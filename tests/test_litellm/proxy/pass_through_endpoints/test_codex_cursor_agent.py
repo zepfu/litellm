@@ -2277,12 +2277,33 @@ def test_cursor_fresh_replay_dispatch_rejects_provider_owned_full_history() -> N
 
 
 @pytest.mark.parametrize(
-    ("item_index", "item_update"),
+    ("item_index", "item_update", "expected_reason"),
     [
-        (0, {"id": "msg_not-a-uuid"}),
-        (4, {"id": "fc_not-a-uuid_0"}),
-        (5, {"id": "fco_not-a-uuid"}),
-        (2, {"unexpected": "value"}),
+        (0, {"id": "msg_not-a-uuid"}, "id_shape"),
+        (4, {"id": "fc_not-a-uuid_0"}, "id_shape"),
+        (5, {"id": "fco_not-a-uuid"}, "id_shape"),
+        (4, {"id": "fc_a4335d9d-8539-9945-bdc7-f14243b0e9b8_"}, "id_shape"),
+        (
+            4,
+            {"id": "fc_a4335d9d-8539-9945-bdc7-f14243b0e9b8_01"},
+            "id_shape",
+        ),
+        (
+            4,
+            {"id": "fc_a4335d9d-8539-9945-bdc7-f14243b0e9b8_-1"},
+            "id_shape",
+        ),
+        (
+            4,
+            {"id": "fc_a4335d9d-8539-9945-bdc7-f14243b0e9b8_x"},
+            "id_shape",
+        ),
+        (
+            4,
+            {"id": "fc_A4335D9D-8539-9945-BDC7-F14243B0E9B8"},
+            "id_shape",
+        ),
+        (2, {"unexpected": "value"}, "item_key_set"),
         (
             2,
             {
@@ -2292,12 +2313,18 @@ def test_cursor_fresh_replay_dispatch_rejects_provider_owned_full_history() -> N
                     "content_item_kinds": ["user.text"],
                 }
             },
+            "id_shape",
         ),
     ],
     ids=[
         "malformed-message-id",
         "malformed-function-call-id",
         "malformed-function-call-output-id",
+        "empty-function-call-id-suffix",
+        "leading-zero-function-call-id-suffix",
+        "negative-function-call-id-suffix",
+        "nonnumeric-function-call-id-suffix",
+        "noncanonical-function-call-id-uuid",
         "unknown-item-key",
         "invalid-present-metadata",
     ],
@@ -2305,6 +2332,7 @@ def test_cursor_fresh_replay_dispatch_rejects_provider_owned_full_history() -> N
 def test_cursor_fresh_replay_dispatch_rejects_unsafe_stock_codex_full_history(
     item_index: int,
     item_update: dict[str, Any],
+    expected_reason: str,
 ) -> None:
     body = _stock_codex_full_history_body()
     body["input"][item_index].update(item_update)
@@ -2314,14 +2342,21 @@ def test_cursor_fresh_replay_dispatch_rejects_unsafe_stock_codex_full_history(
         codex_candidate_calls._CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
         True,
     )
+    rejection: dict[str, Any] = {}
 
     assert (
         codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
             body,
             continuation_exc=continuation_exc,
+            rejection_diagnostic_out=rejection,
         )
         is None
     )
+    diagnostic = rejection[
+        codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
+    ]
+    assert diagnostic["stage"] == "stock_full_history"
+    assert diagnostic["reason"] == expected_reason
 
 
 @pytest.mark.parametrize(
