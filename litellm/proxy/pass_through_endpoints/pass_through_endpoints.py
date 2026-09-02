@@ -819,17 +819,21 @@ def _build_http_exception_from_upstream_status_error(
             structured_detail, retry_after_seconds = usage_limit_detail
             if retry_after_seconds is not None:
                 upstream_headers["Retry-After"] = str(retry_after_seconds)
-            return HTTPException(
+            http_exception = HTTPException(
                 status_code=error.response.status_code,
                 detail=structured_detail,
                 headers=upstream_headers or None,
             )
+            setattr(http_exception, "_aawm_provider_returned", True)
+            return http_exception
 
-    return HTTPException(
+    http_exception = HTTPException(
         status_code=error.response.status_code,
         detail=detail,
         headers=upstream_headers or None,
     )
+    setattr(http_exception, "_aawm_provider_returned", True)
+    return http_exception
 
 
 def _extract_exception_status_code(exc: Exception) -> Optional[int]:
@@ -5005,7 +5009,7 @@ async def pass_through_request(  # noqa: PLR0915
                 error_detail = error_body.decode("utf-8", errors="replace")
             except Exception:
                 error_detail = str(error_body)
-            raise HTTPException(
+            provider_exception = HTTPException(
                 status_code=response.status_code,
                 detail=error_detail,
                 headers={
@@ -5014,6 +5018,8 @@ async def pass_through_request(  # noqa: PLR0915
                 }
                 or None,
             )
+            setattr(provider_exception, "_aawm_provider_returned", True)
+            raise provider_exception
 
         finalize_started_at = datetime.now()
         content = await response.aread()
@@ -5584,10 +5590,12 @@ async def pass_through_request(  # noqa: PLR0915
                         for header_name, header_value in upstream_headers.items()
                     },
                 )
+            if getattr(e, "_aawm_provider_returned", False):
+                setattr(proxy_exc, "_aawm_provider_returned", True)
             raise proxy_exc
         else:
             error_msg = f"{str(e)}"
-            raise ProxyException(
+            proxy_exc = ProxyException(
                 message=getattr(e, "message", error_msg),
                 type=getattr(e, "type", "None"),
                 param=getattr(e, "param", "None"),
@@ -5596,6 +5604,9 @@ async def pass_through_request(  # noqa: PLR0915
                 else getattr(e, "status_code", 500),
                 headers=custom_headers,
             )
+            if getattr(e, "_aawm_provider_returned", False):
+                setattr(proxy_exc, "_aawm_provider_returned", True)
+            raise proxy_exc
 
 
 def _update_metadata_with_tags_in_header(request: Request, metadata: dict) -> dict:
