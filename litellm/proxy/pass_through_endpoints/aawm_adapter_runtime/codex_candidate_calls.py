@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import math
 import re
 import time
 import uuid
@@ -1302,7 +1303,39 @@ def _cursor_replay_function_call_output_items(
         item = dict(raw_item)
         if item.get("type") != "function_call_output":
             return None
-        if set(item) - {"type", "call_id", "callId", "output"}:
+        if set(item) - {
+            "type",
+            "id",
+            "call_id",
+            "callId",
+            "output",
+            "internal_chat_message_metadata_passthrough",
+        }:
+            return None
+        item_id = item.get("id")
+        if item_id is not None and (
+            not isinstance(item_id, str)
+            or not item_id.strip().startswith("fco_")
+        ):
+            return None
+        metadata = item.get("internal_chat_message_metadata_passthrough")
+        if metadata is not None:
+            if (
+                not isinstance(metadata, Mapping)
+                or set(metadata) != {"turn_id", "create_time"}
+            ):
+                return None
+            turn_id = metadata.get("turn_id")
+            create_time = metadata.get("create_time")
+            if (
+                not isinstance(turn_id, str)
+                or not turn_id.strip()
+                or isinstance(create_time, bool)
+                or not isinstance(create_time, float)
+                or not math.isfinite(create_time)
+            ):
+                return None
+        if (item_id is None) != (metadata is None):
             return None
         snake_call_id = item.get("call_id")
         camel_call_id = item.get("callId")

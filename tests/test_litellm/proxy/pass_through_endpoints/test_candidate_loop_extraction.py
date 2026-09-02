@@ -2891,8 +2891,13 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
         "input": [
             {
                 "type": "function_call_output",
+                "id": "fco_01a06244-9f7f-7fe1-869b-23d587ad56f1",
                 "call_id": "pwd-call",
                 "output": "/workspace",
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "01a06244-8523-79c2-b8ff-59238c523de8",
+                    "create_time": 1788355059.5830524,
+                },
             },
         ],
     }
@@ -2923,6 +2928,11 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
         )
     )
     assert rebuilt_request_body is not None
+    assert rebuilt_request_body["input"][-1] == {
+        "type": "function_call_output",
+        "call_id": "pwd-call",
+        "output": "/workspace",
+    }
     replay_safe_classifier = (
         session_affinity.is_replay_safe_session_owner_redispatch_body
     )

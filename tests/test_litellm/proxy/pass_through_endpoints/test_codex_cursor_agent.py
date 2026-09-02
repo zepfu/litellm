@@ -1784,6 +1784,84 @@ def test_cursor_fresh_replay_dispatch_canonicalizes_camel_call_id() -> None:
     }
 
 
+def test_cursor_fresh_replay_dispatch_canonicalizes_stock_codex_output_metadata() -> None:
+    _store_replay_state()
+    body = _replay_body()
+    body["input"] = [
+        {
+            "type": "function_call_output",
+            "id": "fco_01a06244-9f7f-7fe1-869b-23d587ad56f1",
+            "call_id": "call-1",
+            "output": "pwd output",
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01a06244-8523-79c2-b8ff-59238c523de8",
+                "create_time": 1788355059.5830524,
+            },
+        }
+    ]
+
+    rebuilt = (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(body)
+    )
+
+    assert rebuilt is not None
+    assert rebuilt["input"][-1] == {
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": "pwd output",
+    }
+
+
+@pytest.mark.parametrize(
+    "metadata_update",
+    [
+        {"status": "completed"},
+        {"id": "msg_not-a-function-call-output"},
+        {
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "turn-1",
+                "create_time": 1788355059.5830524,
+                "opaque_state": {"provider": "cursor"},
+            }
+        },
+        {
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "turn-1",
+                "create_time": float("inf"),
+            }
+        },
+    ],
+    ids=[
+        "unobserved-status",
+        "wrong-id-kind",
+        "unknown-nested-metadata",
+        "nonfinite-create-time",
+    ],
+)
+def test_cursor_fresh_replay_dispatch_rejects_unsafe_output_metadata(
+    metadata_update: dict[str, Any],
+) -> None:
+    _store_replay_state()
+    body = _replay_body()
+    output_item = {
+        "type": "function_call_output",
+        "id": "fco_01a06244-9f7f-7fe1-869b-23d587ad56f1",
+        "call_id": "call-1",
+        "output": "pwd output",
+        "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a06244-8523-79c2-b8ff-59238c523de8",
+            "create_time": 1788355059.5830524,
+        },
+    }
+    output_item.update(metadata_update)
+    body["input"] = [output_item]
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(body)
+        is None
+    )
+
+
 @pytest.mark.parametrize(
     "tools",
     [
