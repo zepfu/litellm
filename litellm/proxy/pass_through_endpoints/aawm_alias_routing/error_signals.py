@@ -1216,45 +1216,80 @@ def _is_alibaba_token_plan_unsupported_model_response(
     exc: Any,
     *,
     candidate: Optional[dict[str, Any]] = None,
+    attempted_provider_call: bool = True,
 ) -> bool:
     """Detect a structured Alibaba Token Plan unsupported/withdrawn-model rejection.
 
     Both conditions are mandatory:
 
     1. Trusted Alibaba provider attribution: the failed *candidate* must be
-       the Alibaba Token Plan provider. A local exception or another
-       provider's ``ModelNotFound``-style error never matches.
+       the Alibaba Token Plan provider, the provider call must have been
+       attempted, and the exception must carry the provider-return marker. A
+       local exception or another provider's ``ModelNotFound``-style error
+       never matches.
     2. A structured error payload: a structured error block carrying a known
        Alibaba model-admission error code, or a structured error message
        that names the model as unsupported/unknown/withdrawn. Free-form
        local exception text (e.g. a local ``ValueError``) never matches.
 
-    Generic capacity, auth, or request-shape errors never match here, so
-    programming and configuration errors are not hidden behind candidate
-    classification.
+    The provider status must be 400 or 404. Generic capacity, auth, or
+    request-shape errors never match here, so programming and configuration
+    errors are not hidden behind candidate classification.
     """
     if not isinstance(candidate, dict):
         return False
-    if candidate.get("provider") != _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
+    if (
+        not attempted_provider_call
+        or getattr(exc, "_aawm_provider_returned", False) is not True
+        or candidate.get("provider")
+        != _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
+        or _extract_adapter_exception_status_code(exc) not in {400, 404}
+    ):
         return False
+    selected_model = str(candidate.get("model") or "").strip()
+    if not selected_model:
+        return False
+    selected_model_id = selected_model
+    provider_prefix = f"{_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER}/"
+    if selected_model_id.casefold().startswith(provider_prefix.casefold()):
+        selected_model_id = selected_model_id[len(provider_prefix) :]
+    if not selected_model_id or "/" in selected_model_id:
+        return False
+    selected_model_variants = (
+        selected_model.casefold(),
+        selected_model_id.casefold(),
+    )
 
     error_blocks = _iter_codex_auto_agent_error_blocks(exc)
     if not error_blocks:
         return False
 
-    _error_type, error_code = _extract_codex_auto_agent_error_type_and_code(exc)
-    if isinstance(error_code, str) and error_code in _ALIBABA_TOKEN_PLAN_UNSUPPORTED_MODEL_ERROR_CODES:
-        return True
     for error in error_blocks:
+        error_code = error.get("code") or error.get("status")
+        if (
+            isinstance(error_code, str)
+            and error_code in _ALIBABA_TOKEN_PLAN_UNSUPPORTED_MODEL_ERROR_CODES
+        ):
+            return True
         message = error.get("message")
         if not isinstance(message, str):
             continue
         message_lower = message.lower()
         if "model" not in message_lower:
             continue
-        if any(
+        if not any(
             marker in message_lower
             for marker in _ALIBABA_TOKEN_PLAN_UNSUPPORTED_MODEL_MESSAGE_MARKERS
+        ):
+            continue
+        if any(
+            re.search(
+                r"(?<![A-Za-z0-9_.-])"
+                + re.escape(model_variant)
+                + r"(?![A-Za-z0-9_.-])",
+                message_lower,
+            )
+            for model_variant in selected_model_variants
         ):
             return True
     return False
@@ -1472,7 +1507,11 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     )
     if alibaba_exhaustion_class is not None:
         return alibaba_exhaustion_class
-    if _is_alibaba_token_plan_unsupported_model_response(exc, candidate=candidate):
+    if _is_alibaba_token_plan_unsupported_model_response(
+        exc,
+        candidate=candidate,
+        attempted_provider_call=attempted_provider_call,
+    ):
         return "candidate_unavailable"
     if (
         isinstance(candidate, dict)

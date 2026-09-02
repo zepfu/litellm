@@ -589,16 +589,22 @@ def test_resolve_failure_plan_classifies_alibaba_model_not_found_as_candidate_un
     class _StructuredModelNotFound(Exception):
         def __init__(self) -> None:
             super().__init__("ModelNotFound")
+            self.status_code = 404
+            self._aawm_provider_returned = True
             self.detail = {
                 "error": {
                     "type": "invalid_request_error",
                     "code": "ModelNotFound",
-                    "message": "Model not exist",
+                    "message": "Model not exist.",
                 }
             }
 
     exc = _StructuredModelNotFound()
-    candidate = {"provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER}
+    candidate = {
+        "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        "model": "alibaba_token_plan/qwen3.8-max-preview",
+        "route_family": "codex_alibaba_token_plan_chat_completions_adapter",
+    }
     captured: dict = {}
 
     def _capture_publication(**kwargs) -> object:
@@ -613,7 +619,14 @@ def test_resolve_failure_plan_classifies_alibaba_model_not_found_as_candidate_un
         record_codex_failure_evidence_fn=_fail_if_recording,
         request=SimpleNamespace(),
         candidate=candidate,
-        selection={"cooldown_key": f"{CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER}:default", "lane_key": None},
+        selection={
+            "cooldown_key": (
+                "alibaba_token_plan:"
+                "alibaba_token_plan/qwen3.8-max-preview:"
+                "alibaba_token_plan"
+            ),
+            "lane_key": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
+        },
         attempt_record={},
         exc=exc,
         codex_failure_evidence_alias=None,
@@ -626,6 +639,12 @@ def test_resolve_failure_plan_classifies_alibaba_model_not_found_as_candidate_un
 
     assert captured["error_class"] == "candidate_unavailable"
     assert plan.applied_scope == "candidate"
+    assert plan.memory_keys == (
+        "alibaba_token_plan:"
+        "alibaba_token_plan/qwen3.8-max-preview:"
+        "alibaba_token_plan",
+    )
+    assert plan.durable_keys == plan.memory_keys
 
 
 def test_resolve_failure_plan_propagates_one_alibaba_ttl_to_plan_and_attempt(

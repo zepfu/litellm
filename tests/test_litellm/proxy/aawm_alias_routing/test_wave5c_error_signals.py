@@ -257,6 +257,26 @@ def _alibaba_quota_error(
     )
 
 
+def _alibaba_model_error(
+    *,
+    status_code: int,
+    message: str,
+    code: Optional[str] = None,
+    provider_returned: bool = True,
+) -> _FakeExc:
+    error: dict[str, Any] = {
+        "message": message,
+        "type": "invalid_request_error",
+    }
+    if code is not None:
+        error["code"] = code
+    return _FakeExc(
+        detail={"error": error},
+        status_code=status_code,
+        _aawm_provider_returned=provider_returned,
+    )
+
+
 class TestAlibabaTokenPlanExhaustion:
     @pytest.mark.parametrize(
         ("message", "expected_class"),
@@ -908,58 +928,162 @@ class TestUsageLimitQuotaHints:
         }
 
     def test_classify_alibaba_unsupported_model_by_structured_code(self):
-        exc = _FakeExc(
-            detail={
-                "error": {
-                    "message": "Model not exist.",
-                    "type": "invalid_request_error",
-                    "code": "ModelNotFound",
-                }
-            }
+        exc = _alibaba_model_error(
+            status_code=404,
+            message="Model not exist.",
+            code="ModelNotFound",
         )
-        exc.status_code = 404
         assert (
             _classify_codex_auto_agent_retryable_exhaustion(
                 exc,
-                candidate={"provider": "alibaba_token_plan", "model": "alibaba_token_plan/qwen3.8-max-preview"},
+                candidate={
+                    "provider": "alibaba_token_plan",
+                    "model": "alibaba_token_plan/qwen3.8-max-preview",
+                },
             )
             == "candidate_unavailable"
         )
 
     def test_classify_alibaba_withdrawn_model_by_message(self):
-        exc = _FakeExc(
-            detail={
-                "error": {
-                    "message": "Model qwen3.8-max-preview has been withdrawn.",
-                    "type": "invalid_request_error",
-                    "code": "InvalidParameter.Model",
-                }
-            }
+        exc = _alibaba_model_error(
+            status_code=400,
+            message="Model qwen3.8-max-preview has been withdrawn.",
+            code="InvalidParameter.Model",
         )
-        exc.status_code = 400
         assert (
             _classify_codex_auto_agent_retryable_exhaustion(
                 exc,
-                candidate={"provider": "alibaba_token_plan", "model": "alibaba_token_plan/qwen3.8-max-preview"},
+                candidate={
+                    "provider": "alibaba_token_plan",
+                    "model": "alibaba_token_plan/qwen3.8-max-preview",
+                },
             )
             == "candidate_unavailable"
         )
 
     def test_alibaba_model_not_found_from_another_provider_is_not_candidate_unavailable(self):
-        exc = _FakeExc(
-            detail={
-                "error": {
-                    "message": "Model not exist.",
-                    "type": "invalid_request_error",
-                    "code": "ModelNotFound",
-                }
-            }
+        exc = _alibaba_model_error(
+            status_code=404,
+            message="Model not exist.",
+            code="ModelNotFound",
         )
-        exc.status_code = 404
         assert (
             _classify_codex_auto_agent_retryable_exhaustion(
                 exc,
                 candidate={"provider": "openai", "model": "gpt-5"},
+            )
+            != "candidate_unavailable"
+        )
+
+    def test_alibaba_model_error_requires_provider_attempt_and_return_marker(self):
+        candidate = {
+            "provider": "alibaba_token_plan",
+            "model": "alibaba_token_plan/qwen3.8-max-preview",
+        }
+        unattempted = _alibaba_model_error(
+            status_code=404,
+            message="Model not exist.",
+            code="ModelNotFound",
+        )
+        returned_without_attempt = _classify_codex_auto_agent_retryable_exhaustion(
+            unattempted,
+            candidate=candidate,
+            attempted_provider_call=False,
+        )
+        assert returned_without_attempt != "candidate_unavailable"
+
+        unmarked = _alibaba_model_error(
+            status_code=404,
+            message="Model not exist.",
+            code="ModelNotFound",
+            provider_returned=False,
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                unmarked,
+                candidate=candidate,
+                attempted_provider_call=True,
+            )
+            != "candidate_unavailable"
+        )
+
+    def test_alibaba_model_error_requires_400_or_404(self):
+        exc = _alibaba_model_error(
+            status_code=429,
+            message="Model not exist.",
+            code="ModelNotFound",
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate={
+                    "provider": "alibaba_token_plan",
+                    "model": "alibaba_token_plan/qwen3.8-max-preview",
+                },
+            )
+            != "candidate_unavailable"
+        )
+
+    def test_alibaba_withdrawn_model_message_must_name_selected_model(self):
+        exc = _alibaba_model_error(
+            status_code=400,
+            message="Model qwen3.7-max has been withdrawn.",
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate={
+                    "provider": "alibaba_token_plan",
+                    "model": "alibaba_token_plan/qwen3.8-max-preview",
+                },
+            )
+            != "candidate_unavailable"
+        )
+
+    @pytest.mark.parametrize(
+        ("status_code", "detail"),
+        [
+            (
+                401,
+                {
+                    "error": {
+                        "type": "authentication_error",
+                        "message": "Invalid API key.",
+                    }
+                },
+            ),
+            (
+                404,
+                {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Endpoint is unavailable.",
+                    }
+                },
+            ),
+            (
+                400,
+                {"error": "Model qwen3.8-max-preview has been withdrawn."},
+            ),
+        ],
+    )
+    def test_non_model_provider_payloads_do_not_cool_alibaba_candidate(
+        self,
+        status_code: int,
+        detail: dict[str, Any],
+    ):
+        exc = _FakeExc(
+            detail=detail,
+            status_code=status_code,
+            _aawm_provider_returned=True,
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate={
+                    "provider": "alibaba_token_plan",
+                    "model": "alibaba_token_plan/qwen3.8-max-preview",
+                },
             )
             != "candidate_unavailable"
         )
@@ -969,7 +1093,10 @@ class TestUsageLimitQuotaHints:
         assert (
             _classify_codex_auto_agent_retryable_exhaustion(
                 exc,
-                candidate={"provider": "alibaba_token_plan", "model": "alibaba_token_plan/qwen3.8-max-preview"},
+                candidate={
+                    "provider": "alibaba_token_plan",
+                    "model": "alibaba_token_plan/qwen3.8-max-preview",
+                },
             )
             is None
         )
