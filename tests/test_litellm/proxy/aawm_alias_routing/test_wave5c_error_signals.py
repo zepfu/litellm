@@ -63,6 +63,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals impor
     _is_codex_auto_agent_spark_candidate,
     _is_codex_auto_agent_transient_internal_error_class,
     _is_codex_auto_agent_xai_candidate,
+    _is_codex_auto_agent_xai_model_unavailable_response,
     _is_kimi_code_auto_agent_candidate,
     _iter_codex_auto_agent_error_blocks,
     _parse_codex_auto_agent_header_wait_seconds,
@@ -597,7 +598,7 @@ class TestErrorTokens:
     def test_add_text_tokens_candidate_unavailable_grok_not_found(self):
         tokens: set[str] = set()
         _add_codex_auto_agent_text_error_tokens(tokens, "grok-4.5 model not found")
-        assert "aawm_codex_auto_agent_candidate_unavailable" in tokens
+        assert tokens == set()
 
     def test_add_text_tokens_no_false_positive(self):
         tokens: set[str] = set()
@@ -1231,6 +1232,223 @@ class TestUsageLimitQuotaHints:
                 },
             )
             != "candidate_unavailable"
+        )
+
+    @pytest.mark.parametrize(
+        ("candidate", "status_code"),
+        (
+            (
+                {
+                    "provider": "xai",
+                    "model": "xai/grok-future",
+                    "route_family": "codex_grok_native_responses_adapter",
+                },
+                400,
+            ),
+            (
+                {
+                    "provider": "xai",
+                    "model": "xai/grok-future",
+                    "route_family": "codex_grok_native_responses_adapter",
+                },
+                404,
+            ),
+            (
+                {
+                    "provider": "xai",
+                    "model": "oa_xai/grok-future",
+                    "route_family": "codex_xai_oauth_responses_adapter",
+                },
+                400,
+            ),
+            (
+                {
+                    "provider": "xai",
+                    "model": "oa_xai/grok-future",
+                    "route_family": "codex_xai_oauth_responses_adapter",
+                },
+                404,
+            ),
+        ),
+    )
+    def test_xai_model_not_found_exact_provider_evidence_cools_matching_candidate(
+        self,
+        candidate,
+        status_code,
+    ):
+        model_suffix = candidate["model"].split("/", 1)[1]
+        exc = _FakeExc(
+            detail={
+                "error": {
+                    "message": f"model not found: {model_suffix}",
+                    "code": "not_found",
+                }
+            },
+            status_code=status_code,
+            _aawm_provider_returned=True,
+        )
+
+        assert _is_codex_auto_agent_xai_model_unavailable_response(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=True,
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=True,
+            )
+            == "xai_model_unavailable"
+        )
+        assert (
+            _get_codex_auto_agent_candidate_cooldown_scope(
+                "xai_model_unavailable",
+                candidate=candidate,
+            )
+            == "candidate"
+        )
+
+    @pytest.mark.parametrize(
+        ("candidate", "attempted_provider_call", "provider_returned", "status_code", "message", "code"),
+        (
+            (
+                {
+                    "provider": "xai",
+                    "model": "xai/grok-future",
+                    "route_family": "codex_grok_native_responses_adapter",
+                },
+                False,
+                True,
+                404,
+                "model not found: grok-future",
+                "not_found",
+            ),
+            (
+                {
+                    "provider": "xai",
+                    "model": "xai/grok-future",
+                    "route_family": "codex_grok_native_responses_adapter",
+                },
+                True,
+                False,
+                404,
+                "model not found: grok-future",
+                "not_found",
+            ),
+            (
+                {
+                    "provider": "xai",
+                    "model": "xai/grok-future",
+                    "route_family": "codex_grok_native_responses_adapter",
+                },
+                True,
+                True,
+                422,
+                "model not found: grok-future",
+                "not_found",
+            ),
+            (
+                {
+                    "provider": "xai",
+                    "model": "xai/grok-future",
+                    "route_family": "codex_grok_native_responses_adapter",
+                },
+                True,
+                True,
+                404,
+                "model not found: other-model",
+                "not_found",
+            ),
+            (
+                {
+                    "provider": "xai",
+                    "model": "oa_xai/grok-future",
+                    "route_family": "codex_grok_native_responses_adapter",
+                },
+                True,
+                True,
+                404,
+                "model not found: grok-future",
+                "not_found",
+            ),
+            (
+                {
+                    "provider": "openai",
+                    "model": "xai/grok-future",
+                    "route_family": "codex_grok_native_responses_adapter",
+                },
+                True,
+                True,
+                404,
+                "model not found: grok-future",
+                "not_found",
+            ),
+            (
+                {
+                    "provider": "xai",
+                    "model": "xai/grok-future",
+                    "route_family": "anthropic_grok_native_responses_adapter",
+                },
+                True,
+                True,
+                404,
+                "model not found: grok-future",
+                "not_found",
+            ),
+            (
+                {
+                    "provider": "xai",
+                    "model": "xai/grok-future",
+                    "route_family": "codex_grok_native_responses_adapter",
+                },
+                True,
+                True,
+                404,
+                "grok-future model not found",
+                "not_found",
+            ),
+            (
+                {
+                    "provider": "xai",
+                    "model": "xai/grok-future",
+                    "route_family": "codex_grok_native_responses_adapter",
+                },
+                True,
+                True,
+                404,
+                "model not found: grok-future",
+                "invalid_request_error",
+            ),
+        ),
+    )
+    def test_xai_model_not_found_requires_exact_provider_evidence(
+        self,
+        candidate,
+        attempted_provider_call,
+        provider_returned,
+        status_code,
+        message,
+        code,
+    ):
+        exc = _FakeExc(
+            detail={"error": {"message": message, "code": code}},
+            status_code=status_code,
+            _aawm_provider_returned=provider_returned,
+        )
+
+        assert not _is_codex_auto_agent_xai_model_unavailable_response(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=attempted_provider_call,
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=attempted_provider_call,
+            )
+            != "xai_model_unavailable"
         )
 
     def test_local_value_error_is_never_alibaba_unsupported_model(self):

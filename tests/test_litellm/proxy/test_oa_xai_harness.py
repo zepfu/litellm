@@ -231,8 +231,14 @@ def test_xai_route_descriptors_keep_unknown_managed_policy_and_native_boundary()
     assert native.route_family == "grok_cli_chat_proxy"
     assert native.credential_family == "xai_grok_oidc"
     assert native.auth_mode == "grok_oidc"
-    assert route_descriptors.get_xai_route_descriptor("xai/grok-future") is None
-    assert oauth.normalize_grok_native_oauth_model("xai/grok-future") is None
+    native_future = route_descriptors.get_xai_route_descriptor("xai/grok-future")
+    assert native_future is not None
+    assert native_future.public_model == "grok-future"
+    assert native_future.upstream_model == "grok-future"
+    assert native_future.route_family == "grok_cli_chat_proxy"
+    assert native_future.credential_family == "xai_grok_oidc"
+    assert native_future.auth_mode == "grok_oidc"
+    assert oauth.normalize_grok_native_oauth_model("xai/grok-future") == "grok-future"
 
 
 def test_direct_oa_xai_uses_existing_flatten_patch_and_sanitize_helpers():

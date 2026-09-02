@@ -110,13 +110,18 @@ def resolve_oa_xai_route_descriptor(model: str) -> XAIRouteDescriptor:
 
 
 def get_grok_native_route_descriptor(model: Any) -> Optional[XAIRouteDescriptor]:
-    """Return a native OIDC descriptor only for explicitly allowed models."""
+    """Return a native OIDC descriptor for known and explicitly prefixed models."""
 
     if not isinstance(model, str):
         return None
     candidate = model.strip()
     if candidate.startswith("xai/"):
-        candidate = candidate[len("xai/") :]
+        native_model = candidate[len("xai/") :].strip()
+        if not native_model:
+            return None
+        return GROK_NATIVE_ROUTE_DESCRIPTORS.get(native_model) or _native_descriptor(
+            native_model
+        )
     return GROK_NATIVE_ROUTE_DESCRIPTORS.get(candidate)
 
 
