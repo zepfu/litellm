@@ -1289,20 +1289,20 @@ _SUBAGENT_PROHIBITED_FIELD_NAMES = {
 }
 
 
-def _is_default_subagent_optional_field(
+_SUBAGENT_IGNORED_STRING_FIELDS = frozenset({9, 16})
+
+
+def _is_supported_subagent_optional_field(
     field_number: int,
     wire_type: int,
     value: Any,
 ) -> bool:
-    return (
-        field_number == 7
-        and wire_type == 0
-        and value == 0
-    ) or (
-        field_number == 9
-        and wire_type == 2
-        and value == b""
-    )
+    if field_number == 7:
+        return wire_type == 0 and value == 0
+    if field_number in _SUBAGENT_IGNORED_STRING_FIELDS and wire_type == 2:
+        _decode_proto_string(value)
+        return True
+    return False
 
 
 _SPAWN_AGENT_SCHEMA_FIELD_ALIASES = {
@@ -2433,7 +2433,7 @@ def _decode_subagent_request(
             field_number
             for field_number, wire_type, value in args_fields
             if field_number > 5
-            and not _is_default_subagent_optional_field(
+            and not _is_supported_subagent_optional_field(
                 field_number,
                 wire_type,
                 value,
@@ -2455,7 +2455,7 @@ def _decode_subagent_request(
             + "."
         )
 
-    for field_number in (1, 2, 3, 4, 5, 7, 9):
+    for field_number in (1, 2, 3, 4, 5, 7, 9, 16):
         if len(_proto_field_values(args_fields, field_number)) > 1:
             raise CursorConnectProtocolError(
                 "Cursor Agent subagent operation contains a repeated safe scalar field."

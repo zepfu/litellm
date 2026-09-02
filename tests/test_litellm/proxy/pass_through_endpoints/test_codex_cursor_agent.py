@@ -273,6 +273,80 @@ def test_cursor_subagent_args_map_to_advertised_spawn_agent() -> None:
 
 
 @pytest.mark.parametrize(
+    ("ignored_fields", "secrets"),
+    [
+        (
+            cursor_connect._encode_proto_string_field(
+                9,
+                "parent-conversation-sensitive-value",
+            ),
+            ("parent-conversation-sensitive-value",),
+        ),
+        (
+            cursor_connect._encode_proto_string_field(
+                16,
+                "root-parent-sensitive-value",
+            ),
+            ("root-parent-sensitive-value",),
+        ),
+        (
+            cursor_connect._encode_proto_string_field(
+                9,
+                "parent-conversation-sensitive-value",
+            )
+            + cursor_connect._encode_proto_string_field(
+                16,
+                "root-parent-sensitive-value",
+            ),
+            (
+                "parent-conversation-sensitive-value",
+                "root-parent-sensitive-value",
+            ),
+        ),
+    ],
+    ids=["parent-conversation", "root-parent", "both-parent-fields"],
+)
+def test_cursor_subagent_ignores_parent_state_fields_without_leaking(
+    ignored_fields: bytes,
+    secrets: tuple[str, ...],
+) -> None:
+    external_exec_requests: list[dict[str, Any]] = []
+
+    normalized, client_messages = cursor_connect._process_agent_server_message(
+        _cursor_subagent_server_message(
+            _cursor_subagent_args(extra=ignored_fields),
+        ),
+        {},
+        spawn_agent_tool_definition=_advertised_spawn_agent_definition(),
+        external_exec_requests=external_exec_requests,
+    )
+
+    tool_call = normalized["interactionUpdate"]["toolCallCompleted"]
+    assert tool_call["callId"] == "subagent-call"
+    assert tool_call["toolName"] == "spawn_agent"
+    assert json.loads(tool_call["argsJson"]) == {
+        "agent_type": "explorer",
+        "model": "read",
+        "message": "Inspect the requested files without changing them.",
+    }
+    assert client_messages == []
+    assert len(external_exec_requests) == 1
+    request = external_exec_requests[0]
+    assert request["call_id"] == "subagent-call"
+    assert request["message_field"] == 28
+    assert request["request_id"] == 314
+    assert request["exec_id"] == "exec-014"
+    assert request["tool_call_id"] == "subagent-call"
+    assert request["exec_fields"] == [
+        (1, 0, 314),
+        (15, 2, b"exec-014"),
+    ]
+    serialized = json.dumps(tool_call) + repr(request)
+    for secret in secrets:
+        assert secret not in serialized
+
+
+@pytest.mark.parametrize(
     "default_field",
     [
         cursor_connect._encode_proto_varint_field(
@@ -314,33 +388,67 @@ def test_cursor_subagent_accepts_default_optional_fields_through_spawn_agent(
 
 
 @pytest.mark.parametrize(
-    "duplicate_default_fields",
+    ("duplicate_optional_fields", "not_leaked"),
     [
-        cursor_connect._encode_proto_varint_field(
-            7,
-            0,
-            include_default=True,
-        )
-        + cursor_connect._encode_proto_varint_field(
-            7,
-            0,
-            include_default=True,
+        (
+            cursor_connect._encode_proto_varint_field(
+                7,
+                0,
+                include_default=True,
+            )
+            + cursor_connect._encode_proto_varint_field(
+                7,
+                0,
+                include_default=True,
+            ),
+            "Inspect the requested files",
         ),
-        cursor_connect._encode_proto_string_field(
-            9,
-            "",
-            include_empty=True,
-        )
-        + cursor_connect._encode_proto_string_field(
-            9,
-            "",
-            include_empty=True,
+        (
+            cursor_connect._encode_proto_string_field(
+                9,
+                "",
+                include_empty=True,
+            )
+            + cursor_connect._encode_proto_string_field(
+                9,
+                "",
+                include_empty=True,
+            ),
+            "Inspect the requested files",
+        ),
+        (
+            cursor_connect._encode_proto_string_field(
+                9,
+                "parent-conversation-duplicate-secret",
+            )
+            + cursor_connect._encode_proto_string_field(
+                9,
+                "parent-conversation-duplicate-secret",
+            ),
+            "parent-conversation-duplicate-secret",
+        ),
+        (
+            cursor_connect._encode_proto_string_field(
+                16,
+                "root-parent-duplicate-secret",
+            )
+            + cursor_connect._encode_proto_string_field(
+                16,
+                "root-parent-duplicate-secret",
+            ),
+            "root-parent-duplicate-secret",
         ),
     ],
-    ids=["run-in-background-false", "parent-conversation-empty"],
+    ids=[
+        "run-in-background-false",
+        "parent-conversation-empty",
+        "parent-conversation-non-empty",
+        "root-parent-non-empty",
+    ],
 )
-def test_cursor_subagent_rejects_repeated_default_optional_fields_without_leaking(
-    duplicate_default_fields: bytes,
+def test_cursor_subagent_rejects_repeated_optional_fields_without_leaking(
+    duplicate_optional_fields: bytes,
+    not_leaked: str,
 ) -> None:
     external_exec_requests: list[dict[str, Any]] = []
 
@@ -350,7 +458,7 @@ def test_cursor_subagent_rejects_repeated_default_optional_fields_without_leakin
     ) as exc_info:
         cursor_connect._process_agent_server_message(
             _cursor_subagent_server_message(
-                _cursor_subagent_args(extra=duplicate_default_fields),
+                _cursor_subagent_args(extra=duplicate_optional_fields),
             ),
             {},
             spawn_agent_tool_definition=_advertised_spawn_agent_definition(),
@@ -358,10 +466,8 @@ def test_cursor_subagent_rejects_repeated_default_optional_fields_without_leakin
         )
 
     assert external_exec_requests == []
-    assert "Inspect the requested files" not in exc_info.value.message
-    assert "Inspect the requested files" not in json.dumps(
-        exc_info.value.body or {}
-    )
+    assert not_leaked not in exc_info.value.message
+    assert not_leaked not in json.dumps(exc_info.value.body or {})
 
 
 def test_cursor_subagent_requires_unambiguous_advertised_spawn_agent() -> None:
@@ -414,7 +520,6 @@ def test_cursor_subagent_requires_advertised_spawn_agent() -> None:
         (13, "interrupt-secret"),
         (14, "mode-secret"),
         (15, "fork-secret"),
-        (16, "root-parent-secret"),
         (17, "selected-context-secret"),
         (18, "direct-parent-secret"),
         (19, "environment-secret"),
@@ -430,7 +535,6 @@ def test_cursor_subagent_requires_advertised_spawn_agent() -> None:
         "interrupt",
         "mode",
         "fork",
-        "root-parent",
         "selected-context",
         "direct-parent",
         "environment",
@@ -473,15 +577,8 @@ def test_cursor_subagent_rejects_prohibited_optional_fields_without_dispatch(
             cursor_connect._encode_proto_varint_field(7, 1),
             "Inspect the requested files",
         ),
-        (
-            cursor_connect._encode_proto_string_field(
-                9,
-                "parent-conversation-sensitive-value",
-            ),
-            "parent-conversation-sensitive-value",
-        ),
     ],
-    ids=["run-in-background-true", "parent-conversation-non-empty"],
+    ids=["run-in-background-true"],
 )
 def test_cursor_subagent_rejects_non_default_optional_fields_without_leaking(
     non_default_field: bytes,
@@ -496,6 +593,68 @@ def test_cursor_subagent_rejects_non_default_optional_fields_without_leaking(
         cursor_connect._process_agent_server_message(
             _cursor_subagent_server_message(
                 _cursor_subagent_args(extra=non_default_field),
+            ),
+            {},
+            spawn_agent_tool_definition=_advertised_spawn_agent_definition(),
+            external_exec_requests=external_exec_requests,
+        )
+
+    assert external_exec_requests == []
+    assert not_leaked not in exc_info.value.message
+    assert not_leaked not in json.dumps(exc_info.value.body or {})
+
+
+@pytest.mark.parametrize(
+    ("invalid_field", "not_leaked", "error_match"),
+    [
+        (
+            cursor_connect._encode_proto_varint_field(9, 314),
+            "parent-conversation-wire-secret",
+            "unsupported optional field",
+        ),
+        (
+            cursor_connect._encode_proto_varint_field(16, 314),
+            "root-parent-wire-secret",
+            "unsupported optional field",
+        ),
+        (
+            cursor_connect._encode_proto_bytes_field(
+                9,
+                b"parent-conversation-invalid-utf8-secret\xff",
+            ),
+            "parent-conversation-invalid-utf8-secret",
+            "invalid UTF-8",
+        ),
+        (
+            cursor_connect._encode_proto_bytes_field(
+                16,
+                b"root-parent-invalid-utf8-secret\xff",
+            ),
+            "root-parent-invalid-utf8-secret",
+            "invalid UTF-8",
+        ),
+    ],
+    ids=[
+        "parent-conversation-wrong-wire",
+        "root-parent-wrong-wire",
+        "parent-conversation-malformed-string",
+        "root-parent-malformed-string",
+    ],
+)
+def test_cursor_subagent_rejects_invalid_parent_state_fields_without_leaking(
+    invalid_field: bytes,
+    not_leaked: str,
+    error_match: str,
+) -> None:
+    external_exec_requests: list[dict[str, Any]] = []
+
+    with pytest.raises(
+        CursorConnectProtocolError,
+        match=error_match,
+    ) as exc_info:
+        cursor_connect._process_agent_server_message(
+            _cursor_subagent_server_message(
+                _cursor_subagent_args(extra=invalid_field),
             ),
             {},
             spawn_agent_tool_definition=_advertised_spawn_agent_definition(),
