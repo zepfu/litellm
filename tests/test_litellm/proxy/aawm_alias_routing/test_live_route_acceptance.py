@@ -35,6 +35,7 @@ values.
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 from typing import Any, Callable, Optional, Sequence
 from unittest.mock import AsyncMock, MagicMock
@@ -557,6 +558,20 @@ class _StructuredUpstream429(Exception):
         self.upstream_headers = {"Retry-After": str(retry_after_seconds)}
 
 
+class _OpenRouterNoEndpointsError(Exception):
+    """Captured OpenRouter model-unavailable response."""
+
+    def __init__(self, *, status_code: int = 404) -> None:
+        super().__init__("OpenRouter request failed")
+        self.status_code = status_code
+        self.detail = {
+            "error": {
+                "message": "No endpoints found for this model",
+            }
+        }
+        self._aawm_provider_returned = True
+
+
 def _marker_only_capacity_error() -> RuntimeError:
     """A retryable capacity failure with NO structured status code (marker tier)."""
     return RuntimeError("Selected model is at capacity. Please try a different model.")
@@ -625,6 +640,150 @@ def _install_openrouter_and_opencode_performers(
         lpe._write_aawm_alias_routing_durable_payload = original_write  # type: ignore[assignment]
 
     return _restore
+
+
+async def test_or016_openrouter_unavailable_cools_exact_candidate_and_recovers(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exact OpenRouter model-unavailable response fails over and half-opens."""
+    _bypass_session_owner_for_cooldown_contract(monkeypatch)
+    unavailable_model = "openrouter/future-model"
+    native_similar_model = "openrouter/future-model-native"
+    snapshot = compiler.compile_yaml(
+        f"""
+defaults: {{}}
+aliases:
+  - name: basic
+    candidates:
+      - provider: openrouter
+        model: {unavailable_model}
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+      - provider: openai
+        model: {native_similar_model}
+        route_family: codex_responses
+        priority: 90
+"""
+    )
+    snapshot_select.set_active_routing_snapshot(snapshot)
+    async def _fake_codex_oauth_contexts(
+        _request: Request,
+        *,
+        candidate_template: dict[str, Any],
+        affinity: Optional[dict[str, Any]] = None,
+    ) -> list[dict[str, Any]]:
+        _ = affinity
+        return [
+            {
+                "candidate": {
+                    **candidate_template,
+                    "codex_oauth_account_label": "or016-native",
+                    "codex_oauth_account_hash": "or016-native-account",
+                    "codex_oauth_lane_key": "codex-oauth:or016-native",
+                },
+                "lane_key": "codex-oauth:or016-native",
+                "auth_status": "healthy",
+            }
+        ]
+
+    monkeypatch.setitem(
+        lpe._select_codex_auto_agent_candidate.__globals__,
+        "_resolve_codex_oauth_account_candidate_contexts",
+        _fake_codex_oauth_contexts,
+    )
+
+    leaders: list[str] = []
+    attempt_keys_by_candidate: dict[tuple[str, str], str] = {}
+    attempt_records: list[dict[str, Any]] = []
+
+    async def _performer(
+        *,
+        endpoint: str,
+        request: Request,
+        fastapi_response: Response,
+        user_api_key_dict: Any,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+        target_url: str,
+        api_key: Optional[str],
+        forward_headers: bool,
+    ) -> Response:
+        _ = (
+            endpoint,
+            request,
+            fastapi_response,
+            user_api_key_dict,
+            target_url,
+            api_key,
+            forward_headers,
+        )
+        model = str(candidate["model"])
+        provider = str(candidate["provider"])
+        leaders.append(model)
+        lane_key = (
+            policy.CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
+            if provider == "openrouter"
+            else str(candidate.get("codex_oauth_lane_key") or "")
+        )
+        attempt_keys_by_candidate[(provider, model)] = (
+            lane_keys._codex_auto_agent_candidate_key(
+                candidate,
+                lane_key,
+                cooldown_identity_tag=candidate.get("cooldown_identity_tag"),
+            )
+        )
+        metadata = candidate_body.get("litellm_metadata", {})
+        attempts = metadata.get("codex_auto_agent_attempts", [])
+        for attempt in attempts:
+            if isinstance(attempt, dict):
+                attempt_records.append(attempt)
+        if model == unavailable_model and leaders.count(model) == 1:
+            raise _OpenRouterNoEndpointsError()
+        return _SUCCESS_RESPONSE
+
+    restore = _install_candidate_request_performer(_performer)
+    try:
+        result = await _drive_wrapper(session_id="or016-failover")
+        assert isinstance(result, Response)
+        assert leaders == [unavailable_model, native_similar_model]
+
+        unavailable_key = attempt_keys_by_candidate[("openrouter", unavailable_model)]
+        native_key = attempt_keys_by_candidate[("openai", native_similar_model)]
+        assert unavailable_key == _snapshot_candidate_key(snapshot, unavailable_model)
+        assert unavailable_model in unavailable_key
+        assert unavailable_key != native_key
+        assert "codex_openrouter_completion_adapter" in unavailable_key
+        failed_attempt = next(
+            attempt
+            for attempt in attempt_records
+            if attempt.get("model") == unavailable_model
+        )
+        assert failed_attempt["error_class"] == "candidate_unavailable"
+        assert failed_attempt["cooldown_scope"] == "candidate"
+        assert alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(
+            unavailable_key
+        ) > 0
+        assert (
+            alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(
+                native_key
+            )
+            == 0.0
+        )
+
+        alias_state.alias_routing_state.codex.cooldown_until_monotonic_by_key[
+            unavailable_key
+        ] = time.monotonic() - 1.0
+        recovered = await _drive_wrapper(session_id="or016-half-open")
+        assert isinstance(recovered, Response)
+        assert leaders[-1] == unavailable_model
+        assert (
+            alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(
+                unavailable_key
+            )
+            == 0.0
+        )
+    finally:
+        restore()
 
 
 # ---------------------------------------------------------------------------

@@ -132,6 +132,11 @@ _ANTHROPIC_RESPONSES_CANDIDATE = {
     "model": "gpt-5",
     "route_family": "anthropic_openai_responses_adapter",
 }
+_OPENROUTER_COMPLETION_CANDIDATE = {
+    "provider": "openrouter",
+    "model": "openrouter/future-model",
+    "route_family": "codex_openrouter_completion_adapter",
+}
 
 
 class _FakeExc(Exception):
@@ -848,6 +853,146 @@ class TestClassification:
                 attempted_provider_call=True,
             )
             == expected
+        )
+
+    @pytest.mark.parametrize("status_code", [400, 404])
+    def test_openrouter_no_endpoints_is_candidate_unavailable(
+        self,
+        status_code: int,
+    ) -> None:
+        exc = _FakeExc(
+            message="OpenRouter request failed",
+            status_code=status_code,
+            detail={
+                "error": {
+                    "message": "No endpoints found for this model",
+                }
+            },
+            _aawm_provider_returned=True,
+        )
+
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=_OPENROUTER_COMPLETION_CANDIDATE,
+                attempted_provider_call=True,
+            )
+            == "candidate_unavailable"
+        )
+
+    def test_openrouter_retired_model_is_candidate_unavailable(self) -> None:
+        exc = _FakeExc(
+            message="OpenRouter request failed",
+            status_code=404,
+            detail={
+                "error": {
+                    "message": (
+                        "Thank you for participating in the Stealth Ox Alpha "
+                        "testing period. This model was ZAI's GLM-5.3 Flash."
+                    )
+                }
+            },
+            _aawm_provider_returned=True,
+        )
+        candidate = dict(
+            _OPENROUTER_COMPLETION_CANDIDATE,
+            model="openrouter/stealth/ox-alpha",
+        )
+
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=True,
+            )
+            == "candidate_unavailable"
+        )
+
+    @pytest.mark.parametrize(
+        ("candidate", "attempted_provider_call", "detail"),
+        [
+            pytest.param(
+                _OPENROUTER_COMPLETION_CANDIDATE,
+                True,
+                {"error": {"message": "Model not found"}},
+                id="generic-model-not-found",
+            ),
+            pytest.param(
+                _OPENROUTER_COMPLETION_CANDIDATE,
+                False,
+                {"error": {"message": "No endpoints found for this model"}},
+                id="not-attempted",
+            ),
+            pytest.param(
+                {
+                    "provider": "openai",
+                    "model": "openrouter/future-model",
+                    "route_family": "codex_responses",
+                },
+                True,
+                {"error": {"message": "No endpoints found for this model"}},
+                id="native-similar-model",
+            ),
+            pytest.param(
+                {
+                    "provider": "openrouter",
+                    "model": "openrouter/future-model",
+                    "route_family": "codex_responses",
+                },
+                True,
+                {"error": {"message": "No endpoints found for this model"}},
+                id="wrong-route",
+            ),
+        ],
+    )
+    def test_openrouter_model_unavailable_matching_stays_terminal_when_ambiguous(
+        self,
+        candidate: dict[str, Any],
+        attempted_provider_call: bool,
+        detail: dict[str, Any],
+    ) -> None:
+        exc = _FakeExc(
+            message="OpenRouter request failed",
+            status_code=404,
+            detail=detail,
+            _aawm_provider_returned=True,
+        )
+
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=attempted_provider_call,
+            )
+            is None
+        )
+
+    def test_openrouter_downstream_provider_raw_error_stays_terminal(self) -> None:
+        exc = _FakeExc(
+            message="OpenRouter request failed",
+            status_code=404,
+            detail={
+                "error": {
+                    "message": (
+                        "Error from provider (Example): "
+                        "No endpoints found for this model"
+                    ),
+                    "metadata": {
+                        "provider_name": "Example",
+                        "raw": "ERROR",
+                    },
+                }
+            },
+            _aawm_provider_returned=True,
+        )
+
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=_OPENROUTER_COMPLETION_CANDIDATE,
+                attempted_provider_call=True,
+            )
+            == "provider_terminal_error"
         )
 
     @pytest.mark.parametrize("status_code", [408, 500, 502, 503, 504, 529])
