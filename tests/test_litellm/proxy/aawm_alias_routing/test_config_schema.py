@@ -69,6 +69,23 @@ def test_reasoning_effort_malformed_values_rejected() -> None:
             )
 
 
+def test_alias_multi_agent_version_accepts_only_supported_versions() -> None:
+    alias_default = schema.AliasConfig.model_validate(_base_alias())
+    assert alias_default.multi_agent_version is None
+
+    for version in ("v1", "v2"):
+        alias = schema.AliasConfig.model_validate(
+            _base_alias(multi_agent_version=version)
+        )
+        assert alias.multi_agent_version == version
+
+    for bad_value in ("v0", "v3", "V2", 2, ["v2"]):
+        with pytest.raises(ValidationError):
+            schema.AliasConfig.model_validate(
+                _base_alias(multi_agent_version=bad_value)
+            )
+
+
 def test_rejects_arbitrary_behavior() -> None:
     """A candidate whose route_family/provider is not a registered code behavior is rejected."""
     with pytest.raises(ValidationError):

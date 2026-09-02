@@ -103,6 +103,8 @@ class RoutingAlias:
     candidates: tuple[RoutingCandidate | AliasReference, ...]
     # CFG-007: optional TUI-dispatch rules
     dispatch: Optional[DispatchSnapshot] = None
+    # CURSOR-014: optional stock Codex collaboration metadata for the catalog.
+    multi_agent_version: Optional[Literal["v1", "v2"]] = None
 
 
 @dataclass(frozen=True, slots=True)

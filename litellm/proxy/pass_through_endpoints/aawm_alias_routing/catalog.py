@@ -194,16 +194,27 @@ def _concrete_row(
 
 
 def _alias_rows(snapshot: Optional[Any]) -> List[Dict[str, Any]]:
-    return [
-        {
+    if snapshot is None:
+        return []
+    aliases = getattr(snapshot, "aliases", None)
+    if not isinstance(aliases, Mapping):
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for name in iter_compiled_alias_names(snapshot):
+        alias = aliases.get(name)
+        row: Dict[str, Any] = {
             "id": name,
             "object": "model",
             "owned_by": AAWM_ALIAS_OWNED_BY,
             "mode": "chat",
             "model_info": {"aawm_alias": True, "db_model": False},
         }
-        for name in iter_compiled_alias_names(snapshot)
-    ]
+        multi_agent_version = getattr(alias, "multi_agent_version", None)
+        if multi_agent_version is not None:
+            row["multi_agent_version"] = multi_agent_version
+        rows.append(row)
+    return rows
 
 
 def _overlay_rows() -> List[Dict[str, Any]]:

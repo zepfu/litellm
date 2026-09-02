@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 import logging
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -28,6 +28,30 @@ def _alias_entry(
 def _snapshot_with_aliases(names: List[str]) -> SimpleNamespace:
     aliases = {_name: _alias_entry(name=_name) for _name in names}
     return SimpleNamespace(aliases=aliases)
+
+
+def test_alias_catalog_publishes_configured_multi_agent_version_only() -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.catalog import (
+        build_passthrough_model_list,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    rows = build_passthrough_model_list(snapshot)["data"]
+    rows_by_id = {row["id"]: row for row in rows}
+
+    assert rows_by_id["sota-xai"]["multi_agent_version"] == "v2"
+    assert "multi_agent_version" not in rows_by_id["work"]
+
+    without_metadata = SimpleNamespace(
+        aliases={name: SimpleNamespace() for name in snapshot.aliases}
+    )
+    baseline_rows = build_passthrough_model_list(without_metadata)["data"]
+    baseline_by_id = {row["id"]: row for row in baseline_rows}
+    assert rows_by_id["oa_xai/grok-4.6"] == baseline_by_id["oa_xai/grok-4.6"]
 
 
 COMPILED_ALIAS_NAMES = [

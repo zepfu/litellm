@@ -670,6 +670,7 @@ def _compile_alias(
             distribution_strategy=alias.distribution_strategy,
             candidates=(),
             dispatch=dispatch_snapshot,
+            multi_agent_version=alias.multi_agent_version,
         )
 
     ordered_entries = schema.order_alias_entries_by_priority(alias.candidates)
@@ -708,6 +709,7 @@ def _compile_alias(
         distribution_strategy=alias.distribution_strategy,
         candidates=tuple(compiled_entries),
         dispatch=dispatch_snapshot,
+        multi_agent_version=alias.multi_agent_version,
     )
 
 
@@ -777,6 +779,7 @@ def _canonical_snapshot_repr(aliases: dict[str, RoutingAlias]) -> str:
                 "distribution_strategy": alias.distribution_strategy,
                 "name": alias.name,
                 "dispatch": dispatch_repr,
+                "multi_agent_version": alias.multi_agent_version,
             }
         )
     return json.dumps({"aliases": canonical_aliases}, sort_keys=True, separators=(",", ":"))

@@ -694,6 +694,29 @@ aliases:
         compiler.compile_yaml(raw)
 
 
+def test_alias_multi_agent_version_compiles_into_snapshot_and_hash() -> None:
+    base_raw = """
+defaults: {}
+aliases:
+  - name: basic
+    candidates:
+      - provider: openai
+        model: gpt-5.4-mini
+        route_family: codex_responses
+        priority: 0
+"""
+    with_version_raw = base_raw.replace(
+        "name: basic", "name: basic\n    multi_agent_version: v2", 1
+    )
+
+    snapshot_plain = compiler.compile_yaml(base_raw)
+    snapshot_with = compiler.compile_yaml(with_version_raw)
+
+    assert snapshot_plain.aliases["basic"].multi_agent_version is None
+    assert snapshot_with.aliases["basic"].multi_agent_version == "v2"
+    assert snapshot_plain.config_hash != snapshot_with.config_hash
+
+
 # ===========================================================================
 # Wave 3: R3-4 -- semantic digest stability across processes and formatting
 # ===========================================================================

@@ -451,6 +451,9 @@ class AliasConfig(BaseModel):
     )
     route_family: Optional[str] = None
     distribution_strategy: Optional[DistributionStrategy] = None
+    # CURSOR-014: optional stock Codex collaboration metadata for the alias
+    # catalog. This is intentionally alias-scoped rather than candidate-scoped.
+    multi_agent_version: Optional[Literal["v1", "v2"]] = None
     # CFG-007: optional TUI-dispatch rules for logical aliases like sota.
     dispatch: Optional[DispatchConfig] = None
 
