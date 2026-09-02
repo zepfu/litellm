@@ -1963,12 +1963,38 @@ _get_anthropic_adapter_openrouter_target_base = _wave6b_openrouter_runtime._get_
 # Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
 
 
-def _codex_native_openai_candidate_unavailable_detail(__exc, *__, **___):
-    return _wave6b_common._codex_native_openai_candidate_unavailable_detail(__exc, runtime=_wave6b_common_live_runtime())
+def _codex_native_openai_candidate_unavailable_detail(
+    __exc,
+    *__,
+    target_url=None,
+    custom_llm_provider=None,
+    provider_returned=False,
+    **___,
+):
+    return _wave6b_common._codex_native_openai_candidate_unavailable_detail(
+        __exc,
+        runtime=_wave6b_common_live_runtime(),
+        target_url=target_url,
+        custom_llm_provider=custom_llm_provider,
+        provider_returned=provider_returned,
+    )
 
 
-def _raise_codex_native_openai_auto_agent_candidate_unavailable(__exc, *__, **___):
-    return _wave6b_common._raise_codex_native_openai_auto_agent_candidate_unavailable(__exc, runtime=_wave6b_common_live_runtime())
+def _raise_codex_native_openai_auto_agent_candidate_unavailable(
+    __exc,
+    *__,
+    target_url=None,
+    custom_llm_provider=None,
+    provider_returned=False,
+    **___,
+):
+    return _wave6b_common._raise_codex_native_openai_auto_agent_candidate_unavailable(
+        __exc,
+        runtime=_wave6b_common_live_runtime(),
+        target_url=target_url,
+        custom_llm_provider=custom_llm_provider,
+        provider_returned=provider_returned,
+    )
 
 
 def _grok_native_candidate_unavailable_detail(__exc, *__, **___):

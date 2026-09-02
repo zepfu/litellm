@@ -6383,6 +6383,11 @@ class TestPassThroughTerminalFailureLogging:
 
         assert exc_info.value.code == "400"
         mock_exception.assert_not_called()
+        assert getattr(exc_info.value, "_aawm_provider_returned", False) is True
+        assert "model_not_found" in str(exc_info.value.detail)
+        assert "aawm_codex_auto_agent_candidate_unavailable" not in str(
+            exc_info.value.detail
+        )
         warning_call = next(
             call
             for call in mock_warning.call_args_list

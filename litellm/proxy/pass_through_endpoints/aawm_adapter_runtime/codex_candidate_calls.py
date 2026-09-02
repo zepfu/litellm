@@ -691,7 +691,10 @@ if TYPE_CHECKING:
         *,
         request_body: Any = None,
     ) -> Response: ...
-    def _codex_native_openai_candidate_unavailable_detail(exc: Any) -> Optional[str]: ...
+    def _codex_native_openai_candidate_unavailable_detail(
+        exc: Any,
+        **kwargs: Any,
+    ) -> Optional[str]: ...
     async def _collect_responses_response_from_stream(response: Any, **kwargs: Any) -> dict[str, Any]: ...
     def _decode_http_response_body(body: Any) -> str: ...
     async def _dispatch_auto_agent_alias_candidate_request(**kwargs: Any) -> Response: ...
@@ -723,7 +726,10 @@ if TYPE_CHECKING:
     def _raise_codex_auto_agent_empty_success_response(**kwargs: Any) -> Any: ...
     def _raise_codex_auto_agent_failed_responses_payload(**kwargs: Any) -> Any: ...
     def _raise_codex_auto_agent_malformed_tool_call_text_payload(**kwargs: Any) -> Any: ...
-    def _raise_codex_native_openai_auto_agent_candidate_unavailable(exc: Exception) -> Any: ...
+    def _raise_codex_native_openai_auto_agent_candidate_unavailable(
+        exc: Exception,
+        **kwargs: Any,
+    ) -> Any: ...
     def _raise_grok_native_auto_agent_candidate_unavailable(exc: Exception) -> Any: ...
     def _raise_opencode_zen_auto_agent_candidate_unavailable(exc: Exception) -> Any: ...
     def _raise_xai_oauth_auto_agent_candidate_unavailable(exc: Exception) -> Any: ...
@@ -4109,8 +4115,20 @@ async def _perform_codex_auto_agent_native_openai_request(
             caller_managed_hidden_retry=False,
         )
     except Exception as exc:
-        if _codex_native_openai_candidate_unavailable_detail(exc) is not None:
-            _raise_codex_native_openai_auto_agent_candidate_unavailable(exc)
+        provider_returned = bool(getattr(exc, "_aawm_provider_returned", False))
+        native_openai_error_context = {
+            "target_url": target_url,
+            "custom_llm_provider": litellm.LlmProviders.OPENAI.value,
+            "provider_returned": provider_returned,
+        }
+        if _codex_native_openai_candidate_unavailable_detail(
+            exc,
+            **native_openai_error_context,
+        ) is not None:
+            _raise_codex_native_openai_auto_agent_candidate_unavailable(
+                exc,
+                **native_openai_error_context,
+            )
         raise
 
 

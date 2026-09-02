@@ -6,9 +6,13 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable, Never, Optional
 
+import httpx
 from fastapi import HTTPException
 
 from litellm.proxy._types import ProxyException
+from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.openai import (
+    _is_known_openai_model_not_found_response,
+)
 
 
 @dataclass(frozen=True)
@@ -198,10 +202,11 @@ def _codex_native_openai_candidate_unavailable_detail(
     exc: Any,
     *,
     runtime: Runtime,
+    target_url: Any = None,
+    custom_llm_provider: Optional[str] = None,
+    provider_returned: bool = False,
 ) -> Optional[str]:
     status_code = runtime.extract_status_code(exc)
-    if status_code != 400:
-        return None
     detail = runtime.extract_detail(exc)
     if isinstance(detail, bytes):
         detail_text = detail.decode("utf-8", errors="ignore")
@@ -211,6 +216,30 @@ def _codex_native_openai_candidate_unavailable_detail(
         detail_text = str(detail)
     else:
         detail_text = str(exc)
+
+    if provider_returned and target_url is not None:
+        try:
+            classifier_url = (
+                target_url
+                if isinstance(target_url, httpx.URL)
+                else httpx.URL(str(target_url))
+            )
+        except (TypeError, ValueError):
+            classifier_url = None
+        if (
+            classifier_url is not None
+            and classifier_url.path.rstrip("/").lower().endswith("/responses")
+            and _is_known_openai_model_not_found_response(
+                url=classifier_url,
+                custom_llm_provider=custom_llm_provider,
+                status_code=status_code,
+                exc=exc,
+            )
+        ):
+            return detail_text
+
+    if status_code != 400:
+        return None
     normalized = detail_text.lower()
     if (
         "not supported when using codex with a chatgpt account"
@@ -229,11 +258,17 @@ def _raise_codex_native_openai_auto_agent_candidate_unavailable(
     exc: Exception,
     *,
     runtime: Runtime,
+    target_url: Any = None,
+    custom_llm_provider: Optional[str] = None,
+    provider_returned: bool = False,
 ) -> Never:
     detail = (
         _codex_native_openai_candidate_unavailable_detail(
             exc,
             runtime=runtime,
+            target_url=target_url,
+            custom_llm_provider=custom_llm_provider,
+            provider_returned=provider_returned,
         )
         or str(exc)
     )
