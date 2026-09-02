@@ -2373,9 +2373,14 @@ def _build_spawn_agent_arguments(
     readonly_present: bool,
 ) -> tuple[str, Dict[str, Any]]:
     if definition is None:
-        raise CursorConnectProtocolError(
-            "Cursor Agent subagent operation requires an advertised spawn_agent tool."
-        )
+        arguments: Dict[str, Any] = {
+            "agent_type": subagent_type,
+            "model": model_id,
+            "message": prompt,
+        }
+        if readonly_present:
+            arguments["readonly"] = readonly
+        return _SPAWN_AGENT_TOOL_NAME, arguments
     tool_name, properties, required = _spawn_agent_schema_parts(definition)
     arguments: Dict[str, Any] = {}
     for field_name, expected_type, value in (

@@ -557,21 +557,35 @@ def test_cursor_subagent_requires_unambiguous_advertised_spawn_agent() -> None:
     assert "subagent-call" not in exc_info.value.message
 
 
-def test_cursor_subagent_requires_advertised_spawn_agent() -> None:
+def test_cursor_subagent_without_advertised_spawn_agent_uses_canonical_arguments() -> None:
     external_exec_requests: list[dict[str, Any]] = []
 
-    with pytest.raises(
-        CursorConnectProtocolError,
-        match="advertised spawn_agent",
-    ) as exc_info:
-        cursor_connect._process_agent_server_message(
-            _cursor_subagent_server_message(_cursor_subagent_args()),
-            {},
-            external_exec_requests=external_exec_requests,
-        )
+    normalized, client_messages = cursor_connect._process_agent_server_message(
+        _cursor_subagent_server_message(_cursor_subagent_args()),
+        {},
+        external_exec_requests=external_exec_requests,
+    )
 
-    assert external_exec_requests == []
-    assert "Inspect the requested files" not in exc_info.value.message
+    tool_call = normalized["interactionUpdate"]["toolCallCompleted"]
+    assert tool_call["callId"] == "subagent-call"
+    assert tool_call["toolName"] == "spawn_agent"
+    assert json.loads(tool_call["argsJson"]) == {
+        "agent_type": "explorer",
+        "model": "read",
+        "message": "Inspect the requested files without changing them.",
+    }
+    assert client_messages == []
+    assert len(external_exec_requests) == 1
+    request = external_exec_requests[0]
+    assert request["call_id"] == "subagent-call"
+    assert request["message_field"] == 28
+    assert request["request_id"] == 314
+    assert request["exec_id"] == "exec-014"
+    assert request["tool_call_id"] == "subagent-call"
+    assert request["exec_fields"] == [
+        (1, 0, 314),
+        (15, 2, b"exec-014"),
+    ]
 
 
 @pytest.mark.parametrize(
