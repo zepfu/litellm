@@ -649,7 +649,10 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 response_body,
                 request_body=request_body,
             )
-            if adapter == "codex_auto_agent_grok_native_responses"
+            if adapter in {
+                "codex_auto_agent_grok_native_responses",
+                "codex_auto_agent_xai_oauth_responses",
+            }
             else None
         )
         if isinstance(repaired_body, dict):
@@ -765,7 +768,10 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                     response_body,
                     request_body=request_body,
                 )
-                if adapter == "codex_auto_agent_grok_native_responses"
+                if adapter in {
+                    "codex_auto_agent_grok_native_responses",
+                    "codex_auto_agent_xai_oauth_responses",
+                }
                 else None
             )
             if isinstance(repaired_body, dict):
