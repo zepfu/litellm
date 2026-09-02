@@ -272,6 +272,34 @@ def test_cursor_subagent_args_map_to_advertised_spawn_agent() -> None:
     ]
 
 
+def test_cursor_subagent_without_outer_identity_preserves_tool_call_id() -> None:
+    external_exec_requests: list[dict[str, Any]] = []
+
+    normalized, client_messages = cursor_connect._process_agent_server_message(
+        _cursor_subagent_server_message(
+            _cursor_subagent_args(),
+            request_id=0,
+            exec_id="",
+        ),
+        {},
+        spawn_agent_tool_definition=_advertised_spawn_agent_definition(),
+        external_exec_requests=external_exec_requests,
+    )
+
+    tool_call = normalized["interactionUpdate"]["toolCallCompleted"]
+    assert tool_call["callId"] == "subagent-call"
+    assert client_messages == []
+    assert len(external_exec_requests) == 1
+    request = external_exec_requests[0]
+    assert request["request_id"] == 0
+    assert request["exec_id"] == ""
+    assert request["tool_call_id"] == "subagent-call"
+    assert request["exec_fields"] == [
+        (1, 0, 0),
+        (15, 2, b""),
+    ]
+
+
 @pytest.mark.parametrize(
     ("ignored_fields", "secrets"),
     [
@@ -873,6 +901,71 @@ def test_cursor_subagent_result_encodes_success_and_error_with_identity() -> Non
             1,
             wire_type=2,
         ) is not None
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        json.dumps(
+            {
+                "agent_id": "child-agent",
+                "final_message": "Child completed.",
+            }
+        ),
+        json.dumps(
+            {
+                "agent_id": "child-agent",
+                "error": "Child failed.",
+            }
+        ),
+    ],
+    ids=["success", "error"],
+)
+def test_cursor_subagent_result_encodes_without_invented_identity(
+    output: str,
+) -> None:
+    messages = cursor_connect._encode_subagent_terminal_result(
+        {
+            "exec_fields": [],
+        },
+        output,
+    )
+
+    exec_client_message = cursor_connect._proto_last_field(
+        cursor_connect._decode_proto_fields(messages[0]),
+        2,
+        wire_type=2,
+    )
+    assert isinstance(exec_client_message, bytes)
+    exec_client_fields = cursor_connect._decode_proto_fields(exec_client_message)
+    assert cursor_connect._proto_last_field(
+        exec_client_fields,
+        1,
+        wire_type=0,
+    ) is None
+    assert cursor_connect._proto_last_field(
+        exec_client_fields,
+        15,
+        wire_type=2,
+    ) is None
+    assert cursor_connect._proto_last_field(
+        exec_client_fields,
+        28,
+        wire_type=2,
+    ) is not None
+
+    exec_client_control = cursor_connect._proto_last_field(
+        cursor_connect._decode_proto_fields(messages[1]),
+        5,
+        wire_type=2,
+    )
+    assert isinstance(exec_client_control, bytes)
+    stream_close = cursor_connect._proto_last_field(
+        cursor_connect._decode_proto_fields(exec_client_control),
+        1,
+        wire_type=2,
+    )
+    assert stream_close == b""
 
 
 class _CountingRetainedSession:

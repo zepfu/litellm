@@ -2494,11 +2494,6 @@ def _decode_subagent_request(
         readonly = bool(value)
 
     request_id, exec_id = _exec_request_identity(exec_fields)
-    if not request_id and not exec_id:
-        raise CursorConnectProtocolError(
-            "Cursor Agent subagent operation does not contain a replayable "
-            "request identity."
-        )
     tool_name, arguments = _build_spawn_agent_arguments(
         spawn_agent_tool_definition,
         subagent_type=subagent_type,
