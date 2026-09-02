@@ -2760,6 +2760,282 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
 
 
 @pytest.mark.asyncio
+async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failover(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.llms.cursor_agent.connect import CursorConnectError
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        codex_candidate_calls,
+    )
+
+    cursor_candidate = {
+        "provider": "cursor_agent",
+        "model": "cursor_agent/cursor-grok-4.6-high",
+        "route_family": "codex_cursor_agent_aiserver_adapter",
+    }
+    native_xai_candidate = {
+        "provider": "xai",
+        "model": "xai/grok-4.6",
+        "route_family": "codex_xai_oauth_responses_adapter",
+    }
+    managed_xai_candidate = {
+        "provider": "oa_xai",
+        "model": "oa_xai/grok-4.6",
+        "route_family": "codex_xai_oauth_responses_adapter",
+    }
+    selections = [
+        {
+            "candidate": cursor_candidate,
+            "lane_key": "cursor_agent_cli",
+            "cooldown_key": "cursor_agent:cursor-grok-4.6-high",
+            "selection_reason": "first_available",
+            "has_account_bound_state": True,
+            "in_flight_session": True,
+        },
+        {
+            "candidate": native_xai_candidate,
+            "lane_key": "xai_native",
+            "cooldown_key": "xai:grok-4.6",
+            "selection_reason": "next_available",
+            "has_account_bound_state": True,
+            "in_flight_session": True,
+        },
+        {
+            "candidate": managed_xai_candidate,
+            "lane_key": "xai_managed",
+            "cooldown_key": "oa_xai:grok-4.6",
+            "selection_reason": "next_available",
+            "has_account_bound_state": True,
+            "in_flight_session": True,
+        },
+    ]
+    prepared_body = {
+        "model": "work",
+        "previous_response_id": "cursor-unretained",
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "exec_command"},
+            }
+        ],
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": "Complete the original assignment in /workspace.",
+            },
+            {
+                "type": "function_call",
+                "call_id": "pwd-call",
+                "name": "exec_command",
+                "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "pwd-call",
+                "output": "/workspace",
+            },
+        ],
+    }
+    rebuilt_request_body = dict(prepared_body)
+    rebuilt_request_body.pop("previous_response_id")
+    replay_safe_classifier = (
+        session_affinity.is_replay_safe_session_owner_redispatch_body
+    )
+    assert replay_safe_classifier(rebuilt_request_body) is True
+
+    source_exc = CursorConnectError(
+        "Cursor retained session unavailable",
+        status_code=409,
+    )
+    setattr(
+        source_exc,
+        codex_candidate_calls._CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
+        True,
+    )
+    with pytest.raises(ProxyException) as mapped_exc_info:
+        codex_candidate_calls._raise_cursor_agent_alias_error(
+            exc=source_exc,
+            candidate=cursor_candidate,
+        )
+    mapped_exc = mapped_exc_info.value
+
+    routing_state = AliasRoutingStateManager()
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", routing_state)
+    selection_calls: list[dict[str, Any]] = []
+    provider_calls: list[str] = []
+    candidate_bodies: list[dict[str, Any]] = []
+    metadata_input_bodies: list[tuple[str, dict[str, Any]]] = []
+    classifier_calls: list[dict[str, Any]] = []
+    metadata_attempts: list[list[dict[str, Any]]] = []
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        selection_calls.append(kwargs)
+        if not selections:
+            raise AssertionError("candidate loop selected more than three candidates")
+        return dict(selections.pop(0))
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> object:
+        provider_calls.append(candidate["model"])
+        candidate_bodies.append(candidate_body)
+        if candidate["provider"] == "cursor_agent":
+            assert candidate_body["previous_response_id"] == "cursor-unretained"
+            raise mapped_exc
+        if candidate["provider"] == "xai":
+            raise HTTPException(
+                status_code=429,
+                detail={"error": {"code": "rate_limit_exceeded"}},
+            )
+        assert "previous_response_id" not in candidate_body
+        assert replay_safe_classifier(candidate_body) is True
+        return {"candidate": candidate["model"]}
+
+    async def _no_active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _owner_guard(**_kwargs: Any) -> object:
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(self, _lease: object) -> None:
+            return None
+
+    def _classify_rebuilt_request(body: dict[str, Any]) -> bool:
+        classifier_calls.append(body)
+        return replay_safe_classifier(body)
+
+    def _add_candidate_metadata(
+        body: dict[str, Any],
+        *,
+        selection: dict[str, Any],
+        attempts: list[dict[str, Any]],
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        metadata_input_bodies.append(
+            (str(selection["candidate"]["provider"]), body)
+        )
+        metadata_attempts.append(attempts)
+        rebuilt = dict(body)
+        rebuilt["model"] = selection["candidate"]["model"]
+        return rebuilt
+
+    session_affinity_seam = SimpleNamespace(
+        is_replay_safe_session_owner_redispatch_body=_classify_rebuilt_request,
+        resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
+        get_request_codex_auto_review_parent_session_identity=lambda _request: None,
+        build_session_owner_attributes=lambda **_kwargs: {},
+        ensure_session_owner_guard_for_request=_owner_guard,
+        get_request_session_owner_lease=lambda _request: None,
+        finalize_session_owner_lease_on_success=_noop_async,
+        finalize_session_owner_lease_on_failure=_noop_async,
+        reset_released_request_session_owner_guard=lambda _request: False,
+        SessionOwnerMutationOutcome=SimpleNamespace(
+            CONFLICT="conflict",
+            ERROR="error",
+            NOT_HELD="not_held",
+        ),
+    )
+
+    def _unexpected_side_effect(**_kwargs: Any) -> None:
+        raise AssertionError("this regression must not publish or redispatch")
+
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: session_affinity_seam,
+    )
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(lpe, "_record_codex_failure_evidence", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        lpe,
+        "_plan_codex_oauth_account_failover",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_exclude_codex_auto_agent_request_local_candidate_without_cooldown",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "execute_cooldown_publication_transaction",
+        _unexpected_side_effect,
+    )
+
+    response = await candidate_loop.handle_alias_route(
+        SimpleNamespace(
+            select_candidate_fn=_select,
+            perform_candidate_request_fn=_perform,
+            resolve_cooldown_publication_fn=lambda **_kwargs: (
+                candidate_loop.CooldownPublicationPlan()
+            ),
+            publish_cooldown_memory_fn=_unexpected_side_effect,
+            persist_cooldown_fn=_unexpected_side_effect,
+            set_session_affinity_fn=_noop_async,
+            add_alias_metadata_fn=_add_candidate_metadata,
+            raise_redispatch_fn=_unexpected_side_effect,
+        ),
+        alias_family="codex_auto_agent",
+        alias_model="work",
+        request=SimpleNamespace(state=SimpleNamespace()),
+        prepared_request_body=prepared_body,
+        max_candidate_attempts=2,
+        get_active_cooldown_state_fn=_no_active_cooldown,
+        attempts_metadata_key="attempts",
+        skipped_candidates_metadata_key="skipped",
+        no_candidate_detail="no candidates",
+        log_label="Codex",
+    )
+
+    assert response == {"candidate": managed_xai_candidate["model"]}
+    assert provider_calls == [
+        cursor_candidate["model"],
+        native_xai_candidate["model"],
+        managed_xai_candidate["model"],
+    ]
+    assert len(selection_calls) == 3
+    assert selection_calls[0]["excluded_candidate_keys"] == frozenset()
+    assert selection_calls[1]["excluded_candidate_keys"] == frozenset(
+        {"cursor_agent:cursor-grok-4.6-high"}
+    )
+    assert selection_calls[2]["excluded_candidate_keys"] == frozenset(
+        {"cursor_agent:cursor-grok-4.6-high"}
+    )
+    assert candidate_bodies[0]["previous_response_id"] == "cursor-unretained"
+    assert all(
+        "previous_response_id" not in body for body in candidate_bodies[1:]
+    )
+    assert classifier_calls[0] is prepared_body
+    assert classifier_calls[1] == rebuilt_request_body
+    assert metadata_input_bodies[0][1] is prepared_body
+    assert metadata_attempts
+    assert all(captured is metadata_attempts[0] for captured in metadata_attempts)
+    attempts = metadata_attempts[-1]
+    assert attempts[0]["status"] == "candidate_ineligible_no_cooldown"
+    assert attempts[0]["attempted_provider_call"] is False
+    assert attempts[0]["cooldown_scope"] == "none"
+    assert "cooldown_seconds" not in attempts[0]
+    assert attempts[1]["error_class"] == "rate_limited"
+    assert routing_state.codex.cooldown_until_monotonic_by_key == {}
+    assert routing_state.codex.candidate_semantic_ineligibility_by_key == {}
+
+
+@pytest.mark.asyncio
 async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_and_terminal_audit(  # noqa: PLR0915
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

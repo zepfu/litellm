@@ -1934,6 +1934,10 @@ async def handle_alias_route(  # noqa: PLR0915
                             if replay_safety is not None
                             else True
                         )
+                        provider_candidate_attempts = max(
+                            0,
+                            provider_candidate_attempts - 1,
+                        )
                         deterministically_ineligible_candidate_keys.add(cooldown_key)
                         last_retryable_exc = failure_exc
                         break
