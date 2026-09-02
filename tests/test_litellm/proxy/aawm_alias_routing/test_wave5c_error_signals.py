@@ -1183,6 +1183,25 @@ class TestClassification:
             == "candidate_unavailable"
         )
 
+    def test_unmarked_local_proxy_exception_is_not_provider_attributed(self) -> None:
+        exc = ProxyException(
+            message="No endpoints found for this model",
+            type="invalid_request_error",
+            param="model",
+            code=404,
+        )
+        exc.detail = {"error": {"message": "No endpoints found for this model"}}
+
+        assert getattr(exc, "_aawm_provider_returned", False) is not True
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=_OPENROUTER_COMPLETION_CANDIDATE,
+                attempted_provider_call=True,
+            )
+            is None
+        )
+
     def test_openrouter_retired_model_is_candidate_unavailable(self) -> None:
         exc = _FakeExc(
             message="OpenRouter request failed",
