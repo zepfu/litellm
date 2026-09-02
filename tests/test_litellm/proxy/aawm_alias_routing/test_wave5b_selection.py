@@ -25,6 +25,8 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+    CODEX_AUTO_AGENT_NVIDIA_LANE_KEY,
+    CODEX_AUTO_AGENT_NVIDIA_PROVIDER,
     CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
@@ -58,6 +60,19 @@ def _candidate(provider: str = "openai", model: str = "gpt-4o", last_resort: boo
         "model": model,
         "route_family": f"{provider}_responses_adapter",
         "last_resort": last_resort,
+    }
+
+
+def _nvidia_candidate(model: str) -> dict[str, Any]:
+    return {
+        "provider": CODEX_AUTO_AGENT_NVIDIA_PROVIDER,
+        "model": model,
+        "route_family": "codex_nvidia_completion_adapter",
+        "last_resort": False,
+        "cooldown_identity_tag": (
+            f"alias:basic:{CODEX_AUTO_AGENT_NVIDIA_PROVIDER}:{model}:"
+            "codex_nvidia_completion_adapter"
+        ),
     }
 
 
@@ -697,6 +712,81 @@ class TestCodexSelectorFirstChoice:
             )
             is None
         )
+
+    @pytest.mark.asyncio
+    async def test_nvidia_candidate_cooldown_traverses_and_recovers_after_expiry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        clock = [100.0]
+        monkeypatch.setattr(selection.time, "monotonic", lambda: clock[0])
+        manager = AliasRoutingStateManager()
+        _set_selection_runtime_value("alias_routing_state", manager, monkeypatch)
+        _set_selection_runtime_value(
+            "_codex_auto_agent_candidate_key",
+            lambda candidate, lane_key, cooldown_identity_tag=None: (
+                lane_keys._codex_auto_agent_candidate_key(
+                    candidate,
+                    lane_key,
+                    cooldown_identity_tag=cooldown_identity_tag,
+                )
+            ),
+            monkeypatch,
+        )
+        first = _nvidia_candidate("nvidia/acme/future-model")
+        second = _nvidia_candidate("nvidia/acme/backup-model")
+        _set_selection_candidates((first, second))
+
+        async def _manager_cooldown_state(key: str) -> tuple[float, str]:
+            remaining = manager.codex.get_memory_cooldown_remaining(key)
+            return (
+                remaining,
+                "memory" if remaining > 0 else "local_fallback",
+            )
+
+        _set_selection_runtime_value(
+            "_get_codex_active_cooldown_state",
+            _manager_cooldown_state,
+            monkeypatch,
+        )
+        first_key = lane_keys._codex_auto_agent_candidate_key(
+            first,
+            CODEX_AUTO_AGENT_NVIDIA_LANE_KEY,
+            cooldown_identity_tag=first["cooldown_identity_tag"],
+        )
+        second_key = lane_keys._codex_auto_agent_candidate_key(
+            second,
+            CODEX_AUTO_AGENT_NVIDIA_LANE_KEY,
+            cooldown_identity_tag=second["cooldown_identity_tag"],
+        )
+        assert first_key == (
+            "halias:basic:nvidia:nvidia/acme/future-model:"
+            "codex_nvidia_completion_adapter:nvidia:"
+            "nvidia/acme/future-model:nvidia_nim"
+        )
+        assert second_key != first_key
+        assert CODEX_AUTO_AGENT_NVIDIA_LANE_KEY == "nvidia_nim"
+        manager.codex.set_cooldown_memory(first_key, 10.0)
+
+        cooled = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body={"model": "basic"},
+        )
+
+        assert cooled["candidate"]["model"] == second["model"]
+        assert cooled["skipped"][0]["model"] == first["model"]
+        assert cooled["skipped"][0]["lane_key"] == CODEX_AUTO_AGENT_NVIDIA_LANE_KEY
+        assert cooled["skipped"][0]["cooldown_seconds"] > 9.0
+
+        clock[0] = 111.0
+        recovered = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body={"model": "basic"},
+        )
+
+        assert recovered["candidate"]["model"] == first["model"]
+        assert recovered["skipped"] == []
+        assert manager.codex.get_memory_cooldown_remaining(first_key) == 0.0
 
     @pytest.mark.asyncio
     async def test_semantic_marker_progresses_fresh_selection_in_compiled_order(

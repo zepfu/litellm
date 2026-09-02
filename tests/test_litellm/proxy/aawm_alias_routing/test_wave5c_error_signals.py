@@ -32,6 +32,8 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTED_ERROR_CLASS,
     CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_COOLDOWN_SECONDS,
     CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS,
+    CODEX_AUTO_AGENT_NVIDIA_PROVIDER,
+    normalize_nvidia_completion_adapter_model_name,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals import (
     _add_codex_auto_agent_text_error_tokens,
@@ -64,6 +66,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals impor
     _is_codex_auto_agent_transient_internal_error_class,
     _is_codex_auto_agent_xai_candidate,
     _is_codex_auto_agent_xai_model_unavailable_response,
+    _is_nvidia_completion_adapter_model_unavailable_response,
     _is_kimi_code_auto_agent_candidate,
     _iter_codex_auto_agent_error_blocks,
     _parse_codex_auto_agent_header_wait_seconds,
@@ -278,6 +281,39 @@ def _alibaba_model_error(
         error["code"] = code
     return _FakeExc(
         detail={"error": error},
+        status_code=status_code,
+        _aawm_provider_returned=provider_returned,
+    )
+
+
+def _nvidia_candidate(
+    model: str = "nvidia/acme/future-model",
+    *,
+    route_family: str = "codex_nvidia_completion_adapter",
+) -> dict[str, Any]:
+    return {
+        "provider": CODEX_AUTO_AGENT_NVIDIA_PROVIDER,
+        "model": model,
+        "route_family": route_family,
+    }
+
+
+def _nvidia_model_error(
+    *,
+    status_code: int,
+    message: str = "The model 'acme/future-model' does not exist",
+    detail: Any = None,
+    provider_returned: bool = True,
+) -> _FakeExc:
+    if detail is None:
+        detail = {
+            "error": {
+                "type": "invalid_request_error",
+                "message": message,
+            }
+        }
+    return _FakeExc(
+        detail=detail,
         status_code=status_code,
         _aawm_provider_returned=provider_returned,
     )
@@ -545,6 +581,250 @@ class TestAlibabaTokenPlanExhaustion:
 
         assert ttl == CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_BASE_COOLDOWN_SECONDS + jitter
         assert 7200.0 <= ttl <= 10800.0
+
+
+class TestNvidiaModelUnavailable:
+    @pytest.mark.parametrize(
+        ("status_code", "message"),
+        [
+            (400, "The model 'acme/future-model' does not exist"),
+            (404, "The model 'nvidia/acme/future-model' does not exist"),
+        ],
+    )
+    def test_exact_provider_model_error_is_candidate_unavailable(
+        self,
+        status_code: int,
+        message: str,
+    ) -> None:
+        candidate = _nvidia_candidate()
+        exc = _nvidia_model_error(status_code=status_code, message=message)
+
+        assert (
+            _is_nvidia_completion_adapter_model_unavailable_response(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=True,
+            )
+            is True
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=True,
+            )
+            == "candidate_unavailable"
+        )
+        assert (
+            _get_codex_auto_agent_candidate_cooldown_scope(
+                "candidate_unavailable",
+                candidate=candidate,
+            )
+            == "candidate"
+        )
+
+    @pytest.mark.parametrize(
+        "model",
+        (
+            "nvidia/acme/future-model",
+            "nvidia/deepseek-ai/deepseek-v3.2",
+        ),
+    )
+    def test_explicit_nvidia_model_ids_remain_eligible(self, model: str) -> None:
+        assert normalize_nvidia_completion_adapter_model_name(model) == model
+        model_id = model.split("/", 1)[1]
+        exc = _nvidia_model_error(
+            status_code=404,
+            message=f"The model '{model_id}' does not exist",
+        )
+
+        assert _is_nvidia_completion_adapter_model_unavailable_response(
+            exc,
+            candidate=_nvidia_candidate(model),
+        )
+
+    @pytest.mark.parametrize(
+        ("candidate", "status_code", "detail"),
+        [
+            pytest.param(
+                _nvidia_candidate(),
+                404,
+                "404 page not found",
+                id="bare-404",
+            ),
+            pytest.param(
+                _nvidia_candidate(),
+                404,
+                {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Endpoint not found",
+                    }
+                },
+                id="wrong-endpoint-base",
+            ),
+            pytest.param(
+                _nvidia_candidate(
+                    route_family="codex_openrouter_completion_adapter"
+                ),
+                404,
+                {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": (
+                            "The model 'nvidia/acme/future-model' does not exist"
+                        ),
+                    }
+                },
+                id="wrong-route-family",
+            ),
+            pytest.param(
+                _nvidia_candidate(),
+                401,
+                {
+                    "error": {
+                        "type": "authentication_error",
+                        "message": "Invalid API key",
+                    }
+                },
+                id="auth",
+            ),
+            pytest.param(
+                _nvidia_candidate(),
+                400,
+                {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Invalid request payload",
+                    }
+                },
+                id="payload",
+            ),
+            pytest.param(
+                _nvidia_candidate(),
+                404,
+                {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Resource not found",
+                    }
+                },
+                id="generic-404",
+            ),
+            pytest.param(
+                _nvidia_candidate(),
+                400,
+                {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Bad request",
+                    }
+                },
+                id="generic-400",
+            ),
+            pytest.param(
+                _nvidia_candidate(),
+                429,
+                {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": (
+                            "The model 'nvidia/acme/future-model' does not exist"
+                        ),
+                    }
+                },
+                id="unaccepted-status",
+            ),
+        ],
+    )
+    def test_non_model_nvidia_failures_do_not_cool_candidate(
+        self,
+        candidate: dict[str, Any],
+        status_code: int,
+        detail: Any,
+    ) -> None:
+        exc = _nvidia_model_error(
+            status_code=status_code,
+            detail=detail,
+        )
+
+        assert (
+            _is_nvidia_completion_adapter_model_unavailable_response(
+                exc,
+                candidate=candidate,
+            )
+            is False
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=candidate,
+            )
+            != "candidate_unavailable"
+        )
+
+    def test_model_error_requires_attempt_and_provider_return_marker(self) -> None:
+        candidate = _nvidia_candidate()
+        exc = _nvidia_model_error(status_code=404)
+
+        assert (
+            _is_nvidia_completion_adapter_model_unavailable_response(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=False,
+            )
+            is False
+        )
+
+        unmarked = _nvidia_model_error(
+            status_code=404,
+            provider_returned=False,
+        )
+        assert (
+            _is_nvidia_completion_adapter_model_unavailable_response(
+                unmarked,
+                candidate=candidate,
+                attempted_provider_call=True,
+            )
+            is False
+        )
+
+    def test_native_litellm_provider_body_is_model_bound(self) -> None:
+        candidate = _nvidia_candidate()
+        exc = _FakeExc(
+            body={
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "The model 'acme/future-model' does not exist",
+                }
+            },
+            llm_provider="nvidia_nim",
+            status_code=404,
+        )
+
+        assert (
+            _is_nvidia_completion_adapter_model_unavailable_response(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=True,
+            )
+            is True
+        )
+
+    def test_model_error_must_name_selected_model(self) -> None:
+        candidate = _nvidia_candidate()
+        exc = _nvidia_model_error(
+            status_code=404,
+            message="The model 'nvidia/acme/other-model' does not exist",
+        )
+
+        assert (
+            _is_nvidia_completion_adapter_model_unavailable_response(
+                exc,
+                candidate=candidate,
+            )
+            is False
+        )
 
 
 # ---------------------------------------------------------------------------
