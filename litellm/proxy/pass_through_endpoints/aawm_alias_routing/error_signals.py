@@ -384,6 +384,17 @@ class _OpenRouterErrorShapeRuntime:
 
 
 _OPENROUTER_ERROR_SHAPE_RUNTIME = _OpenRouterErrorShapeRuntime()
+_OPENROUTER_NO_ENDPOINTS_MESSAGE = "no endpoints found for this model"
+_OPENROUTER_RETIRED_MODEL_NAMES = frozenset(
+    {
+        "stealth/ox-alpha",
+        "openrouter/stealth/ox-alpha",
+    }
+)
+_OPENROUTER_RETIRED_MODEL_MESSAGE = (
+    "thank you for participating in the stealth ox alpha testing period. "
+    "this model was zai's glm-5.3 flash."
+)
 
 
 def _extract_openrouter_adapter_raw_message(exc: Any) -> Optional[str]:
@@ -405,6 +416,77 @@ def _is_openrouter_adapter_provider_raw_error(exc: Any) -> bool:
     return _openrouter_error_shape.is_provider_raw_error(
         _OPENROUTER_ERROR_SHAPE_RUNTIME,
         exc,
+    )
+
+
+def _is_openrouter_adapter_retired_model_error(
+    exc: Any,
+    *,
+    candidate: dict[str, Any],
+    status_code: Optional[int],
+    raw_message: Optional[str],
+) -> bool:
+    if (
+        status_code != 404
+        or candidate.get("model") not in _OPENROUTER_RETIRED_MODEL_NAMES
+    ):
+        return False
+    combined_text = " ".join(
+        str(part)
+        for part in (
+            raw_message,
+            getattr(exc, "message", None),
+            getattr(exc, "detail", None),
+            str(exc),
+        )
+        if part is not None
+    ).casefold()
+    return _OPENROUTER_RETIRED_MODEL_MESSAGE in " ".join(combined_text.split())
+
+
+def _is_openrouter_adapter_model_unavailable_error(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]],
+    status_code: Optional[int],
+    attempted_provider_call: bool,
+) -> bool:
+    """Match only captured provider-owned OpenRouter model-unavailable shapes."""
+    if (
+        not attempted_provider_call
+        or not isinstance(candidate, dict)
+        or candidate.get("provider") != _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
+        or candidate.get("route_family") != "codex_openrouter_completion_adapter"
+    ):
+        return False
+
+    from litellm.proxy._types import ProxyException
+
+    if not (
+        isinstance(exc, ProxyException)
+        or bool(getattr(exc, "_aawm_provider_returned", False))
+    ):
+        return False
+    if _is_openrouter_adapter_provider_raw_error(exc):
+        return False
+
+    raw_message = _extract_openrouter_adapter_raw_message(exc)
+    exact_messages = (
+        raw_message,
+        getattr(exc, "message", None),
+        str(exc),
+    )
+    if status_code in {400, 404} and any(
+        isinstance(message, str)
+        and " ".join(message.split()).casefold() == _OPENROUTER_NO_ENDPOINTS_MESSAGE
+        for message in exact_messages
+    ):
+        return True
+    return _is_openrouter_adapter_retired_model_error(
+        exc,
+        candidate=candidate,
+        status_code=status_code,
+        raw_message=raw_message,
     )
 
 
@@ -1557,6 +1639,13 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return "malformed_tool_call_text"
     if "safety_policy_denied" in tokens:
         return "safety_policy_denied"
+    if _is_openrouter_adapter_model_unavailable_error(
+        exc,
+        candidate=candidate,
+        status_code=status_code,
+        attempted_provider_call=attempted_provider_call,
+    ):
+        return "candidate_unavailable"
     if status_code == 429:
         return "rate_limited"
     from litellm.proxy._types import ProxyException
