@@ -2776,10 +2776,10 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
     native_xai_candidate = {
         "provider": "xai",
         "model": "xai/grok-4.6",
-        "route_family": "codex_xai_oauth_responses_adapter",
+        "route_family": "codex_grok_native_responses_adapter",
     }
     managed_xai_candidate = {
-        "provider": "oa_xai",
+        "provider": "xai",
         "model": "oa_xai/grok-4.6",
         "route_family": "codex_xai_oauth_responses_adapter",
     }
@@ -2885,7 +2885,7 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
         if candidate["provider"] == "cursor_agent":
             assert candidate_body["previous_response_id"] == "cursor-unretained"
             raise mapped_exc
-        if candidate["provider"] == "xai":
+        if candidate["model"] == "xai/grok-4.6":
             raise HTTPException(
                 status_code=429,
                 detail={"error": {"code": "rate_limit_exceeded"}},
