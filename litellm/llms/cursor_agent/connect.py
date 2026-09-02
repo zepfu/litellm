@@ -1287,6 +1287,24 @@ _SUBAGENT_PROHIBITED_FIELD_NAMES = {
     20: "cloud_base_branch",
     21: "model_parameters",
 }
+
+
+def _is_default_subagent_optional_field(
+    field_number: int,
+    wire_type: int,
+    value: Any,
+) -> bool:
+    return (
+        field_number == 7
+        and wire_type == 0
+        and value == 0
+    ) or (
+        field_number == 9
+        and wire_type == 2
+        and value == b""
+    )
+
+
 _SPAWN_AGENT_SCHEMA_FIELD_ALIASES = {
     "agent_type": frozenset({"agent_type", "subagent_type", "type"}),
     "model": frozenset({"model", "model_id"}),
@@ -2413,8 +2431,13 @@ def _decode_subagent_request(
     unsupported_fields = sorted(
         {
             field_number
-            for field_number, _wire_type, _value in args_fields
+            for field_number, wire_type, value in args_fields
             if field_number > 5
+            and not _is_default_subagent_optional_field(
+                field_number,
+                wire_type,
+                value,
+            )
         }
     )
     if unsupported_fields:
