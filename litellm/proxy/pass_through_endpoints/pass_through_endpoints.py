@@ -475,6 +475,7 @@ _AAWM_PASSTHROUGH_ERROR_LOG_REQUEST_SHAPE_KEYS = (
     "aawm_passthrough_json_egress_content_type_removed_value",
     "aawm_passthrough_body_container_type",
     "aawm_passthrough_body_top_level_keys",
+    "aawm_passthrough_previous_response_id_state",
     "aawm_passthrough_input_container_type",
     "aawm_passthrough_input_item_count",
     "aawm_passthrough_input_item_type_counts",
@@ -2198,6 +2199,7 @@ def _build_passthrough_request_shape_summary(
     summary_fields = (
         "aawm_passthrough_body_container_type",
         "aawm_passthrough_body_top_level_keys",
+        "aawm_passthrough_previous_response_id_state",
         "aawm_passthrough_input_container_type",
         "aawm_passthrough_input_item_count",
         "aawm_passthrough_input_item_type_counts",
@@ -2478,6 +2480,20 @@ def _merge_passthrough_request_shape_metadata(
         if key is not None and key != "litellm_logging_obj"
     ]
     metadata["aawm_passthrough_body_top_level_keys"] = top_level_keys[:40]
+
+    if "previous_response_id" not in body:
+        previous_response_id_state = "missing"
+    else:
+        previous_response_id = body.get("previous_response_id")
+        if previous_response_id is None:
+            previous_response_id_state = "null"
+        elif isinstance(previous_response_id, str) and not previous_response_id:
+            previous_response_id_state = "empty"
+        else:
+            previous_response_id_state = "nonempty"
+    metadata["aawm_passthrough_previous_response_id_state"] = (
+        previous_response_id_state
+    )
 
     input_value = body.get("input")
     metadata["aawm_passthrough_input_container_type"] = _passthrough_container_type(

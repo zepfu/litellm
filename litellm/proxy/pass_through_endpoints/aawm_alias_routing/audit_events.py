@@ -339,7 +339,7 @@ def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
         )
 
 
-def _emit_auto_agent_alias_no_candidate_event(
+def _emit_auto_agent_alias_no_candidate_event(  # noqa: PLR0915
     *,
     alias_family: str,
     alias_model: str,
@@ -348,6 +348,7 @@ def _emit_auto_agent_alias_no_candidate_event(
     exc: HTTPException,
     attempts: Optional[list[dict[str, Any]]] = None,
     traversal_budget_exhausted: bool = False,
+    extra_fields: Optional[Mapping[str, Any]] = None,
 ) -> None:
     assert _get_auto_agent_alias_request_context is not None
     assert _attach_auto_agent_alias_terminal_context_fields is not None
@@ -443,6 +444,8 @@ def _emit_auto_agent_alias_no_candidate_event(
     event["fallback_result"] = "no_candidate_available"
     event["redispatch_required"] = False
     event["agent_session_killed"] = True
+    if extra_fields:
+        event.update(copy.deepcopy(dict(extra_fields)))
     try:
         from functools import partial
 

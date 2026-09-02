@@ -45,6 +45,7 @@ from litellm.proxy.pass_through_endpoints import success_handler
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     HttpPassThroughEndpointHelpers,
     _build_passthrough_input_item_shape_samples,
+    _build_passthrough_request_shape_summary,
     build_aawm_route_access_log_line,
     _build_passthrough_request_shape_failure_request_payload,
     _build_passthrough_error_log_context,
@@ -57,6 +58,7 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     _get_passthrough_hidden_retry_budget_seconds,
     _headers_for_json_passthrough_egress,
     _is_aawm_agent_identity_registered_in_litellm_callbacks,
+    _merge_passthrough_request_shape_metadata,
     _is_known_grok_billing_passthrough_timeout_cancel_response,
     _is_known_grok_personal_team_spending_limit_response,
     _get_passthrough_grok_personal_team_spending_limit_failure_kind,
@@ -386,6 +388,118 @@ def test_passthrough_input_item_shape_samples_capture_head_and_tail_without_valu
     assert secret_prompt not in serialized
     assert secret_arguments not in serialized
     assert "SECRET_OUTPUT" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("state", "body_update"),
+    [
+        ("missing", {}),
+        ("null", {"previous_response_id": None}),
+        ("empty", {"previous_response_id": ""}),
+        ("nonempty", {"previous_response_id": "resp-opaque-secret"}),
+    ],
+    ids=["missing", "null", "empty", "nonempty"],
+)
+def test_passthrough_request_shape_summary_distinguishes_previous_response_id_states(
+    state: str,
+    body_update: dict,
+) -> None:
+    secret_prompt = "PROMPT_VALUE_MUST_NOT_APPEAR"
+    secret_output = "OUTPUT_VALUE_MUST_NOT_APPEAR"
+    secret_tool_description = "TOOL_SCHEMA_MUST_NOT_APPEAR"
+    body = {
+        "model": "work",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": secret_prompt,
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-opaque-secret",
+                "output": secret_output,
+            },
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "name": "secret-tool",
+                "description": secret_tool_description,
+                "parameters": {"type": "object"},
+            },
+            {"type": "custom", "description": secret_tool_description},
+        ],
+    }
+    body.update(body_update)
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/openai_passthrough/v1/responses",
+            "headers": [],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
+    metadata: dict[str, object] = {}
+    _merge_passthrough_request_shape_metadata(
+        metadata,
+        request=request,
+        parsed_body=body,
+        provider_bound_body=body,
+    )
+
+    summary = _build_passthrough_request_shape_summary(metadata)
+
+    assert set(summary) == {
+        "body_container_type",
+        "body_top_level_keys",
+        "previous_response_id_state",
+        "input_container_type",
+        "input_item_count",
+        "input_item_type_counts",
+        "input_item_shape_samples",
+        "tool_count",
+        "tool_type_counts",
+    }
+    assert summary["previous_response_id_state"] == state
+    assert summary["body_container_type"] == "object"
+    assert summary["body_top_level_keys"] == (
+        ["input", "model", "tools"]
+        if state == "missing"
+        else ["input", "model", "previous_response_id", "tools"]
+    )
+    assert summary["input_container_type"] == "array"
+    assert summary["input_item_count"] == 2
+    assert summary["input_item_type_counts"] == {
+        "function_call_output": 1,
+        "message": 1,
+    }
+    assert summary["input_item_shape_samples"] == [
+        {
+            "index": 0,
+            "container_type": "object",
+            "type": "message",
+            "keys": ["content", "role", "type"],
+        },
+        {
+            "index": 1,
+            "container_type": "object",
+            "type": "function_call_output",
+            "keys": ["call_id", "output", "type"],
+        },
+    ]
+    assert summary["tool_count"] == 2
+    assert summary["tool_type_counts"] == {"custom": 1, "function": 1}
+
+    serialized = json.dumps(summary)
+    assert secret_prompt not in serialized
+    assert secret_output not in serialized
+    assert secret_tool_description not in serialized
+    assert "resp-opaque-secret" not in serialized
 
 
 def test_sanitize_passthrough_request_shape_error_preview_redacts_secrets():

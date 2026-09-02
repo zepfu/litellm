@@ -366,6 +366,7 @@ _AGENT_TERMINAL_ACTIVITY_SUMMARY_FIELDS = (
 _AGENT_TERMINAL_REQUEST_SHAPE_SUMMARY_FIELDS = (
     "body_container_type",
     "body_top_level_keys",
+    "previous_response_id_state",
     "input_container_type",
     "input_item_count",
     "input_item_type_counts",
