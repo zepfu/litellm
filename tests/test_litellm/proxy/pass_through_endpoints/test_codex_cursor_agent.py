@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse
 
@@ -163,6 +164,19 @@ def _replay_body(response_id: str = "resp-replay") -> dict[str, Any]:
             }
         ],
     }
+
+
+def _cursor_continuation_failure() -> CursorConnectError:
+    continuation_exc = CursorConnectError(
+        "missing retained session",
+        status_code=409,
+    )
+    setattr(
+        continuation_exc,
+        codex_candidate_calls._CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
+        True,
+    )
+    return continuation_exc
 
 
 def _stock_codex_full_history_body(
@@ -2139,6 +2153,149 @@ def test_cursor_fresh_replay_dispatch_rejects_unsafe_stock_codex_full_history(
         )
         is None
     )
+
+
+@pytest.mark.parametrize(
+    ("mutate_body", "expected_reason"),
+    [
+        (
+            lambda body: body["input"][2].update({"unexpected_key": "secret"}),
+            "item_key_set",
+        ),
+        (
+            lambda body: body["input"][0].update({"id": "msg_invalid"}),
+            "id_shape",
+        ),
+        (
+            lambda body: body["input"][2]["content"][0].update(
+                {"type": "output_text"}
+            ),
+            "content_part_type",
+        ),
+        (
+            lambda body: [
+                item.update({"content": [{"type": "input_text", "text": ""}]})
+                for item in body["input"]
+                if item.get("role") == "user"
+            ],
+            "empty_user_text",
+        ),
+        (
+            lambda body: body["input"][4].update({"arguments": "[]"}),
+            "arguments_not_object",
+        ),
+        (
+            lambda body: body["input"][5].update({"output": {"secret": "value"}}),
+            "output_not_string",
+        ),
+        (
+            lambda body: body["input"][5].update({"call_id": "unresolved"}),
+            "unresolved_call_id",
+        ),
+    ],
+    ids=[
+        "item-key-set",
+        "id-shape",
+        "content-part-type",
+        "empty-user-text",
+        "arguments-not-object",
+        "output-not-string",
+        "unresolved-call-id",
+    ],
+)
+def test_cursor_fresh_replay_dispatch_reports_stock_history_rejection_reason(
+    mutate_body: Any,
+    expected_reason: str,
+) -> None:
+    body = _stock_codex_full_history_body()
+    mutate_body(body)
+    rejection: dict[str, Any] = {}
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            body,
+            continuation_exc=_cursor_continuation_failure(),
+            rejection_diagnostic_out=rejection,
+        )
+        is None
+    )
+
+    diagnostic = rejection[
+        codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
+    ]
+    assert diagnostic["stage"] == "stock_full_history"
+    assert diagnostic["reason"] == expected_reason
+    assert "secret" not in json.dumps(diagnostic)
+    assert "value" not in json.dumps(diagnostic)
+
+
+def test_cursor_fresh_replay_dispatch_reports_provider_tool_rejection() -> None:
+    codex_candidate_calls._store_cursor_replay_state(
+        "resp-provider-tool-rejection",
+        messages=[
+            {"role": "user", "content": "run pwd"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": '{"cmd":"pwd"}',
+                        },
+                    }
+                ],
+            },
+        ],
+        tools=["secret tool"],
+    )
+    rejection: dict[str, Any] = {}
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            _replay_body("resp-provider-tool-rejection"),
+            rejection_diagnostic_out=rejection,
+        )
+        is None
+    )
+
+    assert rejection[
+        codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
+    ] == {
+        "stage": "provider_neutral_tools",
+        "reason": "tool_item",
+        "tool_index": 0,
+    }
+
+
+def test_cursor_fresh_replay_dispatch_success_emits_no_rejection_diagnostic() -> None:
+    _store_replay_state()
+    rejection: dict[str, Any] = {"stale": "value"}
+
+    rebuilt = codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+        _replay_body(),
+        rejection_diagnostic_out=rejection,
+    )
+
+    assert rebuilt is not None
+    assert rejection == {}
+
+
+def test_cursor_replay_rebuilt_body_rejection_reports_replay_safety_reason() -> None:
+    diagnostic = (
+        codex_candidate_calls._cursor_replay_fresh_dispatch_reject_for_replay_safety(
+            SimpleNamespace(
+                safe=False,
+                classification="id_only_reasoning_reference",
+            )
+        )
+    )
+
+    assert diagnostic == {
+        "stage": "rebuilt_body_replay_unsafe",
+        "reason": "id_only_reasoning_reference",
+    }
 
 
 @pytest.mark.parametrize(

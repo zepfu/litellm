@@ -16,6 +16,7 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Mapping
+from dataclasses import dataclass
 from types import FunctionType
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
@@ -46,8 +47,80 @@ _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER = (
 )
 _CURSOR_REPLAY_STATE_FIELD = "_cursor_replay_state"
 _CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD = "cursor_sanitized_proto_structure"
+_CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD = (
+    "cursor_replay_fresh_dispatch_reject"
+)
 _CURSOR_PROTO_STRUCTURE_MAX_DEPTH = 3
 _CURSOR_PROTO_STRUCTURE_MAX_ITEMS = 64
+_CURSOR_REPLAY_DIAGNOSTIC_MAX_INDEX = 4096
+_CURSOR_REPLAY_DIAGNOSTIC_MAX_KEY_COUNT = 32
+_CURSOR_REPLAY_DIAGNOSTIC_MAX_TOKEN_CHARS = 64
+_CURSOR_REPLAY_FRESH_DISPATCH_REJECTION_STAGES = frozenset(
+    {
+        "stock_full_history",
+        "provider_neutral_tools",
+        "fresh_body_copy",
+        "rebuilt_body_replay_unsafe",
+    }
+)
+_CURSOR_REPLAY_FRESH_DISPATCH_REJECTION_REASONS = frozenset(
+    {
+        "request_body_shape",
+        "missing_replay_state",
+        "replay_state_lookup",
+        "replay_state_copy",
+        "invalid_replay_state",
+        "retained_session_present",
+        "messages_container",
+        "messages_empty",
+        "message_role",
+        "message_conversion",
+        "replayed_input_container",
+        "input_container",
+        "input_item_count",
+        "item_not_object",
+        "item_key_set",
+        "item_type",
+        "id_shape",
+        "metadata_shape",
+        "metadata_key_set",
+        "metadata_value_type",
+        "content_container",
+        "content_part_container",
+        "content_part_keys",
+        "content_part_type",
+        "content_part_text_type",
+        "empty_user_text",
+        "function_call_position",
+        "function_call_count",
+        "function_call_output_position",
+        "function_call_output_count",
+        "function_call_fields",
+        "call_id_shape",
+        "call_id_alias_mismatch",
+        "function_name",
+        "arguments_not_object",
+        "output_container",
+        "output_not_string",
+        "call_graph",
+        "unresolved_call_id",
+        "tool_container",
+        "tool_item",
+        "tool_type_validation",
+        "tool_key_set",
+        "tool_name",
+        "tool_transform",
+        "tool_validation",
+        "tool_canonical_mismatch",
+        "tool_copy_failure",
+        "copy_failure",
+        "replay_safety_rejected",
+        "previous_response_id",
+        "id_only_reasoning_reference",
+        "explicit_item_reference",
+        "invalid_body_shape",
+    }
+)
 _CURSOR_CONTINUATION_FIELDS = frozenset(
     {
         "previous_response_id",
@@ -70,6 +143,178 @@ _CURSOR_REPLAY_PRESERVED_STATUS_CODES = frozenset(
 
 class _CursorPostEgressOutputError(ValueError):
     """A returned Cursor payload could not be normalized after provider Run."""
+
+
+@dataclass(frozen=True)
+class _CursorReplayFreshDispatchReject:
+    stage: str
+    reason: str
+    item_index: Optional[int] = None
+    tool_index: Optional[int] = None
+    item_type: Optional[str] = None
+    tool_type: Optional[str] = None
+    item_keys: Optional[tuple[str, ...]] = None
+    tool_keys: Optional[tuple[str, ...]] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        diagnostic: dict[str, Any] = {
+            "stage": self.stage,
+            "reason": self.reason,
+        }
+        for field in ("item_index", "tool_index", "item_type", "tool_type"):
+            value = getattr(self, field)
+            if value is not None:
+                diagnostic[field] = value
+        for field in ("item_keys", "tool_keys"):
+            value = getattr(self, field)
+            if value is not None:
+                diagnostic[field] = list(value)
+        return diagnostic
+
+
+@dataclass(frozen=True)
+class _CursorReplayValidationResult:
+    value: Any
+    rejection: Optional[_CursorReplayFreshDispatchReject] = None
+
+
+@dataclass(frozen=True)
+class _CursorReplayFreshDispatchBuildResult:
+    body: Optional[dict[str, Any]]
+    rejection: Optional[_CursorReplayFreshDispatchReject] = None
+
+
+def _cursor_replay_safe_diagnostic_token(value: Any) -> Optional[str]:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _CURSOR_REPLAY_DIAGNOSTIC_MAX_TOKEN_CHARS
+        or re.fullmatch(r"[A-Za-z0-9_.-]+", value) is None
+    ):
+        return None
+    return value
+
+
+def _cursor_replay_safe_diagnostic_keys(
+    value: Any,
+) -> Optional[tuple[str, ...]]:
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        raw_keys = list(value.keys())
+    except Exception:  # noqa: BLE001
+        return None
+    safe_keys = {
+        key
+        for key in raw_keys
+        if _cursor_replay_safe_diagnostic_token(key) is not None
+    }
+    return tuple(sorted(safe_keys)[:_CURSOR_REPLAY_DIAGNOSTIC_MAX_KEY_COUNT])
+
+
+def _cursor_replay_bounded_diagnostic_index(value: Any) -> Optional[int]:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > _CURSOR_REPLAY_DIAGNOSTIC_MAX_INDEX
+    ):
+        return None
+    return value
+
+
+def _cursor_replay_rejection(
+    stage: str,
+    reason: str,
+    *,
+    item_index: Any = None,
+    tool_index: Any = None,
+    item: Any = None,
+    tool: Any = None,
+) -> _CursorReplayFreshDispatchReject:
+    item_type = (
+        _cursor_replay_safe_diagnostic_token(item.get("type"))
+        if isinstance(item, Mapping)
+        else None
+    )
+    tool_type = (
+        _cursor_replay_safe_diagnostic_token(tool.get("type"))
+        if isinstance(tool, Mapping)
+        else None
+    )
+    return _CursorReplayFreshDispatchReject(
+        stage=stage,
+        reason=reason,
+        item_index=_cursor_replay_bounded_diagnostic_index(item_index),
+        tool_index=_cursor_replay_bounded_diagnostic_index(tool_index),
+        item_type=item_type,
+        tool_type=tool_type,
+        item_keys=_cursor_replay_safe_diagnostic_keys(item),
+        tool_keys=_cursor_replay_safe_diagnostic_keys(tool),
+    )
+
+
+def _cursor_replay_rejected(
+    stage: str,
+    reason: str,
+    *,
+    item_index: Any = None,
+    tool_index: Any = None,
+    item: Any = None,
+    tool: Any = None,
+) -> _CursorReplayValidationResult:
+    return _CursorReplayValidationResult(
+        value=None,
+        rejection=_cursor_replay_rejection(
+            stage,
+            reason,
+            item_index=item_index,
+            tool_index=tool_index,
+            item=item,
+            tool=tool,
+        ),
+    )
+
+
+def _cursor_replay_build_rejected(
+    stage: str,
+    reason: str,
+    *,
+    item_index: Any = None,
+    tool_index: Any = None,
+    item: Any = None,
+    tool: Any = None,
+) -> _CursorReplayFreshDispatchBuildResult:
+    return _CursorReplayFreshDispatchBuildResult(
+        body=None,
+        rejection=_cursor_replay_rejection(
+            stage,
+            reason,
+            item_index=item_index,
+            tool_index=tool_index,
+            item=item,
+            tool=tool,
+        ),
+    )
+
+
+def _cursor_replay_fresh_dispatch_reject_for_replay_safety(
+    replay_safety: Any,
+) -> Optional[dict[str, Any]]:
+    if getattr(replay_safety, "safe", False):
+        return None
+    classification = getattr(replay_safety, "classification", None)
+    if classification not in {
+        "previous_response_id",
+        "id_only_reasoning_reference",
+        "explicit_item_reference",
+        "invalid_body_shape",
+    }:
+        classification = "replay_safety_rejected"
+    return _CursorReplayFreshDispatchReject(
+        stage="rebuilt_body_replay_unsafe",
+        reason=classification,
+    ).to_dict()
 
 
 def _sanitize_cursor_proto_structure_for_telemetry(
@@ -1293,19 +1538,32 @@ def _cursor_replay_function_call_output_items(
     request_body: dict[str, Any],
     *,
     allow_missing_metadata: bool = False,
-) -> Optional[list[dict[str, Any]]]:
+) -> _CursorReplayValidationResult:
     input_items = _cursor_response_input_items(request_body)
     if not input_items:
-        return None
+        return _cursor_replay_rejected(
+            "fresh_body_copy",
+            "output_container",
+        )
 
     outputs: list[dict[str, Any]] = []
     seen_item_ids: set[str] = set()
-    for raw_item in input_items:
+    for item_index, raw_item in enumerate(input_items):
         if not isinstance(raw_item, Mapping):
-            return None
+            return _cursor_replay_rejected(
+                "fresh_body_copy",
+                "item_not_object",
+                item_index=item_index,
+                item=raw_item,
+            )
         item = dict(raw_item)
         if item.get("type") != "function_call_output":
-            return None
+            return _cursor_replay_rejected(
+                "fresh_body_copy",
+                "item_type",
+                item_index=item_index,
+                item=item,
+            )
         if set(item) - {
             "type",
             "id",
@@ -1314,17 +1572,37 @@ def _cursor_replay_function_call_output_items(
             "output",
             "internal_chat_message_metadata_passthrough",
         }:
-            return None
+            return _cursor_replay_rejected(
+                "fresh_body_copy",
+                "item_key_set",
+                item_index=item_index,
+                item=item,
+            )
         item_id = item.get("id")
         if item_id is not None:
             if not isinstance(item_id, str) or not item_id.startswith("fco_"):
-                return None
+                return _cursor_replay_rejected(
+                    "fresh_body_copy",
+                    "id_shape",
+                    item_index=item_index,
+                    item=item,
+                )
             try:
                 canonical_item_uuid = str(uuid.UUID(item_id.removeprefix("fco_")))
             except (AttributeError, ValueError):
-                return None
+                return _cursor_replay_rejected(
+                    "fresh_body_copy",
+                    "id_shape",
+                    item_index=item_index,
+                    item=item,
+                )
             if item_id != f"fco_{canonical_item_uuid}" or item_id in seen_item_ids:
-                return None
+                return _cursor_replay_rejected(
+                    "fresh_body_copy",
+                    "id_shape",
+                    item_index=item_index,
+                    item=item,
+                )
             seen_item_ids.add(item_id)
         metadata_present = "internal_chat_message_metadata_passthrough" in item
         metadata = item.get("internal_chat_message_metadata_passthrough")
@@ -1333,7 +1611,14 @@ def _cursor_replay_function_call_output_items(
                 not isinstance(metadata, Mapping)
                 or set(metadata) != {"turn_id", "create_time"}
             ):
-                return None
+                return _cursor_replay_rejected(
+                    "fresh_body_copy",
+                    "metadata_key_set"
+                    if isinstance(metadata, Mapping)
+                    else "metadata_shape",
+                    item_index=item_index,
+                    item=item,
+                )
             turn_id = metadata.get("turn_id")
             create_time = metadata.get("create_time")
             try:
@@ -1341,7 +1626,12 @@ def _cursor_replay_function_call_output_items(
                     str(uuid.UUID(turn_id)) if isinstance(turn_id, str) else None
                 )
             except (AttributeError, ValueError):
-                return None
+                return _cursor_replay_rejected(
+                    "fresh_body_copy",
+                    "id_shape",
+                    item_index=item_index,
+                    item=item,
+                )
             if (
                 not isinstance(turn_id, str)
                 or turn_id != canonical_turn_id
@@ -1349,22 +1639,47 @@ def _cursor_replay_function_call_output_items(
                 or not isinstance(create_time, float)
                 or not math.isfinite(create_time)
             ):
-                return None
+                return _cursor_replay_rejected(
+                    "fresh_body_copy",
+                    "metadata_value_type",
+                    item_index=item_index,
+                    item=item,
+                )
         if allow_missing_metadata:
             if item_id is None or (metadata_present and metadata is None):
-                return None
+                return _cursor_replay_rejected(
+                    "fresh_body_copy",
+                    "metadata_shape",
+                    item_index=item_index,
+                    item=item,
+                )
         elif (item_id is None) != (metadata is None):
-            return None
+            return _cursor_replay_rejected(
+                "fresh_body_copy",
+                "metadata_shape",
+                item_index=item_index,
+                item=item,
+            )
         snake_call_id = item.get("call_id")
         camel_call_id = item.get("callId")
         if snake_call_id is not None and (
             not isinstance(snake_call_id, str) or not snake_call_id.strip()
         ):
-            return None
+            return _cursor_replay_rejected(
+                "fresh_body_copy",
+                "call_id_shape",
+                item_index=item_index,
+                item=item,
+            )
         if camel_call_id is not None and (
             not isinstance(camel_call_id, str) or not camel_call_id.strip()
         ):
-            return None
+            return _cursor_replay_rejected(
+                "fresh_body_copy",
+                "call_id_shape",
+                item_index=item_index,
+                item=item,
+            )
         normalized_snake_call_id = (
             snake_call_id.strip() if isinstance(snake_call_id, str) else None
         )
@@ -1376,15 +1691,35 @@ def _cursor_replay_function_call_output_items(
             and normalized_camel_call_id is not None
             and normalized_snake_call_id != normalized_camel_call_id
         ):
-            return None
+            return _cursor_replay_rejected(
+                "fresh_body_copy",
+                "call_id_alias_mismatch",
+                item_index=item_index,
+                item=item,
+            )
         call_id = normalized_snake_call_id or normalized_camel_call_id
         if call_id is None:
-            return None
+            return _cursor_replay_rejected(
+                "fresh_body_copy",
+                "call_id_shape",
+                item_index=item_index,
+                item=item,
+            )
         if "output" not in item:
-            return None
+            return _cursor_replay_rejected(
+                "fresh_body_copy",
+                "output_not_string",
+                item_index=item_index,
+                item=item,
+            )
         output = item["output"]
         if not isinstance(output, str):
-            return None
+            return _cursor_replay_rejected(
+                "fresh_body_copy",
+                "output_not_string",
+                item_index=item_index,
+                item=item,
+            )
         outputs.append(
             {
                 "type": "function_call_output",
@@ -1392,7 +1727,7 @@ def _cursor_replay_function_call_output_items(
                 "output": output,
             }
         )
-    return outputs
+    return _CursorReplayValidationResult(value=outputs)
 
 
 def _cursor_replay_is_canonical_uuid(value: Any) -> bool:
@@ -1408,7 +1743,7 @@ def _cursor_replay_stock_codex_message_item(
     raw_item: Mapping[str, Any],
     *,
     allow_missing_metadata: bool = False,
-) -> Optional[dict[str, Any]]:
+) -> _CursorReplayValidationResult:
     item = dict(raw_item)
     metadata_key = "internal_chat_message_metadata_passthrough"
     expected_item_keys = {
@@ -1421,21 +1756,41 @@ def _cursor_replay_stock_codex_message_item(
     if set(item) != expected_item_keys and not (
         allow_missing_metadata and set(item) == expected_item_keys - {metadata_key}
     ):
-        return None
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "item_key_set",
+            item=item,
+        )
     role = item.get("role")
     if role not in {"developer", "user", "assistant"}:
-        return None
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "message_role",
+            item=item,
+        )
 
     item_id = item.get("id")
     if not isinstance(item_id, str):
-        return None
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "id_shape",
+            item=item,
+        )
     if role == "assistant":
         if re.fullmatch(r"msg_resp_[0-9a-f]{32}", item_id) is None:
-            return None
+            return _cursor_replay_rejected(
+                "stock_full_history",
+                "id_shape",
+                item=item,
+            )
     elif not item_id.startswith("msg_") or not _cursor_replay_is_canonical_uuid(
         item_id.removeprefix("msg_")
     ):
-        return None
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "id_shape",
+            item=item,
+        )
 
     metadata_present = "internal_chat_message_metadata_passthrough" in item
     metadata = item.get("internal_chat_message_metadata_passthrough")
@@ -1445,22 +1800,40 @@ def _cursor_replay_stock_codex_message_item(
         else {"turn_id", "create_time", "content_item_kinds"}
     )
     if metadata is None and (not allow_missing_metadata or metadata_present):
-        return None
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "metadata_shape",
+            item=item,
+        )
     if metadata is not None and (
         not isinstance(metadata, Mapping) or set(metadata) != expected_metadata_keys
     ):
-        return None
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "metadata_key_set"
+            if isinstance(metadata, Mapping)
+            else "metadata_shape",
+            item=item,
+        )
     if metadata is not None and not _cursor_replay_is_canonical_uuid(
         metadata.get("turn_id")
     ):
-        return None
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "id_shape",
+            item=item,
+        )
     create_time = metadata.get("create_time") if metadata is not None else None
     if metadata is not None and role != "assistant" and (
         isinstance(create_time, bool)
         or not isinstance(create_time, float)
         or not math.isfinite(create_time)
     ):
-        return None
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "metadata_value_type",
+            item=item,
+        )
     content_item_kinds = (
         metadata.get("content_item_kinds") if metadata is not None else None
     )
@@ -1476,35 +1849,59 @@ def _cursor_replay_stock_codex_message_item(
         )
         or len(content_item_kinds) != len(set(content_item_kinds))
     ):
-        return None
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "metadata_value_type",
+            item=item,
+        )
 
     content = item.get("content")
     expected_content_type = "output_text" if role == "assistant" else "input_text"
     if not isinstance(content, list) or not content:
-        return None
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "content_container",
+            item=item,
+        )
     canonical_content_parts: list[str] = []
     for raw_part in content:
         if not isinstance(raw_part, Mapping):
-            return None
+            return _cursor_replay_rejected(
+                "stock_full_history",
+                "content_part_container",
+                item=item,
+            )
         part = dict(raw_part)
         if (
             set(part) != {"type", "text"}
             or part.get("type") != expected_content_type
             or not isinstance(part.get("text"), str)
         ):
-            return None
+            if set(part) != {"type", "text"}:
+                reason = "content_part_keys"
+            elif part.get("type") != expected_content_type:
+                reason = "content_part_type"
+            else:
+                reason = "content_part_text_type"
+            return _cursor_replay_rejected(
+                "stock_full_history",
+                reason,
+                item=item,
+            )
         canonical_content_parts.append(part["text"])
-    return {
-        "role": role,
-        "content": "".join(canonical_content_parts),
-    }
+    return _CursorReplayValidationResult(
+        value={
+            "role": role,
+            "content": "".join(canonical_content_parts),
+        }
+    )
 
 
 def _cursor_replay_stock_codex_function_call_item(
     raw_item: Mapping[str, Any],
     *,
     allow_missing_metadata: bool = False,
-) -> Optional[dict[str, Any]]:
+) -> _CursorReplayValidationResult:
     item = dict(raw_item)
     metadata_key = "internal_chat_message_metadata_passthrough"
     expected_item_keys = {
@@ -1518,7 +1915,11 @@ def _cursor_replay_stock_codex_function_call_item(
     if set(item) != expected_item_keys and not (
         allow_missing_metadata and set(item) == expected_item_keys - {metadata_key}
     ):
-        return None
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "item_key_set",
+            item=item,
+        )
 
     item_id = item.get("id")
     item_id_match = (
@@ -1532,18 +1933,32 @@ def _cursor_replay_stock_codex_function_call_item(
     if item_id_match is None or not _cursor_replay_is_canonical_uuid(
         item_id_match.group(1)
     ):
-        return None
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "id_shape",
+            item=item,
+        )
 
     metadata_present = "internal_chat_message_metadata_passthrough" in item
     metadata = item.get("internal_chat_message_metadata_passthrough")
     if metadata is None and (not allow_missing_metadata or metadata_present):
-        return None
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "metadata_shape",
+            item=item,
+        )
     if metadata is not None and (
         not isinstance(metadata, Mapping)
         or set(metadata) != {"turn_id"}
         or not _cursor_replay_is_canonical_uuid(metadata.get("turn_id"))
     ):
-        return None
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "metadata_key_set"
+            if isinstance(metadata, Mapping)
+            else "metadata_shape",
+            item=item,
+        )
 
     call_id = item.get("call_id")
     name = item.get("name")
@@ -1557,27 +1972,55 @@ def _cursor_replay_stock_codex_function_call_item(
         or name != name.strip()
         or not isinstance(arguments, str)
     ):
-        return None
+        if not isinstance(call_id, str) or not call_id or call_id != call_id.strip():
+            reason = "call_id_shape"
+        elif not isinstance(name, str) or not name or name != name.strip():
+            reason = "function_name"
+        else:
+            reason = "arguments_not_object"
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            reason,
+            item=item,
+        )
     try:
         parsed_arguments = json.loads(arguments)
     except (TypeError, ValueError):
-        return None
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "arguments_not_object",
+            item=item,
+        )
     if not isinstance(parsed_arguments, dict):
-        return None
-    return {
-        "type": "function_call",
-        "call_id": call_id,
-        "name": name,
-        "arguments": arguments,
-    }
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "arguments_not_object",
+            item=item,
+        )
+    return _CursorReplayValidationResult(
+        value={
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+        }
+    )
 
 
 def _cursor_replay_stock_codex_full_history_input(
     request_body: dict[str, Any],
-) -> Optional[list[dict[str, Any]]]:
+) -> _CursorReplayValidationResult:
     input_items = request_body.get("input")
-    if not isinstance(input_items, list) or len(input_items) < 3:
-        return None
+    if not isinstance(input_items, list):
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "input_container",
+        )
+    if len(input_items) < 3:
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "input_item_count",
+        )
 
     replayed_input: list[dict[str, Any]] = []
     saw_nonempty_user_message = False
@@ -1585,15 +2028,30 @@ def _cursor_replay_stock_codex_full_history_input(
     output_count = 0
     for item_index, raw_item in enumerate(input_items):
         if not isinstance(raw_item, Mapping):
-            return None
+            return _cursor_replay_rejected(
+                "stock_full_history",
+                "item_not_object",
+                item_index=item_index,
+                item=raw_item,
+            )
         item_type = raw_item.get("type")
         if item_type == "message":
-            message_item = _cursor_replay_stock_codex_message_item(
+            message_result = _cursor_replay_stock_codex_message_item(
                 raw_item,
                 allow_missing_metadata=True,
             )
-            if message_item is None:
-                return None
+            if message_result.rejection is not None:
+                rejection = message_result.rejection
+                return _CursorReplayValidationResult(
+                    value=None,
+                    rejection=_cursor_replay_rejection(
+                        "stock_full_history",
+                        rejection.reason,
+                        item_index=item_index,
+                        item=raw_item,
+                    ),
+                )
+            message_item = message_result.value
             if message_item["role"] == "user" and bool(
                 _cursor_response_content_text(message_item["content"]).strip()
             ):
@@ -1601,71 +2059,161 @@ def _cursor_replay_stock_codex_full_history_input(
             replayed_input.append(message_item)
             continue
         if item_type == "function_call":
-            if item_index != len(input_items) - 2 or function_call_count:
-                return None
-            function_call_item = _cursor_replay_stock_codex_function_call_item(
+            if item_index != len(input_items) - 2:
+                return _cursor_replay_rejected(
+                    "stock_full_history",
+                    "function_call_position",
+                    item_index=item_index,
+                    item=raw_item,
+                )
+            if function_call_count:
+                return _cursor_replay_rejected(
+                    "stock_full_history",
+                    "function_call_count",
+                    item_index=item_index,
+                    item=raw_item,
+                )
+            function_call_result = _cursor_replay_stock_codex_function_call_item(
                 raw_item,
                 allow_missing_metadata=True,
             )
-            if function_call_item is None:
-                return None
+            if function_call_result.rejection is not None:
+                rejection = function_call_result.rejection
+                return _CursorReplayValidationResult(
+                    value=None,
+                    rejection=_cursor_replay_rejection(
+                        "stock_full_history",
+                        rejection.reason,
+                        item_index=item_index,
+                        item=raw_item,
+                    ),
+                )
+            function_call_item = function_call_result.value
             function_call_count += 1
             replayed_input.append(function_call_item)
             continue
         if item_type == "function_call_output":
-            if (
-                item_index != len(input_items) - 1
-                or function_call_count != 1
-                or output_count
-                or set(raw_item)
-                not in (
-                    {
-                        "type",
-                        "id",
-                        "call_id",
-                        "output",
-                    },
-                    {
-                        "type",
-                        "id",
-                        "call_id",
-                        "output",
-                        "internal_chat_message_metadata_passthrough",
-                    },
+            if item_index != len(input_items) - 1:
+                return _cursor_replay_rejected(
+                    "stock_full_history",
+                    "function_call_output_position",
+                    item_index=item_index,
+                    item=raw_item,
                 )
+            if function_call_count != 1:
+                return _cursor_replay_rejected(
+                    "stock_full_history",
+                    "function_call_count",
+                    item_index=item_index,
+                    item=raw_item,
+                )
+            if output_count:
+                return _cursor_replay_rejected(
+                    "stock_full_history",
+                    "function_call_output_count",
+                    item_index=item_index,
+                    item=raw_item,
+                )
+            if set(raw_item) not in (
+                {
+                    "type",
+                    "id",
+                    "call_id",
+                    "output",
+                },
+                {
+                    "type",
+                    "id",
+                    "call_id",
+                    "output",
+                    "internal_chat_message_metadata_passthrough",
+                },
             ):
-                return None
-            output_items = _cursor_replay_function_call_output_items(
+                return _cursor_replay_rejected(
+                    "stock_full_history",
+                    "item_key_set",
+                    item_index=item_index,
+                    item=raw_item,
+                )
+            output_result = _cursor_replay_function_call_output_items(
                 {"input": [raw_item]},
                 allow_missing_metadata=True,
             )
-            if output_items is None or len(output_items) != 1:
-                return None
+            if output_result.rejection is not None:
+                rejection = output_result.rejection
+                return _CursorReplayValidationResult(
+                    value=None,
+                    rejection=_cursor_replay_rejection(
+                        "stock_full_history",
+                        rejection.reason,
+                        item_index=item_index,
+                        item=raw_item,
+                    ),
+                )
+            output_items = output_result.value
+            if len(output_items) != 1:
+                return _cursor_replay_rejected(
+                    "stock_full_history",
+                    "function_call_output_count",
+                    item_index=item_index,
+                    item=raw_item,
+                )
             output_count += 1
             replayed_input.extend(output_items)
             continue
-        return None
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "item_type",
+            item_index=item_index,
+            item=raw_item,
+        )
 
-    if (
-        not saw_nonempty_user_message
-        or function_call_count != 1
-        or output_count != 1
-        or _cursor_replay_unresolved_function_call_ids(replayed_input) != set()
-    ):
-        return None
-    return replayed_input
+    if not saw_nonempty_user_message:
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "empty_user_text",
+        )
+    if function_call_count != 1:
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "function_call_count",
+        )
+    if output_count != 1:
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "function_call_output_count",
+        )
+    unresolved_result = _cursor_replay_unresolved_function_call_ids(
+        replayed_input,
+        stage="stock_full_history",
+    )
+    if unresolved_result.rejection is not None:
+        return unresolved_result
+    if unresolved_result.value != set():
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "unresolved_call_id",
+        )
+    return _CursorReplayValidationResult(value=replayed_input)
 
 
 def _cursor_replay_unresolved_function_call_ids(
     replayed_input: list[Any],
-) -> Optional[set[str]]:
+    *,
+    stage: str = "stock_full_history",
+) -> _CursorReplayValidationResult:
     seen_call_ids: set[str] = set()
     seen_output_ids: set[str] = set()
     unresolved_call_ids: set[str] = set()
 
-    for item in replayed_input:
+    for item_index, item in enumerate(replayed_input):
         if not isinstance(item, dict):
-            return None
+            return _cursor_replay_rejected(
+                stage,
+                "item_not_object",
+                item_index=item_index,
+                item=item,
+            )
         item_type = item.get("type")
         if item_type == "function_call":
             call_id = item.get("call_id")
@@ -1676,10 +2224,20 @@ def _cursor_replay_unresolved_function_call_ids(
                 or not isinstance(name, str)
                 or not name.strip()
             ):
-                return None
+                return _cursor_replay_rejected(
+                    stage,
+                    "function_call_fields",
+                    item_index=item_index,
+                    item=item,
+                )
             call_id = call_id.strip()
             if call_id in seen_call_ids:
-                return None
+                return _cursor_replay_rejected(
+                    stage,
+                    "call_graph",
+                    item_index=item_index,
+                    item=item,
+                )
             item["call_id"] = call_id
             item["name"] = name.strip()
             seen_call_ids.add(call_id)
@@ -1687,24 +2245,37 @@ def _cursor_replay_unresolved_function_call_ids(
         elif item_type == "function_call_output":
             call_id = item.get("call_id")
             if not isinstance(call_id, str) or not call_id.strip():
-                return None
+                return _cursor_replay_rejected(
+                    stage,
+                    "unresolved_call_id",
+                    item_index=item_index,
+                    item=item,
+                )
             call_id = call_id.strip()
             if call_id in seen_output_ids or call_id not in unresolved_call_ids:
-                return None
+                return _cursor_replay_rejected(
+                    stage,
+                    "unresolved_call_id",
+                    item_index=item_index,
+                    item=item,
+                )
             item["call_id"] = call_id
             seen_output_ids.add(call_id)
             unresolved_call_ids.remove(call_id)
 
     if not seen_call_ids:
-        return None
-    return unresolved_call_ids
+        return _cursor_replay_rejected(stage, "function_call_count")
+    return _CursorReplayValidationResult(value=unresolved_call_ids)
 
 
 def _cursor_replay_provider_neutral_tools(
     replay_tools: Any,
-) -> Optional[list[dict[str, Any]]]:
+) -> _CursorReplayValidationResult:
     if not isinstance(replay_tools, list):
-        return None
+        return _cursor_replay_rejected(
+            "provider_neutral_tools",
+            "tool_container",
+        )
 
     try:
         from openai.types.responses.response_create_params import ToolParam
@@ -1718,21 +2289,46 @@ def _cursor_replay_provider_neutral_tools(
             dict(tool) if isinstance(tool, Mapping) else None
             for tool in replay_tools
         ]
-        if any(tool is None for tool in tools):
-            return None
+        for tool_index, tool in enumerate(tools):
+            if tool is None:
+                return _cursor_replay_rejected(
+                    "provider_neutral_tools",
+                    "tool_item",
+                    tool_index=tool_index,
+                    tool=(
+                        replay_tools[tool_index]
+                        if tool_index < len(replay_tools)
+                        else None
+                    ),
+                )
         transformed_tools = OpenAICountTokensConfig._transform_tools_for_responses_api(
             cast(list[dict[str, Any]], tools)
         )
         tool_adapter = TypeAdapter(ToolParam)
     except Exception:  # noqa: BLE001
-        return None
+        return _cursor_replay_rejected(
+            "provider_neutral_tools",
+            "tool_transform",
+        )
 
     provider_neutral_tools: list[dict[str, Any]] = []
-    for original_tool, transformed_tool in zip(tools, transformed_tools):
+    for tool_index, (original_tool, transformed_tool) in enumerate(
+        zip(tools, transformed_tools)
+    ):
+        original_tool_value = (
+            replay_tools[tool_index]
+            if tool_index < len(replay_tools)
+            else original_tool
+        )
         if not isinstance(original_tool, dict) or not isinstance(
             transformed_tool, dict
         ):
-            return None
+            return _cursor_replay_rejected(
+                "provider_neutral_tools",
+                "tool_item",
+                tool_index=tool_index,
+                tool=original_tool_value,
+            )
         validation_tool = dict(transformed_tool)
         if validation_tool.get("type") == "function":
             function = original_tool.get("function")
@@ -1743,10 +2339,20 @@ def _cursor_replay_provider_neutral_tools(
                     or set(function)
                     - {"name", "description", "parameters", "strict"}
                 ):
-                    return None
+                    return _cursor_replay_rejected(
+                        "provider_neutral_tools",
+                        "tool_key_set",
+                        tool_index=tool_index,
+                        tool=original_tool,
+                    )
             name = validation_tool.get("name")
             if not isinstance(name, str) or not name.strip():
-                return None
+                return _cursor_replay_rejected(
+                    "provider_neutral_tools",
+                    "tool_name",
+                    tool_index=tool_index,
+                    tool=original_tool,
+                )
             validation_tool["name"] = name.strip()
             validation_tool.setdefault("parameters", {})
             validation_tool.setdefault("strict", None)
@@ -1757,23 +2363,47 @@ def _cursor_replay_provider_neutral_tools(
             )
             canonical_tool = json.loads(tool_adapter.dump_json(validated_tool))
         except Exception:  # noqa: BLE001
-            return None
+            reason = (
+                "tool_type_validation"
+                if not isinstance(validation_tool.get("type"), str)
+                or not validation_tool.get("type", "").strip()
+                else "tool_validation"
+            )
+            return _cursor_replay_rejected(
+                "provider_neutral_tools",
+                reason,
+                tool_index=tool_index,
+                tool=original_tool,
+            )
         if canonical_tool != validation_tool:
-            return None
+            return _cursor_replay_rejected(
+                "provider_neutral_tools",
+                "tool_canonical_mismatch",
+                tool_index=tool_index,
+                tool=original_tool,
+            )
         try:
             provider_neutral_tools.append(copy.deepcopy(original_tool))
         except Exception:  # noqa: BLE001
-            return None
-    return provider_neutral_tools
+            return _cursor_replay_rejected(
+                "provider_neutral_tools",
+                "tool_copy_failure",
+                tool_index=tool_index,
+                tool=original_tool,
+            )
+    return _CursorReplayValidationResult(value=provider_neutral_tools)
 
 
-def _build_cursor_replay_safe_fresh_dispatch_body(  # noqa: PLR0915
+def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
     request_body: Any,
     *,
     continuation_exc: Optional[BaseException] = None,
-) -> Optional[dict[str, Any]]:
+) -> _CursorReplayFreshDispatchBuildResult:
     if not isinstance(request_body, dict):
-        return None
+        return _cursor_replay_build_rejected(
+            "fresh_body_copy",
+            "request_body_shape",
+        )
 
     replay_state = getattr(
         continuation_exc,
@@ -1791,8 +2421,16 @@ def _build_cursor_replay_safe_fresh_dispatch_body(  # noqa: PLR0915
             try:
                 registry_state = _peek_cursor_replay_state(previous_response_id)
             except Exception:  # noqa: BLE001
-                return None
+                return _cursor_replay_build_rejected(
+                    "fresh_body_copy",
+                    "replay_state_lookup",
+                )
             replay_state = _cursor_replay_state_snapshot(registry_state)
+            if replay_state is None:
+                return _cursor_replay_build_rejected(
+                    "fresh_body_copy",
+                    "replay_state_copy",
+                )
         elif (
             previous_response_id is None
             and getattr(
@@ -1801,27 +2439,53 @@ def _build_cursor_replay_safe_fresh_dispatch_body(  # noqa: PLR0915
                 False,
             )
         ):
-            replayed_input = _cursor_replay_stock_codex_full_history_input(
+            full_history_result = _cursor_replay_stock_codex_full_history_input(
                 request_body
             )
+            if full_history_result.rejection is not None:
+                return _CursorReplayFreshDispatchBuildResult(
+                    body=None,
+                    rejection=full_history_result.rejection,
+                )
+            replayed_input = full_history_result.value
             replay_tools_source = request_body.get("tools")
         else:
-            return None
+            return _cursor_replay_build_rejected(
+                "fresh_body_copy",
+                "missing_replay_state",
+            )
     if replayed_input is None:
         if not isinstance(replay_state, dict):
-            return None
+            return _cursor_replay_build_rejected(
+                "fresh_body_copy",
+                "invalid_replay_state",
+            )
         if replay_state.get("retained_session") is not None:
-            return None
+            return _cursor_replay_build_rejected(
+                "fresh_body_copy",
+                "retained_session_present",
+            )
 
         messages = replay_state.get("messages")
-        if not isinstance(messages, list) or not messages:
-            return None
+        if not isinstance(messages, list):
+            return _cursor_replay_build_rejected(
+                "fresh_body_copy",
+                "messages_container",
+            )
+        if not messages:
+            return _cursor_replay_build_rejected(
+                "fresh_body_copy",
+                "messages_empty",
+            )
         if any(
             str(_cursor_as_mapping(message).get("role") or "").strip().lower()
             not in {"system", "developer", "user", "assistant", "tool"}
             for message in messages
         ):
-            return None
+            return _cursor_replay_build_rejected(
+                "fresh_body_copy",
+                "message_role",
+            )
         if not any(
             str(_cursor_as_mapping(message).get("role") or "").strip().lower()
             == "user"
@@ -1832,7 +2496,10 @@ def _build_cursor_replay_safe_fresh_dispatch_body(  # noqa: PLR0915
             )
             for message in messages
         ):
-            return None
+            return _cursor_replay_build_rejected(
+                "fresh_body_copy",
+                "empty_user_text",
+            )
         try:
             from litellm.llms.openai.responses.count_tokens.transformation import (
                 OpenAICountTokensConfig,
@@ -1842,28 +2509,52 @@ def _build_cursor_replay_safe_fresh_dispatch_body(  # noqa: PLR0915
                 OpenAICountTokensConfig.messages_to_responses_input(messages)
             )
         except Exception:  # noqa: BLE001
-            return None
+            return _cursor_replay_build_rejected(
+                "fresh_body_copy",
+                "message_conversion",
+            )
         if not isinstance(replayed_input, list):
-            return None
-        unresolved_call_ids = _cursor_replay_unresolved_function_call_ids(
-            replayed_input
+            return _cursor_replay_build_rejected(
+                "fresh_body_copy",
+                "replayed_input_container",
+            )
+        unresolved_result = _cursor_replay_unresolved_function_call_ids(
+            replayed_input,
+            stage="fresh_body_copy",
         )
-        if unresolved_call_ids is None:
-            return None
-        output_items = _cursor_replay_function_call_output_items(request_body)
-        if output_items is None:
-            return None
+        if unresolved_result.rejection is not None:
+            return _CursorReplayFreshDispatchBuildResult(
+                body=None,
+                rejection=unresolved_result.rejection,
+            )
+        unresolved_call_ids = unresolved_result.value
+        output_result = _cursor_replay_function_call_output_items(request_body)
+        if output_result.rejection is not None:
+            return _CursorReplayFreshDispatchBuildResult(
+                body=None,
+                rejection=output_result.rejection,
+            )
+        output_items = output_result.value
 
-        for output_item in output_items:
+        for output_index, output_item in enumerate(output_items):
             call_id = output_item["call_id"]
             if call_id not in unresolved_call_ids:
-                return None
+                return _cursor_replay_build_rejected(
+                    "fresh_body_copy",
+                    "unresolved_call_id",
+                    item_index=output_index,
+                    item=output_item,
+                )
             unresolved_call_ids.remove(call_id)
         replay_tools_source = replay_state.get("tools")
 
-    replay_tools = _cursor_replay_provider_neutral_tools(replay_tools_source)
-    if replay_tools is None:
-        return None
+    replay_tools_result = _cursor_replay_provider_neutral_tools(replay_tools_source)
+    if replay_tools_result.rejection is not None:
+        return _CursorReplayFreshDispatchBuildResult(
+            body=None,
+            rejection=replay_tools_result.rejection,
+        )
+    replay_tools = replay_tools_result.value
 
     try:
         fresh_body = copy.deepcopy(request_body)
@@ -1873,7 +2564,10 @@ def _build_cursor_replay_safe_fresh_dispatch_body(  # noqa: PLR0915
         ]
         fresh_body["tools"] = replay_tools
     except Exception:  # noqa: BLE001
-        return None
+        return _cursor_replay_build_rejected(
+            "fresh_body_copy",
+            "copy_failure",
+        )
     for field in _CURSOR_CONTINUATION_FIELDS:
         fresh_body.pop(field, None)
     if instructions is not None:
@@ -1887,7 +2581,29 @@ def _build_cursor_replay_safe_fresh_dispatch_body(  # noqa: PLR0915
                 expected_state=registry_state,
                 close_retained_session=False,
             )
-    return fresh_body
+    return _CursorReplayFreshDispatchBuildResult(body=fresh_body)
+
+
+def _build_cursor_replay_safe_fresh_dispatch_body(
+    request_body: Any,
+    *,
+    continuation_exc: Optional[BaseException] = None,
+    rejection_diagnostic_out: Optional[dict[str, Any]] = None,
+) -> Optional[dict[str, Any]]:
+    if rejection_diagnostic_out is not None:
+        rejection_diagnostic_out.clear()
+    result = _build_cursor_replay_safe_fresh_dispatch_body_result(
+        request_body,
+        continuation_exc=continuation_exc,
+    )
+    if (
+        rejection_diagnostic_out is not None
+        and result.rejection is not None
+    ):
+        rejection_diagnostic_out[
+            _CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
+        ] = result.rejection.to_dict()
+    return result.body
 
 
 def _responses_input_to_cursor_messages(  # noqa: PLR0915
