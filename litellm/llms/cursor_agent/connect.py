@@ -2260,7 +2260,11 @@ def _advertised_spawn_agent_tool_definition(
         )
         if isinstance(name, str) and name.casefold() == _SPAWN_AGENT_TOOL_NAME:
             matches.append(definition)
-    if len(matches) != 1:
+    if len(matches) > 1:
+        raise CursorConnectProtocolError(
+            "Cursor Agent advertised multiple spawn_agent tools."
+        )
+    if not matches:
         return None
     return matches[0]
 

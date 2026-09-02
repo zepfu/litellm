@@ -557,6 +557,24 @@ def test_cursor_subagent_requires_unambiguous_advertised_spawn_agent() -> None:
     assert "subagent-call" not in exc_info.value.message
 
 
+def test_cursor_subagent_rejects_duplicate_advertised_spawn_agent() -> None:
+    definition = _advertised_spawn_agent_definition()
+
+    with pytest.raises(
+        CursorConnectProtocolError,
+        match="multiple spawn_agent tools",
+    ):
+        cursor_connect._advertised_spawn_agent_tool_definition(
+            {
+                "runRequest": {
+                    "mcpTools": {
+                        "mcpTools": [definition, definition],
+                    }
+                }
+            }
+        )
+
+
 def test_cursor_subagent_without_advertised_spawn_agent_uses_canonical_arguments() -> None:
     external_exec_requests: list[dict[str, Any]] = []
 
