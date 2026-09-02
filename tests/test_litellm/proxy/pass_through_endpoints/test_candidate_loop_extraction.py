@@ -2835,7 +2835,17 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
                 "additionalProperties": False,
             },
             "strict": False,
-        }
+        },
+        {
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Apply a patch.",
+        },
+        {"type": "tool_search"},
+        {
+            "type": "web_search",
+            "filters": {"allowed_domains": ["example.com"]},
+        },
     ]
     selections = [
         {
@@ -2974,6 +2984,16 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
             },
         ],
     }
+    for item in prepared_body["input"]:
+        item.pop("internal_chat_message_metadata_passthrough", None)
+    assert [set(item) for item in prepared_body["input"]] == [
+        {"type", "id", "role", "content"},
+        {"type", "id", "role", "content"},
+        {"type", "id", "role", "content"},
+        {"type", "id", "role", "content"},
+        {"type", "id", "name", "arguments", "call_id"},
+        {"type", "id", "call_id", "output"},
+    ]
     with pytest.raises(CursorConnectError) as source_exc_info:
         codex_candidate_calls._raise_cursor_session_continuation_unavailable()
     source_exc = source_exc_info.value

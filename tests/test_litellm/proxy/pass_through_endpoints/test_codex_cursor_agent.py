@@ -165,9 +165,12 @@ def _replay_body(response_id: str = "resp-replay") -> dict[str, Any]:
     }
 
 
-def _stock_codex_full_history_body() -> dict[str, Any]:
+def _stock_codex_full_history_body(
+    *,
+    include_metadata: bool = False,
+) -> dict[str, Any]:
     turn_id = "01a06269-1662-7c02-a81a-031c450f8606"
-    return {
+    body = {
         "model": "work",
         "tools": [
             {
@@ -181,7 +184,17 @@ def _stock_codex_full_history_body() -> dict[str, Any]:
                     "additionalProperties": False,
                 },
                 "strict": False,
-            }
+            },
+            {
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch.",
+            },
+            {"type": "tool_search"},
+            {
+                "type": "web_search",
+                "filters": {"allowed_domains": ["example.com"]},
+            },
         ],
         "input": [
             {
@@ -289,6 +302,10 @@ def _stock_codex_full_history_body() -> dict[str, Any]:
             },
         ],
     }
+    if not include_metadata:
+        for item in body["input"]:
+            item.pop("internal_chat_message_metadata_passthrough", None)
+    return body
 
 
 def _cursor_subagent_args(*, extra: bytes = b"") -> bytes:
@@ -1866,12 +1883,19 @@ def test_cursor_fresh_replay_dispatch_rejects_completed_historical_output() -> N
             "type": "function_call_output",
             "call_id": "call-1",
         },
+        {
+            "type": "function_call_output",
+            "id": "fco_01a06244-9f7f-7fe1-869b-23d587ad56f1",
+            "call_id": "call-1",
+            "output": "pwd output",
+        },
     ],
     ids=[
         "unknown-field",
         "nested-output",
         "conflicting-call-id-aliases",
         "missing-output",
+        "id-without-metadata",
     ],
 )
 def test_cursor_fresh_replay_dispatch_rejects_noncanonical_incremental_output(
@@ -1959,8 +1983,35 @@ def test_cursor_fresh_replay_dispatch_canonicalizes_stock_codex_output_metadata(
     }
 
 
-def test_cursor_fresh_replay_dispatch_accepts_stock_codex_full_history() -> None:
-    body = _stock_codex_full_history_body()
+@pytest.mark.parametrize(
+    "include_metadata",
+    [False, True],
+    ids=["metadata-omitted", "metadata-present"],
+)
+def test_cursor_fresh_replay_dispatch_accepts_stock_codex_full_history(
+    include_metadata: bool,
+) -> None:
+    body = _stock_codex_full_history_body(include_metadata=include_metadata)
+    expected_item_keys = [
+        {"type", "id", "role", "content"},
+        {"type", "id", "role", "content"},
+        {"type", "id", "role", "content"},
+        {"type", "id", "role", "content"},
+        {"type", "id", "name", "arguments", "call_id"},
+        {"type", "id", "call_id", "output"},
+    ]
+    if include_metadata:
+        expected_item_keys = [
+            item_keys | {"internal_chat_message_metadata_passthrough"}
+            for item_keys in expected_item_keys
+        ]
+    assert [set(item) for item in body["input"]] == expected_item_keys
+    assert [tool["type"] for tool in body["tools"]] == [
+        "function",
+        "custom",
+        "tool_search",
+        "web_search",
+    ]
     continuation_exc = CursorConnectError("missing retained session", status_code=409)
     setattr(
         continuation_exc,
@@ -2026,6 +2077,54 @@ def test_cursor_fresh_replay_dispatch_rejects_provider_owned_full_history() -> N
             "encrypted_content": "opaque-provider-state",
         },
     )
+    continuation_exc = CursorConnectError("missing retained session", status_code=409)
+    setattr(
+        continuation_exc,
+        codex_candidate_calls._CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
+        True,
+    )
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            body,
+            continuation_exc=continuation_exc,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("item_index", "item_update"),
+    [
+        (0, {"id": "msg_not-a-uuid"}),
+        (4, {"id": "fc_not-a-uuid_0"}),
+        (5, {"id": "fco_not-a-uuid"}),
+        (2, {"unexpected": "value"}),
+        (
+            2,
+            {
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "turn-1",
+                    "create_time": 1788357449.79907,
+                    "content_item_kinds": ["user.text"],
+                }
+            },
+        ),
+    ],
+    ids=[
+        "malformed-message-id",
+        "malformed-function-call-id",
+        "malformed-function-call-output-id",
+        "unknown-item-key",
+        "invalid-present-metadata",
+    ],
+)
+def test_cursor_fresh_replay_dispatch_rejects_unsafe_stock_codex_full_history(
+    item_index: int,
+    item_update: dict[str, Any],
+) -> None:
+    body = _stock_codex_full_history_body()
+    body["input"][item_index].update(item_update)
     continuation_exc = CursorConnectError("missing retained session", status_code=409)
     setattr(
         continuation_exc,
