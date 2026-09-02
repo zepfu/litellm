@@ -20,6 +20,8 @@ COHERE_API_HOSTS: frozenset[str] = frozenset(
         "api.cohere.ai",
     }
 )
+_COHERE_CHAT_V2_PATH = "/v2/chat"
+_COHERE_CODEX_ROUTE_FAMILY = "codex_cohere_chat_completions_adapter"
 
 _MONTHLY_TRIAL_MARKERS: tuple[str, ...] = (
     "monthly trial",
@@ -31,10 +33,10 @@ _MONTHLY_TRIAL_MARKERS: tuple[str, ...] = (
     "trial usage",
     "free trial",
 )
-_COHERE_MODEL_TOKEN = r"""['"]?[^\s,'";]+['"]?"""
+_COHERE_MODEL_TOKEN = r"""['"]?(?P<model>[^\s,'";]+)['"]?"""
 _COHERE_MODEL_UNAVAILABLE_MESSAGE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
-        rf"\bmodel\s+{_COHERE_MODEL_TOKEN}\s+"
+        rf"""\bmodel\s+{_COHERE_MODEL_TOKEN}\s+"""
         r"(?:not found|does not exist|is not available|is unsupported|"
         r"is not supported by the generate api|"
         r"is not supported(?!\s+by\b)|"
@@ -43,7 +45,7 @@ _COHERE_MODEL_UNAVAILABLE_MESSAGE_PATTERNS: tuple[re.Pattern[str], ...] = (
         re.IGNORECASE,
     ),
     re.compile(
-        rf"\bfinetuned model(?:\s+with name)?\s+{_COHERE_MODEL_TOKEN}\s+"
+        rf"""\bfinetuned model(?:\s+with name)?\s+{_COHERE_MODEL_TOKEN}\s+"""
         r"(?:not found|is not ready for serving)\b",
         re.IGNORECASE,
     ),
@@ -75,6 +77,25 @@ def is_cohere_api_url(url: Optional[Union[str, httpx.URL]]) -> bool:
 
     hostname = str(urlparse(str(url or "")).hostname or "").lower()
     return hostname in COHERE_API_HOSTS
+
+
+def _is_exact_cohere_chat_v2_url(url: Optional[Union[str, httpx.URL]]) -> bool:
+    try:
+        parsed = urlparse(str(url or ""))
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    return (
+        parsed.scheme.lower() == "https"
+        and str(parsed.hostname or "").lower() in COHERE_API_HOSTS
+        and parsed.path == _COHERE_CHAT_V2_PATH
+        and not parsed.params
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.username is None
+        and parsed.password is None
+        and port in (None, 443)
+    )
 
 
 def _iter_error_text_values(value: Any) -> list[str]:
@@ -117,7 +138,28 @@ def _iter_structured_error_objects(value: Any) -> list[dict[str, Any]]:
     return values
 
 
-def _is_model_bound_cohere_error_message(value: Any) -> bool:
+def _normalize_cohere_model_name(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().strip("\"'`").rstrip(".,;").casefold()
+
+
+def _cohere_model_identity_variants(
+    selected_upstream_model: Optional[str],
+) -> frozenset[str]:
+    normalized = _normalize_cohere_model_name(selected_upstream_model)
+    if not normalized:
+        return frozenset()
+    if normalized.startswith("cohere/"):
+        return frozenset({normalized, normalized[len("cohere/") :]})
+    return frozenset({normalized, f"cohere/{normalized}"})
+
+
+def _is_model_bound_cohere_error_message(
+    value: Any,
+    *,
+    selected_model_variants: frozenset[str],
+) -> bool:
     if not isinstance(value, str):
         return False
 
@@ -128,18 +170,43 @@ def _is_model_bound_cohere_error_message(value: Any) -> bool:
         .replace("\u201d", '"')
         .split()
     ).lower()
-    return any(
-        pattern.search(normalized)
-        for pattern in _COHERE_MODEL_UNAVAILABLE_MESSAGE_PATTERNS
-    )
+    for pattern in _COHERE_MODEL_UNAVAILABLE_MESSAGE_PATTERNS:
+        match = pattern.search(normalized)
+        if (
+            match is not None
+            and _normalize_cohere_model_name(match.group("model"))
+            in selected_model_variants
+        ):
+            return True
+    return False
 
 
 def _has_structured_model_unavailable_evidence(
     *,
+    url: Optional[Union[str, httpx.URL]],
+    custom_llm_provider: Optional[str],
+    route_family: Optional[str],
+    selected_upstream_model: Optional[str],
     status_code: Optional[int],
+    attempted_provider_call: bool,
+    provider_returned: bool,
     exc: Exception,
 ) -> bool:
-    if status_code not in (400, 404):
+    if (
+        not attempted_provider_call
+        or provider_returned is not True
+        or getattr(exc, "_aawm_provider_returned", False) is not True
+        or str(custom_llm_provider or "").strip().lower() != "cohere"
+        or route_family != _COHERE_CODEX_ROUTE_FAMILY
+        or not _is_exact_cohere_chat_v2_url(url)
+        or status_code not in (400, 404)
+    ):
+        return False
+
+    selected_model_variants = _cohere_model_identity_variants(
+        selected_upstream_model
+    )
+    if not selected_model_variants:
         return False
 
     detail = _extract_passthrough_exception_detail(exc)
@@ -149,7 +216,10 @@ def _has_structured_model_unavailable_evidence(
 
     for error_object in _iter_structured_error_objects(payload):
         for key in ("message", "detail", "error"):
-            if _is_model_bound_cohere_error_message(error_object.get(key)):
+            if _is_model_bound_cohere_error_message(
+                error_object.get(key),
+                selected_model_variants=selected_model_variants,
+            ):
                 return True
     return False
 
@@ -160,6 +230,10 @@ def classify_cohere_failure(
     custom_llm_provider: Optional[str],
     status_code: Optional[int],
     exc: Exception,
+    attempted_provider_call: bool = False,
+    provider_returned: bool = False,
+    route_family: Optional[str] = None,
+    selected_upstream_model: Optional[str] = None,
 ) -> Optional[CohereFailureClassification]:
     """Classify only direct Cohere failures, never OpenRouter-hosted Cohere."""
 
@@ -199,7 +273,13 @@ def classify_cohere_failure(
             log_error_summary="Cohere timeout or connectivity failure",
         )
     if _has_structured_model_unavailable_evidence(
+        url=url,
+        custom_llm_provider=provider,
+        route_family=route_family,
+        selected_upstream_model=selected_upstream_model,
         status_code=status_code,
+        attempted_provider_call=attempted_provider_call,
+        provider_returned=provider_returned,
         exc=exc,
     ):
         return CohereFailureClassification(

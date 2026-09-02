@@ -820,13 +820,20 @@ def test_should_map_codex_cohere_candidate_failures(
         RuntimeError("provider failure"),
         candidate={
             "provider": "cohere",
+            "model": "cohere/command-r",
             "route_family": "codex_cohere_chat_completions_adapter",
         },
         is_codex_alias=True,
+        attempted_provider_call=True,
     )
 
     assert result == expected
     classifier.assert_called_once()
+    assert classifier.call_args.kwargs["attempted_provider_call"] is True
+    assert classifier.call_args.kwargs["route_family"] == (
+        "codex_cohere_chat_completions_adapter"
+    )
+    assert classifier.call_args.kwargs["selected_upstream_model"] == "command-r"
 
 
 @pytest.mark.parametrize(
@@ -849,9 +856,11 @@ def test_should_keep_unattributed_cohere_4xx_as_terminal(
         exc,
         candidate={
             "provider": "cohere",
+            "model": "cohere/command-r",
             "route_family": "codex_cohere_chat_completions_adapter",
         },
         is_codex_alias=True,
+        attempted_provider_call=True,
     )
 
     assert result == "provider_terminal_error"
@@ -861,17 +870,53 @@ def test_should_map_structured_model_bound_cohere_404_to_candidate_unavailable()
     exc = RuntimeError("Cohere request failed")
     exc.status_code = 404
     exc.detail = {"error": {"message": "model 'command-r' not found"}}
+    exc._aawm_provider_returned = True
 
     result = candidate_loop._classify_codex_cohere_candidate_failure(
         exc,
         candidate={
             "provider": "cohere",
+            "model": "cohere/command-r",
             "route_family": "codex_cohere_chat_completions_adapter",
         },
         is_codex_alias=True,
+        attempted_provider_call=True,
     )
 
     assert result == "candidate_unavailable"
+
+
+@pytest.mark.parametrize(
+    ("error_model", "attempted_provider_call", "provider_returned"),
+    [
+        ("command-r", True, False),
+        ("command-r", False, True),
+        ("different-model", True, True),
+    ],
+)
+def test_should_keep_cohere_model_rejection_terminal_without_exact_evidence(
+    error_model,
+    attempted_provider_call,
+    provider_returned,
+):
+    exc = RuntimeError("Cohere request failed")
+    exc.status_code = 404
+    exc.detail = {"error": {"message": f"model '{error_model}' not found"}}
+    if provider_returned:
+        exc._aawm_provider_returned = True
+
+    result = candidate_loop._classify_codex_cohere_candidate_failure(
+        exc,
+        candidate={
+            "provider": "cohere",
+            "model": "cohere/command-r",
+            "route_family": "codex_cohere_chat_completions_adapter",
+        },
+        is_codex_alias=True,
+        attempted_provider_call=attempted_provider_call,
+    )
+
+    assert result == "provider_terminal_error"
 
 
 @pytest.mark.parametrize(

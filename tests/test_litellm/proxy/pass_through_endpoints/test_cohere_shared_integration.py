@@ -31,6 +31,7 @@ from litellm.proxy.pass_through_endpoints.success_handler import (
 
 _COHERE_CHAT_URL = httpx.URL("https://api.cohere.com/v2/chat")
 _COHERE_MODEL = "cohere/north-mini-code-1-0"
+_COHERE_UPSTREAM_MODEL = "north-mini-code-1-0"
 _COHERE_ROUTE_FAMILY = "codex_cohere_chat_completions_adapter"
 
 
@@ -62,11 +63,14 @@ def _structured_cohere_error(
     message: str,
     *,
     nested: bool = False,
+    provider_returned: bool = False,
 ) -> Exception:
     exc = Exception("Cohere request failed")
     exc.detail = (
         {"error": {"message": message}} if nested else {"message": message}
     )
+    if provider_returned:
+        exc._aawm_provider_returned = True
     return exc
 
 
@@ -160,15 +164,19 @@ def _selection_runtime():
         ),
         (
             404,
-            _structured_cohere_error("model 'command-r' is retired"),
+            _structured_cohere_error(
+                f"model '{_COHERE_UPSTREAM_MODEL}' is retired",
+                provider_returned=True,
+            ),
             "cohere_model_unavailable",
             "model_unavailable",
         ),
         (
             404,
             _structured_cohere_error(
-                "finetuned model command-r-custom not found",
+                f"finetuned model {_COHERE_UPSTREAM_MODEL} not found",
                 nested=True,
+                provider_returned=True,
             ),
             "cohere_model_unavailable",
             "model_unavailable",
@@ -176,8 +184,9 @@ def _selection_runtime():
         (
             400,
             _structured_cohere_error(
-                "invalid request: model 'command-r' is not supported by "
-                "the generate API"
+                f"invalid request: model '{_COHERE_UPSTREAM_MODEL}' is not "
+                "supported by the generate API",
+                provider_returned=True,
             ),
             "cohere_model_unavailable",
             "model_unavailable",
@@ -185,9 +194,10 @@ def _selection_runtime():
         (
             400,
             _structured_cohere_error(
-                "finetuned model with name command-r-custom is not ready "
-                "for serving",
+                f"finetuned model with name {_COHERE_UPSTREAM_MODEL} is not "
+                "ready for serving",
                 nested=True,
+                provider_returned=True,
             ),
             "cohere_model_unavailable",
             "model_unavailable",
@@ -218,6 +228,10 @@ def test_cohere_failure_classifier_covers_shared_failure_vocabulary(
         custom_llm_provider="cohere",
         status_code=status_code,
         exc=exc,
+        attempted_provider_call=True,
+        provider_returned=getattr(exc, "_aawm_provider_returned", False) is True,
+        route_family=_COHERE_ROUTE_FAMILY,
+        selected_upstream_model=_COHERE_UPSTREAM_MODEL,
     )
 
     assert classification is not None
@@ -236,6 +250,14 @@ def test_cohere_failure_classifier_covers_shared_failure_vocabulary(
         (
             404,
             _structured_cohere_error("model not found"),
+            "cohere_provider_failure",
+        ),
+        (
+            404,
+            _structured_cohere_error(
+                "model 'different-model' not found",
+                provider_returned=True,
+            ),
             "cohere_provider_failure",
         ),
         (
@@ -265,6 +287,10 @@ def test_cohere_model_unavailable_requires_structured_model_bound_evidence(
         custom_llm_provider="cohere",
         status_code=status_code,
         exc=exc,
+        attempted_provider_call=True,
+        provider_returned=getattr(exc, "_aawm_provider_returned", False) is True,
+        route_family=_COHERE_ROUTE_FAMILY,
+        selected_upstream_model=_COHERE_UPSTREAM_MODEL,
     )
 
     assert classification is not None
@@ -284,6 +310,56 @@ def test_cohere_failure_classifier_redacts_upstream_secret_details() -> None:
     assert classification is not None
     assert secret not in classification.log_error_summary
     assert secret not in repr(classification)
+
+
+@pytest.mark.parametrize(
+    ("url", "route_family", "expected"),
+    [
+        (
+            httpx.URL("https://api.cohere.com/v1/chat"),
+            _COHERE_ROUTE_FAMILY,
+            "cohere_provider_failure",
+        ),
+        (
+            _COHERE_CHAT_URL,
+            "other_cohere_route",
+            "cohere_provider_failure",
+        ),
+        (
+            httpx.URL("https://openrouter.ai/api/v1/chat/completions"),
+            _COHERE_ROUTE_FAMILY,
+            None,
+        ),
+    ],
+)
+def test_cohere_model_unavailable_requires_native_codex_route_context(
+    url: httpx.URL,
+    route_family: str,
+    expected: str | None,
+) -> None:
+    exc = _structured_cohere_error(
+        f"model '{_COHERE_UPSTREAM_MODEL}' not found",
+        provider_returned=True,
+    )
+    classification = classify_cohere_failure(
+        url=url,
+        custom_llm_provider="openrouter"
+        if "openrouter" in str(url)
+        else "cohere",
+        status_code=404,
+        exc=exc,
+        attempted_provider_call=True,
+        provider_returned=True,
+        route_family=route_family,
+        selected_upstream_model=_COHERE_UPSTREAM_MODEL,
+    )
+
+    if expected is None:
+        assert classification is None
+    else:
+        assert classification is not None
+        assert classification.name == expected
+        assert classification.failure_class != "model_unavailable"
 
 
 def test_cohere_classifier_requires_an_exact_cohere_host() -> None:
