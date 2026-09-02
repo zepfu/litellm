@@ -931,8 +931,12 @@ a standard response cost or callback generation cost.
 
 `public.rate_limit_observations` stores provider quota, rate-limit, and billing
 snapshots discovered during normal request logging and quota probes. The
-canonical grouping fields are `provider`, `client`, `account_hash`, `model`,
-`quota_key`, `quota_period`, `quota_type`, and `source`.
+snapshot attribution fields include `provider`, `client`, `account_hash`, `model`,
+`quota_key`, `quota_period`, `quota_type`, and `source`. The latest-observation
+identity used for predecessor lookup and deduplication is
+`(quota_key, provider, client, account_hash, source)`; `model` does not split
+that quota stream. The migration's index represents nullable identity values as
+`n:` for NULL and `v:<value>` for non-NULL values.
 
 Locally counted accepted calls are an event ledger, not a snapshot table.
 `public.locally_counted_accepted_calls` stores one immutable row per
@@ -962,6 +966,91 @@ Provider-specific fields that do not fit a stable column live in
 signals, source fields, and interpretation notes that explain how the snapshot
 was classified. These JSONB fields must not contain credentials, account ids,
 authorization headers, prompt bodies, response text, or raw tool arguments.
+
+### Latest-observation identity index
+
+D1-678 requires an operator-applied migration because request-time schema DDL
+is disabled. Apply it only to exact database `aawm_tristore`:
+
+```bash
+psql --set=ON_ERROR_STOP=1 \
+  --set=expected_database=aawm_tristore \
+  --dbname=aawm_tristore \
+  --file=scripts/apply_rate_limit_observation_identity_index_2026_09_02.sql
+```
+
+The command is an operator-only apply step and is not run by request-time
+schema readiness or by this source-validation patch. Live catalog and
+`EXPLAIN` evidence remain separate post-apply acceptance gates.
+
+The script takes a session advisory lock, keeps the existing canonical index
+available while it builds a separately named replacement with `CREATE INDEX
+CONCURRENTLY`, verifies the replacement is valid and has the exact nullable-safe
+identity/order, then drops the old index concurrently and renames the
+replacement. It performs no row update, delete, backfill, or table rewrite.
+
+An interrupted concurrent build can leave an invalid replacement index; rerun
+the same command to drop that invalid replacement concurrently and rebuild it.
+An interruption after the replacement validates or after the old index is
+dropped leaves the valid replacement usable; rerun reuses it and completes the
+rename. A completed prior run is a no-op.
+
+Verify the exact database, validity flags, and definition:
+
+```sql
+SELECT current_database();
+
+SELECT index_rel.relname AS index_name,
+       ix.indisvalid,
+       ix.indisready,
+       ix.indislive,
+       pg_get_indexdef(index_rel.oid) AS index_definition
+FROM pg_catalog.pg_index AS ix
+JOIN pg_catalog.pg_class AS index_rel
+    ON index_rel.oid = ix.indexrelid
+JOIN pg_catalog.pg_class AS table_rel
+    ON table_rel.oid = ix.indrelid
+JOIN pg_catalog.pg_namespace AS table_ns
+    ON table_ns.oid = table_rel.relnamespace
+WHERE table_ns.nspname = 'public'
+  AND table_rel.relname = 'rate_limit_observations'
+  AND index_rel.relname = 'rate_limit_observations_identity_latest_idx';
+```
+
+Rollback uses the same coexistence order: build the previous definition under
+a temporary name, verify it, then remove the D1-678 index and promote the
+rollback index. Run only after confirming `current_database()` is
+`aawm_tristore` and `to_regclass('public.rate_limit_observations')` resolves
+the expected table:
+
+```sql
+CREATE INDEX CONCURRENTLY rate_limit_observations_identity_latest_rollback_idx
+    ON public.rate_limit_observations (
+        provider,
+        client,
+        account_hash,
+        quota_key,
+        source,
+        model,
+        observed_at DESC
+    );
+
+SELECT ix.indisvalid,
+       ix.indisready,
+       ix.indislive,
+       pg_get_indexdef(index_rel.oid) AS index_definition
+FROM pg_catalog.pg_index AS ix
+JOIN pg_catalog.pg_class AS index_rel
+    ON index_rel.oid = ix.indexrelid
+WHERE index_rel.oid =
+    'public.rate_limit_observations_identity_latest_rollback_idx'::regclass;
+
+DROP INDEX CONCURRENTLY
+    IF EXISTS public.rate_limit_observations_identity_latest_idx;
+
+ALTER INDEX public.rate_limit_observations_identity_latest_rollback_idx
+    RENAME TO rate_limit_observations_identity_latest_idx;
+```
 
 ### Rate-limit observation retention (D1-679)
 

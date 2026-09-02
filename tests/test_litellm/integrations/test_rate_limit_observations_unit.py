@@ -35,6 +35,7 @@ adds the A3A façades.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -53,6 +54,12 @@ from litellm.integrations.aawm_agent_identity import (
 # future relative to this instant, so no observation is dropped as "stale"
 # (the extractor discards resets older than the 15-minute stale tolerance).
 OBSERVED_AT = datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)
+REPO_ROOT = Path(__file__).resolve().parents[3]
+D1_678_INDEX_MIGRATION = (
+    REPO_ROOT
+    / "scripts/apply_rate_limit_observation_identity_index_2026_09_02.sql"
+)
+D1_678_DOCS = REPO_ROOT / "docs/aawm-session-history.md"
 
 # Environment variables that `_build_session_runtime_identity` reads (with
 # allow_runtime=True) to populate the observation `environment` field. Cleared
@@ -960,3 +967,176 @@ async def test_rate_limit_persistence_locks_before_predecessor_read() -> None:
     assert "pg_advisory_xact_lock" in events[1][1]
     assert "WITH candidate AS" in events[2][1]
     assert "INSERT INTO public.rate_limit_observations" in events[3][1]
+
+
+def _d1_678_index_migration_sql() -> str:
+    return D1_678_INDEX_MIGRATION.read_text(encoding="utf-8")
+
+
+def _d1_678_docs_section() -> str:
+    document = D1_678_DOCS.read_text(encoding="utf-8")
+    return document.split("### Latest-observation identity index", 1)[1].split(
+        "\n### ", 1
+    )[0]
+
+
+def test_d1_678_index_migration_guards_exact_target_database() -> None:
+    migration = _d1_678_index_migration_sql()
+
+    assert D1_678_INDEX_MIGRATION.is_file()
+    assert r"\set ON_ERROR_STOP on" in migration
+    assert r"\if :{?expected_database}" in migration
+    assert "NULLIF(btrim(:'expected_database'), '') = 'aawm_tristore'" in migration
+    assert "current_database() = 'aawm_tristore'" in migration
+    assert "public.rate_limit_observations does not exist" in migration
+    assert (
+        "pg_catalog.to_regclass('public.rate_limit_observations') IS NOT NULL"
+        in migration
+    )
+    assert "table_rel.relkind = 'r'" in migration
+    assert "index_rel.relkind = 'i'" in migration
+    assert migration.index(":d1_678_database_guard_statement;") < migration.index(
+        "pg_advisory_lock("
+    )
+    assert migration.index(":d1_678_table_guard_statement;") < migration.index(
+        "pg_advisory_lock("
+    )
+
+
+def test_d1_678_index_migration_uses_concurrent_coexistence_swap() -> None:
+    migration = _d1_678_index_migration_sql()
+    create = (
+        "CREATE INDEX CONCURRENTLY "
+        "rate_limit_observations_identity_latest_d1_678_idx"
+    )
+    drop_old = (
+        "DROP INDEX CONCURRENTLY IF EXISTS\n"
+        "    public.rate_limit_observations_identity_latest_idx;"
+    )
+    drop_replacement = (
+        "DROP INDEX CONCURRENTLY IF EXISTS\n"
+        "    public.rate_limit_observations_identity_latest_d1_678_idx;"
+    )
+    rename = (
+        "ALTER INDEX public.rate_limit_observations_identity_latest_d1_678_idx\n"
+        "    RENAME TO rate_limit_observations_identity_latest_idx;"
+    )
+
+    assert create in migration
+    assert drop_replacement in migration
+    assert drop_old in migration
+    assert rename in migration
+    assert migration.index(drop_replacement) < migration.index(create)
+    assert migration.index(create) < migration.index(drop_old)
+    assert migration.index(":d1_678_replacement_guard_statement;") < migration.index(
+        drop_old
+    )
+    assert migration.index(drop_old) < migration.index(rename)
+    assert "BEGIN;" not in migration
+    assert "COMMIT;" not in migration
+    assert (
+        "CREATE INDEX rate_limit_observations_identity_latest_d1_678_idx"
+        not in migration
+    )
+    assert (
+        "DROP INDEX IF EXISTS\n    public.rate_limit_observations_identity_latest_idx"
+        not in migration
+    )
+
+
+def test_d1_678_index_migration_matches_nullable_identity_order() -> None:
+    migration = _d1_678_index_migration_sql()
+    create_marker = (
+        "CREATE INDEX CONCURRENTLY "
+        "rate_limit_observations_identity_latest_d1_678_idx"
+    )
+    create_block = migration.split(create_marker, 1)[1].split(";", 1)[0]
+
+    assert "ON public.rate_limit_observations" in create_block
+    assert "quota_key,\n        provider," in create_block
+    assert "CASE WHEN client IS NULL THEN 'n:' ELSE 'v:' || client END" in create_block
+    assert "WHEN account_hash IS NULL THEN 'n:'" in create_block
+    assert "ELSE 'v:' || account_hash" in create_block
+    assert "CASE WHEN source IS NULL THEN 'n:' ELSE 'v:' || source END" in create_block
+    assert "observed_at DESC,\n        id DESC" in create_block
+    assert "model" not in create_block
+    assert "indnkeyatts = 7" in migration
+    assert "pg_get_indexdef(target.indexrelid, 7, false)" in migration
+
+
+def test_d1_678_index_migration_is_retry_safe_and_validates_before_drop() -> None:
+    migration = _d1_678_index_migration_sql()
+    replacement_if = migration.index("\\if :d1_678_replacement_ready")
+    replacement_else = migration.index("\\else", replacement_if)
+    rebuild_end = migration.index("\\endif", replacement_else)
+
+    assert "d1_678_canonical_ready" in migration
+    assert "d1_678_replacement_ready" in migration
+    assert "reusing valid replacement index from an earlier attempt" in migration
+    assert (
+        "reusing valid replacement index from an earlier attempt"
+        in migration[replacement_if:replacement_else]
+    )
+    assert (
+        "DROP INDEX CONCURRENTLY IF EXISTS"
+        not in migration[replacement_if:replacement_else]
+    )
+    assert (
+        "DROP INDEX CONCURRENTLY IF EXISTS"
+        in migration[replacement_else:rebuild_end]
+    )
+    assert (
+        "DROP INDEX CONCURRENTLY IF EXISTS\n"
+        "    public.rate_limit_observations_identity_latest_d1_678_idx;"
+        in migration
+    )
+    for flag in ("indisvalid", "indisready", "indislive"):
+        assert migration.count(flag) >= 4
+    assert migration.index(":d1_678_replacement_guard_statement;") < migration.index(
+        "DROP INDEX CONCURRENTLY IF EXISTS\n"
+        "    public.rate_limit_observations_identity_latest_idx;"
+    )
+    assert migration.index(":d1_678_final_guard_statement;") < migration.index(
+        "pg_advisory_unlock("
+    )
+    assert migration.count("pg_advisory_unlock(") == 1
+    assert migration.index("pg_advisory_unlock(") < migration.index(
+        "SELECT\n    current_database()"
+    )
+
+
+def test_d1_678_index_migration_does_not_rewrite_observation_history() -> None:
+    migration = _d1_678_index_migration_sql().upper()
+
+    for forbidden in (
+        "ALTER TABLE",
+        "CREATE TABLE",
+        "DELETE FROM",
+        "INSERT INTO",
+        "TRUNCATE",
+        "UPDATE PUBLIC.RATE_LIMIT_OBSERVATIONS",
+    ):
+        assert forbidden not in migration
+
+
+def test_d1_678_docs_cover_apply_verify_retry_and_rollback() -> None:
+    section = _d1_678_docs_section()
+
+    assert (
+        "psql --set=ON_ERROR_STOP=1 \\\n"
+        "  --set=expected_database=aawm_tristore \\\n"
+        "  --dbname=aawm_tristore \\\n"
+        "  --file=scripts/apply_rate_limit_observation_identity_index_2026_09_02.sql"
+        in section
+    )
+    assert "An interrupted concurrent build can leave an invalid replacement index" in section
+    assert "A completed prior run is a no-op." in section
+    assert "SELECT current_database();" in section
+    assert "pg_get_indexdef(index_rel.oid)" in section
+    assert (
+        "CREATE INDEX CONCURRENTLY "
+        "rate_limit_observations_identity_latest_rollback_idx"
+        in section
+    )
+    assert "DROP INDEX CONCURRENTLY" in section
+    assert "RENAME TO rate_limit_observations_identity_latest_idx" in section
