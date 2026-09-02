@@ -313,6 +313,57 @@ def test_cursor_subagent_accepts_default_optional_fields_through_spawn_agent(
     assert len(external_exec_requests) == 1
 
 
+@pytest.mark.parametrize(
+    "duplicate_default_fields",
+    [
+        cursor_connect._encode_proto_varint_field(
+            7,
+            0,
+            include_default=True,
+        )
+        + cursor_connect._encode_proto_varint_field(
+            7,
+            0,
+            include_default=True,
+        ),
+        cursor_connect._encode_proto_string_field(
+            9,
+            "",
+            include_empty=True,
+        )
+        + cursor_connect._encode_proto_string_field(
+            9,
+            "",
+            include_empty=True,
+        ),
+    ],
+    ids=["run-in-background-false", "parent-conversation-empty"],
+)
+def test_cursor_subagent_rejects_repeated_default_optional_fields_without_leaking(
+    duplicate_default_fields: bytes,
+) -> None:
+    external_exec_requests: list[dict[str, Any]] = []
+
+    with pytest.raises(
+        CursorConnectProtocolError,
+        match="repeated safe scalar field",
+    ) as exc_info:
+        cursor_connect._process_agent_server_message(
+            _cursor_subagent_server_message(
+                _cursor_subagent_args(extra=duplicate_default_fields),
+            ),
+            {},
+            spawn_agent_tool_definition=_advertised_spawn_agent_definition(),
+            external_exec_requests=external_exec_requests,
+        )
+
+    assert external_exec_requests == []
+    assert "Inspect the requested files" not in exc_info.value.message
+    assert "Inspect the requested files" not in json.dumps(
+        exc_info.value.body or {}
+    )
+
+
 def test_cursor_subagent_requires_unambiguous_advertised_spawn_agent() -> None:
     external_exec_requests: list[dict[str, Any]] = []
     definition = _advertised_spawn_agent_definition()

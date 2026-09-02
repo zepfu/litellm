@@ -2455,7 +2455,7 @@ def _decode_subagent_request(
             + "."
         )
 
-    for field_number in range(1, 6):
+    for field_number in (1, 2, 3, 4, 5, 7, 9):
         if len(_proto_field_values(args_fields, field_number)) > 1:
             raise CursorConnectProtocolError(
                 "Cursor Agent subagent operation contains a repeated safe scalar field."
