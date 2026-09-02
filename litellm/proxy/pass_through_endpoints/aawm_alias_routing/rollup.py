@@ -377,6 +377,7 @@ def _record_auto_agent_alias_route_status_rollup(  # noqa: PLR0915
                     candidate_event["status"] = candidate_event.get("outcome")
             candidate_entries.append((label, candidate_event))
 
+    has_candidate_local_attribution = bool(candidate_entries)
     if not candidate_entries:
         if status is None:
             return
@@ -419,7 +420,7 @@ def _record_auto_agent_alias_route_status_rollup(  # noqa: PLR0915
     )
     from litellm.proxy.aawm_route_logging import _AawmRouteRollupOriginIdentity
 
-    for label, candidate_event in candidate_entries:
+    for candidate_index, (label, candidate_event) in enumerate(candidate_entries):
         candidate_status = (
             status
             if candidate_event is event
@@ -485,6 +486,13 @@ def _record_auto_agent_alias_route_status_rollup(  # noqa: PLR0915
             if candidate_origin_identity is None
             else {"origin_identity": candidate_origin_identity}
         )
+        request_status_kwargs = (
+            {"request_status": status}
+            if has_candidate_local_attribution
+            and candidate_index == len(candidate_entries) - 1
+            and status is not None
+            else {}
+        )
         record_aawm_route_rollup(
             group_header_label=group_header_label,
             incoming_endpoint=incoming_endpoint,
@@ -494,6 +502,7 @@ def _record_auto_agent_alias_route_status_rollup(  # noqa: PLR0915
             turns=0,
             status=candidate_status,
             message=_clean_codex_auth_value(candidate_event.get("source_error")),
+            **request_status_kwargs,
             **candidate_origin_kwargs,
         )
 

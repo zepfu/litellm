@@ -1331,6 +1331,7 @@ _AAWM_ROUTE_ROLLUP_STATUS_VALUES = (
     "Cooling Down",
     "Failed",
     "Exhausted",
+    "Ineligible",
     "Incomplete",
     "Recovered",
 )
@@ -2089,6 +2090,7 @@ class AawmRouteRollupAccumulator:
         turns: int = 1,
         status: Optional[str] = None,
         message: Optional[str] = None,
+        request_status: Optional[str] = None,
         origin_identity: Optional[_AawmRouteRollupOriginIdentity] = None,
         review_decision: Optional[AawmReviewDecision] = None,
         review_correlation: Optional[_AawmRouteRollupReviewCorrelation] = None,
@@ -2111,6 +2113,7 @@ class AawmRouteRollupAccumulator:
             return []
 
         normalized_status = _normalize_aawm_route_rollup_status(status)
+        normalized_request_status = _normalize_aawm_route_rollup_status(request_status)
         emitted_lines: list[str] = []
         if (
             review_decision is not None
@@ -2190,6 +2193,19 @@ class AawmRouteRollupAccumulator:
             message=cleaned_message,
             origin_identity=origin_identity,
         )
+
+        if normalized_request_status in _AAWM_ROUTE_ROLLUP_REQUEST_TERMINAL_STATUS_VALUES:
+            group.event_sequence += 1
+            group.record_request_terminal_status(
+                status=normalized_request_status,
+                sequence=group.event_sequence,
+                message=None,
+                request_identity=(
+                    origin_identity.litellm_call_id
+                    if origin_identity is not None
+                    else None
+                ),
+            )
 
         emitted_lines.extend(self.flush_due(now=now))
         return emitted_lines
@@ -2913,6 +2929,7 @@ def record_aawm_route_rollup(
     turns: int = 1,
     status: Optional[str] = None,
     message: Optional[str] = None,
+    request_status: Optional[str] = None,
     origin_identity: Optional[_AawmRouteRollupOriginIdentity] = None,
     review_decision: Optional[AawmReviewDecision] = None,
     review_correlation: Optional[_AawmRouteRollupReviewCorrelation] = None,
@@ -2931,6 +2948,7 @@ def record_aawm_route_rollup(
             turns=turns,
             status=status,
             message=message,
+            request_status=request_status,
             origin_identity=origin_identity,
             review_decision=review_decision,
             review_correlation=review_correlation,
