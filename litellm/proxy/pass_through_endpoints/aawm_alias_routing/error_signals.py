@@ -53,6 +53,8 @@ from .policy import (
     CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS as _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS as _CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
     CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS as _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS,
+    CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS as _CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS,
+    CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_COOLDOWN_SECONDS as _CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_COOLDOWN_SECONDS,
     CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY as _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
     CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER as _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
     CODEX_AUTO_AGENT_NATIVE_PROVIDER as _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
@@ -992,6 +994,8 @@ def _plan_codex_auto_agent_native_grok_continuation_transient_retry(
 
 
 def _get_codex_auto_agent_cooldown_scope(error_class: Optional[str]) -> str:
+    if error_class == _CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS:
+        return "candidate"
     if error_class == _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CLASS:
         return "none"
     if _is_codex_auto_agent_durable_cooldown_error_class(error_class):
@@ -1005,6 +1009,8 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
     candidate: Optional[dict[str, Any]] = None,
     kimi_failure_metadata: Optional[dict[str, Any]] = None,
 ) -> str:
+    if error_class == _CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS:
+        return "candidate"
     if error_class == _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CLASS:
         return "none"
     if error_class in _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES:
@@ -1137,6 +1143,9 @@ def _is_codex_auto_agent_grok_account_quota_exhaustion(
 _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CLASS = (
     "candidate_deterministically_ineligible"
 )
+_CURSOR_SESSION_CONTINUATION_FAILURE_MARKER = (
+    "_cursor_session_continuation_failure"
+)
 _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CODE = (
     "aawm_codex_auto_agent_candidate_ineligible"
 )
@@ -1167,6 +1176,18 @@ def _is_codex_auto_agent_candidate_deterministically_ineligible(exc: Any) -> boo
                 == _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CODE
             )
         )
+    )
+
+
+def _is_codex_auto_agent_continuation_state_unavailable(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Recognize the explicit Cursor-owned retained-session failure signal."""
+    return bool(
+        _is_codex_auto_agent_cursor_agent_candidate(candidate)
+        and getattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, False)
     )
 
 
@@ -1431,6 +1452,11 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     candidate: Optional[dict[str, Any]] = None,
     attempted_provider_call: bool = True,
 ) -> Optional[str]:
+    if _is_codex_auto_agent_continuation_state_unavailable(
+        exc,
+        candidate=candidate,
+    ):
+        return _CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS
     if _is_codex_auto_agent_candidate_deterministically_ineligible(exc):
         return _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CLASS
     assert _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS is not None
@@ -1660,6 +1686,8 @@ def _get_codex_auto_agent_cooldown_seconds(
         candidate=candidate,
         attempted_provider_call=attempted_provider_call,
     )
+    if error_class == _CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS:
+        return _CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_COOLDOWN_SECONDS
     if error_class in _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES:
         return _resolve_alibaba_token_plan_exhaustion_cooldown_seconds()
     tokens = _extract_codex_auto_agent_error_tokens(exc)

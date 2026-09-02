@@ -35,6 +35,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_FIVE_HOUR_EXHAUSTED_ERROR_CLASS,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTED_ERROR_CLASS,
+    CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
     AliasRoutingStateManager,
@@ -738,6 +739,46 @@ class TestApplyAutoAgentAliasCooldown:
         )
         assert result == "candidate"
         setter.assert_awaited_once_with("ck", 120.0)
+
+    @pytest.mark.asyncio
+    async def test_cursor_continuation_scope_publishes_selected_key_only_before_provider_call(
+        self, configured_runtime: dict
+    ) -> None:
+        configured_runtime["scope_fn"].return_value = "candidate"
+        configured_runtime["gate"]._decision = _FakeDecision(should_cool=False)
+        selected_key = "cursor_agent:cursor-grok-4.6-high"
+        setter = AsyncMock()
+        candidate = {
+            "provider": "cursor_agent",
+            "model": "cursor_agent/cursor-grok-4.6-high",
+            "route_family": "codex_cursor_agent_aiserver_adapter",
+            "codex_oauth_account_label": "account-1",
+            "codex_oauth_account_hash": "account-hash-1",
+            "codex_oauth_lane_key": "cursor_agent_cli",
+        }
+
+        result = await _apply_codex_failure_evidence_cooldown(
+            canonical_alias="codex-auto-agent",
+            request=_make_request(),
+            candidate=candidate,
+            lane_key="cursor_agent_cli",
+            selected_cooldown_key=selected_key,
+            cooldown_seconds=300.0,
+            error_class=CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS,
+            set_candidate_cooldown=setter,
+        )
+
+        assert result == "candidate"
+        setter.assert_awaited_once_with(selected_key, 300.0)
+        assert configured_runtime["gate"].current_calls == []
+        assert set(configured_runtime["mgr"].codex.cooldown_until_monotonic_by_key) == {
+            selected_key
+        }
+        assert configured_runtime["mgr"].anthropic.cooldown_until_monotonic_by_key == {}
+        assert (
+            configured_runtime["mgr"].codex.get_memory_cooldown_remaining(selected_key)
+            > 299.0
+        )
 
     @pytest.mark.asyncio
     async def test_candidate_scope_grok_quota_adds_lane_key(

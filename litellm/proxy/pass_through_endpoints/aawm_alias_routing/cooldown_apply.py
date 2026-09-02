@@ -27,6 +27,7 @@ from .interfaces import CooldownPublicationPlan
 from .policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES,
+    CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS,
 )
 from .types import Payload
 
@@ -218,6 +219,7 @@ def _resolve_auto_agent_cooldown_publication_plan(
     if (
         codex_failure_evidence_alias is not None
         and cooldown_scope not in {"none", "request_local"}
+        and error_class != CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS
     ):
         assert _codex_failure_evidence_gate is not None
         decision = _codex_failure_evidence_gate.current_decision(

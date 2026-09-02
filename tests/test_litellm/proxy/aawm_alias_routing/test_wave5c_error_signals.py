@@ -30,6 +30,8 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTED_ERROR_CLASS,
+    CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_COOLDOWN_SECONDS,
+    CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals import (
     _add_codex_auto_agent_text_error_tokens,
@@ -1144,6 +1146,92 @@ class TestKimiMetadata:
 
 
 class TestCooldownScope:
+    def test_cursor_retained_session_marker_is_candidate_scoped_before_provider_call(
+        self,
+    ) -> None:
+        exc = _FakeExc(
+            message="Cursor retained session unavailable",
+            status_code=409,
+        )
+        exc._tokens = set()
+        setattr(
+            exc,
+            error_signals._CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
+            True,
+        )
+
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=_CURSOR_CANDIDATE,
+                attempted_provider_call=False,
+            )
+            == CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS
+        )
+        assert (
+            _get_codex_auto_agent_candidate_cooldown_scope(
+                CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS,
+                candidate=_CURSOR_CANDIDATE,
+            )
+            == "candidate"
+        )
+        assert (
+            _get_codex_auto_agent_cooldown_seconds(
+                exc,
+                candidate=_CURSOR_CANDIDATE,
+                attempted_provider_call=False,
+            )
+            == CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_COOLDOWN_SECONDS
+            == 300.0
+        )
+
+    def test_cursor_marker_requires_cursor_provider_and_unmarked_local_defect_stays_none(
+        self,
+    ) -> None:
+        marked = _FakeExc(message="retained session unavailable", status_code=409)
+        marked._tokens = set()
+        setattr(
+            marked,
+            error_signals._CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
+            True,
+        )
+        foreign_candidate = dict(_CURSOR_CANDIDATE, provider="openai")
+
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                marked,
+                candidate=foreign_candidate,
+                attempted_provider_call=False,
+            )
+            is None
+        )
+
+        local_defect = _FakeExc(
+            message="local tool schema validation rejected the replay",
+            detail={
+                "error": {
+                    "code": _CANDIDATE_INELIGIBILITY_CODE,
+                }
+            },
+        )
+        local_defect.candidate_status = "ineligible"
+        local_defect.ineligibility_reason = "preflight_skipped"
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                local_defect,
+                candidate=_CURSOR_CANDIDATE,
+                attempted_provider_call=False,
+            )
+            == _CANDIDATE_INELIGIBILITY_CLASS
+        )
+        assert (
+            _get_codex_auto_agent_candidate_cooldown_scope(
+                _CANDIDATE_INELIGIBILITY_CLASS,
+                candidate=_CURSOR_CANDIDATE,
+            )
+            == "none"
+        )
+
     def test_deterministic_ineligibility_has_no_cooldown_scope(self):
         assert (
             _get_codex_auto_agent_cooldown_scope(_CANDIDATE_INELIGIBILITY_CLASS)

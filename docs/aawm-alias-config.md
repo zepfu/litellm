@@ -280,6 +280,16 @@ boundary. The transient marker may therefore affect later fresh requests during
 its bounded TTL, but it is not a durable cooldown record. This is distinct from
 provider failures, which use the normal retry and cooldown classification.
 
+A Cursor Agent candidate that raises the explicit retained-session continuation
+marker is the bounded exception to that deterministic preflight rule. It is
+classified as `continuation_state_unavailable`, records
+`attempted_provider_call: false`, and publishes a candidate-scoped 300-second
+cooldown for the selected provider/model candidate identity. The cooldown
+targets only that candidate's existing state key, so sibling models,
+providers, accounts, and route families remain eligible. An unmarked local
+replay or tool-schema validation defect remains
+`candidate_deterministically_ineligible` with `cooldown_scope: none`.
+
 Upstream-origin evidence authorization is separate from provider-derived
 duration and monotonic TTL handling. Only evidence attributable to the upstream
 provider may advance provider evidence; client-origin, deterministic,

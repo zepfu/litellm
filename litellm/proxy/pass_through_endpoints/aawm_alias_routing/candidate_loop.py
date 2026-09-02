@@ -247,9 +247,15 @@ def _mark_request_terminal_error_emitted(request: Any) -> None:
         pass
 
 
-def _is_cursor_session_continuation_failure(exc: Any) -> bool:
+def _is_cursor_session_continuation_failure(
+    exc: Any,
+    *,
+    candidate: Optional[Mapping[str, Any]] = None,
+) -> bool:
     return bool(
-        getattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, False)
+        isinstance(candidate, Mapping)
+        and candidate.get("provider") == "cursor_agent"
+        and getattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, False)
     )
 
 
@@ -941,7 +947,7 @@ async def handle_alias_route(  # noqa: PLR0915
             attempted_provider_call = getattr(exc, "attempted_provider_call", True)
         attempted_provider_call = bool(attempted_provider_call)
         terminal_exc: Optional[HTTPException] = None
-        if _is_cursor_session_continuation_failure(exc):
+        if _is_cursor_session_continuation_failure(exc, candidate=candidate):
             detail = getattr(exc, "detail", None)
             if not isinstance(detail, dict):
                 detail = {
@@ -1975,13 +1981,33 @@ async def handle_alias_route(  # noqa: PLR0915
                     attempt_record[
                         _CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD
                     ] = cursor_sanitized_proto_structure
-                if _is_cursor_session_continuation_failure(failure_exc):
+                if _is_cursor_session_continuation_failure(
+                    failure_exc,
+                    candidate=candidate,
+                ):
+                    continuation_error_class = (
+                        _classify_codex_auto_agent_retryable_exhaustion(
+                            failure_exc,
+                            candidate=candidate,
+                            attempted_provider_call=attempted_provider_call,
+                        )
+                        or "continuation_state_unavailable"
+                    )
+                    continuation_plan = probe_failure_plan
                     _update_codex_auto_agent_retryable_attempt_record(
                         attempt_record=attempt_record,
                         exc=failure_exc,
-                        error_class="candidate_deterministically_ineligible",
-                        cooldown_seconds=0.0,
-                        cooldown_scope="none",
+                        error_class=continuation_error_class,
+                        cooldown_seconds=(
+                            continuation_plan.duration_seconds
+                            if continuation_plan is not None
+                            else 0.0
+                        ),
+                        cooldown_scope=(
+                            continuation_plan.applied_scope
+                            if continuation_plan is not None
+                            else "none"
+                        ),
                         alias_model=alias_model,
                         candidate=candidate,
                     )
@@ -1993,7 +2019,7 @@ async def handle_alias_route(  # noqa: PLR0915
                         selection=selection,
                         attempts=attempts,
                         attempt_record=attempt_record,
-                        error_class="candidate_deterministically_ineligible",
+                        error_class=continuation_error_class,
                         add_alias_metadata_fn=add_alias_metadata_fn,
                     )
                     fresh_fallback_body = (
@@ -2566,10 +2592,10 @@ def _resolve_failure_plan(
     without cooldown-map or durable writes.
     """
     if (
-        _is_cursor_session_continuation_failure(exc)
-        or _error_signals._is_codex_auto_agent_candidate_deterministically_ineligible(
+        _error_signals._is_codex_auto_agent_candidate_deterministically_ineligible(
             exc
         )
+        and not _is_cursor_session_continuation_failure(exc, candidate=candidate)
     ):
         return CooldownPublicationPlan(
             memory_keys=(),

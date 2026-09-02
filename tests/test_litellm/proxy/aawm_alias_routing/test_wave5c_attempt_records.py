@@ -19,6 +19,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_FIVE_HOUR_EXHAUSTED_ERROR_CLASS,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTED_ERROR_CLASS,
+    CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS,
 )
 
 
@@ -337,6 +338,43 @@ class TestRetryableAttemptRecord:
         assert record["status"] == "retryable_no_cooldown"
         assert "cooldown_seconds" not in record
         assert record["cooldown_scope"] == "none"
+
+    def test_cursor_continuation_state_unavailable_records_cooldown_observability(
+        self,
+    ) -> None:
+        record: dict[str, Any] = {"status": "pending"}
+        exc = Exception("Cursor retained session unavailable")
+        exc._status_code = 409  # type: ignore[attr-defined]
+        exc._tokens = set()  # type: ignore[attr-defined]
+        exc._type_code = (  # type: ignore[attr-defined]
+            "cursor_session_continuation",
+            "retained_session_unavailable",
+        )
+        exc._retry_after = None  # type: ignore[attr-defined]
+        exc.failure_phase = "cursor_session_continuation"  # type: ignore[attr-defined]
+        exc.attempted_provider_call = False  # type: ignore[attr-defined]
+
+        attempt_records._update_codex_auto_agent_retryable_attempt_record(
+            attempt_record=record,
+            exc=exc,
+            error_class=CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS,
+            cooldown_seconds=300.0,
+            alias_model="codex-auto-agent",
+            cooldown_scope="candidate",
+            candidate={
+                "provider": "cursor_agent",
+                "model": "cursor_agent/cursor-grok-4.6-high",
+                "route_family": "codex_cursor_agent_aiserver_adapter",
+            },
+        )
+
+        assert record["status"] == "cooldown_set"
+        assert record["error_class"] == "continuation_state_unavailable"
+        assert record["cooldown_scope"] == "candidate"
+        assert record["cooldown_seconds"] == 300.0
+        assert record["attempted_provider_call"] is False
+        assert record["failure_phase"] == "cursor_session_continuation"
+        assert record["source_error"] == "error:409"
 
     @pytest.mark.parametrize(
         ("reason", "attempted_provider_call"),
