@@ -1299,6 +1299,8 @@ def _is_supported_subagent_optional_field(
 ) -> bool:
     if field_number == 7:
         return wire_type == 0 and value == 0
+    if field_number == 19:
+        return wire_type == 0 and value in {0, 1}
     if field_number in _SUBAGENT_IGNORED_STRING_FIELDS and wire_type == 2:
         _decode_proto_string(value)
         return True
@@ -2455,7 +2457,7 @@ def _decode_subagent_request(
             + "."
         )
 
-    for field_number in (1, 2, 3, 4, 5, 7, 9, 16):
+    for field_number in (1, 2, 3, 4, 5, 7, 9, 16, 19):
         if len(_proto_field_values(args_fields, field_number)) > 1:
             raise CursorConnectProtocolError(
                 "Cursor Agent subagent operation contains a repeated safe scalar field."

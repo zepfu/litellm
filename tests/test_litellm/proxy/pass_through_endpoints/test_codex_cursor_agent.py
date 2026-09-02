@@ -359,10 +359,21 @@ def test_cursor_subagent_ignores_parent_state_fields_without_leaking(
             "",
             include_empty=True,
         ),
+        cursor_connect._encode_proto_varint_field(
+            19,
+            0,
+            include_default=True,
+        ),
+        cursor_connect._encode_proto_varint_field(19, 1),
     ],
-    ids=["run-in-background-false", "parent-conversation-empty"],
+    ids=[
+        "run-in-background-false",
+        "parent-conversation-empty",
+        "environment-unspecified",
+        "environment-local",
+    ],
 )
-def test_cursor_subagent_accepts_default_optional_fields_through_spawn_agent(
+def test_cursor_subagent_accepts_supported_optional_fields_through_spawn_agent(
     default_field: bytes,
 ) -> None:
     external_exec_requests: list[dict[str, Any]] = []
@@ -384,7 +395,23 @@ def test_cursor_subagent_accepts_default_optional_fields_through_spawn_agent(
         "message": "Inspect the requested files without changing them.",
     }
     assert client_messages == []
-    assert len(external_exec_requests) == 1
+    assert external_exec_requests == [
+        {
+            "call_id": "subagent-call",
+            "message_field": 28,
+            "exec_fields": [
+                (1, 0, 314),
+                (15, 2, b"exec-014"),
+            ],
+            "request_id": 314,
+            "exec_id": "exec-014",
+            "tool_call_id": "subagent-call",
+            "subagent_type": "explorer",
+            "model_id": "read",
+            "prompt": "Inspect the requested files without changing them.",
+            "readonly": False,
+        }
+    ]
 
 
 @pytest.mark.parametrize(
@@ -438,12 +465,22 @@ def test_cursor_subagent_accepts_default_optional_fields_through_spawn_agent(
             ),
             "root-parent-duplicate-secret",
         ),
+        (
+            cursor_connect._encode_proto_varint_field(
+                19,
+                0,
+                include_default=True,
+            )
+            + cursor_connect._encode_proto_varint_field(19, 1),
+            "Inspect the requested files",
+        ),
     ],
     ids=[
         "run-in-background-false",
         "parent-conversation-empty",
         "parent-conversation-non-empty",
         "root-parent-non-empty",
+        "environment",
     ],
 )
 def test_cursor_subagent_rejects_repeated_optional_fields_without_leaking(
@@ -522,7 +559,6 @@ def test_cursor_subagent_requires_advertised_spawn_agent() -> None:
         (15, "fork-secret"),
         (17, "selected-context-secret"),
         (18, "direct-parent-secret"),
-        (19, "environment-secret"),
         (20, "cloud-branch-secret"),
         (21, "model-parameters-secret"),
     ],
@@ -537,7 +573,6 @@ def test_cursor_subagent_requires_advertised_spawn_agent() -> None:
         "fork",
         "selected-context",
         "direct-parent",
-        "environment",
         "cloud-branch",
         "model-parameters",
     ],
@@ -605,6 +640,36 @@ def test_cursor_subagent_rejects_non_default_optional_fields_without_leaking(
 
 
 @pytest.mark.parametrize(
+    "environment",
+    [2, 3, 99],
+    ids=["cloud", "unknown-three", "unknown-ninety-nine"],
+)
+def test_cursor_subagent_rejects_unsupported_execution_environment_without_leaking(
+    environment: int,
+) -> None:
+    external_exec_requests: list[dict[str, Any]] = []
+
+    with pytest.raises(
+        CursorConnectProtocolError,
+        match="unsupported optional field",
+    ) as exc_info:
+        cursor_connect._process_agent_server_message(
+            _cursor_subagent_server_message(
+                _cursor_subagent_args(
+                    extra=cursor_connect._encode_proto_varint_field(19, environment),
+                ),
+            ),
+            {},
+            spawn_agent_tool_definition=_advertised_spawn_agent_definition(),
+            external_exec_requests=external_exec_requests,
+        )
+
+    assert external_exec_requests == []
+    assert str(environment) not in exc_info.value.message
+    assert str(environment) not in json.dumps(exc_info.value.body or {})
+
+
+@pytest.mark.parametrize(
     ("invalid_field", "not_leaked", "error_match"),
     [
         (
@@ -633,12 +698,21 @@ def test_cursor_subagent_rejects_non_default_optional_fields_without_leaking(
             "root-parent-invalid-utf8-secret",
             "invalid UTF-8",
         ),
+        (
+            cursor_connect._encode_proto_string_field(
+                19,
+                "environment-wire-secret",
+            ),
+            "environment-wire-secret",
+            "unsupported optional field",
+        ),
     ],
     ids=[
         "parent-conversation-wrong-wire",
         "root-parent-wrong-wire",
         "parent-conversation-malformed-string",
         "root-parent-malformed-string",
+        "environment-wrong-wire",
     ],
 )
 def test_cursor_subagent_rejects_invalid_parent_state_fields_without_leaking(
