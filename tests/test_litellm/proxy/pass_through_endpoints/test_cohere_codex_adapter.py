@@ -830,6 +830,51 @@ def test_should_map_codex_cohere_candidate_failures(
 
 
 @pytest.mark.parametrize(
+    ("status_code", "detail"),
+    [
+        (404, "404 page not found"),
+        (404, "model not found"),
+        (400, "invalid request: route is not valid"),
+    ],
+)
+def test_should_keep_unattributed_cohere_4xx_as_terminal(
+    status_code,
+    detail,
+):
+    exc = RuntimeError("Cohere request failed")
+    exc.status_code = status_code
+    exc.detail = {"message": detail}
+
+    result = candidate_loop._classify_codex_cohere_candidate_failure(
+        exc,
+        candidate={
+            "provider": "cohere",
+            "route_family": "codex_cohere_chat_completions_adapter",
+        },
+        is_codex_alias=True,
+    )
+
+    assert result == "provider_terminal_error"
+
+
+def test_should_map_structured_model_bound_cohere_404_to_candidate_unavailable():
+    exc = RuntimeError("Cohere request failed")
+    exc.status_code = 404
+    exc.detail = {"error": {"message": "model 'command-r' not found"}}
+
+    result = candidate_loop._classify_codex_cohere_candidate_failure(
+        exc,
+        candidate={
+            "provider": "cohere",
+            "route_family": "codex_cohere_chat_completions_adapter",
+        },
+        is_codex_alias=True,
+    )
+
+    assert result == "candidate_unavailable"
+
+
+@pytest.mark.parametrize(
     ("candidate", "is_codex_alias"),
     [
         (None, True),

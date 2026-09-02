@@ -58,6 +58,18 @@ def _cohere_candidate(*, route_family: str) -> dict[str, Any]:
     }
 
 
+def _structured_cohere_error(
+    message: str,
+    *,
+    nested: bool = False,
+) -> Exception:
+    exc = Exception("Cohere request failed")
+    exc.detail = (
+        {"error": {"message": message}} if nested else {"message": message}
+    )
+    return exc
+
+
 @pytest.fixture()
 def _selection_runtime():
     runtime_names = {
@@ -148,7 +160,35 @@ def _selection_runtime():
         ),
         (
             404,
-            Exception("model retired"),
+            _structured_cohere_error("model 'command-r' is retired"),
+            "cohere_model_unavailable",
+            "model_unavailable",
+        ),
+        (
+            404,
+            _structured_cohere_error(
+                "finetuned model command-r-custom not found",
+                nested=True,
+            ),
+            "cohere_model_unavailable",
+            "model_unavailable",
+        ),
+        (
+            400,
+            _structured_cohere_error(
+                "invalid request: model 'command-r' is not supported by "
+                "the generate API"
+            ),
+            "cohere_model_unavailable",
+            "model_unavailable",
+        ),
+        (
+            400,
+            _structured_cohere_error(
+                "finetuned model with name command-r-custom is not ready "
+                "for serving",
+                nested=True,
+            ),
             "cohere_model_unavailable",
             "model_unavailable",
         ),
@@ -189,6 +229,49 @@ def test_cohere_failure_classifier_covers_shared_failure_vocabulary(
     assert classification.suppress_traceback is True
 
 
+@pytest.mark.parametrize(
+    ("status_code", "exc", "name"),
+    [
+        (404, Exception("404 page not found"), "cohere_provider_failure"),
+        (
+            404,
+            _structured_cohere_error("model not found"),
+            "cohere_provider_failure",
+        ),
+        (
+            400,
+            _structured_cohere_error("invalid request: route is not valid"),
+            "cohere_validation",
+        ),
+        (
+            404,
+            _structured_cohere_error("route not found"),
+            "cohere_provider_failure",
+        ),
+        (
+            404,
+            Exception("model 'command-r' not found"),
+            "cohere_provider_failure",
+        ),
+    ],
+)
+def test_cohere_model_unavailable_requires_structured_model_bound_evidence(
+    status_code: int,
+    exc: Exception,
+    name: str,
+) -> None:
+    classification = classify_cohere_failure(
+        url=_COHERE_CHAT_URL,
+        custom_llm_provider="cohere",
+        status_code=status_code,
+        exc=exc,
+    )
+
+    assert classification is not None
+    assert classification.name == name
+    assert classification.failure_class == "provider_4xx_other"
+
+
 def test_cohere_failure_classifier_redacts_upstream_secret_details() -> None:
     secret = "cohere-secret-value"
     classification = classify_cohere_failure(
@@ -224,6 +307,15 @@ def test_cohere_classifier_requires_an_exact_cohere_host() -> None:
             custom_llm_provider="openrouter",
             status_code=429,
             exc=Exception("rate limit"),
+        )
+        is None
+    )
+    assert (
+        classify_cohere_failure(
+            url=httpx.URL("https://openrouter.ai/api/v1/chat/completions"),
+            custom_llm_provider="openrouter",
+            status_code=404,
+            exc=_structured_cohere_error("model 'command-r' not found"),
         )
         is None
     )

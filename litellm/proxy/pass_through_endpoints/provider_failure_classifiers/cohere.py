@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 from urllib.parse import urlparse
@@ -30,15 +31,22 @@ _MONTHLY_TRIAL_MARKERS: tuple[str, ...] = (
     "trial usage",
     "free trial",
 )
-_MODEL_UNAVAILABLE_MARKERS: tuple[str, ...] = (
-    "model not found",
-    "model does not exist",
-    "unsupported model",
-    "model is not supported",
-    "model retired",
-    "retired model",
-    "model deprecated",
-    "model is not available",
+_COHERE_MODEL_TOKEN = r"""['"]?[^\s,'";]+['"]?"""
+_COHERE_MODEL_UNAVAILABLE_MESSAGE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        rf"\bmodel\s+{_COHERE_MODEL_TOKEN}\s+"
+        r"(?:not found|does not exist|is not available|is unsupported|"
+        r"is not supported by the generate api|"
+        r"is not supported(?!\s+by\b)|"
+        r"retired|is retired|has been retired|deprecated|is deprecated|"
+        r"has been deprecated)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\bfinetuned model(?:\s+with name)?\s+{_COHERE_MODEL_TOKEN}\s+"
+        r"(?:not found|is not ready for serving)\b",
+        re.IGNORECASE,
+    ),
 )
 _RATE_LIMIT_MARKERS: tuple[str, ...] = (
     "rate limit",
@@ -97,6 +105,55 @@ def _normalized_error_text(exc: Exception) -> str:
     return " ".join(values).strip().lower()
 
 
+def _iter_structured_error_objects(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, dict):
+        return []
+
+    values = [value]
+    for key in ("error", "detail"):
+        nested = value.get(key)
+        if isinstance(nested, dict):
+            values.extend(_iter_structured_error_objects(nested))
+    return values
+
+
+def _is_model_bound_cohere_error_message(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+
+    normalized = " ".join(
+        value.replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .split()
+    ).lower()
+    return any(
+        pattern.search(normalized)
+        for pattern in _COHERE_MODEL_UNAVAILABLE_MESSAGE_PATTERNS
+    )
+
+
+def _has_structured_model_unavailable_evidence(
+    *,
+    status_code: Optional[int],
+    exc: Exception,
+) -> bool:
+    if status_code not in (400, 404):
+        return False
+
+    detail = _extract_passthrough_exception_detail(exc)
+    payload = _coerce_upstream_error_payload(detail)
+    if not isinstance(payload, dict):
+        return False
+
+    for error_object in _iter_structured_error_objects(payload):
+        for key in ("message", "detail", "error"):
+            if _is_model_bound_cohere_error_message(error_object.get(key)):
+                return True
+    return False
+
+
 def classify_cohere_failure(
     *,
     url: Optional[httpx.URL],
@@ -134,13 +191,6 @@ def classify_cohere_failure(
             failure_class="rate_limit",
             log_error_summary="Cohere request rate limit reached",
         )
-    if status_code == 404 or any(marker in text for marker in _MODEL_UNAVAILABLE_MARKERS):
-        return CohereFailureClassification(
-            name="cohere_model_unavailable",
-            failure_kind="cohere_model_unavailable",
-            failure_class="model_unavailable",
-            log_error_summary="Cohere model is unsupported or unavailable",
-        )
     if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
         return CohereFailureClassification(
             name="cohere_timeout_connectivity",
@@ -148,12 +198,29 @@ def classify_cohere_failure(
             failure_class="transient",
             log_error_summary="Cohere timeout or connectivity failure",
         )
+    if _has_structured_model_unavailable_evidence(
+        status_code=status_code,
+        exc=exc,
+    ):
+        return CohereFailureClassification(
+            name="cohere_model_unavailable",
+            failure_kind="cohere_model_unavailable",
+            failure_class="model_unavailable",
+            log_error_summary="Cohere model is unsupported or unavailable",
+        )
     if status_code in (400, 422):
         return CohereFailureClassification(
             name="cohere_validation",
             failure_kind="cohere_validation",
             failure_class="provider_4xx_other",
             log_error_summary="Cohere request validation failed",
+        )
+    if status_code == 404:
+        return CohereFailureClassification(
+            name="cohere_provider_failure",
+            failure_kind="cohere_provider_failure",
+            failure_class="provider_4xx_other",
+            log_error_summary="Cohere provider request failed",
         )
     if status_code is not None and 500 <= status_code <= 599:
         failure_class = "provider_5xx"
