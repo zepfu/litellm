@@ -384,7 +384,7 @@ def _record_auto_agent_alias_route_status_rollup(  # noqa: PLR0915
             candidate_entries.append((label, candidate_event))
 
     has_candidate_local_attribution = bool(candidate_entries)
-    if not candidate_entries:
+    if not candidate_entries and not has_terminal_inventory:
         if status is None:
             return
         model_labels: list[str] = []
@@ -425,6 +425,31 @@ def _record_auto_agent_alias_route_status_rollup(  # noqa: PLR0915
         event.get("reasoning_effort_native_value")
     )
     from litellm.proxy.aawm_route_logging import _AawmRouteRollupOriginIdentity
+
+    if not candidate_entries:
+        if status is None or not group_header_label or not incoming_endpoint:
+            return
+        request_origin_kwargs = (
+            {}
+            if request_identity is None
+            else {
+                "origin_identity": _AawmRouteRollupOriginIdentity(
+                    litellm_call_id=request_identity
+                )
+            }
+        )
+        record_aawm_route_rollup(
+            group_header_label=group_header_label,
+            incoming_endpoint=incoming_endpoint,
+            outgoing_target=outgoing_target,
+            model_label="",
+            effort=effort,
+            turns=0,
+            request_status=status,
+            request_only=True,
+            **request_origin_kwargs,
+        )
+        return
 
     for candidate_index, (label, candidate_event) in enumerate(candidate_entries):
         candidate_status = (
