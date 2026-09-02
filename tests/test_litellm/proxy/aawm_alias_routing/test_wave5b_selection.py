@@ -24,6 +24,8 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
+    CODEX_AUTO_AGENT_OPENCODE_LANE_KEY,
+    CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
     CODEX_AUTO_AGENT_NVIDIA_LANE_KEY,
     CODEX_AUTO_AGENT_NVIDIA_PROVIDER,
@@ -1248,6 +1250,114 @@ class TestCodexSelectorFirstChoice:
         assert first_key not in manager.codex.cooldown_until_monotonic_by_key
 
     @pytest.mark.asyncio
+    async def test_opencode_model_cooldown_preserves_exact_route_and_ordered_fallback(
+        self,
+    ) -> None:
+        candidates = _opencode_candidates()
+        first_key = lane_keys._codex_auto_agent_candidate_key(
+            candidates[0],
+            CODEX_AUTO_AGENT_OPENCODE_LANE_KEY,
+        )
+        second_key = lane_keys._codex_auto_agent_candidate_key(
+            candidates[1],
+            CODEX_AUTO_AGENT_OPENCODE_LANE_KEY,
+        )
+        cooldown_keys: list[str] = []
+
+        async def _cooldown_state(key: str) -> tuple[float, str]:
+            cooldown_keys.append(key)
+            if key == first_key:
+                return (60.0, "memory")
+            return (0.0, "local_fallback")
+
+        _set_selection_candidates(candidates)
+        _set_selection_runtime("_get_codex_active_cooldown_state", _cooldown_state)
+        states = await selection._build_codex_auto_agent_candidate_states(
+            _make_request(),
+            alias_model="basic",
+            candidates=candidates[:2],
+        )
+
+        selected = selection._select_available_state(
+            _make_request(),
+            states,
+            ingress="codex",
+            last_resort=False,
+        )
+        assert selected is not None
+        assert selected["candidate"] == candidates[1]
+        skipped = selection._build_auto_agent_skipped_candidates_from_states(states)
+        assert len(skipped) == 1
+        assert skipped[0]["provider"] == CODEX_AUTO_AGENT_OPENCODE_PROVIDER
+        assert skipped[0]["model"] == candidates[0]["model"]
+        assert skipped[0]["route_family"] == "codex_opencode_zen_adapter"
+        assert skipped[0]["lane_key"] == CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
+        assert skipped[0]["cooldown_seconds"] == 60.0
+        assert skipped[0]["reason"] == "cooldown"
+
+        assert first_key in cooldown_keys
+        assert second_key in cooldown_keys
+        assert all(
+            key not in cooldown_keys
+            for key in (
+                "opencode_zen:__account_quota__:opencode_zen",
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_opencode_model_cooldown_recovers_at_expiry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        candidates = _opencode_candidates()[:2]
+        first_key = lane_keys._codex_auto_agent_candidate_key(
+            candidates[0],
+            CODEX_AUTO_AGENT_OPENCODE_LANE_KEY,
+        )
+        manager = AliasRoutingStateManager()
+        clock = [100.0]
+        monkeypatch.setattr(state_module.time, "monotonic", lambda: clock[0])
+        manager.codex.set_cooldown_memory(first_key, 10.0)
+
+        async def _cooldown_state(key: str) -> tuple[float, str]:
+            return (
+                manager.codex.get_memory_cooldown_remaining(key),
+                "memory",
+            )
+
+        _set_selection_runtime("_get_codex_active_cooldown_state", _cooldown_state)
+
+        cooled_states = await selection._build_codex_auto_agent_candidate_states(
+            _make_request(),
+            alias_model="basic",
+            candidates=candidates,
+        )
+        cooled = selection._select_available_state(
+            _make_request(),
+            cooled_states,
+            ingress="codex",
+            last_resort=False,
+        )
+        assert cooled is not None
+        assert cooled["candidate"] == candidates[1]
+
+        clock[0] = 110.0
+        recovered_states = await selection._build_codex_auto_agent_candidate_states(
+            _make_request(),
+            alias_model="basic",
+            candidates=candidates,
+        )
+        recovered = selection._select_available_state(
+            _make_request(),
+            recovered_states,
+            ingress="codex",
+            last_resort=False,
+        )
+        assert recovered is not None
+        assert recovered["candidate"] == candidates[0]
+        assert first_key not in manager.codex.cooldown_until_monotonic_by_key
+
+    @pytest.mark.asyncio
     async def test_alibaba_account_cooldown_suppresses_both_models_including_last_resort(
         self,
     ) -> None:
@@ -2432,6 +2542,29 @@ def _alibaba_candidates() -> tuple[dict[str, Any], dict[str, Any]]:
             "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
             "model": "alibaba_token_plan/qwen3.7-max",
             "route_family": "alibaba_token_plan_chat_completions_adapter",
+            "last_resort": True,
+        },
+    )
+
+
+def _opencode_candidates() -> tuple[dict[str, Any], ...]:
+    return (
+        {
+            "provider": CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
+            "model": "future-zen-model-a",
+            "route_family": "codex_opencode_zen_adapter",
+            "last_resort": False,
+        },
+        {
+            "provider": CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
+            "model": "future-zen-model-b",
+            "route_family": "codex_opencode_zen_adapter",
+            "last_resort": False,
+        },
+        {
+            "provider": "openai",
+            "model": "fallback-model",
+            "route_family": "codex_responses",
             "last_resort": True,
         },
     )

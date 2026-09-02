@@ -34,6 +34,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS,
     CODEX_AUTO_AGENT_NVIDIA_PROVIDER,
     normalize_nvidia_completion_adapter_model_name,
+    CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals import (
     _add_codex_auto_agent_text_error_tokens,
@@ -279,6 +280,27 @@ def _alibaba_model_error(
     }
     if code is not None:
         error["code"] = code
+    return _FakeExc(
+        detail={"error": error},
+        status_code=status_code,
+        _aawm_provider_returned=provider_returned,
+    )
+
+
+def _opencode_model_error(
+    *,
+    status_code: int,
+    message: str,
+    model: Optional[str] = None,
+    error_type: str = "ModelError",
+    provider_returned: bool = True,
+) -> _FakeExc:
+    error: dict[str, Any] = {
+        "message": message,
+        "type": error_type,
+    }
+    if model is not None:
+        error["model"] = model
     return _FakeExc(
         detail={"error": error},
         status_code=status_code,
@@ -1764,6 +1786,201 @@ class TestUsageLimitQuotaHints:
         exc = _FakeExc(message="too many requests")
         exc._grok_balance_exhausted = True
         assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "capacity_exhausted"
+
+
+# ---------------------------------------------------------------------------
+# OpenCode Zen model admission
+# ---------------------------------------------------------------------------
+
+
+class TestOpenCodeZenModelUnavailable:
+    @pytest.mark.parametrize(
+        ("status_code", "message"),
+        [
+            (
+                400,
+                "ModelError: Model is disabled for opencode/future-zen-model",
+            ),
+            (
+                404,
+                "The model future-zen-model is unpublished and unavailable.",
+            ),
+        ],
+    )
+    def test_provider_returned_model_specific_unavailability_is_candidate_scoped(
+        self,
+        status_code: int,
+        message: str,
+    ) -> None:
+        candidate = {
+            "provider": CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
+            "model": "future-zen-model",
+            "route_family": "codex_opencode_zen_adapter",
+        }
+        exc = _opencode_model_error(
+            status_code=status_code,
+            message=message,
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=True,
+            )
+            == "candidate_unavailable"
+        )
+        assert (
+            _get_codex_auto_agent_candidate_cooldown_scope(
+                "candidate_unavailable",
+                candidate=candidate,
+            )
+            == "candidate"
+        )
+
+    def test_captured_model_error_requires_model_binding(self) -> None:
+        candidate = {
+            "provider": CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
+            "model": "future-zen-model",
+            "route_family": "codex_opencode_zen_adapter",
+        }
+        exc = _opencode_model_error(
+            status_code=400,
+            message="ModelError: Model is disabled",
+            model="future-zen-model",
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=candidate,
+            )
+            == "candidate_unavailable"
+        )
+
+        unbound = _opencode_model_error(
+            status_code=400,
+            message="ModelError: Model is disabled",
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                unbound,
+                candidate=candidate,
+            )
+            != "candidate_unavailable"
+        )
+
+    @pytest.mark.parametrize(
+        ("exc", "candidate", "attempted_provider_call"),
+        [
+            (
+                _FakeExc(
+                    "ProviderModelNotFoundError: future-zen-model",
+                    status_code=404,
+                ),
+                {
+                    "provider": CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
+                    "model": "future-zen-model",
+                    "route_family": "codex_opencode_zen_adapter",
+                },
+                True,
+            ),
+            (
+                _opencode_model_error(
+                    status_code=404,
+                    message="Model future-zen-model is unavailable.",
+                    provider_returned=False,
+                ),
+                {
+                    "provider": CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
+                    "model": "future-zen-model",
+                    "route_family": "codex_opencode_zen_adapter",
+                },
+                True,
+            ),
+            (
+                _opencode_model_error(
+                    status_code=404,
+                    message="Model future-zen-model is unavailable.",
+                ),
+                {
+                    "provider": CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
+                    "model": "future-zen-model",
+                    "route_family": "codex_opencode_zen_adapter",
+                },
+                False,
+            ),
+            (
+                _opencode_model_error(
+                    status_code=404,
+                    message="Model future-zen-model is unavailable.",
+                ),
+                {
+                    "provider": "openai",
+                    "model": "future-zen-model",
+                    "route_family": "codex_opencode_zen_adapter",
+                },
+                True,
+            ),
+            (
+                _opencode_model_error(
+                    status_code=404,
+                    message="Model future-zen-model is unavailable.",
+                ),
+                {
+                    "provider": CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
+                    "model": "future-zen-model",
+                    "route_family": "anthropic_opencode_zen_responses_adapter",
+                },
+                True,
+            ),
+        ],
+    )
+    def test_local_or_wrong_route_model_errors_do_not_cool_candidate(
+        self,
+        exc: _FakeExc,
+        candidate: dict[str, str],
+        attempted_provider_call: bool,
+    ) -> None:
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=attempted_provider_call,
+            )
+            != "candidate_unavailable"
+        )
+
+    @pytest.mark.parametrize(
+        ("status_code", "message"),
+        [
+            (402, "Model future-zen-model is unavailable because payment is required."),
+            (401, "Model future-zen-model is unavailable: invalid API key."),
+            (400, "Model future-zen-model is unavailable: unsupported wire format."),
+            (400, "Model future-zen-model is unavailable: invalid request payload."),
+            (404, "Model future-zen-model is unavailable at the wrong endpoint."),
+            (404, "Model future-zen-model not found."),
+        ],
+    )
+    def test_billing_auth_format_payload_endpoint_and_generic_not_found_remain_terminal(
+        self,
+        status_code: int,
+        message: str,
+    ) -> None:
+        candidate = {
+            "provider": CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
+            "model": "future-zen-model",
+            "route_family": "codex_opencode_zen_adapter",
+        }
+        exc = _opencode_model_error(
+            status_code=status_code,
+            message=message,
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=candidate,
+            )
+            != "candidate_unavailable"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -60,6 +60,7 @@ from .policy import (
     CODEX_AUTO_AGENT_NATIVE_PROVIDER as _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
     CODEX_AUTO_AGENT_NVIDIA_PROVIDER as _CODEX_AUTO_AGENT_NVIDIA_PROVIDER,
     CODEX_AUTO_AGENT_OPENROUTER_PROVIDER as _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
+    CODEX_AUTO_AGENT_OPENCODE_PROVIDER as _CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
     CODEX_AUTO_AGENT_XAI_PROVIDER as _CODEX_AUTO_AGENT_XAI_PROVIDER,
     nvidia_completion_adapter_upstream_model as _nvidia_completion_adapter_upstream_model,
 )
@@ -1534,6 +1535,230 @@ def _is_nvidia_completion_adapter_model_unavailable_response(
     return False
 
 
+_OPENCODE_ZEN_CODEX_ROUTE_FAMILY = "codex_opencode_zen_adapter"
+_OPENCODE_ZEN_MODEL_UNAVAILABLE_MESSAGE_MARKERS = (
+    "model is disabled",
+    "model disabled",
+    "model is unavailable",
+    "model unavailable",
+    "model is not available",
+    "model not available",
+    "model isn't available",
+    "model is not enabled",
+    "model not enabled",
+    "model is unpublished",
+    "model unpublished",
+    "model is not published",
+    "model not published",
+    "model isn't published",
+    "model is not yet published",
+    "model not yet published",
+    "model has not been published",
+    "model has been unpublished",
+    "model was unpublished",
+)
+_OPENCODE_ZEN_MODEL_UNAVAILABLE_EXCLUDED_MARKERS = (
+    "billing",
+    "payment",
+    "credit",
+    "balance",
+    "quota",
+    "spending",
+    "subscription",
+    "funds",
+    "token",
+    "authentication",
+    "authorization",
+    "unauthorized",
+    "forbidden",
+    "invalid api key",
+    "api key",
+    "credential",
+    "endpoint",
+    "unsupported",
+    "not found",
+    "does not exist",
+    "invalid request",
+    "payload",
+    "tool call",
+    "wire format",
+    "content type",
+    "malformed",
+)
+_OPENCODE_ZEN_REJECTED_ERROR_LABELS = frozenset(
+    {
+        "autherror",
+        "authenticationerror",
+        "authorizationerror",
+        "billingerror",
+        "credentialerror",
+        "endpointnotfound",
+        "forbidden",
+        "invalidapikey",
+        "invalidpayload",
+        "modelnotfound",
+        "modelnotfounderror",
+        "paymenterror",
+        "paymentrequired",
+        "providermodelnotfounderror",
+        "unauthorized",
+        "unsupportedmodel",
+        "unsupportedwireformat",
+        "wrongendpoint",
+    }
+)
+_OPENCODE_ZEN_MODEL_ID_FIELDS = frozenset(
+    {
+        "model",
+        "model_id",
+        "model_name",
+        "model_name_or_id",
+        "requested_model",
+        "upstream_model",
+    }
+)
+
+
+def _opencode_zen_model_identity_variants(model: Any) -> frozenset[str]:
+    normalized_model = str(model or "").strip().casefold()
+    if not normalized_model:
+        return frozenset()
+    variants = {normalized_model}
+    for prefix in (
+        f"{_CODEX_AUTO_AGENT_OPENCODE_PROVIDER}/",
+        "opencode/",
+        "opencode-zen/",
+        "zen/",
+    ):
+        if normalized_model.startswith(prefix):
+            model_id = normalized_model[len(prefix) :]
+            if model_id:
+                variants.add(model_id)
+            break
+    return frozenset(variants)
+
+
+def _opencode_zen_error_block_mentions_model(
+    error: dict[str, Any],
+    *,
+    model_variants: frozenset[str],
+) -> bool:
+    if not model_variants:
+        return False
+    pending: list[Any] = [error]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            for key, nested_value in value.items():
+                if key in _OPENCODE_ZEN_MODEL_ID_FIELDS and isinstance(
+                    nested_value, str
+                ):
+                    if (
+                        _opencode_zen_model_identity_variants(nested_value)
+                        & model_variants
+                    ):
+                        return True
+                elif key in {"details", "metadata", "data", "context"}:
+                    pending.append(nested_value)
+            continue
+        if isinstance(value, list):
+            pending.extend(value)
+    return False
+
+
+def _opencode_zen_message_mentions_model(
+    message: str,
+    *,
+    model_variants: frozenset[str],
+) -> bool:
+    message_lower = message.casefold()
+    return any(
+        re.search(
+            r"(?<![A-Za-z0-9_.-])"
+            + re.escape(model_variant)
+            + r"(?![A-Za-z0-9_.-])",
+            message_lower,
+        )
+        for model_variant in model_variants
+    )
+
+
+def _opencode_zen_error_has_rejected_label(
+    exc: Any,
+    error: dict[str, Any],
+) -> bool:
+    for value in (
+        error.get("code"),
+        error.get("type"),
+        error.get("reason"),
+        getattr(exc, "code", None),
+        getattr(exc, "type", None),
+    ):
+        if value is None:
+            continue
+        value_lower = str(value).casefold()
+        compact_value = re.sub(r"[^a-z0-9]", "", value_lower)
+        if compact_value in _OPENCODE_ZEN_REJECTED_ERROR_LABELS or any(
+            marker in value_lower
+            for marker in _OPENCODE_ZEN_MODEL_UNAVAILABLE_EXCLUDED_MARKERS
+        ):
+            return True
+    return False
+
+
+def _is_opencode_zen_unavailable_model_response(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]] = None,
+    attempted_provider_call: bool = True,
+) -> bool:
+    """Detect provider-returned OpenCode Zen model-admission failures.
+
+    OpenCode Zen is eligible for candidate cooldown only when a Codex
+    ``codex_opencode_zen_adapter`` attempt returned HTTP 400/404 and the
+    structured provider error both describes an unpublished/disabled model and
+    binds that error to the configured model. Local validation and generic
+    model-not-found, billing, auth, payload, and endpoint errors remain
+    terminal.
+    """
+    if (
+        not attempted_provider_call
+        or getattr(exc, "_aawm_provider_returned", False) is not True
+        or not isinstance(candidate, dict)
+        or candidate.get("provider") != _CODEX_AUTO_AGENT_OPENCODE_PROVIDER
+        or candidate.get("route_family") != _OPENCODE_ZEN_CODEX_ROUTE_FAMILY
+        or _extract_adapter_exception_status_code(exc) not in {400, 404}
+    ):
+        return False
+    model_variants = _opencode_zen_model_identity_variants(candidate.get("model"))
+    if not model_variants:
+        return False
+    for error in _iter_codex_auto_agent_error_blocks(exc):
+        message = error.get("message")
+        if not isinstance(message, str):
+            continue
+        message_lower = message.casefold()
+        if _opencode_zen_error_has_rejected_label(exc, error) or any(
+            marker in message_lower
+            for marker in _OPENCODE_ZEN_MODEL_UNAVAILABLE_EXCLUDED_MARKERS
+        ):
+            continue
+        if not any(
+            marker in message_lower
+            for marker in _OPENCODE_ZEN_MODEL_UNAVAILABLE_MESSAGE_MARKERS
+        ):
+            continue
+        if _opencode_zen_error_block_mentions_model(
+            error,
+            model_variants=model_variants,
+        ) or _opencode_zen_message_mentions_model(
+            message,
+            model_variants=model_variants,
+        ):
+            return True
+    return False
+
+
 _ALIBABA_TOKEN_PLAN_FIVE_HOUR_EXHAUSTION_MESSAGE_MARKERS = (
     "token-plan 5-hour quota has been exhausted",
     "token-plan five-hour quota has been exhausted",
@@ -1759,6 +1984,12 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     ):
         return _CODEX_AUTO_AGENT_XAI_MODEL_UNAVAILABLE_ERROR_CLASS
     if _is_nvidia_completion_adapter_model_unavailable_response(
+        exc,
+        candidate=candidate,
+        attempted_provider_call=attempted_provider_call,
+    ):
+        return "candidate_unavailable"
+    if _is_opencode_zen_unavailable_model_response(
         exc,
         candidate=candidate,
         attempted_provider_call=attempted_provider_call,
