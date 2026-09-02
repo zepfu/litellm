@@ -43,6 +43,7 @@ import httpx
 import pytest
 from fastapi import FastAPI, HTTPException, Request, Response
 
+from litellm.llms.kimi_code import classify_kimi_code_failure
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     config_compiler as compiler,
@@ -1042,6 +1043,118 @@ async def test_kimi_no_cooldown_publishes_no_shared_key(
     assert publication_events == []
     assert candidate_key not in alias_state.alias_routing_state.codex.cooldown_until_monotonic_by_key
     assert managed_key not in alias_state.alias_routing_state.codex.cooldown_until_monotonic_by_key
+
+
+async def test_kimi_confirmed_model_failure_cools_exact_route_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only structured model evidence cools one Kimi route candidate."""
+    _bypass_session_owner_for_cooldown_contract(monkeypatch)
+    snapshot = compiler.compile_yaml(
+        """
+defaults: {}
+aliases:
+  - name: kimi-ms040
+    distribution_strategy: round_robin
+    candidates:
+      - provider: kimi_code
+        model: kimi_code/k3
+        route_family: codex_kimi_chat_completions_adapter
+        priority: 100
+      - provider: kimi_code
+        model: kimi_code/kimi-for-coding
+        route_family: codex_kimi_chat_completions_adapter
+        priority: 100
+"""
+    )
+    snapshot_select.set_active_routing_snapshot(snapshot)
+    request_body = {
+        "model": "kimi-ms040",
+        "input": [{"role": "user", "content": "hello"}],
+        "litellm_metadata": {"session_id": "kimi-ms040-session"},
+    }
+
+    first_selection = await selection._select_codex_auto_agent_candidate(
+        request=_minimal_request("kimi-ms040-first"),
+        request_body=request_body,
+    )
+    first_candidate = first_selection["candidate"]
+    first_key = first_selection["cooldown_key"]
+    expected_key = lane_keys._codex_auto_agent_candidate_key(
+        first_candidate,
+        policy.CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
+        cooldown_identity_tag=first_candidate["cooldown_identity_tag"],
+    )
+    assert first_key == expected_key
+    assert first_candidate["route_family"] == "codex_kimi_chat_completions_adapter"
+
+    model_id = first_candidate["model"].removeprefix("kimi_code/")
+    generic_404 = classify_kimi_code_failure(
+        status_code=404,
+        error_code="endpoint_not_found",
+        message="The requested Kimi Code endpoint was not found.",
+        upstream_id=model_id,
+    ).to_safe_metadata()
+    assert generic_404["scope"] == "none"
+    assert error_signals._classify_kimi_code_auto_agent_probe_failure(generic_404) == (
+        "kimi_code_no_cooldown"
+    )
+    assert (
+        await cooldown_apply._apply_auto_agent_alias_cooldown(
+            request=_minimal_request("kimi-ms040-generic-404"),
+            candidate=first_candidate,
+            lane_key=policy.CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
+            selected_cooldown_key=first_key,
+            cooldown_seconds=60.0,
+            error_class="kimi_code_no_cooldown",
+            set_candidate_cooldown=cooldown_state._set_codex_auto_agent_cooldown,
+            kimi_failure_metadata=generic_404,
+        )
+        == "none"
+    )
+    assert alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(first_key) == 0.0
+
+    confirmed_model_failure = classify_kimi_code_failure(
+        status_code=404,
+        error_code="model_not_found",
+        message="The selected model is unavailable.",
+        upstream_id=model_id,
+    ).to_safe_metadata()
+    assert confirmed_model_failure["scope"] == "candidate"
+    assert error_signals._classify_kimi_code_auto_agent_probe_failure(
+        confirmed_model_failure
+    ) == "kimi_code_candidate_failure"
+    assert (
+        await cooldown_apply._apply_auto_agent_alias_cooldown(
+            request=_minimal_request("kimi-ms040-confirmed"),
+            candidate=first_candidate,
+            lane_key=policy.CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
+            selected_cooldown_key=first_key,
+            cooldown_seconds=0.05,
+            error_class="kimi_code_candidate_failure",
+            set_candidate_cooldown=cooldown_state._set_codex_auto_agent_cooldown,
+            kimi_failure_metadata=confirmed_model_failure,
+        )
+        == "candidate"
+    )
+    assert alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(first_key) > 0.0
+    managed_key = error_signals._get_kimi_code_managed_account_cooldown_key()
+    assert alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(managed_key) == 0.0
+
+    next_selection = await selection._select_codex_auto_agent_candidate(
+        request=_minimal_request("kimi-ms040-next"),
+        request_body=request_body,
+    )
+    assert next_selection["candidate"]["model"] != first_candidate["model"]
+    assert next_selection["candidate"]["route_family"] == first_candidate["route_family"]
+
+    await asyncio.sleep(0.08)
+    recovered_selection = await selection._select_codex_auto_agent_candidate(
+        request=_minimal_request("kimi-ms040-recovered"),
+        request_body=request_body,
+    )
+    assert recovered_selection["candidate"]["model"] == first_candidate["model"]
+    assert recovered_selection["candidate"]["route_family"] == first_candidate["route_family"]
 
 
 # ---------------------------------------------------------------------------
