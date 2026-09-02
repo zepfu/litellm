@@ -532,7 +532,8 @@ _ZAI_CODING_PLAN_KIND_TO_ERROR_CLASS = {
     ZAICodingPlanFailureKind.QUOTA: "usage_limit_reached",
     ZAICodingPlanFailureKind.RATE: "rate_limited",
     ZAICodingPlanFailureKind.CAPACITY: "capacity_exhausted",
-    ZAICodingPlanFailureKind.VALIDATION: "candidate_unavailable",
+    ZAICodingPlanFailureKind.MODEL_UNAVAILABLE: "candidate_unavailable",
+    ZAICodingPlanFailureKind.VALIDATION: "provider_terminal_error",
     ZAICodingPlanFailureKind.ROUTING: "provider_terminal_error",
 }
 
