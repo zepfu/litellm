@@ -843,13 +843,11 @@ class TestRecordRouteStatusRollup:
         assert lines[1:] == [
             " - cursor(basic):none - Turns: 0 "
             "[Cursor continuation cannot be replayed] [Ineligible]",
-            " - alibaba(basic):none - Turns: 0",
-            " - zai(basic):none - Turns: 0",
             " - Request: [Exhausted]",
         ]
         assert sum(line.startswith(" - cursor(basic)") for line in lines) == 1
-        assert sum(line.startswith(" - alibaba(basic)") for line in lines) == 1
-        assert sum(line.startswith(" - zai(basic)") for line in lines) == 1
+        assert not any(line.startswith(" - alibaba(basic)") for line in lines)
+        assert not any(line.startswith(" - zai(basic)") for line in lines)
         assert lines.count(" - Request: [Exhausted]") == 1
 
     @patch(
@@ -931,11 +929,9 @@ class TestRecordRouteStatusRollup:
         records = {
             call.kwargs["model_label"]: call.kwargs for call in mock_record.call_args_list
         }
-        assert list(records) == ["cursor(basic)", "alibaba(basic)", "zai(basic)"]
+        assert list(records) == ["cursor(basic)", "alibaba(basic)"]
         assert records["cursor(basic)"]["message"] == "Cursor failed again"
         assert records["alibaba(basic)"]["message"] == "Alibaba failed"
-        assert records["zai(basic)"]["status"] is None
-        assert records["zai(basic)"]["message"] is None
 
     @patch(
         "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.record_aawm_route_rollup",
