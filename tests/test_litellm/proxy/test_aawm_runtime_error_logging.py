@@ -79,6 +79,53 @@ def _terminal_record() -> dict[str, object]:
     }
 
 
+def test_build_agent_terminal_error_record_sanitizes_cursor_replay_rejection(
+) -> None:
+    forbidden_values = (
+        "SECRET_PROMPT_VALUE",
+        "SECRET_ARGUMENT_VALUE",
+        "SECRET_OUTPUT_VALUE",
+        "SECRET_SCHEMA_VALUE",
+    )
+    diagnostic = {
+        "stage": "stock_full_history",
+        "reason": "output_not_string",
+        "item_index": 0,
+        "item_type": "function_call_output",
+        "item_keys": ["type", "call_id", "output"],
+        "tool_keys": ["type", "name", "parameters", "description"],
+        "content": forbidden_values[0],
+        "arguments": {"value": forbidden_values[1]},
+        "output": forbidden_values[2],
+        "schema": {"description": forbidden_values[3]},
+        "id": "opaque-item-id",
+        "call_id": "opaque-call-id",
+    }
+
+    record = rel.build_agent_terminal_error_record(
+        error_context={
+            "failure_kind": "agent_alias_no_candidate",
+            "cursor_replay_fresh_dispatch_reject": diagnostic,
+        },
+        terminal_outcome="agent_session_terminated",
+        fallback_result="no_candidate_available",
+        redispatch_required=False,
+        agent_session_killed=True,
+    )
+
+    assert record["context"]["cursor_replay_fresh_dispatch_reject"] == {
+        "stage": "stock_full_history",
+        "reason": "output_not_string",
+        "item_index": 0,
+        "item_type": "function_call_output",
+        "item_keys": ["call_id", "output", "type"],
+        "tool_keys": ["description", "name", "parameters", "type"],
+    }
+    serialized = json.dumps(record)
+    for forbidden in (*forbidden_values, "opaque-item-id", "opaque-call-id"):
+        assert forbidden not in serialized
+
+
 def _append_to_sink(
     sink: str,
     payload: dict[str, object] | list[dict[str, object]],

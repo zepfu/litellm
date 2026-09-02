@@ -805,23 +805,39 @@ async def handle_alias_route(  # noqa: PLR0915
         )
 
     cursor_replay_rejection_request_shape_summary: Optional[dict[str, Any]] = None
+    cursor_replay_fresh_dispatch_reject: Optional[dict[str, Any]] = None
 
     def _cursor_session_continuation_replay_safe_fresh_dispatch_body(
         continuation_exc: Exception,
     ) -> Optional["Payload"]:
+        nonlocal cursor_replay_fresh_dispatch_reject
         nonlocal cursor_replay_rejection_request_shape_summary
         from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
             codex_candidate_calls,
         )
 
+        cursor_replay_fresh_dispatch_reject = None
         cursor_replay_rejection_request_shape_summary = None
+        rejection_diagnostic: dict[str, Any] = {}
         fresh_fallback_body = (
             codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
                 prepared_request_body,
                 continuation_exc=continuation_exc,
+                rejection_diagnostic_out=rejection_diagnostic,
             )
         )
-        if fresh_fallback_body is None:
+        raw_rejection = rejection_diagnostic.get(
+            codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
+        )
+        if isinstance(raw_rejection, Mapping):
+            cursor_replay_fresh_dispatch_reject = dict(raw_rejection)
+            if attempts and isinstance(attempts[-1], dict):
+                attempts[-1][
+                    codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
+                ] = copy.deepcopy(cursor_replay_fresh_dispatch_reject)
+
+        def _capture_request_shape_summary() -> None:
+            nonlocal cursor_replay_rejection_request_shape_summary
             try:
                 request_shape_metadata: dict[str, Any] = {}
                 _merge_passthrough_request_shape_metadata(
@@ -835,10 +851,39 @@ async def handle_alias_route(  # noqa: PLR0915
                 )
             except Exception:
                 cursor_replay_rejection_request_shape_summary = None
+
+        if fresh_fallback_body is None:
+            _capture_request_shape_summary()
             return None
         if not _session_affinity_mod().is_replay_safe_session_owner_redispatch_body(
             fresh_fallback_body
         ):
+            _capture_request_shape_summary()
+            replay_safety_classifier = getattr(
+                _session_affinity_mod(),
+                "classify_session_owner_replay_safety_body",
+                None,
+            )
+            replay_safety = None
+            if callable(replay_safety_classifier):
+                try:
+                    replay_safety = replay_safety_classifier(fresh_fallback_body)
+                except Exception:
+                    replay_safety = None
+            if cursor_replay_fresh_dispatch_reject is None:
+                cursor_replay_fresh_dispatch_reject = (
+                    codex_candidate_calls._cursor_replay_fresh_dispatch_reject_for_replay_safety(
+                        replay_safety
+                    )
+                    or {
+                        "stage": "rebuilt_body_replay_unsafe",
+                        "reason": "replay_safety_rejected",
+                    }
+                )
+                if attempts and isinstance(attempts[-1], dict):
+                    attempts[-1][
+                        codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
+                    ] = copy.deepcopy(cursor_replay_fresh_dispatch_reject)
             return None
         return fresh_fallback_body
 
@@ -1988,12 +2033,20 @@ async def handle_alias_route(  # noqa: PLR0915
                         failure_exc,
                         extra_fields=(
                             {
-                                "aawm_passthrough_request_shape_summary": (
-                                    cursor_replay_rejection_request_shape_summary
+                                field_name: value
+                                for field_name, value in (
+                                    (
+                                        "aawm_passthrough_request_shape_summary",
+                                        cursor_replay_rejection_request_shape_summary,
+                                    ),
+                                    (
+                                        "cursor_replay_fresh_dispatch_reject",
+                                        cursor_replay_fresh_dispatch_reject,
+                                    ),
                                 )
+                                if value is not None
                             }
-                            if cursor_replay_rejection_request_shape_summary is not None
-                            else None
+                            or None
                         ),
                     )
                 if attempted_provider_call:

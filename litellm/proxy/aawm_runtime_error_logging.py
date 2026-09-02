@@ -317,6 +317,7 @@ _AGENT_TERMINAL_CONTEXT_FIELDS = (
     "hidden_retry_final_outcome",
     "hidden_retry_failure_classification",
     "hidden_retry_count",
+    "cursor_replay_fresh_dispatch_reject",
     "aawm_passthrough_request_shape_summary",
     "aawm_passthrough_request_shape_fingerprint",
     "aawm_passthrough_request_shape_error_class",
@@ -338,6 +339,7 @@ _AGENT_TERMINAL_ROUTING_SEQUENCE_FIELDS = (
     "failure_class",
     "error_class",
     "error_status_code",
+    "cursor_replay_fresh_dispatch_reject",
     "error_type",
     "error_code",
     "error_tokens",
@@ -950,9 +952,145 @@ def _sanitize_agent_terminal_context_value(
             value,
             allowed_fields=_AGENT_TERMINAL_ACTIVITY_SUMMARY_FIELDS,
         )
+    if field == "cursor_replay_fresh_dispatch_reject":
+        return _sanitize_agent_terminal_cursor_replay_fresh_dispatch_reject(value)
     if field == "aawm_passthrough_request_shape_summary":
         return _sanitize_agent_terminal_request_shape_summary(value)
     return _sanitize_agent_terminal_scalar(value)
+
+
+_CURSOR_REPLAY_FRESH_DISPATCH_REJECTION_STAGES = frozenset(
+    {
+        "stock_full_history",
+        "provider_neutral_tools",
+        "fresh_body_copy",
+        "rebuilt_body_replay_unsafe",
+    }
+)
+_CURSOR_REPLAY_FRESH_DISPATCH_REJECTION_REASONS = frozenset(
+    {
+        "request_body_shape",
+        "missing_replay_state",
+        "replay_state_lookup",
+        "replay_state_copy",
+        "invalid_replay_state",
+        "retained_session_present",
+        "messages_container",
+        "messages_empty",
+        "message_role",
+        "message_conversion",
+        "replayed_input_container",
+        "input_container",
+        "input_item_count",
+        "item_not_object",
+        "item_key_set",
+        "item_type",
+        "id_shape",
+        "metadata_shape",
+        "metadata_key_set",
+        "metadata_value_type",
+        "content_container",
+        "content_part_container",
+        "content_part_keys",
+        "content_part_type",
+        "content_part_text_type",
+        "empty_user_text",
+        "function_call_position",
+        "function_call_count",
+        "function_call_output_position",
+        "function_call_output_count",
+        "function_call_fields",
+        "call_id_shape",
+        "call_id_alias_mismatch",
+        "function_name",
+        "arguments_not_object",
+        "output_container",
+        "output_not_string",
+        "call_graph",
+        "unresolved_call_id",
+        "tool_container",
+        "tool_item",
+        "tool_type_validation",
+        "tool_key_set",
+        "tool_name",
+        "tool_transform",
+        "tool_validation",
+        "tool_canonical_mismatch",
+        "tool_copy_failure",
+        "copy_failure",
+        "replay_safety_rejected",
+        "previous_response_id",
+        "id_only_reasoning_reference",
+        "explicit_item_reference",
+        "invalid_body_shape",
+    }
+)
+_CURSOR_REPLAY_DIAGNOSTIC_MAX_INDEX = 4096
+_CURSOR_REPLAY_DIAGNOSTIC_MAX_KEY_COUNT = 32
+_CURSOR_REPLAY_DIAGNOSTIC_MAX_TOKEN_CHARS = 64
+
+
+def _sanitize_agent_terminal_diagnostic_token(value: Any) -> Optional[str]:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _CURSOR_REPLAY_DIAGNOSTIC_MAX_TOKEN_CHARS
+    ):
+        return None
+    if any(
+        character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
+        for character in value
+    ):
+        return None
+    return value
+
+
+def _sanitize_agent_terminal_cursor_replay_fresh_dispatch_reject(
+    value: Any,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    stage = value.get("stage")
+    reason = value.get("reason")
+    if (
+        not isinstance(stage, str)
+        or stage not in _CURSOR_REPLAY_FRESH_DISPATCH_REJECTION_STAGES
+        or not isinstance(reason, str)
+        or reason not in _CURSOR_REPLAY_FRESH_DISPATCH_REJECTION_REASONS
+    ):
+        return None
+
+    sanitized: Dict[str, Any] = {
+        "stage": stage,
+        "reason": reason,
+    }
+    for field in ("item_index", "tool_index"):
+        raw_value = value.get(field)
+        if (
+            isinstance(raw_value, int)
+            and not isinstance(raw_value, bool)
+            and 0 <= raw_value <= _CURSOR_REPLAY_DIAGNOSTIC_MAX_INDEX
+        ):
+            sanitized[field] = raw_value
+    for field in ("item_type", "tool_type"):
+        token = _sanitize_agent_terminal_diagnostic_token(value.get(field))
+        if token is not None:
+            sanitized[field] = token
+    for field in ("item_keys", "tool_keys"):
+        raw_keys = value.get(field)
+        if not isinstance(raw_keys, (list, tuple)):
+            continue
+        safe_keys = {
+            token
+            for raw_key in list(raw_keys)[:_CURSOR_REPLAY_DIAGNOSTIC_MAX_KEY_COUNT]
+            if (token := _sanitize_agent_terminal_diagnostic_token(raw_key))
+            is not None
+        }
+        if safe_keys:
+            sanitized[field] = sorted(safe_keys)[
+                :_CURSOR_REPLAY_DIAGNOSTIC_MAX_KEY_COUNT
+            ]
+    return sanitized
 
 
 def _sanitize_agent_terminal_count_mapping(
@@ -986,6 +1124,10 @@ def _sanitize_agent_terminal_mapping(
             cleaned = _sanitize_agent_terminal_scalar_list(raw_value)
         elif field in _AGENT_TERMINAL_COUNT_MAPPING_FIELDS:
             cleaned = _sanitize_agent_terminal_count_mapping(raw_value)
+        elif field == "cursor_replay_fresh_dispatch_reject":
+            cleaned = _sanitize_agent_terminal_cursor_replay_fresh_dispatch_reject(
+                raw_value
+            )
         else:
             cleaned = _sanitize_agent_terminal_scalar(raw_value)
         if cleaned is not None:

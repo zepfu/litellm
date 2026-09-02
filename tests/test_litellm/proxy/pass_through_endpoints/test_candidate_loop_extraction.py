@@ -2378,6 +2378,9 @@ async def test_candidate_loop_cursor_session_continuation_is_session_scoped(  # 
 
     session_affinity_seam = SimpleNamespace(
         is_replay_safe_session_owner_redispatch_body=replay_safe_classifier,
+        classify_session_owner_replay_safety_body=(
+            session_affinity.classify_session_owner_replay_safety_body
+        ),
         resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
         get_request_codex_auto_review_parent_session_identity=lambda _request: None,
         build_session_owner_attributes=lambda **_kwargs: {},
@@ -2393,6 +2396,24 @@ async def test_candidate_loop_cursor_session_continuation_is_session_scoped(  # 
         ),
     )
 
+    def _unsafe_rebuild(
+        _body: dict[str, Any],
+        *,
+        continuation_exc: Exception,
+        rejection_diagnostic_out: dict[str, Any],
+    ) -> dict[str, Any]:
+        _ = continuation_exc
+        rejection_diagnostic_out.clear()
+        return {
+            "model": "work",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_id_only",
+                }
+            ],
+        }
+
     def _record_failure(**kwargs: Any) -> None:
         failure_records.append(kwargs)
 
@@ -2406,6 +2427,11 @@ async def test_candidate_loop_cursor_session_continuation_is_session_scoped(  # 
         lambda: session_affinity_seam,
     )
     monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        codex_candidate_calls,
+        "_build_cursor_replay_safe_fresh_dispatch_body",
+        _unsafe_rebuild,
+    )
     monkeypatch.setattr(
         lpe,
         "_record_auto_agent_alias_attempt_failure",
@@ -2455,7 +2481,7 @@ async def test_candidate_loop_cursor_session_continuation_is_session_scoped(  # 
             ),
             alias_family="codex_auto_agent",
             alias_model="work",
-            request=SimpleNamespace(state=SimpleNamespace()),
+            request=SimpleNamespace(headers={}, state=SimpleNamespace()),
             prepared_request_body=continuation_body,
             max_candidate_attempts=1,
             get_active_cooldown_state_fn=_no_active_cooldown,
@@ -2475,6 +2501,18 @@ async def test_candidate_loop_cursor_session_continuation_is_session_scoped(  # 
     assert caught.value.attempted_provider_call is False
     assert len(provider_calls) == 1
     assert len(failure_records) == 1
+    rejection_field = codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
+    expected_rejection = {
+        "stage": "rebuilt_body_replay_unsafe",
+        "reason": "id_only_reasoning_reference",
+    }
+    assert terminal_events[0]["extra_fields"][rejection_field] == expected_rejection
+    assert "aawm_passthrough_request_shape_summary" in (
+        terminal_events[0]["extra_fields"]
+    )
+    assert failure_records[0]["attempt_record"][rejection_field] == (
+        expected_rejection
+    )
     assert failure_records[0]["error_class"] == (
         "candidate_deterministically_ineligible"
     )
@@ -2497,7 +2535,7 @@ async def test_candidate_loop_cursor_session_continuation_is_session_scoped(  # 
         ),
         alias_family="codex_auto_agent",
         alias_model="work",
-        request=SimpleNamespace(state=SimpleNamespace()),
+        request=SimpleNamespace(headers={}, state=SimpleNamespace()),
         prepared_request_body=fresh_body,
         max_candidate_attempts=1,
         get_active_cooldown_state_fn=_no_active_cooldown,
@@ -3508,10 +3546,18 @@ async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_a
     assert len(failure_records) == 1
     attempt = failure_records[0]["attempt_record"]
     assert attempt[field_name] == expected_structure
+    rejection_field = codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
+    expected_rejection = {
+        "stage": "fresh_body_copy",
+        "reason": "replay_state_lookup",
+    }
+    assert attempt[rejection_field] == expected_rejection
     assert len(persisted) == 1
     terminal_event = persisted[0][-1]
     assert terminal_event["event_type"] == "no_candidate_available"
+    assert terminal_event[rejection_field] == expected_rejection
     assert terminal_event["attempts"][0][field_name] == expected_structure
+    assert terminal_event["attempts"][0][rejection_field] == expected_rejection
     expected_request_shape_summary = {
         "body_container_type": "object",
         "body_top_level_keys": [
@@ -3552,6 +3598,8 @@ async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_a
     assert len(terminal_records) == 1
     terminal_context = terminal_records[0]["error_context"]
     assert terminal_context["attempts"][0][field_name] == expected_structure
+    assert terminal_context[rejection_field] == expected_rejection
+    assert terminal_context["attempts"][0][rejection_field] == expected_rejection
     assert (
         terminal_context["aawm_passthrough_request_shape_summary"]
         == expected_request_shape_summary
@@ -3570,6 +3618,10 @@ async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_a
     assert (
         terminal_record["context"]["aawm_passthrough_request_shape_summary"]
         == expected_request_shape_summary
+    )
+    assert terminal_record["context"][rejection_field] == expected_rejection
+    assert terminal_record["context"]["attempts"][0][rejection_field] == (
+        expected_rejection
     )
 
     serialized = json.dumps(
