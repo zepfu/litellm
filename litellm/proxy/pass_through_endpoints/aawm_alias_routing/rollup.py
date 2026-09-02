@@ -375,6 +375,12 @@ def _record_auto_agent_alias_route_status_rollup(  # noqa: PLR0915
             elif candidate_event.get("terminal_disposition") == "attempted":
                 if candidate_event.get("status") is None:
                     candidate_event["status"] = candidate_event.get("outcome")
+            if (
+                candidate_event.get("terminal_disposition") == "skipped"
+                and candidate_event.get("attempted_provider_call") is False
+                and reason == "not_reached_before_terminal"
+            ):
+                continue
             candidate_entries.append((label, candidate_event))
 
     has_candidate_local_attribution = bool(candidate_entries)
