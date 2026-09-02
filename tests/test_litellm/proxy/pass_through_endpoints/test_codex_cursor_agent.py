@@ -1577,6 +1577,44 @@ def test_cursor_continuation_requires_matching_function_call() -> None:
         )
 
 
+def test_cursor_fresh_replay_dispatch_fails_closed_without_complete_state() -> None:
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            _replay_body("resp-missing")
+        )
+        is None
+    )
+
+    codex_candidate_calls._store_cursor_replay_state(
+        "resp-retained",
+        messages=[
+            {"role": "user", "content": "run pwd"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": '{"cmd":"pwd"}',
+                        },
+                    }
+                ],
+            },
+        ],
+        tools=[],
+        retained_session=object(),
+    )
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            _replay_body("resp-retained")
+        )
+        is None
+    )
+
+
 def test_cursor_continuation_fails_for_missing_and_expired_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -795,11 +795,21 @@ async def handle_alias_route(  # noqa: PLR0915
             and not bool(selection.get("in_flight_session"))
         )
 
-    def _cursor_session_continuation_replay_safe_fresh_dispatch_body() -> Optional[
-        "Payload"
-    ]:
-        fresh_fallback_body = dict(prepared_request_body)
-        fresh_fallback_body.pop("previous_response_id", None)
+    def _cursor_session_continuation_replay_safe_fresh_dispatch_body(
+        continuation_exc: Exception,
+    ) -> Optional["Payload"]:
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+            codex_candidate_calls,
+        )
+
+        fresh_fallback_body = (
+            codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+                prepared_request_body,
+                continuation_exc=continuation_exc,
+            )
+        )
+        if fresh_fallback_body is None:
+            return None
         if not _session_affinity_mod().is_replay_safe_session_owner_redispatch_body(
             fresh_fallback_body
         ):
@@ -1911,7 +1921,9 @@ async def handle_alias_route(  # noqa: PLR0915
                         add_alias_metadata_fn=add_alias_metadata_fn,
                     )
                     fresh_fallback_body = (
-                        _cursor_session_continuation_replay_safe_fresh_dispatch_body()
+                        _cursor_session_continuation_replay_safe_fresh_dispatch_body(
+                            failure_exc
+                        )
                     )
                     if fresh_fallback_body is not None:
                         prepared_request_body = fresh_fallback_body

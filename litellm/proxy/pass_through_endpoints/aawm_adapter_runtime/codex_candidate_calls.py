@@ -42,9 +42,25 @@ _CURSOR_TOOL_CONTINUATION_CUE_MARKER = "_cursor_tool_continuation_cue"
 _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER = (
     "_cursor_session_continuation_failure"
 )
+_CURSOR_REPLAY_STATE_FIELD = "_cursor_replay_state"
 _CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD = "cursor_sanitized_proto_structure"
 _CURSOR_PROTO_STRUCTURE_MAX_DEPTH = 3
 _CURSOR_PROTO_STRUCTURE_MAX_ITEMS = 64
+_CURSOR_CONTINUATION_FIELDS = frozenset(
+    {
+        "previous_response_id",
+        "message_id",
+        "messageId",
+        "conversation_id",
+        "conversationId",
+        "conversation_group_id",
+        "conversationGroupId",
+        "run_id",
+        "runId",
+        "agent_session_id",
+        "agentSessionId",
+    }
+)
 _CURSOR_REPLAY_PRESERVED_STATUS_CODES = frozenset(
     {408, 500, 502, 503, 504, 529}
 )
@@ -266,6 +282,21 @@ def _take_cursor_replay_state(response_id: str) -> dict[str, Any]:
     return state
 
 
+def _cursor_replay_state_snapshot(
+    state: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if not isinstance(state, dict):
+        return None
+    try:
+        return {
+            "messages": copy.deepcopy(state.get("messages")),
+            "tools": copy.deepcopy(state.get("tools")),
+            "retained_session": state.get("retained_session"),
+        }
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _raise_cursor_session_continuation_unavailable(
     *,
     previous_response_id: Optional[str] = None,
@@ -273,16 +304,19 @@ def _raise_cursor_session_continuation_unavailable(
 ) -> None:
     from litellm.llms.cursor_agent.connect import CursorConnectError
 
-    if previous_response_id and replay_state is not None:
-        _consume_cursor_replay_state(
-            previous_response_id,
-            expected_state=replay_state,
-        )
     exc = CursorConnectError(
         "Cursor Agent tool-output continuation cannot resume because its "
         "live retained session is unavailable.",
         status_code=409,
     )
+    replay_snapshot = _cursor_replay_state_snapshot(replay_state)
+    if replay_snapshot is not None:
+        setattr(exc, _CURSOR_REPLAY_STATE_FIELD, replay_snapshot)
+    if previous_response_id and replay_state is not None:
+        _consume_cursor_replay_state(
+            previous_response_id,
+            expected_state=replay_state,
+        )
     setattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, True)
     raise exc
 
@@ -1253,6 +1287,150 @@ def _cursor_function_call_outputs(
     return outputs
 
 
+def _cursor_replay_function_call_output_items(
+    request_body: dict[str, Any],
+) -> Optional[list[dict[str, Any]]]:
+    input_items = _cursor_response_input_items(request_body)
+    if not input_items:
+        return None
+
+    outputs: list[dict[str, Any]] = []
+    for raw_item in input_items:
+        item = _cursor_as_mapping(raw_item)
+        if item.get("type") != "function_call_output":
+            return None
+        call_id = item.get("call_id") or item.get("callId")
+        if not isinstance(call_id, str) or not call_id.strip():
+            return None
+        if "output" not in item:
+            return None
+        try:
+            output_item = copy.deepcopy(item)
+        except Exception:  # noqa: BLE001
+            return None
+        output_item["call_id"] = call_id
+        output_item.pop("callId", None)
+        outputs.append(output_item)
+    return outputs
+
+
+def _build_cursor_replay_safe_fresh_dispatch_body(
+    request_body: Any,
+    *,
+    continuation_exc: Optional[BaseException] = None,
+) -> Optional[dict[str, Any]]:
+    if not isinstance(request_body, dict):
+        return None
+
+    replay_state = getattr(
+        continuation_exc,
+        _CURSOR_REPLAY_STATE_FIELD,
+        None,
+    )
+    registry_state: Optional[dict[str, Any]] = None
+    if not isinstance(replay_state, dict):
+        previous_response_id = request_body.get("previous_response_id")
+        if not isinstance(previous_response_id, str) or not previous_response_id:
+            return None
+        try:
+            registry_state = _peek_cursor_replay_state(previous_response_id)
+        except Exception:  # noqa: BLE001
+            return None
+        replay_state = _cursor_replay_state_snapshot(registry_state)
+    if not isinstance(replay_state, dict):
+        return None
+    if replay_state.get("retained_session") is not None:
+        return None
+
+    messages = replay_state.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+    if any(
+        str(_cursor_as_mapping(message).get("role") or "").strip().lower()
+        not in {"system", "developer", "user", "assistant", "tool"}
+        for message in messages
+    ):
+        return None
+    if not any(
+        str(_cursor_as_mapping(message).get("role") or "").strip().lower()
+        == "user"
+        and bool(
+            _cursor_response_content_text(
+                _cursor_as_mapping(message).get("content")
+            ).strip()
+        )
+        for message in messages
+    ):
+        return None
+    try:
+        from litellm.llms.openai.responses.count_tokens.transformation import (
+            OpenAICountTokensConfig,
+        )
+
+        replayed_input, instructions = (
+            OpenAICountTokensConfig.messages_to_responses_input(messages)
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(replayed_input, list):
+        return None
+    function_call_ids = {
+        item.get("call_id")
+        for item in replayed_input
+        if isinstance(item, dict)
+        and item.get("type") == "function_call"
+        and isinstance(item.get("call_id"), str)
+        and item.get("call_id")
+    }
+    if not function_call_ids or any(
+        not isinstance(item, dict)
+        or item.get("type") == "function_call"
+        and (
+            not isinstance(item.get("call_id"), str)
+            or not item.get("call_id")
+            or not isinstance(item.get("name"), str)
+            or not item.get("name")
+        )
+        for item in replayed_input
+    ):
+        return None
+    output_items = _cursor_replay_function_call_output_items(request_body)
+    if output_items is None:
+        return None
+
+    output_call_ids: set[str] = set()
+    for output_item in output_items:
+        call_id = output_item["call_id"]
+        if call_id in output_call_ids or call_id not in function_call_ids:
+            return None
+        output_call_ids.add(call_id)
+
+    replay_tools = replay_state.get("tools")
+    if not isinstance(replay_tools, list):
+        return None
+
+    try:
+        fresh_body = copy.deepcopy(request_body)
+        fresh_body["input"] = [*replayed_input, *output_items]
+        fresh_body["tools"] = copy.deepcopy(replay_tools)
+    except Exception:  # noqa: BLE001
+        return None
+    for field in _CURSOR_CONTINUATION_FIELDS:
+        fresh_body.pop(field, None)
+    if instructions is not None:
+        fresh_body["instructions"] = instructions
+
+    if registry_state is not None:
+        previous_response_id = request_body.get("previous_response_id")
+        if isinstance(previous_response_id, str) and previous_response_id:
+            _consume_cursor_replay_state(
+                previous_response_id,
+                expected_state=registry_state,
+                close_retained_session=False,
+            )
+    return fresh_body
+
+
 def _responses_input_to_cursor_messages(  # noqa: PLR0915
     request_body: dict[str, Any],
     *,
@@ -1797,6 +1975,9 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
         setattr(proxy_exc, "failure_phase", "cursor_session_continuation")
         setattr(proxy_exc, "attempted_provider_call", False)
         setattr(proxy_exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, True)
+        replay_state = getattr(exc, _CURSOR_REPLAY_STATE_FIELD, None)
+        if isinstance(replay_state, dict):
+            setattr(proxy_exc, _CURSOR_REPLAY_STATE_FIELD, replay_state)
         _set_mapped_detail(
             proxy_exc,
             {

@@ -2531,6 +2531,32 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
         "model": "openrouter/fallback",
         "route_family": "codex_openrouter_responses_adapter",
     }
+    replay_messages = [
+        {
+            "role": "user",
+            "content": "Complete the original assignment in /workspace.",
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "pwd-call",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
+                    },
+                }
+            ],
+        },
+    ]
+    replay_tools = [
+        {
+            "type": "function",
+            "function": {"name": "exec_command"},
+        }
+    ]
     selections = [
         {
             "candidate": cursor_candidate,
@@ -2552,24 +2578,8 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
     prepared_body = {
         "model": "work",
         "previous_response_id": "cursor-unretained",
-        "tools": [
-            {
-                "type": "function",
-                "function": {"name": "exec_command"},
-            }
-        ],
+        "tools": replay_tools,
         "input": [
-            {
-                "type": "message",
-                "role": "user",
-                "content": "Complete the original assignment in /workspace.",
-            },
-            {
-                "type": "function_call",
-                "call_id": "pwd-call",
-                "name": "exec_command",
-                "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
-            },
             {
                 "type": "function_call_output",
                 "call_id": "pwd-call",
@@ -2577,30 +2587,40 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
             },
         ],
     }
-    candidate_bodies: list[dict[str, Any]] = []
-    metadata_input_bodies: list[tuple[str, dict[str, Any]]] = []
-    owner_guard_bodies: list[dict[str, Any]] = []
-    rebuilt_request_body = dict(prepared_body)
-    rebuilt_request_body.pop("previous_response_id")
-    replay_safe_classifier = (
-        session_affinity.is_replay_safe_session_owner_redispatch_body
+    codex_candidate_calls._store_cursor_replay_state(
+        "cursor-unretained",
+        messages=replay_messages,
+        tools=replay_tools,
     )
-    assert replay_safe_classifier(rebuilt_request_body) is True
-    source_exc = CursorConnectError(
-        "Cursor retained session unavailable",
-        status_code=409,
+    replay_state = codex_candidate_calls._peek_cursor_replay_state(
+        "cursor-unretained"
     )
-    setattr(
-        source_exc,
-        codex_candidate_calls._CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
-        True,
-    )
+    with pytest.raises(CursorConnectError) as source_exc_info:
+        codex_candidate_calls._raise_cursor_session_continuation_unavailable(
+            previous_response_id="cursor-unretained",
+            replay_state=replay_state,
+        )
+    source_exc = source_exc_info.value
     with pytest.raises(ProxyException) as mapped_exc_info:
         codex_candidate_calls._raise_cursor_agent_alias_error(
             exc=source_exc,
             candidate=cursor_candidate,
         )
     mapped_exc = mapped_exc_info.value
+    candidate_bodies: list[dict[str, Any]] = []
+    metadata_input_bodies: list[tuple[str, dict[str, Any]]] = []
+    owner_guard_bodies: list[dict[str, Any]] = []
+    rebuilt_request_body = (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            prepared_body,
+            continuation_exc=mapped_exc,
+        )
+    )
+    assert rebuilt_request_body is not None
+    replay_safe_classifier = (
+        session_affinity.is_replay_safe_session_owner_redispatch_body
+    )
+    assert replay_safe_classifier(rebuilt_request_body) is True
 
     routing_state = AliasRoutingStateManager()
     monkeypatch.setattr(candidate_loop, "alias_routing_state", routing_state)
@@ -2629,6 +2649,8 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
             assert candidate_body["previous_response_id"] == "cursor-unretained"
             raise mapped_exc
         assert "previous_response_id" not in candidate_body
+        assert candidate_body["input"] == rebuilt_request_body["input"]
+        assert candidate_body["tools"] == replay_tools
         assert replay_safe_classifier(candidate_body) is True
         return {"candidate": candidate["model"]}
 
@@ -2754,6 +2776,23 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
     )
     assert candidate_bodies[0]["previous_response_id"] == "cursor-unretained"
     assert "previous_response_id" not in candidate_bodies[1]
+    assert candidate_bodies[1]["input"] == [
+        {
+            "role": "user",
+            "content": "Complete the original assignment in /workspace.",
+        },
+        {
+            "type": "function_call",
+            "call_id": "pwd-call",
+            "name": "exec_command",
+            "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "pwd-call",
+            "output": "/workspace",
+        },
+    ]
     assert replay_safe_classifier(candidate_bodies[1]) is True
     assert routing_state.codex.cooldown_until_monotonic_by_key == {}
     assert routing_state.codex.candidate_semantic_ineligibility_by_key == {}
@@ -2783,6 +2822,32 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
         "model": "oa_xai/grok-4.6",
         "route_family": "codex_xai_oauth_responses_adapter",
     }
+    replay_messages = [
+        {
+            "role": "user",
+            "content": "Complete the original assignment in /workspace.",
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "pwd-call",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
+                    },
+                }
+            ],
+        },
+    ]
+    replay_tools = [
+        {
+            "type": "function",
+            "function": {"name": "exec_command"},
+        }
+    ]
     selections = [
         {
             "candidate": cursor_candidate,
@@ -2812,24 +2877,18 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
     prepared_body = {
         "model": "work",
         "previous_response_id": "cursor-unretained",
-        "tools": [
-            {
-                "type": "function",
-                "function": {"name": "exec_command"},
-            }
-        ],
+        "tools": replay_tools,
+        "message_id": "cursor-message-snake",
+        "messageId": "cursor-message-camel",
+        "conversation_id": "cursor-conversation-snake",
+        "conversationId": "cursor-conversation-camel",
+        "conversation_group_id": "cursor-group-snake",
+        "conversationGroupId": "cursor-group-camel",
+        "run_id": "cursor-run-snake",
+        "runId": "cursor-run-camel",
+        "agent_session_id": "cursor-session-snake",
+        "agentSessionId": "cursor-session-camel",
         "input": [
-            {
-                "type": "message",
-                "role": "user",
-                "content": "Complete the original assignment in /workspace.",
-            },
-            {
-                "type": "function_call",
-                "call_id": "pwd-call",
-                "name": "exec_command",
-                "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
-            },
             {
                 "type": "function_call_output",
                 "call_id": "pwd-call",
@@ -2837,28 +2896,37 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
             },
         ],
     }
-    rebuilt_request_body = dict(prepared_body)
-    rebuilt_request_body.pop("previous_response_id")
-    replay_safe_classifier = (
-        session_affinity.is_replay_safe_session_owner_redispatch_body
+    codex_candidate_calls._store_cursor_replay_state(
+        "cursor-unretained",
+        messages=replay_messages,
+        tools=replay_tools,
     )
-    assert replay_safe_classifier(rebuilt_request_body) is True
-
-    source_exc = CursorConnectError(
-        "Cursor retained session unavailable",
-        status_code=409,
+    replay_state = codex_candidate_calls._peek_cursor_replay_state(
+        "cursor-unretained"
     )
-    setattr(
-        source_exc,
-        codex_candidate_calls._CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
-        True,
-    )
+    with pytest.raises(CursorConnectError) as source_exc_info:
+        codex_candidate_calls._raise_cursor_session_continuation_unavailable(
+            previous_response_id="cursor-unretained",
+            replay_state=replay_state,
+        )
+    source_exc = source_exc_info.value
     with pytest.raises(ProxyException) as mapped_exc_info:
         codex_candidate_calls._raise_cursor_agent_alias_error(
             exc=source_exc,
             candidate=cursor_candidate,
         )
     mapped_exc = mapped_exc_info.value
+    rebuilt_request_body = (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            prepared_body,
+            continuation_exc=mapped_exc,
+        )
+    )
+    assert rebuilt_request_body is not None
+    replay_safe_classifier = (
+        session_affinity.is_replay_safe_session_owner_redispatch_body
+    )
+    assert replay_safe_classifier(rebuilt_request_body) is True
 
     routing_state = AliasRoutingStateManager()
     monkeypatch.setattr(candidate_loop, "alias_routing_state", routing_state)
@@ -2891,6 +2959,23 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
                 detail={"error": {"code": "rate_limit_exceeded"}},
             )
         assert "previous_response_id" not in candidate_body
+        assert candidate_body["input"] == rebuilt_request_body["input"]
+        assert candidate_body["tools"] == replay_tools
+        assert all(
+            field not in candidate_body
+            for field in (
+                "message_id",
+                "messageId",
+                "conversation_id",
+                "conversationId",
+                "conversation_group_id",
+                "conversationGroupId",
+                "run_id",
+                "runId",
+                "agent_session_id",
+                "agentSessionId",
+            )
+        )
         assert replay_safe_classifier(candidate_body) is True
         return {"candidate": candidate["model"]}
 
@@ -3020,6 +3105,24 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
     assert all(
         "previous_response_id" not in body for body in candidate_bodies[1:]
     )
+    assert candidate_bodies[1]["input"] == [
+        {
+            "role": "user",
+            "content": "Complete the original assignment in /workspace.",
+        },
+        {
+            "type": "function_call",
+            "call_id": "pwd-call",
+            "name": "exec_command",
+            "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "pwd-call",
+            "output": "/workspace",
+        },
+    ]
+    assert candidate_bodies[2]["input"] == candidate_bodies[1]["input"]
     assert classifier_calls[0] is prepared_body
     assert classifier_calls[1] == rebuilt_request_body
     assert metadata_input_bodies[0][1] is prepared_body
