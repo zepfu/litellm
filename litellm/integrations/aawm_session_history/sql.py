@@ -371,6 +371,7 @@ CREATE TABLE IF NOT EXISTS public.rate_limit_observations (
 _AAWM_RATE_LIMIT_OBSERVATIONS_ALTER_STATEMENTS = (
     "DROP INDEX IF EXISTS public.rate_limit_observations_limit_observed_idx",
     "DROP INDEX IF EXISTS public.rate_limit_observations_provider_client_model_idx",
+    "DROP INDEX IF EXISTS public.rate_limit_observations_identity_latest_idx",
     "DROP INDEX IF EXISTS public.rate_limit_observations_reset_idx",
     "DROP INDEX IF EXISTS public.rate_limit_observations_session_idx",
     "DROP INDEX IF EXISTS public.rate_limit_observations_trace_call_idx",
@@ -614,7 +615,16 @@ WHERE doomed.id = ranked.id
 """,
 )
 _AAWM_RATE_LIMIT_OBSERVATIONS_INDEX_STATEMENTS = (
-    "CREATE INDEX IF NOT EXISTS rate_limit_observations_identity_latest_idx ON public.rate_limit_observations (provider, client, account_hash, quota_key, source, model, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS rate_limit_observations_identity_latest_idx "
+    "ON public.rate_limit_observations ("
+    "quota_key, "
+    "provider, "
+    "(CASE WHEN client IS NULL THEN 'n:' ELSE 'v:' || client END), "
+    "(CASE WHEN account_hash IS NULL THEN 'n:' ELSE 'v:' || account_hash END), "
+    "(CASE WHEN source IS NULL THEN 'n:' ELSE 'v:' || source END), "
+    "observed_at DESC, "
+    "id DESC"
+    ")",
     "CREATE INDEX IF NOT EXISTS rate_limit_observations_quota_observed_idx ON public.rate_limit_observations (quota_key, observed_at DESC)",
     "CREATE INDEX IF NOT EXISTS rate_limit_observations_provider_quota_observed_idx ON public.rate_limit_observations (provider, quota_key, observed_at DESC) INCLUDE (expected_reset_at, remaining_pct, quota_type, model) WHERE remaining_pct >= 0",
     "CREATE INDEX IF NOT EXISTS rate_limit_observations_provider_model_observed_idx ON public.rate_limit_observations (provider, model, observed_at DESC)",
@@ -1638,10 +1648,19 @@ locked AS (
             CONCAT_WS(
                 '|',
                 candidate.provider,
-                COALESCE(candidate.client, '<null>'),
-                COALESCE(candidate.account_hash, '<null>'),
+                CASE
+                    WHEN candidate.client IS NULL THEN 'n:'
+                    ELSE 'v:' || candidate.client
+                END,
+                CASE
+                    WHEN candidate.account_hash IS NULL THEN 'n:'
+                    ELSE 'v:' || candidate.account_hash
+                END,
                 candidate.quota_key,
-                COALESCE(candidate.source, '<null>')
+                CASE
+                    WHEN candidate.source IS NULL THEN 'n:'
+                    ELSE 'v:' || candidate.source
+                END
             )
         )::bigint
     ) AS lock_acquired
@@ -1700,7 +1719,6 @@ WHERE NOT EXISTS (
     SELECT 1
     FROM (
         SELECT
-            latest.model,
             latest.quota_period,
             latest.quota_type,
             latest.expected_reset_at,
@@ -1709,19 +1727,50 @@ WHERE NOT EXISTS (
             latest.quota_used,
             latest.quota_remaining,
             latest.billing_period_start_at,
-            latest.billing_period_end_at,
-            latest.raw_provider_fields
+            latest.billing_period_end_at
         FROM public.rate_limit_observations AS latest
         WHERE latest.provider = candidate.provider
           AND latest.quota_key = candidate.quota_key
           AND latest.client IS NOT DISTINCT FROM candidate.client
           AND latest.account_hash IS NOT DISTINCT FROM candidate.account_hash
           AND latest.source IS NOT DISTINCT FROM candidate.source
+          AND (
+              CASE
+                  WHEN latest.client IS NULL THEN 'n:'
+                  ELSE 'v:' || latest.client
+              END
+          ) = (
+              CASE
+                  WHEN candidate.client IS NULL THEN 'n:'
+                  ELSE 'v:' || candidate.client
+              END
+          )
+          AND (
+              CASE
+                  WHEN latest.account_hash IS NULL THEN 'n:'
+                  ELSE 'v:' || latest.account_hash
+              END
+          ) = (
+              CASE
+                  WHEN candidate.account_hash IS NULL THEN 'n:'
+                  ELSE 'v:' || candidate.account_hash
+              END
+          )
+          AND (
+              CASE
+                  WHEN latest.source IS NULL THEN 'n:'
+                  ELSE 'v:' || latest.source
+              END
+          ) = (
+              CASE
+                  WHEN candidate.source IS NULL THEN 'n:'
+                  ELSE 'v:' || candidate.source
+              END
+          )
         ORDER BY latest.observed_at DESC, latest.id DESC
         LIMIT 1
     ) AS latest
-    WHERE latest.model IS NOT DISTINCT FROM candidate.model
-      AND latest.quota_period IS NOT DISTINCT FROM candidate.quota_period
+    WHERE latest.quota_period IS NOT DISTINCT FROM candidate.quota_period
       AND latest.quota_type IS NOT DISTINCT FROM candidate.quota_type
       AND (
           latest.expected_reset_at IS NOT DISTINCT FROM candidate.expected_reset_at
@@ -1737,7 +1786,29 @@ WHERE NOT EXISTS (
       AND latest.quota_remaining IS NOT DISTINCT FROM candidate.quota_remaining
       AND latest.billing_period_start_at IS NOT DISTINCT FROM candidate.billing_period_start_at
       AND latest.billing_period_end_at IS NOT DISTINCT FROM candidate.billing_period_end_at
-      AND latest.raw_provider_fields IS NOT DISTINCT FROM COALESCE(candidate.raw_provider_fields, '{}'::jsonb)
+)
+"""
+_AAWM_RATE_LIMIT_OBSERVATION_LOCK_SQL = """
+SELECT pg_advisory_xact_lock(
+    hashtext(
+        CONCAT_WS(
+            '|',
+            $1::text,
+            CASE
+                WHEN $2::text IS NULL THEN 'n:'
+                ELSE 'v:' || $2::text
+            END,
+            CASE
+                WHEN $3::text IS NULL THEN 'n:'
+                ELSE 'v:' || $3::text
+            END,
+            $4::text,
+            CASE
+                WHEN $5::text IS NULL THEN 'n:'
+                ELSE 'v:' || $5::text
+            END
+        )
+    )::bigint
 )
 """
 _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_SQL = """
@@ -1793,9 +1864,39 @@ SELECT
 FROM public.rate_limit_observations
 WHERE quota_key = $1
   AND provider = $2
-  AND client IS NOT DISTINCT FROM $3::text
-  AND account_hash IS NOT DISTINCT FROM $4::text
-  AND source IS NOT DISTINCT FROM $5::text
+  AND (
+      CASE
+          WHEN client IS NULL THEN 'n:'
+          ELSE 'v:' || client
+      END
+  ) = (
+      CASE
+          WHEN $3::text IS NULL THEN 'n:'
+          ELSE 'v:' || $3::text
+      END
+  )
+  AND (
+      CASE
+          WHEN account_hash IS NULL THEN 'n:'
+          ELSE 'v:' || account_hash
+      END
+  ) = (
+      CASE
+          WHEN $4::text IS NULL THEN 'n:'
+          ELSE 'v:' || $4::text
+      END
+  )
+  AND (
+      CASE
+          WHEN source IS NULL THEN 'n:'
+          ELSE 'v:' || source
+      END
+  ) = (
+      CASE
+          WHEN $5::text IS NULL THEN 'n:'
+          ELSE 'v:' || $5::text
+      END
+  )
   AND observed_at < $6
 ORDER BY observed_at DESC, id DESC
 LIMIT 1
@@ -1803,7 +1904,7 @@ LIMIT 1
 _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATIONS_BATCH_SQL = """
 WITH candidate AS (
     SELECT
-        input.ordinal::bigint AS ordinal,
+        input.ordinal::bigint AS input_ordinal,
         input.quota_key::text AS quota_key,
         input.provider::text AS provider,
         input.client::text AS client,
@@ -1829,6 +1930,7 @@ WITH candidate AS (
 )
 SELECT
     candidate.quota_key AS input_limit_key,
+    candidate.input_ordinal,
     latest.observed_at,
     latest.source,
     latest.provider,
@@ -1883,14 +1985,44 @@ JOIN LATERAL (
     FROM public.rate_limit_observations AS previous
     WHERE previous.quota_key = candidate.quota_key
       AND previous.provider = candidate.provider
-      AND previous.client IS NOT DISTINCT FROM candidate.client
-      AND previous.account_hash IS NOT DISTINCT FROM candidate.account_hash
-      AND previous.source IS NOT DISTINCT FROM candidate.source
+      AND (
+          CASE
+              WHEN previous.client IS NULL THEN 'n:'
+              ELSE 'v:' || previous.client
+          END
+      ) = (
+          CASE
+              WHEN candidate.client IS NULL THEN 'n:'
+              ELSE 'v:' || candidate.client
+          END
+      )
+      AND (
+          CASE
+              WHEN previous.account_hash IS NULL THEN 'n:'
+              ELSE 'v:' || previous.account_hash
+          END
+      ) = (
+          CASE
+              WHEN candidate.account_hash IS NULL THEN 'n:'
+              ELSE 'v:' || candidate.account_hash
+          END
+      )
+      AND (
+          CASE
+              WHEN previous.source IS NULL THEN 'n:'
+              ELSE 'v:' || previous.source
+          END
+      ) = (
+          CASE
+              WHEN candidate.source IS NULL THEN 'n:'
+              ELSE 'v:' || candidate.source
+          END
+      )
       AND previous.observed_at < candidate.observed_at
-    ORDER BY previous.observed_at DESC, previous.id DESC
-    LIMIT 1
+      ORDER BY previous.observed_at DESC, previous.id DESC
+      LIMIT 1
 ) AS latest ON TRUE
-ORDER BY candidate.ordinal
+ORDER BY candidate.input_ordinal
 """
 _AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL = """
 INSERT INTO public.rate_limit_transitions (

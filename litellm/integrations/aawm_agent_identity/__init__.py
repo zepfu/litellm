@@ -230,6 +230,7 @@ from litellm.integrations.aawm_session_history.sql import (  # noqa: F401
     _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL,
     _AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOT_INSERT_SQL,
     _AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL,
+    _AAWM_RATE_LIMIT_OBSERVATION_LOCK_SQL,
     _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_SQL,
     _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATIONS_BATCH_SQL,
     _AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL,
@@ -3019,6 +3020,7 @@ _infer_window_start_at = _aawm_rate_limit_base._infer_window_start_at
 _quota_period_from_window_minutes = _aawm_rate_limit_base._quota_period_from_window_minutes
 _parse_reset_hint_seconds = _aawm_rate_limit_base._parse_reset_hint_seconds
 _resolve_rate_limit_reset_at = _aawm_rate_limit_base._resolve_rate_limit_reset_at
+_rate_limit_reset_boundary = _aawm_rate_limit_base._rate_limit_reset_boundary
 _json_safe_rate_limit_value = _aawm_rate_limit_base._json_safe_rate_limit_value
 _coerce_rate_limit_payload = _aawm_rate_limit_base._coerce_rate_limit_payload
 _iter_rate_limit_dicts = _aawm_rate_limit_base._iter_rate_limit_dicts
@@ -3490,6 +3492,8 @@ _derive_langfuse_trace_tags_from_langfuse_trace = _aawm_sh_backfill._derive_lang
 # --- Wave A4D storage_fields facades ---
 _rate_limit_storage_provider = _aawm_sh_storage_fields._rate_limit_storage_provider
 _rate_limit_storage_client = _aawm_sh_storage_fields._rate_limit_storage_client
+_rate_limit_observation_identity = _aawm_sh_storage_fields._rate_limit_observation_identity
+_rate_limit_observation_sort_key = _aawm_sh_storage_fields._rate_limit_observation_sort_key
 _rate_limit_storage_quota_key = _aawm_sh_storage_fields._rate_limit_storage_quota_key
 _rate_limit_storage_quota_type = _aawm_sh_storage_fields._rate_limit_storage_quota_type
 _rate_limit_storage_remaining_pct = _aawm_sh_storage_fields._rate_limit_storage_remaining_pct

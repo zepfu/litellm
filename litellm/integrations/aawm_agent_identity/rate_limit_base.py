@@ -93,6 +93,18 @@ def _resolve_rate_limit_reset_at(
     return provider_resets_at, False
 
 
+def _rate_limit_reset_boundary(observation: Dict[str, Any]) -> Optional[datetime]:
+    provider_resets_at = _parse_provider_timestamp(observation.get("provider_resets_at"))
+    if provider_resets_at is not None:
+        return provider_resets_at
+
+    observed_at = _parse_provider_timestamp(observation.get("observed_at"))
+    reset_hint_seconds = _safe_int(observation.get("reset_hint_seconds"))
+    if observed_at is None or reset_hint_seconds is None or reset_hint_seconds < 0:
+        return None
+    return observed_at + timedelta(seconds=reset_hint_seconds)
+
+
 def _json_safe_rate_limit_value(
     value: Any,
     *,
@@ -698,7 +710,7 @@ def _rate_limit_snapshot_signature(
     *,
     include_reset: bool = True,
 ) -> Tuple[Any, ...]:
-    provider_resets_at = _parse_provider_timestamp(observation.get("provider_resets_at"))
+    provider_resets_at = _rate_limit_reset_boundary(observation)
     body = (
         _safe_float(observation.get("used_percentage")),
         _safe_int(observation.get("remaining_requests")),
@@ -712,7 +724,6 @@ def _rate_limit_snapshot_signature(
         _clean_non_empty_string(observation.get("status")),
         bool(observation.get("exhausted")),
         _clean_non_empty_string(observation.get("exhaustion_kind")),
-        None if provider_resets_at is not None else _safe_int(observation.get("reset_hint_seconds")),
     )
     if include_reset:
         return (provider_resets_at, *body)
@@ -726,8 +737,8 @@ def _rate_limit_observation_has_meaningful_change(
     if previous is None:
         return True
 
-    previous_reset = _parse_provider_timestamp(previous.get("provider_resets_at"))
-    current_reset = _parse_provider_timestamp(current.get("provider_resets_at"))
+    previous_reset = _rate_limit_reset_boundary(previous)
+    current_reset = _rate_limit_reset_boundary(current)
     previous_without_reset = _rate_limit_snapshot_signature(previous, include_reset=False)
     current_without_reset = _rate_limit_snapshot_signature(current, include_reset=False)
     if previous_without_reset != current_without_reset:
@@ -793,6 +804,7 @@ _HOST_FUNCTION_NAMES = (
     "_quota_period_from_window_minutes",
     "_parse_reset_hint_seconds",
     "_resolve_rate_limit_reset_at",
+    "_rate_limit_reset_boundary",
     "_json_safe_rate_limit_value",
     "_coerce_rate_limit_payload",
     "_iter_rate_limit_dicts",

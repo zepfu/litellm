@@ -43,6 +43,7 @@ from litellm.integrations.aawm_session_history.sql import (  # noqa: F401
     _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL,
     _AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOT_INSERT_SQL,
     _AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL,
+    _AAWM_RATE_LIMIT_OBSERVATION_LOCK_SQL,
     _AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL,
     _AAWM_PROVIDER_ERROR_OBSERVATION_INSERT_SQL,
     _AAWM_ALIAS_ROUTING_AUDIT_INSERT_SQL,
@@ -2311,7 +2312,33 @@ async def _persist_rate_limit_observations_best_effort(
                     if isinstance(observation, dict)
                 )
         rate_limit_observations.extend(openrouter_free_daily_observations)
-        if rate_limit_observations:
+        if not rate_limit_observations:
+            return
+
+        identity_lock_values = set()
+        for observation in rate_limit_observations:
+            identity = _rate_limit_observation_identity(observation)
+            if identity is None:
+                continue
+            quota_key, provider, client, account_hash, source = identity
+            identity_lock_values.add(
+                (provider, client, account_hash, quota_key, source)
+            )
+        ordered_identity_lock_values = sorted(
+            identity_lock_values,
+            key=lambda values: tuple(
+                "" if value is None else str(value) for value in values
+            ),
+        )
+
+        # Acquire every identity lock before reading predecessors. In READ
+        # COMMITTED, a separate read after a waiting lock gets a fresh snapshot.
+        async with _session_history_transaction(conn):
+            for lock_values in ordered_identity_lock_values:
+                await conn.execute(
+                    _AAWM_RATE_LIMIT_OBSERVATION_LOCK_SQL,
+                    *lock_values,
+                )
             (
                 rate_limit_observations,
                 initial_previous_by_limit_key,
@@ -2319,28 +2346,28 @@ async def _persist_rate_limit_observations_best_effort(
                 conn,
                 rate_limit_observations,
             )
-        if not rate_limit_observations:
-            return
-        transitions = await _derive_rate_limit_transitions(
-            conn,
-            rate_limit_observations,
-            initial_previous_by_limit_key,
-        )
-        await conn.executemany(
-            _AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL,
-            [
-                _build_rate_limit_observation_db_payload(observation)
-                for observation in rate_limit_observations
-            ],
-        )
-        if transitions:
+            if not rate_limit_observations:
+                return
+            transitions = await _derive_rate_limit_transitions(
+                conn,
+                rate_limit_observations,
+                initial_previous_by_limit_key,
+            )
             await conn.executemany(
-                _AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL,
+                _AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL,
                 [
-                    _build_rate_limit_transition_db_payload(transition)
-                    for transition in transitions
+                    _build_rate_limit_observation_db_payload(observation)
+                    for observation in rate_limit_observations
                 ],
             )
+            if transitions:
+                await conn.executemany(
+                    _AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL,
+                    [
+                        _build_rate_limit_transition_db_payload(transition)
+                        for transition in transitions
+                    ],
+                )
     except Exception as exc:
         verbose_logger.warning(
             "AawmAgentIdentity: best-effort rate limit observation persist failed: %s",
