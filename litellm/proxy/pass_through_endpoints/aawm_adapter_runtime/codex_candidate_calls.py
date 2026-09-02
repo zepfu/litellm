@@ -1291,6 +1291,8 @@ def _cursor_function_call_outputs(
 
 def _cursor_replay_function_call_output_items(
     request_body: dict[str, Any],
+    *,
+    allow_missing_metadata: bool = False,
 ) -> Optional[list[dict[str, Any]]]:
     input_items = _cursor_response_input_items(request_body)
     if not input_items:
@@ -1324,6 +1326,7 @@ def _cursor_replay_function_call_output_items(
             if item_id != f"fco_{canonical_item_uuid}" or item_id in seen_item_ids:
                 return None
             seen_item_ids.add(item_id)
+        metadata_present = "internal_chat_message_metadata_passthrough" in item
         metadata = item.get("internal_chat_message_metadata_passthrough")
         if metadata is not None:
             if (
@@ -1347,7 +1350,10 @@ def _cursor_replay_function_call_output_items(
                 or not math.isfinite(create_time)
             ):
                 return None
-        if (item_id is None) != (metadata is None):
+        if allow_missing_metadata:
+            if item_id is None or (metadata_present and metadata is None):
+                return None
+        elif (item_id is None) != (metadata is None):
             return None
         snake_call_id = item.get("call_id")
         camel_call_id = item.get("callId")
@@ -1400,15 +1406,21 @@ def _cursor_replay_is_canonical_uuid(value: Any) -> bool:
 
 def _cursor_replay_stock_codex_message_item(
     raw_item: Mapping[str, Any],
+    *,
+    allow_missing_metadata: bool = False,
 ) -> Optional[dict[str, Any]]:
     item = dict(raw_item)
-    if set(item) != {
+    metadata_key = "internal_chat_message_metadata_passthrough"
+    expected_item_keys = {
         "type",
         "id",
         "role",
         "content",
-        "internal_chat_message_metadata_passthrough",
-    }:
+        metadata_key,
+    }
+    if set(item) != expected_item_keys and not (
+        allow_missing_metadata and set(item) == expected_item_keys - {metadata_key}
+    ):
         return None
     role = item.get("role")
     if role not in {"developer", "user", "assistant"}:
@@ -1425,25 +1437,34 @@ def _cursor_replay_stock_codex_message_item(
     ):
         return None
 
+    metadata_present = "internal_chat_message_metadata_passthrough" in item
     metadata = item.get("internal_chat_message_metadata_passthrough")
     expected_metadata_keys = (
         {"turn_id", "content_item_kinds"}
         if role == "assistant"
         else {"turn_id", "create_time", "content_item_kinds"}
     )
-    if not isinstance(metadata, Mapping) or set(metadata) != expected_metadata_keys:
+    if metadata is None and (not allow_missing_metadata or metadata_present):
         return None
-    if not _cursor_replay_is_canonical_uuid(metadata.get("turn_id")):
+    if metadata is not None and (
+        not isinstance(metadata, Mapping) or set(metadata) != expected_metadata_keys
+    ):
         return None
-    create_time = metadata.get("create_time")
-    if role != "assistant" and (
+    if metadata is not None and not _cursor_replay_is_canonical_uuid(
+        metadata.get("turn_id")
+    ):
+        return None
+    create_time = metadata.get("create_time") if metadata is not None else None
+    if metadata is not None and role != "assistant" and (
         isinstance(create_time, bool)
         or not isinstance(create_time, float)
         or not math.isfinite(create_time)
     ):
         return None
-    content_item_kinds = metadata.get("content_item_kinds")
-    if (
+    content_item_kinds = (
+        metadata.get("content_item_kinds") if metadata is not None else None
+    )
+    if metadata is not None and (
         not isinstance(content_item_kinds, list)
         or not content_item_kinds
         or any(
@@ -1481,16 +1502,22 @@ def _cursor_replay_stock_codex_message_item(
 
 def _cursor_replay_stock_codex_function_call_item(
     raw_item: Mapping[str, Any],
+    *,
+    allow_missing_metadata: bool = False,
 ) -> Optional[dict[str, Any]]:
     item = dict(raw_item)
-    if set(item) != {
+    metadata_key = "internal_chat_message_metadata_passthrough"
+    expected_item_keys = {
         "type",
         "id",
         "name",
         "arguments",
         "call_id",
-        "internal_chat_message_metadata_passthrough",
-    }:
+        metadata_key,
+    }
+    if set(item) != expected_item_keys and not (
+        allow_missing_metadata and set(item) == expected_item_keys - {metadata_key}
+    ):
         return None
 
     item_id = item.get("id")
@@ -1507,8 +1534,11 @@ def _cursor_replay_stock_codex_function_call_item(
     ):
         return None
 
+    metadata_present = "internal_chat_message_metadata_passthrough" in item
     metadata = item.get("internal_chat_message_metadata_passthrough")
-    if (
+    if metadata is None and (not allow_missing_metadata or metadata_present):
+        return None
+    if metadata is not None and (
         not isinstance(metadata, Mapping)
         or set(metadata) != {"turn_id"}
         or not _cursor_replay_is_canonical_uuid(metadata.get("turn_id"))
@@ -1558,7 +1588,10 @@ def _cursor_replay_stock_codex_full_history_input(
             return None
         item_type = raw_item.get("type")
         if item_type == "message":
-            message_item = _cursor_replay_stock_codex_message_item(raw_item)
+            message_item = _cursor_replay_stock_codex_message_item(
+                raw_item,
+                allow_missing_metadata=True,
+            )
             if message_item is None:
                 return None
             if message_item["role"] == "user" and bool(
@@ -1571,7 +1604,8 @@ def _cursor_replay_stock_codex_full_history_input(
             if item_index != len(input_items) - 2 or function_call_count:
                 return None
             function_call_item = _cursor_replay_stock_codex_function_call_item(
-                raw_item
+                raw_item,
+                allow_missing_metadata=True,
             )
             if function_call_item is None:
                 return None
@@ -1584,17 +1618,26 @@ def _cursor_replay_stock_codex_full_history_input(
                 or function_call_count != 1
                 or output_count
                 or set(raw_item)
-                != {
-                    "type",
-                    "id",
-                    "call_id",
-                    "output",
-                    "internal_chat_message_metadata_passthrough",
-                }
+                not in (
+                    {
+                        "type",
+                        "id",
+                        "call_id",
+                        "output",
+                    },
+                    {
+                        "type",
+                        "id",
+                        "call_id",
+                        "output",
+                        "internal_chat_message_metadata_passthrough",
+                    },
+                )
             ):
                 return None
             output_items = _cursor_replay_function_call_output_items(
-                {"input": [raw_item]}
+                {"input": [raw_item]},
+                allow_missing_metadata=True,
             )
             if output_items is None or len(output_items) != 1:
                 return None
