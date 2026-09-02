@@ -470,12 +470,7 @@ def _is_openrouter_adapter_model_unavailable_error(
     ):
         return False
 
-    from litellm.proxy._types import ProxyException
-
-    if not (
-        isinstance(exc, ProxyException)
-        or bool(getattr(exc, "_aawm_provider_returned", False))
-    ):
+    if getattr(exc, "_aawm_provider_returned", False) is not True:
         return False
     if _is_openrouter_adapter_provider_raw_error(exc):
         return False
