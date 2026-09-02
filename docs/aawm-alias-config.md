@@ -194,7 +194,8 @@ The `basic` alias keeps the low-cost common prefix, in order:
 `basic-other` orders Alibaba Token Plan
 `alibaba_token_plan/deepseek-v4-flash-0731` (priority 100, admitted only during
 the recurring half-open `22:00-08:00 UTC+8` window), Z.AI Coding Plan
-`zai_coding_plan/glm-5.3-flash` (priority 90), and Cursor Agent
+`zai_coding_plan/glm-5.3-flash` (priority 90, admitted only from
+`03:00-23:00 America/Los_Angeles`), and Cursor Agent
 `cursor_agent/composer-2.5` (priority 80). It then has mutually exclusive
 priority-zero tails: OpenAI `gpt-5.6-luna` with `reasoning_effort: low` for
 non-Claude, missing, and unknown origins, or native Anthropic
@@ -305,11 +306,11 @@ Ohmypi orchestration child.
 
 Its candidates are `alias_reference: sota-deepseek` (priority 110, scheduled
 for the daily half-open window `22:00-08:00 UTC+8`), Z.AI Coding Plan
-`zai_coding_plan/glm-5.3-flash` (priority 100), `alias_reference:
-sota-moonshot` (priority 90), and `alias_reference: sota-xai` (priority 80).
-Thus Codex's effective expansion through `work-other` is DeepSeek -> Z.AI ->
-Moonshot -> `sota-xai` during the window, and Z.AI -> Moonshot -> `sota-xai`
-outside it.
+`zai_coding_plan/glm-5.3-flash` (priority 100, admitted only from
+`03:00-23:00 America/Los_Angeles`), `alias_reference: sota-moonshot`
+(priority 90), and `alias_reference: sota-xai` (priority 80). The Z.AI
+candidate is skipped during its `23:00-03:00 America/Los_Angeles` blocked
+window, so the next eligible branch is selected.
 `sota-xai` currently expands in this order: Cursor
 `cursor_agent/cursor-grok-4.6-high`, native xAI/OIDC `xai/grok-4.6`, then
 managed xAI/OAuth `oa_xai/grok-4.6`. The Claude-only Sonnet leaves do not enter
@@ -336,7 +337,8 @@ candidates use `reasoning_effort: low`.
 `auto-review-other` orders scheduled Alibaba Token Plan
 `alibaba_token_plan/deepseek-v4-flash-0731` (priority 100,
 `22:00-08:00 UTC+8`), Z.AI Coding Plan
-`zai_coding_plan/glm-5.3-flash` (priority 90), and Cursor Agent
+`zai_coding_plan/glm-5.3-flash` (priority 90, admitted only from
+`03:00-23:00 America/Los_Angeles`), and Cursor Agent
 `cursor_agent/composer-2.5` (priority 80), all at low effort.
 `codex-auto-review` remains a public name but contains only
 `alias_reference: auto-review`; both public aliases are defined in
@@ -370,14 +372,25 @@ schedule:
   utc_offset: "+08:00"
 ```
 
+```yaml
+schedule:
+  start_time: "03:00:00"
+  end_time: "23:00:00"
+  timezone: "America/Los_Angeles"
+```
+
 Absolute windows stay UTC-only and closed-closed (`start <= now <= end`).
-Daily windows require a local start time, local end time, and a fixed
-`utc_offset`. They are half-open: `22:00:00` is included, `07:59:59` is
-included, and `08:00:00` is excluded. When `start_time` is later than
-`end_time`, the window wraps midnight in that offset. Mixing the two forms,
-omitting the offset, using a date-only value, or applying a timezone-bearing
-clock time fails closed. `utc_offset: "+08:00"` is a fixed offset; it is not
-host-local time and does not apply daylight-saving rules.
+Daily windows require a local start time, local end time, and exactly one of
+fixed `utc_offset` or an IANA `timezone`. They are half-open: the start is
+included and the end is excluded. When `start_time` is later than `end_time`,
+the window wraps midnight in the configured zone. Mixing the two forms,
+omitting both offset and timezone, using a date-only value, or applying a
+timezone-bearing clock time fails closed. `utc_offset: "+08:00"` is a fixed
+offset; it is not host-local time and does not apply daylight-saving rules.
+An IANA `timezone` such as `America/Los_Angeles` applies its daylight-saving
+rules at selection time. For example, the Z.AI `03:00-23:00` eligibility
+window blocks `23:00-03:00` at `06:00-10:00 UTC` during PDT and
+`07:00-11:00 UTC` during PST.
 
 The schedule gate applies only to new affinity. Existing session owners are
 still found through `include_out_of_schedule` membership.
@@ -399,7 +412,8 @@ The public `sota-zai` alias is compiled from `sota-zai.yaml`. Codex
 Token Plan `alibaba_token_plan/glm-5.2` stays as the last-resort leaf on
 the same alias (priority 100). Coding Plan is Codex-only: do not set
 `anthropic_route_family` on that candidate. Anthropic ingress therefore
-sees only the Alibaba leaf. Do not invent `aawm-sota-zai` or `sota-zcode`.
+sees only the Alibaba leaf. This public alias has no schedule and remains
+selectable at all times. Do not invent `aawm-sota-zai` or `sota-zcode`.
 Do not add this alias to `sota.yaml` TUI dispatch.
 
 ## Codex passthrough alias catalog (CFG-023)

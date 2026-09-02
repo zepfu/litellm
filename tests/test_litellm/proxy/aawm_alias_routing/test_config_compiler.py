@@ -264,6 +264,64 @@ aliases:
     assert snapshot_absolute.config_hash != snapshot_daily.config_hash
 
 
+def test_named_daily_schedule_compiles_with_iana_timezone() -> None:
+    raw = """
+defaults: {}
+aliases:
+  - name: scheduled
+    candidates:
+      - provider: openrouter
+        model: openrouter/scheduled
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+        schedule:
+          start_time: "03:00:00"
+          end_time: "23:00:00"
+          timezone: "America/Los_Angeles"
+"""
+    snapshot = compiler.compile_yaml(raw)
+    schedule = snapshot.aliases["scheduled"].candidates[0].schedule
+
+    assert schedule is not None
+    assert schedule.kind == "daily"
+    assert schedule.start_time.isoformat() == "03:00:00"
+    assert schedule.end_time.isoformat() == "23:00:00"
+    assert schedule.utc_offset is None
+    assert schedule.timezone == "America/Los_Angeles"
+
+
+def test_canonical_zai_candidates_use_dst_aware_off_peak_window() -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    restricted_aliases = (
+        "provider-zai_coding_plan",
+        "basic-other",
+        "work-other",
+        "auto-review-other",
+    )
+
+    for alias_name in restricted_aliases:
+        candidate = next(
+            candidate
+            for candidate in snapshot.aliases[alias_name].candidates
+            if getattr(candidate, "provider", None) == "zai_coding_plan"
+        )
+        assert candidate.schedule is not None
+        assert candidate.schedule.kind == "daily"
+        assert candidate.schedule.start_time.isoformat() == "03:00:00"
+        assert candidate.schedule.end_time.isoformat() == "23:00:00"
+        assert candidate.schedule.timezone == "America/Los_Angeles"
+        assert candidate.schedule.utc_offset is None
+
+    sota_zai_candidate = snapshot.aliases["sota-zai"].candidates[0]
+    assert sota_zai_candidate.provider == "zai_coding_plan"
+    assert sota_zai_candidate.schedule is None
+
+
 def test_alias_reference_schedule_participates_in_config_hash() -> None:
     """CFG-020: alias_reference schedules feed the semantic digest."""
     unscheduled = """
@@ -832,6 +890,6 @@ def test_auto_review_other_preserves_low_effort_helper_candidates() -> None:
         for candidate in helper.candidates
     ] == [
         ("alibaba_token_plan/deepseek-v4-flash-0731", 100, "low", "daily"),
-        ("zai_coding_plan/glm-5.3-flash", 90, "low", None),
+        ("zai_coding_plan/glm-5.3-flash", 90, "low", "daily"),
         ("cursor_agent/composer-2.5", 80, "low", None),
     ]

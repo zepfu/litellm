@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import random
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timezone, tzinfo
 from typing import Any, Mapping, NamedTuple, Optional, Sequence, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import Request
 
@@ -364,10 +365,19 @@ def _is_schedule_window_active(
     if (
         schedule.start_time is None
         or schedule.end_time is None
-        or schedule.utc_offset is None
+        or (schedule.utc_offset is None and schedule.timezone is None)
     ):
         return False
-    local_now = now_utc.astimezone(timezone(schedule.utc_offset)).timetz().replace(
+    local_timezone: tzinfo
+    if schedule.timezone is not None:
+        try:
+            local_timezone = ZoneInfo(schedule.timezone)
+        except (ValueError, ZoneInfoNotFoundError):
+            return False
+    else:
+        assert schedule.utc_offset is not None
+        local_timezone = timezone(schedule.utc_offset)
+    local_now = now_utc.astimezone(local_timezone).timetz().replace(
         tzinfo=None, microsecond=0
     )
     now_seconds = _clock_seconds(local_now)
@@ -540,7 +550,7 @@ def _resolve_snapshot_alias_candidates(
             and not _is_snapshot_candidate_in_schedule_window(entry, now_utc=now_utc)
         ):
             continue
-        shaped = _shape_snapshot_candidate(
+        shaped_candidate = _shape_snapshot_candidate(
             entry,
             ingress=ingress,
             # Preserve the full snapshot digest for affinity compatibility and
@@ -548,21 +558,21 @@ def _resolve_snapshot_alias_candidates(
             # cooldown_identity_tag below for cooldown/evidence/probe keys.
             epoch_tag=snapshot.config_hash,
         )
-        if shaped is None:
+        if shaped_candidate is None:
             continue
-        shaped["cooldown_identity_tag"] = _snapshot_cooldown_identity_tag(
+        shaped_candidate["cooldown_identity_tag"] = _snapshot_cooldown_identity_tag(
             owning_alias=alias.name,
-            candidate=shaped,
+            candidate=shaped_candidate,
         )
-        shaped["selection_priority"] = entry.priority
-        shaped["resolved_alias"] = alias.name
-        shaped["alias_path"] = list(next_path)
+        shaped_candidate["selection_priority"] = entry.priority
+        shaped_candidate["resolved_alias"] = alias.name
+        shaped_candidate["alias_path"] = list(next_path)
         if alias.distribution_strategy is not None:
-            shaped["selection_group"] = alias.name
-            shaped["selection_strategy"] = alias.distribution_strategy
-            shaped["selection_choice"] = f"{entry.provider}:{entry.model}"
-            shaped["selection_weight"] = entry.weight
-        resolved.append(shaped)
+            shaped_candidate["selection_group"] = alias.name
+            shaped_candidate["selection_strategy"] = alias.distribution_strategy
+            shaped_candidate["selection_choice"] = f"{entry.provider}:{entry.model}"
+            shaped_candidate["selection_weight"] = entry.weight
+        resolved.append(shaped_candidate)
     return resolved
 
 

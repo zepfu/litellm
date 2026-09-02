@@ -29,6 +29,7 @@ class ScheduleWindow:
     start_time: Optional[time] = None
     end_time: Optional[time] = None
     utc_offset: Optional[timedelta] = None
+    timezone: Optional[str] = None
 
 
 @dataclass(frozen=True, slots=True)

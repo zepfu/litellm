@@ -477,6 +477,7 @@ def _compile_schedule(
         start_time=schedule.start_time,
         end_time=schedule.end_time,
         utc_offset=schedule.utc_offset,
+        timezone=schedule.timezone,
     )
 
 
@@ -495,6 +496,13 @@ def _canonical_schedule_repr(
         }
     assert schedule.start_time is not None
     assert schedule.end_time is not None
+    if schedule.timezone is not None:
+        return {
+            "end_time": schedule.end_time.isoformat(),
+            "kind": "daily",
+            "start_time": schedule.start_time.isoformat(),
+            "timezone": schedule.timezone,
+        }
     assert schedule.utc_offset is not None
     return {
         "end_time": schedule.end_time.isoformat(),

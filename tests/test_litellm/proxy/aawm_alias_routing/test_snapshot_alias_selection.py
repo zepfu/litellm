@@ -128,6 +128,116 @@ def test_canonical_sota_zai_prefers_coding_plan_on_codex_ingress() -> None:
         snapshot_select.set_active_routing_snapshot(previous)
 
 
+def test_zai_coding_plan_candidates_are_off_peak_only_except_public_sota() -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    previous = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(snapshot)
+    peak = dt.datetime(2026, 7, 1, 6, 0, tzinfo=dt.timezone.utc)
+    off_peak = dt.datetime(2026, 7, 1, 10, 0, tzinfo=dt.timezone.utc)
+    restricted_aliases = (
+        "provider-zai_coding_plan",
+        "basic-other",
+        "work-other",
+        "auto-review-other",
+    )
+    try:
+        for alias_name in restricted_aliases:
+            peak_models = [
+                candidate["model"]
+                for candidate in snapshot_select._select_snapshot_candidates(
+                    alias_name,
+                    ingress="codex",
+                    now_utc=peak,
+                )
+            ]
+            off_peak_models = [
+                candidate["model"]
+                for candidate in snapshot_select._select_snapshot_candidates(
+                    alias_name,
+                    ingress="codex",
+                    now_utc=off_peak,
+                )
+            ]
+            assert "zai_coding_plan/glm-5.3-flash" not in peak_models
+            assert "zai_coding_plan/glm-5.3-flash" in off_peak_models
+
+        for now_utc in (peak, off_peak):
+            sota_models = [
+                candidate["model"]
+                for candidate in snapshot_select._select_snapshot_candidates(
+                    "sota-zai",
+                    ingress="codex",
+                    now_utc=now_utc,
+                )
+            ]
+            assert sota_models[0] == "zai_coding_plan/glm-5.3"
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous)
+
+
+@pytest.mark.parametrize(
+    ("now_utc", "expected_eligible"),
+    [
+        (
+            dt.datetime(2026, 7, 1, 5, 59, 59, tzinfo=dt.timezone.utc),
+            True,
+        ),
+        (dt.datetime(2026, 7, 1, 6, 0, tzinfo=dt.timezone.utc), False),
+        (
+            dt.datetime(2026, 7, 1, 9, 59, 59, tzinfo=dt.timezone.utc),
+            False,
+        ),
+        (dt.datetime(2026, 7, 1, 10, 0, tzinfo=dt.timezone.utc), True),
+        (
+            dt.datetime(2026, 1, 1, 6, 59, 59, tzinfo=dt.timezone.utc),
+            True,
+        ),
+        (dt.datetime(2026, 1, 1, 7, 0, tzinfo=dt.timezone.utc), False),
+        (
+            dt.datetime(2026, 1, 1, 10, 59, 59, tzinfo=dt.timezone.utc),
+            False,
+        ),
+        (dt.datetime(2026, 1, 1, 11, 0, tzinfo=dt.timezone.utc), True),
+    ],
+    ids=[
+        "pdt-before-peak",
+        "pdt-peak-start",
+        "pdt-before-off-peak",
+        "pdt-off-peak-start",
+        "pst-before-peak",
+        "pst-peak-start",
+        "pst-before-off-peak",
+        "pst-off-peak-start",
+    ],
+)
+def test_zai_off_peak_schedule_uses_dst_aware_pacific_boundaries(
+    now_utc: dt.datetime,
+    expected_eligible: bool,
+) -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    previous = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(snapshot)
+    try:
+        selected = snapshot_select._select_snapshot_candidates(
+            "provider-zai_coding_plan",
+            ingress="codex",
+            now_utc=now_utc,
+        )
+        assert bool(selected) is expected_eligible
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous)
+
+
 def test_proportional_tie_distribution() -> None:
     """Equal-priority candidates split by weight over many selections within tolerance."""
     raw = """

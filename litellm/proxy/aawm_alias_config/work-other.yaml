@@ -14,6 +14,10 @@ aliases:
         model: zai_coding_plan/glm-5.3-flash
         route_family: codex_zai_coding_plan_chat_completions_adapter
         priority: 100
+        schedule:
+          start_time: "03:00:00"
+          end_time: "23:00:00"
+          timezone: "America/Los_Angeles"
       - alias_reference: sota-moonshot
         priority: 90
       - alias_reference: sota-xai

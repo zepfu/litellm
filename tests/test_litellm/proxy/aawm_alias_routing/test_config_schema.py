@@ -215,6 +215,18 @@ def test_daily_schedule_requires_offset_and_rejects_mixed_forms() -> None:
     assert daily.schedule is not None
     assert daily.schedule.kind == "daily"
 
+    named_timezone = schema.CandidateConfig.model_validate(
+        _base_candidate(
+            schedule={
+                "start_time": "03:00:00",
+                "end_time": "23:00:00",
+                "timezone": "America/Los_Angeles",
+            }
+        )
+    )
+    assert named_timezone.schedule is not None
+    assert named_timezone.schedule.timezone == "America/Los_Angeles"
+
     reference = schema.AliasReferenceCandidateConfig.model_validate(
         {
             "alias_reference": "sota-deepseek",
@@ -269,6 +281,27 @@ def test_daily_schedule_requires_offset_and_rejects_mixed_forms() -> None:
                     "start_time": "22:00:00",
                     "end_time": "08:00:00",
                     "utc_offset": "Asia/Shanghai",
+                }
+            )
+        )
+    with pytest.raises(ValidationError):
+        schema.CandidateConfig.model_validate(
+            _base_candidate(
+                schedule={
+                    "start_time": "03:00:00",
+                    "end_time": "23:00:00",
+                    "timezone": "not/a-timezone",
+                }
+            )
+        )
+    with pytest.raises(ValidationError):
+        schema.CandidateConfig.model_validate(
+            _base_candidate(
+                schedule={
+                    "start_time": "03:00:00",
+                    "end_time": "23:00:00",
+                    "utc_offset": "-08:00",
+                    "timezone": "America/Los_Angeles",
                 }
             )
         )

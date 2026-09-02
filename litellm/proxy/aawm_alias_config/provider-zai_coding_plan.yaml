@@ -12,3 +12,7 @@ aliases:
         route_family: codex_zai_coding_plan_chat_completions_adapter
         priority: 100
         reasoning_effort: max
+        schedule:
+          start_time: "03:00:00"
+          end_time: "23:00:00"
+          timezone: "America/Los_Angeles"

@@ -17,6 +17,10 @@ aliases:
         model: zai_coding_plan/glm-5.3-flash
         route_family: codex_zai_coding_plan_chat_completions_adapter
         priority: 90
+        schedule:
+          start_time: "03:00:00"
+          end_time: "23:00:00"
+          timezone: "America/Los_Angeles"
 
       - provider: cursor_agent
         model: cursor_agent/composer-2.5

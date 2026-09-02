@@ -19,6 +19,7 @@ import re
 from collections.abc import Sequence
 from datetime import datetime, time, timedelta
 from typing import Literal, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -206,6 +207,22 @@ def _parse_fixed_utc_offset(value: object) -> timedelta:
     return offset
 
 
+def _parse_timezone(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            "daily schedule timezone must be an IANA timezone such as "
+            "America/Los_Angeles"
+        )
+    raw = value.strip()
+    try:
+        ZoneInfo(raw)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise ValueError(
+            f"daily schedule timezone {raw!r} is not a valid IANA timezone"
+        ) from exc
+    return raw
+
+
 class ScheduleWindowConfig(BaseModel):
     """Absolute UTC or recurring daily local-time window for a candidate."""
 
@@ -216,6 +233,7 @@ class ScheduleWindowConfig(BaseModel):
     start_time: Optional[time] = None
     end_time: Optional[time] = None
     utc_offset: Optional[timedelta] = None
+    timezone: Optional[str] = None
 
     @field_validator("start", "end")
     @classmethod
@@ -240,6 +258,13 @@ class ScheduleWindowConfig(BaseModel):
             return None
         return _parse_fixed_utc_offset(value)
 
+    @field_validator("timezone", mode="before")
+    @classmethod
+    def _parse_daily_timezone(cls, value: object) -> object:
+        if value is None:
+            return None
+        return _parse_timezone(value)
+
     @model_validator(mode="after")
     def _require_exclusive_schedule_shape(self) -> "ScheduleWindowConfig":
         has_absolute = self.start is not None or self.end is not None
@@ -247,10 +272,12 @@ class ScheduleWindowConfig(BaseModel):
             self.start_time is not None
             or self.end_time is not None
             or self.utc_offset is not None
+            or self.timezone is not None
         )
         if has_absolute and has_daily:
             raise ValueError(
-                "schedule cannot mix absolute start/end with daily start_time/end_time/utc_offset"
+                "schedule cannot mix absolute start/end with daily "
+                "start_time/end_time/utc_offset/timezone"
             )
         if has_absolute:
             if self.start is None or self.end is None:
@@ -260,13 +287,19 @@ class ScheduleWindowConfig(BaseModel):
                     f"schedule window end ({self.end!r}) must not precede start ({self.start!r})"
                 )
             return self
+        if self.utc_offset is not None and self.timezone is not None:
+            raise ValueError(
+                "daily schedule windows require either utc_offset or timezone, "
+                "not both"
+            )
         if (
             self.start_time is None
             or self.end_time is None
-            or self.utc_offset is None
+            or (self.utc_offset is None and self.timezone is None)
         ):
             raise ValueError(
-                "daily schedule windows require start_time, end_time, and utc_offset"
+                "daily schedule windows require start_time, end_time, and "
+                "either utc_offset or timezone"
             )
         return self
 
