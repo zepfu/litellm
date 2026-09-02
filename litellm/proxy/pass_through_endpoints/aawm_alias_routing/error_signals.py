@@ -58,8 +58,10 @@ from .policy import (
     CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY as _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
     CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER as _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
     CODEX_AUTO_AGENT_NATIVE_PROVIDER as _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+    CODEX_AUTO_AGENT_NVIDIA_PROVIDER as _CODEX_AUTO_AGENT_NVIDIA_PROVIDER,
     CODEX_AUTO_AGENT_OPENROUTER_PROVIDER as _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
     CODEX_AUTO_AGENT_XAI_PROVIDER as _CODEX_AUTO_AGENT_XAI_PROVIDER,
+    nvidia_completion_adapter_upstream_model as _nvidia_completion_adapter_upstream_model,
 )
 from .types import Payload
 
@@ -1428,6 +1430,110 @@ def _is_alibaba_token_plan_unsupported_model_response(
     return False
 
 
+_NVIDIA_COMPLETION_ADAPTER_ROUTE_FAMILY = "codex_nvidia_completion_adapter"
+_NVIDIA_MODEL_DOES_NOT_EXIST_RE = re.compile(
+    r"\AThe model '([^']+)' does not exist\Z"
+)
+
+
+def _is_nvidia_completion_adapter_model_unavailable_response(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]] = None,
+    attempted_provider_call: bool = True,
+) -> bool:
+    """Detect an exact, provider-returned NVIDIA model-admission rejection."""
+    provider_returned = getattr(exc, "_aawm_provider_returned", False) is True
+    provider_body = getattr(exc, "body", None)
+    response = getattr(exc, "response", None)
+    try:
+        response_text = getattr(response, "text", None)
+    except Exception:
+        response_text = None
+    provider_payload_available = provider_body is not None or bool(
+        isinstance(response_text, str) and response_text.strip()
+    )
+    if (
+        not attempted_provider_call
+        or (
+            not provider_returned
+            and not (
+                str(getattr(exc, "llm_provider", "") or "").casefold()
+                == "nvidia_nim"
+                and provider_payload_available
+            )
+        )
+        or not isinstance(candidate, dict)
+        or candidate.get("provider") != _CODEX_AUTO_AGENT_NVIDIA_PROVIDER
+        or candidate.get("route_family") != _NVIDIA_COMPLETION_ADAPTER_ROUTE_FAMILY
+        or _extract_adapter_exception_status_code(exc) not in {400, 404}
+    ):
+        return False
+
+    selected_model = candidate.get("model")
+    if not isinstance(selected_model, str):
+        return False
+    selected_model = selected_model.strip()
+    provider_prefix = f"{_CODEX_AUTO_AGENT_NVIDIA_PROVIDER}/"
+    if not selected_model.casefold().startswith(provider_prefix.casefold()):
+        return False
+    selected_model_id = selected_model[len(provider_prefix) :].strip()
+    if not selected_model_id:
+        return False
+
+    selected_model_variants = {
+        selected_model,
+        selected_model_id,
+    }
+    normalized_upstream_model = _nvidia_completion_adapter_upstream_model(
+        selected_model
+    )
+    if normalized_upstream_model:
+        selected_model_variants.add(normalized_upstream_model)
+        selected_model_variants.add(
+            f"{_CODEX_AUTO_AGENT_NVIDIA_PROVIDER}/{normalized_upstream_model}"
+        )
+
+    messages: list[str] = []
+
+    def _collect_messages(payload: Any) -> None:
+        if isinstance(payload, bytes):
+            _collect_messages(payload.decode("utf-8", errors="ignore"))
+            return
+        if isinstance(payload, str):
+            stripped = payload.strip()
+            if stripped:
+                messages.append(stripped)
+                for parsed in _parse_json_payloads_from_text_candidates([payload]):
+                    _collect_messages(parsed)
+            return
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict):
+                _collect_messages(error.get("message"))
+            elif isinstance(error, (str, bytes)):
+                _collect_messages(error)
+            _collect_messages(payload.get("message"))
+            return
+        if isinstance(payload, list):
+            for item in payload:
+                _collect_messages(item)
+
+    for error in _iter_codex_auto_agent_error_blocks(exc):
+        _collect_messages(error.get("message"))
+    if provider_returned:
+        _collect_messages(getattr(exc, "detail", None))
+        _collect_messages(getattr(exc, "message", None))
+    _collect_messages(provider_body)
+    _collect_messages(response_text)
+
+    for message in messages:
+        match = _NVIDIA_MODEL_DOES_NOT_EXIST_RE.fullmatch(message)
+        if match is not None and match.group(1) in selected_model_variants:
+            return True
+    return False
+
+
 _ALIBABA_TOKEN_PLAN_FIVE_HOUR_EXHAUSTION_MESSAGE_MARKERS = (
     "token-plan 5-hour quota has been exhausted",
     "token-plan five-hour quota has been exhausted",
@@ -1652,6 +1758,12 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         attempted_provider_call=attempted_provider_call,
     ):
         return _CODEX_AUTO_AGENT_XAI_MODEL_UNAVAILABLE_ERROR_CLASS
+    if _is_nvidia_completion_adapter_model_unavailable_response(
+        exc,
+        candidate=candidate,
+        attempted_provider_call=attempted_provider_call,
+    ):
+        return "candidate_unavailable"
     if (
         isinstance(candidate, dict)
         and candidate.get("route_family") == "codex_responses"
@@ -2104,6 +2216,7 @@ _HOST_FUNCTION_NAMES = (
     "is_openai_responses_unpersisted_item_not_found_error",
     "_openai_responses_unpersisted_item_not_found_message",
     "_classify_alibaba_token_plan_quota_exhaustion_response",
+    "_is_nvidia_completion_adapter_model_unavailable_response",
     "_classify_codex_auto_agent_retryable_exhaustion",
     "_is_codex_auto_agent_retryable_exhaustion",
     "plan_responses_pre_commit_retry",
