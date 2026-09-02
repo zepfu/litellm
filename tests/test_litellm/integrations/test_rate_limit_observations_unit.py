@@ -34,10 +34,12 @@ adds the A3A façades.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 
+from litellm.integrations import aawm_agent_identity
 from litellm.integrations.aawm_agent_identity import (
     _build_rate_limit_observation_db_payload,
     _extract_anthropic_header_rate_limit_observations,
@@ -690,3 +692,271 @@ def test_observation_dataclass_roundtrip_matches_legacy_dict(
     assert len(observations) == 1
     db_payload = _build_rate_limit_observation_db_payload(observations[0])
     assert db_payload == golden_db_payload
+
+
+def _semantic_rate_limit_observation(**changes):
+    observation = {
+        "observed_at": datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc),
+        "source": "rate_limit_headers",
+        "provider": "openai",
+        "client_family": "codex",
+        "account_hash": "account-1",
+        "limit_key": "shared-quota",
+        "quota_period": "hourly",
+        "quota_type": "tokens",
+        "provider_resets_at": datetime(2026, 7, 1, 13, 0, tzinfo=timezone.utc),
+        "used_percentage": 10.0,
+        "remaining_requests": None,
+        "used_requests": None,
+        "total_requests": None,
+        "status": "observed",
+        "exhausted": False,
+        "exhaustion_kind": None,
+        "reset_hint_seconds": None,
+        "model": "gpt-5",
+        "quota_limit": 100.0,
+        "quota_used": 10.0,
+        "quota_remaining": 90.0,
+        "billing_period_start_at": datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc),
+        "billing_period_end_at": datetime(2026, 7, 1, 13, 0, tzinfo=timezone.utc),
+        "raw_provider_fields": {"used_percent": "10"},
+    }
+    observation.update(changes)
+    return observation
+
+
+def test_rate_limit_identity_index_is_nullable_safe_and_latest_ordered() -> None:
+    index_sql = aawm_agent_identity._AAWM_RATE_LIMIT_OBSERVATIONS_INDEX_STATEMENTS[0]
+    alter_sql = aawm_agent_identity._AAWM_RATE_LIMIT_OBSERVATIONS_ALTER_STATEMENTS
+
+    assert "rate_limit_observations_identity_latest_idx" in index_sql
+    assert "CASE WHEN client IS NULL THEN 'n:' ELSE 'v:' || client END" in index_sql
+    assert "CASE WHEN account_hash IS NULL THEN 'n:' ELSE 'v:' || account_hash END" in index_sql
+    assert "CASE WHEN source IS NULL THEN 'n:' ELSE 'v:' || source END" in index_sql
+    assert "observed_at DESC, id DESC" in index_sql
+    assert "model" not in index_sql
+    assert "DROP INDEX IF EXISTS public.rate_limit_observations_identity_latest_idx" in alter_sql
+
+
+def test_rate_limit_latest_queries_use_identity_order_and_ignore_model_filter() -> None:
+    single_sql = aawm_agent_identity._AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_SQL
+    batch_sql = aawm_agent_identity._AAWM_RATE_LIMIT_PREVIOUS_OBSERVATIONS_BATCH_SQL
+
+    assert "ORDER BY observed_at DESC, id DESC" in single_sql
+    assert "ORDER BY previous.observed_at DESC, previous.id DESC" in batch_sql
+    assert "input_ordinal" in batch_sql
+    assert "previous.model" not in batch_sql
+    for column in ("client", "account_hash", "source"):
+        assert f"WHEN {column} IS NULL THEN 'n:'" in single_sql
+        assert f"WHEN previous.{column} IS NULL THEN 'n:'" in batch_sql
+
+
+@pytest.mark.asyncio
+async def test_fetch_previous_rate_limit_observations_maps_full_nullable_identity() -> None:
+    observations = [
+        _semantic_rate_limit_observation(
+            provider="openai",
+            client_family="codex",
+            account_hash="account-1",
+            source="codex_headers",
+        ),
+        _semantic_rate_limit_observation(
+            provider="anthropic",
+            client_family="claude",
+            account_hash="account-2",
+            source="anthropic_headers",
+        ),
+        _semantic_rate_limit_observation(
+            provider="google",
+            client_family=None,
+            account_hash=None,
+            source=None,
+        ),
+    ]
+    previous_rows = [
+        {
+            "input_ordinal": 1,
+            "input_limit_key": "shared-quota",
+            "provider": "openai",
+            "client_family": "codex",
+            "account_hash": "account-1",
+            "source": "codex_headers",
+            "model": "gpt-4",
+        },
+        {
+            "input_ordinal": 2,
+            "input_limit_key": "shared-quota",
+            "provider": "anthropic",
+            "client_family": "claude",
+            "account_hash": "account-2",
+            "source": "anthropic_headers",
+            "model": "claude-3",
+        },
+        {
+            "input_ordinal": 3,
+            "input_limit_key": "shared-quota",
+            "provider": "google",
+            "client_family": None,
+            "account_hash": None,
+            "source": None,
+            "model": "gemini-2",
+        },
+    ]
+    conn = AsyncMock()
+    conn.fetch.return_value = previous_rows
+
+    previous_by_identity = await aawm_agent_identity._fetch_previous_rate_limit_observations(
+        conn,
+        observations,
+    )
+
+    assert len(previous_by_identity) == 3
+    assert previous_by_identity[
+        aawm_agent_identity._rate_limit_observation_identity(observations[0])
+    ]["model"] == "gpt-4"
+    assert previous_by_identity[
+        aawm_agent_identity._rate_limit_observation_identity(observations[1])
+    ]["model"] == "claude-3"
+    assert previous_by_identity[
+        aawm_agent_identity._rate_limit_observation_identity(observations[2])
+    ]["model"] == "gemini-2"
+    fetch_args = conn.fetch.await_args.args
+    assert fetch_args[1] == ["shared-quota", "shared-quota", "shared-quota"]
+    assert fetch_args[2] == ["openai", "anthropic", "google"]
+    assert fetch_args[3] == ["codex", "claude", None]
+    assert fetch_args[4] == ["account-1", "account-2", None]
+    assert fetch_args[5] == ["codex_headers", "anthropic_headers", None]
+
+
+def test_rate_limit_semantics_ignore_model_raw_and_volatile_reset_countdown() -> None:
+    previous = _semantic_rate_limit_observation(
+        provider_resets_at=None,
+        reset_hint_seconds=3600,
+        raw_provider_fields={"reset-after-seconds": "3600", "model": "gpt-5"},
+    )
+    current = _semantic_rate_limit_observation(
+        observed_at=previous["observed_at"] + timedelta(minutes=1),
+        provider_resets_at=None,
+        reset_hint_seconds=3540,
+        model="gpt-5-mini",
+        raw_provider_fields={"reset-after-seconds": "3540", "model": "gpt-5-mini"},
+    )
+
+    assert (
+        aawm_agent_identity._rate_limit_observation_has_meaningful_change(
+            previous,
+            current,
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"used_percentage": 11.0},
+        {"status": "exhausted", "exhausted": True},
+        {
+            "provider_resets_at": datetime(2026, 7, 1, 14, 0, tzinfo=timezone.utc),
+        },
+        {"quota_limit": 200.0},
+        {
+            "billing_period_start_at": datetime(
+                2026,
+                7,
+                1,
+                13,
+                0,
+                tzinfo=timezone.utc,
+            ),
+        },
+    ],
+)
+def test_rate_limit_semantics_preserve_genuine_state_transitions(changes) -> None:
+    previous = _semantic_rate_limit_observation()
+    current = _semantic_rate_limit_observation(**changes)
+
+    assert (
+        aawm_agent_identity._rate_limit_observation_has_meaningful_change(
+            previous,
+            current,
+        )
+        is True
+    )
+
+
+def test_rate_limit_insert_recheck_ignores_model_and_raw_attribution() -> None:
+    sql = aawm_agent_identity._AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL
+
+    assert "pg_advisory_xact_lock" in sql
+    assert "ORDER BY latest.observed_at DESC, latest.id DESC" in sql
+    assert "latest.quota_period IS NOT DISTINCT FROM candidate.quota_period" in sql
+    assert "latest.quota_type IS NOT DISTINCT FROM candidate.quota_type" in sql
+    assert "latest.model" not in sql
+    assert "latest.raw_provider_fields" not in sql
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_persistence_locks_before_predecessor_read() -> None:
+    observed_at = datetime(2026, 7, 1, 12, 1, tzinfo=timezone.utc)
+    current = _semantic_rate_limit_observation(
+        observed_at=observed_at,
+        used_percentage=11.0,
+    )
+    previous = _semantic_rate_limit_observation(
+        observed_at=observed_at - timedelta(minutes=1),
+        used_percentage=10.0,
+    )
+    previous.update(
+        {
+            "input_ordinal": 1,
+            "input_limit_key": "shared-quota",
+        }
+    )
+    events = []
+
+    class _Transaction:
+        async def __aenter__(self):
+            events.append("transaction_enter")
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            events.append("transaction_exit")
+            return False
+
+    conn = AsyncMock()
+    conn.transaction = lambda: _Transaction()
+
+    async def execute(*args):
+        events.append(("execute", args[0]))
+
+    async def fetch(*args):
+        events.append(("fetch", args[0]))
+        return [previous]
+
+    async def executemany(*args):
+        events.append(("executemany", args[0]))
+
+    conn.execute.side_effect = execute
+    conn.fetch.side_effect = fetch
+    conn.executemany.side_effect = executemany
+
+    await aawm_agent_identity._persist_rate_limit_observations_best_effort(
+        conn,
+        [{"rate_limit_observations": [current]}],
+        history_records=[],
+    )
+
+    event_names = [
+        event[0] if isinstance(event, tuple) else event for event in events
+    ]
+    assert event_names == [
+        "transaction_enter",
+        "execute",
+        "fetch",
+        "executemany",
+        "transaction_exit",
+    ]
+    assert "pg_advisory_xact_lock" in events[1][1]
+    assert "WITH candidate AS" in events[2][1]
+    assert "INSERT INTO public.rate_limit_observations" in events[3][1]

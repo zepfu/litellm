@@ -15082,8 +15082,18 @@ async def test_filter_meaningful_rate_limit_observations_batches_previous_lookup
     )
     assert fetch_args[6] == [second_at, first_at]
     assert kept == observations
-    assert previous_by_limit_key["codex_bengalfox:primary"]["used_percentage"] == 90.0
-    assert previous_by_limit_key["anthropic:seven_day"]["used_percentage"] == 40.0
+    assert (
+        previous_by_limit_key[
+            aawm_agent_identity._rate_limit_observation_identity(observations[0])
+        ]["used_percentage"]
+        == 90.0
+    )
+    assert (
+        previous_by_limit_key[
+            aawm_agent_identity._rate_limit_observation_identity(observations[1])
+        ]["used_percentage"]
+        == 40.0
+    )
 
 
 @pytest.mark.asyncio
@@ -15480,7 +15490,8 @@ def test_rate_limit_observation_insert_sql_guards_unchanged_latest_snapshot() ->
     assert "latest.quota_remaining IS NOT DISTINCT FROM candidate.quota_remaining" in sql
     assert "latest.billing_period_start_at IS NOT DISTINCT FROM candidate.billing_period_start_at" in sql
     assert "latest.billing_period_end_at IS NOT DISTINCT FROM candidate.billing_period_end_at" in sql
-    assert "latest.raw_provider_fields IS NOT DISTINCT FROM" in sql
+    assert "latest.model" not in sql
+    assert "latest.raw_provider_fields" not in sql
 
 
 def test_rate_limit_meaningful_change_ignores_reset_hint_when_reset_time_exists() -> None:

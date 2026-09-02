@@ -100,6 +100,13 @@ _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_FIELDS: Tuple[str, ...] = (
     "evidence",
     "metadata",
 )
+_RateLimitObservationIdentity = Tuple[
+    str,
+    str,
+    Optional[str],
+    Optional[str],
+    Optional[str],
+]
 
 
 def _rate_limit_storage_provider(record: Dict[str, Any]) -> str:
@@ -513,12 +520,39 @@ def _build_alias_routing_audit_db_payload(
     )
 
 
+def _rate_limit_observation_identity(
+    observation: Dict[str, Any],
+) -> Optional[_RateLimitObservationIdentity]:
+    quota_key = _rate_limit_storage_quota_key(observation)
+    if not isinstance(quota_key, str) or not quota_key:
+        return None
+    return (
+        quota_key,
+        _rate_limit_storage_provider(observation),
+        _rate_limit_storage_client(observation),
+        observation.get("account_hash"),
+        observation.get("source"),
+    )
+
+
+def _rate_limit_observation_sort_key(
+    observation: Dict[str, Any],
+) -> Tuple[str, str, str, str, str, Any]:
+    identity = _rate_limit_observation_identity(observation)
+    identity_values = identity or ("", "", None, None, None)
+    return (
+        *(str(value) if value is not None else "" for value in identity_values),
+        observation.get("observed_at") or datetime.min.replace(tzinfo=timezone.utc),
+    )
+
+
 def _rate_limit_previous_observation_row_to_dict(row: Any) -> Dict[str, Any]:
     try:
         row_dict = dict(row)
     except Exception:
         return {key: _maybe_get(row, key) for key in _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_FIELDS}
     row_dict.pop("input_limit_key", None)
+    row_dict.pop("input_ordinal", None)
     return row_dict
 
 
@@ -546,20 +580,20 @@ async def _fetch_previous_rate_limit_observation(
 async def _fetch_previous_rate_limit_observations(
     conn: Any,
     observations: List[Dict[str, Any]],
-) -> Dict[str, Optional[Dict[str, Any]]]:
-    first_observation_by_limit_key: Dict[str, Dict[str, Any]] = {}
+) -> Dict[_RateLimitObservationIdentity, Optional[Dict[str, Any]]]:
+    first_observation_by_identity: Dict[
+        _RateLimitObservationIdentity,
+        Tuple[int, Dict[str, Any]],
+    ] = {}
+    input_ordinal = 0
     for observation in observations:
-        limit_key = _rate_limit_storage_quota_key(observation)
-        if (
-            not isinstance(limit_key, str)
-            or not limit_key
-            or not observation.get("observed_at")
-            or limit_key in first_observation_by_limit_key
-        ):
+        identity = _rate_limit_observation_identity(observation)
+        if identity is None or not observation.get("observed_at") or identity in first_observation_by_identity:
             continue
-        first_observation_by_limit_key[limit_key] = observation
+        input_ordinal += 1
+        first_observation_by_identity[identity] = (input_ordinal, observation)
 
-    if not first_observation_by_limit_key:
+    if not first_observation_by_identity:
         return {}
 
     limit_keys: List[str] = []
@@ -568,15 +602,26 @@ async def _fetch_previous_rate_limit_observations(
     account_hashes: List[Optional[str]] = []
     sources: List[Optional[str]] = []
     observed_ats: List[Any] = []
-    for limit_key, observation in first_observation_by_limit_key.items():
+    input_ordinal_by_identity: Dict[_RateLimitObservationIdentity, int] = {}
+    identities_by_quota_key: Dict[str, List[_RateLimitObservationIdentity]] = {}
+    for identity, (input_ordinal, observation) in first_observation_by_identity.items():
+        limit_key, provider, client, account_hash, source = identity
+        input_ordinal_by_identity[identity] = input_ordinal
+        identities_by_quota_key.setdefault(limit_key, []).append(identity)
         limit_keys.append(limit_key)
-        providers.append(_rate_limit_storage_provider(observation))
-        clients.append(_rate_limit_storage_client(observation))
-        account_hashes.append(observation.get("account_hash"))
-        sources.append(observation.get("source"))
+        providers.append(provider)
+        clients.append(client)
+        account_hashes.append(account_hash)
+        sources.append(source)
         observed_ats.append(observation["observed_at"])
 
-    previous_by_limit_key: Dict[str, Optional[Dict[str, Any]]] = {limit_key: None for limit_key in limit_keys}
+    identity_by_input_ordinal = {
+        input_ordinal: identity
+        for identity, input_ordinal in input_ordinal_by_identity.items()
+    }
+    previous_by_identity: Dict[_RateLimitObservationIdentity, Optional[Dict[str, Any]]] = {
+        identity: None for identity in first_observation_by_identity
+    }
     rows = await conn.fetch(
         _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATIONS_BATCH_SQL,
         limit_keys,
@@ -587,91 +632,118 @@ async def _fetch_previous_rate_limit_observations(
         observed_ats,
     )
     for row in rows:
+        identity = identity_by_input_ordinal.get(_safe_int(_maybe_get(row, "input_ordinal")))
         limit_key = _maybe_get(row, "input_limit_key")
-        if isinstance(limit_key, str) and limit_key in previous_by_limit_key:
-            previous_by_limit_key[limit_key] = _rate_limit_previous_observation_row_to_dict(row)
-    return previous_by_limit_key
+        if identity is None and isinstance(limit_key, str):
+            row_identity = (
+                limit_key,
+                _maybe_get(row, "provider"),
+                _maybe_get(row, "client_family"),
+                _maybe_get(row, "account_hash"),
+                _maybe_get(row, "source"),
+            )
+            if row_identity in previous_by_identity:
+                identity = row_identity
+            else:
+                matching_identities = identities_by_quota_key.get(limit_key, [])
+                if len(matching_identities) == 1:
+                    identity = matching_identities[0]
+        if identity is not None:
+            previous_by_identity[identity] = _rate_limit_previous_observation_row_to_dict(row)
+    return previous_by_identity
 
 
 async def _derive_rate_limit_transitions(
     conn: Any,
     observations: List[Dict[str, Any]],
-    initial_previous_by_limit_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
+    initial_previous_by_limit_key: Optional[
+        Dict[_RateLimitObservationIdentity, Optional[Dict[str, Any]]]
+    ] = None,
 ) -> List[Dict[str, Any]]:
     transitions: List[Dict[str, Any]] = []
-    previous_by_limit_key: Dict[str, Optional[Dict[str, Any]]] = dict(initial_previous_by_limit_key or {})
+    previous_by_identity: Dict[
+        _RateLimitObservationIdentity,
+        Optional[Dict[str, Any]],
+    ] = dict(initial_previous_by_limit_key or {})
     ordered_observations = sorted(
         observations,
-        key=lambda item: (
-            _rate_limit_storage_quota_key(item),
-            item.get("observed_at") or datetime.min.replace(tzinfo=timezone.utc),
-        ),
+        key=_rate_limit_observation_sort_key,
     )
     missing_previous_observations: List[Dict[str, Any]] = []
     for observation in ordered_observations:
-        limit_key = _rate_limit_storage_quota_key(observation)
-        if isinstance(limit_key, str) and limit_key and limit_key not in previous_by_limit_key:
-            previous_by_limit_key[limit_key] = None
+        identity = _rate_limit_observation_identity(observation)
+        if identity is not None and identity not in previous_by_identity:
+            previous_by_identity[identity] = None
             missing_previous_observations.append(observation)
     if missing_previous_observations:
-        previous_by_limit_key.update(
+        previous_by_identity.update(
             await _fetch_previous_rate_limit_observations(
                 conn,
                 missing_previous_observations,
             )
         )
     for observation in ordered_observations:
-        limit_key = _rate_limit_storage_quota_key(observation)
-        if not isinstance(limit_key, str) or not limit_key:
+        identity = _rate_limit_observation_identity(observation)
+        if identity is None:
             continue
-        previous = previous_by_limit_key.get(limit_key)
+        previous = previous_by_identity.get(identity)
         if previous is not None:
             classification = _classify_rate_limit_transition(previous, observation)
             if classification is not None:
                 transitions.append(_build_rate_limit_transition(previous, observation, classification))
-        previous_by_limit_key[limit_key] = observation
+        previous_by_identity[identity] = observation
     return transitions
 
 
 async def _filter_meaningful_rate_limit_observations(
     conn: Any,
     observations: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], Dict[str, Optional[Dict[str, Any]]]]:
+) -> Tuple[
+    List[Dict[str, Any]],
+    Dict[_RateLimitObservationIdentity, Optional[Dict[str, Any]]],
+]:
     kept_by_index: List[Tuple[int, Dict[str, Any]]] = []
-    rolling_previous_by_limit_key: Dict[str, Optional[Dict[str, Any]]] = {}
-    initial_previous_by_limit_key: Dict[str, Optional[Dict[str, Any]]] = {}
+    rolling_previous_by_identity: Dict[
+        _RateLimitObservationIdentity,
+        Optional[Dict[str, Any]],
+    ] = {}
+    initial_previous_by_identity: Dict[
+        _RateLimitObservationIdentity,
+        Optional[Dict[str, Any]],
+    ] = {}
     indexed_observations = [
         (index, observation)
         for index, observation in enumerate(observations)
-        if isinstance(observation.get("limit_key"), str) and observation.get("limit_key")
+        if _rate_limit_observation_identity(observation) is not None and observation.get("observed_at")
     ]
     indexed_observations.sort(
         key=lambda item: (
-            _rate_limit_storage_quota_key(item[1]),
-            item[1].get("observed_at") or datetime.min.replace(tzinfo=timezone.utc),
+            *_rate_limit_observation_sort_key(item[1]),
             item[0],
         )
     )
 
-    initial_previous_by_limit_key.update(
+    initial_previous_by_identity.update(
         await _fetch_previous_rate_limit_observations(
             conn,
             [observation for _index, observation in indexed_observations],
         )
     )
-    rolling_previous_by_limit_key.update(initial_previous_by_limit_key)
+    rolling_previous_by_identity.update(initial_previous_by_identity)
 
     for index, observation in indexed_observations:
-        limit_key = _rate_limit_storage_quota_key(observation)
-        previous = rolling_previous_by_limit_key.get(limit_key)
+        identity = _rate_limit_observation_identity(observation)
+        if identity is None:
+            continue
+        previous = rolling_previous_by_identity.get(identity)
         if not _rate_limit_observation_has_meaningful_change(previous, observation):
             continue
 
         kept_by_index.append((index, observation))
-        rolling_previous_by_limit_key[limit_key] = observation
+        rolling_previous_by_identity[identity] = observation
 
     kept_by_index.sort(key=lambda item: item[0])
-    return [observation for _index, observation in kept_by_index], initial_previous_by_limit_key
+    return [observation for _index, observation in kept_by_index], initial_previous_by_identity
 
 
 def _rate_limit_observation_only_requested(kwargs: Dict[str, Any]) -> bool:
@@ -684,6 +756,8 @@ _HOST_FUNCTION_NAMES: Tuple[str, ...] = (
     "_rate_limit_storage_provider",
     "_rate_limit_storage_client",
     "_rate_limit_storage_quota_key",
+    "_rate_limit_observation_identity",
+    "_rate_limit_observation_sort_key",
     "_rate_limit_storage_quota_type",
     "_rate_limit_storage_remaining_pct",
     "_rate_limit_storage_numeric_detail",
