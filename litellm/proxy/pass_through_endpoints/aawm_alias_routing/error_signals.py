@@ -83,6 +83,13 @@ _CODEX_AUTO_AGENT_GROK_PERSONAL_TEAM_SPENDING_LIMIT_TOKEN = (
 _CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL = (
     _grok_side_channel._CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL
 )
+_CODEX_AUTO_AGENT_XAI_MODEL_UNAVAILABLE_ERROR_CLASS = "xai_model_unavailable"
+_CODEX_AUTO_AGENT_XAI_MODEL_UNAVAILABLE_ROUTE_FAMILIES = frozenset(
+    {
+        "codex_grok_native_responses_adapter",
+        "codex_xai_oauth_responses_adapter",
+    }
+)
 
 # ---------------------------------------------------------------------------
 # Kimi safe-metadata allowlist constants (owned by this module)
@@ -659,17 +666,6 @@ def _add_codex_auto_agent_text_error_tokens(
         "model is not supported" in text_lower or " is not supported" in text_lower
     ):
         tokens.add("aawm_codex_auto_agent_candidate_unavailable")
-    if "grok-4.5" in text_lower and any(
-        marker in text_lower
-        for marker in (
-            "model not found",
-            "model does not exist",
-            "model is not available",
-            "unknown model",
-            "unsupported model",
-        )
-    ):
-        tokens.add("aawm_codex_auto_agent_candidate_unavailable")
     if "aawm_auto_agent_failed_responses_payload" in text_lower:
         tokens.add("aawm_auto_agent_failed_responses_payload")
     if "aawm_auto_agent_malformed_tool_call_text" in text_lower:
@@ -788,6 +784,56 @@ def _is_codex_auto_agent_xai_candidate(
     if not isinstance(candidate, dict):
         return False
     return candidate.get("provider") == _CODEX_AUTO_AGENT_XAI_PROVIDER
+
+
+def _get_codex_auto_agent_xai_model_unavailable_suffix(
+    candidate: Optional[dict[str, Any]],
+) -> Optional[str]:
+    if not isinstance(candidate, dict):
+        return None
+    if candidate.get("provider") != _CODEX_AUTO_AGENT_XAI_PROVIDER:
+        return None
+    route_family = str(candidate.get("route_family") or "")
+    if route_family not in _CODEX_AUTO_AGENT_XAI_MODEL_UNAVAILABLE_ROUTE_FAMILIES:
+        return None
+    model = str(candidate.get("model") or "").strip()
+    if route_family == "codex_grok_native_responses_adapter":
+        if not model.startswith("xai/"):
+            return None
+        suffix = model[len("xai/") :].strip()
+    else:
+        if not model.startswith("oa_xai/"):
+            return None
+        suffix = model[len("oa_xai/") :].strip()
+    return suffix or None
+
+
+def _is_codex_auto_agent_xai_model_unavailable_response(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]],
+    attempted_provider_call: bool,
+) -> bool:
+    """Match only the captured provider-returned XAI model-not-found shape."""
+    if (
+        not attempted_provider_call
+        or getattr(exc, "_aawm_provider_returned", False) is not True
+        or _extract_adapter_exception_status_code(exc) not in {400, 404}
+    ):
+        return False
+    model_suffix = _get_codex_auto_agent_xai_model_unavailable_suffix(candidate)
+    if model_suffix is None:
+        return False
+    expected_message = f"model not found: {model_suffix}"
+    for parsed in _extract_adapter_error_payloads(exc):
+        if not isinstance(parsed, dict):
+            continue
+        error = parsed.get("error")
+        if not isinstance(error, dict):
+            continue
+        if error.get("code") == "not_found" and error.get("message") == expected_message:
+            return True
+    return False
 
 
 def _is_codex_auto_agent_cursor_agent_candidate(
@@ -1116,6 +1162,11 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
             return "candidate"
         if error_class == "kimi_code_no_cooldown":
             return "none"
+    if (
+        error_class == _CODEX_AUTO_AGENT_XAI_MODEL_UNAVAILABLE_ERROR_CLASS
+        and _get_codex_auto_agent_xai_model_unavailable_suffix(candidate) is not None
+    ):
+        return "candidate"
     if error_class == "safety_policy_denied":
         return "request_local"
     if _is_codex_auto_agent_cursor_agent_candidate(candidate) and error_class in {
@@ -1595,6 +1646,12 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         attempted_provider_call=attempted_provider_call,
     ):
         return "candidate_unavailable"
+    if _is_codex_auto_agent_xai_model_unavailable_response(
+        exc,
+        candidate=candidate,
+        attempted_provider_call=attempted_provider_call,
+    ):
+        return _CODEX_AUTO_AGENT_XAI_MODEL_UNAVAILABLE_ERROR_CLASS
     if (
         isinstance(candidate, dict)
         and candidate.get("route_family") == "codex_responses"

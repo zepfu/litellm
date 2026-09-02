@@ -32139,10 +32139,10 @@ def test_codex_auto_agent_grok_4_5_candidate_unavailable_does_not_durable_cooldo
     )
 
 
-def test_codex_auto_agent_grok_4_5_model_not_found_is_candidate_unavailable():
+def test_codex_auto_agent_xai_model_not_found_without_provider_evidence_is_not_classified():
     grok45_native = {
         "provider": "xai",
-        "model": "grok-4.5",
+        "model": "xai/grok-4.5",
         "route_family": "codex_grok_native_responses_adapter",
     }
     not_found_exc = HTTPException(
@@ -32150,15 +32150,195 @@ def test_codex_auto_agent_grok_4_5_model_not_found_is_candidate_unavailable():
         detail=b'{"error":{"message":"model not found: grok-4.5","code":"not_found"}}',
     )
 
-    assert _classify_codex_auto_agent_retryable_exhaustion(not_found_exc) == ("candidate_unavailable")
-    assert _get_codex_auto_agent_cooldown_seconds(not_found_exc, candidate=grok45_native) == 3 * 60 * 60.0
     assert (
-        _get_codex_auto_agent_candidate_cooldown_scope(
-            "candidate_unavailable",
+        _classify_codex_auto_agent_retryable_exhaustion(
+            not_found_exc,
             candidate=grok45_native,
+            attempted_provider_call=True,
         )
-        == "none"
+        is None
     )
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_xai_model_unavailable_cools_route_and_recovers_after_expiry(  # noqa: PLR0915
+    tmp_path,
+    monkeypatch,
+):
+    credential_path = tmp_path / "xai-oauth.json"
+    credential_path.write_text(
+        json.dumps(
+            {
+                "key": "managed-oauth-token",
+                "access_token": "managed-oauth-token",
+                "refresh_token": "refresh-token",
+                "expires_at": (
+                    datetime.now(timezone.utc) + timedelta(hours=1)
+                ).isoformat(),
+                "oidc_client_id": "xai-oauth-client-id",
+                "token_endpoint": "https://auth.test/token",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_AUTH_FILE", str(credential_path))
+    request = _build_codex_auto_agent_request("xai-015-first")
+    body = {
+        "model": "provider-xai",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "xai-015-first"},
+    }
+    model_not_found = HTTPException(
+        status_code=404,
+        detail={
+            "error": {
+                "message": "model not found: grok-4.6",
+                "code": "not_found",
+            }
+        },
+    )
+    model_not_found._aawm_provider_returned = True
+    native_success = Response(content='{"native": true}', media_type="application/json")
+    managed_success = Response(content='{"managed": true}', media_type="application/json")
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    native_handler = AsyncMock(side_effect=[model_not_found, native_success])
+    managed_handler = AsyncMock(return_value=managed_success)
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_grok_native_responses_request",
+        new=native_handler,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_oa_xai_responses_request",
+        new=managed_handler,
+    ):
+        first_response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            canonical_alias=body["model"],
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert first_response is managed_success
+    assert native_handler.await_count == 1
+    assert managed_handler.await_count == 1
+    first_metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    native_attempt = first_metadata["codex_auto_agent_attempts"][0]
+    native_cooldown_key = next(
+        event["cooldown_key"]
+        for event in first_metadata["aawm_alias_routing_audit_events"]
+        if event.get("model") == "xai/grok-4.6" and event.get("cooldown_key")
+    )
+    assert native_attempt["provider"] == "xai"
+    assert native_attempt["model"] == "xai/grok-4.6"
+    assert native_attempt["route_family"] == "codex_grok_native_responses_adapter"
+    assert native_attempt["lane_key"] == "xai_grok_native"
+    assert native_attempt["error_class"] == "xai_model_unavailable"
+    assert native_attempt["error_status_code"] == 404
+    assert native_attempt["cooldown_scope"] == "candidate"
+    assert native_cooldown_key.endswith(
+        "xai:xai/grok-4.6:xai_grok_native"
+    )
+    native_state_key = next(
+        key
+        for key in _codex_auto_agent_cooldown_until_monotonic_by_key
+        if key.endswith(native_cooldown_key)
+    )
+    durable_native_key = _build_aawm_alias_routing_durable_cache_key(
+        alias_family="codex",
+        state_kind="cooldown",
+        state_key=native_state_key,
+    )
+    assert dual_cache.store[durable_native_key]["cooldown_keys"] == [
+        native_state_key
+    ]
+
+    repeated_request = _build_codex_auto_agent_request("xai-015-repeated")
+    repeated_body = dict(body)
+    repeated_body["litellm_metadata"] = {"session_id": "xai-015-repeated"}
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        repeated_selection = await _select_codex_auto_agent_candidate(
+            request=repeated_request,
+            request_body=repeated_body,
+    )
+    assert repeated_selection["candidate"]["model"] == "oa_xai/grok-4.6"
+    repeated_native_skip = next(
+        skipped
+        for skipped in repeated_selection["skipped"]
+        if skipped["model"] == "xai/grok-4.6"
+    )
+    assert repeated_native_skip["reason"] == "cooldown"
+    assert repeated_native_skip["route_family"] == "codex_grok_native_responses_adapter"
+    assert repeated_native_skip["lane_key"] == "xai_grok_native"
+    assert repeated_selection["cooldown_key"] != native_cooldown_key
+    assert repeated_selection["cooldown_key"].endswith(
+        "xai:oa_xai/grok-4.6:xai_oauth_managed"
+    )
+
+    dual_cache.store[durable_native_key]["expires_at_epoch"] = time.time() - 1.0
+    _codex_auto_agent_cooldown_until_monotonic_by_key[native_state_key] = (
+        time.monotonic() - 1.0
+    )
+    llm_passthrough_endpoints._alias_routing_state.codex.cooldown_until_monotonic_by_key.pop(
+        native_state_key,
+        None,
+    )
+    llm_passthrough_endpoints._alias_routing_state.codex.cooldown_negative_until_monotonic_by_key.pop(
+        native_state_key,
+        None,
+    )
+
+    recovery_request = _build_codex_auto_agent_request("xai-015-recovery")
+    recovery_body = dict(body)
+    recovery_body["litellm_metadata"] = {"session_id": "xai-015-recovery"}
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_grok_native_responses_request",
+        new=native_handler,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_oa_xai_responses_request",
+        new=managed_handler,
+    ):
+        recovered_response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=recovery_request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=recovery_body,
+            canonical_alias=recovery_body["model"],
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    recovery_metadata = recovery_request.scope["parsed_body"][1]["litellm_metadata"]
+    assert recovered_response.status_code == 200
+    recovery_attempts = [
+        (attempt.get("model"), attempt.get("status"), attempt.get("error_class"))
+        for attempt in recovery_metadata["codex_auto_agent_attempts"]
+    ]
+    assert native_handler.await_count == 2, (
+        recovery_metadata.get("codex_auto_agent_selected_model"),
+        recovery_attempts,
+    )
+    assert managed_handler.await_count == 1, (
+        recovery_metadata.get("codex_auto_agent_selected_model"),
+        recovery_attempts,
+    )
+    assert recovery_metadata["codex_auto_agent_selected_model"] == "xai/grok-4.6"
 
 
 def test_codex_auto_agent_grok_4_5_usage_limit_wins_over_candidate_unavailable():
