@@ -2888,30 +2888,87 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
         "route_family": "codex_xai_oauth_responses_adapter",
     }
     turn_id = "01a06269-1662-7c02-a81a-031c450f8606"
+    function_names = (
+        "exec_command",
+        "write_stdin",
+        "view_image",
+        "get_goal",
+        "create_goal",
+        "update_goal",
+        "list_mcp_resources",
+        "list_mcp_resource_templates",
+        "read_mcp_resource",
+        "request_user_input",
+        "request_plugin_install",
+    )
     replay_tools = [
         {
             "type": "function",
-            "name": "exec_command",
-            "description": "Run a shell command.",
+            "name": name,
+            "description": f"Run the {name} tool.",
             "parameters": {
                 "type": "object",
-                "properties": {"cmd": {"type": "string"}},
-                "required": ["cmd"],
+                "properties": {},
                 "additionalProperties": False,
             },
             "strict": False,
-        },
-        {
-            "type": "custom",
-            "name": "apply_patch",
-            "description": "Apply a patch.",
-        },
-        {"type": "tool_search"},
-        {
-            "type": "web_search",
-            "filters": {"allowed_domains": ["example.com"]},
-        },
+        }
+        for name in function_names
     ]
+    replay_tools.extend(
+        [
+            {
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch.",
+            },
+            {
+                "description": (
+                    "# Tool discovery\n\n"
+                    "Searches over deferred tool metadata with BM25 and "
+                    "exposes matching tools for the next model call.\n\n"
+                    "You have access to tools from the following sources:\n"
+                    "- Codex: Built-in tools.\n"
+                    "Some of the tools may not have been provided to you "
+                    "upfront, and you should use this tool (`tool_search`) "
+                    "to search for the required tools."
+                ),
+                "execution": "client",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": (
+                                "Search query for deferred tools."
+                            ),
+                        },
+                        "limit": {
+                            "type": "number",
+                            "description": (
+                                "Maximum number of tools to return. "
+                                "Defaults to 8."
+                            ),
+                        },
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+                "type": "tool_search",
+            },
+            {
+                "type": "web_search",
+                "filters": {"allowed_domains": ["example.com"]},
+            },
+        ]
+    )
+    assert len(replay_tools) == 14
+    assert set(replay_tools[12]) == {
+        "description",
+        "execution",
+        "parameters",
+        "type",
+    }
     selections = [
         {
             "candidate": cursor_candidate,
@@ -3075,6 +3132,26 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
         )
     )
     assert rebuilt_request_body is not None
+    assert all(
+        field not in rebuilt_request_body
+        for field in (
+            "previous_response_id",
+            "message_id",
+            "messageId",
+            "conversation_id",
+            "conversationId",
+            "conversation_group_id",
+            "conversationGroupId",
+            "run_id",
+            "runId",
+            "agent_session_id",
+            "agentSessionId",
+        )
+    )
+    assert rebuilt_request_body["input"][2] == {
+        "role": "user",
+        "content": "Complete the original assignment in /workspace.",
+    }
     assert rebuilt_request_body["input"][-1] == {
         "type": "function_call_output",
         "call_id": "call-8ef73738-1b5f-4aab-8789-fa1f309bb320-0",

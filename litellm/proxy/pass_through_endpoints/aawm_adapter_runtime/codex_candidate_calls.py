@@ -2268,6 +2268,67 @@ def _cursor_replay_unresolved_function_call_ids(
     return _CursorReplayValidationResult(value=unresolved_call_ids)
 
 
+def _cursor_replay_canonicalize_stock_tool_search(
+    tool: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    if set(tool) != {"description", "execution", "parameters", "type"}:
+        return None
+    if (
+        tool.get("type") != "tool_search"
+        or tool.get("execution") != "client"
+        or not isinstance(tool.get("description"), str)
+        or not tool["description"]
+    ):
+        return None
+
+    parameters = tool.get("parameters")
+    if not isinstance(parameters, Mapping):
+        return None
+    if set(parameters) != {
+        "additionalProperties",
+        "properties",
+        "required",
+        "type",
+    }:
+        return None
+    if (
+        parameters.get("type") != "object"
+        or parameters.get("required") != ["query"]
+        or parameters.get("additionalProperties") is not False
+    ):
+        return None
+
+    properties = parameters.get("properties")
+    if not isinstance(properties, Mapping) or set(properties) != {
+        "limit",
+        "query",
+    }:
+        return None
+    for property_name, property_type in (
+        ("query", "string"),
+        ("limit", "number"),
+    ):
+        property_schema = properties.get(property_name)
+        if (
+            not isinstance(property_schema, Mapping)
+            or set(property_schema) != {"description", "type"}
+            or property_schema.get("type") != property_type
+            or not isinstance(property_schema.get("description"), str)
+            or not property_schema["description"]
+        ):
+            return None
+
+    try:
+        canonical_tool = json.loads(json.dumps(dict(tool)))
+    except Exception:  # noqa: BLE001
+        return None
+    return (
+        canonical_tool
+        if isinstance(canonical_tool, dict) and canonical_tool == dict(tool)
+        else None
+    )
+
+
 def _cursor_replay_provider_neutral_tools(
     replay_tools: Any,
 ) -> _CursorReplayValidationResult:
@@ -2356,25 +2417,37 @@ def _cursor_replay_provider_neutral_tools(
             validation_tool["name"] = name.strip()
             validation_tool.setdefault("parameters", {})
             validation_tool.setdefault("strict", None)
-        try:
-            validated_tool = tool_adapter.validate_python(
-                validation_tool,
-                strict=True,
+        if validation_tool.get("type") == "tool_search":
+            canonical_tool = _cursor_replay_canonicalize_stock_tool_search(
+                validation_tool
             )
-            canonical_tool = json.loads(tool_adapter.dump_json(validated_tool))
-        except Exception:  # noqa: BLE001
-            reason = (
-                "tool_type_validation"
-                if not isinstance(validation_tool.get("type"), str)
-                or not validation_tool.get("type", "").strip()
-                else "tool_validation"
-            )
-            return _cursor_replay_rejected(
-                "provider_neutral_tools",
-                reason,
-                tool_index=tool_index,
-                tool=original_tool,
-            )
+            if canonical_tool is None:
+                return _cursor_replay_rejected(
+                    "provider_neutral_tools",
+                    "tool_validation",
+                    tool_index=tool_index,
+                    tool=original_tool,
+                )
+        else:
+            try:
+                validated_tool = tool_adapter.validate_python(
+                    validation_tool,
+                    strict=True,
+                )
+                canonical_tool = json.loads(tool_adapter.dump_json(validated_tool))
+            except Exception:  # noqa: BLE001
+                reason = (
+                    "tool_type_validation"
+                    if not isinstance(validation_tool.get("type"), str)
+                    or not validation_tool.get("type", "").strip()
+                    else "tool_validation"
+                )
+                return _cursor_replay_rejected(
+                    "provider_neutral_tools",
+                    reason,
+                    tool_index=tool_index,
+                    tool=original_tool,
+                )
         if canonical_tool != validation_tool:
             return _cursor_replay_rejected(
                 "provider_neutral_tools",

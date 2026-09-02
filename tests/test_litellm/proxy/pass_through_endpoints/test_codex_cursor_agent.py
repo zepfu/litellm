@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Union, get_args
 from urllib.parse import urlparse
 
 import pytest
@@ -180,6 +180,83 @@ def _cursor_continuation_failure() -> CursorConnectError:
     return continuation_exc
 
 
+def _stock_tool_search_descriptor() -> dict[str, Any]:
+    return {
+        "description": (
+            "# Tool discovery\n\n"
+            "Searches over deferred tool metadata with BM25 and exposes "
+            "matching tools for the next model call.\n\n"
+            "You have access to tools from the following sources:\n"
+            "- Codex: Built-in tools.\n"
+            "Some of the tools may not have been provided to you upfront, "
+            "and you should use this tool (`tool_search`) to search for "
+            "the required tools."
+        ),
+        "execution": "client",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query for deferred tools.",
+                },
+                "limit": {
+                    "type": "number",
+                    "description": (
+                        "Maximum number of tools to return. Defaults to 8."
+                    ),
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        "type": "tool_search",
+    }
+
+
+def _stock_codex_tools() -> list[dict[str, Any]]:
+    function_names = (
+        "exec_command",
+        "write_stdin",
+        "view_image",
+        "get_goal",
+        "create_goal",
+        "update_goal",
+        "list_mcp_resources",
+        "list_mcp_resource_templates",
+        "read_mcp_resource",
+        "request_user_input",
+        "request_plugin_install",
+    )
+    function_tools = [
+        {
+            "type": "function",
+            "name": name,
+            "description": f"Run the {name} tool.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            "strict": False,
+        }
+        for name in function_names
+    ]
+    return [
+        *function_tools,
+        {
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Apply a patch.",
+        },
+        _stock_tool_search_descriptor(),
+        {
+            "type": "web_search",
+            "filters": {"allowed_domains": ["example.com"]},
+        },
+    ]
+
+
 def _stock_codex_full_history_body(
     *,
     include_metadata: bool = False,
@@ -187,30 +264,7 @@ def _stock_codex_full_history_body(
     turn_id = "01a06269-1662-7c02-a81a-031c450f8606"
     body = {
         "model": "work",
-        "tools": [
-            {
-                "type": "function",
-                "name": "exec_command",
-                "description": "Run a shell command.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"cmd": {"type": "string"}},
-                    "required": ["cmd"],
-                    "additionalProperties": False,
-                },
-                "strict": False,
-            },
-            {
-                "type": "custom",
-                "name": "apply_patch",
-                "description": "Apply a patch.",
-            },
-            {"type": "tool_search"},
-            {
-                "type": "web_search",
-                "filters": {"allowed_domains": ["example.com"]},
-            },
-        ],
+        "tools": _stock_codex_tools(),
         "input": [
             {
                 "type": "message",
@@ -2021,12 +2075,17 @@ def test_cursor_fresh_replay_dispatch_accepts_stock_codex_full_history(
             for item_keys in expected_item_keys
         ]
     assert [set(item) for item in body["input"]] == expected_item_keys
-    assert [tool["type"] for tool in body["tools"]] == [
-        "function",
-        "custom",
-        "tool_search",
-        "web_search",
-    ]
+    assert len(body["tools"]) == 14
+    assert [tool["type"] for tool in body["tools"][:11]] == ["function"] * 11
+    assert body["tools"][11]["type"] == "custom"
+    assert set(body["tools"][12]) == {
+        "description",
+        "execution",
+        "parameters",
+        "type",
+    }
+    assert body["tools"][12]["type"] == "tool_search"
+    assert body["tools"][13]["type"] == "web_search"
     continuation_exc = CursorConnectError("missing retained session", status_code=409)
     setattr(
         continuation_exc,
@@ -2080,6 +2139,93 @@ def test_cursor_fresh_replay_dispatch_accepts_stock_codex_full_history(
         and "internal_chat_message_metadata_passthrough" not in item
         for item in rebuilt["input"]
     )
+
+
+def test_cursor_fresh_replay_dispatch_accepts_stock_tool_search_with_legacy_tool_param(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openai.types.responses import response_create_params
+    from pydantic import TypeAdapter, ValidationError
+
+    body = _stock_codex_full_history_body()
+    stock_tool_search = body["tools"][12]
+    legacy_tool_args = tuple(
+        tool_type
+        for tool_type in get_args(response_create_params.ToolParam)
+        if getattr(tool_type, "__name__", "") != "ToolSearchToolParam"
+    )
+    legacy_tool_param = Union[legacy_tool_args]
+    monkeypatch.setattr(
+        response_create_params,
+        "ToolParam",
+        legacy_tool_param,
+    )
+
+    with pytest.raises(ValidationError) as validation_exc:
+        TypeAdapter(legacy_tool_param).validate_python(
+            stock_tool_search,
+            strict=True,
+        )
+    assert any(
+        error["type"] == "literal_error"
+        and error["loc"][-1] == "type"
+        and error["input"] == "tool_search"
+        for error in validation_exc.value.errors()
+    )
+
+    rejection: dict[str, Any] = {}
+    rebuilt = codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+        body,
+        continuation_exc=_cursor_continuation_failure(),
+        rejection_diagnostic_out=rejection,
+    )
+
+    assert rebuilt is not None, rejection
+    assert rebuilt["tools"][12] == stock_tool_search
+    assert rejection == {}
+
+
+@pytest.mark.parametrize(
+    "mutate_tool_search",
+    [
+        lambda tool: tool.update({"unexpected": "value"}),
+        lambda tool: tool.update({"execution": "server"}),
+        lambda tool: tool["parameters"]["properties"]["limit"].update(
+            {"type": "string"}
+        ),
+        lambda tool: tool["parameters"].update({"required": []}),
+        lambda tool: tool.update({"type": "unknown_tool"}),
+    ],
+    ids=[
+        "extra-top-level-key",
+        "wrong-execution",
+        "wrong-limit-type",
+        "wrong-required",
+        "unknown-tool-type",
+    ],
+)
+def test_cursor_fresh_replay_dispatch_rejects_malformed_stock_tool_search(
+    mutate_tool_search: Any,
+) -> None:
+    body = _stock_codex_full_history_body()
+    mutate_tool_search(body["tools"][12])
+    rejection: dict[str, Any] = {}
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            body,
+            continuation_exc=_cursor_continuation_failure(),
+            rejection_diagnostic_out=rejection,
+        )
+        is None
+    )
+    diagnostic = rejection[
+        codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
+    ]
+    assert diagnostic["stage"] == "provider_neutral_tools"
+    assert diagnostic["reason"] == "tool_validation"
+    assert diagnostic["tool_index"] == 12
+    assert diagnostic["tool_type"] in {"tool_search", "unknown_tool"}
 
 
 def test_cursor_fresh_replay_dispatch_rejects_provider_owned_full_history() -> None:
