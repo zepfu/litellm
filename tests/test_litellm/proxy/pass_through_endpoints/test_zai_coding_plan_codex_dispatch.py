@@ -488,8 +488,6 @@ def test_should_map_coding_plan_1113_to_wrong_base_terminal_error() -> None:
         (1000, "provider_terminal_error"),
         (1001, "provider_terminal_error"),
         (1113, "provider_terminal_error"),
-        (1211, "candidate_unavailable"),
-        (1311, "candidate_unavailable"),
         (1302, "rate_limited"),
         (1308, "usage_limit_reached"),
         (1309, "usage_limit_reached"),
@@ -518,6 +516,65 @@ def test_should_map_coding_plan_business_codes_in_candidate_loop(
             },
         )
         == expected_class
+    )
+
+
+@pytest.mark.parametrize("error_code", (1211, 1311))
+def test_should_map_zai_model_codes_only_for_attributed_provider_returns(
+    error_code: int,
+) -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        candidate_loop,
+    )
+
+    exc = _StructuredCodingPlanError(
+        code=error_code,
+        message=f"provider model admission rejected: {error_code}",
+        status_code=400,
+    )
+    setattr(exc, "_aawm_provider_returned", True)
+
+    assert (
+        candidate_loop._classify_codex_zai_coding_plan_candidate_failure(
+            exc,
+            candidate={
+                "provider": "zai_coding_plan",
+                "model": _ADAPTER_MODEL,
+                "route_family": _CODEX_ZAI_ROUTE_FAMILY,
+            },
+            attempted_provider_call=True,
+        )
+        == "candidate_unavailable"
+    )
+
+
+@pytest.mark.parametrize("error_code", (1211, 1311))
+@pytest.mark.parametrize("attempted_provider_call", (False, True))
+def test_should_keep_unmarked_local_zai_model_codes_terminal(
+    error_code: int,
+    attempted_provider_call: bool,
+) -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        candidate_loop,
+    )
+
+    exc = _StructuredCodingPlanError(
+        code=error_code,
+        message=f"local model validation rejected: {error_code}",
+        status_code=400,
+    )
+
+    assert (
+        candidate_loop._classify_codex_zai_coding_plan_candidate_failure(
+            exc,
+            candidate={
+                "provider": "zai_coding_plan",
+                "model": _ADAPTER_MODEL,
+                "route_family": _CODEX_ZAI_ROUTE_FAMILY,
+            },
+            attempted_provider_call=attempted_provider_call,
+        )
+        == "provider_terminal_error"
     )
 
 
@@ -595,10 +652,12 @@ async def test_should_fail_over_in_order_after_zai_model_admission_failure(  # n
         _ = candidate_body
         provider_calls.append(candidate["provider"])
         if candidate["provider"] == "zai_coding_plan":
-            raise _StructuredCodingPlanError(
+            exc = _StructuredCodingPlanError(
                 code=error_code,
                 message=f"model admission rejected: {error_code}",
             )
+            setattr(exc, "_aawm_provider_returned", True)
+            raise exc
         return {"provider": candidate["provider"], "ok": True}
 
     def _resolve_publication(**kwargs: Any) -> object:
