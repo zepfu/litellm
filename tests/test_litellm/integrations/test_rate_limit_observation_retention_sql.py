@@ -113,18 +113,38 @@ def test_should_preserve_every_source_column_and_source_id() -> None:
     )
 
 
-def test_should_add_only_archive_identity_and_age_indexes() -> None:
+def test_should_add_archive_and_hot_retention_indexes() -> None:
     migration = _migration_sql()
-    assert migration.count("CREATE INDEX IF NOT EXISTS") == 2
+    normalized = " ".join(migration.split())
+    assert (
+        len(
+            re.findall(
+                r"CREATE INDEX(?: CONCURRENTLY)? IF NOT EXISTS",
+                migration,
+            )
+        )
+        == 3
+    )
     assert (
         "rate_limit_observation_older_identity_latest_idx" in migration
     )
     assert (
         "provider, client, account_hash, quota_key, source, observed_at DESC, id DESC"
-        in " ".join(migration.split())
+        in normalized
     )
     assert "rate_limit_observation_older_observed_at_idx" in migration
-    assert "observed_at ASC, id ASC" in " ".join(migration.split())
+    assert (
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+        "rate_limit_observations_retention_observed_at_id_idx "
+        "ON public.rate_limit_observations (observed_at ASC, id ASC);"
+        in normalized
+    )
+    hot_retention_index = migration.index(
+        "rate_limit_observations_retention_observed_at_id_idx"
+    )
+    assert migration.index(
+        ":d1_679_source_table_guard_statement;"
+    ) < hot_retention_index < migration.index("BEGIN;")
     assert "rate_limit_observations_identity_latest_idx" not in migration
 
 
@@ -138,7 +158,13 @@ def test_should_use_strict_daily_and_weekly_age_cutoffs() -> None:
     )
 
     assert "v_cutoff TIMESTAMPTZ := NOW() - INTERVAL '45 days';" in daily
-    assert "WHERE observed_at < v_cutoff" in daily
+    assert (
+        "WHERE observed_at < v_cutoff "
+        "ORDER BY observed_at ASC, id ASC "
+        "LIMIT v_batch_size "
+        "FOR UPDATE SKIP LOCKED"
+        in " ".join(daily.split())
+    )
     assert "<= v_cutoff" not in daily
     assert "v_cutoff TIMESTAMPTZ := NOW() - INTERVAL '6 months';" in weekly
     assert "WHERE observed_at < v_cutoff" in weekly
@@ -308,6 +334,10 @@ def test_should_document_unapplied_retention_install_contract() -> None:
         "The definitions are prepared but unapplied.",
         "apply_rate_limit_observation_retention_2026_09_02.sql",
         "install_rate_limit_observation_retention_jobs_2026_09_02.sql",
+        "`CREATE INDEX CONCURRENTLY` runs outside the migration transaction",
+        "may remain if the later transactional DDL fails",
+        "can leave an invalid index",
+        "`DROP INDEX CONCURRENTLY IF EXISTS public.rate_limit_observations_retention_observed_at_id_idx`",
         "D1-678 remains the owner",
         "it never deletes from `public.rate_limit_observations`",
     ):

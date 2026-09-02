@@ -974,12 +974,15 @@ identities. The archive has only an identity/latest index and an
 
 The prepared daily PostgreSQL function selects at most 1,000 source rows whose
 age is strictly older than `NOW() - INTERVAL '45 days'`, ordered by
-`observed_at` and `id`. It takes the shared transaction advisory lock
-`aawm.rate_limit_observation_retention`, inserts each exact source row into the
-archive idempotently, and deletes a source row only when the archive insert or
-an exact existing archive row is confirmed by the same transaction. A failed
-insert or an archive identity/content mismatch leaves the source row in place
-for retry.
+`observed_at` and `id`. The migration adds
+`public.rate_limit_observations(observed_at ASC, id ASC)` as
+`rate_limit_observations_retention_observed_at_id_idx` so that predicate and
+ordering have a bounded hot-table index path. It takes the shared transaction
+advisory lock `aawm.rate_limit_observation_retention`, inserts each exact source
+row into the archive idempotently, and deletes a source row only when the
+archive insert or an exact existing archive row is confirmed by the same
+transaction. A failed insert or an archive identity/content mismatch leaves
+the source row in place for retry.
 
 The separate weekly PostgreSQL function selects at most 5,000 archive rows whose
 `observed_at` is strictly older than `NOW() - INTERVAL '6 months'` under the
@@ -1031,14 +1034,22 @@ psql --set=ON_ERROR_STOP=1 \
   --file=scripts/install_rate_limit_observation_retention_jobs_2026_09_02.sql
 ```
 
-Apply requires separate authorization and must be ordered after the archive
-schema/function migration. Before installation, record the read-only
-`aawm_tristore` row counts and estimated bytes for both age cutoffs. Afterward,
-monitor `cron.job` and `cron.job_run_details`, and reconcile source,
+In the migration, `CREATE INDEX CONCURRENTLY` runs outside the migration
+transaction after the database, role, and source-table guards. The index build
+is idempotent, but it may remain if the later transactional DDL fails. A failed
+concurrent build can leave an invalid index, so inspect its `pg_index.indisvalid`
+state before retrying the migration.
+
+Apply requires separate authorization and job installation must be ordered
+after the archive schema/function migration. Before installation, record the
+read-only `aawm_tristore` row counts and estimated bytes for both age cutoffs.
+Afterward, monitor `cron.job` and `cron.job_run_details`, and reconcile source,
 archive, moved, and expired counts with duplicate `id` checks. Rollback first
-unschedules the two named jobs, then may revoke or drop the functions after
-both jobs stop; archive data is retained. Dropping the archive table is
-destructive and is never an automatic rollback step.
+unschedules the two named jobs, then may revoke or drop the functions after both
+jobs stop. The hot-table index rollback also runs outside a transaction:
+`DROP INDEX CONCURRENTLY IF EXISTS public.rate_limit_observations_retention_observed_at_id_idx`.
+Archive data is retained. Dropping the archive table is destructive and is
+never an automatic rollback step.
 
 Grok no-format `/v1/billing` monthly counter payloads (`monthlyLimit`,
 `used`) populate `quota_limit`, `quota_used`, `quota_remaining`, billing-period

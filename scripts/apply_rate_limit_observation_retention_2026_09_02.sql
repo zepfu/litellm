@@ -1,8 +1,8 @@
 -- D1-679: define bounded rate-limit observation retention.
 --
--- This file creates the archive table and the two database-native retention
--- functions. It does not install pg_cron, schedule a job, or run cleanup.
--- Apply only to the explicitly guarded target database.
+-- This file creates the hot-table retention index, archive table, and the two
+-- database-native retention functions. It does not install pg_cron, schedule a
+-- job, or run cleanup. Apply only to the explicitly guarded target database.
 
 \set ON_ERROR_STOP on
 
@@ -90,6 +90,10 @@ END AS d1_679_source_table_present \gset
 \endif
 
 :d1_679_source_table_guard_statement;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS
+    rate_limit_observations_retention_observed_at_id_idx
+    ON public.rate_limit_observations (observed_at ASC, id ASC);
 
 BEGIN;
 
