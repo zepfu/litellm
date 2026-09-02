@@ -154,14 +154,14 @@ def _auto_agent_alias_route_rollup_status(event: dict[str, Any]) -> Optional[str
     selection_reason = str(event.get("selection_reason") or "")
     failure_class = str(event.get("failure_class") or "")
     cooldown_scope = str(event.get("cooldown_scope") or "")
+    if event_type == "no_candidate_available":
+        return "Exhausted"
     if (
         candidate_status in {"ineligible", "candidate_ineligible_no_cooldown"}
         or attempt_status == "candidate_ineligible_no_cooldown"
         or failure_class == "candidate_deterministically_ineligible"
     ):
         return "Ineligible"
-    if event_type == "no_candidate_available":
-        return "Exhausted"
     if _auto_agent_alias_request_outcome_is_recovered(event):
         return "Recovered"
     if _auto_agent_alias_request_outcome_is_pending_failover(event):
@@ -294,42 +294,113 @@ def _resolve_auto_agent_alias_route_rollup_group_header_label(
     return f"{group_header_label}@{host_name}"
 
 
-def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
+def _record_auto_agent_alias_route_status_rollup(  # noqa: PLR0915
+    event: dict[str, Any],
+) -> None:
     status = _auto_agent_alias_route_rollup_status(event)
-    if status is None:
-        return
     request_identity = _auto_agent_alias_event_request_identity(event)
     alias_model = _clean_codex_auth_value(event.get("alias_model"))
-    model_labels: list[str] = []
-    model_label = _auto_agent_alias_model_rollup_label(event)
-    if model_label:
-        model_labels.append(model_label)
+
     candidates = event.get("candidates")
-    if isinstance(candidates, list):
-        for candidate in candidates:
+    attempts = event.get("attempts")
+    normalized_attempts = [
+        attempt for attempt in attempts or [] if isinstance(attempt, dict)
+    ]
+    has_terminal_inventory = isinstance(candidates, list) and any(
+        isinstance(candidate, dict)
+        and candidate.get("terminal_disposition") in {"attempted", "skipped"}
+        for candidate in candidates
+    )
+
+    # Terminal events carry one event-level failure plus a candidate inventory.
+    # Keep legacy events without dispositions on their existing broadcast path,
+    # but use each candidate's own attempt/skip data when the inventory is
+    # available.
+    candidate_entries: list[tuple[str, dict[str, Any]]] = []
+    if has_terminal_inventory or normalized_attempts:
+        seen_labels: set[str] = set()
+        attempts_by_identity: dict[
+            tuple[str, str, str], list[dict[str, Any]]
+        ] = {}
+
+        def _identity(candidate: dict[str, Any]) -> tuple[str, str, str]:
+            return tuple(
+                _clean_codex_auth_value(candidate.get(key)) or ""
+                for key in ("provider", "model", "route_family")
+            )
+
+        for attempt in normalized_attempts:
+            attempts_by_identity.setdefault(_identity(attempt), []).append(attempt)
+
+        for attempt in normalized_attempts:
+            label = _auto_agent_alias_model_rollup_label(
+                {
+                    **attempt,
+                    "alias_model": alias_model,
+                }
+            )
+            if not label or label in seen_labels:
+                continue
+            seen_labels.add(label)
+            candidate_entries.append(
+                (label, attempts_by_identity[_identity(attempt)][-1])
+            )
+
+        for candidate in candidates if isinstance(candidates, list) else []:
             if not isinstance(candidate, dict):
                 continue
-            candidate_label = _auto_agent_alias_model_rollup_label(
+            label = _auto_agent_alias_model_rollup_label(
                 {
-                    "model": candidate.get("model"),
+                    **candidate,
                     "alias_model": alias_model,
                     "provider": candidate.get("provider") or event.get("provider"),
                 }
             )
-            if candidate_label and candidate_label not in model_labels:
-                model_labels.append(candidate_label)
-    if not model_labels:
-        return
-
-    message = _auto_agent_alias_route_status_message(event)
-    if _should_emit_auto_agent_alias_route_status_event(event, status=status):
-        for label in model_labels:
-            emit_aawm_route_status_event(
-                alias_model=alias_model,
-                model_label=label.split("(", 1)[0],
-                status=status,
-                message=message,
+            if not label or label in seen_labels:
+                continue
+            seen_labels.add(label)
+            candidate_event = dict(candidate)
+            reason = _clean_codex_auth_value(
+                candidate_event.get("reason") or candidate_event.get("skip_reason")
             )
+            if candidate_event.get("terminal_disposition") == "skipped":
+                if candidate_event.get("candidate_status") is None:
+                    if reason == "candidate_ineligible":
+                        candidate_event["candidate_status"] = "ineligible"
+                    elif reason:
+                        candidate_event["candidate_status"] = f"skipped_{reason}"
+                if candidate_event.get("selection_reason") is None:
+                    candidate_event["selection_reason"] = reason
+                candidate_event.setdefault("attempted_provider_call", False)
+            elif candidate_event.get("terminal_disposition") == "attempted":
+                if candidate_event.get("status") is None:
+                    candidate_event["status"] = candidate_event.get("outcome")
+            candidate_entries.append((label, candidate_event))
+
+    if not candidate_entries:
+        if status is None:
+            return
+        model_labels: list[str] = []
+        model_label = _auto_agent_alias_model_rollup_label(event)
+        if model_label:
+            model_labels.append(model_label)
+        if isinstance(candidates, list):
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                candidate_label = _auto_agent_alias_model_rollup_label(
+                    {
+                        "model": candidate.get("model"),
+                        "alias_model": alias_model,
+                        "provider": candidate.get("provider") or event.get("provider"),
+                    }
+                )
+                if candidate_label and candidate_label not in model_labels:
+                    model_labels.append(candidate_label)
+        if not model_labels:
+            return
+        candidate_entries = [(label, event) for label in model_labels]
+
     group_header_label = _resolve_auto_agent_alias_route_rollup_group_header_label(event)
     incoming_endpoint = _clean_codex_auth_value(event.get("incoming_endpoint"))
     outgoing_target = (
@@ -340,8 +411,6 @@ def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
         )
         or "candidate_selection"
     )
-    if not group_header_label or not incoming_endpoint:
-        return
     # Zero-turn status rollups use same-request native effort only.
     # Core normalization renders absent/invalid values as "none"; never consult
     # candidate config, defaults, or model capabilities here.
@@ -350,37 +419,72 @@ def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
     )
     from litellm.proxy.aawm_route_logging import _AawmRouteRollupOriginIdentity
 
-    attempted_provider_call = event.get("attempted_provider_call") is True
-    is_native_openai_provider = (
-        _clean_codex_auth_value(event.get("provider"))
-        == _CODEX_AUTO_AGENT_NATIVE_PROVIDER
-    )
-    account_hash = _clean_codex_auth_value(event.get("account_hash"))
-    account_display = _clean_codex_auth_value(event.get("account_display"))
-    origin_identity = None
-    if request_identity or (attempted_provider_call and account_hash):
-        origin_identity = _AawmRouteRollupOriginIdentity(
-            litellm_call_id=request_identity,
-            provider=(
-                _clean_codex_auth_value(event.get("provider"))
-                if attempted_provider_call
-                else None
-            ),
-            account_identity=(
-                account_hash
-                if attempted_provider_call and is_native_openai_provider
-                else None
-            ),
-            account_display=(
-                account_display
-                if attempted_provider_call and is_native_openai_provider and account_hash
-                else None
-            ),
+    for label, candidate_event in candidate_entries:
+        candidate_status = (
+            status
+            if candidate_event is event
+            else _auto_agent_alias_route_rollup_status(candidate_event)
         )
-    origin_kwargs = (
-        {} if origin_identity is None else {"origin_identity": origin_identity}
-    )
-    for label in model_labels:
+        candidate_message = _auto_agent_alias_route_status_message(candidate_event)
+        if (
+            candidate_status is not None
+            and _should_emit_auto_agent_alias_route_status_event(
+                candidate_event,
+                status=candidate_status,
+            )
+        ):
+            emit_aawm_route_status_event(
+                alias_model=alias_model,
+                model_label=label.split("(", 1)[0],
+                status=candidate_status,
+                message=candidate_message,
+            )
+        if not group_header_label or not incoming_endpoint:
+            continue
+
+        candidate_attempted_provider_call = (
+            candidate_event.get("attempted_provider_call") is True
+        )
+        candidate_provider = (
+            _clean_codex_auth_value(candidate_event.get("provider"))
+            if candidate_attempted_provider_call
+            else None
+        )
+        candidate_is_native_openai_provider = (
+            candidate_provider == _CODEX_AUTO_AGENT_NATIVE_PROVIDER
+        )
+        candidate_account_hash = _clean_codex_auth_value(
+            candidate_event.get("account_hash")
+        )
+        candidate_account_display = _clean_codex_auth_value(
+            candidate_event.get("account_display")
+        )
+        candidate_origin_identity = None
+        if request_identity or (
+            candidate_attempted_provider_call and candidate_account_hash
+        ):
+            candidate_origin_identity = _AawmRouteRollupOriginIdentity(
+                litellm_call_id=request_identity,
+                provider=candidate_provider,
+                account_identity=(
+                    candidate_account_hash
+                    if candidate_attempted_provider_call
+                    and candidate_is_native_openai_provider
+                    else None
+                ),
+                account_display=(
+                    candidate_account_display
+                    if candidate_attempted_provider_call
+                    and candidate_is_native_openai_provider
+                    and candidate_account_hash
+                    else None
+                ),
+            )
+        candidate_origin_kwargs = (
+            {}
+            if candidate_origin_identity is None
+            else {"origin_identity": candidate_origin_identity}
+        )
         record_aawm_route_rollup(
             group_header_label=group_header_label,
             incoming_endpoint=incoming_endpoint,
@@ -388,9 +492,9 @@ def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
             model_label=label,
             effort=effort,
             turns=0,
-            status=status,
-            message=_clean_codex_auth_value(event.get("source_error")),
-            **origin_kwargs,
+            status=candidate_status,
+            message=_clean_codex_auth_value(candidate_event.get("source_error")),
+            **candidate_origin_kwargs,
         )
 
 

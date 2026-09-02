@@ -776,6 +776,170 @@ class TestRecordRouteStatusRollup:
     @patch(
         "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.emit_aawm_route_status_event",
     )
+    def test_terminal_inventory_keeps_candidate_local_attribution(
+        self,
+        mock_emit,
+        mock_record,
+    ):
+        event = self._make_event(
+            model="cursor",
+            provider="cursor",
+            route_family="codex_cursor_agent_aiserver_adapter",
+            source_error="Cursor continuation cannot be replayed",
+            failure_class="candidate_deterministically_ineligible",
+            candidates=[
+                {
+                    "provider": "cursor",
+                    "model": "cursor",
+                    "route_family": "codex_cursor_agent_aiserver_adapter",
+                    "terminal_disposition": "attempted",
+                    "outcome": "candidate_ineligible_no_cooldown",
+                },
+                {
+                    "provider": "alibaba_token_plan",
+                    "model": "alibaba",
+                    "route_family": "codex_alibaba_chat_completions_adapter",
+                    "terminal_disposition": "skipped",
+                    "reason": "not_reached_before_terminal",
+                },
+                {
+                    "provider": "zai",
+                    "model": "zai",
+                    "route_family": "codex_zai_coding_plan_chat_completions_adapter",
+                    "terminal_disposition": "skipped",
+                    "reason": "not_reached_before_terminal",
+                },
+            ],
+            attempts=[
+                {
+                    "provider": "cursor",
+                    "model": "cursor",
+                    "route_family": "codex_cursor_agent_aiserver_adapter",
+                    "status": "candidate_ineligible_no_cooldown",
+                    "candidate_status": "ineligible",
+                    "failure_class": "candidate_deterministically_ineligible",
+                    "source_error": "Cursor continuation cannot be replayed",
+                    "attempted_provider_call": False,
+                }
+            ],
+        )
+
+        assert _auto_agent_alias_route_rollup_status(event) == "Exhausted"
+        _record_auto_agent_alias_route_status_rollup(event)
+
+        mock_emit.assert_called_once_with(
+            alias_model="basic",
+            model_label="cursor",
+            status="Ineligible",
+            message=(
+                "source_error=Cursor continuation cannot be replayed; "
+                "failure_class=candidate_deterministically_ineligible; "
+                "candidate_status=ineligible"
+            ),
+        )
+        records = {
+            call.kwargs["model_label"]: call.kwargs for call in mock_record.call_args_list
+        }
+        assert list(records) == ["cursor(basic)", "alibaba(basic)", "zai(basic)"]
+        assert records["cursor(basic)"]["status"] == "Ineligible"
+        assert records["cursor(basic)"]["message"] == (
+            "Cursor continuation cannot be replayed"
+        )
+        for label in ("alibaba(basic)", "zai(basic)"):
+            assert records[label]["status"] is None
+            assert records[label]["message"] is None
+
+    @patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.record_aawm_route_rollup",
+    )
+    @patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.emit_aawm_route_status_event",
+    )
+    def test_multiple_attempts_preserve_order_and_deduplicate_inventory(
+        self,
+        mock_emit,
+        mock_record,
+    ):
+        event = self._make_event(
+            candidates=[
+                {
+                    "provider": "cursor",
+                    "model": "cursor",
+                    "route_family": "codex_cursor_agent_aiserver_adapter",
+                    "terminal_disposition": "attempted",
+                    "outcome": "retryable_no_cooldown",
+                },
+                {
+                    "provider": "alibaba_token_plan",
+                    "model": "alibaba",
+                    "route_family": "codex_alibaba_chat_completions_adapter",
+                    "terminal_disposition": "attempted",
+                    "outcome": "cooldown_set",
+                },
+                {
+                    "provider": "zai",
+                    "model": "zai",
+                    "route_family": "codex_zai_coding_plan_chat_completions_adapter",
+                    "terminal_disposition": "skipped",
+                    "reason": "not_reached_before_terminal",
+                },
+            ],
+            attempts=[
+                {
+                    "provider": "cursor",
+                    "model": "cursor",
+                    "route_family": "codex_cursor_agent_aiserver_adapter",
+                    "status": "retryable_no_cooldown",
+                    "failure_class": "provider_error",
+                    "error_status_code": 503,
+                    "source_error": "Cursor failed",
+                    "attempted_provider_call": True,
+                },
+                {
+                    "provider": "alibaba_token_plan",
+                    "model": "alibaba",
+                    "route_family": "codex_alibaba_chat_completions_adapter",
+                    "status": "cooldown_set",
+                    "failure_class": "capacity_exhausted",
+                    "source_error": "Alibaba failed",
+                    "attempted_provider_call": True,
+                },
+                {
+                    "provider": "cursor",
+                    "model": "cursor",
+                    "route_family": "codex_cursor_agent_aiserver_adapter",
+                    "status": "retryable_no_cooldown",
+                    "failure_class": "provider_error",
+                    "error_status_code": 503,
+                    "source_error": "Cursor failed again",
+                    "attempted_provider_call": True,
+                },
+            ],
+        )
+
+        _record_auto_agent_alias_route_status_rollup(event)
+
+        assert [
+            call.kwargs["model_label"] for call in mock_emit.call_args_list
+        ] == ["cursor", "alibaba"]
+        assert [
+            call.kwargs["status"] for call in mock_emit.call_args_list
+        ] == ["Failed", "Cooling Down"]
+        records = {
+            call.kwargs["model_label"]: call.kwargs for call in mock_record.call_args_list
+        }
+        assert list(records) == ["cursor(basic)", "alibaba(basic)", "zai(basic)"]
+        assert records["cursor(basic)"]["message"] == "Cursor failed again"
+        assert records["alibaba(basic)"]["message"] == "Alibaba failed"
+        assert records["zai(basic)"]["status"] is None
+        assert records["zai(basic)"]["message"] is None
+
+    @patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.record_aawm_route_rollup",
+    )
+    @patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.emit_aawm_route_status_event",
+    )
     def test_outgoing_target_explicit_overrides_route_family(self, mock_emit, mock_record):
         event = self._make_event(outgoing_target="custom.endpoint/v1")
         _record_auto_agent_alias_route_status_rollup(event)
