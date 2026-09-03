@@ -2329,6 +2329,19 @@ def _cursor_replay_canonicalize_stock_tool_search(
     )
 
 
+def _cursor_replay_canonicalize_stock_web_search(
+    tool: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    if set(tool) != {"type", "external_web_access"}:
+        return None
+    if (
+        tool.get("type") != "web_search"
+        or not isinstance(tool.get("external_web_access"), bool)
+    ):
+        return None
+    return dict(tool)
+
+
 def _cursor_replay_provider_neutral_tools(
     replay_tools: Any,
 ) -> _CursorReplayValidationResult:
@@ -2419,6 +2432,17 @@ def _cursor_replay_provider_neutral_tools(
             validation_tool.setdefault("strict", None)
         if validation_tool.get("type") == "tool_search":
             canonical_tool = _cursor_replay_canonicalize_stock_tool_search(
+                validation_tool
+            )
+            if canonical_tool is None:
+                return _cursor_replay_rejected(
+                    "provider_neutral_tools",
+                    "tool_validation",
+                    tool_index=tool_index,
+                    tool=original_tool,
+                )
+        elif "external_web_access" in validation_tool:
+            canonical_tool = _cursor_replay_canonicalize_stock_web_search(
                 validation_tool
             )
             if canonical_tool is None:

@@ -2163,6 +2163,76 @@ def test_cursor_fresh_replay_dispatch_accepts_stock_codex_full_history(
     )
 
 
+@pytest.mark.parametrize(
+    "external_web_access",
+    [True, False],
+    ids=["external-web-access-true", "external-web-access-false"],
+)
+def test_cursor_fresh_replay_dispatch_accepts_stock_web_search_extension(
+    external_web_access: bool,
+) -> None:
+    body = _stock_codex_full_history_body()
+    web_search_tool = {
+        "type": "web_search",
+        "external_web_access": external_web_access,
+    }
+    body["tools"][13] = web_search_tool
+    rejection: dict[str, Any] = {}
+
+    rebuilt = codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+        body,
+        continuation_exc=_cursor_continuation_failure(),
+        rejection_diagnostic_out=rejection,
+    )
+
+    assert rebuilt is not None, rejection
+    assert len(body["tools"]) == 14
+    assert rebuilt["tools"] == body["tools"]
+    assert rejection == {}
+
+
+@pytest.mark.parametrize(
+    "web_search_tool",
+    [
+        {"external_web_access": True},
+        {"type": "web_search", "external_web_access": 1},
+        {"type": "web_search", "external_web_access": "true"},
+        {"type": "web_search", "external_web_access": None},
+        {"type": "web_search", "external_web_access": True, "filters": {}},
+        {"type": "web_search_preview", "external_web_access": True},
+    ],
+    ids=[
+        "missing-type-key",
+        "integer-external-web-access",
+        "string-external-web-access",
+        "null-external-web-access",
+        "extra-key",
+        "wrong-tool-type",
+    ],
+)
+def test_cursor_fresh_replay_dispatch_rejects_malformed_stock_web_search_extension(
+    web_search_tool: dict[str, Any],
+) -> None:
+    body = _stock_codex_full_history_body()
+    body["tools"][13] = web_search_tool
+    rejection: dict[str, Any] = {}
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            body,
+            continuation_exc=_cursor_continuation_failure(),
+            rejection_diagnostic_out=rejection,
+        )
+        is None
+    )
+    diagnostic = rejection[
+        codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
+    ]
+    assert diagnostic["stage"] == "provider_neutral_tools"
+    assert diagnostic["reason"] == "tool_validation"
+    assert diagnostic["tool_index"] == 13
+
+
 def test_cursor_fresh_replay_dispatch_accepts_stock_tool_search_with_legacy_tool_param(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
