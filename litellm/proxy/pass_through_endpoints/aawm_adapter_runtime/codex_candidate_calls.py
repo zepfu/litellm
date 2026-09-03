@@ -3288,7 +3288,8 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
     HTTP 408/504 map to the existing timeout classification.
     Provider-returned auth and other non-transient 4xx failures use the
     terminal, non-coolable provider-error contract. Local failures without
-    provider attribution preserve their existing unavailable mapping.
+    provider attribution preserve their sanitized error shape but remain
+    terminal without advancing or cooling the candidate.
     """
     from litellm.llms.cursor_agent.connect import CursorConnectProtocolError
     from litellm.proxy._types import ProxyException
@@ -3302,9 +3303,12 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
         and not isinstance(exc, _CursorPostEgressOutputError)
         and not getattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, False)
     )
+    status_code = int(getattr(exc, "status_code", 502) or 502)
+    if status_code < 400 or status_code > 599:
+        status_code = 502
     cursor_sanitized_provider_error = (
         _sanitize_cursor_provider_error_body(getattr(exc, "body", None))
-        if provider_returned
+        if provider_returned or 400 <= status_code < 500
         else None
     )
     provider_error_fields = (
@@ -3441,9 +3445,6 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
         )
         raise proxy_exc from exc
 
-    status_code = int(getattr(exc, "status_code", 502) or 502)
-    if status_code < 400 or status_code > 599:
-        status_code = 502
     if status_code in (408, 504):
         error_code = "upstream_timeout"
         error_type = "upstream_timeout"
@@ -3453,7 +3454,7 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
     elif provider_returned and status_code == 429:
         error_code = "rate_limited"
         error_type = "upstream_error"
-    elif provider_returned:
+    elif provider_returned or 400 <= status_code < 500:
         error_code = "provider_terminal_error"
         error_type = (
             "authentication_error"
@@ -3462,11 +3463,7 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
         )
     else:
         error_code = "aawm_codex_auto_agent_candidate_unavailable"
-        error_type = (
-            "authentication_error"
-            if status_code in {401, 403}
-            else "upstream_error"
-        )
+        error_type = "upstream_error"
     detail = (
         f"cursor_agent request failed; model={model} "
         f"route_family={route_family}; status={status_code}; {message}"
@@ -3482,6 +3479,8 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
     if provider_returned:
         setattr(proxy_exc, "attempted_provider_call", True)
         setattr(proxy_exc, "_aawm_provider_returned", True)
+    elif 400 <= status_code < 500:
+        setattr(proxy_exc, "attempted_provider_call", False)
     _set_mapped_detail(
         proxy_exc,
         {
