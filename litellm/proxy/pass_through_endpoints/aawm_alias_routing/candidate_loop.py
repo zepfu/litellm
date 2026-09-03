@@ -891,7 +891,10 @@ async def handle_alias_route(  # noqa: PLR0915
                         codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
                     ] = copy.deepcopy(cursor_replay_fresh_dispatch_reject)
             return None
-        return fresh_fallback_body
+        return _lpe._merge_litellm_metadata(
+            fresh_fallback_body,
+            extra_fields={"aawm_redispatch_ordinal": 1},
+        )
 
     def _prefer_codex_oauth_account_failover(
         *,
