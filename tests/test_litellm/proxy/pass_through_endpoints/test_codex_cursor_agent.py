@@ -3601,6 +3601,53 @@ def test_cursor_auth_and_non_transient_fail_closed_to_durable_unavailable(
     )
 
 
+def test_cursor_provider_http_error_preserves_sanitized_attribution() -> None:
+    from litellm.proxy._types import ProxyException
+
+    provider_body = {
+        "error": {
+            "code": "model_not_found",
+            "message": "Unknown model: cursor-grok-4.6-high",
+            "type": "invalid_request_error",
+            "model": "cursor-grok-4.6-high",
+            "secret": "do-not-leak",
+        },
+        "request_id": "provider-request-secret",
+    }
+    with pytest.raises(ProxyException) as exc_info:
+        codex_candidate_calls._raise_cursor_agent_alias_error(
+            exc=CursorConnectError(
+                "Cursor Agent Connect request failed with HTTP 404.",
+                status_code=404,
+                body=json.dumps(provider_body).encode("utf-8"),
+                provider_returned=True,
+            ),
+            candidate=_candidate(provider="cursor_agent"),
+        )
+
+    exc = exc_info.value
+    sanitized_body = {
+        "error": {
+            "code": "model_not_found",
+            "message": "Unknown model: cursor-grok-4.6-high",
+            "model": "cursor-grok-4.6-high",
+            "type": "invalid_request_error",
+        }
+    }
+    assert exc.status_code == 404
+    assert exc.attempted_provider_call is True
+    assert exc._aawm_provider_returned is True
+    assert exc.body == sanitized_body
+    assert exc.detail["error"]["code"] == "model_not_found"
+    assert exc.detail["error"]["message"] == (
+        "Unknown model: cursor-grok-4.6-high"
+    )
+    assert exc.detail["cursor_sanitized_provider_error"] == sanitized_body
+    serialized = json.dumps(exc.detail)
+    assert "do-not-leak" not in serialized
+    assert "provider-request-secret" not in serialized
+
+
 def test_cursor_preflight_conversion_value_error_maps_to_ineligible() -> None:
     from litellm.proxy._types import ProxyException
 

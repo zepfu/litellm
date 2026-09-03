@@ -65,6 +65,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals impor
     _is_codex_auto_agent_retryable_exhaustion,
     _is_codex_auto_agent_spark_candidate,
     _is_codex_auto_agent_transient_internal_error_class,
+    _is_codex_auto_agent_cursor_agent_model_unavailable_response,
     _is_codex_auto_agent_xai_candidate,
     _is_codex_auto_agent_xai_model_unavailable_response,
     _is_nvidia_completion_adapter_model_unavailable_response,
@@ -131,6 +132,11 @@ _CODEX_RESPONSES_CANDIDATE = {
 _CURSOR_CANDIDATE = {
     "provider": "cursor_agent",
     "model": "cursor-grok-4.6-high",
+    "route_family": "codex_cursor_agent_aiserver_adapter",
+}
+_CURSOR_MODEL_UNAVAILABLE_CANDIDATE = {
+    "provider": "cursor_agent",
+    "model": "cursor_agent/cursor-grok-4.6-high",
     "route_family": "codex_cursor_agent_aiserver_adapter",
 }
 _ANTHROPIC_RESPONSES_CANDIDATE = {
@@ -300,6 +306,26 @@ def _opencode_model_error(
         "message": message,
         "type": error_type,
     }
+    if model is not None:
+        error["model"] = model
+    return _FakeExc(
+        detail={"error": error},
+        status_code=status_code,
+        _aawm_provider_returned=provider_returned,
+    )
+
+
+def _cursor_model_error(
+    *,
+    status_code: int,
+    message: str,
+    code: Optional[str] = None,
+    model: Optional[str] = None,
+    provider_returned: bool = True,
+) -> _FakeExc:
+    error: dict[str, Any] = {"message": message}
+    if code is not None:
+        error["code"] = code
     if model is not None:
         error["model"] = model
     return _FakeExc(
@@ -1501,6 +1527,233 @@ class TestProviderAttributedModelUnavailableMatcher:
                 attempted_provider_call=True,
             )
             == "candidate_unavailable"
+        )
+
+
+class TestCursorAgentModelUnavailable:
+    @pytest.mark.parametrize(
+        ("status_code", "code", "message"),
+        [
+            (
+                400,
+                "unknown_model",
+                "Unknown model: cursor-grok-4.6-high",
+            ),
+            (
+                404,
+                "model_not_found",
+                "Model cursor-grok-4.6-high was not found.",
+            ),
+        ],
+    )
+    def test_exact_provider_model_error_matches(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+    ) -> None:
+        candidate = _CURSOR_MODEL_UNAVAILABLE_CANDIDATE
+        exc = _cursor_model_error(
+            status_code=status_code,
+            code=code,
+            message=message,
+        )
+
+        assert _is_codex_auto_agent_cursor_agent_model_unavailable_response(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=True,
+        )
+        match = _match_codex_auto_agent_provider_attributed_model_unavailable(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=True,
+        )
+        assert match is not None
+        assert match.provider == "cursor_agent"
+        assert match.status_code == status_code
+        assert match.error_class == "candidate_unavailable"
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=True,
+            )
+            == "candidate_unavailable"
+        )
+
+    @pytest.mark.parametrize(
+        (
+            "candidate",
+            "attempted_provider_call",
+            "provider_returned",
+            "status_code",
+            "code",
+            "message",
+        ),
+        [
+            pytest.param(
+                _CURSOR_MODEL_UNAVAILABLE_CANDIDATE,
+                True,
+                True,
+                404,
+                "unknown_model",
+                "Unknown model: other-model",
+                id="wrong-model-token",
+            ),
+            pytest.param(
+                _CURSOR_MODEL_UNAVAILABLE_CANDIDATE,
+                True,
+                True,
+                404,
+                "not_found",
+                "Resource not found",
+                id="generic-404",
+            ),
+            pytest.param(
+                _CURSOR_MODEL_UNAVAILABLE_CANDIDATE,
+                True,
+                True,
+                400,
+                "unsupported_parameter",
+                "Unsupported parameter for model cursor-grok-4.6-high",
+                id="unsupported-parameter",
+            ),
+            pytest.param(
+                _CURSOR_MODEL_UNAVAILABLE_CANDIDATE,
+                True,
+                True,
+                400,
+                "unsupported_operation",
+                "Unsupported operation for model cursor-grok-4.6-high",
+                id="unsupported-operation",
+            ),
+            pytest.param(
+                _CURSOR_MODEL_UNAVAILABLE_CANDIDATE,
+                True,
+                True,
+                401,
+                "unknown_model",
+                "Unknown model: cursor-grok-4.6-high",
+                id="401",
+            ),
+            pytest.param(
+                _CURSOR_MODEL_UNAVAILABLE_CANDIDATE,
+                True,
+                True,
+                403,
+                "unknown_model",
+                "Unknown model: cursor-grok-4.6-high",
+                id="403",
+            ),
+            pytest.param(
+                _CURSOR_MODEL_UNAVAILABLE_CANDIDATE,
+                True,
+                True,
+                409,
+                "model_unavailable",
+                "Cursor Agent continuation session is unavailable for model "
+                "cursor-grok-4.6-high",
+                id="missing-session-409",
+            ),
+            pytest.param(
+                _CURSOR_MODEL_UNAVAILABLE_CANDIDATE,
+                False,
+                True,
+                404,
+                "unknown_model",
+                "Unknown model: cursor-grok-4.6-high",
+                id="absent-attempt",
+            ),
+            pytest.param(
+                _CURSOR_MODEL_UNAVAILABLE_CANDIDATE,
+                True,
+                False,
+                404,
+                "unknown_model",
+                "Unknown model: cursor-grok-4.6-high",
+                id="absent-provider-return",
+            ),
+            pytest.param(
+                {
+                    **_CURSOR_MODEL_UNAVAILABLE_CANDIDATE,
+                    "route_family": "codex_cursor_agent_chat_adapter",
+                },
+                True,
+                True,
+                404,
+                "unknown_model",
+                "Unknown model: cursor-grok-4.6-high",
+                id="wrong-route-family",
+            ),
+            pytest.param(
+                _CURSOR_MODEL_UNAVAILABLE_CANDIDATE,
+                True,
+                True,
+                404,
+                "not_found",
+                "Model cursor-grok-4.6-high was not found at the endpoint",
+                id="wrong-endpoint",
+            ),
+            pytest.param(
+                _CURSOR_MODEL_UNAVAILABLE_CANDIDATE,
+                True,
+                True,
+                404,
+                "item_not_found",
+                "Item cursor-grok-4.6-high was not found",
+                id="missing-item",
+            ),
+            pytest.param(
+                _CURSOR_MODEL_UNAVAILABLE_CANDIDATE,
+                True,
+                True,
+                404,
+                "model_not_found",
+                "Model cursor-grok-4.6-high was not found because the route "
+                "is malformed",
+                id="malformed-route",
+            ),
+            pytest.param(
+                _CURSOR_MODEL_UNAVAILABLE_CANDIDATE,
+                True,
+                True,
+                400,
+                "model_unavailable",
+                "Cursor Agent continuation model cursor-grok-4.6-high is "
+                "unavailable",
+                id="continuation-error",
+            ),
+        ],
+    )
+    def test_non_model_or_unattributed_errors_do_not_match(
+        self,
+        candidate: dict[str, Any],
+        attempted_provider_call: bool,
+        provider_returned: bool,
+        status_code: int,
+        code: str,
+        message: str,
+    ) -> None:
+        exc = _cursor_model_error(
+            status_code=status_code,
+            code=code,
+            message=message,
+            provider_returned=provider_returned,
+        )
+
+        assert not _is_codex_auto_agent_cursor_agent_model_unavailable_response(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=attempted_provider_call,
+        )
+        assert (
+            _match_codex_auto_agent_provider_attributed_model_unavailable(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=attempted_provider_call,
+            )
+            is None
         )
 
 

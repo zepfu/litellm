@@ -73,12 +73,15 @@ class CursorConnectError(Exception):
         status_code: int = 502,
         headers: Optional[Mapping[str, Any]] = None,
         body: Any = None,
+        provider_returned: bool = False,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.status_code = status_code
         self.headers = dict(headers or {})
         self.body = body
+        if provider_returned:
+            self._aawm_provider_returned = True
 
 
 class CursorConnectProtocolError(CursorConnectError):
@@ -3977,12 +3980,14 @@ class CursorAgentConnectClient:
                 "Cursor Agent rejected the access token.",
                 status_code=401,
                 headers=headers,
+                provider_returned=True,
             )
         if status_code >= 400:
             raise CursorConnectError(
                 f"Cursor Agent Connect request failed with HTTP {status_code}.",
                 status_code=status_code,
                 headers=headers,
+                provider_returned=True,
             )
         content_type = headers.get("content-type", "").lower()
         if CURSOR_AGENT_CONNECT_CONTENT_TYPE not in content_type:
@@ -4176,6 +4181,7 @@ class CursorAgentConnectClient:
                 status_code=401,
                 headers=getattr(response, "headers", {}),
                 body=body,
+                provider_returned=True,
             )
         if status_code >= 400:
             body = await self._read_response_body(response)
@@ -4184,6 +4190,7 @@ class CursorAgentConnectClient:
                 status_code=status_code,
                 headers=getattr(response, "headers", {}),
                 body=body,
+                provider_returned=True,
             )
         result = CursorAgentRunResult()
         blobs: Dict[bytes, bytes] = {}
