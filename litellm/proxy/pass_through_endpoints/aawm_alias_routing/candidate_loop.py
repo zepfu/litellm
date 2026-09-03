@@ -2414,6 +2414,10 @@ async def handle_alias_route(  # noqa: PLR0915
                     has_continuation_state
                     and cooldown_scope != "none"
                     and not account_failover_planned
+                    and not (
+                        error_class == "candidate_unavailable"
+                        and account_failover_replay_safe
+                    )
                 ):
                     attempt_record["status"] = "terminal_in_flight_cooldown_set"
                     failure_body = _record_auto_agent_alias_attempt_failure(
