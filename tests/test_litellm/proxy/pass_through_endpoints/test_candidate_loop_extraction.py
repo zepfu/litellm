@@ -979,6 +979,221 @@ def test_resolve_failure_plan_dispatcher_short_circuits_generic_classifier(
     assert plan.applied_scope == "candidate"
 
 
+@pytest.mark.parametrize(
+    "detail",
+    [
+        pytest.param(
+            {"error": {"code": "not_found", "message": "Resource not found"}},
+            id="generic",
+        ),
+        pytest.param(None, id="header-only"),
+    ],
+)
+def test_resolve_failure_plan_skips_unmatched_cursor_evidence_and_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+    detail: Any,
+) -> None:
+    candidate = {
+        "provider": "cursor_agent",
+        "model": "cursor_agent/cursor-grok-4.6-high",
+        "route_family": "codex_cursor_agent_aiserver_adapter",
+    }
+    exc = HTTPException(
+        status_code=404,
+        detail=detail,
+        headers={"Retry-After": "30"},
+    )
+    setattr(exc, "_aawm_provider_returned", True)
+    matcher_calls: list[bool] = []
+    evidence_calls: list[dict[str, Any]] = []
+    publication: dict[str, Any] = {}
+
+    def _match(
+        match_exc: Exception,
+        *,
+        candidate: Optional[dict[str, Any]] = None,
+        attempted_provider_call: bool = True,
+    ) -> Any:
+        matcher_calls.append(attempted_provider_call)
+        return candidate_loop._error_signals._match_codex_auto_agent_provider_attributed_model_unavailable(
+            match_exc,
+            candidate=candidate,
+            attempted_provider_call=attempted_provider_call,
+        )
+
+    def _capture_publication(**kwargs: Any) -> Any:
+        publication.update(kwargs)
+        return lpe._resolve_auto_agent_cooldown_publication_plan(**kwargs)
+
+    monkeypatch.setattr(
+        lpe._codex_failure_evidence_gate,
+        "current_decision",
+        lambda **kwargs: SimpleNamespace(should_cool=False, duration_seconds=30.0),
+    )
+
+    plan = candidate_loop._resolve_failure_plan(
+        resolve_cooldown_publication_fn=_capture_publication,
+        record_codex_failure_evidence_fn=lambda **kwargs: evidence_calls.append(kwargs),
+        request=SimpleNamespace(),
+        candidate=candidate,
+        selection={
+            "cooldown_key": "cursor_agent:cursor-grok-4.6-high",
+            "lane_key": "cursor_agent_cli",
+        },
+        attempt_record={"attempted_provider_call": True},
+        exc=exc,
+        codex_failure_evidence_alias="work",
+        kimi_failure_metadata_fn=lambda exc, candidate=None: None,
+        classify_kimi_fn=lambda metadata: None,
+        classify_retryable_fn=lambda exc, candidate=None, attempted_provider_call=True: (
+            "provider_terminal_error"
+        ),
+        grok_quota_fn=lambda exc, candidate=None: False,
+        cooldown_seconds_fn=lambda exc, candidate=None, attempted_provider_call=True: 30.0,
+        match_provider_attributed_model_unavailable_fn=_match,
+    )
+
+    assert matcher_calls == [True]
+    assert evidence_calls == []
+    assert publication["error_class"] == "provider_terminal_error"
+    assert plan.applied_scope == "none"
+    assert plan.memory_keys == ()
+    assert plan.durable_keys == ()
+
+
+@pytest.mark.parametrize("status_code", [400, 404])
+def test_resolve_failure_plan_records_matched_cursor_evidence_for_candidate_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    candidate = {
+        "provider": "cursor_agent",
+        "model": "cursor_agent/cursor-grok-4.6-high",
+        "route_family": "codex_cursor_agent_aiserver_adapter",
+    }
+    exc = HTTPException(
+        status_code=status_code,
+        detail={
+            "error": {
+                "code": "model_not_found",
+                "message": "Model cursor-grok-4.6-high was not found.",
+            }
+        },
+    )
+    setattr(exc, "_aawm_provider_returned", True)
+    matcher_calls: list[bool] = []
+    evidence_calls: list[dict[str, Any]] = []
+    publication: dict[str, Any] = {}
+
+    def _match(
+        match_exc: Exception,
+        *,
+        candidate: Optional[dict[str, Any]] = None,
+        attempted_provider_call: bool = True,
+    ) -> Any:
+        matcher_calls.append(attempted_provider_call)
+        return candidate_loop._error_signals._match_codex_auto_agent_provider_attributed_model_unavailable(
+            match_exc,
+            candidate=candidate,
+            attempted_provider_call=attempted_provider_call,
+        )
+
+    def _capture_publication(**kwargs: Any) -> Any:
+        publication.update(kwargs)
+        return lpe._resolve_auto_agent_cooldown_publication_plan(**kwargs)
+
+    monkeypatch.setattr(
+        lpe._codex_failure_evidence_gate,
+        "current_decision",
+        lambda **kwargs: SimpleNamespace(should_cool=True, duration_seconds=30.0),
+    )
+
+    plan = candidate_loop._resolve_failure_plan(
+        resolve_cooldown_publication_fn=_capture_publication,
+        record_codex_failure_evidence_fn=lambda **kwargs: evidence_calls.append(kwargs),
+        request=SimpleNamespace(),
+        candidate=candidate,
+        selection={
+            "cooldown_key": "cursor_agent:cursor-grok-4.6-high",
+            "lane_key": "cursor_agent_cli",
+        },
+        attempt_record={"attempted_provider_call": True},
+        exc=exc,
+        codex_failure_evidence_alias="work",
+        kimi_failure_metadata_fn=lambda exc, candidate=None: None,
+        classify_kimi_fn=lambda metadata: None,
+        classify_retryable_fn=lambda exc, candidate=None, attempted_provider_call=True: (
+            "provider_terminal_error"
+        ),
+        grok_quota_fn=lambda exc, candidate=None: False,
+        cooldown_seconds_fn=lambda exc, candidate=None, attempted_provider_call=True: 30.0,
+        match_provider_attributed_model_unavailable_fn=_match,
+    )
+
+    assert matcher_calls == [True]
+    assert len(evidence_calls) == 1
+    assert evidence_calls[0]["canonical_alias"] == "work"
+    assert evidence_calls[0]["cooldown_key"] == "cursor_agent:cursor-grok-4.6-high"
+    assert publication["error_class"] == "candidate_unavailable"
+    assert plan.applied_scope == "candidate"
+    assert plan.memory_keys == ("cursor_agent:cursor-grok-4.6-high",)
+    assert plan.durable_keys == ("cursor_agent:cursor-grok-4.6-high",)
+
+
+def test_resolve_failure_plan_preserves_openrouter_model_unavailable_evidence_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = {
+        "provider": "openrouter",
+        "model": "openrouter/future-model",
+        "route_family": "codex_openrouter_completion_adapter",
+    }
+    exc = HTTPException(
+        status_code=404,
+        detail={"error": {"message": "No endpoints found for this model"}},
+    )
+    setattr(exc, "_aawm_provider_returned", True)
+    evidence_calls: list[dict[str, Any]] = []
+    publication: dict[str, Any] = {}
+
+    def _capture_publication(**kwargs: Any) -> Any:
+        publication.update(kwargs)
+        return lpe._resolve_auto_agent_cooldown_publication_plan(**kwargs)
+
+    monkeypatch.setattr(
+        lpe._codex_failure_evidence_gate,
+        "current_decision",
+        lambda **kwargs: SimpleNamespace(should_cool=True, duration_seconds=30.0),
+    )
+
+    plan = candidate_loop._resolve_failure_plan(
+        resolve_cooldown_publication_fn=_capture_publication,
+        record_codex_failure_evidence_fn=lambda **kwargs: evidence_calls.append(kwargs),
+        request=SimpleNamespace(),
+        candidate=candidate,
+        selection={
+            "cooldown_key": "openrouter:future-model",
+            "lane_key": "openrouter",
+        },
+        attempt_record={"attempted_provider_call": True},
+        exc=exc,
+        codex_failure_evidence_alias="work",
+        kimi_failure_metadata_fn=lambda exc, candidate=None: None,
+        classify_kimi_fn=lambda metadata: None,
+        classify_retryable_fn=(
+            candidate_loop._error_signals._classify_codex_auto_agent_retryable_exhaustion
+        ),
+        grok_quota_fn=lambda exc, candidate=None: False,
+        cooldown_seconds_fn=lambda exc, candidate=None, attempted_provider_call=True: 30.0,
+    )
+
+    assert len(evidence_calls) == 1
+    assert publication["error_class"] == "candidate_unavailable"
+    assert plan.applied_scope == "candidate"
+    assert plan.memory_keys == ("openrouter:future-model",)
+    assert plan.durable_keys == ("openrouter:future-model",)
+
+
 def test_resolve_failure_plan_classifies_coding_plan_1113_as_terminal_routing() -> None:
     class _InsufficientBalance(Exception):
         def __init__(self) -> None:

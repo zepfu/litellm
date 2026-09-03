@@ -2692,6 +2692,7 @@ def _resolve_failure_plan(
             candidate=candidate,
             attempted_provider_call=attempted_provider_call,
         )
+    provider_attributed_model_unavailable = None
     if error_class is None:
         provider_attributed_model_unavailable = (
             match_provider_attributed_model_unavailable_fn(
@@ -2722,7 +2723,15 @@ def _resolve_failure_plan(
         )
     else:
         cooldown_seconds = cooldown_seconds_fn(exc, candidate=candidate)
-    if codex_failure_evidence_alias is not None:
+    # The legacy evidence classifier treats every 404 as model-unavailable.
+    # Cursor 400/404 evidence is trusted only after the shared matcher binds it
+    # to the selected provider model.
+    unmatched_cursor_model_error = (
+        candidate.get("provider") == "cursor_agent"
+        and _error_signals._extract_adapter_exception_status_code(exc) in {400, 404}
+        and provider_attributed_model_unavailable is None
+    )
+    if codex_failure_evidence_alias is not None and not unmatched_cursor_model_error:
         record_codex_failure_evidence_fn(
             canonical_alias=codex_failure_evidence_alias,
             cooldown_key=selection["cooldown_key"],
