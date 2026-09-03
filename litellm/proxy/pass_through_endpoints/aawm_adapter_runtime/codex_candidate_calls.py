@@ -4096,6 +4096,7 @@ async def _perform_codex_auto_agent_native_openai_request(
             "target_url": target_url,
             "custom_llm_provider": litellm.LlmProviders.OPENAI.value,
             "provider_returned": provider_returned,
+            "expected_model": request_body.get("model"),
         }
         if _codex_native_openai_candidate_unavailable_detail(
             exc,

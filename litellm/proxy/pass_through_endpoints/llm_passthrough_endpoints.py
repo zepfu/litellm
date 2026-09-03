@@ -1969,6 +1969,7 @@ def _codex_native_openai_candidate_unavailable_detail(
     target_url=None,
     custom_llm_provider=None,
     provider_returned=False,
+    expected_model=None,
     **___,
 ):
     return _wave6b_common._codex_native_openai_candidate_unavailable_detail(
@@ -1977,6 +1978,7 @@ def _codex_native_openai_candidate_unavailable_detail(
         target_url=target_url,
         custom_llm_provider=custom_llm_provider,
         provider_returned=provider_returned,
+        expected_model=expected_model,
     )
 
 
@@ -1986,6 +1988,7 @@ def _raise_codex_native_openai_auto_agent_candidate_unavailable(
     target_url=None,
     custom_llm_provider=None,
     provider_returned=False,
+    expected_model=None,
     **___,
 ):
     return _wave6b_common._raise_codex_native_openai_auto_agent_candidate_unavailable(
@@ -1994,6 +1997,7 @@ def _raise_codex_native_openai_auto_agent_candidate_unavailable(
         target_url=target_url,
         custom_llm_provider=custom_llm_provider,
         provider_returned=provider_returned,
+        expected_model=expected_model,
     )
 
 
