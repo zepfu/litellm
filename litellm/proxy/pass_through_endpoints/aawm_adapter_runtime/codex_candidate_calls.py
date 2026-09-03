@@ -3286,9 +3286,9 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
     existing transient/timeout classification so a Cursor blip advances to
     the next candidate instead of publishing a durable candidate cooldown.
     HTTP 408/504 map to the existing timeout classification.
-    Auth (401/403) and other non-transient failures stay on the
-    ``aawm_codex_auto_agent_candidate_unavailable`` code so they remain
-    durably unavailable.
+    Provider-returned auth and other non-transient 4xx failures use the
+    terminal, non-coolable provider-error contract. Local failures without
+    provider attribution preserve their existing unavailable mapping.
     """
     from litellm.llms.cursor_agent.connect import CursorConnectProtocolError
     from litellm.proxy._types import ProxyException
@@ -3450,9 +3450,23 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
     elif status_code in (500, 502, 503, 529):
         error_code = "upstream_transient_internal"
         error_type = "upstream_error"
+    elif provider_returned and status_code == 429:
+        error_code = "rate_limited"
+        error_type = "upstream_error"
+    elif provider_returned:
+        error_code = "provider_terminal_error"
+        error_type = (
+            "authentication_error"
+            if status_code in {401, 403}
+            else "upstream_error"
+        )
     else:
         error_code = "aawm_codex_auto_agent_candidate_unavailable"
-        error_type = "authentication_error" if status_code == 401 else "upstream_error"
+        error_type = (
+            "authentication_error"
+            if status_code in {401, 403}
+            else "upstream_error"
+        )
     detail = (
         f"cursor_agent request failed; model={model} "
         f"route_family={route_family}; status={status_code}; {message}"

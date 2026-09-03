@@ -846,8 +846,12 @@ _CURSOR_AGENT_MODEL_UNAVAILABLE_CODES = frozenset(
     {
         "model_disabled",
         "model_disabled_error",
+        "model_absent",
+        "model_absent_error",
         "modeldisabled",
         "modeldisablederror",
+        "modelabsent",
+        "modelabsenterror",
         "model_not_available",
         "model_not_found",
         "model_not_found_error",
@@ -859,6 +863,8 @@ _CURSOR_AGENT_MODEL_UNAVAILABLE_CODES = frozenset(
         "model_unpublished",
         "model_unpublished_error",
         "model_unsupported",
+        "model_withdrawn",
+        "model_withdrawn_error",
         "modelnotavailable",
         "modelnotfound",
         "modelnotfounderror",
@@ -869,6 +875,8 @@ _CURSOR_AGENT_MODEL_UNAVAILABLE_CODES = frozenset(
         "modelunpublished",
         "modelunpublishederror",
         "modelunsupported",
+        "modelwithdrawn",
+        "modelwithdrawnerror",
         "unknown_model",
         "unknown_model_error",
         "unknownmodel",
@@ -879,14 +887,17 @@ _CURSOR_AGENT_MODEL_UNAVAILABLE_CODES = frozenset(
 )
 _CURSOR_AGENT_MODEL_UNAVAILABLE_MESSAGE_PATTERNS = (
     re.compile(
-        r"\b(?:unknown|unsupported|unpublished|disabled|unavailable)"
+        r"\b(?:unknown|unsupported|unpublished|disabled|unavailable|absent|withdrawn)"
         r"\s+(?:upstream\s+)?model\b"
     ),
     re.compile(
         r"\b(?:upstream\s+)?model\b.{0,96}\b"
         r"(?:unknown|not\s+found|unpublished|disabled|unsupported|"
-        r"unavailable|not\s+published|not\s+supported|not\s+available)\b"
+        r"unavailable|absent|withdrawn|not\s+published|not\s+supported|"
+        r"not\s+available|does\s+not\s+exist|has\s+been\s+withdrawn)\b"
     ),
+    re.compile(r"\bdoes\s+not\s+exist\b"),
+    re.compile(r"\bhas\s+been\s+withdrawn\b"),
 )
 _CURSOR_AGENT_MODEL_UNAVAILABLE_EXCLUDED_MARKERS = (
     "auth",
@@ -1097,6 +1108,23 @@ def _is_codex_auto_agent_cursor_agent_model_unavailable_response(
             model_variants=model_variants,
         )
         for error in _iter_codex_auto_agent_error_blocks(exc)
+    )
+
+
+def _is_codex_auto_agent_cursor_agent_provider_terminal_response(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]],
+    attempted_provider_call: bool,
+) -> bool:
+    status_code = _extract_adapter_exception_status_code(exc)
+    return bool(
+        attempted_provider_call
+        and getattr(exc, "_aawm_provider_returned", False) is True
+        and _is_codex_auto_agent_cursor_agent_candidate(candidate)
+        and status_code is not None
+        and 400 <= status_code < 500
+        and status_code not in {408, 429}
     )
 
 
@@ -1426,6 +1454,11 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
     ):
         return "candidate"
     if error_class == "safety_policy_denied":
+        return "request_local"
+    if (
+        _is_codex_auto_agent_cursor_agent_candidate(candidate)
+        and error_class == "provider_terminal_error"
+    ):
         return "request_local"
     if _is_codex_auto_agent_cursor_agent_candidate(candidate) and error_class in {
         "upstream_timeout",
@@ -2305,6 +2338,12 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     )
     if provider_attributed_model_unavailable is not None:
         return provider_attributed_model_unavailable.error_class
+    if _is_codex_auto_agent_cursor_agent_provider_terminal_response(
+        exc,
+        candidate=candidate,
+        attempted_provider_call=attempted_provider_call,
+    ):
+        return "provider_terminal_error"
     if (
         isinstance(candidate, dict)
         and candidate.get("route_family") == "codex_responses"

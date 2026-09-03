@@ -3648,6 +3648,84 @@ def test_cursor_provider_http_error_preserves_sanitized_attribution() -> None:
     assert "provider-request-secret" not in serialized
 
 
+@pytest.mark.parametrize(
+    ("status_code", "body", "expected_code", "expected_type"),
+    [
+        (
+            400,
+            {
+                "error": {
+                    "code": "invalid_request",
+                    "message": "Unsupported request parameter.",
+                }
+            },
+            "invalid_request",
+            "upstream_error",
+        ),
+        (404, b"", "provider_terminal_error", "upstream_error"),
+        (
+            404,
+            {"error": {"code": "not_found", "message": "Resource not found."}},
+            "not_found",
+            "upstream_error",
+        ),
+        (401, b"", "provider_terminal_error", "authentication_error"),
+        (403, b"", "provider_terminal_error", "authentication_error"),
+    ],
+    ids=[
+        "generic-400",
+        "header-only-404",
+        "generic-404",
+        "401-auth",
+        "403-auth",
+    ],
+)
+def test_cursor_provider_unmatched_4xx_is_terminal_without_candidate_cooldown(
+    status_code: int,
+    body: Any,
+    expected_code: str,
+    expected_type: str,
+) -> None:
+    from litellm.proxy._types import ProxyException
+
+    candidate = _candidate(provider="cursor_agent")
+    with pytest.raises(ProxyException) as exc_info:
+        codex_candidate_calls._raise_cursor_agent_alias_error(
+            exc=CursorConnectError(
+                f"Cursor provider returned HTTP {status_code}.",
+                status_code=status_code,
+                body=body,
+                provider_returned=True,
+            ),
+            candidate=candidate,
+        )
+
+    exc = exc_info.value
+    assert exc.status_code == status_code
+    assert exc.type == expected_type
+    assert exc.attempted_provider_call is True
+    assert exc._aawm_provider_returned is True
+    assert exc.detail["error"]["code"] == expected_code
+    assert (
+        exc.detail["error"]["code"]
+        != "aawm_codex_auto_agent_candidate_unavailable"
+    )
+    classified = (
+        llm_passthrough_endpoints._classify_codex_auto_agent_retryable_exhaustion(
+            exc,
+            candidate=candidate,
+        )
+    )
+    assert classified == "provider_terminal_error"
+    assert (
+        llm_passthrough_endpoints._get_codex_auto_agent_candidate_cooldown_scope(
+            classified,
+            candidate=candidate,
+        )
+        == "request_local"
+    )
+
+
 def test_cursor_preflight_conversion_value_error_maps_to_ineligible() -> None:
     from litellm.proxy._types import ProxyException
 
