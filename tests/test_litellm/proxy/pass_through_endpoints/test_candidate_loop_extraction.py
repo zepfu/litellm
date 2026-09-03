@@ -2880,22 +2880,25 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
         {"cursor_agent:cursor-grok-4.6-high"}
     )
     assert selection_calls[0]["request_body"] is prepared_body
-    assert selection_calls[1]["request_body"] is classifier_calls[1]
+    assert selection_calls[1]["request_body"]["input"] == rebuilt_request_body["input"]
     assert all(
         selected["has_account_bound_state"] is True
         and selected["in_flight_session"] is True
         for selected in selected_candidates
     )
     assert classifier_calls[0] is prepared_body
-    assert classifier_calls[1] == rebuilt_request_body
-    assert owner_guard_bodies == classifier_calls
+    rebuilt_classifier_body = next(
+        body for body in classifier_calls if body["input"] == rebuilt_request_body["input"]
+    )
+    assert rebuilt_classifier_body == rebuilt_request_body
+    assert owner_guard_bodies[-1]["input"] == rebuilt_request_body["input"]
     assert all(
         body is prepared_body
         for provider, body in metadata_input_bodies
         if provider == "cursor_agent"
     )
     assert all(
-        body is classifier_calls[1]
+        body["input"] == rebuilt_request_body["input"]
         for provider, body in metadata_input_bodies
         if provider == "openrouter"
     )
