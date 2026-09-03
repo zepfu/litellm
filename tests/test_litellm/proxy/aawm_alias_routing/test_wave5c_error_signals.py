@@ -1544,6 +1544,16 @@ class TestCursorAgentModelUnavailable:
                 "model_not_found",
                 "Model cursor-grok-4.6-high was not found.",
             ),
+            (
+                400,
+                "model_absent",
+                "Model cursor-grok-4.6-high does not exist.",
+            ),
+            (
+                404,
+                "model_withdrawn",
+                "Model cursor-grok-4.6-high has been withdrawn.",
+            ),
         ],
     )
     def test_exact_provider_model_error_matches(
@@ -1754,6 +1764,56 @@ class TestCursorAgentModelUnavailable:
                 attempted_provider_call=attempted_provider_call,
             )
             is None
+        )
+
+    @pytest.mark.parametrize(
+        ("code", "message"),
+        [
+            (
+                "not_found",
+                "Model cursor-grok-4.6-high was not found at the endpoint",
+            ),
+            (
+                "item_not_found",
+                "Item cursor-grok-4.6-high was not found",
+            ),
+            (
+                "model_not_found",
+                "Model cursor-grok-4.6-high was not found because the route "
+                "is malformed",
+            ),
+        ],
+        ids=["wrong-endpoint", "missing-item", "malformed-route"],
+    )
+    def test_exact_model_non_model_404_is_terminal_without_candidate_cooldown(
+        self,
+        code: str,
+        message: str,
+    ) -> None:
+        candidate = _CURSOR_MODEL_UNAVAILABLE_CANDIDATE
+        exc = _cursor_model_error(
+            status_code=404,
+            code=code,
+            message=message,
+        )
+
+        assert not _is_codex_auto_agent_cursor_agent_model_unavailable_response(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=True,
+        )
+        classified = _classify_codex_auto_agent_retryable_exhaustion(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=True,
+        )
+        assert classified == "provider_terminal_error"
+        assert (
+            _get_codex_auto_agent_candidate_cooldown_scope(
+                classified,
+                candidate=candidate,
+            )
+            == "request_local"
         )
 
 

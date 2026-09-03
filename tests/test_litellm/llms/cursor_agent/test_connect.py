@@ -290,6 +290,73 @@ class _H2LoopbackPeer:
         return None
 
 
+class _H2ErrorPeer:
+    def __init__(self, *, status_code: int, body: bytes) -> None:
+        self.status_code = status_code
+        self.body = body
+        self.server = H2Connection(
+            config=H2Configuration(
+                client_side=False,
+                header_encoding="utf-8",
+            )
+        )
+        self.server.initiate_connection()
+        self.incoming: asyncio.Queue[bytes] = asyncio.Queue()
+        self.incoming.put_nowait(self.server.data_to_send())
+        self.closed = False
+
+    async def open_connection(self, *_args: Any, **_kwargs: Any) -> tuple[Any, Any]:
+        return self, self
+
+    async def read(self, _size: int) -> bytes:
+        return await self.incoming.get()
+
+    def write(self, data: bytes) -> None:
+        for event in self.server.receive_data(data):
+            if isinstance(event, RequestReceived):
+                self.server.send_headers(
+                    event.stream_id,
+                    [
+                        (":status", str(self.status_code)),
+                        ("content-type", "application/json"),
+                        ("x-cursor-error", "provider"),
+                    ],
+                    end_stream=not self.body,
+                )
+                if self.body:
+                    split_at = max(1, len(self.body) // 2)
+                    self.server.send_data(
+                        event.stream_id,
+                        self.body[:split_at],
+                        end_stream=False,
+                    )
+                    self.server.send_data(
+                        event.stream_id,
+                        self.body[split_at:],
+                        end_stream=True,
+                    )
+            elif isinstance(event, DataReceived):
+                self.server.acknowledge_received_data(
+                    event.flow_controlled_length,
+                    event.stream_id,
+                )
+        outbound = self.server.data_to_send()
+        if outbound:
+            self.incoming.put_nowait(outbound)
+
+    async def drain(self) -> None:
+        return None
+
+    def get_extra_info(self, name: str) -> Any:
+        return _FakeTLS() if name == "ssl_object" else None
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+
 class _H2WindowUpdatePeer:
     def __init__(self) -> None:
         self.server = H2Connection(
@@ -855,6 +922,40 @@ def test_h2_bidi_receives_terminal_before_request_half_close(
     assert peer.request_headers["content-type"] == "application/connect+proto"
     request_frames = decode_connect_proto_frames(bytes(peer.request_body))
     assert _top_level_fields(request_frames[0].payload)[0][0] == 1
+
+
+def test_h2_bidi_collects_provider_error_body_before_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = json.dumps(
+        {
+            "error": {
+                "code": "model_not_found",
+                "message": "Model cursor-grok-4.6-high does not exist.",
+            }
+        },
+        separators=(",", ":"),
+    ).encode()
+    peer = _H2ErrorPeer(status_code=404, body=body)
+    monkeypatch.setattr(asyncio, "open_connection", peer.open_connection)
+    client = CursorAgentConnectClient(auth=CursorAgentAuth("access-token"))
+
+    with pytest.raises(CursorConnectError) as exc_info:
+        asyncio.run(
+            client.run(
+                _run_request(),
+                url="https://cursor.test/agent.v1.AgentService/Run",
+                timeout=0.5,
+            )
+        )
+
+    exc = exc_info.value
+    assert exc.status_code == 404
+    assert exc.headers[":status"] == "404"
+    assert exc.headers["x-cursor-error"] == "provider"
+    assert exc.body == body
+    assert exc._aawm_provider_returned is True
+    assert peer.closed is True
 
 
 def test_h2_bidi_flushes_response_window_updates_without_pending_request_data(

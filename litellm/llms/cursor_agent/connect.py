@@ -58,6 +58,7 @@ CONNECT_END_STREAM_FLAG = 0x02
 CONNECT_KNOWN_FLAGS = CONNECT_END_STREAM_FLAG | CONNECT_COMPRESSED_FLAG
 CURSOR_CONNECT_HEARTBEAT_SECONDS = 5.0
 CURSOR_CONNECT_TERMINAL_TIMEOUT_SECONDS = 120.0
+_CURSOR_CONNECT_MAX_ERROR_BODY_BYTES = 64 * 1024
 _CURSOR_PROTO_STRUCTURE_MAX_DEPTH = 3
 _CURSOR_PROTO_STRUCTURE_MAX_ITEMS = 64
 _CURSOR_PROTO_STRUCTURE_MAX_BYTES = 4096
@@ -2848,6 +2849,9 @@ class CursorAgentRetainedSession:
         self.local_exec_tool_name = local_exec_tool_name
         self.spawn_agent_tool_definition = spawn_agent_tool_definition
         self.saw_response_headers = saw_response_headers
+        self.response_status_code: Optional[int] = None
+        self.response_headers: Dict[str, str] = {}
+        self.error_response_body = bytearray()
         self.pending = bytearray()
         self._buffered_frames: List[CursorConnectProtoFrame] = []
         self._external_exec_requests: Dict[str, Dict[str, Any]] = {}
@@ -2959,6 +2963,30 @@ class CursorAgentRetainedSession:
             self.writer.write(outbound)
             await self.writer.drain()
 
+    def _append_error_response_body(self, chunk: bytes) -> None:
+        remaining = (
+            _CURSOR_CONNECT_MAX_ERROR_BODY_BYTES - len(self.error_response_body)
+        )
+        if remaining > 0:
+            self.error_response_body.extend(chunk[:remaining])
+
+    def _provider_response_error(self) -> Optional[CursorConnectError]:
+        status_code = self.response_status_code
+        if status_code is None or status_code < 400:
+            return None
+        message = (
+            "Cursor Agent rejected the access token."
+            if status_code == 401
+            else f"Cursor Agent Connect request failed with HTTP {status_code}."
+        )
+        return CursorConnectError(
+            message,
+            status_code=status_code,
+            headers=self.response_headers,
+            body=bytes(self.error_response_body),
+            provider_returned=True,
+        )
+
     def _handle_frame(
         self,
         frame: CursorConnectProtoFrame,
@@ -3050,12 +3078,15 @@ class CursorAgentRetainedSession:
             except TimeoutError:
                 continue
             if not incoming:
-                self.decoder.finish()
                 if not self.saw_response_headers:
                     raise CursorConnectError(
                         "Cursor Agent HTTP/2 stream closed before response headers.",
                         status_code=502,
                     )
+                provider_response_error = self._provider_response_error()
+                if provider_response_error is not None:
+                    raise provider_response_error
+                self.decoder.finish()
                 result.validate_terminal()
                 return result
 
@@ -3066,16 +3097,26 @@ class CursorAgentRetainedSession:
                     response_headers = CursorAgentConnectClient._h2_response_headers(
                         event.headers
                     )
-                    CursorAgentConnectClient._validate_h2_response_headers(
+                    status_code = CursorAgentConnectClient._validate_h2_response_headers(
                         response_headers
                     )
                     self.saw_response_headers = True
+                    self.response_status_code = status_code
+                    self.response_headers = response_headers
+                    if status_code >= 400:
+                        self.pending.clear()
                     continue
                 if isinstance(event, h2_events.DataReceived):
                     self.connection.acknowledge_received_data(
                         event.flow_controlled_length,
                         event.stream_id,
                     )
+                    if (
+                        self.response_status_code is not None
+                        and self.response_status_code >= 400
+                    ):
+                        self._append_error_response_body(event.data)
+                        continue
                     frames = self.decoder.feed(event.data)
                     for index, frame in enumerate(frames):
                         if self._handle_frame(
@@ -3090,6 +3131,11 @@ class CursorAgentRetainedSession:
                     trailer_headers = CursorAgentConnectClient._h2_response_headers(
                         event.headers
                     )
+                    if (
+                        self.response_status_code is not None
+                        and self.response_status_code >= 400
+                    ):
+                        continue
                     error_code = trailer_headers.get("connect-error-code")
                     if error_code and error_code != "0":
                         raise CursorConnectError(
@@ -3102,6 +3148,9 @@ class CursorAgentRetainedSession:
                         )
                     continue
                 if isinstance(event, h2_events.StreamEnded):
+                    provider_response_error = self._provider_response_error()
+                    if provider_response_error is not None:
+                        raise provider_response_error
                     self.decoder.finish()
                     result.validate_terminal()
                     return result
@@ -3964,10 +4013,21 @@ class CursorAgentConnectClient:
 
     @staticmethod
     def _validate_h2_response_headers(headers: Mapping[str, str]) -> int:
+        raw_status_code = headers.get(":status")
         try:
-            status_code = int(headers.get(":status", "502"))
+            status_code = int(raw_status_code)
         except (TypeError, ValueError):
-            status_code = 502
+            raise CursorConnectProtocolError(
+                "Cursor Agent Connect returned an invalid HTTP status.",
+                status_code=502,
+                headers=headers,
+            )
+        if status_code < 100 or status_code > 599:
+            raise CursorConnectProtocolError(
+                "Cursor Agent Connect returned an invalid HTTP status.",
+                status_code=502,
+                headers=headers,
+            )
         content_encoding = headers.get("content-encoding", "").lower().strip()
         if content_encoding not in {"", "identity"}:
             raise CursorConnectProtocolError(
@@ -3975,20 +4035,8 @@ class CursorAgentConnectClient:
                 status_code=502,
                 headers=headers,
             )
-        if status_code == 401:
-            raise CursorConnectError(
-                "Cursor Agent rejected the access token.",
-                status_code=401,
-                headers=headers,
-                provider_returned=True,
-            )
         if status_code >= 400:
-            raise CursorConnectError(
-                f"Cursor Agent Connect request failed with HTTP {status_code}.",
-                status_code=status_code,
-                headers=headers,
-                provider_returned=True,
-            )
+            return status_code
         content_type = headers.get("content-type", "").lower()
         if CURSOR_AGENT_CONNECT_CONTENT_TYPE not in content_type:
             raise CursorConnectProtocolError(
