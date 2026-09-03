@@ -4457,3 +4457,99 @@ async def test_direct_openai_owner_accepts_legacy_and_current_managed_shapes() -
     assert stored[0]["attributes"]["route_family"] == "codex_responses"
     assert stored[0]["attributes"]["endpoint_contract"] == "codex_responses"
     assert stored[0]["attributes"]["state_format"] == "codex_responses"
+
+
+# =============================================================================
+# CURSOR-015: Validated cursor replay state helpers
+# =============================================================================
+
+class TestCursor015ValidatedCursorReplay:
+    def test_has_validated_cursor_replay_returns_false_for_fresh_request(self) -> None:
+        from types import SimpleNamespace
+        request = SimpleNamespace(state=SimpleNamespace())
+        assert sa.has_validated_cursor_replay(request) is False
+
+    def test_set_and_has_validated_cursor_replay(self) -> None:
+        from types import SimpleNamespace
+        request = SimpleNamespace(state=SimpleNamespace())
+        body = {"model": "work", "input": []}
+        sa.set_validated_cursor_replay(
+            request,
+            body=body,
+            stage="cursor_replay_built",
+            reason="strict_reconstruction_validated",
+        )
+        assert sa.has_validated_cursor_replay(request) is True
+        assert sa.get_validated_cursor_replay_body_id(request) == id(body)
+
+    def test_validated_cursor_replay_body_id_is_none_for_fresh_request(self) -> None:
+        from types import SimpleNamespace
+        request = SimpleNamespace(state=SimpleNamespace())
+        assert sa.get_validated_cursor_replay_body_id(request) is None
+
+    def test_has_validated_cursor_replay_returns_false_for_none_request(self) -> None:
+        assert sa.has_validated_cursor_replay(None) is False
+
+    def test_set_validated_cursor_replay_is_noop_for_none_request(self) -> None:
+        sa.set_validated_cursor_replay(
+            None,
+            body={},
+            stage="test",
+            reason="test",
+        )
+
+
+# =============================================================================
+# CURSOR-015: Derive effective identity
+# =============================================================================
+
+class TestCursor015DeriveEffectiveIdentity:
+    def test_derives_deterministic_identity_for_base(self) -> None:
+        identity = sa._derive_effective_identity_for_base("sess-cursor015-base")
+        assert identity is not None
+        assert identity.startswith(
+            sa._SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX
+        )
+        assert identity == sa._derive_effective_identity_for_base("sess-cursor015-base")
+
+    def test_returns_none_for_empty_base(self) -> None:
+        assert sa._derive_effective_identity_for_base(None) is None
+        assert sa._derive_effective_identity_for_base("") is None
+
+    def test_different_bases_produce_different_identities(self) -> None:
+        id_a = sa._derive_effective_identity_for_base("sess-a")
+        id_b = sa._derive_effective_identity_for_base("sess-b")
+        assert id_a is not None
+        assert id_b is not None
+        assert id_a != id_b
+
+
+# =============================================================================
+# CURSOR-015: Rediscovered effective owner
+# =============================================================================
+
+class TestCursor015RediscoveredEffectiveOwner:
+    def test_set_rediscovered_effective_owner_stores_on_request(self) -> None:
+        from types import SimpleNamespace
+        request = SimpleNamespace(state=SimpleNamespace())
+        sa.set_rediscovered_effective_owner(
+            request,
+            effective_identity="sess-cursor015-effective",
+            owner_record={"owner": "owner-id", "state": "owned"},
+        )
+        stored = getattr(
+            request.state,
+            sa._REQUEST_STATE_REDISCOVERED_EFFECTIVE_OWNER_ATTR,
+            None,
+        )
+        assert stored is not None
+        assert stored["effective_identity"] == "sess-cursor015-effective"
+        assert stored["owner_id"] == "owner-id"
+        assert stored["state"] == "owned"
+
+    def test_set_rediscovered_effective_owner_is_noop_for_none_request(self) -> None:
+        sa.set_rediscovered_effective_owner(
+            None,
+            effective_identity="sess-cursor015-effective",
+            owner_record={"owner": "x", "state": "owned"},
+        )

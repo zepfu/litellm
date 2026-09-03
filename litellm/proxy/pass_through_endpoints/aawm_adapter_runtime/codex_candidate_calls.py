@@ -2621,6 +2621,19 @@ def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
                 "fresh_body_copy",
                 "replayed_input_container",
             )
+        # CURSOR-015: Reject known Cursor continuation identifiers
+        # that survive within the reconstructed input before asserting
+        # portability.
+        for item_index, item in enumerate(replayed_input):
+            if isinstance(item, dict):
+                for field in _CURSOR_CONTINUATION_FIELDS:
+                    if field in item and item.get(field) is not None:
+                        return _cursor_replay_build_rejected(
+                            "fresh_body_copy",
+                            "cursor_continuation_identifier",
+                            item_index=item_index,
+                            item=item,
+                        )
         unresolved_result = _cursor_replay_unresolved_function_call_ids(
             replayed_input,
             stage="fresh_body_copy",
@@ -2649,6 +2662,14 @@ def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
                     item=output_item,
                 )
             unresolved_call_ids.remove(call_id)
+        # CURSOR-015: Reject if any function calls remain unresolved
+        # after processing all output items.  A partially resolved call
+        # graph is not safe to replay.
+        if unresolved_call_ids:
+            return _cursor_replay_build_rejected(
+                "fresh_body_copy",
+                "unresolved_call_id",
+            )
         replay_tools_source = replay_state.get("tools")
 
     replay_tools_result = _cursor_replay_provider_neutral_tools(replay_tools_source)
@@ -4317,6 +4338,7 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
                 *_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES,
             ],
             caller_managed_hidden_retry=True,
+            caller_managed_owner_success=True,
         )
     except Exception as exc:
         if _grok_native_candidate_unavailable_detail(exc) is not None:
@@ -4404,6 +4426,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
                 *_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES,
             ],
             caller_managed_hidden_retry=True,
+            caller_managed_owner_success=True,
         )
     except Exception as exc:
         if _xai_oauth_candidate_unavailable_detail(exc) is not None:

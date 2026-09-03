@@ -4117,6 +4117,10 @@ async def pass_through_request(  # noqa: PLR0915
     blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
     retryable_upstream_status_codes: Optional[list[int]] = None,
     caller_managed_hidden_retry: bool = False,
+    # CURSOR-015: When True, the caller (candidate loop) owns
+    # the success promotion after candidate-level validation;
+    # pass_through_request releases on failure but does not promote.
+    caller_managed_owner_success: bool = False,
     raw_body_passthrough: bool = False,
     passthrough_logging_metadata: Optional[dict[str, Any]] = None,
 ):
@@ -4751,9 +4755,10 @@ async def pass_through_request(  # noqa: PLR0915
             status_ok = bool(
                 getattr(response, "status_code", 500) < 300
             )
-            await _aawm_session_owner_on_upstream_result(
-                request=request, success=status_ok
-            )
+            if not caller_managed_owner_success:
+                await _aawm_session_owner_on_upstream_result(
+                    request=request, success=status_ok
+                )
             if not status_ok:
                 # Keep existing error handling below.
                 pass
@@ -4937,9 +4942,11 @@ async def pass_through_request(  # noqa: PLR0915
             )
             raise
         status_ok = bool(getattr(response, "status_code", 500) < 300)
-        await _aawm_session_owner_on_upstream_result(
-            request=request, success=status_ok
-        )
+        # CURSOR-015: Defer owner promotion when caller validates.
+        if not caller_managed_owner_success:
+            await _aawm_session_owner_on_upstream_result(
+                request=request, success=status_ok
+            )
         upstream_wait_completed_at = datetime.now()
         _record_passthrough_duration(
             kwargs,

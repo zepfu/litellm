@@ -7,6 +7,7 @@ from typing import Any, Union, get_args
 from urllib.parse import urlparse
 
 import pytest
+from fastapi import HTTPException
 from fastapi.responses import Response, StreamingResponse
 from starlette.requests import Request
 
@@ -4257,3 +4258,143 @@ def test_cursor_terminal_failures_consume_replay_state(
 
     with pytest.raises(CursorConnectError, match="missing"):
         codex_candidate_calls._peek_cursor_replay_state("resp-replay")
+
+
+# =============================================================================
+# CURSOR-015: Reject nested cursor continuation identifiers
+# =============================================================================
+
+def test_cursor_fresh_replay_dispatch_rejects_nested_continuation_identifiers() -> None:
+    """R7: Known Cursor continuation identifiers in replayed input must be
+    rejected before asserting portability."""
+    body = _stock_codex_full_history_body()
+    body["input"][0]["previous_response_id"] = "resp_nested_123"
+    continuation_exc = _cursor_continuation_failure()
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            body,
+            continuation_exc=continuation_exc,
+        )
+        is None
+    )
+
+
+def test_cursor_fresh_replay_dispatch_rejects_camel_continuation_identifier() -> None:
+    """R7: CamelCase variants of Cursor continuation identifiers are also rejected."""
+    body = _stock_codex_full_history_body()
+    body["input"][2]["conversationId"] = "conv_nested_456"
+    continuation_exc = _cursor_continuation_failure()
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            body,
+            continuation_exc=continuation_exc,
+        )
+        is None
+    )
+
+
+def test_cursor_fresh_replay_dispatch_rejects_agent_session_id() -> None:
+    """R7: agent_session_id in input items is rejected."""
+    body = _stock_codex_full_history_body()
+    body["input"][1]["agent_session_id"] = "agent_sess_789"
+    continuation_exc = _cursor_continuation_failure()
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            body,
+            continuation_exc=continuation_exc,
+        )
+        is None
+    )
+
+
+# =============================================================================
+# CURSOR-015: Reject unresolved call graph
+# =============================================================================
+
+def test_cursor_fresh_replay_dispatch_rejects_unresolved_call_graph() -> None:
+    """R7: A partially resolved call graph must be rejected before
+    asserting portability."""
+    codex_candidate_calls._store_cursor_replay_state(
+        "resp-unresolved-call",
+        messages=[
+            {"role": "user", "content": "run two commands"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": '{"cmd":"pwd"}',
+                        },
+                    },
+                    {
+                        "id": "call-2",
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": '{"cmd":"date"}',
+                        },
+                    },
+                ],
+            },
+        ],
+        tools=[],
+    )
+    body = {
+        "model": "work",
+        "previous_response_id": "resp-unresolved-call",
+        "input": [
+            {
+                "type": "function_call_output",
+                "id": "fco_01a06244-9f7f-7fe1-869b-23d587ad56f1",
+                "call_id": "call-1",
+                "output": "pwd output",
+            },
+        ],
+    }
+    continuation_exc = _cursor_continuation_failure()
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            body,
+            continuation_exc=continuation_exc,
+        )
+        is None
+    )
+
+
+# =============================================================================
+# CURSOR-015: Non-streaming 2xx non-JSON rejection
+# =============================================================================
+
+def test_cursor_015_non_streaming_non_json_2xx_raises_502() -> None:
+    """R5: Non-streaming 2xx response that is not valid JSON must raise
+    HTTP 502, not be silently promoted."""
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        payload_validation,
+    )
+
+    response = Response(
+        content=b"not json",
+        status_code=200,
+        media_type="application/json",
+    )
+
+    try:
+        asyncio.run(
+            payload_validation._validate_codex_auto_agent_responses_payload(
+                response=response,
+                adapter="xai",
+                adapter_model="xai/grok-4.6",
+                adapter_label="native-xai",
+            )
+        )
+        assert False, "Expected HTTPException"
+    except HTTPException as exc:
+        assert exc.status_code == 502
+        assert "non-JSON" in exc.detail["error"]["message"]

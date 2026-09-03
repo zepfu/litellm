@@ -4566,6 +4566,30 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 ),
                 request=request,
             )
+        # CURSOR-015: Clear the compatible, non-held Cursor request lease
+        # before activating the effective identity.  A held lease is a hard
+        # error; cross-identity lease reuse is prohibited.
+        if not sa.clear_non_held_request_session_owner_lease(request):
+            existing_lease = sa.get_request_session_owner_lease(request)
+            if existing_lease is not None and (
+                existing_lease.held_reservation
+                or existing_lease.promoted
+            ):
+                sa.raise_session_owner_redispatch_required(
+                    session_identity=session_owner_identity,
+                    alias_model=alias_model,
+                    candidate=candidate,
+                    failure_phase="session_owner_held_lease_on_identity_transition",
+                    guard=sa.SessionOwnerGuardResult(
+                        decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                        session_identity=session_owner_identity,
+                        cache_key=_cache_key,
+                        owner_record=session_owner_record,
+                        owner_id=session_owner_record.get("owner"),
+                        mismatch_reason=mismatch_reason,
+                    ),
+                    request=request,
+                )
         effective_identity = sa.activate_session_owner_redispatch_effective_identity(
             request=request,
             base_session_identity=session_owner_identity,
@@ -4623,6 +4647,95 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 ),
             }
         )
+        # CURSOR-015: When the base owner is Cursor, rediscover an
+        # existing first-generation effective native owner before
+        # honoring the base Cursor affinity.  Bind to it when it is
+        # already owned or reserved; do not create a second generation.
+        base_hosted = sa._hosted_provider_from_attributes(
+            session_owner_record
+        ) if isinstance(session_owner_record, dict) else None
+        if base_hosted == "cursor_agent" and not is_auto_review:
+            derived_effective = sa._derive_effective_identity_for_base(
+                session_owner_identity
+            )
+            if derived_effective is not None:
+                effective_record, _effective_key, effective_error = (
+                    await sa.get_session_owner_record(
+                        session_identity=derived_effective,
+                        request=request,
+                        wait_for_foreign_reservation=True,
+                    )
+                )
+                if effective_error is None and isinstance(
+                    effective_record, dict
+                ) and sa._record_state(effective_record) in {
+                    "owned", "reserved"
+                }:
+                    sa.set_rediscovered_effective_owner(
+                        request,
+                        effective_identity=derived_effective,
+                        owner_record=effective_record,
+                    )
+                    effective_affinity = sa.owner_record_as_affinity_hint(
+                        effective_record,
+                        preserve_account_identity=True,
+                    )
+                    if effective_affinity is not None:
+                        effective_affinity_candidate = _find_codex_auto_agent_affinity_candidate(
+                            effective_affinity,
+                            alias_model=alias_model,
+                            client_product_label=client_product_label,
+                            request=request,
+                        )
+                        if effective_affinity_candidate is not None:
+                            effective_state = await _build_codex_auto_agent_affinity_candidate_state(
+                                request,
+                                candidate_template=effective_affinity_candidate,
+                                affinity=effective_affinity,
+                                excluded_candidate_keys=excluded_candidate_keys,
+                            )
+                            if _is_auto_agent_candidate_state_available(
+                                effective_state
+                            ):
+                                return _attach_account_bound_selection_metadata(
+                                    _attach_session_owner_selection_fields(
+                                        _attach_aawm_alias_routing_state_sources(
+                                            {
+                                                **effective_state,
+                                                "alias_model": alias_model,
+                                                "session_key": session_key,
+                                                "selection_reason": "rediscovered_effective_owner",
+                                                "skipped": [],
+                                                "in_flight_session": True,
+                                                "request_mode": request_mode,
+                                                "redispatch_ordinal": redispatch_ordinal,
+                                                "affinity_bypassed": True,
+                                            },
+                                            affinity=effective_affinity,
+                                            selected_state=effective_state,
+                                        ),
+                                        canonical_session_identity=derived_effective,
+                                        session_owner_guard=type("G", (), {
+                                            "decision": "compatible_owner",
+                                            "owner_record": effective_record,
+                                            "owner_id": effective_record.get("owner"),
+                                            "mismatch_reason": None,
+                                            "provenance": sa.build_session_owner_provenance(
+                                                session_identity=derived_effective,
+                                                decision="compatible_owner",
+                                                owner_record=effective_record,
+                                                owner_id=effective_record.get("owner"),
+                                                cache_key=_effective_key,
+                                            ),
+                                            "reservation_token": None,
+                                            "held_reservation": False,
+                                            "cache_key": _effective_key,
+                                        })(),
+                                        session_owner_identity=derived_effective,
+                                    ),
+                                    has_account_bound_state=has_account_bound_state,
+                                    affinity=effective_affinity,
+                                )
         if affinity is None:
             # Owned but unusable attributes => fail before free selection.
             sa.raise_session_owner_redispatch_required(
@@ -4675,6 +4788,32 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
     elif request_mode == "ordinary_continuation":
         affinity = await _get_codex_session_affinity(session_key)
     elif request_mode == "fresh_redispatch":
+        if has_continuation_state and not sa.has_validated_cursor_replay(request):
+            # CURSOR-015: Provider-owned continuation with neither durable
+            # owner nor compatible affinity must fail closed before free
+            # candidate selection.
+            sa.raise_session_owner_redispatch_required(
+                session_identity=session_owner_identity,
+                alias_model=alias_model,
+                failure_phase="session_owner_fresh_redispatch_no_owner_affinity",
+                guard=sa.SessionOwnerGuardResult(
+                    decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                    session_identity=session_owner_identity,
+                    cache_key=_cache_key,
+                    owner_record=session_owner_record,
+                    owner_id=session_owner_record.get("owner") if isinstance(session_owner_record, dict) else None,
+                    mismatch_reason="session_owner: fresh redispatch without owner or affinity",
+                    provenance=sa.build_session_owner_provenance(
+                        session_identity=session_owner_identity,
+                        decision="redispatch_required",
+                        owner_record=session_owner_record,
+                        owner_id=session_owner_record.get("owner") if isinstance(session_owner_record, dict) else None,
+                        mismatch_reason="session_owner: fresh redispatch without owner or affinity",
+                        cache_key=_cache_key,
+                    ),
+                ),
+                request=request,
+            )
         existing_affinity = await _get_codex_session_affinity(session_key)
         if existing_affinity is not None:
             affinity_bypassed = True
@@ -4856,9 +4995,16 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             isinstance(session_owner_record, dict)
             and sa._record_state(session_owner_record) == "owned"
         ):
-            if account_identity_pinned and _candidate_matches_affinity(
-                affinity_state["candidate"],
-                affinity,
+            # CURSOR-015: Require genuine account-bearing affinity
+            # before raising account_bound_owner_unavailable.  The adjacent
+            # non-owned branch already requires _affinity_pins_account_identity.
+            if (
+                account_identity_pinned
+                and _affinity_pins_account_identity(affinity)
+                and _candidate_matches_affinity(
+                    affinity_state["candidate"],
+                    affinity,
+                )
             ):
                 _raise_codex_auto_agent_redispatch_required(
                     candidate=dict(affinity_state.get("candidate") or {}),

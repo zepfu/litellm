@@ -743,6 +743,20 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
         try:
             response_body = json.loads(_decode_http_response_body(response.body))  # noqa: F821
         except Exception:
+            if response.status_code < 300:
+                from starlette import status
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail={
+                        "error": {
+                            "message": "Upstream returned a non-JSON 2xx response.",
+                            "code": "aawm_codex_auto_agent_non_json_responses_payload",
+                            "adapter": adapter,
+                            "adapter_model": adapter_model,
+                            "adapter_label": adapter_label,
+                        }
+                    },
+                ) from None
             return response
         identity_changed = False
         if isinstance(response_body, dict):

@@ -144,6 +144,19 @@ class SessionOwnerReplaySafetyResult:
 
 
 _SESSION_OWNER_STATE_KIND = "session_owner"
+# CURSOR-015: Validated provider-neutral replay state bound to the exact
+# rebuilt body. Set only by the candidate loop after strict reconstruction,
+# complete call-graph validation, tool validation, and opaque-state removal.
+# Used as the trust boundary for provider_owned_continuation derivation.
+_REQUEST_STATE_VALIDATED_CURSOR_REPLAY_ATTR = "_aawm_validated_cursor_replay"
+_REQUEST_STATE_VALIDATED_CURSOR_REPLAY_BODY_ID = (
+    "_aawm_validated_cursor_replay_body_id"
+)
+# CURSOR-015: Rediscovered existing first-generation effective native owner.
+_REQUEST_STATE_REDISCOVERED_EFFECTIVE_OWNER_ATTR = (
+    "_aawm_rediscovered_effective_owner"
+)
+
 _SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX = (
     "aawm-session-owner-redispatch-v1:"
 )
@@ -380,6 +393,80 @@ def request_has_effective_session_identity(request: Any) -> bool:
     return get_request_effective_session_identity(request) is not None
 
 
+
+def set_validated_cursor_replay(
+    request: Any,
+    *,
+    body: dict[str, Any],
+    stage: str,
+    reason: str,
+) -> None:
+    """CURSOR-015: Set server-owned validated provider-neutral replay state.
+
+    Bound to the exact rebuilt body identity; callers must invalidate or
+    replace when the authoritative body changes.
+    """
+    if request is None:
+        return
+    state = getattr(request, "state", None)
+    if state is None:
+        return
+    setattr(
+        state,
+        _REQUEST_STATE_VALIDATED_CURSOR_REPLAY_ATTR,
+        {"stage": stage, "reason": reason},
+    )
+    setattr(
+        state,
+        _REQUEST_STATE_VALIDATED_CURSOR_REPLAY_BODY_ID,
+        id(body),
+    )
+
+
+def get_validated_cursor_replay_body_id(request: Any) -> Optional[int]:
+    """Return the body id of the validated replay, or None."""
+    if request is None:
+        return None
+    state = getattr(request, "state", None)
+    if state is None:
+        return None
+    return getattr(state, _REQUEST_STATE_VALIDATED_CURSOR_REPLAY_BODY_ID, None)
+
+
+def has_validated_cursor_replay(request: Any) -> bool:
+    """CURSOR-015: True when a validated provider-neutral replay is active."""
+    if request is None:
+        return False
+    state = getattr(request, "state", None)
+    if state is None:
+        return False
+    replay = getattr(state, _REQUEST_STATE_VALIDATED_CURSOR_REPLAY_ATTR, None)
+    return isinstance(replay, dict) and bool(replay)
+
+
+def set_rediscovered_effective_owner(
+    request: Any,
+    *,
+    effective_identity: str,
+    owner_record: dict[str, Any],
+) -> None:
+    """CURSOR-015: Record a rediscovered existing effective native owner."""
+    if request is None:
+        return
+    state = getattr(request, "state", None)
+    if state is None:
+        return
+    setattr(
+        state,
+        _REQUEST_STATE_REDISCOVERED_EFFECTIVE_OWNER_ATTR,
+        {
+            "effective_identity": effective_identity,
+            "owner_id": owner_record.get("owner"),
+            "state": owner_record.get("state"),
+        },
+    )
+
+
 def activate_codex_auto_review_session_identity(
     *,
     request: Any,
@@ -478,6 +565,25 @@ def activate_codex_auto_review_session_owner_identity(
                 owner_identity,
             )
     return owner_identity
+
+
+def _derive_effective_identity_for_base(
+    base_session_identity: Optional[str],
+) -> Optional[str]:
+    """CURSOR-015: Deterministically derive the effective identity
+    for a given base session identity without activating it.
+
+    Returns None when the base is missing or empty.
+    """
+    base = _clean_optional_str(base_session_identity)
+    if base is None:
+        return None
+    digest = hashlib.sha256(
+        (
+            _SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_DOMAIN_SEPARATOR + base
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"{_SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX}{digest}"
 
 
 def activate_session_owner_redispatch_effective_identity(
@@ -3995,12 +4101,39 @@ async def ensure_session_owner_guard_for_request(
         )
     if active_lease is not None and guard.held_reservation:
         active_lease.reservation_token = guard.reservation_token
+        original_held = active_lease.held_reservation
         active_lease.held_reservation = True
-        active_lease.decision = guard.decision.value
-        active_lease.owner_id = guard.owner_id or active_lease.owner_id
-        active_lease.promoted = False
-        active_lease.released = False
-        set_request_session_owner_lease(request, active_lease)
+        # CURSOR-015: Verify the active lease identity matches the guard
+        # identity.  A non-held compatible lease from a different identity
+        # must be replaced rather than mutated; a held cross-identity lease
+        # is a hard error.
+        if active_lease.session_identity != guard.session_identity:
+            if original_held or active_lease.promoted:
+                raise_session_owner_redispatch_required(
+                    session_identity=guard.session_identity or session_identity,
+                    guard=guard,
+                    alias_model=alias_model,
+                    candidate=candidate or requested_attributes,
+                    failure_phase="session_owner_cross_identity_lease_conflict",
+                    request=request,
+                )
+            # Non-held compatible lease from a different identity:
+            # replace rather than mutate.
+            active_lease = None
+        if active_lease is not None:
+            active_lease.decision = guard.decision.value
+            active_lease.owner_id = guard.owner_id or active_lease.owner_id
+            active_lease.promoted = False
+            active_lease.released = False
+            set_request_session_owner_lease(request, active_lease)
+        else:
+            lease = lease_from_guard_result(
+                guard,
+                attributes=requested_attributes
+                or (active_lease.attributes if active_lease is not None else None),
+            )
+            set_request_session_owner_lease(request, lease)
+        return guard
     else:
         lease = lease_from_guard_result(
             guard,

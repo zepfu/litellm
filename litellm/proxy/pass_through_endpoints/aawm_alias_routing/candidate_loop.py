@@ -824,9 +824,19 @@ async def handle_alias_route(  # noqa: PLR0915
         )
     )
 
+    # CURSOR-015: Derive provider_owned_continuation from raw continuation
+    # state minus the exact validated provider-neutral replay authority.
+    # Use this for traversal, exclusion, refund, cooldown, and failover
+    # decisions; retain raw has_continuation_state for audit/payload
+    # validation only.
+    def _provider_owned_continuation() -> bool:
+        return has_continuation_state and not (
+            _session_affinity_mod().has_validated_cursor_replay(request)
+        )
+
     def _genuinely_fresh_dispatch(selection: Mapping[str, Any]) -> bool:
         return (
-            not has_continuation_state
+            not _provider_owned_continuation()
             and not has_previous_response_id
             and not bool(selection.get("has_account_bound_state"))
             and not bool(selection.get("in_flight_session"))
@@ -913,6 +923,15 @@ async def handle_alias_route(  # noqa: PLR0915
                         codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
                     ] = copy.deepcopy(cursor_replay_fresh_dispatch_reject)
             return None
+        # CURSOR-015: Set server-owned validated provider-neutral replay
+        # state bound to the exact rebuilt body.  The client ordinal remains
+        # telemetry only.
+        _session_affinity_mod().set_validated_cursor_replay(
+            request,
+            body=fresh_fallback_body,
+            stage="cursor_replay_built",
+            reason="strict_reconstruction_validated",
+        )
         return _lpe._merge_litellm_metadata(
             fresh_fallback_body,
             extra_fields={"aawm_redispatch_ordinal": 1},
@@ -943,7 +962,7 @@ async def handle_alias_route(  # noqa: PLR0915
         ) and not account_failover_replay_safe:
             return False
         return (
-            not has_continuation_state
+            not _provider_owned_continuation()
             or candidate.get("codex_oauth_credential_affinity")
             == "interchangeable"
         )
@@ -1156,15 +1175,9 @@ async def handle_alias_route(  # noqa: PLR0915
                 if isinstance(selection_error, dict)
                 else None
             )
-            if (
-                exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS
-                and (
-                    getattr(exc, "redispatch_required", None) is True
-                    or selection_detail.get("redispatch_required") is True
-                )
-                and selection_error_code not in _IN_FLIGHT_REDISPATCH_ERROR_CODES
-            ):
-                raise
+            # CURSOR-015: Emit the structured redispatch terminal
+            # before the early non-in-flight 429 rethrow so the
+            # first post-rebuild failure_phase is observable.
             if _emit_validated_redispatch_terminal_event(
                 exc=exc,
                 request=request,
@@ -1175,6 +1188,15 @@ async def handle_alias_route(  # noqa: PLR0915
                 emit_pre_attempt_terminal_event=(
                     _emit_auto_agent_alias_pre_attempt_terminal_event
                 ),
+            ):
+                raise
+            if (
+                exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+                and (
+                    getattr(exc, "redispatch_required", None) is True
+                    or selection_detail.get("redispatch_required") is True
+                )
+                and selection_error_code not in _IN_FLIGHT_REDISPATCH_ERROR_CODES
             ):
                 raise
             if exc.status_code == 429:
@@ -1282,7 +1304,7 @@ async def handle_alias_route(  # noqa: PLR0915
                 selection=selection,
                 attempt_record=attempt_record,
                 error_class=admission_error_class,
-                has_continuation_state=has_continuation_state,
+                has_continuation_state=_provider_owned_continuation(),
                 has_previous_response_id=has_previous_response_id,
                 account_failover_replay_safe=account_failover_replay_safe,
                 provider_status_code=attempt_record.get("error_status_code"),
@@ -1694,7 +1716,7 @@ async def handle_alias_route(  # noqa: PLR0915
                             ),
                         )
                     ):
-                        if not has_continuation_state:
+                        if not _provider_owned_continuation():
                             raise probe_failure_exc
                         attempt_record["status"] = (
                             "terminal_in_flight_unpersisted_item_not_found"
@@ -1752,7 +1774,7 @@ async def handle_alias_route(  # noqa: PLR0915
                             candidate=candidate,
                             selection=selection,
                             is_codex_alias=codex_failure_evidence_alias is not None,
-                            has_continuation_state=has_continuation_state,
+                            has_continuation_state=_provider_owned_continuation(),
                             has_previous_response_id=has_previous_response_id,
                             attempted_provider_call=attempted_provider_call,
                         )
@@ -2303,7 +2325,7 @@ async def handle_alias_route(  # noqa: PLR0915
                         "apply_account_exhaustion_cooldown": False,
                         "retryable": True,
                     }
-                    if has_continuation_state:
+                    if _provider_owned_continuation():
                         raise HTTPException(
                             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail={
@@ -2397,14 +2419,14 @@ async def handle_alias_route(  # noqa: PLR0915
                     selection=selection,
                     attempt_record=attempt_record,
                     error_class=error_class,
-                    has_continuation_state=has_continuation_state,
+                    has_continuation_state=_provider_owned_continuation(),
                     has_previous_response_id=has_previous_response_id,
                     account_failover_replay_safe=account_failover_replay_safe,
                     provider_status_code=attempt_record.get("error_status_code"),
                 )
                 if (
                     cooldown_scope == "none"
-                    and not has_continuation_state
+                    and not _provider_owned_continuation()
                     and not deterministically_ineligible
                 ):
                     _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
@@ -2414,7 +2436,7 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                 if (
                     error_class == "token_invalidated"
-                    and has_continuation_state
+                    and _provider_owned_continuation()
                     and not account_failover_replay_safe
                     and not account_failover_planned
                 ):
@@ -2475,7 +2497,7 @@ async def handle_alias_route(  # noqa: PLR0915
                         )
                         raise
                 if (
-                    has_continuation_state
+                    _provider_owned_continuation()
                     and cooldown_scope != "none"
                     and not account_failover_planned
                     and not (
@@ -2580,7 +2602,7 @@ async def handle_alias_route(  # noqa: PLR0915
                     provider_candidate_attempts += 1
                 native_grok_retry_eligible = _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
                     is_native_grok_4_5_candidate=(_is_codex_auto_agent_native_grok_4_5_candidate(candidate)),
-                    has_continuation_state=has_continuation_state,
+                    has_continuation_state=_provider_owned_continuation(),
                     error_class=error_class,
                     cooldown_scope=cooldown_scope,
                 )
@@ -2595,7 +2617,7 @@ async def handle_alias_route(  # noqa: PLR0915
                     native_grok_retry_metadata,
                 ) = _plan_codex_auto_agent_native_grok_continuation_transient_retry(
                     is_native_grok_4_5_candidate=(_is_codex_auto_agent_native_grok_4_5_candidate(candidate)),
-                    has_continuation_state=has_continuation_state,
+                    has_continuation_state=_provider_owned_continuation(),
                     error_class=error_class,
                     cooldown_scope=cooldown_scope,
                     provider_attempt=native_grok_provider_attempt,
