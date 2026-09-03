@@ -1009,6 +1009,36 @@ async def handle_alias_route(  # noqa: PLR0915
             ):
                 if hasattr(exc, field):
                     setattr(terminal_exc, field, getattr(exc, field))
+        elif _error_signals._is_codex_auto_agent_cursor_agent_provider_terminal_response(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=attempted_provider_call,
+        ):
+            source_headers = getattr(exc, "headers", None)
+            source_detail = copy.deepcopy(getattr(exc, "detail", None))
+            terminal_exc = HTTPException(
+                status_code=int(_extract_adapter_exception_status_code(exc)),
+                detail=source_detail,
+                headers=(
+                    dict(source_headers)
+                    if isinstance(source_headers, Mapping)
+                    else None
+                ),
+            )
+            terminal_exc.detail = source_detail
+            for field in (
+                "attempted_provider_call",
+                "_aawm_provider_returned",
+                "body",
+                "code",
+                "message",
+                "openai_code",
+                "param",
+                "provider_specific_fields",
+                "type",
+            ):
+                if hasattr(exc, field):
+                    setattr(terminal_exc, field, getattr(exc, field))
         kimi_failure_metadata = _get_safe_kimi_code_probe_failure_metadata(
             exc,
             candidate=candidate if isinstance(candidate, dict) else None,
@@ -2338,6 +2368,29 @@ async def handle_alias_route(  # noqa: PLR0915
                         current_status=attempt_record.get("status"),
                     ).to_observability_dict()
                 )
+                if (
+                    error_class == "provider_terminal_error"
+                    and _error_signals._is_codex_auto_agent_cursor_agent_provider_terminal_response(
+                        failure_exc,
+                        candidate=candidate,
+                        attempted_provider_call=attempted_provider_call,
+                    )
+                ):
+                    attempt_record["status"] = (
+                        "terminal_provider_error_no_cooldown"
+                    )
+                    _record_auto_agent_alias_attempt_failure(
+                        alias_family=alias_family,
+                        alias_model=alias_model,
+                        request=request,
+                        prepared_request_body=prepared_request_body,
+                        selection=selection,
+                        attempts=attempts,
+                        attempt_record=attempt_record,
+                        error_class=error_class,
+                        add_alias_metadata_fn=add_alias_metadata_fn,
+                    )
+                    _raise_terminal_alias_failure(failure_exc)
                 account_failover_planned = _plan_codex_oauth_account_failover(
                     request,
                     candidate=candidate,
@@ -2727,11 +2780,13 @@ def _resolve_failure_plan(
     # Unmatched Cursor model/auth failures remain terminal and must not enter
     # either the evidence gate or request-local cooldown resolution.
     unmatched_cursor_terminal_error = (
-        candidate.get("provider") == "cursor_agent"
-        and _error_signals._extract_adapter_exception_status_code(exc)
-        in {400, 401, 403, 404}
-        and provider_attributed_model_unavailable is None
+        provider_attributed_model_unavailable is None
         and error_class == "provider_terminal_error"
+        and _error_signals._is_codex_auto_agent_cursor_agent_provider_terminal_response(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=attempted_provider_call,
+        )
     )
     if unmatched_cursor_terminal_error:
         return CooldownPublicationPlan(

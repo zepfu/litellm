@@ -1201,6 +1201,311 @@ def test_resolve_failure_plan_preserves_openrouter_model_unavailable_evidence_pr
     assert plan.durable_keys == ("openrouter:future-model",)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "detail", "expected_terminal"),
+    [
+        pytest.param(
+            404,
+            {"error": {"code": "not_found", "message": "Resource not found"}},
+            True,
+            id="generic",
+        ),
+        pytest.param(404, None, True, id="header-only"),
+        pytest.param(
+            404,
+            {
+                "error": {
+                    "code": "not_found",
+                    "message": (
+                        "Model cursor-grok-4.6-high was not found at the endpoint"
+                    ),
+                }
+            },
+            True,
+            id="wrong-endpoint",
+        ),
+        pytest.param(
+            404,
+            {
+                "error": {
+                    "code": "item_not_found",
+                    "message": "Item cursor-grok-4.6-high was not found",
+                }
+            },
+            True,
+            id="missing-item",
+        ),
+        pytest.param(
+            422,
+            {
+                "error": {
+                    "code": "invalid_request",
+                    "message": "Cursor Agent request body is malformed",
+                }
+            },
+            True,
+            id="malformed",
+        ),
+        pytest.param(
+            401,
+            {
+                "error": {
+                    "code": "unauthorized",
+                    "message": "Cursor Agent authentication failed",
+                }
+            },
+            True,
+            id="auth",
+        ),
+        pytest.param(
+            404,
+            {
+                "error": {
+                    "code": "model_not_found",
+                    "message": "Model cursor-grok-4.6-high was not found.",
+                }
+            },
+            False,
+            id="selected-model-unavailable",
+        ),
+    ],
+)
+async def test_candidate_loop_advances_only_for_matched_cursor_model_unavailable(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    detail: Any,
+    expected_terminal: bool,
+) -> None:
+    cursor_candidate = {
+        "provider": "cursor_agent",
+        "model": "cursor_agent/cursor-grok-4.6-high",
+        "route_family": "codex_cursor_agent_aiserver_adapter",
+    }
+    second_candidate = {
+        "provider": "xai",
+        "model": "xai/grok-4.6",
+        "route_family": "codex_responses",
+    }
+    selections = [
+        {
+            "candidate": cursor_candidate,
+            "lane_key": "cursor_agent_cli",
+            "cooldown_key": "cursor_agent:cursor-grok-4.6-high",
+            "selection_reason": "first_available",
+            "skipped": [],
+        },
+        {
+            "candidate": second_candidate,
+            "lane_key": "xai",
+            "cooldown_key": "xai:xai/grok-4.6",
+            "selection_reason": "next_available",
+            "skipped": [],
+        },
+    ]
+    source_exc = ProxyException(
+        message=(
+            str(detail.get("error", {}).get("message"))
+            if isinstance(detail, dict)
+            else "Cursor Agent provider returned an empty error response"
+        ),
+        type=(
+            "authentication_error"
+            if status_code in {401, 403}
+            else "upstream_error"
+        ),
+        param="model",
+        code=status_code,
+        headers={"x-cursor-provider-error": "true"},
+    )
+    source_exc.status_code = status_code
+    source_exc.detail = detail
+    source_exc.body = detail
+    source_exc.attempted_provider_call = True
+    source_exc._aawm_provider_returned = True
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    selection_calls: list[dict[str, Any]] = []
+    provider_calls: list[str] = []
+    evidence_calls: list[dict[str, Any]] = []
+    publication_plans: list[Any] = []
+    exclusion_calls: list[dict[str, Any]] = []
+    request_local_cooldown_calls: list[dict[str, Any]] = []
+    failure_records: list[dict[str, Any]] = []
+    terminal_events: list[dict[str, Any]] = []
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        selection_calls.append(kwargs)
+        if not selections:
+            raise AssertionError("candidate loop selected more than two candidates")
+        return selections.pop(0)
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> object:
+        provider_calls.append(candidate["provider"])
+        if candidate["provider"] == "cursor_agent":
+            raise source_exc
+        return {"candidate": candidate["model"], "body": candidate_body}
+
+    async def _no_active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _owner_guard(**_kwargs: Any) -> object:
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    async def _capture_publication(*, plan: Any, **_kwargs: Any) -> None:
+        publication_plans.append(plan)
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(self, _lease: object) -> None:
+            return None
+
+    session_affinity_seam = SimpleNamespace(
+        is_replay_safe_session_owner_redispatch_body=lambda _body: True,
+        resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
+        get_request_codex_auto_review_parent_session_identity=lambda _request: None,
+        build_session_owner_attributes=lambda **_kwargs: {},
+        ensure_session_owner_guard_for_request=_owner_guard,
+        get_request_session_owner_lease=lambda _request: None,
+        finalize_session_owner_lease_on_success=_noop_async,
+        finalize_session_owner_lease_on_failure=_noop_async,
+    )
+
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: session_affinity_seam,
+    )
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_started",
+        lambda **kwargs: kwargs["prepared_request_body"],
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_codex_failure_evidence",
+        lambda **kwargs: evidence_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_failure",
+        lambda **kwargs: failure_records.append(kwargs),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_no_candidate_event",
+        lambda **kwargs: terminal_events.append(kwargs),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_exclude_codex_auto_agent_request_local_candidate_without_cooldown",
+        lambda request, **kwargs: exclusion_calls.append(
+            {"request": request, **kwargs}
+        ),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_apply_request_local_cooldown_from_plan",
+        lambda request, **kwargs: request_local_cooldown_calls.append(
+            {"request": request, **kwargs}
+        ),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_plan_codex_oauth_account_failover",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "execute_cooldown_publication_transaction",
+        _capture_publication,
+    )
+    monkeypatch.setattr(
+        lpe._codex_failure_evidence_gate,
+        "current_decision",
+        lambda **_kwargs: SimpleNamespace(should_cool=True, duration_seconds=30.0),
+    )
+
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=lpe._resolve_auto_agent_cooldown_publication_plan,
+        publish_cooldown_memory_fn=lambda **_kwargs: None,
+        persist_cooldown_fn=_noop_async,
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=lambda body, **_kwargs: body,
+        raise_redispatch_fn=None,
+    )
+    route_kwargs = {
+        "services": services,
+        "alias_family": "codex_auto_agent",
+        "alias_model": "work",
+        "request": request,
+        "prepared_request_body": {"model": "work", "input": "dispatch basic"},
+        "max_candidate_attempts": 2,
+        "get_active_cooldown_state_fn": _no_active_cooldown,
+        "attempts_metadata_key": "codex_auto_agent_attempts",
+        "skipped_candidates_metadata_key": "codex_auto_agent_skipped_candidates",
+        "no_candidate_detail": "no candidates",
+        "log_label": "Codex",
+    }
+
+    if expected_terminal:
+        with pytest.raises(HTTPException) as caught:
+            await candidate_loop.handle_alias_route(**route_kwargs)
+
+        assert caught.value.status_code == status_code
+        assert caught.value.detail == detail
+        assert caught.value.body == source_exc.body
+        assert caught.value.code == source_exc.code
+        assert caught.value.headers == source_exc.headers
+        assert len(selection_calls) == 1
+        assert provider_calls == ["cursor_agent"]
+        assert evidence_calls == []
+        assert publication_plans == []
+        assert len(failure_records) == 1
+        terminal_attempt = failure_records[0]["attempt_record"]
+        assert terminal_attempt["status"] == "terminal_provider_error_no_cooldown"
+        assert terminal_attempt["error_class"] == "provider_terminal_error"
+        assert terminal_attempt["cooldown_scope"] == "none"
+        assert "cooldown_seconds" not in terminal_attempt
+        assert len(terminal_events) == 1
+        assert terminal_events[0]["exc"] is caught.value
+    else:
+        response = await candidate_loop.handle_alias_route(**route_kwargs)
+
+        assert response["candidate"] == second_candidate["model"]
+        assert len(selection_calls) == 2
+        assert provider_calls == ["cursor_agent", "xai"]
+        assert len(evidence_calls) == 1
+        assert len(publication_plans) == 1
+        assert publication_plans[0].applied_scope == "candidate"
+        assert failure_records[0]["attempt_record"]["error_class"] == (
+            "candidate_unavailable"
+        )
+
+    assert exclusion_calls == []
+    assert request_local_cooldown_calls == []
+    assert getattr(request.state, "aawm_alias_request_local_excluded_keys", None) is None
+    assert getattr(request.state, "aawm_alias_request_local_cooldown_until", None) is None
+
+
 def test_resolve_failure_plan_classifies_coding_plan_1113_as_terminal_routing() -> None:
     class _InsufficientBalance(Exception):
         def __init__(self) -> None:
