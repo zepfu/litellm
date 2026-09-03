@@ -64,6 +64,7 @@ from .policy import (
     CODEX_AUTO_AGENT_XAI_PROVIDER as _CODEX_AUTO_AGENT_XAI_PROVIDER,
     nvidia_completion_adapter_upstream_model as _nvidia_completion_adapter_upstream_model,
 )
+from .interfaces import ProviderAttributedModelUnavailableMatch
 from .types import Payload
 
 # ---------------------------------------------------------------------------
@@ -1754,6 +1755,67 @@ def _is_opencode_zen_unavailable_model_response(
     return False
 
 
+def _match_codex_auto_agent_provider_attributed_model_unavailable(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]] = None,
+    attempted_provider_call: bool = True,
+) -> Optional[ProviderAttributedModelUnavailableMatch]:
+    """Match the shared provider-attributed model-unavailable contract."""
+    if not isinstance(candidate, dict):
+        return None
+    provider = candidate.get("provider")
+    if (
+        not isinstance(provider, str)
+        or not provider.strip()
+        or not attempted_provider_call
+        or getattr(exc, "_aawm_provider_returned", False) is not True
+    ):
+        return None
+    status_code = _extract_adapter_exception_status_code(exc)
+    if status_code not in {400, 404}:
+        return None
+
+    if _is_alibaba_token_plan_unsupported_model_response(
+        exc,
+        candidate=candidate,
+        attempted_provider_call=attempted_provider_call,
+    ):
+        return ProviderAttributedModelUnavailableMatch(
+            provider=provider,
+            status_code=int(status_code),
+        )
+    if _is_codex_auto_agent_xai_model_unavailable_response(
+        exc,
+        candidate=candidate,
+        attempted_provider_call=attempted_provider_call,
+    ):
+        return ProviderAttributedModelUnavailableMatch(
+            provider=provider,
+            status_code=int(status_code),
+            error_class=_CODEX_AUTO_AGENT_XAI_MODEL_UNAVAILABLE_ERROR_CLASS,
+        )
+    if _is_nvidia_completion_adapter_model_unavailable_response(
+        exc,
+        candidate=candidate,
+        attempted_provider_call=attempted_provider_call,
+    ):
+        return ProviderAttributedModelUnavailableMatch(
+            provider=provider,
+            status_code=int(status_code),
+        )
+    if _is_opencode_zen_unavailable_model_response(
+        exc,
+        candidate=candidate,
+        attempted_provider_call=attempted_provider_call,
+    ):
+        return ProviderAttributedModelUnavailableMatch(
+            provider=provider,
+            status_code=int(status_code),
+        )
+    return None
+
+
 _ALIBABA_TOKEN_PLAN_FIVE_HOUR_EXHAUSTION_MESSAGE_MARKERS = (
     "token-plan 5-hour quota has been exhausted",
     "token-plan five-hour quota has been exhausted",
@@ -1966,30 +2028,15 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     )
     if alibaba_exhaustion_class is not None:
         return alibaba_exhaustion_class
-    if _is_alibaba_token_plan_unsupported_model_response(
-        exc,
-        candidate=candidate,
-        attempted_provider_call=attempted_provider_call,
-    ):
-        return "candidate_unavailable"
-    if _is_codex_auto_agent_xai_model_unavailable_response(
-        exc,
-        candidate=candidate,
-        attempted_provider_call=attempted_provider_call,
-    ):
-        return _CODEX_AUTO_AGENT_XAI_MODEL_UNAVAILABLE_ERROR_CLASS
-    if _is_nvidia_completion_adapter_model_unavailable_response(
-        exc,
-        candidate=candidate,
-        attempted_provider_call=attempted_provider_call,
-    ):
-        return "candidate_unavailable"
-    if _is_opencode_zen_unavailable_model_response(
-        exc,
-        candidate=candidate,
-        attempted_provider_call=attempted_provider_call,
-    ):
-        return "candidate_unavailable"
+    provider_attributed_model_unavailable = (
+        _match_codex_auto_agent_provider_attributed_model_unavailable(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=attempted_provider_call,
+        )
+    )
+    if provider_attributed_model_unavailable is not None:
+        return provider_attributed_model_unavailable.error_class
     if (
         isinstance(candidate, dict)
         and candidate.get("route_family") == "codex_responses"
