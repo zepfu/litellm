@@ -3563,8 +3563,8 @@ def test_cursor_transport_failure_maps_to_request_local_transient() -> None:
     )
 
 
-@pytest.mark.parametrize("status_code", [400, 401, 403, 429])
-def test_cursor_auth_and_non_transient_fail_closed_to_durable_unavailable(
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404])
+def test_cursor_local_4xx_is_terminal_without_candidate_unavailable(
     status_code: int,
 ) -> None:
     from litellm.proxy._types import ProxyException
@@ -3581,24 +3581,243 @@ def test_cursor_auth_and_non_transient_fail_closed_to_durable_unavailable(
 
     exc = exc_info.value
     assert exc.status_code == status_code
-    assert (
-        exc.detail["error"]["code"]
-        == "aawm_codex_auto_agent_candidate_unavailable"
-    )
+    assert exc.detail["error"]["code"] == "provider_terminal_error"
+    assert exc.attempted_provider_call is False
+    assert getattr(exc, "_aawm_provider_returned", False) is False
     classified = (
         llm_passthrough_endpoints._classify_codex_auto_agent_retryable_exhaustion(
             exc,
             candidate=candidate,
+            attempted_provider_call=exc.attempted_provider_call,
         )
     )
-    assert classified == "candidate_unavailable"
-    assert (
-        llm_passthrough_endpoints._get_codex_auto_agent_candidate_cooldown_scope(
-            classified,
+    assert classified is None
+
+
+def test_cursor_local_4xx_preserves_sanitized_error_without_attribution() -> None:
+    from litellm.proxy._types import ProxyException
+
+    local_body = {
+        "error": {
+            "code": "local_proxy_route_not_found",
+            "message": "Local proxy route was not found.",
+            "type": "invalid_request_error",
+            "status": 404,
+            "secret": "do-not-leak",
+        },
+        "request_id": "local-request-secret",
+    }
+    candidate = _candidate(provider="cursor_agent")
+    with pytest.raises(ProxyException) as exc_info:
+        codex_candidate_calls._raise_cursor_agent_alias_error(
+            exc=CursorConnectError(
+                "Local Cursor proxy returned HTTP 404.",
+                status_code=404,
+                body=json.dumps(local_body).encode("utf-8"),
+            ),
             candidate=candidate,
         )
-        == "candidate"
+
+    exc = exc_info.value
+    sanitized_body = {
+        "error": {
+            "code": "local_proxy_route_not_found",
+            "message": "Local proxy route was not found.",
+            "status": 404,
+            "type": "invalid_request_error",
+        }
+    }
+    assert exc.status_code == 404
+    assert exc.attempted_provider_call is False
+    assert getattr(exc, "_aawm_provider_returned", False) is False
+    assert exc.body == sanitized_body
+    assert exc.detail["error"] == sanitized_body["error"]
+    assert exc.detail["cursor_sanitized_provider_error"] == sanitized_body
+    assert (
+        llm_passthrough_endpoints._classify_codex_auto_agent_retryable_exhaustion(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=exc.attempted_provider_call,
+        )
+        is None
     )
+    serialized = json.dumps(exc.detail)
+    assert "do-not-leak" not in serialized
+    assert "local-request-secret" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_cursor_local_4xx_stops_alias_without_cooldown_or_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from litellm.proxy._types import ProxyException
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        candidate_loop,
+    )
+
+    cursor_candidate = _candidate(provider="cursor_agent")
+    fallback_candidate = {
+        "provider": "openai",
+        "model": "gpt-5.3-codex",
+        "route_family": "codex_responses",
+    }
+    selections = [
+        {
+            "candidate": cursor_candidate,
+            "alias_model": "work",
+            "lane_key": "cursor-agent",
+            "cooldown_key": "cursor-agent:cursor-grok-4.6-high",
+            "selection_reason": "first_choice",
+            "skipped": [],
+        },
+        {
+            "candidate": fallback_candidate,
+            "alias_model": "work",
+            "lane_key": "openai",
+            "cooldown_key": "openai:gpt-5.3-codex",
+            "selection_reason": "fallback",
+            "skipped": [],
+        },
+    ]
+    selection_calls: list[str] = []
+    provider_calls: list[str] = []
+    memory_publications: list[tuple[str, ...]] = []
+    durable_publications: list[tuple[str, ...]] = []
+    request_local_cooldowns: list[str] = []
+
+    async def _select(**_kwargs: Any) -> dict[str, Any]:
+        selection = selections[len(selection_calls)]
+        selection_calls.append(selection["candidate"]["provider"])
+        return selection
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> Response:
+        del candidate_body
+        provider_calls.append(candidate["provider"])
+        if candidate["provider"] == "cursor_agent":
+            codex_candidate_calls._raise_cursor_agent_alias_error(
+                exc=CursorConnectError(
+                    "Local Cursor proxy returned HTTP 404.",
+                    status_code=404,
+                    body={
+                        "error": {
+                            "code": "local_proxy_route_not_found",
+                            "message": "Local proxy route was not found.",
+                        }
+                    },
+                ),
+                candidate=candidate,
+            )
+        return Response(content="fallback", status_code=200)
+
+    async def _no_active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> Any:
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(self, _lease: Any) -> None:
+            return None
+
+    async def _ensure_session_owner_guard(**_kwargs: Any) -> Any:
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    session_affinity = SimpleNamespace(
+        is_replay_safe_session_owner_redispatch_body=lambda _body: False,
+        resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
+        get_request_codex_auto_review_parent_session_identity=lambda _request: None,
+        build_session_owner_attributes=lambda **_kwargs: {},
+        ensure_session_owner_guard_for_request=_ensure_session_owner_guard,
+        get_request_session_owner_lease=lambda _request: None,
+        finalize_session_owner_lease_on_success=_noop_async,
+        finalize_session_owner_lease_on_failure=_noop_async,
+        reset_released_request_session_owner_guard=lambda _request: False,
+        SessionOwnerMutationOutcome=SimpleNamespace(
+            CONFLICT="conflict",
+            ERROR="error",
+            NOT_HELD="not_held",
+        ),
+    )
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=(
+            llm_passthrough_endpoints._resolve_auto_agent_cooldown_publication_plan
+        ),
+        publish_cooldown_memory_fn=lambda *, keys, **_kwargs: (
+            memory_publications.append(tuple(keys))
+        ),
+        persist_cooldown_fn=lambda *, keys, **_kwargs: (
+            durable_publications.append(tuple(keys))
+        ),
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=(
+            llm_passthrough_endpoints._add_codex_auto_agent_alias_metadata
+        ),
+        raise_redispatch_fn=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("local Cursor 4xx must not redispatch")
+        ),
+    )
+
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: session_affinity,
+    )
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        llm_passthrough_endpoints,
+        "_record_codex_failure_evidence",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        llm_passthrough_endpoints,
+        "_apply_request_local_cooldown_from_plan",
+        lambda _request, *, candidate, **_kwargs: (
+            request_local_cooldowns.append(candidate["provider"])
+        ),
+    )
+
+    with pytest.raises(ProxyException) as exc_info:
+        await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="work",
+            request=_request(),
+            prepared_request_body={
+                "model": "work",
+                "input": "hello",
+                "stream": False,
+            },
+            max_candidate_attempts=2,
+            get_active_cooldown_state_fn=_no_active_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail["error"]["code"] == "local_proxy_route_not_found"
+    assert selection_calls == ["cursor_agent"]
+    assert provider_calls == ["cursor_agent"]
+    assert memory_publications == []
+    assert durable_publications == []
+    assert request_local_cooldowns == []
 
 
 def test_cursor_provider_http_error_preserves_sanitized_attribution() -> None:
@@ -3643,6 +3862,14 @@ def test_cursor_provider_http_error_preserves_sanitized_attribution() -> None:
         "Unknown model: cursor-grok-4.6-high"
     )
     assert exc.detail["cursor_sanitized_provider_error"] == sanitized_body
+    assert (
+        llm_passthrough_endpoints._classify_codex_auto_agent_retryable_exhaustion(
+            exc,
+            candidate=_candidate(provider="cursor_agent"),
+            attempted_provider_call=exc.attempted_provider_call,
+        )
+        == "candidate_unavailable"
+    )
     serialized = json.dumps(exc.detail)
     assert "do-not-leak" not in serialized
     assert "provider-request-secret" not in serialized
