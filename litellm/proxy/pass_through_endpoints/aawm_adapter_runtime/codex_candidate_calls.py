@@ -3176,6 +3176,99 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
     )
 
 
+_CURSOR_PROVIDER_ERROR_FIELDS = frozenset(
+    {
+        "code",
+        "message",
+        "model",
+        "model_id",
+        "model_name",
+        "requested_model",
+        "status",
+        "type",
+        "upstream_model",
+    }
+)
+_CURSOR_PROVIDER_ERROR_NESTED_FIELDS = frozenset(
+    {"context", "data", "details", "metadata"}
+)
+
+
+def _sanitize_cursor_provider_error_body(body: Any) -> Optional[dict[str, Any]]:
+    """Keep only bounded structured fields from a real Cursor error body."""
+    parsed_body: Any = body
+    if isinstance(body, (bytes, bytearray)):
+        try:
+            parsed_body = json.loads(bytes(body).decode("utf-8", errors="ignore"))
+        except (TypeError, ValueError):
+            return None
+    elif isinstance(body, str):
+        try:
+            parsed_body = json.loads(body)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(parsed_body, Mapping):
+        return None
+
+    provider_error = parsed_body.get("error")
+    if not isinstance(provider_error, Mapping):
+        provider_error = parsed_body
+    if not any(field in provider_error for field in _CURSOR_PROVIDER_ERROR_FIELDS):
+        return None
+
+    def _sanitize_value(value: Any, *, limit: int) -> Any:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return None
+            return sanitize_credential_error_message(value, limit=limit)
+        return None
+
+    sanitized_error: dict[str, Any] = {}
+    for field in _CURSOR_PROVIDER_ERROR_FIELDS:
+        value = provider_error.get(field)
+        if field == "message":
+            sanitized = _sanitize_value(value, limit=512)
+        elif field == "code":
+            sanitized = _sanitize_value(value, limit=128)
+        elif field in {
+            "model",
+            "model_id",
+            "model_name",
+            "requested_model",
+            "upstream_model",
+        }:
+            sanitized = _sanitize_value(value, limit=256)
+        else:
+            sanitized = _sanitize_value(value, limit=128)
+        if sanitized is not None:
+            sanitized_error[field] = sanitized
+
+    for field in _CURSOR_PROVIDER_ERROR_NESTED_FIELDS:
+        nested = provider_error.get(field)
+        if not isinstance(nested, Mapping):
+            continue
+        sanitized_nested: dict[str, Any] = {}
+        for nested_field in _CURSOR_PROVIDER_ERROR_FIELDS:
+            value = nested.get(nested_field)
+            sanitized = _sanitize_value(
+                value,
+                limit=512 if nested_field == "message" else 256,
+            )
+            if sanitized is not None:
+                sanitized_nested[nested_field] = sanitized
+        if sanitized_nested:
+            sanitized_error[field] = sanitized_nested
+
+    if not sanitized_error:
+        return None
+    return {"error": sanitized_error}
+
+
 def _raise_cursor_agent_alias_error(  # noqa: PLR0915
     *,
     exc: Exception,
@@ -3203,6 +3296,28 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
     message = str(getattr(exc, "message", None) or exc)
     model = str(candidate.get("model") or "")
     route_family = str(candidate.get("route_family") or "")
+    provider_returned = (
+        getattr(exc, "_aawm_provider_returned", False) is True
+        and not isinstance(exc, CursorConnectProtocolError)
+        and not isinstance(exc, _CursorPostEgressOutputError)
+        and not getattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, False)
+    )
+    cursor_sanitized_provider_error = (
+        _sanitize_cursor_provider_error_body(getattr(exc, "body", None))
+        if provider_returned
+        else None
+    )
+    provider_error_fields = (
+        cursor_sanitized_provider_error.get("error", {})
+        if isinstance(cursor_sanitized_provider_error, dict)
+        else {}
+    )
+    provider_message = provider_error_fields.get("message")
+    mapped_provider_message = (
+        provider_message
+        if isinstance(provider_message, str) and provider_message
+        else None
+    )
     cursor_sanitized_proto_structure = (
         _sanitize_cursor_proto_structure_for_telemetry(getattr(exc, "body", None))
         if isinstance(exc, CursorConnectProtocolError)
@@ -3213,7 +3328,14 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
         proxy_exc: ProxyException,
         error: dict[str, Any],
     ) -> None:
-        mapped_detail: dict[str, Any] = {"error": error}
+        mapped_error = dict(error)
+        if provider_error_fields:
+            mapped_error.update(copy.deepcopy(provider_error_fields))
+        mapped_detail: dict[str, Any] = {"error": mapped_error}
+        if cursor_sanitized_provider_error is not None:
+            provider_body = copy.deepcopy(cursor_sanitized_provider_error)
+            mapped_detail["cursor_sanitized_provider_error"] = provider_body
+            setattr(proxy_exc, "body", copy.deepcopy(provider_body))
         if cursor_sanitized_proto_structure is not None:
             structure = copy.deepcopy(cursor_sanitized_proto_structure)
             mapped_detail[_CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD] = structure
@@ -3335,17 +3457,21 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
         f"cursor_agent request failed; model={model} "
         f"route_family={route_family}; status={status_code}; {message}"
     )
+    mapped_message = mapped_provider_message or detail
     proxy_exc = ProxyException(
-        message=detail,
+        message=mapped_message,
         type=error_type,
         param="model",
         code=status_code,
     )
     setattr(proxy_exc, "status_code", status_code)
+    if provider_returned:
+        setattr(proxy_exc, "attempted_provider_call", True)
+        setattr(proxy_exc, "_aawm_provider_returned", True)
     _set_mapped_detail(
         proxy_exc,
         {
-            "message": detail,
+            "message": mapped_message,
             "type": error_type,
             "code": error_code,
         },

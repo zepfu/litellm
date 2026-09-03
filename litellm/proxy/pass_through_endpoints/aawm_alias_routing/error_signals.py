@@ -841,6 +841,265 @@ def _is_codex_auto_agent_cursor_agent_candidate(
     return isinstance(candidate, dict) and candidate.get("provider") == "cursor_agent"
 
 
+_CURSOR_AGENT_CODEX_ROUTE_FAMILY = "codex_cursor_agent_aiserver_adapter"
+_CURSOR_AGENT_MODEL_UNAVAILABLE_CODES = frozenset(
+    {
+        "model_disabled",
+        "model_disabled_error",
+        "modeldisabled",
+        "modeldisablederror",
+        "model_not_available",
+        "model_not_found",
+        "model_not_found_error",
+        "model_not_published",
+        "model_not_supported",
+        "model_unavailable",
+        "model_unavailable_error",
+        "model_unknown",
+        "model_unpublished",
+        "model_unpublished_error",
+        "model_unsupported",
+        "modelnotavailable",
+        "modelnotfound",
+        "modelnotfounderror",
+        "modelnotsupported",
+        "modelunavailable",
+        "modelunavailableerror",
+        "modelunknown",
+        "modelunpublished",
+        "modelunpublishederror",
+        "modelunsupported",
+        "unknown_model",
+        "unknown_model_error",
+        "unknownmodel",
+        "unknownmodelerror",
+        "unsupported_model",
+        "unsupportedmodel",
+    }
+)
+_CURSOR_AGENT_MODEL_UNAVAILABLE_MESSAGE_PATTERNS = (
+    re.compile(
+        r"\b(?:unknown|unsupported|unpublished|disabled|unavailable)"
+        r"\s+(?:upstream\s+)?model\b"
+    ),
+    re.compile(
+        r"\b(?:upstream\s+)?model\b.{0,96}\b"
+        r"(?:unknown|not\s+found|unpublished|disabled|unsupported|"
+        r"unavailable|not\s+published|not\s+supported|not\s+available)\b"
+    ),
+)
+_CURSOR_AGENT_MODEL_UNAVAILABLE_EXCLUDED_MARKERS = (
+    "auth",
+    "authentication",
+    "authorization",
+    "credential",
+    "credentials",
+    "continuation",
+    "endpoint",
+    "forbidden",
+    "invalid parameter",
+    "invalid request",
+    "item",
+    "malformed",
+    "operation",
+    "parameter",
+    "path",
+    "previous_response_id",
+    "request",
+    "resource",
+    "route",
+    "session",
+    "token",
+    "tool",
+    "unauthorized",
+    "url",
+    "wrong endpoint",
+)
+_CURSOR_AGENT_MODEL_UNAVAILABLE_REJECTED_LABELS = frozenset(
+    {
+        "api_key_invalid",
+        "auth_error",
+        "authentication",
+        "authentication_error",
+        "authorization",
+        "authorization_error",
+        "continuation",
+        "continuation_error",
+        "credential_error",
+        "endpoint_not_found",
+        "forbidden",
+        "forbidden_error",
+        "invalid_api_key",
+        "invalid_credentials",
+        "invalid_token",
+        "item_not_found",
+        "item_not_found_error",
+        "malformed_protocol",
+        "malformed_route",
+        "malformed_response",
+        "protocol_error",
+        "session_not_found",
+        "session_unavailable",
+        "unsupported_operation",
+        "unsupported_operation_error",
+        "unsupported_parameter",
+        "unsupported_parameter_error",
+        "unauthorized_error",
+        "wrong_endpoint",
+    }
+)
+_CURSOR_AGENT_MODEL_ID_FIELDS = frozenset(
+    {
+        "model",
+        "model_id",
+        "model_name",
+        "requested_model",
+        "upstream_model",
+    }
+)
+
+
+def _normalize_cursor_agent_error_label(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").casefold()).strip("_")
+
+
+def _cursor_agent_model_identity_variants(
+    candidate: Optional[dict[str, Any]],
+) -> frozenset[str]:
+    if not isinstance(candidate, dict):
+        return frozenset()
+    selected_model = candidate.get("model")
+    if not isinstance(selected_model, str):
+        return frozenset()
+    selected_model = selected_model.strip()
+    provider_prefix = "cursor_agent/"
+    if not selected_model.casefold().startswith(provider_prefix):
+        return frozenset()
+    model_id = selected_model[len(provider_prefix) :].strip()
+    if not model_id:
+        return frozenset()
+    return frozenset({model_id.casefold(), selected_model.casefold()})
+
+
+def _cursor_agent_text_mentions_model(
+    value: Any,
+    *,
+    model_variants: frozenset[str],
+) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized_value = " ".join(value.split()).casefold()
+    for model_variant in model_variants:
+        boundary_chars = (
+            r"A-Za-z0-9_.:/-" if "/" in model_variant else r"A-Za-z0-9_.:-"
+        )
+        if re.search(
+            rf"(?<![{boundary_chars}]){re.escape(model_variant)}"
+            rf"(?![{boundary_chars}])",
+            normalized_value,
+        ):
+            return True
+    return False
+
+
+def _cursor_agent_error_blocks(error: dict[str, Any]) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    pending: list[Any] = [error]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            blocks.append(value)
+            for key in ("context", "data", "details", "metadata"):
+                nested = value.get(key)
+                if isinstance(nested, (dict, list)):
+                    pending.append(nested)
+        elif isinstance(value, list):
+            pending.extend(value)
+    return blocks
+
+
+def _is_cursor_agent_model_unavailable_error_block(
+    error: dict[str, Any],
+    *,
+    model_variants: frozenset[str],
+) -> bool:
+    blocks = _cursor_agent_error_blocks(error)
+    if not blocks or not model_variants:
+        return False
+
+    model_bound = False
+    recognized_unavailable_label = False
+    message_values: list[str] = []
+    for block in blocks:
+        for key, value in block.items():
+            if key in _CURSOR_AGENT_MODEL_ID_FIELDS and isinstance(value, str):
+                if value.strip().casefold() in model_variants:
+                    model_bound = True
+            if key in {"detail", "message", "reason"} and isinstance(value, str):
+                message_values.append(value)
+        for key in ("code", "reason", "status", "type"):
+            label = _normalize_cursor_agent_error_label(block.get(key))
+            if label in _CURSOR_AGENT_MODEL_UNAVAILABLE_CODES:
+                recognized_unavailable_label = True
+            elif label in _CURSOR_AGENT_MODEL_UNAVAILABLE_REJECTED_LABELS:
+                return False
+
+    if not message_values:
+        return model_bound and recognized_unavailable_label
+    normalized_messages = " ".join(
+        " ".join(value.split()).casefold() for value in message_values
+    )
+    if any(
+        re.search(
+            rf"(?<![a-z0-9_]){re.escape(marker)}(?![a-z0-9_])",
+            normalized_messages,
+        )
+        for marker in _CURSOR_AGENT_MODEL_UNAVAILABLE_EXCLUDED_MARKERS
+    ):
+        return False
+    for message in message_values:
+        if not _cursor_agent_text_mentions_model(
+            message,
+            model_variants=model_variants,
+        ):
+            continue
+        normalized_message = " ".join(message.split()).casefold()
+        if any(
+            pattern.search(normalized_message)
+            for pattern in _CURSOR_AGENT_MODEL_UNAVAILABLE_MESSAGE_PATTERNS
+        ):
+            return True
+    return model_bound and recognized_unavailable_label
+
+
+def _is_codex_auto_agent_cursor_agent_model_unavailable_response(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]],
+    attempted_provider_call: bool,
+) -> bool:
+    """Match only a provider-returned, exact-model Cursor admission failure."""
+    if (
+        not attempted_provider_call
+        or getattr(exc, "_aawm_provider_returned", False) is not True
+        or not isinstance(candidate, dict)
+        or candidate.get("provider") != "cursor_agent"
+        or candidate.get("route_family") != _CURSOR_AGENT_CODEX_ROUTE_FAMILY
+        or _extract_adapter_exception_status_code(exc) not in {400, 404}
+    ):
+        return False
+    model_variants = _cursor_agent_model_identity_variants(candidate)
+    if not model_variants:
+        return False
+    return any(
+        _is_cursor_agent_model_unavailable_error_block(
+            error,
+            model_variants=model_variants,
+        )
+        for error in _iter_codex_auto_agent_error_blocks(exc)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Kimi code helpers
 # ---------------------------------------------------------------------------
@@ -1776,6 +2035,15 @@ def _match_codex_auto_agent_provider_attributed_model_unavailable(
     if status_code not in {400, 404}:
         return None
 
+    if _is_codex_auto_agent_cursor_agent_model_unavailable_response(
+        exc,
+        candidate=candidate,
+        attempted_provider_call=attempted_provider_call,
+    ):
+        return ProviderAttributedModelUnavailableMatch(
+            provider=provider,
+            status_code=int(status_code),
+        )
     if _is_alibaba_token_plan_unsupported_model_response(
         exc,
         candidate=candidate,
