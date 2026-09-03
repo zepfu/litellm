@@ -50,6 +50,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     config_compiler as compiler,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    classification,
     cooldown_apply,
     cooldown_state,
     error_signals,
@@ -693,6 +694,7 @@ aliases:
     )
 
     leaders: list[str] = []
+    provider_attempts: dict[str, int] = {}
     attempt_keys_by_candidate: dict[tuple[str, str], str] = {}
     attempt_records: list[dict[str, Any]] = []
 
@@ -720,6 +722,7 @@ aliases:
         model = str(candidate["model"])
         provider = str(candidate["provider"])
         leaders.append(model)
+        provider_attempts[model] = provider_attempts.get(model, 0) + 1
         lane_key = (
             policy.CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
             if provider == "openrouter"
@@ -743,9 +746,27 @@ aliases:
 
     restore = _install_candidate_request_performer(_performer)
     try:
+        unrelated_alias = "or016-unrelated"
+        unrelated_key = "codex:or016-unrelated"
+        alias_state.alias_routing_state.codex_failure_evidence_gate.record(
+            canonical_alias=unrelated_alias,
+            cooldown_key=unrelated_key,
+            event=classification.classify_failure(
+                status_code=404,
+                provider="openrouter",
+                message="unrelated model unavailable",
+            ),
+        )
+        assert alias_state.alias_routing_state.codex_failure_evidence_gate.contains(
+            canonical_alias=unrelated_alias,
+            cooldown_key=unrelated_key,
+        )
+
         result = await _drive_wrapper(session_id="or016-failover")
         assert isinstance(result, Response)
         assert leaders == [unavailable_model, native_similar_model]
+        assert provider_attempts[unavailable_model] == 1
+        assert provider_attempts[native_similar_model] == 1
 
         unavailable_key = attempt_keys_by_candidate[("openrouter", unavailable_model)]
         native_key = attempt_keys_by_candidate[("openai", native_similar_model)]
@@ -769,6 +790,20 @@ aliases:
             )
             == 0.0
         )
+        assert alias_state.alias_routing_state.codex_failure_evidence_gate.contains(
+            canonical_alias="basic",
+            cooldown_key=unavailable_key,
+        )
+
+        active_result = await _drive_wrapper(session_id="or016-active")
+        assert isinstance(active_result, Response)
+        assert leaders == [
+            unavailable_model,
+            native_similar_model,
+            native_similar_model,
+        ]
+        assert provider_attempts[unavailable_model] == 1
+        assert provider_attempts[native_similar_model] == 2
 
         alias_state.alias_routing_state.codex.cooldown_until_monotonic_by_key[
             unavailable_key
@@ -781,6 +816,15 @@ aliases:
                 unavailable_key
             )
             == 0.0
+        )
+        assert provider_attempts[unavailable_model] == 2
+        assert not alias_state.alias_routing_state.codex_failure_evidence_gate.contains(
+            canonical_alias="basic",
+            cooldown_key=unavailable_key,
+        )
+        assert alias_state.alias_routing_state.codex_failure_evidence_gate.contains(
+            canonical_alias=unrelated_alias,
+            cooldown_key=unrelated_key,
         )
     finally:
         restore()

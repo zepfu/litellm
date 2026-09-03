@@ -1751,6 +1751,17 @@ async def handle_alias_route(  # noqa: PLR0915
                     if probe_failure_exc is None:
                         intent.complete()
                         alias_routing_state.publication_intents.remove(intent)
+                        if (
+                            codex_failure_evidence_alias is not None
+                            and alias_routing_state.codex_failure_evidence_gate.contains(
+                                canonical_alias=codex_failure_evidence_alias,
+                                cooldown_key=selection["cooldown_key"],
+                            )
+                        ):
+                            alias_routing_state.codex_failure_evidence_gate.clear_entries(
+                                canonical_aliases=(codex_failure_evidence_alias,),
+                                cooldown_keys=(selection["cooldown_key"],),
+                            )
                         await set_session_affinity_fn(
                             selection.get("session_key"),
                             candidate,
