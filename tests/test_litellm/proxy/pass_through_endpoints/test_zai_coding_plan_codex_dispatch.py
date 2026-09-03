@@ -443,7 +443,7 @@ async def test_alias_candidate_provider_handler_dispatches_coding_plan() -> None
 
 
 class _StructuredCodingPlanError(Exception):
-    def __init__(self, *, code: int, message: str, status_code: int = 429) -> None:
+    def __init__(self, *, code: int, message: str, status_code: int = 400) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.detail = {
@@ -801,8 +801,39 @@ async def test_should_fail_over_in_order_after_zai_model_admission_failure(  # n
     assert failure_attempts[0]["error_class"] == "candidate_unavailable"
     assert failure_attempts[0]["error_code"] == str(error_code)
     assert failure_attempts[0]["error_type"] == "invalid_request_error"
-    assert failure_attempts[0]["error_status_code"] == 429
+    assert failure_attempts[0]["error_status_code"] == 400
     assert failure_attempts[0]["cooldown_scope"] == "candidate"
+
+
+@pytest.mark.parametrize("error_code", (1211, 1311))
+@pytest.mark.parametrize("status_code", (429, 500))
+def test_should_keep_zai_model_codes_terminal_for_non_admission_statuses(
+    error_code: int,
+    status_code: int,
+) -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        candidate_loop,
+    )
+
+    exc = _StructuredCodingPlanError(
+        code=error_code,
+        message=f"provider model admission rejected: {error_code}",
+        status_code=status_code,
+    )
+    setattr(exc, "_aawm_provider_returned", True)
+
+    assert (
+        candidate_loop._classify_codex_zai_coding_plan_candidate_failure(
+            exc,
+            candidate={
+                "provider": "zai_coding_plan",
+                "model": _ADAPTER_MODEL,
+                "route_family": _CODEX_ZAI_ROUTE_FAMILY,
+            },
+            attempted_provider_call=True,
+        )
+        == "provider_terminal_error"
+    )
 
 
 def test_should_keep_half_open_zai_cooldown_recovery() -> None:

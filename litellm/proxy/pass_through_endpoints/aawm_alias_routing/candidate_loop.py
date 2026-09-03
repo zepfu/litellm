@@ -559,8 +559,9 @@ def _classify_codex_zai_coding_plan_candidate_failure(
 
     1113 on the coding base is a wrong-base / wrong-key routing defect, not
     ordinary-balance recharge. Model-unavailable business codes require both
-    an attempted call and explicit provider-return attribution. Unknown codes
-    return ``None`` so generic classifiers can still inspect HTTP status.
+    an attempted call, explicit provider-return attribution, and an HTTP 400
+    or 404 response. Unknown codes return ``None`` so generic classifiers can
+    still inspect HTTP status.
     """
 
     if (
@@ -583,6 +584,7 @@ def _classify_codex_zai_coding_plan_candidate_failure(
     if failure.kind == ZAICodingPlanFailureKind.MODEL_UNAVAILABLE and (
         not attempted_provider_call
         or getattr(exc, "_aawm_provider_returned", False) is not True
+        or failure.status_code not in {400, 404}
     ):
         return "provider_terminal_error"
     if failure.kind != ZAICodingPlanFailureKind.UNKNOWN:
