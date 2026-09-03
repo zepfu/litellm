@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 import httpx
@@ -15,6 +16,9 @@ from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.common im
 
 _OPENAI_MODEL_NOT_FOUND_ERROR_CODE = "model_not_found"
 _OPENAI_MODEL_NOT_FOUND_ERROR_TYPE = "invalid_request_error"
+_OPENAI_MODEL_NOT_FOUND_MESSAGE_RE = re.compile(
+    r"^The requested model '([^']+)' does not exist\.$"
+)
 
 
 def _is_openai_passthrough_target(
@@ -45,12 +49,30 @@ def _get_openai_model_not_found_error_summary(exc: Exception) -> Optional[str]:
     return message[:512]
 
 
+def _get_openai_model_not_found_model(exc: Exception) -> Optional[str]:
+    detail = _extract_passthrough_exception_detail(exc)
+    payload = _coerce_upstream_error_payload(detail)
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+    if str(error.get("code") or "").strip() != _OPENAI_MODEL_NOT_FOUND_ERROR_CODE:
+        return None
+    if str(error.get("type") or "").strip() != _OPENAI_MODEL_NOT_FOUND_ERROR_TYPE:
+        return None
+    message = " ".join(str(error.get("message") or "").split())
+    match = _OPENAI_MODEL_NOT_FOUND_MESSAGE_RE.fullmatch(message)
+    return match.group(1).strip() if match is not None else None
+
+
 def _is_known_openai_model_not_found_response(
     *,
     url: Optional[httpx.URL],
     custom_llm_provider: Optional[str],
     status_code: Optional[int],
     exc: Exception,
+    expected_model: Optional[str] = None,
 ) -> bool:
     if status_code not in {
         status.HTTP_400_BAD_REQUEST,
@@ -62,7 +84,10 @@ def _is_known_openai_model_not_found_response(
         custom_llm_provider=custom_llm_provider,
     ):
         return False
-    return _get_openai_model_not_found_error_summary(exc) is not None
+    normalized_expected_model = str(expected_model or "").strip()
+    if not normalized_expected_model:
+        return False
+    return _get_openai_model_not_found_model(exc) == normalized_expected_model
 
 
 def _get_openai_model_not_found_failure_kind() -> str:

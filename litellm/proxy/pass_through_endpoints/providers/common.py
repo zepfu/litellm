@@ -205,6 +205,7 @@ def _codex_native_openai_candidate_unavailable_detail(
     target_url: Any = None,
     custom_llm_provider: Optional[str] = None,
     provider_returned: bool = False,
+    expected_model: Optional[str] = None,
 ) -> Optional[str]:
     status_code = runtime.extract_status_code(exc)
     detail = runtime.extract_detail(exc)
@@ -234,6 +235,7 @@ def _codex_native_openai_candidate_unavailable_detail(
                 custom_llm_provider=custom_llm_provider,
                 status_code=status_code,
                 exc=exc,
+                expected_model=expected_model,
             )
         ):
             return detail_text
@@ -261,6 +263,7 @@ def _raise_codex_native_openai_auto_agent_candidate_unavailable(
     target_url: Any = None,
     custom_llm_provider: Optional[str] = None,
     provider_returned: bool = False,
+    expected_model: Optional[str] = None,
 ) -> Never:
     detail = (
         _codex_native_openai_candidate_unavailable_detail(
@@ -269,6 +272,7 @@ def _raise_codex_native_openai_auto_agent_candidate_unavailable(
             target_url=target_url,
             custom_llm_provider=custom_llm_provider,
             provider_returned=provider_returned,
+            expected_model=expected_model,
         )
         or str(exc)
     )

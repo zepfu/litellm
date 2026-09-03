@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from litellm.proxy._types import ProxyException
@@ -18,6 +19,9 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.classification import (
     CooldownEvidenceGate,
     classify_failure,
+)
+from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.openai import (
+    _is_known_openai_model_not_found_response,
 )
 from litellm.proxy.pass_through_endpoints.providers.common import (
     Runtime,
@@ -36,9 +40,10 @@ def _runtime() -> Runtime:
 def _openai_model_not_found(
     *,
     status_code: int = 400,
+    model: str = "gpt-5.6-future",
     payload: Any = None,
 ) -> ProxyException:
-    message = "The requested model 'gpt-5.6-future' does not exist."
+    message = f"The requested model '{model}' does not exist."
     exc = ProxyException(
         message=message,
         type="invalid_request_error",
@@ -67,6 +72,7 @@ def _candidate_unavailable() -> ProxyException:
             target_url="https://api.openai.com/v1/responses",
             custom_llm_provider="openai",
             provider_returned=True,
+            expected_model="gpt-5.6-future",
         )
     return caught.value
 
@@ -83,11 +89,35 @@ def test_openai_model_not_found_accepts_existing_responses_shapes(
         target_url="https://api.openai.com/v1/responses",
         custom_llm_provider="openai",
         provider_returned=True,
+        expected_model="gpt-5.6-future",
     )
 
     assert detail is not None
     assert "model_not_found" in detail
     assert "gpt-5.6-future" in detail
+
+
+def test_openai_model_not_found_requires_exact_expected_model_at_classifier_and_wrapper() -> None:
+    exc = _openai_model_not_found(model="different-model")
+
+    assert _is_known_openai_model_not_found_response(
+        url=httpx.URL("https://api.openai.com/v1/responses"),
+        custom_llm_provider="openai",
+        status_code=400,
+        exc=exc,
+        expected_model="gpt-5.6-future",
+    ) is False
+    assert (
+        _codex_native_openai_candidate_unavailable_detail(
+            exc,
+            runtime=_runtime(),
+            target_url="https://api.openai.com/v1/responses",
+            custom_llm_provider="openai",
+            provider_returned=True,
+            expected_model="gpt-5.6-future",
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -242,6 +272,27 @@ async def test_native_openai_maps_attributed_model_not_found_but_preserves_local
                 custom_headers={},
             )
     assert caught.value is local_exc
+
+    mismatched_exc = _openai_model_not_found(model="different-model")
+    mismatched_exc._aawm_provider_returned = True  # type: ignore[attr-defined]
+
+    async def _raise_mismatched(**_kwargs: Any) -> Any:
+        raise mismatched_exc
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(lpe, "pass_through_request", _raise_mismatched)
+        with pytest.raises(ProxyException) as caught:
+            await lpe._perform_codex_auto_agent_native_openai_request(
+                request=MagicMock(),
+                fastapi_response=MagicMock(),
+                user_api_key_dict=MagicMock(),
+                target_url="https://api.openai.com/v1/responses",
+                api_key=None,
+                forward_headers=True,
+                request_body={"model": "gpt-5.6-future", "input": "hello"},
+                custom_headers={},
+            )
+    assert caught.value is mismatched_exc
 
 
 @pytest.mark.asyncio
