@@ -927,6 +927,58 @@ def test_resolve_failure_plan_passes_provider_attempt_evidence_to_classifier() -
     assert plan.applied_scope == "candidate"
 
 
+@pytest.mark.parametrize("attempted_provider_call", [True, False])
+def test_resolve_failure_plan_dispatcher_short_circuits_generic_classifier(
+    attempted_provider_call: bool,
+) -> None:
+    matcher_calls: list[bool] = []
+    generic_calls: list[bool] = []
+    captured: dict[str, Any] = {}
+    candidate = {"provider": "test-provider", "model": "future-model"}
+
+    def _match(
+        exc: Exception,
+        *,
+        candidate: Optional[dict[str, Any]] = None,
+        attempted_provider_call: bool = True,
+    ) -> SimpleNamespace:
+        del exc
+        assert candidate == {"provider": "test-provider", "model": "future-model"}
+        matcher_calls.append(attempted_provider_call)
+        return SimpleNamespace(error_class="candidate_unavailable")
+
+    def _generic_classifier(*args: Any, **kwargs: Any) -> Optional[str]:
+        del args
+        generic_calls.append(bool(kwargs.get("attempted_provider_call")))
+        raise AssertionError("generic classification must be short-circuited")
+
+    def _capture_publication(**kwargs: Any) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(applied_scope="candidate", duration_seconds=30.0, **kwargs)
+
+    plan = candidate_loop._resolve_failure_plan(
+        resolve_cooldown_publication_fn=_capture_publication,
+        record_codex_failure_evidence_fn=lambda **kwargs: None,
+        request=SimpleNamespace(),
+        candidate=candidate,
+        selection={"cooldown_key": "test:selected", "lane_key": None},
+        attempt_record={"attempted_provider_call": attempted_provider_call},
+        exc=Exception("provider model unavailable"),
+        codex_failure_evidence_alias=None,
+        kimi_failure_metadata_fn=lambda exc, candidate=None: None,
+        classify_kimi_fn=lambda metadata: None,
+        classify_retryable_fn=_generic_classifier,
+        grok_quota_fn=lambda exc, candidate=None: False,
+        cooldown_seconds_fn=lambda exc, candidate=None, attempted_provider_call=True: 30.0,
+        match_provider_attributed_model_unavailable_fn=_match,
+    )
+
+    assert matcher_calls == [attempted_provider_call]
+    assert generic_calls == []
+    assert captured["error_class"] == "candidate_unavailable"
+    assert plan.applied_scope == "candidate"
+
+
 def test_resolve_failure_plan_classifies_coding_plan_1113_as_terminal_routing() -> None:
     class _InsufficientBalance(Exception):
         def __init__(self) -> None:

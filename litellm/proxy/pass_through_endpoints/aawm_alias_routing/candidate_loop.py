@@ -67,6 +67,7 @@ from .interfaces import (
     GetActiveCooldownStateFn,
     GetKimiFailureMetadataFn,
     IsGrokAccountQuotaFailureFn,
+    MatchProviderAttributedModelUnavailableFn,
     RecordCodexFailureEvidenceFn,
     ResolveCooldownPublicationFn,
 )
@@ -2612,6 +2613,9 @@ def _resolve_failure_plan(
     grok_quota_fn: IsGrokAccountQuotaFailureFn,
     cooldown_seconds_fn: GetCooldownSecondsFn,
     fresh_codex_auth_error_class: Optional[str] = None,
+    match_provider_attributed_model_unavailable_fn: MatchProviderAttributedModelUnavailableFn = (
+        _error_signals._match_codex_auto_agent_provider_attributed_model_unavailable
+    ),
 ) -> CooldownPublicationPlan:
     """Resolve ONE publication plan for ``exc`` (pure, no I/O).
 
@@ -2673,6 +2677,16 @@ def _resolve_failure_plan(
             candidate=candidate,
             attempted_provider_call=attempted_provider_call,
         )
+    if error_class is None:
+        provider_attributed_model_unavailable = (
+            match_provider_attributed_model_unavailable_fn(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=attempted_provider_call,
+            )
+        )
+        if provider_attributed_model_unavailable is not None:
+            error_class = provider_attributed_model_unavailable.error_class
     if error_class is None:
         if _accepts_attempted_provider_call(classify_retryable_fn):
             error_class = classify_retryable_fn(

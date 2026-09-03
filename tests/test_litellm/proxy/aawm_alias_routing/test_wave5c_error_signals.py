@@ -68,6 +68,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals impor
     _is_codex_auto_agent_xai_candidate,
     _is_codex_auto_agent_xai_model_unavailable_response,
     _is_nvidia_completion_adapter_model_unavailable_response,
+    _match_codex_auto_agent_provider_attributed_model_unavailable,
     _is_kimi_code_auto_agent_candidate,
     _iter_codex_auto_agent_error_blocks,
     _parse_codex_auto_agent_header_wait_seconds,
@@ -1371,6 +1372,136 @@ class TestClassification:
     def test_classify_none_for_unknown(self):
         exc = _FakeExc(message="all good")
         assert _classify_codex_auto_agent_retryable_exhaustion(exc) is None
+
+
+class TestProviderAttributedModelUnavailableMatcher:
+    def test_alibaba_match_contains_provider_status_and_default_error_class(self):
+        candidate = {
+            "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+            "model": "alibaba_token_plan/qwen3.8-max-preview",
+        }
+        exc = _alibaba_model_error(
+            status_code=404,
+            message="Model not exist.",
+            code="ModelNotFound",
+        )
+
+        match = _match_codex_auto_agent_provider_attributed_model_unavailable(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=True,
+        )
+
+        assert match is not None
+        assert match.provider == CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
+        assert match.status_code == 404
+        assert match.error_class == "candidate_unavailable"
+
+    @pytest.mark.parametrize(
+        ("attempted_provider_call", "provider_returned"),
+        [(False, True), (True, False)],
+    )
+    def test_match_requires_attempt_and_provider_return_evidence(
+        self,
+        attempted_provider_call: bool,
+        provider_returned: bool,
+    ):
+        candidate = {
+            "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+            "model": "alibaba_token_plan/qwen3.8-max-preview",
+        }
+        exc = _alibaba_model_error(
+            status_code=404,
+            message="Model not exist.",
+            code="ModelNotFound",
+            provider_returned=provider_returned,
+        )
+
+        assert (
+            _match_codex_auto_agent_provider_attributed_model_unavailable(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=attempted_provider_call,
+            )
+            is None
+        )
+
+    def test_match_rejects_non_model_admission_status(self):
+        candidate = {
+            "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+            "model": "alibaba_token_plan/qwen3.8-max-preview",
+        }
+        exc = _alibaba_model_error(
+            status_code=429,
+            message="Model not exist.",
+            code="ModelNotFound",
+        )
+
+        assert (
+            _match_codex_auto_agent_provider_attributed_model_unavailable(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=True,
+            )
+            is None
+        )
+
+    def test_xai_match_preserves_existing_error_class(self):
+        candidate = {
+            "provider": "xai",
+            "model": "xai/grok-future",
+            "route_family": "codex_grok_native_responses_adapter",
+        }
+        exc = _FakeExc(
+            detail={
+                "error": {
+                    "message": "model not found: grok-future",
+                    "code": "not_found",
+                }
+            },
+            status_code=400,
+            _aawm_provider_returned=True,
+        )
+
+        match = _match_codex_auto_agent_provider_attributed_model_unavailable(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=True,
+        )
+
+        assert match is not None
+        assert match.provider == "xai"
+        assert match.status_code == 400
+        assert match.error_class == "xai_model_unavailable"
+
+    def test_openrouter_is_left_to_later_classifier(self):
+        exc = _FakeExc(
+            message="OpenRouter request failed",
+            status_code=404,
+            detail={
+                "error": {
+                    "message": "No endpoints found for this model",
+                }
+            },
+            _aawm_provider_returned=True,
+        )
+
+        assert (
+            _match_codex_auto_agent_provider_attributed_model_unavailable(
+                exc,
+                candidate=_OPENROUTER_COMPLETION_CANDIDATE,
+                attempted_provider_call=True,
+            )
+            is None
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=_OPENROUTER_COMPLETION_CANDIDATE,
+                attempted_provider_call=True,
+            )
+            == "candidate_unavailable"
+        )
 
 
 class TestUsageLimitQuotaHints:

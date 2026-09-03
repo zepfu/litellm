@@ -66,6 +66,13 @@ class AliasCandidate:
 
 
 @dataclass(frozen=True)
+class ProviderAttributedModelUnavailableMatch:
+    provider: str
+    status_code: int
+    error_class: str = "candidate_unavailable"
+
+
+@dataclass(frozen=True)
 class CandidateSelection:
     """Typed result of candidate selection for one loop attempt.
 
@@ -283,6 +290,20 @@ class ClassifyRetryableFailureFn(Protocol):
         candidate: Optional[dict[str, Any]] = None,
         attempted_provider_call: bool = True,
     ) -> Optional[str]:
+        ...
+
+
+@runtime_checkable
+class MatchProviderAttributedModelUnavailableFn(Protocol):
+    """Match a provider-attributed model-unavailable failure."""
+
+    def __call__(
+        self,
+        exc: Any,
+        *,
+        candidate: Optional[dict[str, Any]] = None,
+        attempted_provider_call: bool = True,
+    ) -> Optional[ProviderAttributedModelUnavailableMatch]:
         ...
 
 
