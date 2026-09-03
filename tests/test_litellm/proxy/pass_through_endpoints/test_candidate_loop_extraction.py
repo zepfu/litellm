@@ -980,17 +980,23 @@ def test_resolve_failure_plan_dispatcher_short_circuits_generic_classifier(
 
 
 @pytest.mark.parametrize(
-    "detail",
+    ("status_code", "detail"),
     [
         pytest.param(
+            404,
             {"error": {"code": "not_found", "message": "Resource not found"}},
             id="generic",
         ),
-        pytest.param(None, id="header-only"),
+        pytest.param(404, None, id="header-only"),
+        pytest.param(
+            401,
+            {"error": {"code": "unauthorized", "message": "Authentication failed"}},
+            id="auth",
+        ),
     ],
 )
 def test_resolve_failure_plan_skips_unmatched_cursor_evidence_and_cooldown(
-    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
     detail: Any,
 ) -> None:
     candidate = {
@@ -999,14 +1005,14 @@ def test_resolve_failure_plan_skips_unmatched_cursor_evidence_and_cooldown(
         "route_family": "codex_cursor_agent_aiserver_adapter",
     }
     exc = HTTPException(
-        status_code=404,
+        status_code=status_code,
         detail=detail,
         headers={"Retry-After": "30"},
     )
     setattr(exc, "_aawm_provider_returned", True)
     matcher_calls: list[bool] = []
+    classifier_calls: list[bool] = []
     evidence_calls: list[dict[str, Any]] = []
-    publication: dict[str, Any] = {}
 
     def _match(
         match_exc: Exception,
@@ -1021,18 +1027,20 @@ def test_resolve_failure_plan_skips_unmatched_cursor_evidence_and_cooldown(
             attempted_provider_call=attempted_provider_call,
         )
 
-    def _capture_publication(**kwargs: Any) -> Any:
-        publication.update(kwargs)
-        return lpe._resolve_auto_agent_cooldown_publication_plan(**kwargs)
-
-    monkeypatch.setattr(
-        lpe._codex_failure_evidence_gate,
-        "current_decision",
-        lambda **kwargs: SimpleNamespace(should_cool=False, duration_seconds=30.0),
-    )
+    def _classify(
+        classify_exc: Exception,
+        *,
+        candidate: Optional[dict[str, Any]] = None,
+        attempted_provider_call: bool = True,
+    ) -> str:
+        del classify_exc, candidate
+        classifier_calls.append(attempted_provider_call)
+        return "provider_terminal_error"
 
     plan = candidate_loop._resolve_failure_plan(
-        resolve_cooldown_publication_fn=_capture_publication,
+        resolve_cooldown_publication_fn=lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("unmatched Cursor terminal failures must not resolve cooldown")
+        ),
         record_codex_failure_evidence_fn=lambda **kwargs: evidence_calls.append(kwargs),
         request=SimpleNamespace(),
         candidate=candidate,
@@ -1045,20 +1053,19 @@ def test_resolve_failure_plan_skips_unmatched_cursor_evidence_and_cooldown(
         codex_failure_evidence_alias="work",
         kimi_failure_metadata_fn=lambda exc, candidate=None: None,
         classify_kimi_fn=lambda metadata: None,
-        classify_retryable_fn=lambda exc, candidate=None, attempted_provider_call=True: (
-            "provider_terminal_error"
-        ),
+        classify_retryable_fn=_classify,
         grok_quota_fn=lambda exc, candidate=None: False,
         cooldown_seconds_fn=lambda exc, candidate=None, attempted_provider_call=True: 30.0,
         match_provider_attributed_model_unavailable_fn=_match,
     )
 
     assert matcher_calls == [True]
+    assert classifier_calls == [True]
     assert evidence_calls == []
-    assert publication["error_class"] == "provider_terminal_error"
     assert plan.applied_scope == "none"
     assert plan.memory_keys == ()
     assert plan.durable_keys == ()
+    assert plan.request_local_action is None
 
 
 @pytest.mark.parametrize("status_code", [400, 404])

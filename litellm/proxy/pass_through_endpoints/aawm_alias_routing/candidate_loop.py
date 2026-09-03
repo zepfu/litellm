@@ -2724,14 +2724,22 @@ def _resolve_failure_plan(
     else:
         cooldown_seconds = cooldown_seconds_fn(exc, candidate=candidate)
     # The legacy evidence classifier treats every 404 as model-unavailable.
-    # Cursor 400/404 evidence is trusted only after the shared matcher binds it
-    # to the selected provider model.
-    unmatched_cursor_model_error = (
+    # Unmatched Cursor model/auth failures remain terminal and must not enter
+    # either the evidence gate or request-local cooldown resolution.
+    unmatched_cursor_terminal_error = (
         candidate.get("provider") == "cursor_agent"
-        and _error_signals._extract_adapter_exception_status_code(exc) in {400, 404}
+        and _error_signals._extract_adapter_exception_status_code(exc)
+        in {400, 401, 403, 404}
         and provider_attributed_model_unavailable is None
+        and error_class == "provider_terminal_error"
     )
-    if codex_failure_evidence_alias is not None and not unmatched_cursor_model_error:
+    if unmatched_cursor_terminal_error:
+        return CooldownPublicationPlan(
+            applied_scope="none",
+            grok_account_quota_exhausted=grok_account_quota_exhausted,
+            kimi_failure_metadata=kimi_failure_metadata,
+        )
+    if codex_failure_evidence_alias is not None:
         record_codex_failure_evidence_fn(
             canonical_alias=codex_failure_evidence_alias,
             cooldown_key=selection["cooldown_key"],
