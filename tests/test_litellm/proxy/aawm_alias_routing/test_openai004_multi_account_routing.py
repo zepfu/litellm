@@ -5368,6 +5368,7 @@ def test_should_bind_direct_inventory_for_concrete_codex_targets() -> None:
     )
     # Config-derived classification (no name heuristics): exclusive responses
     # openai catalog rows and chatgpt-provider twins bind; dual chat models do not.
+    assert codex_oauth._is_direct_codex_oauth_inventory_model("gpt-6-astra") is True
     assert codex_oauth._is_direct_codex_oauth_inventory_model("gpt-5.6-terra") is True
     assert codex_oauth._is_direct_codex_oauth_inventory_model("gpt-5.6-luna") is True
     assert codex_oauth._is_direct_codex_oauth_inventory_model("gpt-4o") is False

@@ -534,6 +534,60 @@ def test_gpt_5_6_reasoning_effort_flags_in_runtime_model_info(monkeypatch):
         assert supports_max_reasoning_effort(model) is True
 
 
+def test_gpt_6_astra_pricing_and_runtime_model_info(monkeypatch):
+    import json
+    from pathlib import Path
+
+    from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
+    from litellm.utils import (
+        _invalidate_model_cost_lowercase_map,
+        get_model_info,
+        supports_max_reasoning_effort,
+    )
+
+    expected_costs = {
+        "input_cost_per_token": 1e-05,
+        "cache_read_input_token_cost": 1e-06,
+        "cache_creation_input_token_cost": 1.25e-05,
+        "output_cost_per_token": 5e-05,
+        "input_cost_per_token_above_272k_tokens": 2e-05,
+        "cache_read_input_token_cost_above_272k_tokens": 2e-06,
+        "cache_creation_input_token_cost_above_272k_tokens": 2.5e-05,
+        "output_cost_per_token_above_272k_tokens": 7.5e-05,
+    }
+    pricing_map_paths = [
+        Path("model_prices_and_context_window.json"),
+        Path("litellm/bundled_model_prices_and_context_window_fallback.json"),
+    ]
+    for pricing_map_path in pricing_map_paths:
+        model_cost = json.loads(pricing_map_path.read_text())
+        for model, provider, mode in (
+            ("gpt-6-astra", "openai", "chat"),
+            ("chatgpt/gpt-6-astra", "chatgpt", "responses"),
+        ):
+            model_info = model_cost[model]
+            assert {key: model_info[key] for key in expected_costs} == expected_costs
+            assert model_info["litellm_provider"] == provider
+            assert model_info["mode"] == mode
+            assert model_info["max_input_tokens"] == 1050000
+            assert model_info["max_output_tokens"] == 128000
+            assert model_info["supports_none_reasoning_effort"] is False
+            assert model_info["supports_xhigh_reasoning_effort"] is True
+            assert model_info["supports_max_reasoning_effort"] is True
+
+    local_model_cost = GetModelCostMap.load_local_model_cost_map()
+    monkeypatch.setattr(litellm, "model_cost", local_model_cost)
+    _invalidate_model_cost_lowercase_map()
+    get_model_info.cache_clear()
+
+    runtime_model_info = get_model_info("gpt-6-astra")
+    assert (
+        runtime_model_info["cache_creation_input_token_cost_above_272k_tokens"]
+        == 2.5e-05
+    )
+    assert supports_max_reasoning_effort("gpt-6-astra") is True
+
+
 def test_codex_chatgpt_unsupported_request_params_in_cost_map():
     import json
     from pathlib import Path
@@ -732,6 +786,7 @@ def validate_model_cost_values(model_data, exceptions=None):
         "output_cost_per_token_above_200k_tokens",
         "input_cost_per_token_above_272k_tokens",
         "output_cost_per_token_above_272k_tokens",
+        "cache_creation_input_token_cost_above_272k_tokens",
         "input_cost_per_character_above_128k_tokens",
         "output_cost_per_character_above_128k_tokens",
         "input_cost_per_image_above_128k_tokens",
@@ -820,6 +875,7 @@ def test_aaamodel_prices_and_context_window_json_is_valid():
                 "cache_creation_input_token_cost": {"type": "number"},
                 "cache_creation_input_token_cost_above_1hr": {"type": "number"},
                 "cache_creation_input_token_cost_above_200k_tokens": {"type": "number"},
+                "cache_creation_input_token_cost_above_272k_tokens": {"type": "number"},
                 "cache_read_input_token_cost": {"type": "number"},
                 "cache_read_input_token_cost_above_200k_tokens": {"type": "number"},
                 "cache_read_input_token_cost_above_272k_tokens": {"type": "number"},
