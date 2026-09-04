@@ -20,6 +20,9 @@ from litellm.llms.cursor_agent.connect import (
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
     codex_candidate_calls,
 )
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.schema_rejections import (
+    extract_schema_rejection,
+)
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints
 from litellm.proxy.aawm_route_logging import (
     clear_aawm_route_rollups,
@@ -1223,6 +1226,143 @@ class _CountingRetainedSession:
 
     async def aclose(self) -> None:
         self.close()
+
+
+@pytest.mark.parametrize(
+    (
+        "input_item",
+        "expected_reason",
+        "expected_category",
+        "expected_object_type",
+        "expected_safe_keys",
+    ),
+    [
+        (
+            {"type": "function_call", "call_id": "call-1"},
+            "function_call_fields",
+            "tool_schema",
+            "function_call",
+            ["call_id", "type"],
+        ),
+        (
+            {
+                "type": "function_call_output",
+                "call_id": "unmatched-call",
+                "output": "tool result",
+            },
+            "unresolved_call_id",
+            "tool_schema",
+            "function_call_output",
+            ["call_id", "output", "type"],
+        ),
+        (
+            {},
+            "item_not_object",
+            "request_shape",
+            "unknown",
+            [],
+        ),
+        (
+            {
+                "type": "unsupported_private_item",
+                "authorization": "secret",
+                "opaque_id": "0123456789abcdef0123456789abcdef",
+            },
+            "item_type",
+            "request_shape",
+            "object",
+            ["type"],
+        ),
+    ],
+    ids=[
+        "function-call-fields",
+        "unresolved-call-id",
+        "empty-input-item",
+        "unsupported-input-type",
+    ],
+)
+def test_cursor_initial_request_schema_rejections_are_bounded(
+    input_item: dict[str, Any],
+    expected_reason: str,
+    expected_category: str,
+    expected_object_type: str,
+    expected_safe_keys: list[str],
+) -> None:
+    with pytest.raises(
+        codex_candidate_calls._CursorRequestSchemaError
+    ) as exc_info:
+        codex_candidate_calls._responses_input_to_cursor_messages(
+            {"input": [input_item]}
+        )
+
+    diagnostic = getattr(
+        exc_info.value,
+        codex_candidate_calls._CURSOR_REQUEST_SCHEMA_REJECTION_FIELD,
+    )
+    assert diagnostic == {
+        "stage": "request_preparation",
+        "reason": expected_reason,
+        "category": expected_category,
+        "object_type": expected_object_type,
+        "item_index": 0,
+        **(
+            {"safe_keys": expected_safe_keys}
+            if expected_safe_keys
+            else {}
+        ),
+    }
+    serialized = json.dumps(diagnostic)
+    assert "secret" not in serialized
+    assert "unsupported_private_item" not in serialized
+    assert "0123456789abcdef0123456789abcdef" not in serialized
+
+
+def test_cursor_request_schema_rejection_survives_proxy_mapping() -> None:
+    from litellm.proxy._types import ProxyException
+
+    candidate = _candidate(provider="cursor_agent")
+    with pytest.raises(
+        codex_candidate_calls._CursorRequestSchemaError
+    ) as source_exc_info:
+        codex_candidate_calls._responses_input_to_cursor_messages(
+            {
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call-1",
+                    }
+                ]
+            }
+        )
+
+    with pytest.raises(ProxyException) as mapped_exc_info:
+        codex_candidate_calls._raise_cursor_agent_alias_error(
+            exc=source_exc_info.value,
+            candidate=candidate,
+        )
+
+    mapped_exc = mapped_exc_info.value
+    diagnostic = extract_schema_rejection(
+        mapped_exc,
+        provider=candidate["provider"],
+        route_family=candidate["route_family"],
+        attempted_provider_call=mapped_exc.attempted_provider_call,
+        failure_phase=mapped_exc.failure_phase,
+    )
+
+    assert mapped_exc.attempted_provider_call is False
+    assert diagnostic is not None
+    assert diagnostic.provider == "cursor_agent"
+    assert (
+        diagnostic.route_family
+        == "codex_cursor_agent_aiserver_adapter"
+    )
+    assert diagnostic.stage == "request_preparation"
+    assert diagnostic.reason == "function_call_fields"
+    assert diagnostic.category == "tool_schema"
+    assert diagnostic.object_type == "function_call"
+    assert diagnostic.item_index == 0
+    assert diagnostic.safe_keys == ("call_id", "type")
 
 
 def test_cursor_codex_path_returns_native_function_call_and_replays_tool_history(

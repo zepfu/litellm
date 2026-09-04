@@ -50,11 +50,39 @@ _CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD = "cursor_sanitized_proto_structure"
 _CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD = (
     "cursor_replay_fresh_dispatch_reject"
 )
+_CURSOR_REQUEST_SCHEMA_REJECTION_FIELD = "_aawm_schema_rejection"
 _CURSOR_PROTO_STRUCTURE_MAX_DEPTH = 3
 _CURSOR_PROTO_STRUCTURE_MAX_ITEMS = 64
 _CURSOR_REPLAY_DIAGNOSTIC_MAX_INDEX = 4096
 _CURSOR_REPLAY_DIAGNOSTIC_MAX_KEY_COUNT = 32
 _CURSOR_REPLAY_DIAGNOSTIC_MAX_TOKEN_CHARS = 64
+_CURSOR_REQUEST_SCHEMA_REJECTION_REASONS = frozenset(
+    {
+        "function_call_fields",
+        "unresolved_call_id",
+        "item_not_object",
+        "item_type",
+    }
+)
+_CURSOR_REQUEST_SCHEMA_REJECTION_CATEGORIES = frozenset(
+    {"request_shape", "tool_schema"}
+)
+_CURSOR_REQUEST_SCHEMA_REJECTION_OBJECT_TYPES = frozenset(
+    {"function_call", "function_call_output", "object", "unknown"}
+)
+_CURSOR_REQUEST_SCHEMA_SAFE_KEYS = frozenset(
+    {
+        "arguments",
+        "call_id",
+        "content",
+        "function",
+        "id",
+        "name",
+        "output",
+        "role",
+        "type",
+    }
+)
 _CURSOR_REPLAY_FRESH_DISPATCH_REJECTION_STAGES = frozenset(
     {
         "stock_full_history",
@@ -145,6 +173,41 @@ class _CursorPostEgressOutputError(ValueError):
     """A returned Cursor payload could not be normalized after provider Run."""
 
 
+class _CursorRequestSchemaError(ValueError):
+    """A bounded pre-egress Cursor request-shape rejection."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        category: str,
+        object_type: str,
+        item_index: Optional[int] = None,
+        item: Any = None,
+    ) -> None:
+        super().__init__(message)
+        if (
+            reason not in _CURSOR_REQUEST_SCHEMA_REJECTION_REASONS
+            or category not in _CURSOR_REQUEST_SCHEMA_REJECTION_CATEGORIES
+            or object_type not in _CURSOR_REQUEST_SCHEMA_REJECTION_OBJECT_TYPES
+        ):
+            raise ValueError("Invalid bounded Cursor request-schema diagnostic.")
+        diagnostic: dict[str, Any] = {
+            "stage": "request_preparation",
+            "reason": reason,
+            "category": category,
+            "object_type": object_type,
+        }
+        bounded_item_index = _cursor_replay_bounded_diagnostic_index(item_index)
+        if bounded_item_index is not None:
+            diagnostic["item_index"] = bounded_item_index
+        safe_keys = _cursor_request_schema_safe_keys(item)
+        if safe_keys:
+            diagnostic["safe_keys"] = list(safe_keys)
+        setattr(self, _CURSOR_REQUEST_SCHEMA_REJECTION_FIELD, diagnostic)
+
+
 @dataclass(frozen=True)
 class _CursorReplayFreshDispatchReject:
     stage: str
@@ -221,6 +284,25 @@ def _cursor_replay_bounded_diagnostic_index(value: Any) -> Optional[int]:
     ):
         return None
     return value
+
+
+def _cursor_request_schema_safe_keys(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, Mapping):
+        return ()
+    try:
+        raw_keys = value.keys()
+    except Exception:  # noqa: BLE001
+        return ()
+    return tuple(
+        sorted(
+            {
+                key
+                for key in raw_keys
+                if isinstance(key, str)
+                and key in _CURSOR_REQUEST_SCHEMA_SAFE_KEYS
+            }
+        )
+    )
 
 
 def _cursor_replay_rejection(
@@ -1410,6 +1492,8 @@ def _cursor_function_name(item: dict[str, Any]) -> str:
 def _cursor_function_call_message(
     item: dict[str, Any],
     function_calls: dict[str, str],
+    *,
+    item_index: Optional[int] = None,
 ) -> dict[str, Any]:
     call_id = _cursor_call_id(item)
     name = _cursor_function_name(item)
@@ -1418,8 +1502,13 @@ def _cursor_function_call_message(
     if arguments is None:
         arguments = function.get("arguments")
     if not call_id or not name:
-        raise ValueError(
-            "Cursor Agent continuation requires function_call call_id and name."
+        raise _CursorRequestSchemaError(
+            "Cursor Agent continuation requires function_call call_id and name.",
+            reason="function_call_fields",
+            category="tool_schema",
+            object_type="function_call",
+            item_index=item_index,
+            item=item,
         )
     function_calls[call_id] = name
     return {
@@ -1451,12 +1540,19 @@ def _validate_cursor_returned_tool_calls(tool_calls: list[Any]) -> None:
 def _cursor_tool_result_message(
     item: dict[str, Any],
     function_calls: dict[str, str],
+    *,
+    item_index: Optional[int] = None,
 ) -> dict[str, Any]:
     call_id = _cursor_call_id(item)
     if not call_id or call_id not in function_calls:
-        raise ValueError(
+        raise _CursorRequestSchemaError(
             "Cursor Agent continuation requires a matching "
-            "function_call for every function_call_output."
+            "function_call for every function_call_output.",
+            reason="unresolved_call_id",
+            category="tool_schema",
+            object_type="function_call_output",
+            item_index=item_index,
+            item=item,
         )
     output = item.get("output")
     if output is None:
@@ -2744,17 +2840,36 @@ def _responses_input_to_cursor_messages(  # noqa: PLR0915
             continue
         item = _cursor_as_mapping(raw_item)
         if not item:
-            raise ValueError("Cursor Agent received an unsupported empty input item.")
+            raise _CursorRequestSchemaError(
+                "Cursor Agent received an unsupported empty input item.",
+                reason="item_not_object",
+                category="request_shape",
+                object_type="unknown",
+                item_index=item_index,
+                item=item,
+            )
         item_type = str(item.get("type") or "")
         role = str(item.get("role") or "")
 
         if item_type in {"function_call", "mcp_call"}:
-            messages.append(_cursor_function_call_message(item, function_calls))
+            messages.append(
+                _cursor_function_call_message(
+                    item,
+                    function_calls,
+                    item_index=item_index,
+                )
+            )
             last_item_was_user = False
             continue
 
         if item_type in {"function_call_output", "mcp_call_output"}:
-            messages.append(_cursor_tool_result_message(item, function_calls))
+            messages.append(
+                _cursor_tool_result_message(
+                    item,
+                    function_calls,
+                    item_index=item_index,
+                )
+            )
             saw_function_call_output = True
             function_call_output_ends_input = (
                 item_type == "function_call_output"
@@ -2764,7 +2879,13 @@ def _responses_input_to_cursor_messages(  # noqa: PLR0915
             continue
 
         if role == "tool":
-            messages.append(_cursor_tool_result_message(item, function_calls))
+            messages.append(
+                _cursor_tool_result_message(
+                    item,
+                    function_calls,
+                    item_index=item_index,
+                )
+            )
             saw_function_call_output = True
             last_item_was_user = False
             continue
@@ -2781,8 +2902,13 @@ def _responses_input_to_cursor_messages(  # noqa: PLR0915
             )
             continue
 
-        raise ValueError(
-            f"Cursor Agent received unsupported Responses input type: {item_type or role or 'unknown'}."
+        raise _CursorRequestSchemaError(
+            f"Cursor Agent received unsupported Responses input type: {item_type or role or 'unknown'}.",
+            reason="item_type",
+            category="request_shape",
+            object_type="object",
+            item_index=item_index,
+            item=item,
         )
 
     # A tool result is a continuation of the interrupted Cursor turn.
@@ -3327,6 +3453,13 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
         if isinstance(exc, CursorConnectProtocolError)
         else None
     )
+    cursor_request_schema_rejection = (
+        copy.deepcopy(
+            getattr(exc, _CURSOR_REQUEST_SCHEMA_REJECTION_FIELD)
+        )
+        if isinstance(exc, _CursorRequestSchemaError)
+        else None
+    )
 
     def _set_mapped_detail(
         proxy_exc: ProxyException,
@@ -3347,6 +3480,12 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
                 proxy_exc,
                 _CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD,
                 copy.deepcopy(structure),
+            )
+        if cursor_request_schema_rejection is not None:
+            setattr(
+                proxy_exc,
+                _CURSOR_REQUEST_SCHEMA_REJECTION_FIELD,
+                copy.deepcopy(cursor_request_schema_rejection),
             )
         setattr(proxy_exc, "detail", mapped_detail)
 
