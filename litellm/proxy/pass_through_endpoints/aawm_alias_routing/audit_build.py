@@ -28,6 +28,12 @@ from .selection import (
     _auto_agent_alias_float,
     _codex_auto_agent_candidate_public_shape,
 )
+from .schema_rejections import (
+    SCHEMA_REJECTION_ERROR_CODE,
+    SCHEMA_REJECTION_FAILURE_CLASS,
+    normalize_schema_rejection,
+    resolve_schema_rejection_failure_identity,
+)
 
 # ---------------------------------------------------------------------------
 # Injected runtime seams (god-module / audit_context.py)
@@ -81,6 +87,17 @@ _resolve_auto_agent_alias_route_rollup_outgoing_target: Optional[
 ] = None
 _auto_agent_alias_int: Callable[..., Optional[int]] = _auto_agent_alias_int
 _auto_agent_alias_cooldown_until: Callable[..., Optional[str]] = _auto_agent_alias_cooldown_until
+
+
+def _candidate_schema_rejection(
+    candidate: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    diagnostic = normalize_schema_rejection(
+        candidate,
+        provider=candidate.get("provider"),
+        route_family=candidate.get("route_family"),
+    )
+    return diagnostic.to_dict() if diagnostic is not None else None
 
 _host_globals: Optional[dict] = None
 _MISSING = object()
@@ -289,6 +306,15 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
         "redispatch_required": redispatch_required,
         "redispatch_threshold_crossed": False,
     }
+    schema_rejection = _candidate_schema_rejection(candidate)
+    if schema_rejection is not None:
+        event["schema_rejection"] = schema_rejection
+        event["failure_class"], event["error_code"] = (
+            resolve_schema_rejection_failure_identity(
+                failure_class=event.get("failure_class"),
+                error_code=event.get("error_code"),
+            )
+        )
     if isinstance(error_tokens, list):
         event["error_tokens"] = error_tokens
     elif isinstance(error_tokens, set):
@@ -466,6 +492,11 @@ def _build_auto_agent_alias_audit_events(
             continue
         status = str(attempt.get("status") or "").strip()
         failure_class = attempt.get("error_class")
+        if _candidate_schema_rejection(attempt) is not None:
+            failure_class, _ = resolve_schema_rejection_failure_identity(
+                failure_class=failure_class,
+                error_code=attempt.get("error_code"),
+            )
         redispatch_required = bool(attempt.get("redispatch_required")) or status in {
             "terminal_in_flight_cooldown_set",
             "terminal_in_flight_token_invalidated",
@@ -738,6 +769,14 @@ def install(host_globals: dict) -> None:
         ("_resolve_auto_agent_alias_route_rollup_outgoing_target", _resolve_auto_agent_alias_route_rollup_outgoing_target),
         ("_auto_agent_alias_int", _auto_agent_alias_int),
         ("_auto_agent_alias_cooldown_until", _auto_agent_alias_cooldown_until),
+        ("_candidate_schema_rejection", _candidate_schema_rejection),
+        ("normalize_schema_rejection", normalize_schema_rejection),
+        (
+            "resolve_schema_rejection_failure_identity",
+            resolve_schema_rejection_failure_identity,
+        ),
+        ("SCHEMA_REJECTION_FAILURE_CLASS", SCHEMA_REJECTION_FAILURE_CLASS),
+        ("SCHEMA_REJECTION_ERROR_CODE", SCHEMA_REJECTION_ERROR_CODE),
     ):
         host_globals.setdefault(_sk, _sv)
 

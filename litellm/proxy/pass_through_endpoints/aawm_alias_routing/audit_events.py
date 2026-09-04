@@ -32,6 +32,13 @@ from .audit_build import (
     _format_auto_agent_alias_timestamp as _default_format_timestamp,
 )
 from .selection import _build_auto_agent_terminal_candidate_inventory
+from .schema_rejections import (
+    SCHEMA_REJECTION_ERROR_CODE,
+    SCHEMA_REJECTION_FAILURE_CLASS,
+    SCHEMA_REJECTION_KEY,
+    normalize_schema_rejection,
+    resolve_schema_rejection_failure_identity,
+)
 
 _format_auto_agent_alias_timestamp: Callable[[datetime], str] = _default_format_timestamp
 _extract_auto_agent_alias_metadata_value: Optional[Callable[..., Optional[str]]] = None
@@ -169,6 +176,19 @@ def _enrich_auto_agent_alias_terminal_event_from_attempts(
         value = last_attempt.get(key)
         if value is not None:
             event[key] = value
+    schema_rejection = normalize_schema_rejection(
+        last_attempt,
+        provider=last_attempt.get("provider"),
+        route_family=last_attempt.get("route_family"),
+    )
+    if schema_rejection is not None:
+        event[SCHEMA_REJECTION_KEY] = schema_rejection.to_dict()
+        event["failure_class"], event["error_code"] = (
+            resolve_schema_rejection_failure_identity(
+                failure_class=event.get("failure_class"),
+                error_code=event.get("error_code"),
+            )
+        )
     return normalized_attempts
 
 
@@ -255,6 +275,13 @@ def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
                 if value is not None:
                     terminal_selection[key] = value
         terminal_selection["candidate"] = terminal_candidate
+        schema_rejection = normalize_schema_rejection(
+            detail_mapping,
+            provider=terminal_candidate.get("provider"),
+            route_family=terminal_candidate.get("route_family"),
+        )
+        if schema_rejection is not None:
+            terminal_candidate[SCHEMA_REJECTION_KEY] = schema_rejection.to_dict()
 
         normalized_attempts = [
             copy.deepcopy(attempt)
@@ -276,6 +303,13 @@ def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
             terminal_attempt["error_type"] = error_type
         if error_code is not None:
             terminal_attempt["error_code"] = str(error_code)
+        if schema_rejection is not None:
+            terminal_attempt["error_class"], terminal_attempt["error_code"] = (
+                resolve_schema_rejection_failure_identity(
+                    failure_class=terminal_attempt.get("error_class"),
+                    error_code=terminal_attempt.get("error_code"),
+                )
+            )
         if extra_fields:
             terminal_attempt.update(extra_fields)
 
@@ -325,6 +359,14 @@ def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
             event["error_code"] = str(error_code)
         if extra_fields:
             event.update(copy.deepcopy(dict(extra_fields)))
+        if schema_rejection is not None:
+            event[SCHEMA_REJECTION_KEY] = schema_rejection.to_dict()
+            event["failure_class"], event["error_code"] = (
+                resolve_schema_rejection_failure_identity(
+                    failure_class=event.get("failure_class"),
+                    error_code=event.get("error_code"),
+                )
+            )
 
         _emit_auto_agent_alias_route_event(event, level="warning")
         _persist_auto_agent_alias_audit_only_events_best_effort(
@@ -630,6 +672,14 @@ def install(host_globals: dict) -> None:
         ("_build_auto_agent_alias_audit_events", _build_auto_agent_alias_audit_events),
         ("_persist_auto_agent_alias_audit_only_events_best_effort", _persist_auto_agent_alias_audit_only_events_best_effort),
         ("_build_auto_agent_terminal_candidate_inventory", _build_auto_agent_terminal_candidate_inventory),
+        ("normalize_schema_rejection", normalize_schema_rejection),
+        (
+            "resolve_schema_rejection_failure_identity",
+            resolve_schema_rejection_failure_identity,
+        ),
+        ("SCHEMA_REJECTION_KEY", SCHEMA_REJECTION_KEY),
+        ("SCHEMA_REJECTION_FAILURE_CLASS", SCHEMA_REJECTION_FAILURE_CLASS),
+        ("SCHEMA_REJECTION_ERROR_CODE", SCHEMA_REJECTION_ERROR_CODE),
     ):
         host_globals.setdefault(_sk, _sv)
 

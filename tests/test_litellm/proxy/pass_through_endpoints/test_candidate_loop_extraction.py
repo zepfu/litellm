@@ -4280,6 +4280,8 @@ async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_a
         "reason": "replay_state_lookup",
     }
     assert attempt[rejection_field] == expected_rejection
+    assert attempt["schema_rejection"]["category"] == "cursor_replay"
+    assert attempt["schema_rejection"]["reason"] == "replay_state_lookup"
     assert cooldown_memory_publications == [
         {"keys": (selection["cooldown_key"],), "seconds": 300.0}
     ]
@@ -4289,7 +4291,17 @@ async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_a
     assert len(persisted) == 1
     terminal_event = persisted[0][-1]
     assert terminal_event["event_type"] == "no_candidate_available"
+    assert terminal_event["failure_class"] == "continuation_state_unavailable"
+    assert terminal_event["failure_class"] not in {
+        "provider_terminal_error",
+        "unclassified",
+    }
+    assert terminal_event["schema_rejection"] == attempt["schema_rejection"]
     assert terminal_event[rejection_field] == expected_rejection
+    assert (
+        terminal_event["attempts"][0]["error_class"]
+        == "continuation_state_unavailable"
+    )
     assert terminal_event["attempts"][0][field_name] == expected_structure
     assert terminal_event["attempts"][0][rejection_field] == expected_rejection
     expected_request_shape_summary = {

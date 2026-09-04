@@ -317,6 +317,7 @@ _AGENT_TERMINAL_CONTEXT_FIELDS = (
     "hidden_retry_final_outcome",
     "hidden_retry_failure_classification",
     "hidden_retry_count",
+    "schema_rejection",
     "cursor_replay_fresh_dispatch_reject",
     "aawm_passthrough_request_shape_summary",
     "aawm_passthrough_request_shape_fingerprint",
@@ -339,6 +340,7 @@ _AGENT_TERMINAL_ROUTING_SEQUENCE_FIELDS = (
     "failure_class",
     "error_class",
     "error_status_code",
+    "schema_rejection",
     "cursor_replay_fresh_dispatch_reject",
     "error_type",
     "error_code",
@@ -952,11 +954,33 @@ def _sanitize_agent_terminal_context_value(
             value,
             allowed_fields=_AGENT_TERMINAL_ACTIVITY_SUMMARY_FIELDS,
         )
+    if field == "schema_rejection":
+        return _sanitize_agent_terminal_schema_rejection(value)
     if field == "cursor_replay_fresh_dispatch_reject":
         return _sanitize_agent_terminal_cursor_replay_fresh_dispatch_reject(value)
     if field == "aawm_passthrough_request_shape_summary":
         return _sanitize_agent_terminal_request_shape_summary(value)
     return _sanitize_agent_terminal_scalar(value)
+
+
+def _sanitize_agent_terminal_schema_rejection(
+    value: Any,
+    *,
+    provider: Optional[str] = None,
+    route_family: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.schema_rejections import (
+        normalize_schema_rejection,
+    )
+
+    diagnostic = normalize_schema_rejection(
+        value,
+        provider=provider,
+        route_family=route_family,
+    )
+    return diagnostic.to_dict() if diagnostic is not None else None
 
 
 _CURSOR_REPLAY_FRESH_DISPATCH_REJECTION_STAGES = frozenset(
@@ -1124,6 +1148,12 @@ def _sanitize_agent_terminal_mapping(
             cleaned = _sanitize_agent_terminal_scalar_list(raw_value)
         elif field in _AGENT_TERMINAL_COUNT_MAPPING_FIELDS:
             cleaned = _sanitize_agent_terminal_count_mapping(raw_value)
+        elif field == "schema_rejection":
+            cleaned = _sanitize_agent_terminal_schema_rejection(
+                raw_value,
+                provider=value.get("provider"),
+                route_family=value.get("route_family"),
+            )
         elif field == "cursor_replay_fresh_dispatch_reject":
             cleaned = _sanitize_agent_terminal_cursor_replay_fresh_dispatch_reject(
                 raw_value

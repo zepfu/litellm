@@ -28,6 +28,13 @@ from .request_metadata import (
     _extract_auto_agent_alias_canonical_thread_id,
     _extract_auto_agent_alias_parent_thread_id,
 )
+from .schema_rejections import (
+    SCHEMA_REJECTION_KEY,
+    SchemaRejectionDiagnostic,
+    extract_schema_rejection,
+    normalize_schema_rejection,
+    resolve_schema_rejection_failure_identity,
+)
 
 _AAWM_ALIAS_REQUEST_CALL_ID_STATE_KEY = "aawm_alias_request_litellm_call_id"
 _AAWM_ALIAS_REQUEST_OUTCOME_STATE_KEY = "aawm_alias_request_outcome"
@@ -428,6 +435,48 @@ def _safe_publication_label(
     return value
 
 
+def _attach_schema_rejection_to_attempt_record(
+    *,
+    attempt_record: dict[str, Any],
+    exc: Any = None,
+    candidate: Optional[Mapping[str, Any]] = None,
+    diagnostic: Optional[SchemaRejectionDiagnostic] = None,
+) -> Optional[SchemaRejectionDiagnostic]:
+    """Attach one bounded schema diagnostic and its stable failure identity."""
+    candidate_mapping = candidate if isinstance(candidate, Mapping) else {}
+    provider = candidate_mapping.get("provider") or attempt_record.get("provider")
+    route_family = candidate_mapping.get("route_family") or attempt_record.get(
+        "route_family"
+    )
+    if diagnostic is None:
+        if exc is not None:
+            diagnostic = extract_schema_rejection(
+                exc,
+                provider=provider,
+                route_family=route_family,
+                attempted_provider_call=attempt_record.get(
+                    "attempted_provider_call"
+                ),
+                failure_phase=attempt_record.get("failure_phase"),
+            )
+    if diagnostic is None:
+        diagnostic = normalize_schema_rejection(
+            attempt_record,
+            provider=provider,
+            route_family=route_family,
+        )
+    if diagnostic is None:
+        return None
+    attempt_record[SCHEMA_REJECTION_KEY] = diagnostic.to_dict()
+    failure_class, error_code = resolve_schema_rejection_failure_identity(
+        failure_class=attempt_record.get("error_class"),
+        error_code=attempt_record.get("error_code"),
+    )
+    attempt_record["error_class"] = failure_class
+    attempt_record["error_code"] = error_code
+    return diagnostic
+
+
 def _attach_kimi_managed_account_publication_telemetry(
     *,
     attempt_record: dict[str, Any],
@@ -598,6 +647,11 @@ def _update_codex_auto_agent_retryable_attempt_record(
             metadata=kimi_failure_metadata,
         )
     attempt_record.update(update)
+    _attach_schema_rejection_to_attempt_record(
+        attempt_record=attempt_record,
+        exc=exc,
+        candidate=candidate,
+    )
     return error_tokens
 
 

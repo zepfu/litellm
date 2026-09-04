@@ -650,6 +650,39 @@ to Langfuse, session history, another built-in callback, or a custom logger.
 Use the structured fields to group and triage failures, but keep
 `.analysis/todo.md` as the source of truth for active work.
 
+## Schema-rejection diagnostics
+
+AAWM alias attempt records, route-audit events, terminal-audit events, and
+terminal-agent JSONL `context` can carry the same stable `schema_rejection`
+mapping when structured local or upstream evidence identifies a request or tool
+schema rejection. The mapping contains:
+
+- route identity: `provider` and `route_family`;
+- bounded classification: `stage`, `reason`, `category`, `object_type`, and
+  `safe_keys`;
+- optional bounded positions: `item_index` and `tool_index`;
+- sanitized upstream identity: `upstream_status`, `upstream_error_class`, and
+  `upstream_error_code`, when available;
+- optional `field_path` and `schema_category`. Field paths contain only
+  allowlisted dotted/indexed structural segments; sensitive, UUID, long-hex,
+  and other opaque segments are rejected.
+
+The diagnostic excludes raw prompts, tool descriptions, tool arguments and
+outputs, credentials, opaque identifiers, complete schemas, request or response
+bodies, and unrestricted exception or provider text. Structured validation
+details such as raw messages, input values, and validation context are also not
+serialized.
+
+`schema_rejection` is supplemental evidence and does not erase a meaningful
+failure identity. Existing specific failure classes and error codes remain
+authoritative. If the failure class or code is absent or generic
+(`provider_terminal_error` or `unclassified`), that component is recorded as
+`schema_rejection`.
+
+This mapping is observability-only. It does not change request validation,
+candidate routing, replay-safety decisions, retries or cooldown behavior, or
+provider and terms-of-service boundaries.
+
 ## Terminal agent error JSONL intake
 
 Some pass-through and AAWM alias failures terminate a spawned agent session

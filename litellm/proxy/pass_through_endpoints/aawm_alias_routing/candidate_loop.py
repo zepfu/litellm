@@ -71,7 +71,14 @@ from .interfaces import (
     RecordCodexFailureEvidenceFn,
     ResolveCooldownPublicationFn,
 )
+from .schema_rejections import (
+    SCHEMA_REJECTION_KEY,
+    normalize_schema_rejection,
+    resolve_schema_rejection_failure_identity,
+)
 from .state import alias_routing_state, validate_alias_family
+
+_MAX_ATTEMPT_FAILURE_PHASE_LENGTH = 128
 
 
 def _session_affinity_mod():
@@ -95,6 +102,35 @@ def _request_endpoint_path(request: Any) -> Optional[str]:
     except Exception:
         path = None
     return path if isinstance(path, str) else None
+
+
+def _store_attempt_failure_state(
+    attempt_record: dict[str, Any],
+    exc: Any,
+) -> bool:
+    attempted_provider_call = attempt_record.get("attempted_provider_call")
+    if not isinstance(attempted_provider_call, bool):
+        attempted_provider_call = getattr(exc, "attempted_provider_call", None)
+    if not isinstance(attempted_provider_call, bool):
+        attempted_provider_call = True
+    attempt_record["attempted_provider_call"] = attempted_provider_call
+
+    failure_phase = None
+    for value in (
+        attempt_record.get("failure_phase"),
+        getattr(exc, "failure_phase", None),
+        "provider_attempt",
+    ):
+        if (
+            isinstance(value, str)
+            and value
+            and len(value) <= _MAX_ATTEMPT_FAILURE_PHASE_LENGTH
+            and all(character.isalnum() or character in "._-" for character in value)
+        ):
+            failure_phase = value
+            break
+    attempt_record["failure_phase"] = failure_phase
+    return attempted_provider_call
 
 
 def _admission_mod():
@@ -743,6 +779,9 @@ async def handle_alias_route(  # noqa: PLR0915
     _record_auto_agent_alias_attempt_failure = _lpe._record_auto_agent_alias_attempt_failure
     from . import attempt_records as _attempt_records
 
+    _attach_schema_rejection_to_attempt_record = (
+        _attempt_records._attach_schema_rejection_to_attempt_record
+    )
     _record_auto_agent_alias_attempt_success = getattr(
         _lpe,
         "_record_auto_agent_alias_attempt_success",
@@ -863,6 +902,17 @@ async def handle_alias_route(  # noqa: PLR0915
                 attempts[-1][
                     codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
                 ] = copy.deepcopy(cursor_replay_fresh_dispatch_reject)
+                _attach_schema_rejection_to_attempt_record(
+                    attempt_record=attempts[-1],
+                    candidate=candidate,
+                    diagnostic=normalize_schema_rejection(
+                        {
+                            codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD: raw_rejection
+                        },
+                        provider=candidate.get("provider"),
+                        route_family=candidate.get("route_family"),
+                    ),
+                )
 
         def _capture_request_shape_summary() -> None:
             nonlocal cursor_replay_rejection_request_shape_summary
@@ -912,6 +962,17 @@ async def handle_alias_route(  # noqa: PLR0915
                     attempts[-1][
                         codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
                     ] = copy.deepcopy(cursor_replay_fresh_dispatch_reject)
+                    _attach_schema_rejection_to_attempt_record(
+                        attempt_record=attempts[-1],
+                        candidate=candidate,
+                        diagnostic=normalize_schema_rejection(
+                            {
+                                codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD: cursor_replay_fresh_dispatch_reject
+                            },
+                            provider=candidate.get("provider"),
+                            route_family=candidate.get("route_family"),
+                        ),
+                    )
             return None
         return _lpe._merge_litellm_metadata(
             fresh_fallback_body,
@@ -967,10 +1028,12 @@ async def handle_alias_route(  # noqa: PLR0915
             last_attempt[_CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD] = copy.deepcopy(
                 cursor_sanitized_proto_structure
             )
-        attempted_provider_call = last_attempt.get("attempted_provider_call")
-        if attempted_provider_call is None:
-            attempted_provider_call = getattr(exc, "attempted_provider_call", True)
-        attempted_provider_call = bool(attempted_provider_call)
+        attempted_provider_call = _store_attempt_failure_state(last_attempt, exc)
+        _attach_schema_rejection_to_attempt_record(
+            attempt_record=last_attempt,
+            exc=exc,
+            candidate=candidate,
+        )
         terminal_exc: Optional[HTTPException] = None
         if _is_cursor_session_continuation_failure(exc, candidate=candidate):
             detail = getattr(exc, "detail", None)
@@ -2177,6 +2240,11 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                 if error_class is None:
                     error_class = fresh_codex_auth_error_class
+                if attempt_record.get(SCHEMA_REJECTION_KEY) is not None:
+                    error_class, _ = resolve_schema_rejection_failure_identity(
+                        failure_class=error_class,
+                        error_code=attempt_record.get("error_code"),
+                    )
                 if error_class is None:
                     raise _proxy_exception_for_unclassified_probe_failure(failure_exc)
                 deterministically_ineligible = (
@@ -2691,6 +2759,14 @@ def _resolve_failure_plan(
     identifies a Codex configured alias, then resolves scope/target keys
     without cooldown-map or durable writes.
     """
+    from .attempt_records import _attach_schema_rejection_to_attempt_record
+
+    attempted_provider_call = _store_attempt_failure_state(attempt_record, exc)
+    schema_rejection = _attach_schema_rejection_to_attempt_record(
+        attempt_record=attempt_record,
+        exc=exc,
+        candidate=candidate,
+    )
     if (
         _error_signals._is_codex_auto_agent_candidate_deterministically_ineligible(
             exc
@@ -2707,11 +2783,6 @@ def _resolve_failure_plan(
             kimi_failure_metadata=None,
             allow_ttl_shrink=False,
         )
-    raw_attempted_provider_call = attempt_record.get("attempted_provider_call")
-    if raw_attempted_provider_call is None:
-        raw_attempted_provider_call = getattr(exc, "attempted_provider_call", True)
-    attempted_provider_call = bool(raw_attempted_provider_call)
-    attempt_record["attempted_provider_call"] = attempted_provider_call
 
     def _accepts_attempted_provider_call(fn: Any) -> bool:
         try:
@@ -2767,6 +2838,11 @@ def _resolve_failure_plan(
             error_class = classify_retryable_fn(exc, candidate=candidate)
     if error_class is None:
         error_class = fresh_codex_auth_error_class
+    if schema_rejection is not None:
+        error_class, _ = resolve_schema_rejection_failure_identity(
+            failure_class=error_class,
+            error_code=attempt_record.get("error_code"),
+        )
     grok_account_quota_exhausted = grok_quota_fn(exc, candidate=candidate)
     if _accepts_attempted_provider_call(cooldown_seconds_fn):
         cooldown_seconds = cooldown_seconds_fn(
