@@ -4,14 +4,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 from uuid import uuid4
 
-from .adapter import ChatGPTHistoryAdapter, FixtureTransport
+from .adapter import (
+    AuthenticationRequiredError,
+    ChatGPTHistoryAdapter,
+    FixtureTransport,
+    RateLimitedError,
+)
 from .config import AccountConfig, CollectorConfig
 from .ledger import Ledger
 from .models import ConversationSummary, MessageRecord
-from .privacy import SURFACE_CHAT, evidence_identity, observation_projection
+from .privacy import SURFACE_CHAT, evidence_identity, observation_projection, sanitize_identity
 from .reconstruct import reconstruct_attempts
 from .timeutil import ensure_utc, isoformat_utc, parse_datetime
 
@@ -53,18 +58,27 @@ class Collector:
     def _adapter_for(self, account: AccountConfig) -> ChatGPTHistoryAdapter:
         if self.adapter is not None:
             return self.adapter
-        if self.fixture_root is None:
-            raise RuntimeError(
-                "live Playwright collection is not enabled in this vertical slice; "
-                "pass --fixture-root for fixture-backed discovery"
+        adapter_name = account.browser.adapter
+        if adapter_name in {"fixture_history", "fixture"} or self.fixture_root is not None:
+            if self.fixture_root is None:
+                raise RuntimeError(
+                    "fixture_history adapter requires --fixture-root or a configured fixture directory"
+                )
+            transport = FixtureTransport(self.fixture_root)
+            return ChatGPTHistoryAdapter(
+                transport,
+                expected_identity={
+                    "provider_user_id": account.expected_provider_user_id,
+                    "workspace_id": account.expected_workspace_id,
+                },
             )
-        transport = FixtureTransport(self.fixture_root)
-        return ChatGPTHistoryAdapter(
-            transport,
-            expected_identity={
-                "provider_user_id": account.expected_provider_user_id,
-                "workspace_id": account.expected_workspace_id,
-            },
+        if adapter_name in {"playwright_persistent_context", "playwright"}:
+            from .browser import build_playwright_adapter
+
+            return build_playwright_adapter(account)
+        raise RuntimeError(
+            f"unknown browser.adapter {adapter_name!r}; supported values are "
+            "fixture_history and playwright_persistent_context"
         )
 
     def inspect_capabilities(self, account_id: Optional[str] = None) -> dict[str, Any]:
@@ -103,7 +117,6 @@ class Collector:
         adapter = self._adapter_for(account)
         now = ensure_utc(self.clock())
         run_id = str(uuid4())
-        warnings: list[str] = []
         self.ledger.upsert_account(
             {
                 "collector_account_id": account.id,
@@ -111,46 +124,12 @@ class Collector:
                 "workspace_id": account.expected_workspace_id,
                 "quota_owner_id": account.quota_owner_id,
                 "surface": SURFACE_CHAT,
-                "auth_state": "ready",
+                "auth_state": "unconfigured",
                 "plan_policy_id": account.plan_policy_id,
                 "enabled": account.enabled,
                 "profile_path": str(account.browser.profile_path),
             }
         )
-        identity = adapter.inspect_session()
-        if identity.get("auth_state") in {"auth_required", "identity_mismatch"}:
-            with self.ledger.transaction():
-                self.ledger.record_run_start(
-                    run_id=run_id,
-                    account_id=account.id,
-                    mode=mode,
-                    started_at=now,
-                    scheduled_for=scheduled_for,
-                    missed_intervals=missed_intervals,
-                )
-                self.ledger.finish_run(
-                    run_id,
-                    ended_at=self.clock(),
-                    result=identity["auth_state"],
-                    coverage="paused",
-                    error_class=identity["auth_state"],
-                    details={"identity": identity},
-                )
-            return RunResult(
-                run_id=run_id,
-                mode=mode,
-                result=identity["auth_state"],
-                coverage="paused",
-                new_attempts=0,
-                updated_attempts=0,
-                deduplicated_attempts=0,
-                conversations_seen=0,
-                pages_fetched=0,
-                missed_intervals=missed_intervals,
-                warnings=[identity["auth_state"]],
-                requests=list(getattr(adapter.transport, "requests", [])),
-            )
-        backfill_start = since or (now - account.scheduler.initial_backfill_duration)
         with self.ledger.transaction():
             self.ledger.record_run_start(
                 run_id=run_id,
@@ -160,6 +139,142 @@ class Collector:
                 scheduled_for=scheduled_for,
                 missed_intervals=missed_intervals,
             )
+        try:
+            try:
+                identity = sanitize_identity(adapter.inspect_session())
+            except AuthenticationRequiredError:
+                identity = {"surface": "unknown", "auth_state": "auth_required"}
+            self._persist_account_identity(account, identity)
+            if identity.get("auth_state") in {"auth_required", "identity_mismatch"}:
+                return self._finish_paused_run(
+                    account=account,
+                    adapter=adapter,
+                    run_id=run_id,
+                    mode=mode,
+                    identity=identity,
+                    missed_intervals=missed_intervals,
+                )
+            backfill_start = since or (now - account.scheduler.initial_backfill_duration)
+            return self._collect_history(
+                account=account,
+                adapter=adapter,
+                run_id=run_id,
+                mode=mode,
+                now=now,
+                backfill_start=backfill_start,
+                missed_intervals=missed_intervals,
+            )
+        except AuthenticationRequiredError as exc:
+            identity = {
+                "surface": "unknown",
+                "auth_state": "auth_required",
+            }
+            self._persist_account_identity(account, identity)
+            return self._finish_paused_run(
+                account=account,
+                adapter=adapter,
+                run_id=run_id,
+                mode=mode,
+                identity=identity,
+                missed_intervals=missed_intervals,
+                error_class=f"http_{exc.status}",
+            )
+        except RateLimitedError as exc:
+            ended = ensure_utc(self.clock())
+            with self.ledger.transaction():
+                self.ledger.finish_run(
+                    run_id,
+                    ended_at=ended,
+                    result="rate_limited",
+                    coverage="partial",
+                    error_class="http_429",
+                    details={
+                        "status": exc.status,
+                        "retry_after": exc.retry_after,
+                        "path": exc.path,
+                        "quota_exhaustion": False,
+                    },
+                )
+            raise
+
+    def _persist_account_identity(
+        self,
+        account: AccountConfig,
+        identity: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        safe = sanitize_identity(
+            {
+                "provider_user_id": identity.get("provider_user_id")
+                or account.expected_provider_user_id,
+                "workspace_id": identity.get("workspace_id") or account.expected_workspace_id,
+                "quota_owner_id": account.quota_owner_id,
+                "surface": identity.get("surface"),
+                "auth_state": identity.get("auth_state") or "unknown",
+            }
+        )
+        self.ledger.upsert_account(
+            {
+                "collector_account_id": account.id,
+                "provider_user_id": safe.get("provider_user_id"),
+                "workspace_id": safe.get("workspace_id"),
+                "quota_owner_id": safe.get("quota_owner_id") or account.quota_owner_id,
+                "surface": SURFACE_CHAT,
+                "auth_state": safe.get("auth_state") or "unknown",
+                "plan_policy_id": account.plan_policy_id,
+                "enabled": account.enabled,
+                "profile_path": str(account.browser.profile_path),
+            }
+        )
+        return safe
+
+    def _finish_paused_run(
+        self,
+        *,
+        account: AccountConfig,
+        adapter: ChatGPTHistoryAdapter,
+        run_id: str,
+        mode: str,
+        identity: Mapping[str, Any],
+        missed_intervals: int,
+        error_class: str | None = None,
+    ) -> RunResult:
+        auth_state = str(identity.get("auth_state") or "auth_required")
+        with self.ledger.transaction():
+            self.ledger.finish_run(
+                run_id,
+                ended_at=ensure_utc(self.clock()),
+                result=auth_state,
+                coverage="paused",
+                error_class=error_class or auth_state,
+                details={"identity": dict(identity)},
+            )
+        return RunResult(
+            run_id=run_id,
+            mode=mode,
+            result=auth_state,
+            coverage="paused",
+            new_attempts=0,
+            updated_attempts=0,
+            deduplicated_attempts=0,
+            conversations_seen=0,
+            pages_fetched=0,
+            missed_intervals=missed_intervals,
+            warnings=[auth_state],
+            requests=list(getattr(adapter.transport, "requests", [])),
+        )
+
+    def _collect_history(
+        self,
+        *,
+        account: AccountConfig,
+        adapter: ChatGPTHistoryAdapter,
+        run_id: str,
+        mode: str,
+        now: datetime,
+        backfill_start: datetime,
+        missed_intervals: int,
+    ) -> RunResult:
+        warnings: list[str] = []
         scopes = ["active"]
         if account.collection.include_archived:
             scopes.append("archived")
@@ -391,31 +506,12 @@ class Collector:
         records: list[MessageRecord] = []
         payload = adapter.fetch_conversation(summary.conversation_id)
         pages += 1
-        from .adapter import adapt_message_page, iter_mapping_messages
+        from .adapter import adapt_message_page
 
-        # Surface propagation: conversations discovered by the Chat collector
-        # are Chat conversations.  Default unknown / None surfaces to
-        # SURFACE_CHAT so that _ingest_messages, reconstruct_attempts, and
-        # reporting all see the correct surface, avoiding zero-count attempts.
-        effective_surface = (
-            summary.surface if summary.surface == SURFACE_CHAT else SURFACE_CHAT
-        )
-
-        if isinstance(payload.get("mapping"), dict):
-            mapping_warnings: list[str] = []
-            records.extend(
-                iter_mapping_messages(
-                    payload["mapping"],
-                    conversation_id=summary.conversation_id,
-                    warnings=mapping_warnings,
-                    conversation_surface=effective_surface,
-                )
-            )
-            warnings.extend(mapping_warnings)
         page = adapt_message_page(
             payload,
             conversation_id=summary.conversation_id,
-            conversation_surface=effective_surface,
+            conversation_surface=summary.surface,
         )
         records.extend(page.items)
         warnings.extend(page.warnings)
@@ -426,7 +522,11 @@ class Collector:
                 warnings.append("repeated_cursor")
                 break
             seen_cursors.add(str(cursor))
-            next_page = adapter.fetch_messages(summary.conversation_id, before=str(cursor))
+            next_page = adapter.fetch_messages(
+                summary.conversation_id,
+                before=str(cursor),
+                conversation_surface=summary.surface,
+            )
             pages += 1
             records.extend(next_page.items)
             warnings.extend(next_page.warnings)

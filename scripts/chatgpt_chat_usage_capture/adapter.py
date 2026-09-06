@@ -1,10 +1,4 @@
-"""Fixture-backed ChatGPT history adapter with explicit surface=chat.
-
-Live Playwright access is a later operator-authorized verification gate. This
-adapter implements the reviewed route contract against synthetic fixtures so
-discovery, pagination, sanitization, and reconstruction can be tested without
-credentials or provider writes.
-"""
+"""Read-only ChatGPT history adapter for fixture and browser transports."""
 
 from __future__ import annotations
 
@@ -16,7 +10,6 @@ from typing import Any, Mapping, Optional, Protocol
 from .models import AdaptedPage, CapabilityRecord, ConversationSummary, MessageRecord
 from .privacy import (
     ADAPTER_VERSION,
-    SURFACE_CHAT,
     classify_surface,
     sanitize_identity,
     sanitize_mapping,
@@ -41,6 +34,32 @@ class AdapterError(RuntimeError):
     """Raised when a history page cannot be adapted safely."""
 
 
+class AuthenticationRequiredError(AdapterError):
+    """An authentication challenge requires the account to pause."""
+
+    def __init__(self, message: str, *, status: int, path: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.path = path
+
+
+class RateLimitedError(AdapterError):
+    """HTTP 429 from a history read; never a Chat Pro quota-exhaustion signal."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int = 429,
+        retry_after: str | None = None,
+        path: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+        self.path = path
+
+
 class HistoryTransport(Protocol):
     def request(self, method: str, path: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         ...
@@ -61,15 +80,18 @@ class FixtureTransport:
         method = method.upper()
         if method not in ALLOWED_METHODS:
             raise AdapterError(f"method not allowlisted: {method} {path}")
-        if not any(path == prefix or path.startswith(prefix) for prefix in ALLOWED_PATH_PREFIXES):
-            if path not in {SESSION_ROUTE, INIT_ROUTE}:
-                raise AdapterError(f"path not allowlisted: {path}")
+        if not _is_allowed_path(path):
+            raise AdapterError(f"path not allowlisted: {path}")
         self.requests.append({"method": method, "path": path, "params": dict(params or {})})
         payload = _load_fixture(self.root, method, path, params or {})
-        if payload.get("http_status") in {401, 403}:
-            raise AdapterError(f"authentication required for {path}")
-        if payload.get("content_type") == "text/html":
-            raise AdapterError(f"HTML login page is not a JSON history page: {path}")
+        _raise_if_authentication_required(payload, path)
+        if str(payload.get("content_type") or "").lower().startswith("text/html"):
+            raise AuthenticationRequiredError(
+                f"HTML login page for {path}",
+                status=int(payload.get("http_status") or 200),
+                path=path,
+            )
+        _raise_if_rate_limited(payload, path)
         return payload
 
 
@@ -98,7 +120,12 @@ class ChatGPTHistoryAdapter:
         )
 
     def inspect_session(self) -> dict[str, Any]:
-        payload = self.transport.request("GET", SESSION_ROUTE)
+        try:
+            payload = self.transport.request("GET", SESSION_ROUTE)
+            _raise_if_authentication_required(payload, SESSION_ROUTE)
+            _raise_if_rate_limited(payload, SESSION_ROUTE)
+        except AuthenticationRequiredError:
+            return {"surface": "unknown", "auth_state": "auth_required"}
         identity = sanitize_identity(
             {
                 "provider_user_id": payload.get("user", {}).get("id")
@@ -111,7 +138,7 @@ class ChatGPTHistoryAdapter:
                 or payload.get("account", {}).get("id")
                 if isinstance(payload.get("account"), Mapping)
                 else payload.get("quota_owner_id"),
-                "surface": SURFACE_CHAT,
+                "surface": classify_surface(payload, default=None),
                 "auth_state": "ready" if payload.get("accessToken") or payload.get("user") else "auth_required",
             }
         )
@@ -121,7 +148,6 @@ class ChatGPTHistoryAdapter:
             identity["auth_state"] = "identity_mismatch"
         if expected_workspace and identity.get("workspace_id") not in {expected_workspace, None}:
             identity["auth_state"] = "identity_mismatch"
-        identity["surface"] = SURFACE_CHAT
         return identity
 
     def list_conversations(
@@ -142,36 +168,28 @@ class ChatGPTHistoryAdapter:
                 "is_archived": str(archived).lower(),
             },
         )
+        path = MODERN_INDEX
+        _raise_if_authentication_required(payload, path)
+        _raise_if_rate_limited(payload, path)
         return adapt_conversation_index(payload, archived=archived, offset=offset, limit=limit)
 
     def fetch_conversation(self, conversation_id: str) -> dict[str, Any]:
         modern_path = MODERN_DETAIL.format(conversation_id=conversation_id)
-        try:
-            payload = self.transport.request(
-                "GET",
-                modern_path,
-                {"include_has_versions": "true", "num_turns": 100},
-            )
-            status = int(payload.get("http_status") or 200)
-            if status in {404, 405}:
-                raise AdapterError("modern_missing")
-            if status == 429:
-                raise AdapterError(f"rate limited ({status}) for {conversation_id}; no fallback — caller must back off and retry")
-            if status in {401, 403}:
-                raise AdapterError(f"refusing legacy fallback after {status} for {conversation_id}")
-            return payload
-        except AdapterError as exc:
-            if "rate limited" in str(exc):
-                raise
-            if "modern_missing" not in str(exc) and "not found" not in str(exc).lower():
-                # Fixture transports encode missing modern detail as a 404 payload.
-                exc_payload: Any = getattr(exc, "payload", None)
-                if exc_payload is None:
-                    try:
-                        return self.transport.request("GET", LEGACY_DETAIL.format(conversation_id=conversation_id))
-                    except AdapterError:
-                        raise
-            return self.transport.request("GET", LEGACY_DETAIL.format(conversation_id=conversation_id))
+        payload = self.transport.request(
+            "GET",
+            modern_path,
+            {"include_has_versions": "true", "num_turns": 100},
+        )
+        _raise_if_authentication_required(payload, modern_path)
+        _raise_if_rate_limited(payload, modern_path)
+        status = int(payload.get("http_status") or 200)
+        if status in {404, 405}:
+            legacy_path = LEGACY_DETAIL.format(conversation_id=conversation_id)
+            legacy_payload = self.transport.request("GET", legacy_path)
+            _raise_if_authentication_required(legacy_payload, legacy_path)
+            _raise_if_rate_limited(legacy_payload, legacy_path)
+            return legacy_payload
+        return payload
 
     def fetch_messages(
         self,
@@ -179,6 +197,7 @@ class ChatGPTHistoryAdapter:
         *,
         before: str | None = None,
         num_turns: int = 100,
+        conversation_surface: str = "unknown",
     ) -> AdaptedPage:
         params: dict[str, Any] = {"include_has_versions": "true", "num_turns": num_turns}
         if before:
@@ -188,7 +207,19 @@ class ChatGPTHistoryAdapter:
             MODERN_MESSAGES.format(conversation_id=conversation_id),
             params,
         )
-        return adapt_message_page(payload, conversation_id=conversation_id)
+        path = MODERN_MESSAGES.format(conversation_id=conversation_id)
+        _raise_if_authentication_required(payload, path)
+        _raise_if_rate_limited(payload, path)
+        return adapt_message_page(
+            payload,
+            conversation_id=conversation_id,
+            conversation_surface=conversation_surface,
+        )
+
+    def close(self) -> None:
+        closer = getattr(self.transport, "close", None)
+        if callable(closer):
+            closer()
 
 
 def _load_fixture(root: Path, method: str, path: str, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -321,7 +352,14 @@ def adapt_message_page(payload: Mapping[str, Any], *, conversation_id: str, conv
     warnings: list[str] = []
     records: list[MessageRecord] = []
     if isinstance(payload.get("mapping"), Mapping):
-        records.extend(iter_mapping_messages(payload["mapping"], conversation_id=conversation_id, warnings=warnings, conversation_surface=classify_surface(payload, default="unknown")))
+        records.extend(
+            iter_mapping_messages(
+                payload["mapping"],
+                conversation_id=conversation_id,
+                warnings=warnings,
+                conversation_surface=classify_surface(payload, default=conversation_surface),
+            )
+        )
     messages = payload.get("messages")
     if isinstance(messages, list):
         for item in messages:
@@ -429,6 +467,36 @@ def message_from_node(
         origin=_optional_str(metadata.get("origin") or metadata.get("from_shared") and "shared"),
         metadata=sanitize_mapping(metadata),
     )
+
+
+def _raise_if_rate_limited(payload: Mapping[str, Any], path: str) -> None:
+    status = int(payload.get("http_status") or 200)
+    if status != 429:
+        return
+    headers = payload.get("headers") if isinstance(payload.get("headers"), Mapping) else {}
+    retry_after = payload.get("retry_after") or headers.get("Retry-After") or headers.get("retry-after")
+    raise RateLimitedError(
+        f"rate limited (429) for {path}; no legacy fallback and not quota exhaustion",
+        status=429,
+        retry_after=None if retry_after is None else str(retry_after),
+        path=path,
+    )
+
+
+def _raise_if_authentication_required(payload: Mapping[str, Any], path: str) -> None:
+    status = int(payload.get("http_status") or 200)
+    content_type = str(payload.get("content_type") or "").lower()
+    if status not in {401, 403} and not content_type.startswith("text/html"):
+        return
+    raise AuthenticationRequiredError(
+        f"authentication required ({status}) for {path}; legacy fallback is disabled",
+        status=status if status in {401, 403} else 401,
+        path=path,
+    )
+
+
+def _is_allowed_path(path: str) -> bool:
+    return any(path == prefix or path.startswith(f"{prefix}/") for prefix in ALLOWED_PATH_PREFIXES)
 
 
 def _optional_str(value: Any) -> Optional[str]:
