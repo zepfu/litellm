@@ -1,0 +1,1 @@
+{"user": {"id": "user-abc123", "name": "Test User", "email": "test@example.com"}, "accessToken": "sk-test-token-123", "workspace_id": "ws-xyz", "account": {"id": "user-abc123"}, "quota_owner_id": "user-abc123"}
