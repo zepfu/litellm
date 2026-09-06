@@ -159,10 +159,13 @@ from .aawm_alias_routing.output_guard_config import (
 from .aawm_alias_routing.audit_persist import _emit_aawm_terminal_error
 from .streaming_handler import (
     RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS,
-    RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
     PassThroughStreamingHandler,
     ResponsesStreamPreCommitFailure,
     _RESPONSES_TRANSIENT_CAPACITY_CLASSES,
+)
+from .aawm_alias_routing.pre_commit_retry import (
+    OpenAIAlphaCapacityRetryCoordinator,
+    _build_openai_capacity_target_identity,
 )
 from .success_handler import PassThroughEndpointLogging
 
@@ -1667,7 +1670,7 @@ def _mark_passthrough_hidden_retry_budget_exhausted(
     )
 
 
-async def _execute_passthrough_pre_first_byte_with_hidden_retries(
+async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0915
     *,
     kwargs: Optional[dict],
     operation_name: str,
@@ -1675,13 +1678,24 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(
     caller_managed_hidden_retry: bool,
     url: Optional[httpx.URL] = None,
     custom_llm_provider: Optional[str] = None,
+    openai_capacity_coordinator: Optional[
+        OpenAIAlphaCapacityRetryCoordinator
+    ] = None,
 ) -> Any:
     if caller_managed_hidden_retry:
         return await operation()
 
-    max_attempts = len(PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS) + 1
+    max_attempts = (
+        0
+        if openai_capacity_coordinator is not None
+        else len(PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS) + 1
+    )
     # Wall-clock budget independent of per-attempt HTTP timeout (RR-056 / B2).
-    budget_seconds = _get_passthrough_hidden_retry_budget_seconds()
+    budget_seconds = (
+        openai_capacity_coordinator.deadline_seconds
+        if openai_capacity_coordinator is not None
+        else _get_passthrough_hidden_retry_budget_seconds()
+    )
     start_monotonic = time.monotonic()
     attempt_number = 0
     while True:
@@ -1689,14 +1703,23 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(
         try:
             timeout_seconds: Optional[float] = None
             if budget_seconds > 0:
-                timeout_seconds = budget_seconds
+                timeout_seconds = (
+                    openai_capacity_coordinator.remaining_seconds
+                    if openai_capacity_coordinator is not None
+                    else budget_seconds
+                )
                 if attempt_number > 1:
-                    timeout_seconds -= time.monotonic() - start_monotonic
+                    timeout_seconds = max(
+                        0.0,
+                        timeout_seconds - (time.monotonic() - start_monotonic),
+                    )
             result = await _await_passthrough_pre_first_byte_operation(
                 operation,
                 timeout_seconds=timeout_seconds,
                 operation_name=operation_name,
             )
+            if openai_capacity_coordinator is not None:
+                await openai_capacity_coordinator.signal_success()
             if attempt_number > 1:
                 _record_passthrough_hidden_retry_metadata(
                     kwargs,
@@ -1754,12 +1777,47 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(
                 custom_llm_provider=custom_llm_provider,
             )
             if (
-                isinstance(exc, ResponsesStreamPreCommitFailure)
+                openai_capacity_coordinator is not None
+                and isinstance(exc, ResponsesStreamPreCommitFailure)
+                and exc.error_class in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
+                and exc.retryable
+            ):
+                if not openai_capacity_coordinator.within_deadline():
+                    exc.pre_commit_retry_exhausted = True
+                    openai_capacity_coordinator.record_terminal(
+                        "deadline_exhausted"
+                    )
+                    _record_passthrough_hidden_retry_metadata(
+                        kwargs,
+                        attempt_number=attempt_number,
+                        max_attempts=0,
+                        status_code=status_code,
+                        failure_class=failure_class,
+                        wait_seconds=0.0,
+                        final_outcome="failed_after_retry",
+                        failure_classification=failure_classification,
+                    )
+                    _mark_passthrough_hidden_retry_budget_exhausted(
+                        kwargs,
+                        budget_seconds=openai_capacity_coordinator.deadline_seconds,
+                        elapsed_seconds=openai_capacity_coordinator.elapsed_seconds,
+                    )
+                    raise
+                wait_seconds = openai_capacity_coordinator.next_wait_seconds()
+                should_retry = True
+            else:
+                wait_seconds = 0.0
+            if (
+                openai_capacity_coordinator is None
+                and isinstance(exc, ResponsesStreamPreCommitFailure)
                 and attempt_number >= RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS
             ):
                 should_retry = False
                 exc.pre_commit_retry_exhausted = True
-            if not should_retry or attempt_number >= max_attempts:
+            if not should_retry or (
+                openai_capacity_coordinator is None
+                and attempt_number >= max_attempts
+            ):
                 _record_passthrough_hidden_retry_metadata(
                     kwargs,
                     attempt_number=attempt_number,
@@ -1777,19 +1835,20 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(
                 raise
 
             if isinstance(exc, ResponsesStreamPreCommitFailure):
-                wait_seconds = float(
-                    exc.retry_after_seconds
-                    or RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS
-                )
+                if openai_capacity_coordinator is None:
+                    wait_seconds = float(exc.retry_after_seconds or 10.0)
             else:
-                wait_seconds = _get_passthrough_hidden_retry_wait_seconds(
-                    attempt_number - 1
-                )
+                if openai_capacity_coordinator is None:
+                    wait_seconds = _get_passthrough_hidden_retry_wait_seconds(
+                        attempt_number - 1
+                    )
             elapsed_seconds = time.monotonic() - start_monotonic
             # Stop when wall-clock budget is already exhausted, or when the next
             # fixed backoff alone would push total elapsed past the ceiling.
             # budget_seconds <= 0 disables this bound (attempt-count still applies).
             budget_exhausted = bool(
+                openai_capacity_coordinator is None
+                and
                 budget_seconds > 0
                 and (
                     elapsed_seconds >= budget_seconds
@@ -1845,7 +1904,13 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(
                 failure_class,
                 wait_seconds,
             )
-            await _passthrough_hidden_retry_sleep(wait_seconds)
+            if openai_capacity_coordinator is not None:
+                wakeup_reason = await openai_capacity_coordinator.sleep_with_wakeup(
+                    wait_seconds
+                )
+                openai_capacity_coordinator.record_retry(wakeup_reason)
+            else:
+                await _passthrough_hidden_retry_sleep(wait_seconds)
 
 
 def _clean_passthrough_error_context_value(value: Any) -> Optional[str]:
@@ -1943,6 +2008,30 @@ def _is_openai_passthrough_responses_error_context(
             "/backend-api/codex/responses/",
             "/responses/",
         )
+    )
+
+
+def _is_openai_alpha_capacity_retry_target(
+    *,
+    request: Any,
+    url: httpx.URL,
+    endpoint_type: EndpointType,
+) -> bool:
+    """Limit the long capacity retry budget to the central OpenAI Responses route."""
+    if endpoint_type != EndpointType.OPENAI:
+        return False
+    incoming_path = str(getattr(getattr(request, "url", None), "path", "") or "")
+    if "/openai_passthrough/" not in incoming_path:
+        return False
+    if not incoming_path.rstrip("/").endswith(("responses", "v1/responses")):
+        return False
+    parsed_url = urlparse(str(url))
+    hostname = (parsed_url.hostname or "").lower()
+    upstream_path = (parsed_url.path or "").rstrip("/")
+    if hostname == "api.openai.com" and upstream_path.endswith("/v1/responses"):
+        return True
+    return hostname == "chatgpt.com" and upstream_path.endswith(
+        "/backend-api/codex/responses"
     )
 
 
@@ -4656,6 +4745,23 @@ async def pass_through_request(  # noqa: PLR0915
                     exc_info=True,
                 )
 
+            capacity_retry_coordinator = None
+            if _is_openai_alpha_capacity_retry_target(
+                request=request,
+                url=url,
+                endpoint_type=endpoint_type,
+            ):
+                capacity_retry_coordinator = OpenAIAlphaCapacityRetryCoordinator(
+                    target_identity=_build_openai_capacity_target_identity(
+                        provider="openai",
+                        model=(
+                            str(provider_bound_body.get("model") or "")
+                            if isinstance(provider_bound_body, dict)
+                            else None
+                        ),
+                    )
+                )
+
             async def _send_stream_pre_first_byte() -> Tuple[
                 httpx.Response, httpx.Request
             ]:
@@ -4719,6 +4825,7 @@ async def pass_through_request(  # noqa: PLR0915
                         response
                     )
                     if pre_commit_failure is not None:
+                        await response.aclose()
                         raise pre_commit_failure
                 return response, req
 
@@ -4735,6 +4842,7 @@ async def pass_through_request(  # noqa: PLR0915
                         caller_managed_hidden_retry=caller_managed_hidden_retry,
                         url=url,
                         custom_llm_provider=custom_llm_provider,
+                        openai_capacity_coordinator=capacity_retry_coordinator,
                     ),
                 )
             except ResponsesStreamPreCommitFailure as pre_commit_exc:
