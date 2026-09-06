@@ -118,6 +118,11 @@ from litellm.llms.cursor_agent.usage import (
     hash_cursor_agent_auth_jwt_identity,
     parse_current_period_usage,
 )
+from litellm.llms.chatgpt.conversation_init import (
+    CHATGPT_CONVERSATION_INIT_DEFAULT_URL,
+    ChatGPTConversationInitError,
+    collect_conversation_init_observations,
+)
 
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -356,6 +361,12 @@ DEFAULT_CURSOR_AGENT_USAGE_POLL_ENABLED = False
 DEFAULT_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS = 600.0
 DEFAULT_CURSOR_AGENT_USAGE_POLL_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_CURSOR_AGENT_USAGE_DASHBOARD_URL = CURSOR_AGENT_DASHBOARD_HOST
+DEFAULT_CHATGPT_CONVERSATION_INIT_POLL_ENABLED = False
+DEFAULT_CHATGPT_CONVERSATION_INIT_POLL_INTERVAL_SECONDS = 600.0
+DEFAULT_CHATGPT_CONVERSATION_INIT_SOURCE_PATH = (
+    "/run/aawm/chatgpt/conversation-init.json"
+)
+DEFAULT_CHATGPT_CONVERSATION_INIT_URL = CHATGPT_CONVERSATION_INIT_DEFAULT_URL
 DEFAULT_GROK_BILLING_POLL_ENABLED = False
 DEFAULT_GROK_BILLING_POLL_INTERVAL_SECONDS = 600.0
 DEFAULT_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS = 30.0
@@ -1502,6 +1513,16 @@ class ProviderStatusLoopConfig:
         DEFAULT_CURSOR_AGENT_USAGE_POLL_HTTP_TIMEOUT_SECONDS
     )
     cursor_agent_usage_dashboard_url: str = DEFAULT_CURSOR_AGENT_USAGE_DASHBOARD_URL
+    chatgpt_conversation_init_poll_enabled: bool = (
+        DEFAULT_CHATGPT_CONVERSATION_INIT_POLL_ENABLED
+    )
+    chatgpt_conversation_init_poll_interval_seconds: float = (
+        DEFAULT_CHATGPT_CONVERSATION_INIT_POLL_INTERVAL_SECONDS
+    )
+    chatgpt_conversation_init_source_path: str = (
+        DEFAULT_CHATGPT_CONVERSATION_INIT_SOURCE_PATH
+    )
+    chatgpt_conversation_init_url: str = DEFAULT_CHATGPT_CONVERSATION_INIT_URL
     grok_billing_url: str = DEFAULT_GROK_BILLING_URL
     grok_billing_client_version: Optional[str] = None
     grok_billing_client_version_source: Optional[str] = None
@@ -1607,6 +1628,7 @@ class SidecarTaskState:
     grok_billing_last_attempt_monotonic: Optional[float] = None
     xai_reset_poll_last_attempt_monotonic: Optional[float] = None
     cursor_agent_usage_last_attempt_monotonic: Optional[float] = None
+    chatgpt_conversation_init_last_attempt_monotonic: Optional[float] = None
     codex_reset_credit_last_attempt_monotonic_by_label: Dict[str, float] = (
         dataclass_field(default_factory=dict)
     )
@@ -3051,6 +3073,66 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "This is not the agentn turn host and not Cloud Agents /v0/me."
         ),
     )
+    chatgpt_init_group = parser.add_mutually_exclusive_group()
+    chatgpt_init_group.add_argument(
+        "--chatgpt-conversation-init-poll-enabled",
+        dest="chatgpt_conversation_init_poll_enabled",
+        action="store_true",
+        default=_env_bool(
+            "AAWM_CHATGPT_CONVERSATION_INIT_POLL_ENABLED",
+            DEFAULT_CHATGPT_CONVERSATION_INIT_POLL_ENABLED,
+        ),
+        help=(
+            "Read a credential-safe ChatGPT conversation-init fixture into "
+            "rate_limit_observations. Disabled by default. The sidecar never "
+            "HTTP-calls chatgpt.com or reads Oracle cookies. Defaults to "
+            "AAWM_CHATGPT_CONVERSATION_INIT_POLL_ENABLED or false."
+        ),
+    )
+    chatgpt_init_group.add_argument(
+        "--no-chatgpt-conversation-init-poll",
+        dest="chatgpt_conversation_init_poll_enabled",
+        action="store_false",
+        help="Disable ChatGPT conversation-init fixture polling.",
+    )
+    parser.add_argument(
+        "--chatgpt-conversation-init-poll-interval-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_CHATGPT_CONVERSATION_INIT_POLL_INTERVAL_SECONDS",
+            DEFAULT_CHATGPT_CONVERSATION_INIT_POLL_INTERVAL_SECONDS,
+        ),
+        help=(
+            "Minimum seconds between ChatGPT conversation-init poll attempts. "
+            "Defaults to AAWM_CHATGPT_CONVERSATION_INIT_POLL_INTERVAL_SECONDS "
+            "or 600."
+        ),
+    )
+    parser.add_argument(
+        "--chatgpt-conversation-init-source-path",
+        default=os.getenv(
+            "AAWM_CHATGPT_CONVERSATION_INIT_SOURCE_PATH",
+            DEFAULT_CHATGPT_CONVERSATION_INIT_SOURCE_PATH,
+        ),
+        help=(
+            "Regular-file JSON snapshot from the browser-boundary collector. "
+            "Defaults to AAWM_CHATGPT_CONVERSATION_INIT_SOURCE_PATH or "
+            "/run/aawm/chatgpt/conversation-init.json. Must not be empty."
+        ),
+    )
+    parser.add_argument(
+        "--chatgpt-conversation-init-url",
+        default=os.getenv(
+            "AAWM_CHATGPT_CONVERSATION_INIT_URL",
+            DEFAULT_CHATGPT_CONVERSATION_INIT_URL,
+        ),
+        help=(
+            "Documented ChatGPT conversation-init URL for the current POST "
+            "no-body contract. The sidecar does not fetch this URL. Defaults "
+            "to AAWM_CHATGPT_CONVERSATION_INIT_URL or "
+            "https://chatgpt.com/backend-api/conversation/init."
+        ),
+    )
 
     codex_credit_group = parser.add_mutually_exclusive_group()
     codex_credit_group.add_argument(
@@ -3230,6 +3312,7 @@ def _validate_config_args(args: argparse.Namespace) -> None:
     _validate_grok_billing_config_args(args)
     _validate_xai_reset_poll_config_args(args)
     _validate_cursor_agent_usage_config_args(args)
+    _validate_chatgpt_conversation_init_config_args(args)
     _validate_observability_anomaly_scan_config_args(args)
     _validate_codex_reset_credit_poll_config_args(args)
 
@@ -3474,6 +3557,22 @@ def _validate_cursor_agent_usage_config_args(args: argparse.Namespace) -> None:
         raise SystemExit("--cursor-agent-usage-dashboard-url must not be empty")
 
 
+def _validate_chatgpt_conversation_init_config_args(
+    args: argparse.Namespace,
+) -> None:
+    if args.chatgpt_conversation_init_poll_interval_seconds <= 0:
+        raise SystemExit(
+            "--chatgpt-conversation-init-poll-interval-seconds must be "
+            "greater than 0"
+        )
+    if not str(args.chatgpt_conversation_init_source_path).strip():
+        raise SystemExit(
+            "--chatgpt-conversation-init-source-path must not be empty"
+        )
+    if not str(args.chatgpt_conversation_init_url).strip():
+        raise SystemExit("--chatgpt-conversation-init-url must not be empty")
+
+
 def _validate_grok_billing_config_args(args: argparse.Namespace) -> None:
     if args.grok_billing_poll_interval_seconds <= 0:
         raise SystemExit("--grok-billing-poll-interval-seconds must be greater than 0")
@@ -3692,6 +3791,18 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         ),
         cursor_agent_usage_dashboard_url=str(
             args.cursor_agent_usage_dashboard_url
+        ).strip(),
+        chatgpt_conversation_init_poll_enabled=(
+            args.chatgpt_conversation_init_poll_enabled
+        ),
+        chatgpt_conversation_init_poll_interval_seconds=(
+            args.chatgpt_conversation_init_poll_interval_seconds
+        ),
+        chatgpt_conversation_init_source_path=str(
+            args.chatgpt_conversation_init_source_path
+        ).strip(),
+        chatgpt_conversation_init_url=str(
+            args.chatgpt_conversation_init_url
         ).strip(),
         grok_billing_url=args.grok_billing_url,
         grok_billing_client_version=args.grok_billing_client_version,
@@ -8228,6 +8339,59 @@ def _persist_cursor_agent_usage_observations(
             try:
                 with conn.cursor() as cur:
                     _set_cursor_agent_usage_database_timeouts(
+                        cur,
+                        lock_timeout_ms=config.db_lock_timeout_ms,
+                        statement_timeout_ms=config.db_statement_timeout_ms,
+                    )
+                    for payload in payloads:
+                        cur.execute(GROK_BILLING_RATE_LIMIT_INSERT_SQL, payload)
+                        inserted_count += max(0, cur.rowcount)
+            except (
+                probes.psycopg.errors.LockNotAvailable,
+                probes.psycopg.errors.QueryCanceled,
+            ) as exc:
+                conn.rollback()
+                raise probes.ProviderStatusDatabaseWriteSkipped(
+                    error_class=exc.__class__.__name__,
+                    message=str(exc),
+                ) from exc
+    except probes.ProviderStatusDatabaseWriteSkipped:
+        raise
+    return inserted_count
+
+
+def _set_chatgpt_conversation_init_database_timeouts(
+    cur: Any,
+    *,
+    lock_timeout_ms: int,
+    statement_timeout_ms: int,
+) -> None:
+    cur.execute(
+        "SELECT set_config('application_name', %s, false)",
+        (
+            f"{probes._provider_status_db_application_name()}-chatgpt-conversation-init",
+        ),
+    )
+    cur.execute("SELECT set_config('lock_timeout', %s, true)", (f"{lock_timeout_ms}ms",))
+    cur.execute(
+        "SELECT set_config('statement_timeout', %s, true)",
+        (f"{statement_timeout_ms}ms",),
+    )
+
+
+def _persist_chatgpt_conversation_init_observations(
+    config: ProviderStatusLoopConfig,
+    payloads: Sequence[tuple[Any, ...]],
+) -> int:
+    if not payloads:
+        return 0
+    dsn = _resolve_dsn(config)
+    inserted_count = 0
+    try:
+        with probes.psycopg.connect(dsn) as conn:
+            try:
+                with conn.cursor() as cur:
+                    _set_chatgpt_conversation_init_database_timeouts(
                         cur,
                         lock_timeout_ms=config.db_lock_timeout_ms,
                         statement_timeout_ms=config.db_statement_timeout_ms,
@@ -13466,6 +13630,92 @@ def _run_cursor_agent_usage_poll_task(
     }
 
 
+def _run_chatgpt_conversation_init_poll_task(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+) -> Optional[Dict[str, Any]]:
+    if not config.chatgpt_conversation_init_poll_enabled:
+        return None
+    last_attempt = state.chatgpt_conversation_init_last_attempt_monotonic
+    if (
+        last_attempt is not None
+        and now_monotonic - last_attempt
+        < config.chatgpt_conversation_init_poll_interval_seconds
+    ):
+        return None
+
+    state.chatgpt_conversation_init_last_attempt_monotonic = now_monotonic
+    observed_at = datetime.now(timezone.utc)
+    summary: Dict[str, Any] = {
+        "attempted": True,
+        "persisted": False,
+        "skipped": False,
+        "observation_count": 0,
+        "inserted_count": 0,
+        "status_code": None,
+        "telemetry_class": None,
+        "telemetry_status": None,
+        "error_class": None,
+        "error_message": None,
+        "last_good_state_retained": False,
+        "collector_source": "file",
+        "request_method": "POST",
+        "request_body_omitted": True,
+        "has_model_message": False,
+        "has_conversation_content": False,
+    }
+    try:
+        payloads, parser_summary = collect_conversation_init_observations(
+            config.chatgpt_conversation_init_source_path,
+            observed_at=observed_at,
+            request_url=config.chatgpt_conversation_init_url,
+        )
+        summary.update(parser_summary)
+        summary["observation_count"] = len(payloads)
+        if config.apply and payloads:
+            summary["inserted_count"] = (
+                _persist_chatgpt_conversation_init_observations(
+                    config,
+                    payloads,
+                )
+            )
+            summary["persisted"] = True
+        if not payloads:
+            summary["last_good_state_retained"] = True
+            if summary.get("telemetry_class") is None:
+                status = summary.get("telemetry_status")
+                if status == "auth":
+                    summary["telemetry_class"] = "auth"
+                elif status in {"malformed", "missing_account_identity"}:
+                    summary["telemetry_class"] = "malformed_telemetry"
+                elif status:
+                    summary["telemetry_class"] = "http_error"
+    except probes.ProviderStatusDatabaseWriteSkipped as exc:
+        summary["error_class"] = exc.__class__.__name__
+        summary["error_message"] = _redacted_failure_message(str(exc))
+        summary["telemetry_class"] = "database_write_skipped"
+        summary["skipped"] = True
+        summary["last_good_state_retained"] = True
+    except Exception as exc:
+        summary["error_class"] = exc.__class__.__name__
+        summary["error_message"] = _redacted_failure_message(str(exc))
+        summary["last_good_state_retained"] = True
+        if isinstance(exc, ChatGPTConversationInitError):
+            summary["status_code"] = exc.status_code
+            summary["telemetry_class"] = exc.telemetry_class
+        else:
+            summary["telemetry_class"] = "malformed_telemetry"
+
+    return {
+        "event": "chatgpt_conversation_init_poll",
+        "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+        "environment": config.environment,
+        **summary,
+    }
+
+
 def _alibaba_subscription_refresh_due(
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
@@ -13947,6 +14197,10 @@ def run_due_sidecar_tasks(
         (_run_kimi_usage_poll_task, "kimi_usage_poll"),
         (_run_zai_coding_plan_quota_poll_task, "zai_coding_plan_quota_poll"),
         (_run_cursor_agent_usage_poll_task, "cursor_agent_usage_poll"),
+        (
+            _run_chatgpt_conversation_init_poll_task,
+            "chatgpt_conversation_init_poll",
+        ),
         (_run_alibaba_quota_poll_task, "alibaba_quota_poll"),
         (_run_grok_billing_poll_task, "grok_billing_poll"),
         (_run_xai_reset_poll_task, "xai_reset_poll"),

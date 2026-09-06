@@ -757,6 +757,51 @@ helpers (`constants.py`, `dashboard.py`, and `usage.py`). It does not
 package the full `cursor_agent` provider, `common_utils.py`, or `httpx`.
 Dashboard polling uses `urllib` with those stdlib helpers.
 
+## ChatGPT conversation-init observations
+
+The current ChatGPT frontend issues `POST /backend-api/conversation/init` with
+no body. GET is invalid: a browser GET returned HTTP 400
+`{"detail":"Invalid conversation init"}`, and a headless GET returned HTTP 403.
+The collector must not submit a model message or conversation content.
+
+This path has two cooperating pieces:
+
+- Browser-boundary collector: `litellm/llms/chatgpt/conversation_init.py`
+  accepts an injected transport, issues the no-body POST contract, redacts
+  cookies, tokens, headers, raw storage, and personal fields, then atomically
+  writes a credential-safe JSON snapshot. It refuses symlink destinations.
+  Fixture transports make this unit-testable without live auth.
+- Sidecar file consumer: `scripts/run_provider_status_observations_loop.py`
+  rereads that snapshot from a regular file. The sidecar never HTTP-calls
+  chatgpt.com, never reads Oracle cookies, and never ships `authenticator.py`,
+  `common_utils.py`, or `httpx`.
+
+The sidecar image copies only `conversation_init.py` and touches
+`litellm/llms/chatgpt/__init__.py`. Persist uses the existing
+`rate_limit_observations` insert path. Account identifiers and collector source
+paths are hashed; titles, names, usernames, workspace fields, feature notes,
+emails, cookies, and tokens are redacted. Snapshot `raw_provider_fields` omit
+`observed_at` so repeated identical polls do not defeat dedup. Empty
+`model_limits`, `limits_progress`, or `blocked_features` collections, and
+absent fields, are `empty_unknown` / `absent_unknown`. They are not proof of
+unlimited capacity or zero usage. HTTP 400/403, authentication loss, malformed
+JSON, and non-init shapes retain the last valid observation.
+
+Relevant environment variables:
+
+- `AAWM_CHATGPT_CONVERSATION_INIT_POLL_ENABLED`: enables the sidecar file
+  consumer. Defaults to disabled.
+- `AAWM_CHATGPT_CONVERSATION_INIT_POLL_INTERVAL_SECONDS`: minimum seconds
+  between attempts; default `600`.
+- `AAWM_CHATGPT_CONVERSATION_INIT_SOURCE_PATH`: regular-file JSON snapshot;
+  default `/run/aawm/chatgpt/conversation-init.json`.
+- `AAWM_CHATGPT_CONVERSATION_INIT_URL`: documented POST URL. The sidecar does
+  not fetch this URL.
+
+Live authenticated Oracle-browser proof remains an explicit acceptance gap.
+Fixture collector coverage does not claim live counts or a successful
+authenticated POST from the Oracle browser.
+
 ## Alibaba Token Plan quota polling
 
 The provider-status sidecar can poll the authenticated ModelStudio Token Plan
