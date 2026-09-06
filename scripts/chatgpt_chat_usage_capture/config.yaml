@@ -1,0 +1,99 @@
+# ChatGPT ordinary Chat usage collector configuration (D1-752)
+schema_version: 1
+
+application:
+  name: chatgpt-chat-usage-capture
+  report_timezone: America/New_York
+  database_path: ./state/usage.sqlite
+  persist_message_content: false
+  bind_host: 127.0.0.1
+  bind_port: 8765
+
+accounts:
+  - id: default
+    enabled: true
+    provider: openai
+    surface: chat
+    plan_policy_id: pro200-chat-2026-09-05
+    browser:
+      adapter: fixture_history
+      profile_path: ./state/browser/default
+      headless: false
+      allow_interactive_login: true
+    scheduler:
+      refresh_interval: PT1H
+      reconciliation_interval: PT24H
+      jitter_seconds: 60
+      catch_up: coalesce
+      refresh_on_startup: if_due
+      overlap_duration: PT48H
+      initial_backfill_duration: P14D
+      reconciliation_lookback: P14D
+    collection:
+      include_archived: true
+      include_projects: true
+      require_surface_evidence: true
+      request_gap_ms: 1000
+      request_timeout_seconds: 30
+      max_http_attempts_per_run: 500
+      max_run_seconds: 1200
+      max_pages_per_conversation_per_run: 100
+      observe_quota_metadata: true
+
+accounting:
+  working_estimator: requested_if_known_else_recorded_final
+  count_only_generation_started_or_completed: true
+  uncertain_attempts_in_working_estimate: false
+  include_unknown_surface_in_chat: false
+  missing_quota_window_behavior: show_activity_only
+  boundary_convention: start_inclusive_end_exclusive
+
+model_mapping:
+  version: initial-unmapped
+  canonical_families:
+    - astra_pro
+    - sol_pro
+    - other_chat
+    - unknown
+  exact_rules: []
+  unknown_behavior: preserve_and_report
+
+quota_policies:
+  - id: pro200-chat-2026-09-05
+    status: documented_seed_requires_account_verification
+    surface: chat
+    buckets:
+      - id: pro200-astra-chat
+        families:
+          - astra_pro
+        capacity: 200
+        unit: message
+        documented_period_hint: weekly
+        membership: union_once_per_attempt
+        window:
+          type: unknown
+      - id: pro200-sol-chat
+        families:
+          - sol_pro
+        capacity: 200
+        unit: message
+        documented_period_hint: weekly
+        membership: union_once_per_attempt
+        window:
+          type: unknown
+      - id: pro200-other-chat
+        families:
+          - other_chat
+        capacity: 200
+        unit: message
+        documented_period_hint: weekly
+        membership: union_once_per_attempt
+        window:
+          type: unknown
+
+reporting:
+  default_lookback: P7D
+
+retention:
+  sanitized_observation_days: 45
+  normalized_attempt_days: 180
