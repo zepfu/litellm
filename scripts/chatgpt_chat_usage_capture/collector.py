@@ -104,19 +104,20 @@ class Collector:
         now = ensure_utc(self.clock())
         run_id = str(uuid4())
         warnings: list[str] = []
-        self.ledger.upsert_account(
-            {
-                "collector_account_id": account.id,
-                "provider_user_id": account.expected_provider_user_id,
-                "workspace_id": account.expected_workspace_id,
-                "quota_owner_id": account.quota_owner_id,
-                "surface": SURFACE_CHAT,
-                "auth_state": "ready",
-                "plan_policy_id": account.plan_policy_id,
-                "enabled": account.enabled,
-                "profile_path": str(account.browser.profile_path),
-            }
-        )
+        with self.ledger.transaction():
+            self.ledger.upsert_account(
+                {
+                    "collector_account_id": account.id,
+                    "provider_user_id": account.expected_provider_user_id,
+                    "workspace_id": account.expected_workspace_id,
+                    "quota_owner_id": account.quota_owner_id,
+                    "surface": SURFACE_CHAT,
+                    "auth_state": "ready",
+                    "plan_policy_id": account.plan_policy_id,
+                    "enabled": account.enabled,
+                    "profile_path": str(account.browser.profile_path),
+                }
+            )
         identity = adapter.inspect_session()
         if identity.get("auth_state") in {"auth_required", "identity_mismatch"}:
             with self.ledger.transaction():
@@ -439,28 +440,29 @@ class Collector:
                 break
             cursor = next_page.continuation
         coverage = "partial" if warnings else "validated_page"
-        self.ledger.mark_conversation_fetched(account.id, summary.conversation_id, coverage)
-        self.ledger.insert_observation(
-            account_id=account.id,
-            source_kind="conversation",
-            source_id=summary.conversation_id,
-            revision=isoformat_utc(summary.updated_at) or run_id,
-            surface=summary.surface,
-            conversation_id=summary.conversation_id,
-            payload=observation_projection(
-                {
-                    "id": summary.conversation_id,
-                    "update_time": isoformat_utc(summary.updated_at),
-                    "surface": summary.surface,
-                    "message_count": len(records),
-                },
+        with self.ledger.transaction():
+            self.ledger.mark_conversation_fetched(account.id, summary.conversation_id, coverage)
+            self.ledger.insert_observation(
+                account_id=account.id,
                 source_kind="conversation",
+                source_id=summary.conversation_id,
+                revision=isoformat_utc(summary.updated_at) or run_id,
+                surface=summary.surface,
+                conversation_id=summary.conversation_id,
+                payload=observation_projection(
+                    {
+                        "id": summary.conversation_id,
+                        "update_time": isoformat_utc(summary.updated_at),
+                        "surface": summary.surface,
+                        "message_count": len(records),
+                    },
+                    source_kind="conversation",
+                    run_id=run_id,
+                    evidence_id=summary.conversation_id,
+                ),
+                observed_at=now,
                 run_id=run_id,
-                evidence_id=summary.conversation_id,
-            ),
-            observed_at=now,
-            run_id=run_id,
-        )
+            )
         return records, pages, warnings
 
     def _ingest_messages(
