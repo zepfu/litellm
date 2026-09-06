@@ -66,6 +66,12 @@ from .policy import (
 )
 from .interfaces import ProviderAttributedModelUnavailableMatch
 from .types import Payload
+from .retry import (
+    OpenAIAlphaCapacityRetryBudget,
+    openai_alpha_capacity_retry_wait_seconds,
+    openai_alpha_capacity_retry_within_deadline,
+)
+
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -2441,7 +2447,11 @@ _RESPONSES_PRE_COMMIT_ACCOUNT_EXHAUSTION_CLASSES = frozenset(
         "usage_limit_reached",
     }
 )
+# Legacy alias preserved for existing callers that reference the old constant.
+# The progressive schedule in retry.py is authoritative for wait durations.
 RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS = 10.0
+# No longer bounded by a fixed attempt count; the schedule and deadline define
+# the retry envelope.  Kept as a sentinel only for non-OpenAI callers.
 RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS = 2
 
 
@@ -2449,12 +2459,15 @@ def plan_responses_pre_commit_retry(
     *,
     error_class: Optional[str],
     same_account_transient_attempts: int,
+    elapsed_seconds: float = 0.0,
+    budget: Optional[OpenAIAlphaCapacityRetryBudget] = None,
 ) -> dict[str, Any]:
-    """Decide same-account delayed retry vs account rotation before SSE commit.
+    """Decide same-account retry vs account rotation before SSE commit.
 
-    Transient capacity (`server_overloaded` and equivalents) waits 10s and
-    retries once on the same account. Definitive exhaustion rotates accounts
-    immediately. A second transient failure is a pre-stream 503.
+    OpenAI alpha capacity errors use the progressive schedule
+    ``15, 30, 60, 120, 240, 240, ...`` and a two-hour request-wide deadline.
+    Non-capacity errors (usage exhaustion, terminal, etc.) are excluded
+    immediately.
     """
     normalized = str(error_class or "")
     if normalized in _RESPONSES_PRE_COMMIT_ACCOUNT_EXHAUSTION_CLASSES:
@@ -2468,21 +2481,33 @@ def plan_responses_pre_commit_retry(
             "error_class": normalized,
         }
     if normalized in _RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES:
-        if same_account_transient_attempts < RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS:
+        next_wait = openai_alpha_capacity_retry_wait_seconds(
+            same_account_transient_attempts
+        )
+        deadline = (
+            budget.deadline_seconds
+            if budget is not None
+            else 7200.0
+        )
+        if not openai_alpha_capacity_retry_within_deadline(
+            elapsed_seconds=elapsed_seconds,
+            next_wait_seconds=next_wait,
+            deadline_seconds=deadline,
+        ):
             return {
-                "action": "retry_same_account",
-                "retry_same_account": True,
+                "action": "deadline_exhausted",
+                "retry_same_account": False,
                 "apply_account_exhaustion_cooldown": False,
-                "wait_seconds": RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
+                "wait_seconds": 0.0,
                 "http_status": 503,
                 "retryable": True,
                 "error_class": normalized,
             }
         return {
-            "action": "pre_stream_unavailable",
-            "retry_same_account": False,
+            "action": "retry_same_account",
+            "retry_same_account": True,
             "apply_account_exhaustion_cooldown": False,
-            "wait_seconds": RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
+            "wait_seconds": next_wait,
             "http_status": 503,
             "retryable": True,
             "error_class": normalized,
@@ -2497,9 +2522,6 @@ def plan_responses_pre_commit_retry(
         "error_class": normalized or "provider_terminal_error",
     }
 
-
-# ---------------------------------------------------------------------------
-# Header wait / cooldown seconds
 # ---------------------------------------------------------------------------
 
 
