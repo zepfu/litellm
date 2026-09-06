@@ -687,12 +687,13 @@ def test_no_replay_after_substantive_output():
 def test_plan_retries_same_account_for_transient_capacity():
     first = plan_responses_pre_commit_retry(
         error_class="server_overloaded",
-        same_account_transient_attempts=1,
+        same_account_transient_attempts=0,
     )
     assert first["action"] == "retry_same_account"
     assert first["retry_same_account"] is True
     assert first["apply_account_exhaustion_cooldown"] is False
-    assert first["wait_seconds"] == 10.0
+    # Progressive schedule: attempt 0 -> 15s
+    assert first["wait_seconds"] == 15.0
     assert first["http_status"] == 503
     assert first["retryable"] is True
 
@@ -709,16 +710,19 @@ def test_plan_rotates_account_for_usage_limit():
 
 
 def test_plan_returns_pre_stream_503_after_two_transient_failures():
+    """Deadline exhaustion replaces the old fixed-2-attempt-then-503 model."""
     plan = plan_responses_pre_commit_retry(
         error_class="server_overloaded",
-        same_account_transient_attempts=2,
+        same_account_transient_attempts=0,
+        elapsed_seconds=7195.0,
+        budget=OpenAIAlphaCapacityRetryBudget(deadline_seconds=7200.0),
     )
-    assert plan["action"] == "pre_stream_unavailable"
+    assert plan["action"] == "deadline_exhausted"
     assert plan["retry_same_account"] is False
     assert plan["apply_account_exhaustion_cooldown"] is False
     assert plan["http_status"] == 503
     assert plan["retryable"] is True
-    assert plan["wait_seconds"] == 10.0
+    assert plan["wait_seconds"] == 0.0
 
 
 def _opencode_go_empty_success_proxy_exception() -> ProxyException:
@@ -1006,3 +1010,261 @@ async def test_peek_does_not_raise_on_truncated_utf8_at_end_of_stream():
     assert failure is None
     replayed = [chunk async for chunk in peeked.aiter_bytes()]
     assert replayed == chunks
+
+
+# ---------------------------------------------------------------------------
+# OPENAI-054: progressive capacity retry schedule and deadline
+# ---------------------------------------------------------------------------
+
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.retry import (
+    OpenAIAlphaCapacityRetryBudget,
+    openai_alpha_capacity_retry_wait_seconds,
+    openai_alpha_capacity_retry_within_deadline,
+)
+
+
+def test_progressive_schedule_returns_15_30_60_120_240_then_repeats():
+    assert openai_alpha_capacity_retry_wait_seconds(0) == 15.0
+    assert openai_alpha_capacity_retry_wait_seconds(1) == 30.0
+    assert openai_alpha_capacity_retry_wait_seconds(2) == 60.0
+    assert openai_alpha_capacity_retry_wait_seconds(3) == 120.0
+    assert openai_alpha_capacity_retry_wait_seconds(4) == 240.0
+    assert openai_alpha_capacity_retry_wait_seconds(5) == 240.0
+    assert openai_alpha_capacity_retry_wait_seconds(6) == 240.0
+    assert openai_alpha_capacity_retry_wait_seconds(10) == 240.0
+    assert openai_alpha_capacity_retry_wait_seconds(100) == 240.0
+
+
+def test_negative_attempt_number_clamped_to_zero():
+    assert openai_alpha_capacity_retry_wait_seconds(-1) == 15.0
+    assert openai_alpha_capacity_retry_wait_seconds(-100) == 15.0
+
+
+def test_deadline_allows_retry_when_within_budget():
+    assert openai_alpha_capacity_retry_within_deadline(
+        elapsed_seconds=0.0,
+        next_wait_seconds=15.0,
+        deadline_seconds=7200.0,
+    ) is True
+
+
+def test_deadline_rejects_retry_when_exceeded():
+    assert openai_alpha_capacity_retry_within_deadline(
+        elapsed_seconds=7200.0,
+        next_wait_seconds=1.0,
+        deadline_seconds=7200.0,
+    ) is False
+
+
+def test_deadline_rejects_when_projected_exceeds():
+    assert openai_alpha_capacity_retry_within_deadline(
+        elapsed_seconds=7190.0,
+        next_wait_seconds=15.0,
+        deadline_seconds=7200.0,
+    ) is False
+
+
+def test_deadline_rejects_when_zero():
+    assert openai_alpha_capacity_retry_within_deadline(
+        elapsed_seconds=0.0,
+        next_wait_seconds=1.0,
+        deadline_seconds=0.0,
+    ) is False
+
+
+def test_deadline_rejects_when_negative():
+    assert openai_alpha_capacity_retry_within_deadline(
+        elapsed_seconds=0.0,
+        next_wait_seconds=1.0,
+        deadline_seconds=-1.0,
+    ) is False
+
+
+def test_plan_progressive_schedule_first_retry_15s():
+    plan = plan_responses_pre_commit_retry(
+        error_class="server_overloaded",
+        same_account_transient_attempts=0,
+    )
+    assert plan["action"] == "retry_same_account"
+    assert plan["retry_same_account"] is True
+    assert plan["wait_seconds"] == 15.0
+    assert plan["retryable"] is True
+
+
+def test_plan_progressive_schedule_second_retry_30s():
+    plan = plan_responses_pre_commit_retry(
+        error_class="server_overloaded",
+        same_account_transient_attempts=1,
+    )
+    assert plan["action"] == "retry_same_account"
+    assert plan["wait_seconds"] == 30.0
+
+
+def test_plan_progressive_schedule_third_retry_60s():
+    plan = plan_responses_pre_commit_retry(
+        error_class="server_overloaded",
+        same_account_transient_attempts=2,
+    )
+    assert plan["action"] == "retry_same_account"
+    assert plan["wait_seconds"] == 60.0
+
+
+def test_plan_progressive_schedule_fourth_retry_120s():
+    plan = plan_responses_pre_commit_retry(
+        error_class="server_overloaded",
+        same_account_transient_attempts=3,
+    )
+    assert plan["action"] == "retry_same_account"
+    assert plan["wait_seconds"] == 120.0
+
+
+def test_plan_progressive_schedule_fifth_retry_240s():
+    plan = plan_responses_pre_commit_retry(
+        error_class="server_overloaded",
+        same_account_transient_attempts=4,
+    )
+    assert plan["action"] == "retry_same_account"
+    assert plan["wait_seconds"] == 240.0
+
+
+def test_plan_progressive_schedule_sixth_retry_repeats_240s():
+    plan = plan_responses_pre_commit_retry(
+        error_class="server_overloaded",
+        same_account_transient_attempts=5,
+    )
+    assert plan["action"] == "retry_same_account"
+    assert plan["wait_seconds"] == 240.0
+
+
+def test_plan_deadline_exhausted_when_projected_exceeds():
+    plan = plan_responses_pre_commit_retry(
+        error_class="server_overloaded",
+        same_account_transient_attempts=0,
+        elapsed_seconds=7190.0,
+        budget=OpenAIAlphaCapacityRetryBudget(deadline_seconds=7200.0),
+    )
+    assert plan["action"] == "deadline_exhausted"
+    assert plan["retry_same_account"] is False
+    assert plan["retryable"] is True
+
+
+def test_plan_no_deadline_when_already_exceeded():
+    plan = plan_responses_pre_commit_retry(
+        error_class="server_overloaded",
+        same_account_transient_attempts=4,
+        elapsed_seconds=7205.0,
+        budget=OpenAIAlphaCapacityRetryBudget(deadline_seconds=7200.0),
+    )
+    assert plan["action"] == "deadline_exhausted"
+
+
+def test_plan_usage_limit_still_rotates():
+    """Non-capacity exhaustion is still excluded from retries."""
+    plan = plan_responses_pre_commit_retry(
+        error_class="usage_limit_reached",
+        same_account_transient_attempts=0,
+    )
+    assert plan["action"] == "rotate_account"
+    assert plan["retry_same_account"] is False
+    assert plan["apply_account_exhaustion_cooldown"] is True
+
+
+def test_plan_terminal_for_non_capacity():
+    plan = plan_responses_pre_commit_retry(
+        error_class="token_invalidated",
+        same_account_transient_attempts=0,
+    )
+    assert plan["action"] == "terminal"
+    assert plan["retryable"] is False
+
+
+def test_plan_terminal_for_none_error_class():
+    plan = plan_responses_pre_commit_retry(
+        error_class=None,
+        same_account_transient_attempts=0,
+    )
+    assert plan["action"] == "terminal"
+    assert plan["retryable"] is False
+
+
+def test_plan_capacity_exhausted_uses_progressive_schedule():
+    plan = plan_responses_pre_commit_retry(
+        error_class="capacity_exhausted",
+        same_account_transient_attempts=0,
+    )
+    assert plan["action"] == "retry_same_account"
+    assert plan["wait_seconds"] == 15.0
+
+
+def test_plan_upstream_transient_internal_uses_progressive_schedule():
+    plan = plan_responses_pre_commit_retry(
+        error_class="upstream_transient_internal",
+        same_account_transient_attempts=1,
+    )
+    assert plan["action"] == "retry_same_account"
+    assert plan["wait_seconds"] == 30.0
+
+
+def test_plan_default_deadline_is_7200():
+    """Without an explicit budget, the 7200s default deadline is used."""
+    plan = plan_responses_pre_commit_retry(
+        error_class="server_overloaded",
+        same_account_transient_attempts=0,
+        elapsed_seconds=8000.0,
+    )
+    assert plan["action"] == "deadline_exhausted"
+
+
+def test_plan_custom_budget_short_deadline():
+    plan = plan_responses_pre_commit_retry(
+        error_class="server_overloaded",
+        same_account_transient_attempts=0,
+        elapsed_seconds=30.0,
+        budget=OpenAIAlphaCapacityRetryBudget(deadline_seconds=40.0),
+    )
+    # 30 + 15 = 45 > 40, so deadline exhausted
+    assert plan["action"] == "deadline_exhausted"
+
+
+def test_plan_custom_budget_still_retries():
+    plan = plan_responses_pre_commit_retry(
+        error_class="server_overloaded",
+        same_account_transient_attempts=0,
+        elapsed_seconds=10.0,
+        budget=OpenAIAlphaCapacityRetryBudget(deadline_seconds=40.0),
+    )
+    # 10 + 15 = 25 <= 40
+    assert plan["action"] == "retry_same_account"
+    assert plan["wait_seconds"] == 15.0
+
+
+def test_plan_existing_legacy_caller_still_works():
+    """Callers that don't pass elapsed_seconds or budget still get valid results."""
+    first = plan_responses_pre_commit_retry(
+        error_class="server_overloaded",
+        same_account_transient_attempts=1,
+    )
+    assert first["action"] == "retry_same_account"
+    assert first["wait_seconds"] == 30.0
+
+    second = plan_responses_pre_commit_retry(
+        error_class="server_overloaded",
+        same_account_transient_attempts=2,
+    )
+    assert second["action"] == "retry_same_account"
+    assert second["wait_seconds"] == 60.0
+
+
+def test_openai_alpha_capacity_budget_defaults():
+    budget = OpenAIAlphaCapacityRetryBudget()
+    assert budget.schedule == (15.0, 30.0, 60.0, 120.0, 240.0)
+    assert budget.deadline_seconds == 7200.0
+
+
+def test_openai_alpha_capacity_budget_custom():
+    budget = OpenAIAlphaCapacityRetryBudget(
+        schedule=(10.0, 20.0),
+        deadline_seconds=3600.0,
+    )
+    assert budget.schedule == (10.0, 20.0)
+    assert budget.deadline_seconds == 3600.0
