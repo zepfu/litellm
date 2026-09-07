@@ -183,6 +183,15 @@ _CANONICAL_ACCOUNT_ID_KEYS = frozenset(
         "chatgpt_account_id",
     }
 )
+_CANONICAL_ACTIVE_ACCOUNT_ID_PATHS = (
+    ("account_id",),
+    ("chatgpt_account_id",),
+    ("account", "account_id"),
+    ("account", "chatgpt_account_id"),
+)
+_CANONICAL_ACCOUNT_ID_PROVENANCE_FIELDS = frozenset(
+    ".".join(path) for path in _CANONICAL_ACTIVE_ACCOUNT_ID_PATHS
+)
 _CANONICAL_ACCOUNT_HASH_RE = re.compile(
     rf"^[0-9a-f]{{{CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_LENGTH}}}$"
 )
@@ -431,7 +440,7 @@ def _extract_canonical_account_identity(
     raw: Any,
     payload: Any,
 ) -> Tuple[Optional[str], List[str], Optional[str]]:
-    """Extract only authoritative account-id fields from one response envelope."""
+    """Extract account ids only from fixed active-account structures."""
 
     candidates: List[Tuple[str, str]] = []
     sources: List[Any] = [payload]
@@ -440,16 +449,10 @@ def _extract_canonical_account_identity(
     for source in sources:
         if not isinstance(source, Mapping):
             continue
-        for path, mapping in _mapping_nodes(source):
-            for field_name, value in mapping.items():
-                if _normalize_key(field_name) not in _CANONICAL_ACCOUNT_ID_KEYS:
-                    continue
+        for path in _CANONICAL_ACTIVE_ACCOUNT_ID_PATHS:
+            field_path = ".".join(path)
+            for value in _values_at_structural_path(source, path):
                 account_id = _clean_canonical_account_id(value)
-                field_path = (
-                    ".".join(path + (str(field_name),))
-                    if path
-                    else str(field_name)
-                )
                 if account_id is not None:
                     candidates.append((account_id, field_path))
 
@@ -1293,14 +1296,19 @@ def _parse_blocked_features(
         if isinstance(item, str):
             identity = _safe_identity(item)
             entry: Mapping[str, Any] = {"blocked": True}
+            blocked_state: Optional[bool] = True
         elif isinstance(item, Mapping):
             identity = _entry_identity(item) or _safe_identity(item.get("_identity"))
             entry = item
+            blocked_value = entry.get("blocked")
+            blocked_state = blocked_value if isinstance(blocked_value, bool) else None
         else:
             malformed += 1
             continue
         if identity is None:
             malformed += 1
+            continue
+        if blocked_state is not True:
             continue
         rows.append(
             {
@@ -1318,7 +1326,7 @@ def _parse_blocked_features(
                 "raw_provider_fields": {
                     "parser_version": CHATGPT_CONVERSATION_INIT_PARSER_VERSION,
                     "identity": identity,
-                    "blocked": True,
+                    "blocked": blocked_state,
                     "collection": "blocked_features",
                     "entry_projections": _entry_projections(entry),
                 },
@@ -1329,7 +1337,7 @@ def _parse_blocked_features(
                     ],
                     "parser_version": CHATGPT_CONVERSATION_INIT_PARSER_VERSION,
                     "identity": identity,
-                    "blocked": True,
+                    "blocked": blocked_state,
                 },
             }
         )
@@ -1768,6 +1776,28 @@ def _mapping_nodes(
             for index, nested in enumerate(value[:MAX_PROJECTION_LIST_ITEMS]):
                 pending.append((path + (str(index),), nested))
     return nodes
+
+
+def _values_at_structural_path(
+    source: Mapping[str, Any],
+    path: Sequence[str],
+) -> List[Any]:
+    """Read only a fixed key path; never traverse arbitrary child names."""
+
+    values: List[Any] = [source]
+    for segment in path:
+        normalized_segment = _normalize_key(segment)
+        next_values: List[Any] = []
+        for value in values:
+            if not isinstance(value, Mapping):
+                continue
+            for key, nested in value.items():
+                if _normalize_key(key) == normalized_segment:
+                    next_values.append(nested)
+        values = next_values
+        if not values:
+            break
+    return values
 
 
 def _unique_pairs(
@@ -2403,9 +2433,9 @@ def _collect_bound_conversation_init_snapshot(
             reusable=reusable,
         )
 
-    payload = sanitized.get("payload")
+    _status_code, payload_raw, _envelope_redacted = _split_boundary_envelope(raw)
     account_id, identity_fields, identity_error = (
-        _extract_canonical_account_identity(raw, payload)
+        _extract_canonical_account_identity(raw, payload_raw)
     )
     if identity_error is not None or account_id is None:
         return _bound_capture_failure(
@@ -2739,9 +2769,8 @@ def _retained_bound_envelope_identity(
         if isinstance(retained_fields, list)
         else []
     )
-    if not fields or not any(
-        _normalize_key(field.rsplit(".", 1)[-1]) in _CANONICAL_ACCOUNT_ID_KEYS
-        for field in fields
+    if not fields or any(
+        field not in _CANONICAL_ACCOUNT_ID_PROVENANCE_FIELDS for field in fields
     ):
         return None, []
     return account_hash, fields
