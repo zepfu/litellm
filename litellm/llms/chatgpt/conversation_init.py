@@ -15,7 +15,12 @@ The browser-boundary collector lives in this same stdlib module. It accepts
 an injected transport, issues the no-body POST contract, writes a
 credential-safe snapshot, and can be fixture-tested without live auth. It
 does not copy Oracle cookies or persist headers, tokens, or personal data.
-Live authenticated Oracle-browser proof remains a separate acceptance gate.
+Bound Oracle capture requires an exact existing CDP target and an expected
+canonical account hash. The bound path only verifies an authoritative
+``account_id``/``chatgpt_account_id`` from the same response; missing identity
+fails closed because this module has no established same-context metadata
+contract to substitute. Live authenticated Oracle-browser proof remains a
+separate acceptance gate.
 """
 
 from __future__ import annotations
@@ -59,9 +64,15 @@ CHATGPT_CONVERSATION_INIT_SNAPSHOT_QUOTA_KEY = (
 CHATGPT_CONVERSATION_INIT_ACCOUNT_IDENTITY_SOURCE = (
     "chatgpt.conversation_init.account"
 )
+CHATGPT_CONVERSATION_INIT_BROWSER_ACCOUNT_IDENTITY_SOURCE = (
+    "chatgpt.conversation_init.oracle_browser.account_id"
+)
+CHATGPT_CONVERSATION_INIT_VERIFIED_PAYLOAD_IDENTITY_SOURCE = "provider_payload"
 CHATGPT_CONVERSATION_INIT_SOURCE_IDENTITY_SOURCE = (
     "chatgpt.conversation_init.collector_source_path"
 )
+CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_LENGTH = 12
+CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_ALGORITHM = "sha256"
 CHATGPT_CONVERSATION_INIT_BROWSER_CDP_ENDPOINT_ENV = (
     "AAWM_CHATGPT_CONVERSATION_INIT_BROWSER_CDP_ENDPOINT"
 )
@@ -108,8 +119,16 @@ _ENVELOPE_KEYS = {
     "json",
     "data",
     "account_hash",
+    "account_id",
+    "chatgpt_account_id",
+    "account_identity_hash_algorithm",
+    "account_identity_hash_length",
     "account_identity_fields",
     "account_identity_source",
+    "account_identity_verification_source",
+    "account_identity_verified",
+    "collector_source",
+    "browser_boundary",
     "payload_schema",
     "payload_state",
     "redacted_field_count",
@@ -156,6 +175,15 @@ _ACCOUNT_IDENTITY_KEYS = (
     "profileid",
     "membershipid",
     "membership_id",
+)
+_CANONICAL_ACCOUNT_ID_KEYS = frozenset(
+    {
+        "account_id",
+        "chatgpt_account_id",
+    }
+)
+_CANONICAL_ACCOUNT_HASH_RE = re.compile(
+    rf"^[0-9a-f]{{{CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_LENGTH}}}$"
 )
 _ACCOUNT_IDENTITY_CONTAINERS = ("user", "account", "profile", "membership")
 _IDENTITY_FIELD_NAMES = (
@@ -369,6 +397,74 @@ def hash_chatgpt_conversation_init_account_identity(
     return hashlib.sha256(material).hexdigest(), unique_fields
 
 
+def hash_chatgpt_conversation_init_canonical_account_id(
+    account_id: Any,
+) -> Optional[str]:
+    """Return the inventory-compatible canonical account hash.
+
+    This deliberately accepts only the canonical account identity value. It
+    does not hash user ids, source paths, composite field material, or an
+    expected hash supplied by the caller.
+    """
+
+    cleaned = _clean_canonical_account_id(account_id)
+    if cleaned is None:
+        return None
+    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[
+        :CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_LENGTH
+    ]
+
+
+def _clean_canonical_account_id(value: Any) -> Optional[str]:
+    """Apply the same string normalization used by the OAuth inventory."""
+
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned or any(ord(character) < 32 for character in cleaned):
+        return None
+    return cleaned
+
+
+def _extract_canonical_account_identity(
+    raw: Any,
+    payload: Any,
+) -> Tuple[Optional[str], List[str], Optional[str]]:
+    """Extract only authoritative account-id fields from one response envelope."""
+
+    candidates: List[Tuple[str, str]] = []
+    sources: List[Any] = [payload]
+    if raw is not payload:
+        sources.append(raw)
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for path, mapping in _mapping_nodes(source):
+            for field_name, value in mapping.items():
+                if _normalize_key(field_name) not in _CANONICAL_ACCOUNT_ID_KEYS:
+                    continue
+                account_id = _clean_canonical_account_id(value)
+                field_path = (
+                    ".".join(path + (str(field_name),))
+                    if path
+                    else str(field_name)
+                )
+                if account_id is not None:
+                    candidates.append((account_id, field_path))
+
+    unique_ids = {account_id for account_id, _field_path in candidates}
+    fields = _unique_pairs(
+        [account_id for account_id, _field_path in candidates],
+        [field_path for _account_id, field_path in candidates],
+    )[1]
+    if not unique_ids:
+        return None, fields, "missing_authoritative_account_id"
+    if len(unique_ids) != 1:
+        return None, fields, "conflicting_authoritative_account_id"
+    account_id = next(iter(unique_ids))
+    return account_id, fields, None
+
+
 def hash_chatgpt_conversation_init_source_identity(source_path: str) -> str:
     """Hash a collector source path. Never return the raw path."""
 
@@ -414,6 +510,7 @@ def sanitize_conversation_init_boundary(
     *,
     source_path: Optional[str] = None,
     request_url: Optional[str] = None,
+    _allow_verified_envelope_identity: bool = False,
 ) -> Dict[str, Any]:
     """Strip credentials/raw headers and project a persistence-safe snapshot."""
 
@@ -433,16 +530,34 @@ def sanitize_conversation_init_boundary(
             "account_hash": None,
             "account_identity_fields": [],
             "account_identity_source": None,
+            "account_identity_verified": False,
+            "account_identity_hash_algorithm": None,
+            "account_identity_hash_length": None,
+            "account_identity_verification_source": None,
             "source_identity_hash": source_identity_hash,
             "redacted_field_count": 0,
         }
 
     status_code, payload_raw, envelope_redacted = _split_boundary_envelope(raw)
-    account_hash, account_identity_fields = (
-        hash_chatgpt_conversation_init_account_identity(payload_raw)
-        if isinstance(payload_raw, Mapping)
+    account_identity_verified = False
+    account_identity_hash_algorithm = None
+    account_identity_hash_length = None
+    retained_bound_identity = (
+        _retained_bound_envelope_identity(raw)
+        if _allow_verified_envelope_identity
         else (None, [])
     )
+    if retained_bound_identity[0]:
+        account_hash, account_identity_fields = retained_bound_identity
+        account_identity_verified = True
+        account_identity_hash_algorithm = CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_ALGORITHM
+        account_identity_hash_length = CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_LENGTH
+    else:
+        account_hash, account_identity_fields = (
+            hash_chatgpt_conversation_init_account_identity(payload_raw)
+            if isinstance(payload_raw, Mapping)
+            else (None, [])
+        )
     if not account_hash:
         account_hash, account_identity_fields = _retained_envelope_identity(raw)
     if isinstance(payload_raw, Mapping):
@@ -473,6 +588,14 @@ def sanitize_conversation_init_boundary(
         "account_hash": account_hash,
         "account_identity_fields": account_identity_fields,
         "account_identity_source": account_identity_source,
+        "account_identity_verified": account_identity_verified,
+        "account_identity_hash_algorithm": account_identity_hash_algorithm,
+        "account_identity_hash_length": account_identity_hash_length,
+        "account_identity_verification_source": (
+            CHATGPT_CONVERSATION_INIT_BROWSER_ACCOUNT_IDENTITY_SOURCE
+            if account_identity_verified
+            else None
+        ),
         "source_identity_hash": source_identity_hash,
         "redacted_field_count": envelope_redacted + value_redacted,
     }
@@ -495,6 +618,18 @@ def _resolve_parse_guard(
     source_identity_hash = sanitized.get("source_identity_hash")
     account_identity_fields = list(sanitized.get("account_identity_fields") or [])
     account_identity_source = sanitized.get("account_identity_source")
+    account_identity_verified = (
+        sanitized.get("account_identity_verified") is True
+        and _is_canonical_account_hash(account_hash)
+        and sanitized.get("account_identity_source")
+        == CHATGPT_CONVERSATION_INIT_VERIFIED_PAYLOAD_IDENTITY_SOURCE
+        and sanitized.get("account_identity_verification_source")
+        == CHATGPT_CONVERSATION_INIT_BROWSER_ACCOUNT_IDENTITY_SOURCE
+        and sanitized.get("account_identity_hash_algorithm")
+        == CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_ALGORITHM
+        and sanitized.get("account_identity_hash_length")
+        == CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_LENGTH
+    )
     if not account_hash and isinstance(source_identity_hash, str) and source_identity_hash:
         account_hash = source_identity_hash
         if not account_identity_fields:
@@ -512,6 +647,23 @@ def _resolve_parse_guard(
         "has_conversation_content": False,
         "status_code": status_code,
         "account_identity_hashed": account_hash is not None,
+        "account_hash": account_hash,
+        "account_identity_verified": account_identity_verified,
+        "account_identity_hash_algorithm": (
+            CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_ALGORITHM
+            if account_identity_verified
+            else None
+        ),
+        "account_identity_hash_length": (
+            CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_LENGTH
+            if account_identity_verified
+            else None
+        ),
+        "account_identity_verification_source": (
+            CHATGPT_CONVERSATION_INIT_BROWSER_ACCOUNT_IDENTITY_SOURCE
+            if account_identity_verified
+            else None
+        ),
         "account_identity_fields": account_identity_fields,
         "account_identity_source": account_identity_source,
         "model_limits_state": "absent_unknown",
@@ -558,6 +710,7 @@ def _resolve_parse_guard(
         "payload_schema": payload_schema,
         "request": request,
         "account_hash": account_hash,
+        "account_identity_verified": account_identity_verified,
         "account_identity_fields": account_identity_fields,
         "account_identity_source": account_identity_source,
     }
@@ -725,6 +878,7 @@ def collect_conversation_init_observations(
         raw,
         source_path=source_path,
         request_url=request_url,
+        _allow_verified_envelope_identity=True,
     )
     observations, summary = parse_conversation_init_observations(
         sanitized,
@@ -739,6 +893,17 @@ def collect_conversation_init_observations(
     summary["collector_source"] = "file"
     account_hash = sanitized.get("account_hash") or sanitized.get(
         "source_identity_hash"
+    )
+    summary["account_hash"] = account_hash
+    summary["account_identity_verified"] = bool(
+        summary.get("account_identity_verified")
+    )
+    summary["account_identity_source"] = sanitized.get("account_identity_source")
+    summary["account_identity_verification_source"] = sanitized.get(
+        "account_identity_verification_source"
+    )
+    summary["account_identity_verification_error"] = sanitized.get(
+        "account_identity_verification_error"
     )
     if observations and isinstance(account_hash, str) and account_hash:
         payloads = build_conversation_init_rate_limit_tuples(
@@ -989,6 +1154,17 @@ def _snapshot_observation(
         "telemetry_status": summary["telemetry_status"],
         "account_identity_fields": list(account_identity_fields),
         "account_identity_source": account_identity_source,
+        "account_identity_verified": bool(
+            summary.get("account_identity_verified")
+        ),
+        "account_identity_verification_source": summary.get(
+            "account_identity_verification_source"
+        ),
+        "account_hash": (
+            summary.get("account_hash")
+            if summary.get("account_identity_verified")
+            else None
+        ),
         "request_method": request.get("method"),
         "request_body_omitted": True,
         "has_model_message": False,
@@ -1663,6 +1839,7 @@ class OracleBrowserConversationInitTransport:
         self,
         *,
         cdp_endpoint: Optional[str] = None,
+        page_target_id: str,
         timeout_seconds: float = 30.0,
         playwright_factory: Optional[Callable[[], Any]] = None,
     ) -> None:
@@ -1680,6 +1857,7 @@ class OracleBrowserConversationInitTransport:
             )
         if timeout_seconds <= 0:
             raise ValueError("Oracle browser CDP timeout must be greater than 0.")
+        self.page_target_id = _validate_page_target_id(page_target_id)
         self.timeout_seconds = timeout_seconds
         self._playwright_factory = playwright_factory
 
@@ -1693,10 +1871,14 @@ class OracleBrowserConversationInitTransport:
                 self.cdp_endpoint,
                 timeout=int(self.timeout_seconds * 1000),
             )
-            page = _find_existing_chatgpt_page(browser, request.full_url)
+            page = _find_existing_chatgpt_page(
+                browser,
+                self.page_target_id,
+                request.full_url,
+            )
             if page is None:
                 raise OracleBrowserBoundaryUnavailable(
-                    "Oracle browser has no existing ChatGPT page for the "
+                    "Oracle browser has no existing ChatGPT CDP target for the "
                     "conversation-init request."
                 )
             result = page.evaluate(_ORACLE_BROWSER_FETCH_SCRIPT, request.full_url)
@@ -1734,12 +1916,14 @@ class OracleBrowserConversationInitTransport:
 def build_oracle_browser_conversation_init_transport(
     *,
     cdp_endpoint: Optional[str] = None,
+    page_target_id: str,
     timeout_seconds: float = 30.0,
 ) -> OracleBrowserConversationInitTransport:
     """Build the attach-only transport for the established Oracle boundary."""
 
     return OracleBrowserConversationInitTransport(
         cdp_endpoint=cdp_endpoint,
+        page_target_id=page_target_id,
         timeout_seconds=timeout_seconds,
     )
 
@@ -1765,7 +1949,24 @@ def _validate_oracle_browser_request(request: urllib_request.Request) -> None:
         )
 
 
-def _find_existing_chatgpt_page(browser: Any, request_url: str) -> Any:
+def _validate_page_target_id(page_target_id: Any) -> str:
+    if not isinstance(page_target_id, str):
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle browser conversation-init requires an exact CDP page target id."
+        )
+    cleaned = page_target_id.strip()
+    if not cleaned or any(ord(character) < 32 for character in cleaned):
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle browser conversation-init requires an exact CDP page target id."
+        )
+    return cleaned
+
+
+def _find_existing_chatgpt_page(
+    browser: Any,
+    page_target_id: str,
+    request_url: str,
+) -> Any:
     target_host = urlsplit(request_url).hostname
     if not target_host:
         return None
@@ -1773,8 +1974,45 @@ def _find_existing_chatgpt_page(browser: Any, request_url: str) -> Any:
         for page in getattr(context, "pages", ()):
             page_url = str(getattr(page, "url", "") or "")
             page_host = urlsplit(page_url).hostname
-            if page_host == target_host:
+            if page_host == target_host and _page_target_id(context, page) == page_target_id:
                 return page
+    return None
+
+
+def _page_target_id(context: Any, page: Any) -> Optional[str]:
+    """Read a page's CDP target id without creating or navigating a page."""
+
+    for attribute_name in ("target_id", "targetId"):
+        value = getattr(page, attribute_name, None)
+        if isinstance(value, str) and value:
+            return value
+
+    new_cdp_session = getattr(context, "new_cdp_session", None)
+    if not callable(new_cdp_session):
+        return None
+    session = None
+    try:
+        session = new_cdp_session(page)
+        result = session.send("Target.getTargetInfo")
+        target_info = (
+            result.get("targetInfo")
+            if isinstance(result, Mapping)
+            and isinstance(result.get("targetInfo"), Mapping)
+            else result
+        )
+        if isinstance(target_info, Mapping):
+            value = target_info.get("targetId")
+            if isinstance(value, str) and value:
+                return value
+    except Exception:
+        return None
+    finally:
+        detach = getattr(session, "detach", None)
+        if callable(detach):
+            try:
+                detach()
+            except Exception:
+                pass
     return None
 
 
@@ -1796,10 +2034,14 @@ def _coerce_browser_response(result: Any) -> Mapping[str, Any]:
         raise OracleBrowserBoundaryUnavailable(
             "Oracle browser returned an invalid conversation-init status."
         ) from exc
-    return {
+    response: Dict[str, Any] = {
         "status_code": status,
         "payload": result.get("payload"),
     }
+    for key in _CANONICAL_ACCOUNT_ID_KEYS:
+        if key in result:
+            response[key] = result[key]
+    return response
 
 
 def _disconnect_attached_browser(playwright: Any, browser: Any) -> None:
@@ -1964,34 +2206,258 @@ def collect_conversation_init_snapshot_from_oracle_browser(
     source_path: str,
     *,
     cdp_endpoint: Optional[str] = None,
-    request_url: Optional[str] = None,
+    page_target_id: str,
+    expected_account_hash: str,
     timeout_seconds: float = 30.0,
+    request_url: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Collect conversation-init through the existing Oracle browser.
+    """Collect one verified, account-bound snapshot through Oracle's browser.
 
     The caller must provide an already-running Oracle browser with an existing
-    authenticated ChatGPT page and a reachable CDP endpoint. This function
-    never launches Chrome, opens a page, reads browser storage, or exports
-    credentials.
+    authenticated ChatGPT page, its exact CDP target id, a reachable CDP
+    endpoint, and the canonical12 account hash pin. This function never
+    launches Chrome, opens a page, reads browser storage, or exports
+    credentials. It writes only a current response whose authoritative
+    ``account_id``/``chatgpt_account_id`` hashes to the configured pin.
+    The returned summary includes ``account_identity_verified``,
+    canonical12 ``account_hash``, ``account_identity_source``,
+    ``account_identity_verification_error``, ``snapshot_fresh``, and
+    ``last_good_state_retained``.
     """
 
-    transport = build_oracle_browser_conversation_init_transport(
-        cdp_endpoint=cdp_endpoint,
-        timeout_seconds=timeout_seconds,
-    )
-    summary = collect_conversation_init_snapshot(
+    contract = conversation_init_request_contract(request_url)
+    summary = _collector_summary(contract, source_path)
+    expected = _normalize_expected_account_hash(expected_account_hash)
+    if expected is None:
+        return _bound_capture_failure(
+            summary,
+            source_path=source_path,
+            expected_account_hash=None,
+            error="invalid_expected_account_hash",
+            telemetry_status="auth",
+            telemetry_class="auth",
+        )
+    try:
+        transport = build_oracle_browser_conversation_init_transport(
+            cdp_endpoint=cdp_endpoint,
+            page_target_id=page_target_id,
+            timeout_seconds=timeout_seconds,
+        )
+    except (ChatGPTConversationInitError, ValueError) as exc:
+        return _bound_capture_failure(
+            summary,
+            source_path=source_path,
+            expected_account_hash=expected,
+            error="browser_boundary_unavailable",
+            telemetry_status="auth",
+            telemetry_class=(
+                exc.telemetry_class
+                if isinstance(exc, ChatGPTConversationInitError)
+                else "auth"
+            ),
+        )
+
+    return _collect_bound_conversation_init_snapshot(
         source_path,
         transport=transport,
         request_url=request_url,
+        expected_account_hash=expected,
+        summary=summary,
     )
+
+
+def _collect_bound_conversation_init_snapshot(
+    source_path: str,
+    *,
+    transport: ConversationInitTransport,
+    request_url: Optional[str],
+    expected_account_hash: str,
+    summary: Dict[str, Any],
+) -> Dict[str, Any]:
+    request = build_conversation_init_request(
+        conversation_init_request_contract(request_url)["url"]
+    )
+    reusable = _destination_has_reusable_bound_snapshot(
+        source_path,
+        expected_account_hash=expected_account_hash,
+    )
+    try:
+        raw = transport.fetch(request)
+    except ChatGPTConversationInitError as exc:
+        return _bound_capture_failure(
+            summary,
+            source_path=source_path,
+            expected_account_hash=expected_account_hash,
+            error="browser_boundary_unavailable",
+            telemetry_status="auth",
+            telemetry_class=exc.telemetry_class,
+            reusable=reusable,
+        )
+    except Exception:
+        return _bound_capture_failure(
+            summary,
+            source_path=source_path,
+            expected_account_hash=expected_account_hash,
+            error="browser_boundary_unavailable",
+            telemetry_status="auth",
+            telemetry_class="auth",
+            reusable=reusable,
+        )
+    if not isinstance(raw, Mapping):
+        return _bound_capture_failure(
+            summary,
+            source_path=source_path,
+            expected_account_hash=expected_account_hash,
+            error="malformed_browser_response",
+            telemetry_status="malformed",
+            telemetry_class="malformed_telemetry",
+            reusable=reusable,
+        )
+
+    sanitized = sanitize_conversation_init_boundary(
+        raw,
+        source_path=source_path,
+        request_url=request_url,
+        _allow_verified_envelope_identity=False,
+    )
+    summary["status_code"] = sanitized.get("status_code")
+    summary["redacted_field_count"] = sanitized.get("redacted_field_count")
+    summary["payload_state"] = sanitized.get("payload_state")
     summary["collector_source"] = ORACLE_BROWSER_BOUNDARY_NAME
     summary["browser_boundary"] = ORACLE_BROWSER_BOUNDARY_NAME
-    summary["live_authenticated_oracle_browser"] = bool(
-        summary.get("written")
-        and isinstance(summary.get("status_code"), int)
-        and 200 <= int(summary["status_code"]) < 300
-        and summary.get("account_identity_hashed")
+
+    status_failure = _http_status_failure(sanitized.get("status_code"))
+    if status_failure is not None:
+        return _bound_capture_failure(
+            summary,
+            source_path=source_path,
+            expected_account_hash=expected_account_hash,
+            error=f"http_{status_failure}",
+            telemetry_status=status_failure,
+            telemetry_class=(
+                "auth" if status_failure == "auth" else "http_error"
+            ),
+            reusable=reusable,
+        )
+
+    payload = sanitized.get("payload")
+    account_id, identity_fields, identity_error = (
+        _extract_canonical_account_identity(raw, payload)
     )
+    if identity_error is not None or account_id is None:
+        return _bound_capture_failure(
+            summary,
+            source_path=source_path,
+            expected_account_hash=expected_account_hash,
+            error=identity_error or "missing_authoritative_account_id",
+            telemetry_status="missing_account_identity",
+            telemetry_class="malformed_telemetry",
+            reusable=reusable,
+        )
+    actual_account_hash = hash_chatgpt_conversation_init_canonical_account_id(
+        account_id
+    )
+    if actual_account_hash != expected_account_hash:
+        return _bound_capture_failure(
+            summary,
+            source_path=source_path,
+            expected_account_hash=expected_account_hash,
+            error="account_identity_mismatch",
+            telemetry_status="auth",
+            telemetry_class="auth",
+            reusable=reusable,
+        )
+
+    sanitized = _apply_verified_bound_identity(
+        sanitized,
+        account_hash=actual_account_hash,
+        account_identity_fields=identity_fields,
+    )
+    summary["account_identity_hashed"] = True
+    summary["account_hash"] = actual_account_hash
+    summary["account_identity_verified"] = True
+    summary["account_identity_fields"] = sanitized["account_identity_fields"]
+    summary["account_identity_source"] = sanitized["account_identity_source"]
+    summary["account_identity_hash_algorithm"] = (
+        CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_ALGORITHM
+    )
+    summary["account_identity_hash_length"] = (
+        CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_LENGTH
+    )
+    summary["account_identity_verification_source"] = sanitized[
+        "account_identity_verification_source"
+    ]
+    summary["live_authenticated_oracle_browser"] = True
+    writable = _snapshot_is_persistable(
+        sanitized,
+        expected_account_hash=expected_account_hash,
+        require_verified_identity=True,
+    )
+    if not writable:
+        return _bound_capture_failure(
+            summary,
+            source_path=source_path,
+            expected_account_hash=expected_account_hash,
+            error="current_snapshot_not_persistable",
+            telemetry_status=_failure_telemetry_status(sanitized),
+            telemetry_class=_failure_telemetry_class(sanitized),
+            reusable=reusable,
+        )
+    try:
+        write_conversation_init_snapshot(source_path, sanitized)
+    except ChatGPTConversationInitError as exc:
+        return _bound_capture_failure(
+            summary,
+            source_path=source_path,
+            expected_account_hash=expected_account_hash,
+            error="snapshot_write_failed",
+            telemetry_status="malformed",
+            telemetry_class=exc.telemetry_class,
+            reusable=reusable,
+        )
+    summary["written"] = True
+    summary["snapshot_fresh"] = True
+    summary["last_good_state_retained"] = False
+    summary["telemetry_status"] = "valid"
+    summary["telemetry_class"] = None
+    return summary
+
+
+def _normalize_expected_account_hash(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if _CANONICAL_ACCOUNT_HASH_RE.fullmatch(cleaned) is None:
+        return None
+    return cleaned
+
+
+def _bound_capture_failure(
+    summary: Dict[str, Any],
+    *,
+    source_path: str,
+    expected_account_hash: Optional[str],
+    error: str,
+    telemetry_status: str,
+    telemetry_class: str,
+    reusable: Optional[bool] = None,
+) -> Dict[str, Any]:
+    if reusable is None:
+        reusable = bool(
+            expected_account_hash
+            and _destination_has_reusable_bound_snapshot(
+                source_path,
+                expected_account_hash=expected_account_hash,
+            )
+        )
+    summary["collector_source"] = ORACLE_BROWSER_BOUNDARY_NAME
+    summary["browser_boundary"] = ORACLE_BROWSER_BOUNDARY_NAME
+    summary["written"] = False
+    summary["snapshot_fresh"] = False
+    summary["last_good_state_retained"] = reusable
+    summary["account_identity_verification_error"] = error
+    summary["telemetry_status"] = telemetry_status
+    summary["telemetry_class"] = telemetry_class
     return summary
 
 
@@ -2010,17 +2476,76 @@ def _collector_summary(contract: Mapping[str, Any], source_path: str) -> Dict[st
         "status_code": None,
         "payload_state": None,
         "account_identity_hashed": False,
+        "account_hash": None,
+        "account_identity_verified": False,
+        "account_identity_fields": [],
+        "account_identity_source": None,
+        "account_identity_hash_algorithm": None,
+        "account_identity_hash_length": None,
+        "account_identity_verification_source": None,
+        "account_identity_verification_error": None,
         "redacted_field_count": 0,
         "source_identity_hash": hash_chatgpt_conversation_init_source_identity(
             source_path
         ),
         "telemetry_status": None,
         "telemetry_class": None,
+        "snapshot_fresh": False,
         "last_good_state_retained": False,
     }
 
 
-def _snapshot_is_persistable(sanitized: Mapping[str, Any]) -> bool:
+def _apply_verified_bound_identity(
+    sanitized: Mapping[str, Any],
+    *,
+    account_hash: str,
+    account_identity_fields: Sequence[str],
+) -> Dict[str, Any]:
+    result = dict(sanitized)
+    result["account_hash"] = account_hash
+    result["account_identity_fields"] = _safe_identity_fields(
+        account_identity_fields
+    )
+    result["account_identity_source"] = (
+        CHATGPT_CONVERSATION_INIT_VERIFIED_PAYLOAD_IDENTITY_SOURCE
+    )
+    result["account_identity_verification_source"] = (
+        CHATGPT_CONVERSATION_INIT_BROWSER_ACCOUNT_IDENTITY_SOURCE
+    )
+    result["account_identity_verified"] = True
+    result["account_identity_hash_algorithm"] = (
+        CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_ALGORITHM
+    )
+    result["account_identity_hash_length"] = (
+        CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_LENGTH
+    )
+    result["account_identity_verification_error"] = None
+    result["collector_source"] = ORACLE_BROWSER_BOUNDARY_NAME
+    result["browser_boundary"] = ORACLE_BROWSER_BOUNDARY_NAME
+    return result
+
+
+def _safe_identity_fields(fields: Sequence[str]) -> List[str]:
+    safe: List[str] = []
+    for field in fields[:MAX_PROJECTION_LIST_ITEMS]:
+        if not isinstance(field, str):
+            continue
+        cleaned = field.strip()
+        if (
+            cleaned
+            and len(cleaned) <= MAX_SAFE_STRING_LENGTH
+            and not _is_unsafe_string(cleaned)
+        ):
+            safe.append(cleaned)
+    return safe
+
+
+def _snapshot_is_persistable(
+    sanitized: Mapping[str, Any],
+    *,
+    expected_account_hash: Optional[str] = None,
+    require_verified_identity: bool = False,
+) -> bool:
     if _http_status_failure(sanitized.get("status_code")) is not None:
         return False
     if sanitized.get("payload_state") != "present":
@@ -2028,6 +2553,23 @@ def _snapshot_is_persistable(sanitized: Mapping[str, Any]) -> bool:
     payload = sanitized.get("payload")
     if not looks_like_conversation_init_payload(payload):
         return False
+    if require_verified_identity:
+        return bool(
+            sanitized.get("account_identity_verified") is True
+            and _is_canonical_account_hash(sanitized.get("account_hash"))
+            and (
+                expected_account_hash is None
+                or sanitized.get("account_hash") == expected_account_hash
+            )
+            and sanitized.get("account_identity_source")
+            == CHATGPT_CONVERSATION_INIT_VERIFIED_PAYLOAD_IDENTITY_SOURCE
+            and sanitized.get("account_identity_verification_source")
+            == CHATGPT_CONVERSATION_INIT_BROWSER_ACCOUNT_IDENTITY_SOURCE
+            and sanitized.get("account_identity_hash_algorithm")
+            == CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_ALGORITHM
+            and sanitized.get("account_identity_hash_length")
+            == CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_LENGTH
+        )
     return bool(sanitized.get("account_hash") or sanitized.get("source_identity_hash"))
 
 
@@ -2038,6 +2580,27 @@ def _destination_has_reusable_snapshot(path: str) -> bool:
         return False
     sanitized = sanitize_conversation_init_boundary(raw, source_path=path)
     return _snapshot_is_persistable(sanitized)
+
+
+def _destination_has_reusable_bound_snapshot(
+    path: str,
+    *,
+    expected_account_hash: str,
+) -> bool:
+    try:
+        raw = load_conversation_init_source(path)
+    except ChatGPTConversationInitError:
+        return False
+    sanitized = sanitize_conversation_init_boundary(
+        raw,
+        source_path=path,
+        _allow_verified_envelope_identity=True,
+    )
+    return _snapshot_is_persistable(
+        sanitized,
+        expected_account_hash=expected_account_hash,
+        require_verified_identity=True,
+    )
 
 
 def _failure_telemetry_status(sanitized: Mapping[str, Any]) -> str:
@@ -2077,6 +2640,50 @@ def _retained_envelope_identity(raw: Any) -> Tuple[Optional[str], List[str]]:
     return str(account_hash), fields
 
 
+def _retained_bound_envelope_identity(
+    raw: Any,
+) -> Tuple[Optional[str], List[str]]:
+    if not isinstance(raw, Mapping):
+        return None, []
+    if raw.get("account_identity_verified") is not True:
+        return None, []
+    if raw.get("account_identity_source") != (
+        CHATGPT_CONVERSATION_INIT_VERIFIED_PAYLOAD_IDENTITY_SOURCE
+    ):
+        return None, []
+    if raw.get("account_identity_verification_source") != (
+        CHATGPT_CONVERSATION_INIT_BROWSER_ACCOUNT_IDENTITY_SOURCE
+    ):
+        return None, []
+    if raw.get("account_identity_hash_algorithm") != (
+        CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_ALGORITHM
+    ):
+        return None, []
+    if raw.get("account_identity_hash_length") != (
+        CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_LENGTH
+    ):
+        return None, []
+    if raw.get("browser_boundary") != ORACLE_BROWSER_BOUNDARY_NAME:
+        return None, []
+    if raw.get("collector_source") != ORACLE_BROWSER_BOUNDARY_NAME:
+        return None, []
+    account_hash = raw.get("account_hash")
+    if not _is_canonical_account_hash(account_hash):
+        return None, []
+    retained_fields = raw.get("account_identity_fields")
+    fields = (
+        _safe_identity_fields(retained_fields)
+        if isinstance(retained_fields, list)
+        else []
+    )
+    if not fields or not any(
+        _normalize_key(field.rsplit(".", 1)[-1]) in _CANONICAL_ACCOUNT_ID_KEYS
+        for field in fields
+    ):
+        return None, []
+    return account_hash, fields
+
+
 def _resolve_account_identity_source(
     raw: Any,
     *,
@@ -2085,7 +2692,15 @@ def _resolve_account_identity_source(
 ) -> Optional[str]:
     if isinstance(raw, Mapping):
         retained = raw.get("account_identity_source")
-        if retained in {"provider_payload", "source_path"} and account_hash:
+        if (
+            retained
+            in {
+                "provider_payload",
+                "source_path",
+                CHATGPT_CONVERSATION_INIT_BROWSER_ACCOUNT_IDENTITY_SOURCE,
+            }
+            and account_hash
+        ):
             return str(retained)
     if account_hash:
         return "provider_payload"
@@ -2098,6 +2713,10 @@ def _is_retained_account_hash(value: Any) -> bool:
     if not isinstance(value, str):
         return False
     return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
+def _is_canonical_account_hash(value: Any) -> bool:
+    return isinstance(value, str) and _CANONICAL_ACCOUNT_HASH_RE.fullmatch(value) is not None
 
 
 def _unlink_quietly(path: str) -> None:
