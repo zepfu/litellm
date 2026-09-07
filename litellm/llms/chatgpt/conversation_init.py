@@ -216,24 +216,22 @@ _SAFE_STRING_FIELD_NAMES = {
         "window",
     )
 }
-_SAFE_UNKNOWN_CONTEXT_MARKERS = (
-    "capability",
-    "capabilities",
-    "feature",
-    "features",
-    "usage",
-    "usages",
+_SAFE_NUMERIC_TOKEN_KEY_MARKERS = (
+    "input",
+    "output",
+    "total",
+    "count",
     "limit",
-    "limits",
-    "quota",
-    "quotas",
-    "progress",
-    "blocked",
-    "flag",
-    "flags",
-    "availability",
-    "supported",
-    "enabled",
+    "remaining",
+    "used",
+    "usage",
+    "budget",
+    "max",
+    "cache",
+    "cached",
+    "prompt",
+    "completion",
+    "reasoning",
 )
 
 _REMAINING_KEYS = ("remaining", "remaining_count", "remainingCount", "left")
@@ -779,8 +777,8 @@ def _split_boundary_envelope(
         raw
     )
     status_code = _parse_status_code(raw)
-    for key in raw:
-        if _is_secret_key(str(key)):
+    for key, value in raw.items():
+        if _is_secret_key(str(key), value):
             redacted += 1
     if not has_envelope and looks_like_conversation_init_payload(raw):
         return status_code, raw, redacted
@@ -799,7 +797,8 @@ def _split_boundary_envelope(
         payload = {
             key: value
             for key, value in raw.items()
-            if _normalize_key(key) not in _ENVELOPE_KEYS and not _is_secret_key(str(key))
+            if _normalize_key(key) not in _ENVELOPE_KEYS
+            and not _is_secret_key(str(key), value)
         }
     if has_envelope:
         for key in raw:
@@ -833,7 +832,6 @@ def _redact_mapping(
     *,
     depth: int,
     parent_key: Optional[str] = None,
-    allow_unknown_strings: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], int]:
     redacted_count = 0
     payload: Dict[str, Any] = {}
@@ -841,12 +839,11 @@ def _redact_mapping(
     items = list(mapping.items())[:MAX_PROJECTION_OBJECT_KEYS]
     parent_normalized = _normalize_key(parent_key) if parent_key else ""
     identity_container = parent_normalized in _ACCOUNT_IDENTITY_CONTAINERS
-    safe_context = allow_unknown_strings or _is_safe_unknown_context(parent_key)
     for key, value in items:
         name = str(key)
         normalized = _normalize_key(name)
         if (
-            _is_secret_key(name)
+            _is_secret_key(name, value)
             or _is_pii_field_name(name)
             or normalized in _ACCOUNT_IDENTITY_KEYS
             or (identity_container and normalized == "id")
@@ -860,9 +857,6 @@ def _redact_mapping(
             value,
             depth=depth + 1,
             parent_key=name,
-            allow_unknown_strings=(
-                safe_context or _is_safe_unknown_context(name)
-            ),
         )
         redacted_count += nested_redacted
         schema[name] = node
@@ -876,7 +870,6 @@ def _redact_value(
     *,
     depth: int,
     parent_key: Optional[str] = None,
-    allow_unknown_strings: bool = False,
 ) -> Tuple[Any, Dict[str, Any], int]:
     if depth > MAX_PROJECTION_DEPTH:
         return None, {"kind": "truncated"}, 0
@@ -894,7 +887,6 @@ def _redact_value(
         if not _is_safe_string_value(
             value,
             field_name=parent_key,
-            allow_unknown_strings=allow_unknown_strings,
         ):
             return None, {"kind": "redacted"}, 1
         clipped = value if len(value) <= MAX_SAFE_STRING_LENGTH else value[:MAX_SAFE_STRING_LENGTH]
@@ -905,7 +897,6 @@ def _redact_value(
             value,
             depth=depth,
             parent_key=parent_key,
-            allow_unknown_strings=allow_unknown_strings,
         )
         fingerprint = _schema_fingerprint(nested_schema)
         object_node: Dict[str, Any] = {
@@ -926,7 +917,6 @@ def _redact_value(
                 item,
                 depth=depth + 1,
                 parent_key=parent_key,
-                allow_unknown_strings=allow_unknown_strings
             )
             redacted += nested_redacted
             item_kinds.append(str(item_node.get("kind") or "unknown"))
@@ -1358,14 +1348,6 @@ def _is_pii_field_name(name: str) -> bool:
     return False
 
 
-def _is_safe_unknown_context(name: Optional[str]) -> bool:
-    normalized = _normalize_key(name) if name else ""
-    return bool(
-        normalized
-        and any(marker in normalized for marker in _SAFE_UNKNOWN_CONTEXT_MARKERS)
-    )
-
-
 def _is_unsafe_mapping_key(name: str) -> bool:
     """Reject dynamic keys that can carry personal data before persistence."""
     text = str(name)
@@ -1396,15 +1378,10 @@ def _is_safe_string_value(
     value: str,
     *,
     field_name: Optional[str],
-    allow_unknown_strings: bool,
 ) -> bool:
-    """Allow only known telemetry strings or enum-like unknown values."""
+    """Allow strings only for explicitly safe telemetry field semantics."""
     normalized = _normalize_key(field_name) if field_name else ""
-    if normalized in _SAFE_STRING_FIELD_NAMES:
-        return _is_safe_telemetry_string(value)
-    if allow_unknown_strings:
-        return _is_safe_telemetry_string(value)
-    return False
+    return normalized in _SAFE_STRING_FIELD_NAMES and _is_safe_telemetry_string(value)
 
 
 def _entry_projections(entry: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1413,7 +1390,7 @@ def _entry_projections(entry: Mapping[str, Any]) -> Dict[str, Any]:
         name = str(key)
         if (
             name == "_identity"
-            or _is_secret_key(name)
+            or _is_secret_key(name, value)
             or _is_pii_field_name(name)
             or _normalize_key(name) == "name"
         ):
@@ -1422,7 +1399,6 @@ def _entry_projections(entry: Mapping[str, Any]) -> Dict[str, Any]:
             value,
             depth=1,
             parent_key=name,
-            allow_unknown_strings=_is_safe_unknown_context(name),
         )
         if node.get("kind") != "redacted":
             projections[name] = projected
@@ -1536,13 +1512,30 @@ def _safe_identity(value: Any) -> Optional[str]:
     return cleaned[:128]
 
 
-def _is_secret_key(name: str) -> bool:
+def _is_secret_key(name: str, value: Any = None) -> bool:
     normalized = _normalize_key(name)
     if not normalized:
+        return False
+    if _is_safe_numeric_token_value(name, value):
         return False
     if normalized in {"authorization", "cookie", "cookies", "set-cookie", "set_cookie"}:
         return True
     return any(marker in normalized for marker in _SECRET_KEY_MARKERS)
+
+
+def _is_safe_numeric_token_value(name: str, value: Any) -> bool:
+    """Allow finite numeric token counters while rejecting token material."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, float) and (
+        value != value or value in {float("inf"), float("-inf")}
+    ):
+        return False
+    normalized = _normalize_key(name)
+    return "token" in normalized and any(
+        marker in normalized.split("_")
+        for marker in _SAFE_NUMERIC_TOKEN_KEY_MARKERS
+    )
 
 
 def _is_unsafe_string(value: str) -> bool:

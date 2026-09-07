@@ -785,7 +785,11 @@ The sidecar image copies only `conversation_init.py` and touches
 `litellm/llms/chatgpt/__init__.py`. Persist uses the existing
 `rate_limit_observations` insert path. Account identifiers and collector source
 paths are hashed; titles, names, usernames, workspace fields, feature notes,
-emails, cookies, and tokens are redacted. Snapshot `raw_provider_fields` omit
+emails, cookies, token values, and unknown string fields are redacted. Strings
+are retained only for explicit telemetry fields such as model/feature identity,
+status, state, mode, window, and reset timestamps. Finite numeric token usage
+counters such as `input_tokens`, `output_tokens`, and `token_limit` remain
+available in sanitized projections. Snapshot `raw_provider_fields` omit
 `observed_at` so repeated identical polls do not defeat dedup. Empty
 `model_limits`, `limits_progress`, or `blocked_features` collections, and
 absent fields, are `empty_unknown` / `absent_unknown`. They are not proof of

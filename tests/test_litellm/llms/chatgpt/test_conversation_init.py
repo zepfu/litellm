@@ -99,7 +99,7 @@ _PAYLOAD_WITH_UNKNOWN_KEYS = {
     "model_limits": [],
     "limits_progress": [],
     "blocked_features": [],
-    "future_capability": "enabled",
+    "future_capability": {"state": "enabled"},
     "experimental_flag": True,
     "atlas_mode_enabled": False,
     "banner_info": {"some_key": "some_value"},
@@ -418,6 +418,92 @@ def test_sanitize_preserves_safe_unknown_nested_values_and_changes_history() -> 
         first_feature["raw_provider_fields"]["entry_projections"]
         != second_feature["raw_provider_fields"]["entry_projections"]
     )
+
+
+def test_sanitize_redacts_unknown_strings_inside_safe_contexts() -> None:
+    raw = _with_identity(
+        {
+            "type": "conversation_init",
+            "default_model_slug": "gpt-6-pro",
+            "model_limits": [],
+            "limits_progress": [
+                {
+                    "feature": "deep_research",
+                    "future_capability": {
+                        "owner": "jane_doe",
+                        "opaque_value": "opaque-token-secret",
+                        "state": "enabled",
+                        "window": "rolling",
+                    },
+                }
+            ],
+            "blocked_features": [],
+        }
+    )
+
+    sanitized = sanitize_conversation_init_boundary(raw)
+    serialized = json.dumps(sanitized, sort_keys=True)
+    capability = sanitized["payload"]["limits_progress"][0]["future_capability"]
+    observations, _summary = parse_conversation_init_observations(
+        sanitized,
+        observed_at=datetime.now(timezone.utc),
+    )
+    persisted = json.dumps(observations, sort_keys=True)
+
+    assert capability == {
+        "state": "enabled",
+        "window": "rolling",
+    }
+    assert "jane_doe" not in serialized
+    assert "opaque-token-secret" not in serialized
+    assert "jane_doe" not in persisted
+    assert "opaque-token-secret" not in persisted
+
+
+def test_sanitize_preserves_numeric_token_counters_but_redacts_token_values() -> None:
+    raw = _with_identity(
+        {
+            "type": "conversation_init",
+            "default_model_slug": "gpt-6-pro",
+            "model_limits": [],
+            "limits_progress": [
+                {
+                    "feature": "deep_research",
+                    "input_tokens": 12,
+                    "output_tokens": 34,
+                    "token_limit": 100,
+                    "sessionToken": "session-token-secret",
+                    "token_metadata": {"value": "opaque-token-secret"},
+                }
+            ],
+            "blocked_features": [],
+        }
+    )
+
+    sanitized = sanitize_conversation_init_boundary(raw)
+    serialized = json.dumps(sanitized, sort_keys=True)
+    entry = sanitized["payload"]["limits_progress"][0]
+    observations, _summary = parse_conversation_init_observations(
+        sanitized,
+        observed_at=datetime.now(timezone.utc),
+    )
+    feature = next(
+        row
+        for row in observations
+        if row["quota_key"] == "chatgpt_conversation_init:feature:deep_research"
+    )
+    projections = feature["raw_provider_fields"]["entry_projections"]
+
+    assert entry["input_tokens"] == 12
+    assert entry["output_tokens"] == 34
+    assert entry["token_limit"] == 100
+    assert projections["input_tokens"] == 12
+    assert projections["output_tokens"] == 34
+    assert projections["token_limit"] == 100
+    assert "sessionToken" not in entry
+    assert "token_metadata" not in entry
+    assert "session-token-secret" not in serialized
+    assert "opaque-token-secret" not in serialized
 
 
 # ---------------------------------------------------------------------------
