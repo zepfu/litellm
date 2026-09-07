@@ -12,7 +12,7 @@ import type {
   ConversationSummary,
   MessageRecord,
 } from "../../src/contracts/records.js";
-import { scopeKey } from "../../src/ledger/identity.js";
+import { collectorScopeKey, scopeKey } from "../../src/ledger/identity.js";
 import { Ledger } from "../../src/ledger/store.js";
 import type {
   LedgerScope,
@@ -59,11 +59,11 @@ afterEach(() => {
 });
 
 describe("D1-752 Stage 2B ledger", () => {
-  it("runs migrations and scopes identical upstream generation IDs by account identity", () => {
+  it("runs migrations and converges identical upstream activity for one verified owner", () => {
     const directory = mkdtempSync(join(tmpdir(), "stage2b-ledger-"));
     temporaryDirectories.push(directory);
     const ledger = new Ledger(join(directory, "usage.sqlite"));
-    expect(ledger.schemaVersion).toBe(3);
+    expect(ledger.schemaVersion).toBe(4);
 
     const first = scope("account-one", "provider-user-one", "workspace-one", "quota-one");
     const second = scope("account-two", "provider-user-one", "workspace-one", "quota-one");
@@ -78,13 +78,28 @@ describe("D1-752 Stage 2B ledger", () => {
     const secondAttempts = ledger.listAttempts(second);
     expect(firstAttempts).toHaveLength(1);
     expect(secondAttempts).toHaveLength(1);
-    expect(firstAttempts[0]?.attemptId).not.toBe(secondAttempts[0]?.attemptId);
-    expect(scopeKey(first)).not.toBe(scopeKey(second));
+    expect(firstAttempts[0]?.attemptId).toBe(secondAttempts[0]?.attemptId);
+    expect(scopeKey(first)).toBe(scopeKey(second));
+    expect(collectorScopeKey(first)).not.toBe(collectorScopeKey(second));
     expect(
       ledger.db
         .prepare("SELECT COUNT(*) AS count FROM attempt_aliases")
         .get() as { count: number },
-    ).toEqual({ count: 8 });
+    ).toEqual({ count: 4 });
+    expect(
+      ledger.activityProvenance(
+        first,
+        "attempt",
+        String(firstAttempts[0]?.attemptId),
+      ).map((row) => row.collector_account_id),
+    ).toEqual(["account-one", "account-two"]);
+    expect(
+      ledger.db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM observations WHERE scope_key=?",
+        )
+        .get(scopeKey(first)),
+    ).toEqual({ count: 2 });
     ledger.close();
   });
 
@@ -224,6 +239,158 @@ describe("D1-752 Stage 2B ledger", () => {
     ledger.close();
   });
 
+  it("preserves A-B-A observation, message, and attempt revision occurrences", () => {
+    const directory = mkdtempSync(join(tmpdir(), "stage2b-aba-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    const account = scope("account-aba", "provider-user", "workspace", "quota");
+    ledger.upsertAccount(account);
+
+    for (const [index, finalModel] of ["model-a", "model-b", "model-a"].entries()) {
+      ledger.ingestConversation(
+        account,
+        progressDetail(
+          "conversation-aba",
+          "finished_successfully",
+          true,
+          finalModel,
+          `2026-09-07T10:0${index + 1}:00.000Z`,
+        ),
+        mappingReviewed,
+        context(
+          `run-aba-${index + 1}`,
+          "conversation-aba",
+          `2026-09-07T10:0${index + 1}:30.000Z`,
+        ),
+      );
+    }
+
+    const attempt = ledger.listAttempts(account)[0]!;
+    expect(attempt.recordedFinalModelRaw).toBe("model-a");
+    expect(
+      ledger.attemptRevisions(account, String(attempt.attemptId)).map((item) =>
+        String((item.payload as Record<string, unknown>).recordedFinalModelRaw),
+      ),
+    ).toEqual(["model-a", "model-b", "model-a"]);
+    expect(
+      ledger.messageRevisions(account, "conversation-aba", "message-final").map((item) =>
+        String((item.payload as Record<string, unknown>).recordedFinalModelRaw),
+      ),
+    ).toEqual(["model-a", "model-b", "model-a"]);
+    expect(
+      ledger.db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM observations WHERE scope_key=? AND source_kind=? AND source_id=?",
+        )
+        .get(scopeKey(account), "conversation_detail", "conversation-aba"),
+    ).toEqual({ count: 3 });
+    ledger.close();
+  });
+
+  it("does not let older evidence replace the current projection", () => {
+    const directory = mkdtempSync(join(tmpdir(), "stage2b-stale-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    const account = scope("account-stale", "provider-user", "workspace", "quota");
+    ledger.upsertAccount(account);
+
+    ledger.ingestConversation(
+      account,
+      progressDetail(
+        "conversation-stale",
+        "finished_successfully",
+        true,
+        "model-new",
+        "2026-09-07T10:02:00.000Z",
+      ),
+      mappingReviewed,
+      context("run-stale-new", "conversation-stale", "2026-09-07T12:00:00.000Z"),
+    );
+    ledger.ingestConversation(
+      account,
+      progressDetail(
+        "conversation-stale",
+        "finished_successfully",
+        true,
+        "model-old",
+        "2026-09-07T10:01:00.000Z",
+      ),
+      mappingReviewed,
+      context("run-stale-old", "conversation-stale", "2026-09-07T11:00:00.000Z"),
+    );
+
+    const attempt = ledger.listAttempts(account)[0]!;
+    expect(attempt.recordedFinalModelRaw).toBe("model-new");
+    expect(
+      ledger.messagesFor(account, "conversation-stale").find(
+        (message) => message.messageId === "message-final",
+      )?.recordedFinalModelRaw,
+    ).toBe("model-new");
+    expect(ledger.attemptRevisions(account, String(attempt.attemptId))).toHaveLength(1);
+    expect(ledger.messageRevisions(account, "conversation-stale", "message-final")).toHaveLength(2);
+    ledger.close();
+  });
+
+  it("allowlists persisted context provenance and quarantines future timestamps", () => {
+    const directory = mkdtempSync(join(tmpdir(), "stage2b-provenance-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    const account = scope("account-provenance", "provider-user", "workspace", "quota");
+    ledger.upsertAccount(account);
+
+    ledger.ingestConversation(
+      account,
+      progressDetail(
+        "conversation-provenance",
+        "finished_successfully",
+        true,
+        "model-final",
+        "2026-09-07T13:00:00.000Z",
+      ),
+      mappingReviewed,
+      {
+        ...context(
+          "run-provenance",
+          "conversation-provenance",
+          "2026-09-07T12:00:00.000Z",
+        ),
+        provenance: {
+          adapter_version: "chatgpt-chat-history-v1",
+          detail_route: "modern",
+          pagination_state: "complete",
+          scopes: ["active"],
+          fixture: "stage2b-synthetic",
+          authorization: "Bearer should-not-persist",
+          nested: { prompt: "should-not-persist" },
+        },
+      },
+    );
+
+    const observation = ledger.db
+      .prepare("SELECT provenance_json FROM observations")
+      .get() as { provenance_json: string };
+    const provenance = JSON.parse(observation.provenance_json) as Record<string, unknown>;
+    expect(provenance).toMatchObject({
+      adapter_version: "chatgpt-chat-history-v1",
+      detail_route: "modern",
+      pagination_state: "complete",
+      scopes: ["active"],
+      fixture: "stage2b-synthetic",
+      collector_account_id: "account-provenance",
+    });
+    expect(provenance.authorization).toBeUndefined();
+    expect(provenance.nested).toBeUndefined();
+
+    const finalMessage = ledger.messagesFor(account, "conversation-provenance").find(
+      (message) => message.messageId === "message-final",
+    );
+    expect(finalMessage?.createdAt).toBeNull();
+    const attempt = ledger.listAttempts(account)[0]!;
+    expect(attempt.latestPossibleAt).toBe("2026-09-07T11:00:00.000Z");
+    expect(attempt.warnings).toContain("future_timestamp_quarantined");
+    ledger.close();
+  });
+
   it("sanitizes evidence before storage and records coverage provenance", () => {
     const directory = mkdtempSync(join(tmpdir(), "stage2b-privacy-"));
     temporaryDirectories.push(directory);
@@ -311,6 +478,14 @@ describe("D1-752 Stage 2B ledger", () => {
         String(ledger.listAttempts(account)[0]?.attemptId),
       ).map((item) => item.mapping_version),
     ).toEqual(["mapping-v1", "mapping-v2"]);
+    const revisedAttempt = ledger.listAttempts(account)[0]!;
+    const revisedPayload = ledger.attemptRevisions(
+      account,
+      String(revisedAttempt.attemptId),
+    )[1]?.payload as Record<string, unknown>;
+    expect(revisedPayload.aliases).toEqual(revisedAttempt.aliases);
+    expect(revisedPayload.evidenceMessageIds).toEqual(revisedAttempt.evidenceMessageIds);
+    expect(revisedPayload.warnings).toEqual(revisedAttempt.warnings);
     expect(ledger.aggregateRevisions(account)).toHaveLength(1);
     ledger.close();
   });

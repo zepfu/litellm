@@ -3,6 +3,7 @@ import type {
   MessageRecord,
   Surface,
 } from "../contracts/records.js";
+import type { SanitizedProvenance } from "./identity.js";
 
 export interface LedgerScope {
   collectorAccountId: string;
@@ -55,6 +56,8 @@ export interface IngestContext {
   schemaVersion: string;
   provenance?: Record<string, unknown>;
 }
+
+export type LedgerProvenance = SanitizedProvenance;
 
 export interface IngestResult {
   observationId: string;
