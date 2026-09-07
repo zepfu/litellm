@@ -66,9 +66,19 @@ timestamps. `limit` is clamped to a hard cap of 1000; the default is 200.
 | `POST /api/v1/schedule` | Reserved for scheduler stage; returns `501 not_implemented`. |
 
 Write routes accept a bounded JSON object (default 16 KiB, max nesting depth
-16, max 256 keys). If `idempotency_key` is provided, the first response is
-cached and replayed for the same key and body. Reusing the same key with a
-different body returns `409 conflict`.
+16, max 256 keys). If `idempotency_key` is provided, the key and a
+deterministic request snapshot are reserved before the service callback runs.
+Concurrent requests with the same key and body coalesce onto the original
+callback; reusing the same key with a different body returns `409 conflict`,
+including while the original callback is still running. The response is
+stored as an immutable snapshot, so later callback mutations do not change a
+replay.
+
+The idempotency cache is bounded (default 1000 entries) and evicts completed
+entries oldest-first. In-flight reservations are never evicted. If all
+configured slots are in flight, a new keyed write returns `503 unavailable`.
+If a callback fails, its reservation is removed and concurrent waiters receive
+the same failure response; a later retry may claim the key again.
 
 ## Service injection and availability
 

@@ -11,7 +11,12 @@
 import { createServer, type Server } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-import { IdempotencyCache, fingerprintRequest } from "./idempotency.js";
+import {
+  cloneValue,
+  fingerprintRequest,
+  IdempotencyCache,
+  immutableSnapshot,
+} from "./idempotency.js";
 import {
   hasCsrfHeader,
   isAuthenticated,
@@ -520,39 +525,73 @@ async function handleIdempotentPost<T extends {
     maxIdempotencyKeyLength,
   );
 
-  if (idempotencyKey !== undefined) {
-    const cached = idempotency.get(route, idempotencyKey);
-    if (cached !== undefined) {
-      if (cached.fingerprint !== fingerprintRequest(route, body)) {
-        sendError(
-          response,
-          HTTP_STATUS.conflict,
-          "conflict",
-          "Idempotency-Key replayed with a different request body",
-        );
-        return;
-      }
-      sendJson(response, cached.status, cached.body);
-      return;
-    }
-  }
-
   const account = optionalAccountId(
     typeof body["account"] === "string" ? body["account"] : undefined,
   );
-  const payload = { ...body, account, idempotencyKey } as T;
-  const result = await service(payload);
-  const status = HTTP_STATUS.accepted;
-  if (idempotencyKey !== undefined) {
-    idempotency.set(
-      route,
-      idempotencyKey,
-      status,
-      result,
-      fingerprintRequest(route, body),
+
+  // Snapshot and fingerprint before invoking a callback. A service may mutate
+  // nested input objects, so replay identity must not depend on that mutation.
+  const requestSnapshot = immutableSnapshot(body);
+  const reservation =
+    idempotencyKey === undefined
+      ? undefined
+      : idempotency.reserve(
+          route,
+          idempotencyKey,
+          fingerprintRequest(route, requestSnapshot),
+        );
+
+  if (reservation?.kind === "conflict") {
+    sendError(
+      response,
+      HTTP_STATUS.conflict,
+      "conflict",
+      "Idempotency-Key replayed with a different request body",
     );
+    return;
   }
-  sendJson(response, status, result);
+  if (reservation?.kind === "capacity") {
+    sendError(
+      response,
+      HTTP_STATUS.unavailable,
+      "unavailable",
+      "Idempotency cache is full",
+    );
+    return;
+  }
+  if (reservation?.kind === "replay") {
+    sendJson(response, reservation.entry.status, reservation.entry.body);
+    return;
+  }
+  if (reservation?.kind === "pending") {
+    const cached = await reservation.promise;
+    sendJson(response, cached.status, cached.body);
+    return;
+  }
+
+  // Give the callback its own mutable copy so nested callback changes cannot
+  // alter the request snapshot used by the reservation.
+  const payload = {
+    ...cloneValue(requestSnapshot),
+    account,
+    idempotencyKey,
+  } as T;
+
+  try {
+    const result = await service(payload);
+    const status = HTTP_STATUS.accepted;
+    if (reservation?.kind === "new") {
+      const cached = reservation.complete(status, result);
+      sendJson(response, cached.status, cached.body);
+      return;
+    }
+    sendJson(response, status, result);
+  } catch (error) {
+    if (reservation?.kind === "new") {
+      reservation.fail(error);
+    }
+    throw error;
+  }
 }
 
 /** Close the server gracefully. */

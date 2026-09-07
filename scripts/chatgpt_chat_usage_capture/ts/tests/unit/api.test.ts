@@ -6,6 +6,7 @@ import {
   type LocalApiServerHandle,
   type LocalApiServices,
 } from "../../src/api/index.js";
+import { IdempotencyCache } from "../../src/api/idempotency.js";
 import { HTTP_STATUS, UNAVAILABLE_REASON } from "../../src/api/types.js";
 
 const AUTH_TOKEN = "test-token-0123456789abcdef";
@@ -41,6 +42,20 @@ async function apiFetch(
     headers.set("Authorization", `Bearer ${AUTH_TOKEN}`);
   }
   return fetch(url, { ...init, headers });
+}
+
+function postJson(
+  url: string,
+  body: Record<string, unknown>,
+): Promise<Response> {
+  return apiFetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Usage-Capture-Token": AUTH_TOKEN,
+    },
+    body: JSON.stringify(body),
+  });
 }
 
 /**
@@ -275,6 +290,267 @@ describe("local API server", () => {
       }),
     });
     expect(second.status).toBe(HTTP_STATUS.conflict);
+  });
+
+  it("coalesces concurrent same-key requests and invokes the service once", async () => {
+    let callCount = 0;
+    let release!: () => void;
+    const callbackGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let markStarted!: () => void;
+    const callbackStarted = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const { server, baseUrl } = await startServer({
+      requestRefresh: async ({ account }) => {
+        callCount += 1;
+        markStarted();
+        await callbackGate;
+        return { account, accepted: true, callCount };
+      },
+    });
+    servers.push(server);
+
+    const body = {
+      account: "personal-primary",
+      idempotency_key: "refresh-concurrent",
+    };
+    const firstPromise = postJson(`${baseUrl}/api/v1/refresh`, body);
+    await callbackStarted;
+    const secondPromise = postJson(`${baseUrl}/api/v1/refresh`, body);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    release();
+
+    const [first, second] = await Promise.all([firstPromise, secondPromise]);
+    expect(first.status).toBe(HTTP_STATUS.accepted);
+    expect(second.status).toBe(HTTP_STATUS.accepted);
+    await expect(first.json()).resolves.toEqual({
+      account: "personal-primary",
+      accepted: true,
+      callCount: 1,
+    });
+    await expect(second.json()).resolves.toEqual({
+      account: "personal-primary",
+      accepted: true,
+      callCount: 1,
+    });
+    expect(callCount).toBe(1);
+  });
+
+  it("rejects a changed body while the original key is still in flight", async () => {
+    let callCount = 0;
+    let release!: () => void;
+    const callbackGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let markStarted!: () => void;
+    const callbackStarted = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const { server, baseUrl } = await startServer({
+      requestRefresh: async ({ account }) => {
+        callCount += 1;
+        if (callCount === 1) {
+          markStarted();
+          await callbackGate;
+        }
+        return { account, accepted: true, callCount };
+      },
+    });
+    servers.push(server);
+
+    const firstPromise = postJson(`${baseUrl}/api/v1/refresh`, {
+      account: "personal-primary",
+      idempotency_key: "refresh-in-flight-conflict",
+    });
+    await callbackStarted;
+
+    const changed = await postJson(`${baseUrl}/api/v1/refresh`, {
+      account: "other-account",
+      idempotency_key: "refresh-in-flight-conflict",
+    });
+    expect(changed.status).toBe(HTTP_STATUS.conflict);
+    expect(callCount).toBe(1);
+
+    release();
+    const first = await firstPromise;
+    expect(first.status).toBe(HTTP_STATUS.accepted);
+    expect(callCount).toBe(1);
+  });
+
+  it("fingerprints the request before a callback mutates nested input", async () => {
+    let callCount = 0;
+    const { server, baseUrl } = await startServer({
+      recordManualObservation: async (input) => {
+        callCount += 1;
+        const observation = input.observation as
+          | { nested?: { value?: string } }
+          | undefined;
+        if (observation?.nested !== undefined) {
+          observation.nested.value = "callback-mutated";
+        }
+        return { accepted: true, callCount };
+      },
+    });
+    servers.push(server);
+
+    const body = {
+      account: "personal-primary",
+      observation: { nested: { value: "original" } },
+      idempotency_key: "observation-mutation",
+    };
+    const first = await postJson(
+      `${baseUrl}/api/v1/manual-observations`,
+      body,
+    );
+    expect(first.status).toBe(HTTP_STATUS.accepted);
+
+    const second = await postJson(
+      `${baseUrl}/api/v1/manual-observations`,
+      body,
+    );
+    expect(second.status).toBe(HTTP_STATUS.accepted);
+    await expect(second.json()).resolves.toEqual({
+      accepted: true,
+      callCount: 1,
+    });
+    expect(callCount).toBe(1);
+  });
+
+  it("replays an immutable response snapshot after the callback result changes", async () => {
+    let callCount = 0;
+    const callbackResult = { nested: { value: "original" } };
+    const { server, baseUrl } = await startServer({
+      requestRefresh: async () => {
+        callCount += 1;
+        return callbackResult;
+      },
+    });
+    servers.push(server);
+
+    const body = {
+      account: "personal-primary",
+      idempotency_key: "response-snapshot",
+    };
+    const first = await postJson(`${baseUrl}/api/v1/refresh`, body);
+    expect(first.status).toBe(HTTP_STATUS.accepted);
+    await expect(first.json()).resolves.toEqual({
+      nested: { value: "original" },
+    });
+
+    callbackResult.nested.value = "changed-after-callback";
+    const second = await postJson(`${baseUrl}/api/v1/refresh`, body);
+    expect(second.status).toBe(HTTP_STATUS.accepted);
+    await expect(second.json()).resolves.toEqual({
+      nested: { value: "original" },
+    });
+    expect(callCount).toBe(1);
+  });
+
+  it("releases a failed reservation so a later HTTP retry can claim the key", async () => {
+    let callCount = 0;
+    const { server, baseUrl } = await startServer({
+      requestRefresh: async ({ account }) => {
+        callCount += 1;
+        if (callCount === 1) {
+          throw new Error("callback failed");
+        }
+        return { account, accepted: true, callCount };
+      },
+    });
+    servers.push(server);
+
+    const body = {
+      account: "personal-primary",
+      idempotency_key: "failure-retry",
+    };
+    const first = await postJson(`${baseUrl}/api/v1/refresh`, body);
+    expect(first.status).toBe(HTTP_STATUS.unavailable);
+    expect(callCount).toBe(1);
+
+    const retry = await postJson(`${baseUrl}/api/v1/refresh`, body);
+    expect(retry.status).toBe(HTTP_STATUS.accepted);
+    await expect(retry.json()).resolves.toEqual({
+      account: "personal-primary",
+      accepted: true,
+      callCount: 2,
+    });
+    expect(callCount).toBe(2);
+  });
+
+  it("rejects pending waiters on failure without wedging the key", async () => {
+    const cache = new IdempotencyCache(1);
+    const owner = cache.reserve("refresh", "key", "fingerprint");
+    const waiter = cache.reserve("refresh", "key", "fingerprint");
+    const failure = new Error("callback failed");
+
+    if (owner.kind !== "new" || waiter.kind !== "pending") {
+      throw new Error("expected a new reservation and a pending waiter");
+    }
+
+    owner.fail(failure);
+    await expect(waiter.promise).rejects.toBe(failure);
+
+    const retry = cache.reserve("refresh", "key", "fingerprint");
+    expect(retry.kind).toBe("new");
+  });
+
+  it("keeps active reservations within the configured cache bound", async () => {
+    let callCount = 0;
+    let release!: () => void;
+    const callbackGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let markStarted!: () => void;
+    const callbackStarted = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const { server, baseUrl } = await startServer(
+      {
+        requestRefresh: async ({ account }) => {
+          callCount += 1;
+          if (callCount === 1) {
+            markStarted();
+            await callbackGate;
+          }
+          return { account, accepted: true, callCount };
+        },
+      },
+      { maxIdempotencyEntries: 1 },
+    );
+    servers.push(server);
+
+    const firstPromise = postJson(`${baseUrl}/api/v1/refresh`, {
+      account: "personal-primary",
+      idempotency_key: "bounded-1",
+    });
+    await callbackStarted;
+
+    const blocked = await postJson(`${baseUrl}/api/v1/refresh`, {
+      account: "personal-primary",
+      idempotency_key: "bounded-2",
+    });
+    expect(blocked.status).toBe(HTTP_STATUS.unavailable);
+    expect(callCount).toBe(1);
+
+    release();
+    const first = await firstPromise;
+    expect(first.status).toBe(HTTP_STATUS.accepted);
+
+    const second = await postJson(`${baseUrl}/api/v1/refresh`, {
+      account: "personal-primary",
+      idempotency_key: "bounded-2",
+    });
+    expect(second.status).toBe(HTTP_STATUS.accepted);
+    expect(callCount).toBe(2);
+
+    const firstReplay = await postJson(`${baseUrl}/api/v1/refresh`, {
+      account: "personal-primary",
+      idempotency_key: "bounded-1",
+    });
+    expect(firstReplay.status).toBe(HTTP_STATUS.accepted);
+    expect(callCount).toBe(3);
   });
 
   it("returns explicit 503 when a service is not injected", async () => {
