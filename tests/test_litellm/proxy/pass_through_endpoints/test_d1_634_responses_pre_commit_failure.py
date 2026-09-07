@@ -1923,3 +1923,80 @@ async def test_central_coordinator_does_not_tight_loop_non_capacity_retryable():
     assert attempts == 1
     coordinator.sleep_with_wakeup.assert_not_awaited()
     coordinator.record_retry.assert_not_called()
+
+
+def test_candidate_loop_planner_calls_pass_live_elapsed_and_deadline():
+    """Candidate-loop planner calls must use live request-wide elapsed/deadline.
+
+    Passing only per-slot attempt counts lets ``plan_responses_pre_commit_retry``
+    default ``elapsed_seconds=0.0`` and reuse a stale schedule instead of the
+    request-wide two-hour deadline.
+    """
+    import ast
+    from pathlib import Path
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        candidate_loop,
+    )
+
+    tree = ast.parse(
+        Path(candidate_loop.__file__).read_text(encoding="utf-8"),
+        filename=candidate_loop.__file__,
+    )
+    handle = next(
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "handle_alias_route"
+    )
+
+    assigned_names = {
+        target.id
+        for node in ast.walk(handle)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    annotated_names = {
+        node.target.id
+        for node in ast.walk(handle)
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    assert "request_retry_started_at" in assigned_names
+    assert "request_retry_budget" in assigned_names | annotated_names
+
+    calls = [
+        node
+        for node in ast.walk(handle)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "plan_responses_pre_commit_retry"
+    ]
+    assert len(calls) == 2
+
+    def _name_ids(node: ast.AST) -> set[str]:
+        return {child.id for child in ast.walk(node) if isinstance(child, ast.Name)}
+
+    def _attr_names(node: ast.AST) -> set[str]:
+        names: set[str] = set()
+        for child in ast.walk(node):
+            if isinstance(child, ast.Attribute):
+                names.add(child.attr)
+        return names
+
+    for call in calls:
+        keywords = {kw.arg: kw.value for kw in call.keywords if kw.arg is not None}
+        assert set(keywords) >= {
+            "error_class",
+            "same_account_transient_attempts",
+            "elapsed_seconds",
+            "budget",
+        }
+        elapsed_names = _name_ids(keywords["elapsed_seconds"])
+        elapsed_attrs = _attr_names(keywords["elapsed_seconds"])
+        budget_names = _name_ids(keywords["budget"])
+        assert "request_retry_started_at" in elapsed_names
+        assert "monotonic" in elapsed_attrs
+        assert "same_account_transient_attempts_by_slot" not in elapsed_names
+        assert "request_retry_budget" in budget_names
+        assert "same_account_transient_attempts_by_slot" not in budget_names

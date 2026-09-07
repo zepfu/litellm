@@ -35,6 +35,7 @@ import asyncio
 import copy
 import hashlib
 import inspect
+import time
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 import httpx
@@ -71,6 +72,7 @@ from .interfaces import (
     RecordCodexFailureEvidenceFn,
     ResolveCooldownPublicationFn,
 )
+from .retry import OpenAIAlphaCapacityRetryBudget
 from .schema_rejections import (
     SCHEMA_REJECTION_KEY,
     normalize_schema_rejection,
@@ -854,6 +856,8 @@ async def handle_alias_route(  # noqa: PLR0915
     native_grok_continuation_transient_provider_attempts = 0
     provider_candidate_attempts = 0
     same_account_transient_attempts_by_slot: dict[Optional[str], int] = {}
+    request_retry_started_at = time.monotonic()
+    request_retry_budget = OpenAIAlphaCapacityRetryBudget()
     token_invalidated_reload_attempts: set[str] = set()
     account_failover_replay_safe = (
         replay_safety.safe
@@ -1920,6 +1924,10 @@ async def handle_alias_route(  # noqa: PLR0915
                                 )
                                 + 1
                             ),
+                            elapsed_seconds=(
+                                time.monotonic() - request_retry_started_at
+                            ),
+                            budget=request_retry_budget,
                         )
                     )
                     prefer_account_failover = (
@@ -2323,6 +2331,10 @@ async def handle_alias_route(  # noqa: PLR0915
                     same_account_transient_attempts=(
                         same_account_transient_attempts_by_slot.get(account_slot, 0)
                     ),
+                    elapsed_seconds=(
+                        time.monotonic() - request_retry_started_at
+                    ),
+                    budget=request_retry_budget,
                 )
                 prefer_account_failover = _prefer_codex_oauth_account_failover(
                     candidate=candidate,
