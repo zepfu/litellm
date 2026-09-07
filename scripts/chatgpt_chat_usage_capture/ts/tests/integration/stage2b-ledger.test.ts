@@ -63,7 +63,7 @@ describe("D1-752 Stage 2B ledger", () => {
     const directory = mkdtempSync(join(tmpdir(), "stage2b-ledger-"));
     temporaryDirectories.push(directory);
     const ledger = new Ledger(join(directory, "usage.sqlite"));
-    expect(ledger.schemaVersion).toBe(5);
+    expect(ledger.schemaVersion).toBe(6);
 
     const first = scope("account-one", "provider-user-one", "workspace-one", "quota-one");
     const second = scope("account-two", "provider-user-one", "workspace-one", "quota-one");
@@ -632,6 +632,81 @@ describe("D1-752 Stage 2B ledger", () => {
     ledger.close();
   });
 
+  it("lets fresh evidence reuse a stale history payload without suppressing projection recovery", () => {
+    const directory = mkdtempSync(join(tmpdir(), "stage2b-stale-replay-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    const account = scope("account-stale-replay", "provider-user", "workspace", "quota");
+    ledger.upsertAccount(account);
+
+    ledger.ingestConversation(
+      account,
+      progressDetail(
+        "conversation-stale-replay",
+        "finished_successfully",
+        true,
+        "model-a",
+        "2026-09-07T10:00:00.000Z",
+      ),
+      mappingReviewed,
+      context("run-stale-replay-a", "conversation-stale-replay", "2026-09-07T12:00:00.000Z"),
+    );
+    ledger.ingestConversation(
+      account,
+      progressDetail(
+        "conversation-stale-replay",
+        "finished_successfully",
+        true,
+        "model-b",
+        "2026-09-07T10:02:00.000Z",
+      ),
+      mappingReviewed,
+      context("run-stale-replay-b", "conversation-stale-replay", "2026-09-07T13:00:00.000Z"),
+    );
+    ledger.ingestConversation(
+      account,
+      progressDetail(
+        "conversation-stale-replay",
+        "finished_successfully",
+        true,
+        "model-a",
+        "2026-09-07T10:01:00.000Z",
+      ),
+      mappingReviewed,
+      context("run-stale-replay-stale-a", "conversation-stale-replay", "2026-09-07T12:30:00.000Z"),
+    );
+
+    const freshReplay = ledger.ingestConversation(
+      account,
+      progressDetail(
+        "conversation-stale-replay",
+        "finished_successfully",
+        true,
+        "model-a",
+        "2026-09-07T10:01:00.000Z",
+      ),
+      mappingReviewed,
+      context("run-stale-replay-fresh-a", "conversation-stale-replay", "2026-09-07T14:00:00.000Z"),
+    );
+
+    expect(freshReplay.observationInserted).toBe(false);
+    expect(freshReplay.messageInserted).toBe(1);
+    expect(freshReplay.attemptUpdated).toBe(1);
+    expect(freshReplay.attemptDeduplicated).toBe(0);
+    expect(ledger.listAttempts(account)[0]?.recordedFinalModelRaw).toBe("model-a");
+    expect(
+      ledger.messageRevisions(account, "conversation-stale-replay", "message-final").map((item) =>
+        String((item.payload as Record<string, unknown>).recordedFinalModelRaw),
+      ),
+    ).toEqual(["model-a", "model-b", "model-a"]);
+    expect(
+      ledger.attemptRevisions(account, String(ledger.listAttempts(account)[0]?.attemptId)).map(
+        (item) => String((item.payload as Record<string, unknown>).recordedFinalModelRaw),
+      ),
+    ).toEqual(["model-a", "model-b", "model-a"]);
+    ledger.close();
+  });
+
   it("allowlists persisted context provenance and quarantines future timestamps", () => {
     const directory = mkdtempSync(join(tmpdir(), "stage2b-provenance-"));
     temporaryDirectories.push(directory);
@@ -686,9 +761,76 @@ describe("D1-752 Stage 2B ledger", () => {
       (message) => message.messageId === "message-final",
     );
     expect(finalMessage?.createdAt).toBeNull();
+    expect(finalMessage?.quarantine).toMatchObject({
+      state: "quarantined",
+      warnings: ["future_timestamp_quarantined"],
+    });
+    expect(finalMessage?.quarantine?.timestamps).toContainEqual({
+      field: "createdAt",
+      value: "2026-09-07T13:00:00.000Z",
+      observedAt: "2026-09-07T12:00:00.000Z",
+      messageId: "message-final",
+    });
     const attempt = ledger.listAttempts(account)[0]!;
     expect(attempt.latestPossibleAt).toBe("2026-09-07T11:00:00.000Z");
     expect(attempt.warnings).toContain("future_timestamp_quarantined");
+    expect(attempt.quarantine).toMatchObject({
+      state: "quarantined",
+      warnings: ["future_timestamp_quarantined"],
+    });
+    expect(
+      (attempt.quarantine as { timestamps: Array<Record<string, string>> }).timestamps,
+    ).toContainEqual({
+      field: "createdAt",
+      value: "2026-09-07T13:00:00.000Z",
+      observedAt: "2026-09-07T12:00:00.000Z",
+      messageId: "message-final",
+    });
+    expect(
+      JSON.parse(
+        (ledger.db.prepare(
+          "SELECT quarantine_json FROM message_records WHERE message_id='message-final'",
+        ).get() as {
+          quarantine_json: string;
+        }).quarantine_json,
+      ),
+    ).toMatchObject({ state: "quarantined" });
+    expect(
+      JSON.parse(
+        (ledger.db.prepare("SELECT quarantine_json FROM observations").get() as {
+          quarantine_json: string;
+        }).quarantine_json,
+      ),
+    ).toMatchObject({ state: "quarantined" });
+    expect(
+      ledger.messageRevisions(account, "conversation-provenance", "message-final")[0]?.payload,
+    ).toMatchObject({
+      createdAt: null,
+      quarantine: {
+        timestamps: [
+          {
+            field: "createdAt",
+            value: "2026-09-07T13:00:00.000Z",
+            observedAt: "2026-09-07T12:00:00.000Z",
+            messageId: "message-final",
+          },
+        ],
+      },
+    });
+
+    expect(
+      ledger.rebuildAttemptsFromMessages(
+        account,
+        mappingReviewed,
+        "2026-09-07T14:00:00.000Z",
+      ),
+    ).toBe(0);
+    const rebuilt = ledger.listAttempts(account)[0]!;
+    expect(rebuilt.warnings).toContain("future_timestamp_quarantined");
+    expect(rebuilt.quarantine).toMatchObject({
+      state: "quarantined",
+      warnings: ["future_timestamp_quarantined"],
+    });
     ledger.close();
   });
 
