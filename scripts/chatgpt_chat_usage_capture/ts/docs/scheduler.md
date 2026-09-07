@@ -12,6 +12,8 @@ prefixed tables:
 
 - `chatgpt_scheduler_state`: one row per `(account_id, profile_id)`.
 - `chatgpt_scheduler_leases`: one row per `(account_id, profile_id)`.
+- `chatgpt_scheduler_write_lock`: one shared row used to acquire SQLite write
+  ownership before scheduler callbacks run.
 
 The scheduler does not alter the shared ledger migration table or ledger store.
 Times are stored as UTC epoch milliseconds. `account_id` identifies the
@@ -94,3 +96,8 @@ The intended later integration sequence is:
 
 The Stage 3 API deliberately leaves job execution, collector budgets,
 retry/cooldown policy, configuration loading, and CLI wiring to later stages.
+
+Every scheduler transaction acquires an actual SQLite write lock before its
+callback runs, including a scheduler operation nested inside a caller-owned
+deferred transaction. This keeps live lease time sampling after write
+ownership, rather than treating `db.inTransaction` alone as sufficient.

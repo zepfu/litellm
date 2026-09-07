@@ -134,6 +134,65 @@ describe("durable scheduler state", () => {
     db.close();
   });
 
+  it("acquires a write lock before sampling time inside a deferred outer transaction", () => {
+    const directory = mkdtempSync(join(tmpdir(), "scheduler-deferred-lock-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "state.sqlite");
+    let now = 900;
+    let armed = false;
+    let peerWriteBlocked = false;
+    const firstDb = new Database(path);
+    const secondDb = new Database(path);
+    firstDb.pragma("busy_timeout = 0");
+    secondDb.pragma("busy_timeout = 0");
+    const first = new SchedulerStore(firstDb, {
+      clock: () => {
+        if (armed) {
+          try {
+            secondDb
+              .prepare(`
+                UPDATE chatgpt_scheduler_write_lock
+                SET touched_at=touched_at
+                WHERE lock_id=1
+              `)
+              .run();
+          } catch (error) {
+            if (
+              error instanceof Error &&
+              error.message.toLowerCase().includes("database is locked")
+            ) {
+              peerWriteBlocked = true;
+            } else {
+              throw error;
+            }
+          }
+        }
+        return now;
+      },
+      random: () => 0,
+    });
+    const second = new SchedulerStore(secondDb, {
+      clock: () => now,
+      random: () => 0,
+    });
+    const account = scope();
+    first.ensureSchedule(account, { anchorAt: 0, interval: "PT1H" });
+    armed = true;
+
+    firstDb.exec("BEGIN");
+    const lease = first.claimLease(account, "worker-a", {
+      leaseDurationMs: 100,
+    });
+
+    expect(lease.acquired).toBe(true);
+    expect(peerWriteBlocked).toBe(true);
+    expect(second.getLease(account)).toBeNull();
+    firstDb.exec("COMMIT");
+    expect(second.getLease(account)?.ownerId).toBe("worker-a");
+    secondDb.close();
+    firstDb.close();
+  });
+
   it("coalesces six missed hourly ticks into one durable catch-up", () => {
     let now = 0;
     const db = new Database(":memory:");

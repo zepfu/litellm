@@ -78,6 +78,13 @@ const CREATE_SCHEDULER_TABLES = `
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (account_id, profile_id)
   );
+
+  CREATE TABLE IF NOT EXISTS chatgpt_scheduler_write_lock (
+    lock_id INTEGER PRIMARY KEY CHECK (lock_id = 1),
+    touched_at INTEGER NOT NULL
+  );
+  INSERT OR IGNORE INTO chatgpt_scheduler_write_lock(lock_id, touched_at)
+  VALUES (1, 0);
 `;
 
 export class SchedulerError extends Error {
@@ -728,6 +735,7 @@ export class SchedulerStore {
     if (!this.db.inTransaction) {
       this.db.exec("BEGIN IMMEDIATE");
       try {
+        this.acquireWriteOwnership();
         const result = callback();
         this.db.exec("COMMIT");
         return result;
@@ -742,6 +750,7 @@ export class SchedulerStore {
     const savepoint = `scheduler_sp_${this.savepointCounter++}`;
     this.db.exec(`SAVEPOINT ${savepoint}`);
     try {
+      this.acquireWriteOwnership();
       const result = callback();
       this.db.exec(`RELEASE ${savepoint}`);
       return result;
@@ -750,6 +759,16 @@ export class SchedulerStore {
       this.db.exec(`RELEASE ${savepoint}`);
       throw error;
     }
+  }
+
+  private acquireWriteOwnership(): void {
+    this.db
+      .prepare(`
+        UPDATE chatgpt_scheduler_write_lock
+        SET touched_at=touched_at
+        WHERE lock_id=1
+      `)
+      .run();
   }
 }
 
