@@ -167,8 +167,10 @@ from .streaming_handler import (
     _RESPONSES_TRANSIENT_CAPACITY_CLASSES,
 )
 from .aawm_alias_routing.pre_commit_retry import (
+    ClientDisconnectedCancellation,
     OpenAIAlphaCapacityRetryCoordinator,
     _build_openai_capacity_target_identity,
+    await_with_client_disconnect,
     get_or_create_openai_alpha_capacity_retry_coordinator,
 )
 from .aawm_alias_routing.durable import get_aawm_alias_routing_state_namespace
@@ -1387,42 +1389,51 @@ async def _await_passthrough_pre_first_byte_operation(
     *,
     timeout_seconds: Optional[float],
     operation_name: str,
+    request: Optional[Request] = None,
 ) -> Any:
-    if timeout_seconds is None:
-        return await operation()
-
-    if timeout_seconds <= 0:
+    if timeout_seconds is not None and timeout_seconds <= 0:
         raise _PassthroughHiddenRetryBudgetTimeout(
             f"Pass-through {operation_name} hidden retry budget exhausted"
         )
 
-    operation_coroutine = operation()
-    try:
-        operation_task = asyncio.create_task(
-            operation_coroutine,
-            eager_start=True,
-        )
-    except TypeError:
-        operation_coroutine.close()
-        operation_task = asyncio.create_task(operation())
-    try:
-        if operation_task.done():
-            return operation_task.result()
-        done, _ = await asyncio.wait(
-            {operation_task},
-            timeout=timeout_seconds,
-        )
-        if operation_task not in done:
-            operation_task.cancel()
-            await asyncio.gather(operation_task, return_exceptions=True)
-            raise _PassthroughHiddenRetryBudgetTimeout(
-                f"Pass-through {operation_name} hidden retry budget exhausted"
+    async def _run_operation() -> Any:
+        if timeout_seconds is None:
+            return await operation()
+
+        operation_coroutine = operation()
+        try:
+            operation_task = asyncio.create_task(
+                operation_coroutine,
+                eager_start=True,
             )
-        return operation_task.result()
-    finally:
-        if not operation_task.done():
-            operation_task.cancel()
-        await asyncio.gather(operation_task, return_exceptions=True)
+        except TypeError:
+            operation_coroutine.close()
+            operation_task = asyncio.create_task(operation())
+        try:
+            if operation_task.done():
+                return operation_task.result()
+            done, _ = await asyncio.wait(
+                {operation_task},
+                timeout=timeout_seconds,
+            )
+            if operation_task not in done:
+                operation_task.cancel()
+                await asyncio.gather(operation_task, return_exceptions=True)
+                raise _PassthroughHiddenRetryBudgetTimeout(
+                    f"Pass-through {operation_name} hidden retry budget exhausted"
+                )
+            return operation_task.result()
+        finally:
+            if not operation_task.done():
+                operation_task.cancel()
+            await asyncio.gather(operation_task, return_exceptions=True)
+
+    if request is None:
+        return await _run_operation()
+    return await await_with_client_disconnect(
+        _run_operation,
+        request=request,
+    )
 
 
 def _get_passthrough_hidden_retry_wait_seconds(attempt_index: int) -> float:
@@ -1792,6 +1803,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
     operation_name: str,
     operation: Any,
     caller_managed_hidden_retry: bool,
+    request: Optional[Request] = None,
     url: Optional[httpx.URL] = None,
     custom_llm_provider: Optional[str] = None,
     openai_capacity_coordinator: Optional[
@@ -1839,11 +1851,36 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         0.0,
                         timeout_seconds - (time.monotonic() - start_monotonic),
                     )
-            result = await _await_passthrough_pre_first_byte_operation(
-                operation,
-                timeout_seconds=timeout_seconds,
-                operation_name=operation_name,
-            )
+            try:
+                if request is not None and openai_capacity_coordinator is not None:
+                    result = await _await_passthrough_pre_first_byte_operation(
+                        operation,
+                        timeout_seconds=timeout_seconds,
+                        operation_name=operation_name,
+                        request=request,
+                    )
+                else:
+                    result = await _await_passthrough_pre_first_byte_operation(
+                        operation,
+                        timeout_seconds=timeout_seconds,
+                        operation_name=operation_name,
+                    )
+            except ClientDisconnectedCancellation:
+                if openai_capacity_coordinator is not None:
+                    openai_capacity_coordinator.record_terminal(
+                        "client_disconnected",
+                        error_class="client_disconnected",
+                        status_code=None,
+                    )
+                raise
+            except asyncio.CancelledError:
+                if openai_capacity_coordinator is not None:
+                    openai_capacity_coordinator.record_terminal(
+                        "cancelled",
+                        error_class="cancelled",
+                        status_code=None,
+                    )
+                raise
             if openai_capacity_coordinator is not None:
                 await openai_capacity_coordinator.signal_success()
                 success_response = (
@@ -2121,11 +2158,46 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 wait_seconds,
             )
             if openai_capacity_coordinator is not None:
-                wakeup_reason = await openai_capacity_coordinator.sleep_with_wakeup(
-                    wait_seconds,
-                    error_class=failure_class,
-                    status_code=status_code,
-                )
+                if request is not None:
+                    try:
+                        wakeup_reason = await await_with_client_disconnect(
+                            lambda: openai_capacity_coordinator.sleep_with_wakeup(
+                                wait_seconds,
+                                error_class=failure_class,
+                                status_code=status_code,
+                            ),
+                            request=request,
+                        )
+                    except ClientDisconnectedCancellation:
+                        openai_capacity_coordinator.record_terminal(
+                            "client_disconnected",
+                            error_class=failure_class,
+                            status_code=status_code,
+                        )
+                        raise
+                    except asyncio.CancelledError:
+                        openai_capacity_coordinator.record_terminal(
+                            "cancelled",
+                            error_class=failure_class,
+                            status_code=status_code,
+                        )
+                        raise
+                else:
+                    try:
+                        wakeup_reason = (
+                            await openai_capacity_coordinator.sleep_with_wakeup(
+                                wait_seconds,
+                                error_class=failure_class,
+                                status_code=status_code,
+                            )
+                        )
+                    except asyncio.CancelledError:
+                        openai_capacity_coordinator.record_terminal(
+                            "cancelled",
+                            error_class=failure_class,
+                            status_code=status_code,
+                        )
+                        raise
                 openai_capacity_coordinator.record_retry(
                     wakeup_reason,
                     error_class=failure_class,
@@ -5073,6 +5145,7 @@ async def pass_through_request(  # noqa: PLR0915
                         operation_name="stream_pre_first_byte",
                         operation=_send_stream_pre_first_byte,
                         caller_managed_hidden_retry=caller_managed_hidden_retry,
+                        request=request,
                         url=url,
                         custom_llm_provider=custom_llm_provider,
                         openai_capacity_coordinator=capacity_retry_coordinator,
@@ -5309,6 +5382,7 @@ async def pass_through_request(  # noqa: PLR0915
                     operation_name="non_stream_pre_first_byte",
                     operation=_send_non_stream_pre_first_byte,
                     caller_managed_hidden_retry=caller_managed_hidden_retry,
+                    request=request,
                     url=url,
                     custom_llm_provider=custom_llm_provider,
                     openai_capacity_coordinator=capacity_retry_coordinator,

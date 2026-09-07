@@ -16,7 +16,7 @@ import hashlib
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional, TypeVar
 from urllib.parse import urlsplit
 
 from starlette.requests import Request
@@ -39,6 +39,69 @@ _OPENAI_CAPACITY_SUCCESS_EPOCH_TTL_SECONDS = 300  # 5 min stale-success expiry
 _OPENAI_CAPACITY_SUCCESS_POLL_SECONDS = 1.0
 _OPENAI_CAPACITY_RETRY_STATE_KEY = "aawm_openai_capacity_retry"
 _LOCAL_CAPACITY_WAKEUP_EVENTS: dict[tuple[str, str], set[asyncio.Event]] = {}
+_CLIENT_DISCONNECT_POLL_SECONDS = 0.25
+_T = TypeVar("_T")
+
+
+class ClientDisconnectedCancellation(asyncio.CancelledError):
+    """Cancellation raised when the parsed client request disconnects."""
+
+
+async def _wait_for_client_disconnect(request: Request) -> None:
+    while True:
+        if await request.is_disconnected():
+            return
+        await asyncio.sleep(_CLIENT_DISCONNECT_POLL_SECONDS)
+
+
+async def await_with_client_disconnect(
+    operation: Callable[[], Awaitable[_T]],
+    *,
+    request: Request,
+) -> _T:
+    """Run an awaitable while canceling it when the parsed request disconnects.
+
+    ``operation`` is an unstarted factory so an already-disconnected request
+    cannot begin another egress. The request body must be parsed before this
+    helper is called; it only polls ``Request.is_disconnected()``. On
+    disconnect, the operation is canceled and awaited before
+    ``ClientDisconnectedCancellation`` is propagated. Caller cancellation
+    remains a normal ``asyncio.CancelledError``. The watcher is canceled and
+    awaited on every other exit path as well.
+    """
+    if await request.is_disconnected():
+        raise ClientDisconnectedCancellation("client disconnected")
+
+    disconnect_task = asyncio.create_task(_wait_for_client_disconnect(request))
+    try:
+        operation_task = asyncio.create_task(operation())
+    except BaseException:
+        disconnect_task.cancel()
+        await asyncio.gather(disconnect_task, return_exceptions=True)
+        raise
+
+    try:
+        done, _ = await asyncio.wait(
+            {operation_task, disconnect_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if disconnect_task in done:
+            disconnect_task.result()
+            if not operation_task.done():
+                operation_task.cancel()
+            await asyncio.gather(operation_task, return_exceptions=True)
+            raise ClientDisconnectedCancellation("client disconnected")
+        return operation_task.result()
+    finally:
+        if not operation_task.done():
+            operation_task.cancel()
+        if not disconnect_task.done():
+            disconnect_task.cancel()
+        await asyncio.gather(
+            operation_task,
+            disconnect_task,
+            return_exceptions=True,
+        )
 
 
 def _resolve_openai_capacity_namespace(namespace: Optional[str]) -> str:

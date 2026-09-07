@@ -2715,6 +2715,279 @@ async def test_central_coordinator_does_not_tight_loop_non_capacity_retryable():
     )
 
 
+@pytest.mark.asyncio
+async def test_direct_capacity_owner_cancels_inflight_operation_on_disconnect():
+    request = MagicMock(spec=Request)
+    operation_started = asyncio.Event()
+    operation_cancelled = asyncio.Event()
+    disconnect_polls = 0
+
+    async def is_disconnected() -> bool:
+        nonlocal disconnect_polls
+        disconnect_polls += 1
+        return operation_started.is_set()
+
+    request.is_disconnected = is_disconnected
+    coordinator = MagicMock()
+    coordinator.deadline_seconds = 60.0
+    coordinator.remaining_seconds = 60.0
+    coordinator.signal_success = AsyncMock()
+    coordinator.record_terminal = MagicMock()
+    attempts = 0
+
+    async def operation():
+        nonlocal attempts
+        attempts += 1
+        operation_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            operation_cancelled.set()
+            raise
+
+    with pytest.raises(asyncio.CancelledError):
+        await _execute_passthrough_pre_first_byte_with_hidden_retries(
+            kwargs={},
+            operation_name="stream_pre_first_byte",
+            operation=operation,
+            caller_managed_hidden_retry=False,
+            request=request,
+            openai_capacity_coordinator=coordinator,
+        )
+
+    assert attempts == 1
+    assert operation_cancelled.is_set()
+    coordinator.record_terminal.assert_called_once_with(
+        "client_disconnected",
+        error_class="client_disconnected",
+        status_code=None,
+    )
+    assert not coordinator.sleep_with_wakeup.called
+    polls_after_cancel = disconnect_polls
+    await asyncio.sleep(0.3)
+    assert disconnect_polls == polls_after_cancel
+
+
+@pytest.mark.asyncio
+async def test_direct_capacity_owner_cancels_retry_wait_on_disconnect():
+    request = MagicMock(spec=Request)
+    wait_started = asyncio.Event()
+    wait_cancelled = asyncio.Event()
+    disconnect_polls = 0
+
+    async def is_disconnected() -> bool:
+        nonlocal disconnect_polls
+        disconnect_polls += 1
+        return wait_started.is_set()
+
+    request.is_disconnected = is_disconnected
+    coordinator = MagicMock()
+    coordinator.deadline_seconds = 60.0
+    coordinator.remaining_seconds = 60.0
+    coordinator.within_deadline.return_value = True
+    coordinator.next_wait_seconds.return_value = 15.0
+    coordinator.record_retry = MagicMock()
+    coordinator.record_terminal = MagicMock()
+    attempts = 0
+
+    async def operation():
+        nonlocal attempts
+        attempts += 1
+        raise ResponsesStreamPreCommitFailure(
+            error_class="server_overloaded",
+            classification="transient_capacity",
+            retryable=True,
+            message="overloaded",
+        )
+
+    async def sleep_with_wakeup(
+        seconds: float, *, error_class: str, status_code: int
+    ) -> str:
+        assert seconds == 15.0
+        wait_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            wait_cancelled.set()
+            raise
+        return "timer"
+
+    coordinator.sleep_with_wakeup = sleep_with_wakeup
+
+    with pytest.raises(asyncio.CancelledError):
+        await _execute_passthrough_pre_first_byte_with_hidden_retries(
+            kwargs={},
+            operation_name="stream_pre_first_byte",
+            operation=operation,
+            caller_managed_hidden_retry=False,
+            request=request,
+            openai_capacity_coordinator=coordinator,
+        )
+
+    assert attempts == 1
+    assert wait_cancelled.is_set()
+    coordinator.record_terminal.assert_called_once_with(
+        "client_disconnected",
+        error_class="server_overloaded",
+        status_code=503,
+    )
+    coordinator.record_retry.assert_not_called()
+    polls_after_cancel = disconnect_polls
+    await asyncio.sleep(0.3)
+    assert disconnect_polls == polls_after_cancel
+
+
+@pytest.mark.asyncio
+async def test_direct_capacity_owner_records_external_cancellation_during_wait():
+    request = MagicMock(spec=Request)
+    wait_started = asyncio.Event()
+    wait_cancelled = asyncio.Event()
+    disconnect_polls = 0
+
+    async def is_disconnected() -> bool:
+        nonlocal disconnect_polls
+        disconnect_polls += 1
+        return False
+
+    request.is_disconnected = is_disconnected
+    coordinator = MagicMock()
+    coordinator.deadline_seconds = 60.0
+    coordinator.remaining_seconds = 60.0
+    coordinator.within_deadline.return_value = True
+    coordinator.next_wait_seconds.return_value = 15.0
+    coordinator.record_retry = MagicMock()
+    coordinator.record_terminal = MagicMock()
+    attempts = 0
+
+    async def operation():
+        nonlocal attempts
+        attempts += 1
+        raise ResponsesStreamPreCommitFailure(
+            error_class="server_overloaded",
+            classification="transient_capacity",
+            retryable=True,
+            message="overloaded",
+        )
+
+    async def sleep_with_wakeup(
+        seconds: float, *, error_class: str, status_code: int
+    ) -> str:
+        assert seconds == 15.0
+        wait_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            wait_cancelled.set()
+            raise
+        return "timer"
+
+    coordinator.sleep_with_wakeup = sleep_with_wakeup
+    task = asyncio.create_task(
+        _execute_passthrough_pre_first_byte_with_hidden_retries(
+            kwargs={},
+            operation_name="stream_pre_first_byte",
+            operation=operation,
+            caller_managed_hidden_retry=False,
+            request=request,
+            openai_capacity_coordinator=coordinator,
+        )
+    )
+    await wait_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert attempts == 1
+    assert wait_cancelled.is_set()
+    coordinator.record_terminal.assert_called_once_with(
+        "cancelled",
+        error_class="server_overloaded",
+        status_code=503,
+    )
+    coordinator.record_retry.assert_not_called()
+    polls_after_cancel = disconnect_polls
+    await asyncio.sleep(0.3)
+    assert disconnect_polls == polls_after_cancel
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "error"])
+async def test_direct_capacity_owner_cleans_disconnect_watcher_on_exit(outcome):
+    request = MagicMock(spec=Request)
+    disconnect_polls = 0
+
+    async def is_disconnected() -> bool:
+        nonlocal disconnect_polls
+        disconnect_polls += 1
+        return False
+
+    request.is_disconnected = is_disconnected
+    coordinator = MagicMock()
+    coordinator.deadline_seconds = 60.0
+    coordinator.remaining_seconds = 60.0
+    coordinator.signal_success = AsyncMock()
+
+    async def operation():
+        if outcome == "error":
+            raise RuntimeError("terminal")
+        return "ok"
+
+    if outcome == "error":
+        with pytest.raises(RuntimeError, match="terminal"):
+            await _execute_passthrough_pre_first_byte_with_hidden_retries(
+                kwargs={},
+                operation_name="stream_pre_first_byte",
+                operation=operation,
+                caller_managed_hidden_retry=False,
+                request=request,
+                openai_capacity_coordinator=coordinator,
+            )
+    else:
+        result = await _execute_passthrough_pre_first_byte_with_hidden_retries(
+            kwargs={},
+            operation_name="stream_pre_first_byte",
+            operation=operation,
+            caller_managed_hidden_retry=False,
+            request=request,
+            openai_capacity_coordinator=coordinator,
+        )
+        assert result == "ok"
+
+    polls_after_exit = disconnect_polls
+    await asyncio.sleep(0.3)
+    assert disconnect_polls == polls_after_exit
+
+
+@pytest.mark.asyncio
+async def test_caller_managed_hidden_retry_does_not_start_disconnect_watcher():
+    request = MagicMock(spec=Request)
+    request.is_disconnected = AsyncMock(
+        side_effect=AssertionError("caller-managed sends must not watch")
+    )
+    coordinator = MagicMock()
+    coordinator.remaining_seconds = 60.0
+    attempts = 0
+
+    async def operation():
+        nonlocal attempts
+        attempts += 1
+        return "ok"
+
+    result = await _execute_passthrough_pre_first_byte_with_hidden_retries(
+        kwargs={},
+        operation_name="stream_pre_first_byte",
+        operation=operation,
+        caller_managed_hidden_retry=True,
+        request=request,
+        openai_capacity_coordinator=coordinator,
+    )
+
+    assert result == "ok"
+    assert attempts == 1
+    request.is_disconnected.assert_not_awaited()
+
+
 def test_candidate_loop_planner_calls_pass_live_elapsed_and_deadline():
     """Candidate-loop planner calls must use live request-wide elapsed/deadline.
 
@@ -2815,6 +3088,7 @@ async def test_nonstream_openai_passthrough_responses_hands_off_capacity_coordin
     mock_request.headers = {"content-type": "application/json"}
     mock_request.query_params = {}
     mock_request.state = SimpleNamespace()
+    mock_request.is_disconnected = AsyncMock(return_value=False)
     custom_body = {"model": "gpt-5.4"}
     monkeypatch.setenv(
         "AAWM_ALIAS_ROUTING_STATE_NAMESPACE", "aawm-routing-test-v2"
@@ -2881,6 +3155,7 @@ async def test_nonstream_openai_passthrough_responses_hands_off_capacity_coordin
 
     coordinator = captured.get("openai_capacity_coordinator")
     assert captured.get("operation_name") == "non_stream_pre_first_byte"
+    assert captured.get("request") is mock_request
     assert isinstance(coordinator, OpenAIAlphaCapacityRetryCoordinator)
     assert coordinator.deadline_seconds == 7200.0
     assert coordinator._namespace == "aawm-routing-test-v2"
@@ -3066,6 +3341,7 @@ async def test_nonstream_alpha_openai_sse_substantive_bytes_survive_precommit_pe
     mock_request.headers = {"content-type": "application/json"}
     mock_request.query_params = {}
     mock_request.state = SimpleNamespace()
+    mock_request.is_disconnected = AsyncMock(return_value=False)
     custom_body = {"model": "gpt-5.4"}
     chunks = [
         _sse(
