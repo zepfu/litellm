@@ -91,3 +91,55 @@ The report also exposes unknown time, ambiguous time, unresolved fragments,
 unknown model evidence, excluded surfaces, and shared/imported/copied
 exclusions independently. It does not calculate remaining quota, reset
 periods, or provider charges.
+
+## Quota projection
+
+`src/accounting/quota.ts` is a pure projection over reconstructed
+`ReconstructedAttempt` values. It does not resolve reset windows, persist
+observations, or make provider requests. The caller supplies one resolved
+membership value per attempt and policy bucket (`in`, `out`, `ambiguous`, or
+`unknown`) plus an overall history coverage state.
+
+The working estimator is
+`requested_if_known_else_recorded_final`. A known requested family is selected
+first. A missing requested family may use a mapped recorded final family only
+when a completed answer exists, and that assessment is labeled
+`final_response_inference`. A rejection before generation starts is retained in
+the assessment but excluded. The default mode excludes failures after start,
+cancellations, unknown acceptance, post-start rejection, conflicting model
+families, and unresolved duplicate identities from the working count; it still
+reports each as an explicit uncertain-debit category even when a family is
+missing, ineligible, or outside the supplied window. The opt-in `include` mode
+includes eligible uncertain categories and labels the result accordingly.
+
+Repeated identical records for one attempt identity are deduplicated before
+classification. Conflicting records for one identity are retained as one
+`conflicting_duplicate_identity` uncertainty assessment and never select an
+arbitrary family or contribute to a bucket.
+Independent uncertainty categories from owned Chat variants are unioned, so a
+conflicting revision does not hide a known failure or cancellation.
+
+Only verified Chat attempts for the expected quota owner contribute. Work,
+Codex, other surfaces, shared/imported/copied origins, missing ownership, and
+owner mismatches remain visible as exclusions or unclassified activity.
+Individual and shared bucket contributions are set-based: one selected attempt
+can contribute once to its individual bucket and once to the applicable shared
+bucket.
+
+Direct server observations remain separate from local projections. A known
+window and complete history coverage are required for a numeric working
+remainder and model headroom; otherwise those qualified values are `null`.
+When local usage and membership are known but coverage is partial, the
+unclamped remainder and any negative discrepancy remain as
+`diagnostic_only` evidence, while the qualified remainder stays `null`. The
+unclamped remainder preserves negative capacity discrepancies and the
+presentation-safe remainder is clamped to zero when qualified. Model headroom
+is the minimum of all compatible known individual/shared remainders and is
+`null` when any required bucket is unknown.
+
+Definite in-window usage exceeding capacity preserves the negative diagnostic
+even when additional attempts have ambiguous membership. That discrepancy is
+`diagnostic_only`; unresolved membership still makes qualified remainder and
+headroom unknown. Arithmetic fixtures retain weekly history while supplying
+distinct daily memberships, so daily rollover does not replenish the weekly
+Astra allocation.
