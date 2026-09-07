@@ -13,7 +13,7 @@ from .models import AttemptRecord, ConversationSummary, MessageRecord
 from .privacy import SURFACE_CHAT, assert_no_secrets, evidence_identity
 from .timeutil import isoformat_utc, parse_datetime
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 LEDGER_APPLICATION = "chatgpt-chat-usage-capture"
 
 DDL = """
@@ -234,7 +234,21 @@ CREATE TABLE IF NOT EXISTS scheduler_state (
     lease_until TEXT,
     missed_intervals INTEGER NOT NULL DEFAULT 0,
     backoff_until TEXT,
-    pending_work_json TEXT
+    pending_work_json TEXT,
+    schedule_anchor_at TEXT,
+    last_jitter_seconds INTEGER,
+    fencing_generation INTEGER NOT NULL DEFAULT 0,
+    last_heartbeat_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS daily_aggregates (
+    collector_account_id TEXT NOT NULL,
+    local_date TEXT NOT NULL,
+    timezone TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    revision_id TEXT,
+    PRIMARY KEY (collector_account_id, local_date, timezone)
 );
 
 CREATE TABLE IF NOT EXISTS notifications (
@@ -265,6 +279,10 @@ class Ledger:
     def migrate(self) -> None:
         with self.transaction():
             self.conn.executescript(DDL)
+            self._ensure_column("scheduler_state", "schedule_anchor_at", "TEXT")
+            self._ensure_column("scheduler_state", "last_jitter_seconds", "INTEGER")
+            self._ensure_column("scheduler_state", "fencing_generation", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column("scheduler_state", "last_heartbeat_at", "TEXT")
             row = self.conn.execute(
                 "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
             ).fetchone()
@@ -273,6 +291,17 @@ class Ledger:
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (SCHEMA_VERSION, isoformat_utc(datetime.now().astimezone()) or ""),
                 )
+            elif int(row["version"]) < SCHEMA_VERSION:
+                self.conn.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (SCHEMA_VERSION, isoformat_utc(datetime.now().astimezone()) or ""),
+                )
+
+    def _ensure_column(self, table: str, column: str, decl: str) -> None:
+        rows = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        names = {row[1] for row in rows}
+        if column not in names:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -735,15 +764,29 @@ class Ledger:
                 return row["attempt_id"]
         return None
 
-    def list_attempts(self, account_id: str) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
-            """
+    def list_attempts(
+        self,
+        account_id: str,
+        *,
+        include_tombstones: bool = False,
+        cursor: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        sql = """
             SELECT * FROM attempts
-            WHERE collector_account_id=? AND tombstone=0
-            ORDER BY COALESCE(attempt_time, earliest_possible_at)
-            """,
-            (account_id,),
-        ).fetchall()
+            WHERE collector_account_id=?
+        """
+        params: list[Any] = [account_id]
+        if not include_tombstones:
+            sql += " AND tombstone=0"
+        if cursor:
+            sql += " AND attempt_id > ?"
+            params.append(cursor)
+        sql += " ORDER BY COALESCE(attempt_time, earliest_possible_at), attempt_id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        rows = self.conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
 
     def set_window(
@@ -868,6 +911,10 @@ class Ledger:
             "missed_intervals": 0,
             "backoff_until": None,
             "pending_work_json": None,
+            "schedule_anchor_at": None,
+            "last_jitter_seconds": None,
+            "fencing_generation": 0,
+            "last_heartbeat_at": None,
         }
         current.update(fields)
         self.conn.execute(
@@ -875,8 +922,9 @@ class Ledger:
             INSERT INTO scheduler_state (
                 collector_account_id, refresh_interval, next_due_at, last_started_at,
                 last_finished_at, lease_owner, lease_token, lease_until, missed_intervals,
-                backoff_until, pending_work_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                backoff_until, pending_work_json, schedule_anchor_at, last_jitter_seconds,
+                fencing_generation, last_heartbeat_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(collector_account_id) DO UPDATE SET
                 refresh_interval=excluded.refresh_interval,
                 next_due_at=excluded.next_due_at,
@@ -887,7 +935,11 @@ class Ledger:
                 lease_until=excluded.lease_until,
                 missed_intervals=excluded.missed_intervals,
                 backoff_until=excluded.backoff_until,
-                pending_work_json=excluded.pending_work_json
+                pending_work_json=excluded.pending_work_json,
+                schedule_anchor_at=excluded.schedule_anchor_at,
+                last_jitter_seconds=excluded.last_jitter_seconds,
+                fencing_generation=excluded.fencing_generation,
+                last_heartbeat_at=excluded.last_heartbeat_at
             """,
             (
                 account_id,
@@ -901,6 +953,10 @@ class Ledger:
                 int(current.get("missed_intervals") or 0),
                 current.get("backoff_until"),
                 current.get("pending_work_json"),
+                current.get("schedule_anchor_at"),
+                current.get("last_jitter_seconds"),
+                int(current.get("fencing_generation") or 0),
+                current.get("last_heartbeat_at"),
             ),
         )
 
@@ -916,3 +972,317 @@ class Ledger:
             """,
             (gap_id, account_id, scope, reason, stamp, stamp),
         )
+
+    def compare_and_set_lease(
+        self,
+        account_id: str,
+        *,
+        expected_token: Optional[str],
+        owner: str,
+        token: str,
+        lease_until: datetime,
+        heartbeat_at: Optional[datetime] = None,
+        generation: Optional[int] = None,
+    ) -> bool:
+        """Atomically claim or re-fence a lease. Stale tokens must not overwrite newer state."""
+        now = heartbeat_at or lease_until
+        current = self.get_scheduler_state(account_id)
+        if current is None:
+            self.upsert_scheduler_state(
+                account_id,
+                lease_owner=owner,
+                lease_token=token,
+                lease_until=isoformat_utc(lease_until),
+                last_heartbeat_at=isoformat_utc(now),
+                fencing_generation=int(generation or 1),
+            )
+            return True
+        stored_token = current.get("lease_token")
+        if expected_token is None:
+            if stored_token not in (None, ""):
+                return False
+        elif stored_token != expected_token:
+            return False
+        next_generation = int(generation if generation is not None else (current.get("fencing_generation") or 0) + 1)
+        cursor = self.conn.execute(
+            """
+            UPDATE scheduler_state
+            SET lease_owner=?, lease_token=?, lease_until=?, last_heartbeat_at=?, fencing_generation=?
+            WHERE collector_account_id=? AND ((? IS NULL AND (lease_token IS NULL OR lease_token='')) OR lease_token=?)
+            """,
+            (
+                owner,
+                token,
+                isoformat_utc(lease_until),
+                isoformat_utc(now),
+                next_generation,
+                account_id,
+                expected_token,
+                expected_token,
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def heartbeat_lease(self, account_id: str, token: str, *, lease_until: datetime, heartbeat_at: datetime) -> bool:
+        cursor = self.conn.execute(
+            """
+            UPDATE scheduler_state
+            SET lease_until=?, last_heartbeat_at=?
+            WHERE collector_account_id=? AND lease_token=?
+            """,
+            (isoformat_utc(lease_until), isoformat_utc(heartbeat_at), account_id, token),
+        )
+        return cursor.rowcount == 1
+
+    def release_lease(self, account_id: str, token: str) -> bool:
+        cursor = self.conn.execute(
+            """
+            UPDATE scheduler_state
+            SET lease_owner=NULL, lease_token=NULL, lease_until=NULL
+            WHERE collector_account_id=? AND lease_token=?
+            """,
+            (account_id, token),
+        )
+        return cursor.rowcount == 1
+
+    def pending_work(self, account_id: str) -> list[dict[str, Any]]:
+        state = self.get_scheduler_state(account_id) or {}
+        raw = state.get("pending_work_json")
+        if not raw:
+            return []
+        payload = json.loads(raw)
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if isinstance(payload, dict):
+            return [payload]
+        return []
+
+    def enqueue_pending_work(self, account_id: str, item: Mapping[str, Any]) -> list[dict[str, Any]]:
+        queued = self.pending_work(account_id)
+        key = (item.get("kind"), item.get("mode"), item.get("since"))
+        if not any((existing.get("kind"), existing.get("mode"), existing.get("since")) == key for existing in queued):
+            queued.append(dict(item))
+        self.upsert_scheduler_state(account_id, pending_work_json=json.dumps(queued, separators=(",", ":")))
+        return queued
+
+    def clear_pending_work(self, account_id: str) -> None:
+        self.upsert_scheduler_state(account_id, pending_work_json=None)
+
+    def list_accounts(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute("SELECT * FROM accounts ORDER BY collector_account_id").fetchall()
+        return [dict(row) for row in rows]
+
+    def list_windows(self, account_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM quota_window_definitions
+            WHERE collector_account_id=?
+            ORDER BY bucket_id
+            """,
+            (account_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_quota_observations(
+        self,
+        account_id: str,
+        *,
+        bucket_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM quota_observations WHERE collector_account_id=?"
+        params: list[Any] = [account_id]
+        if bucket_id:
+            sql += " AND bucket_id=?"
+            params.append(bucket_id)
+        sql += " ORDER BY observed_at DESC LIMIT ?"
+        params.append(int(limit))
+        return [dict(row) for row in self.conn.execute(sql, params).fetchall()]
+
+    def list_runs(self, account_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM collector_runs
+            WHERE collector_account_id=?
+            ORDER BY started_at DESC
+            LIMIT ?
+            """,
+            (account_id, int(limit)),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_coverage_gaps(self, account_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM coverage_gaps
+            WHERE collector_account_id=?
+            ORDER BY first_seen_at
+            """,
+            (account_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def insert_aggregate_revision(
+        self,
+        *,
+        revision_id: str,
+        account_id: str,
+        created_at: datetime,
+        policy_id: Optional[str],
+        mapping_version: Optional[str],
+        payload: Mapping[str, Any],
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO aggregate_revisions (
+                revision_id, collector_account_id, created_at, policy_id, mapping_version, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                revision_id,
+                account_id,
+                isoformat_utc(created_at),
+                policy_id,
+                mapping_version,
+                json.dumps(payload, separators=(",", ":"), default=str),
+            ),
+        )
+
+    def get_latest_revision(self, account_id: str) -> Optional[dict[str, Any]]:
+        row = self.conn.execute(
+            """
+            SELECT * FROM aggregate_revisions
+            WHERE collector_account_id=?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (account_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["payload"] = json.loads(item.get("payload_json") or "{}")
+        return item
+
+    def upsert_daily_aggregate(
+        self,
+        *,
+        account_id: str,
+        local_date: str,
+        timezone_name: str,
+        payload: Mapping[str, Any],
+        created_at: datetime,
+        revision_id: Optional[str] = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO daily_aggregates (
+                collector_account_id, local_date, timezone, payload_json, created_at, revision_id
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(collector_account_id, local_date, timezone) DO UPDATE SET
+                payload_json=excluded.payload_json,
+                created_at=excluded.created_at,
+                revision_id=excluded.revision_id
+            """,
+            (
+                account_id,
+                local_date,
+                timezone_name,
+                json.dumps(payload, separators=(",", ":"), default=str),
+                isoformat_utc(created_at),
+                revision_id,
+            ),
+        )
+
+    def list_daily_aggregates(self, account_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM daily_aggregates
+            WHERE collector_account_id=?
+            ORDER BY local_date
+            """,
+            (account_id,),
+        ).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item.get("payload_json") or "{}")
+            items.append(item)
+        return items
+
+    def prune_retention(
+        self,
+        account_id: str,
+        *,
+        now: datetime,
+        observation_days: int,
+        attempt_days: int,
+        daily_aggregate_days: int,
+        preserve_active_window_evidence: bool = True,
+    ) -> dict[str, Any]:
+        """Prune expired observations/attempts while keeping tombstones and aliases."""
+        from datetime import timedelta, timezone
+        now_utc = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+        observation_cutoff = isoformat_utc(now_utc - timedelta(days=observation_days))
+        attempt_cutoff = isoformat_utc(now_utc - timedelta(days=attempt_days))
+        aggregate_cutoff_date = (now_utc.date() - timedelta(days=daily_aggregate_days)).isoformat()
+        warnings: list[str] = []
+        protected_starts: list[str] = []
+        if preserve_active_window_evidence:
+            for window in self.list_windows(account_id):
+                if window.get("start_at"):
+                    protected_starts.append(window["start_at"])
+        deleted_observations = self.conn.execute(
+            """
+            DELETE FROM observations
+            WHERE collector_account_id=? AND observed_at < ?
+            """,
+            (account_id, observation_cutoff),
+        ).rowcount
+        deleted_quota = self.conn.execute(
+            """
+            DELETE FROM quota_observations
+            WHERE collector_account_id=? AND observed_at < ?
+            """,
+            (account_id, observation_cutoff),
+        ).rowcount
+        expired_attempts = self.conn.execute(
+            """
+            SELECT attempt_id FROM attempts
+            WHERE collector_account_id=? AND tombstone=0
+              AND COALESCE(attempt_time, earliest_possible_at, '') < ?
+            """,
+            (account_id, attempt_cutoff),
+        ).fetchall()
+        tombstoned = 0
+        for row in expired_attempts:
+            self.conn.execute(
+                "UPDATE attempts SET tombstone=1 WHERE attempt_id=?",
+                (row["attempt_id"],),
+            )
+            tombstoned += 1
+        deleted_aggregates = self.conn.execute(
+            """
+            DELETE FROM daily_aggregates
+            WHERE collector_account_id=? AND local_date < ?
+            """,
+            (account_id, aggregate_cutoff_date),
+        ).rowcount
+        remaining_observations = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM observations WHERE collector_account_id=?",
+            (account_id,),
+        ).fetchone()["n"]
+        if remaining_observations == 0 and (deleted_observations or tombstoned):
+            warnings.append("raw observations pruned; rebuild from original website payloads is no longer possible")
+        if protected_starts:
+            earliest_protected = min(protected_starts)
+            if observation_cutoff is not None and observation_cutoff > earliest_protected:
+                warnings.append("retention cutoff is later than an active window start; rebuildability of that window is reduced")
+        return {
+            "deleted_observations": deleted_observations,
+            "deleted_quota_observations": deleted_quota,
+            "tombstoned_attempts": tombstoned,
+            "deleted_daily_aggregates": deleted_aggregates,
+            "aliases_preserved": True,
+            "warnings": warnings,
+        }
