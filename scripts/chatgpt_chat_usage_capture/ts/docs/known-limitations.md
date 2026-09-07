@@ -1,27 +1,44 @@
 # Known limitations
 
-- Stage 1 stops at bootstrap and capability inspection. There is no ledger,
-  accounting, attempt reconstruction, quota-window evaluation, scheduler,
-  local API, dashboard, export, or model report.
-- `inspect-capabilities` reads only the first active and archived index pages.
-  The adapter reports continuation and coverage signals, but Stage 1 does not
-  perform a complete history traversal.
-- The capability record is a versioned adapter declaration plus the evidence
-  observed during the command. It is not an official provider capability
+- Stage 2A stops at sanitized history discovery/acquisition and JSON
+  checkpoints. There is no SQLite ledger/schema, accounting, attempt
+  reconstruction, quota-window evaluation, scheduler, local API, dashboard,
+  export, or model report.
+- A complete active and archived index scan is complete only for the records
+  exposed by those private endpoints during that scan. Temporary, deleted,
+  inaccessible, or otherwise unenumerated conversations remain outside the
+  observed coverage.
+- Project coverage remains `unknown` unless Project identifiers are actually
+  observed. `has_versions` exposes branch/version metadata or active-branch
+  evidence; it does not prove that all historical branches are visible.
+- JSON checkpoints are an interim Stage-2A durability boundary. They support
+  restartable discovery and incomplete-detail revisits but do not provide the
+  later ledger's transactional observation, message, or attempt history.
+- A page budget, repeated cursor, contradictory total, unknown schema, or
+  provider error produces partial coverage and keeps the relevant watermark
+  from advancing. Previously valid checkpoints are retained.
+- Explicit backfill and reconciliation ranges do not use an incremental
+  watermark. Implicit refresh uses a 48-hour discovery overlap; this overlap
+  does not discard older stored activity.
+- Legacy detail is used only after an approved capability and a modern `404` or
+  `405`. Missing conversations and endpoint capability failures cannot always
+  be distinguished from a private provider response.
+- The capability record is a versioned adapter declaration plus evidence
+  observed during collection. It is not an official provider capability
   guarantee.
 - Live operation requires a dedicated persistent Playwright profile and a
   locally installed Chromium browser. Automated credential acquisition is not
   supported.
-- Fixture-backed `inspect-capabilities` is offline contract acceptance only; it
-  does not prove live endpoint availability, authentication, or provider schema
+- Fixture-backed commands are offline contract acceptance only; they do not
+  prove live endpoint availability, authentication, or provider schema
   compatibility.
 - Interactive login is intentionally opt-in and human-driven. The package
   never accepts credentials on the command line or writes them to config,
   logs, fixtures, or state.
-- Provider route and response schemas may change. Unknown shapes are marked
-  `unrecognized` or `partial`; the adapter does not invent complete coverage.
-- Project coverage and quota metadata are reported as unknown or not collected
-  in Stage 1. No official remaining-quota value is inferred.
+- Provider route and response schemas may change. Unknown shapes and
+  contradictory pagination are marked explicitly; the adapter does not invent
+  complete coverage.
+- Quota metadata and official remaining values are not collected in Stage 2A.
 - The fixture transport is deterministic synthetic support, not a provider
   emulator and not a live endpoint proof.
 - The Python implementation remains the reference for later accounting and

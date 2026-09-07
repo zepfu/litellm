@@ -18,8 +18,8 @@ describe("CLI", () => {
     rmSync(stateDirectory, { recursive: true, force: true });
   });
 
-  it("rejects Stage-2+ commands with an explicit error", async () => {
-    for (const command of ["backfill", "refresh", "report", "schedule", "rebuild"]) {
+  it("rejects deferred commands with an explicit error", async () => {
+    for (const command of ["run", "report", "schedule", "rebuild"]) {
       const exitCode = await run([command, "--config", "unused.yaml"]);
       expect(exitCode).toBe(2);
     }
@@ -69,5 +69,49 @@ describe("CLI", () => {
     );
     expect(persisted.state).toBe("ready");
     expect(persisted.identity.providerUserId).toBe("user-abc123");
+  });
+
+  it("runs fixture-backed backfill and explicit reconciliation", async () => {
+    const config = defaultConfig();
+    const account = config.accounts[0]!;
+    account.id = "fixture-primary";
+    account.expectedProviderUserId = "user-abc123";
+    account.expectedWorkspaceId = "ws-xyz";
+    account.quotaOwnerId = "user-abc123";
+    account.browser.adapter = "fixture_history";
+    account.browser.profilePath = "";
+    config.application.stateDirectory = stateDirectory;
+
+    const configPath = join(stateDirectory, "fixture-config.json");
+    saveConfig(config, configPath);
+    const fixtureRoot = new URL("../fixtures/v1/", import.meta.url).pathname;
+
+    await expect(
+      run([
+        "backfill",
+        "--config",
+        configPath,
+        "--fixture-root",
+        fixtureRoot,
+        "--state-directory",
+        stateDirectory,
+      ]),
+    ).resolves.toBe(0);
+
+    await expect(
+      run([
+        "reconcile",
+        "--config",
+        configPath,
+        "--fixture-root",
+        fixtureRoot,
+        "--state-directory",
+        stateDirectory,
+        "--since",
+        "2026-09-01T00:00:00.000Z",
+        "--until",
+        "2026-09-08T00:00:00.000Z",
+      ]),
+    ).resolves.toBe(0);
   });
 });

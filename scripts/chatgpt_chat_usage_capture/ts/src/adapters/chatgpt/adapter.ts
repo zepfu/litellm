@@ -15,6 +15,7 @@ import type {
   ConversationDetailProjection,
   ConversationSummary,
   MessageRecord,
+  PaginationState,
   Surface,
 } from "../../contracts/records.js";
 import {
@@ -80,6 +81,18 @@ export class RateLimitedError extends AdapterError {
   }
 }
 
+export class LegacyFallbackNotApprovedError extends AdapterError {
+  readonly status: number;
+  readonly path: string;
+
+  constructor(message: string, options: { status: number; path: string }) {
+    super(message);
+    this.name = "LegacyFallbackNotApprovedError";
+    this.status = options.status;
+    this.path = options.path;
+  }
+}
+
 export interface HistoryTransport {
   request(
     method: string,
@@ -136,6 +149,7 @@ export class ChatGPTHistoryAdapter {
   constructor(
     private readonly transport: HistoryTransport,
     private readonly expectedIdentity: ExpectedIdentity = {},
+    private readonly options: { legacyFallbackApproved?: boolean } = {},
   ) {}
 
   async inspectSessionIdentity() {
@@ -186,6 +200,7 @@ export class ChatGPTHistoryAdapter {
 
   async fetchConversation(
     conversationId: string,
+    options: { allowLegacyFallback?: boolean } = {},
   ): Promise<ConversationDetailProjection> {
     const modernPath = conversationPath(MODERN_DETAIL, conversationId);
     const payload = await this.request("GET", modernPath, {
@@ -196,13 +211,30 @@ export class ChatGPTHistoryAdapter {
     raiseIfRateLimited(payload, modernPath);
     const status = numberOr(payload.http_status, 200);
     if (status === 404 || status === 405) {
+      const allowLegacyFallback =
+        options.allowLegacyFallback ??
+        this.options.legacyFallbackApproved ??
+        this.capabilities.legacySupport === "fallback_on_404_405";
+      if (!allowLegacyFallback) {
+        throw new LegacyFallbackNotApprovedError(
+          `modern detail returned ${status} for ${conversationId}; legacy fallback is not capability-approved`,
+          { status, path: modernPath },
+        );
+      }
       const legacyPath = conversationPath(LEGACY_DETAIL, conversationId);
       const legacyPayload = await this.request("GET", legacyPath);
       raiseIfAuthenticationRequired(legacyPayload, legacyPath);
       raiseIfRateLimited(legacyPayload, legacyPath);
-      return adaptConversationDetail(legacyPayload, conversationId);
+      return adaptConversationDetail(legacyPayload, conversationId, {
+        detailRoute: "legacy",
+      });
     }
-    return adaptConversationDetail(payload, conversationId);
+    if (status < 200 || status >= 300) {
+      throw new AdapterError(`modern detail returned HTTP ${status} for ${conversationId}`);
+    }
+    return adaptConversationDetail(payload, conversationId, {
+      detailRoute: "modern",
+    });
   }
 
   async fetchMessages(
@@ -261,6 +293,7 @@ export function adaptConversationIndex(
       items: [],
       continuation: null,
       exhausted: false,
+      paginationState: "unknown",
       schemaVersion: ADAPTER_VERSION,
       coverage: "unrecognized",
       warnings: ["missing items array"],
@@ -298,32 +331,64 @@ export function adaptConversationIndex(
     });
   }
 
-  const total = typeof payload.total === "number" ? payload.total : null;
+  const totalValue = payload.total;
+  const total =
+    typeof totalValue === "number" &&
+    Number.isInteger(totalValue) &&
+    totalValue >= 0
+      ? totalValue
+      : null;
+  if (totalValue !== undefined && total === null) {
+    warnings.push("invalid_total");
+  }
   let continuation: string | number | null = null;
   let exhausted = false;
-  if (total !== null && offset + itemsRaw.length >= total) {
-    exhausted = true;
-  } else if (payload.has_missing_conversations) {
-    exhausted = false;
+  let paginationState: PaginationState = "unknown";
+  const pageEnd = offset + itemsRaw.length;
+  const hasMissingConversations = payload.has_missing_conversations === true;
+  if (hasMissingConversations) {
     warnings.push("index reported missing conversations");
+  }
+  if (totalValue !== undefined && total === null) {
+    paginationState = "unknown";
+  } else if (total !== null && total < offset) {
+    warnings.push("total_before_offset");
+    paginationState = "contradictory";
+  } else if (total !== null && pageEnd > total) {
+    warnings.push("page_exceeds_total");
+    paginationState = "contradictory";
+  } else if (total !== null && itemsRaw.length < limit && pageEnd < total) {
+    // A short page cannot prove exhaustion while the server says more items
+    // remain. Keep a resumable offset and expose the contradiction.
+    warnings.push("short_page_before_reported_total");
+    continuation = pageEnd;
+    paginationState = "contradictory";
+  } else if (total !== null && pageEnd >= total) {
+    exhausted = !hasMissingConversations;
+    paginationState = exhausted ? "complete" : "unknown";
   } else if (itemsRaw.length < limit) {
-    exhausted = true;
+    exhausted = !hasMissingConversations;
+    paginationState = exhausted ? "complete" : "unknown";
   } else {
-    continuation = offset + itemsRaw.length;
+    continuation = pageEnd;
+    paginationState = "continuation";
   }
 
   let coverage: AdaptedPage<ConversationSummary>["coverage"] = "validated_page";
-  if (warnings.length > 0) {
-    coverage = "partial";
-  }
-  if (total === null && continuation === null && !exhausted) {
+  if (paginationState === "unknown") {
     coverage = "unrecognized";
+  } else if (
+    paginationState === "contradictory" ||
+    warnings.length > 0
+  ) {
+    coverage = "partial";
   }
 
   return {
     items: summaries,
     continuation,
     exhausted,
+    paginationState,
     schemaVersion: ADAPTER_VERSION,
     coverage,
     warnings,
@@ -333,6 +398,7 @@ export function adaptConversationIndex(
 export function adaptConversationDetail(
   payload: Record<string, unknown>,
   conversationId: string,
+  options: { detailRoute?: "modern" | "legacy" } = {},
 ): ConversationDetailProjection {
   const surface = classifySurface(payload, { default: null }) as Surface;
   const page = adaptMessagePage(payload, {
@@ -345,7 +411,9 @@ export function adaptConversationDetail(
     updatedAt: optionalString(payload.update_time ?? payload.updated_at),
     currentNode: optionalString(payload.current_node),
     surface,
+    detailRoute: options.detailRoute ?? "modern",
     messages: page.items,
+    paginationState: page.paginationState,
     coverage: page.coverage,
     warnings: page.warnings,
   };
@@ -401,6 +469,7 @@ export function adaptMessagePage(
       items: records,
       continuation: null,
       exhausted: false,
+      paginationState: "unknown",
       schemaVersion: ADAPTER_VERSION,
       coverage: "unrecognized",
       warnings,
@@ -412,6 +481,7 @@ export function adaptMessagePage(
       items: records,
       continuation: null,
       exhausted: true,
+      paginationState: "complete",
       schemaVersion: ADAPTER_VERSION,
       coverage: warnings.length > 0 ? "partial" : "validated_page",
       warnings,
@@ -425,6 +495,7 @@ export function adaptMessagePage(
       items: records,
       continuation: null,
       exhausted: false,
+      paginationState: "unknown",
       schemaVersion: ADAPTER_VERSION,
       coverage: "unrecognized",
       warnings,
@@ -435,6 +506,7 @@ export function adaptMessagePage(
   const hasPrevious = pageInfo.has_previous_page;
   let exhausted = false;
   let continuation: string | number | null = null;
+  let paginationState: PaginationState = "unknown";
   let invalidPagination = false;
   if (typeof hasPrevious !== "boolean") {
     warnings.push("non_boolean_has_previous_page");
@@ -445,17 +517,20 @@ export function adaptMessagePage(
       invalidPagination = true;
     } else {
       continuation = cursor.trim();
+      paginationState = "continuation";
     }
   } else if (cursor !== null && cursor !== undefined && cursor !== "") {
     warnings.push("terminal_page_has_cursor");
     invalidPagination = true;
   } else {
     exhausted = true;
+    paginationState = "complete";
   }
   if (payload.repeated_cursor) {
     warnings.push("repeated_cursor");
     exhausted = false;
     continuation = null;
+    paginationState = "repeated_cursor";
   }
 
   const coverage = invalidPagination
@@ -468,6 +543,7 @@ export function adaptMessagePage(
     items: records,
     continuation,
     exhausted,
+    paginationState: invalidPagination ? "contradictory" : paginationState,
     schemaVersion: ADAPTER_VERSION,
     coverage,
     warnings,

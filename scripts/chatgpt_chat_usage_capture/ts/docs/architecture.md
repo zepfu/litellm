@@ -1,7 +1,8 @@
-# Stage-1 architecture
+# Stage-2A architecture
 
 The TypeScript slice keeps browser access, provider adaptation, identity
-verification, privacy projection, and local bootstrap state separate.
+verification, privacy projection, history discovery, and durable collection
+state separate.
 
 ```text
 CLI
@@ -20,9 +21,14 @@ JSON config -> bootstrap state machine
              |                  |
              v                  v
       identity verifier   sanitized page records
-             |
-             v
-   0600 bootstrap identity state
+             |                  |
+             +----------+-------+
+                        v
+              Stage-2A history collector
+              active | archived | revisits
+                        |
+                        v
+             0600 JSON checkpoints
 ```
 
 ## Boundaries
@@ -39,7 +45,7 @@ generated config can be loaded without a manual format conversion.
 requires an existing dedicated profile. A missing profile is created only
 after `--interactive-login` is explicitly supplied. Downloads are disabled.
 The browser context and its cookies, storage, and tokens remain in the profile
-directory and are never serialized into Stage-1 state.
+directory and are never serialized into collector state.
 
 For offline acceptance, the CLI can select `fixture_history` with an explicit
 `--fixture-root`. That path uses the same adapter against synthetic JSON and
@@ -56,8 +62,40 @@ signal. `assertAllowedRequest` is applied by the adapter and by both the
 Playwright and fixture transports before any request is issued.
 
 The adapter exposes active and archived index coverage, modern detail support,
-message-page pagination evidence, and legacy detail fallback behavior. The
-capability record is versioned with `chatgpt-chat-history-v1`.
+message-page pagination evidence, project/version visibility, and legacy detail
+fallback behavior. Pagination controls are normalized into explicit states;
+short pages contradicting a larger reported total remain partial and
+resumable. The capability record is versioned with
+`chatgpt-chat-history-v1`. A modern detail `404` or `405` reaches the legacy
+route only when the caller has approved that capability; `401`, `403`, `429`,
+and other statuses do not.
+
+Stage 2A extends the committed Stage-1 contracts without removing existing
+fields: `AdaptedPage` adds `paginationState`, and
+`ConversationDetailProjection` adds `detailRoute` plus `paginationState`.
+These fields preserve route provenance and distinguish validated completion
+from continuation, contradiction, repetition, budget exhaustion, or unknown
+pagination.
+
+### History collection
+
+`src/history/collector.ts` is the Stage-2A acquisition boundary. It scans both
+active and archived scopes, deduplicates conversation IDs across scopes, uses
+conversation update time for candidate discovery, and then fetches message
+metadata. It never reconstructs attempts or writes accounting totals.
+
+`backfill` uses a 14-day elapsed range by default and accepts arbitrary
+half-open UTC ranges. `refresh` computes a per-scope discovery cutoff from the
+last complete discovery start minus 48 hours. An explicit backfill or
+reconciliation range always wins over a stored watermark. Discovery completion
+and detail completion are separate: an incomplete detail remains in the
+revisit queue even when the index scan watermark advances.
+
+`src/history/checkpoints.ts` provides a small atomic JSON implementation of the
+Stage-2A checkpoint interface. Each scope stores its continuation, page
+budget, pagination state, range, warnings, and last complete discovery start.
+The same state file stores outstanding conversation revisits. This is an
+intermediate Stage-2A boundary; it is not the later SQLite ledger.
 
 ### Identity
 
@@ -83,7 +121,8 @@ projection before it is written.
 
 ### Stage boundary
 
-The TypeScript implementation intentionally stops before ledger/accounting,
-attempt reconstruction, scheduler, local API, dashboard, and exports. The
-Python implementation in the parent directory remains the reference for those
-later stages; it is not imported by this package.
+The TypeScript implementation intentionally stops before SQLite
+ledger/accounting, attempt reconstruction, quota windows, scheduler, local API,
+dashboard, and exports. The Python implementation in the parent directory
+remains the reference for those later stages; it is not imported by this
+package.

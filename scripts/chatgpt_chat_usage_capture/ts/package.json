@@ -1,7 +1,7 @@
 {
   "name": "chatgpt-chat-usage-capture",
   "version": "0.1.0",
-  "description": "Independent read-only ChatGPT ordinary Chat usage collector (D1-752 Stage 1: evidence contract and fixture-backed adapter)",
+  "description": "Independent read-only ChatGPT ordinary Chat usage collector (D1-752 TypeScript Stage 2A history acquisition)",
   "license": "MIT",
   "type": "module",
   "private": true,

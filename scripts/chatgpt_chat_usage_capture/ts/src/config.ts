@@ -1,7 +1,6 @@
 /**
- * Stage-1 configuration loader. Only the subset of the spec configuration
- * required for bootstrap and inspect-capabilities is modeled here; scheduler,
- * accounting, and ledger configuration belong to later stages.
+ * Configuration loader. Collection-specific scheduler, accounting, and
+ * ledger configuration belong to later stages.
  */
 
 import {

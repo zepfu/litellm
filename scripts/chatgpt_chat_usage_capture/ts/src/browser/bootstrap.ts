@@ -1,5 +1,5 @@
 /**
- * Stage-1 bootstrap and capability inspection.
+ * Bootstrap and capability inspection for the TypeScript collector.
  *
  * Bootstrap binds an account to a dedicated browser profile and verifies
  * identity, workspace, and quota owner before declaring the account ready.

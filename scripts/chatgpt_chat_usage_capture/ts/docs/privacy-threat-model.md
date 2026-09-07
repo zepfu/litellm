@@ -47,14 +47,14 @@ or make network calls.
 
 ## Threats and residual risk
 
-| Threat | Stage-1 response | Residual risk |
+| Threat | Stage-2A response | Residual risk |
 | --- | --- | --- |
 | Accidental mutating provider call | `GET`-only method and exact route allowlist | A future change could weaken the boundary; route tests must remain part of the gate |
 | Wrong account attribution | Required three-field identity match | Provider schema changes can make identity unavailable until the adapter is updated |
 | Credential or content persistence | Allowlist projection and secret scan | Upstream response data still exists in memory during the request |
 | Shared/default profile exposure | Dedicated-profile checks and explicit login | Filesystem ownership and OS-level access are outside the package |
 | HTML login or auth challenge treated as data | HTML, `401`, and `403` become auth-required | Live provider behavior can change and require new detection |
-| Provider throttling mistaken for quota | `429` becomes `RateLimitedError` | No retry scheduler or quota accounting exists in Stage 1 |
+| Provider throttling mistaken for quota | `429` becomes `RateLimitedError` | No retry scheduler or quota accounting exists in Stage 2A |
 | Schema drift | Coverage and warnings are returned instead of inventing completeness | The current adapter cannot interpret unknown future shapes |
 
 This is a local privacy boundary, not a security boundary against a

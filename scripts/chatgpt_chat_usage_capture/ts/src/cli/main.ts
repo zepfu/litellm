@@ -1,10 +1,10 @@
 /**
- * Stage-1 CLI entry point.
+ * TypeScript collector CLI entry point.
  *
- * Implemented commands: init, bootstrap, inspect-capabilities. All other
- * Stage-2+ commands fail closed with an explicit "not implemented in Stage 1"
- * error. No command submits prompts, exports credentials, or bypasses the
- * GET-only route allowlist.
+ * Implemented commands include bootstrap, capability inspection, and the
+ * Stage-2A history modes. Later ledger/scheduler/API commands fail closed.
+ * No command submits prompts, exports credentials, or bypasses the GET-only
+ * route allowlist.
  */
 
 import { existsSync } from "node:fs";
@@ -17,8 +17,28 @@ import {
   inspectCapabilities,
   inspectFixtureCapabilities,
 } from "../browser/bootstrap.js";
+import {
+  ChatGPTHistoryAdapter,
+  type HistoryTransport,
+} from "../adapters/chatgpt/adapter.js";
+import { FixtureTransport } from "../adapters/chatgpt/fixture-transport.js";
+import { PlaywrightTransport } from "../browser/session.js";
 import { ADAPTER_VERSION } from "../contracts/records.js";
 import type { BootstrapResult, InspectCapabilitiesResult } from "../browser/bootstrap.js";
+import type {
+  HistoryCollectionMode,
+  HistoryCollectionResult,
+  HistoryRange,
+} from "../contracts/history.js";
+import { HistoryCollector } from "../history/collector.js";
+import { JsonCheckpointStore } from "../history/checkpoints.js";
+import {
+  defaultBackfillRange,
+  makeRange,
+  parseDuration,
+  parseInstant,
+} from "../history/range.js";
+import type { AccountConfig } from "../config.js";
 
 interface CliArgs {
   command: string;
@@ -27,12 +47,13 @@ interface CliArgs {
   interactiveLogin: boolean;
   stateDirectory: string | null;
   fixtureRoot: string | null;
+  since: string | null;
+  until: string | null;
 }
 
 const STAGE1_COMMANDS = new Set(["init", "bootstrap", "inspect-capabilities"]);
+const STAGE2_HISTORY_COMMANDS = new Set(["backfill", "refresh", "reconcile"]);
 const STAGE2_PLUS_COMMANDS = new Set([
-  "backfill",
-  "refresh",
   "run",
   "status",
   "report",
@@ -54,11 +75,19 @@ export async function run(argv: string[]): Promise<number> {
     return 2;
   }
 
+  if (STAGE2_HISTORY_COMMANDS.has(args.command)) {
+    try {
+      return await runHistoryCollection(args);
+    } catch (error) {
+      console.error(`usage-capture: ${(error as Error).message}`);
+      return 1;
+    }
+  }
   if (!STAGE1_COMMANDS.has(args.command)) {
     if (STAGE2_PLUS_COMMANDS.has(args.command)) {
       console.error(
-        `usage-capture: '${args.command}' is not implemented in Stage 1. ` +
-          "Stage 1 covers bootstrap, inspect-capabilities, and init only.",
+        `usage-capture: '${args.command}' is not implemented in this lane. ` +
+          "Stage 2A covers bootstrap, capability inspection, and history acquisition only.",
       );
       return 2;
     }
@@ -81,7 +110,10 @@ async function execute(args: CliArgs): Promise<number> {
   if (args.command === "bootstrap") {
     return runBootstrap(args);
   }
-  return runInspectCapabilities(args);
+  if (args.command === "inspect-capabilities") {
+    return runInspectCapabilities(args);
+  }
+  return runHistoryCollection(args);
 }
 
 function runInit(args: CliArgs): number {
@@ -168,12 +200,114 @@ async function runInspectCapabilities(args: CliArgs): Promise<number> {
   return result.state === "ready" ? 0 : 1;
 }
 
+async function runHistoryCollection(args: CliArgs): Promise<number> {
+  const config = loadConfig(args.configPath);
+  const account = selectAccount(config.accounts, args.accountId);
+  if (!account) {
+    console.error(`usage-capture ${args.command}: account '${args.accountId}' not found`);
+    return 2;
+  }
+  if (account.browser.adapter === "fixture_history" && !args.fixtureRoot) {
+    console.error(
+      `usage-capture ${args.command}: fixture_history requires --fixture-root`,
+    );
+    return 2;
+  }
+  if (account.browser.adapter === "playwright_persistent_context" && args.fixtureRoot) {
+    console.error(
+      `usage-capture ${args.command}: --fixture-root requires browser.adapter fixture_history`,
+    );
+    return 2;
+  }
+
+  const stateDirectory = resolve(
+    args.stateDirectory ?? config.application.stateDirectory,
+  );
+  const mode: HistoryCollectionMode =
+    args.command === "backfill"
+      ? "backfill"
+      : args.command === "reconcile"
+        ? "reconciliation"
+        : "incremental";
+  let range: HistoryRange | undefined;
+  try {
+    range = collectionRange(args, mode);
+  } catch (error) {
+    console.error(`usage-capture ${args.command}: ${(error as Error).message}`);
+    return 2;
+  }
+
+  const transport: HistoryTransport =
+    account.browser.adapter === "fixture_history"
+      ? new FixtureTransport(resolve(args.fixtureRoot!))
+      : new PlaywrightTransport(account.browser);
+  const adapter = new ChatGPTHistoryAdapter(transport, {
+    providerUserId: account.expectedProviderUserId,
+    workspaceId: account.expectedWorkspaceId,
+    quotaOwnerId: account.quotaOwnerId,
+  });
+  try {
+    const request = range ? { mode, range } : { mode };
+    const result = await new HistoryCollector(adapter, {
+      accountId: account.id,
+      store: new JsonCheckpointStore(stateDirectory, account.id),
+    }).collect(request);
+    printCollectionResult(result);
+    return result.status === "blocked" ? 1 : 0;
+  } finally {
+    await adapter.close();
+  }
+}
+
+function collectionRange(
+  args: CliArgs,
+  mode: HistoryCollectionMode,
+): HistoryRange | undefined {
+  if (mode === "incremental" && !args.since && !args.until) {
+    return undefined;
+  }
+  if (mode === "reconciliation" && !args.since) {
+    throw new Error("reconcile requires --since and an explicit range");
+  }
+  const now = new Date();
+  const end = args.until ? parseInstant(args.until) : now;
+  if (!args.since) {
+    return defaultBackfillRange(end);
+  }
+  const sinceIsDuration = /^\d+(?:\.\d+)?[dhm]$/i.test(args.since.trim());
+  if (!sinceIsDuration) {
+    return makeRange(parseInstant(args.since), end);
+  }
+  const duration = parseDuration(args.since);
+  return makeRange(new Date(end.getTime() - duration), end);
+}
+
 function printBootstrapResult(result: BootstrapResult): void {
   console.log(JSON.stringify(result, null, 2));
 }
 
 function printInspectCapabilitiesResult(result: InspectCapabilitiesResult): void {
   console.log(JSON.stringify(result, null, 2));
+}
+
+function printCollectionResult(result: HistoryCollectionResult): void {
+  console.log(
+    JSON.stringify(
+      {
+        ...result,
+        conversations: result.conversations.map((conversation) => ({
+          summary: conversation.summary,
+          scopes: conversation.scopes,
+          coverage: conversation.coverage,
+          messageCount: conversation.messages.length,
+          revisit: conversation.revisit,
+          warnings: conversation.warnings,
+        })),
+      },
+      null,
+      2,
+    ),
+  );
 }
 
 function selectAccount<T extends { id: string; enabled: boolean }>(
@@ -193,6 +327,8 @@ function parseArgs(argv: string[]): CliArgs {
   let interactiveLogin = false;
   let stateDirectory: string | null = null;
   let fixtureRoot: string | null = null;
+  let since: string | null = null;
+  let until: string | null = null;
 
   for (let index = 1; index < argv.length; index += 1) {
     const flag = argv[index];
@@ -210,6 +346,12 @@ function parseArgs(argv: string[]): CliArgs {
     } else if (flag === "--fixture-root" && argv[index + 1]) {
       fixtureRoot = argv[index + 1]!;
       index += 1;
+    } else if (flag === "--since" && argv[index + 1]) {
+      since = argv[index + 1]!;
+      index += 1;
+    } else if (flag === "--until" && argv[index + 1]) {
+      until = argv[index + 1]!;
+      index += 1;
     } else if (flag === "--help" || flag === "-h") {
       printHelp();
       process.exit(0);
@@ -224,7 +366,11 @@ function parseArgs(argv: string[]): CliArgs {
   }
 
   if (fixtureRoot && command !== "inspect-capabilities") {
-    throw new Error("--fixture-root is only supported by inspect-capabilities");
+    if (!STAGE2_HISTORY_COMMANDS.has(command)) {
+      throw new Error(
+        "--fixture-root is only supported by inspect-capabilities or history collection",
+      );
+    }
   }
 
   return {
@@ -234,14 +380,16 @@ function parseArgs(argv: string[]): CliArgs {
     interactiveLogin,
     stateDirectory,
     fixtureRoot,
+    since,
+    until,
   };
 }
 
 function printHelp(): void {
   console.log(
-    `usage-capture (Stage 1, adapter ${ADAPTER_VERSION})
+    `usage-capture (Stage 2A history lane, adapter ${ADAPTER_VERSION})
 
-Stage-1 commands:
+Bootstrap and capability commands:
   init --config <path>
       Write a starter JSON config (schema_version 1) for the dedicated profile.
 
@@ -256,10 +404,21 @@ Stage-1 commands:
       Use --fixture-root only with a fixture_history account for offline
       acceptance; live inspection requires playwright_persistent_context.
 
-All other commands (backfill, refresh, report, schedule, windows, quota,
-rebuild, export, dashboard, models) are Stage-2+ and fail closed with an
-explicit error. No prompt submission, credential export, or provider mutation
-is supported in Stage 1.`,
+  backfill --config <path> [--account <id>] [--fixture-root <path>]
+      [--since <14d|ISO-8601>] [--until <ISO-8601>]
+      Discover active and archived history. The default range is 14 days.
+
+  refresh --config <path> [--account <id>] [--fixture-root <path>]
+      Run incremental discovery with the durable per-scope watermark and a
+      48-hour overlap.
+
+  reconcile --config <path> [--account <id>] [--fixture-root <path>]
+      --since <ISO-8601> [--until <ISO-8601>]
+      Re-read the explicitly requested history range.
+
+Other commands (run, report, schedule, windows, quota, rebuild, export,
+dashboard, models) remain deferred. All collection requests are GET-only;
+this lane never submits prompts or mutates provider state.`,
   );
 }
 

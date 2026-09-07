@@ -3,6 +3,9 @@ import { describe, expect, it } from "vitest";
 import {
   ChatGPTHistoryAdapter,
   AdapterError,
+  LegacyFallbackNotApprovedError,
+  RateLimitedError,
+  adaptConversationIndex,
   assertAllowedRequest,
   isAllowedPath,
   INIT_ROUTE,
@@ -11,6 +14,7 @@ import {
   MODERN_INDEX,
   MODERN_MESSAGES,
   SESSION_ROUTE,
+  type HistoryTransport,
 } from "../../src/adapters/chatgpt/adapter.js";
 import { FixtureTransport } from "../../src/adapters/chatgpt/fixture-transport.js";
 import { PlaywrightTransport } from "../../src/browser/session.js";
@@ -112,5 +116,121 @@ describe("route allowlist", () => {
     await expect(adapter.fetchConversation("conv/001")).rejects.toThrow(
       "conversation id is not a safe path token",
     );
+  });
+
+  it("does not treat a short page as complete when total says more remain", () => {
+    const page = adaptConversationIndex(
+      {
+        items: [{ id: "conv-001", update_time: "2026-09-07T00:00:00Z" }],
+        total: 3,
+      },
+      { archived: false, offset: 0, limit: 2 },
+    );
+
+    expect(page.exhausted).toBe(false);
+    expect(page.continuation).toBe(1);
+    expect(page.paginationState).toBe("contradictory");
+    expect(page.coverage).toBe("partial");
+    expect(page.warnings).toContain("short_page_before_reported_total");
+  });
+
+  it("requires capability approval before using legacy detail after 404", async () => {
+    class StatusTransport implements HistoryTransport {
+      readonly requests: string[] = [];
+
+      async request(
+        _method: string,
+        path: string,
+      ): Promise<Record<string, unknown>> {
+        this.requests.push(path);
+        if (path.endsWith("/conversations/conv-001")) {
+          return { http_status: 404 };
+        }
+        return {
+          http_status: 200,
+          mapping: {
+            "node-1": {
+              id: "node-1",
+              message: {
+                id: "msg-1",
+                author: { role: "assistant" },
+                metadata: { model_slug: "gpt-5.6-astra-pro" },
+              },
+            },
+          },
+        };
+      }
+    }
+
+    const unapprovedTransport = new StatusTransport();
+    const unapproved = new ChatGPTHistoryAdapter(
+      unapprovedTransport,
+      {},
+      { legacyFallbackApproved: false },
+    );
+    await expect(unapproved.fetchConversation("conv-001")).rejects.toBeInstanceOf(
+      LegacyFallbackNotApprovedError,
+    );
+    expect(unapprovedTransport.requests).toEqual([
+      "/backend-api/conversations/conv-001",
+    ]);
+
+    const approvedTransport = new StatusTransport();
+    const approved = new ChatGPTHistoryAdapter(
+      approvedTransport,
+      {},
+      { legacyFallbackApproved: true },
+    );
+    const result = await approved.fetchConversation("conv-001");
+    expect(result.detailRoute).toBe("legacy");
+    expect(approvedTransport.requests).toEqual([
+      "/backend-api/conversations/conv-001",
+      "/backend-api/conversation/conv-001",
+    ]);
+  });
+
+  it("never falls back to legacy detail for a rate limit", async () => {
+    class RateLimitTransport implements HistoryTransport {
+      readonly requests: string[] = [];
+
+      async request(
+        _method: string,
+        path: string,
+      ): Promise<Record<string, unknown>> {
+        this.requests.push(path);
+        return {
+          http_status: 429,
+          retry_after: "120",
+        };
+      }
+    }
+
+    const transport = new RateLimitTransport();
+    const adapter = new ChatGPTHistoryAdapter(
+      transport,
+      {},
+      { legacyFallbackApproved: true },
+    );
+    await expect(adapter.fetchConversation("conv-001")).rejects.toBeInstanceOf(
+      RateLimitedError,
+    );
+    expect(transport.requests).toEqual([
+      "/backend-api/conversations/conv-001",
+    ]);
+  });
+
+  it("marks missing-conversation uncertainty as explicit unknown state", () => {
+    const page = adaptConversationIndex(
+      {
+        items: [],
+        total: 0,
+        has_missing_conversations: true,
+      },
+      { archived: false, offset: 0, limit: 100 },
+    );
+
+    expect(page.exhausted).toBe(false);
+    expect(page.paginationState).toBe("unknown");
+    expect(page.coverage).toBe("unrecognized");
   });
 });

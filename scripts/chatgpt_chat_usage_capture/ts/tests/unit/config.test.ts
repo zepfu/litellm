@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { defaultConfig, loadConfig, saveConfig } from "../../src/config.js";
 
-describe("Stage-1 config contract", () => {
+describe("Stage-2A config contract", () => {
   const temporaryDirectories: string[] = [];
 
   afterEach(() => {

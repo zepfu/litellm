@@ -2,7 +2,7 @@
   "schemaVersion": "fixture-manifest-v1",
   "adapterVersion": "chatgpt-chat-history-v1",
   "createdOn": "2026-09-07",
-  "description": "Synthetic Stage-1 fixtures for identity, pagination, and privacy tests. No real user data.",
+  "description": "Synthetic Stage-2A fixtures for identity, pagination, and privacy tests. No real user data.",
   "routes": [
     {
       "method": "GET",
