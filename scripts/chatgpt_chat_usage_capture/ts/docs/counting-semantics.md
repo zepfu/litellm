@@ -87,3 +87,37 @@ The report also exposes unknown time, ambiguous time, unresolved fragments,
 unknown model evidence, excluded surfaces, and shared/imported/copied
 exclusions independently. It does not calculate remaining quota, reset
 periods, or provider charges.
+
+## Quota projection
+
+`src/accounting/quota.ts` is a pure projection over reconstructed
+`ReconstructedAttempt` values. It does not resolve reset windows, persist
+observations, or make provider requests. The caller supplies one resolved
+membership value per attempt and policy bucket (`in`, `out`, `ambiguous`, or
+`unknown`) plus an overall history coverage state.
+
+The working estimator is
+`requested_if_known_else_recorded_final`. A known requested family is selected
+first. A missing requested family may use a mapped recorded final family only
+when a completed answer exists, and that assessment is labeled
+`final_response_inference`. A rejection before generation starts is retained in
+the assessment but excluded. The default mode excludes failures after start,
+cancellations, unknown acceptance, post-start rejection, conflicting model
+families, and unresolved duplicate identities from the working count; it still
+reports each as an explicit uncertain-debit category. The opt-in `include`
+mode includes those categories and labels the result accordingly.
+
+Only verified Chat attempts for the expected quota owner contribute. Work,
+Codex, other surfaces, shared/imported/copied origins, missing ownership, and
+owner mismatches remain visible as exclusions or unclassified activity.
+Individual and shared bucket contributions are set-based: one selected attempt
+can contribute once to its individual bucket and once to the applicable shared
+bucket.
+
+Direct server observations remain separate from local projections. A known
+window and complete history coverage are required for a numeric working
+remainder; otherwise the remainder and model headroom are `null`. The
+unclamped remainder preserves negative capacity discrepancies while the
+presentation-safe remainder is clamped to zero. Model headroom is the minimum
+of all compatible known individual/shared remainders and is `null` when any
+required bucket is unknown.
