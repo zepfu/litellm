@@ -34,11 +34,18 @@ from starlette.requests import Request
 from litellm.proxy.pass_through_endpoints import aawm_alias_routing as package
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import candidate_loop
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    pre_commit_retry as pre_commit_retry_module,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import session_affinity
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import snapshot_select
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
     DEFAULT_CONFIG_DIR,
     compile_directory,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry import (
+    _build_openai_capacity_target_identity,
+    get_or_create_openai_alpha_capacity_retry_coordinator,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
     AliasRoutingStateManager,
@@ -50,6 +57,9 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
 )
 from litellm.proxy._types import ProxyException
+from litellm.proxy.pass_through_endpoints.streaming_handler import (
+    ResponsesStreamPreCommitFailure,
+)
 
 PACKAGE_DIR = Path(package.__file__).resolve().parent
 GOD_PATH = Path(lpe.__file__).resolve()
@@ -2541,6 +2551,205 @@ async def test_candidate_loop_ineligible_falls_through_without_request_local_sta
         "aawm_alias_request_local_cooldown_until",
         None,
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_capacity_retries_use_one_request_coordinator(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    namespace = "openai-054-driver-test"
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_STATE_NAMESPACE", namespace)
+    target_url = "https://chatgpt.com/backend-api/codex/responses"
+    monkeypatch.setattr(
+        lpe,
+        "_codex_oauth_responses_target_url",
+        lambda: target_url,
+    )
+    monkeypatch.setattr(
+        pre_commit_retry_module,
+        "_resolve_redis_for_capacity_wakeup",
+        lambda: None,
+    )
+
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        url=SimpleNamespace(path="/openai_passthrough/v1/responses"),
+    )
+    candidate = {
+        "provider": "openai",
+        "model": "gpt-5.4-codex",
+        "route_family": "codex_responses",
+    }
+    target_identity = _build_openai_capacity_target_identity(
+        provider="openai",
+        model=candidate["model"],
+        upstream_url=target_url,
+    )
+    selection_calls: list[dict[str, Any]] = []
+    provider_calls: list[str] = []
+    waits: list[float] = []
+    reentry_snapshots: list[tuple[bool, float, float]] = []
+    failure_records: list[dict[str, Any]] = []
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        selection_calls.append(kwargs)
+        return {
+            "candidate": dict(candidate),
+            "lane_key": "codex-oauth:test",
+            "cooldown_key": "openai:gpt-5.4-codex",
+            "selection_reason": "first_available",
+            "skipped": [],
+        }
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> object:
+        del candidate_body
+        provider_calls.append(candidate["model"])
+        coordinator = request.state.aawm_openai_capacity_retry
+        reentered = get_or_create_openai_alpha_capacity_retry_coordinator(
+            request,
+            target_identity=target_identity,
+            namespace=namespace,
+        )
+        reentry_snapshots.append(
+            (
+                reentered is coordinator,
+                coordinator._start_monotonic,
+                coordinator.deadline_seconds,
+            )
+        )
+        if len(provider_calls) <= 2:
+            raise ResponsesStreamPreCommitFailure(
+                error_class="server_overloaded",
+                classification="transient_capacity",
+                retryable=True,
+                message="overloaded",
+            )
+        return {"ok": True}
+
+    async def _no_active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _owner_guard(**_kwargs: Any) -> object:
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    async def _sleep_with_wakeup(
+        _coordinator: object,
+        wait_seconds: float,
+    ) -> str:
+        waits.append(wait_seconds)
+        return "timer"
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(self, _lease: object) -> None:
+            return None
+
+    session_affinity_seam = SimpleNamespace(
+        is_replay_safe_session_owner_redispatch_body=lambda _body: True,
+        resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
+        get_request_codex_auto_review_parent_session_identity=lambda _request: None,
+        build_session_owner_attributes=lambda **_kwargs: {},
+        ensure_session_owner_guard_for_request=_owner_guard,
+        get_request_session_owner_lease=lambda _request: None,
+        finalize_session_owner_lease_on_success=_noop_async,
+        finalize_session_owner_lease_on_failure=_noop_async,
+    )
+
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: session_affinity_seam,
+    )
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        pre_commit_retry_module.OpenAIAlphaCapacityRetryCoordinator,
+        "sleep_with_wakeup",
+        _sleep_with_wakeup,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_started",
+        lambda **kwargs: kwargs["prepared_request_body"],
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_failure",
+        lambda **kwargs: failure_records.append(kwargs),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_success",
+        lambda **kwargs: kwargs["attempt_record"],
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_codex_failure_evidence",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        lambda exc, **_kwargs: getattr(exc, "error_class", None),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_plan_codex_oauth_account_failover",
+        lambda *_args, **_kwargs: False,
+    )
+
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=lpe._resolve_auto_agent_cooldown_publication_plan,
+        publish_cooldown_memory_fn=lambda **_kwargs: None,
+        persist_cooldown_fn=_noop_async,
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=lambda body, **_kwargs: body,
+        raise_redispatch_fn=None,
+    )
+
+    response = await candidate_loop.handle_alias_route(
+        services,
+        alias_family="codex_auto_agent",
+        alias_model="work",
+        request=request,
+        prepared_request_body={"model": "work", "input": "dispatch basic"},
+        max_candidate_attempts=1,
+        get_active_cooldown_state_fn=_no_active_cooldown,
+        attempts_metadata_key="codex_auto_agent_attempts",
+        skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+        no_candidate_detail="no candidates",
+        log_label="Codex",
+    )
+
+    coordinator = request.state.aawm_openai_capacity_retry
+    assert response == {"ok": True}
+    assert provider_calls == ["gpt-5.4-codex"] * 3
+    assert waits == [15.0, 30.0]
+    assert len(failure_records) == 2
+    assert len(selection_calls) == 1
+    assert coordinator.retry_count == 2
+    assert coordinator.target_identity == target_identity
+    assert coordinator.deadline_seconds == 7200.0
+    assert all(snapshot[0] for snapshot in reentry_snapshots)
+    assert len({snapshot[1] for snapshot in reentry_snapshots}) == 1
+    assert {snapshot[2] for snapshot in reentry_snapshots} == {7200.0}
 
 
 @pytest.mark.asyncio

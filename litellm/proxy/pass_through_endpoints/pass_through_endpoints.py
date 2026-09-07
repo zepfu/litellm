@@ -169,6 +169,7 @@ from .streaming_handler import (
 from .aawm_alias_routing.pre_commit_retry import (
     OpenAIAlphaCapacityRetryCoordinator,
     _build_openai_capacity_target_identity,
+    get_or_create_openai_alpha_capacity_retry_coordinator,
 )
 from .aawm_alias_routing.durable import get_aawm_alias_routing_state_namespace
 from .success_handler import PassThroughEndpointLogging
@@ -1790,6 +1791,12 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
     ] = None,
 ) -> Any:
     if caller_managed_hidden_retry:
+        if openai_capacity_coordinator is not None:
+            return await _await_passthrough_pre_first_byte_operation(
+                operation,
+                timeout_seconds=openai_capacity_coordinator.remaining_seconds,
+                operation_name=operation_name,
+            )
         return await operation()
 
     max_attempts = (
@@ -4928,17 +4935,20 @@ async def pass_through_request(  # noqa: PLR0915
                 url=url,
                 endpoint_type=endpoint_type,
             ):
-                capacity_retry_coordinator = OpenAIAlphaCapacityRetryCoordinator(
-                    target_identity=_build_openai_capacity_target_identity(
-                        provider="openai",
-                        model=(
-                            str(provider_bound_body.get("model") or "")
-                            if isinstance(provider_bound_body, dict)
-                            else None
+                capacity_retry_coordinator = (
+                    get_or_create_openai_alpha_capacity_retry_coordinator(
+                        request,
+                        target_identity=_build_openai_capacity_target_identity(
+                            provider="openai",
+                            model=(
+                                str(provider_bound_body.get("model") or "")
+                                if isinstance(provider_bound_body, dict)
+                                else None
+                            ),
+                            upstream_url=str(url) if url is not None else None,
                         ),
-                        upstream_url=str(url) if url is not None else None,
-                    ),
-                    namespace=get_aawm_alias_routing_state_namespace(),
+                        namespace=get_aawm_alias_routing_state_namespace(),
+                    )
                 )
 
             async def _send_stream_pre_first_byte() -> Tuple[
@@ -5125,17 +5135,20 @@ async def pass_through_request(  # noqa: PLR0915
             url=url,
             endpoint_type=endpoint_type,
         ):
-            capacity_retry_coordinator = OpenAIAlphaCapacityRetryCoordinator(
-                target_identity=_build_openai_capacity_target_identity(
-                    provider="openai",
-                    model=(
-                        str(provider_bound_body.get("model") or "")
-                        if isinstance(provider_bound_body, dict)
-                        else None
+            capacity_retry_coordinator = (
+                get_or_create_openai_alpha_capacity_retry_coordinator(
+                    request,
+                    target_identity=_build_openai_capacity_target_identity(
+                        provider="openai",
+                        model=(
+                            str(provider_bound_body.get("model") or "")
+                            if isinstance(provider_bound_body, dict)
+                            else None
+                        ),
+                        upstream_url=str(url) if url is not None else None,
                     ),
-                    upstream_url=str(url) if url is not None else None,
-                ),
-                namespace=get_aawm_alias_routing_state_namespace(),
+                    namespace=get_aawm_alias_routing_state_namespace(),
+                )
             )
 
         async def _send_non_stream_pre_first_byte() -> httpx.Response:

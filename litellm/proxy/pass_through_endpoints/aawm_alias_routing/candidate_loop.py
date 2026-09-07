@@ -72,7 +72,13 @@ from .interfaces import (
     RecordCodexFailureEvidenceFn,
     ResolveCooldownPublicationFn,
 )
-from .retry import OpenAIAlphaCapacityRetryBudget
+from .durable import get_aawm_alias_routing_state_namespace
+from .pre_commit_retry import (
+    OpenAIAlphaCapacityRetryBudget,
+    OpenAIAlphaCapacityRetryCoordinator,
+    _build_openai_capacity_target_identity,
+    get_or_create_openai_alpha_capacity_retry_coordinator,
+)
 from .schema_rejections import (
     SCHEMA_REJECTION_KEY,
     normalize_schema_rejection,
@@ -826,6 +832,26 @@ async def handle_alias_route(  # noqa: PLR0915
     add_alias_metadata_fn = services.add_alias_metadata_fn
     raise_redispatch_required_fn = services.raise_redispatch_fn
     is_codex_alias = validate_alias_family(alias_family) == "codex"
+
+    def _get_openai_alpha_capacity_retry_coordinator(
+        candidate: dict[str, Any],
+    ) -> Optional[OpenAIAlphaCapacityRetryCoordinator]:
+        if not _error_signals._is_openai_alpha_capacity_retry_enabled(
+            request=request,
+            candidate=candidate,
+            is_codex_alias=is_codex_alias,
+        ):
+            return None
+        return get_or_create_openai_alpha_capacity_retry_coordinator(
+            request,
+            target_identity=_build_openai_capacity_target_identity(
+                provider="openai",
+                model=str(candidate.get("model") or ""),
+                upstream_url=_lpe._codex_oauth_responses_target_url(),
+            ),
+            namespace=get_aawm_alias_routing_state_namespace(),
+        )
+
     replay_safety = (
         _session_affinity_mod().classify_session_owner_replay_safety_body(
             prepared_request_body
@@ -1295,6 +1321,9 @@ async def handle_alias_route(  # noqa: PLR0915
             raise
         candidate = selection["candidate"]
         cooldown_key = str(selection["cooldown_key"])
+        capacity_retry_coordinator = (
+            _get_openai_alpha_capacity_retry_coordinator(candidate)
+        )
         if cooldown_key in failed_provider_candidate_keys:
             if attempts:
                 _mark_auto_agent_alias_request_terminal_failure(
@@ -1877,6 +1906,8 @@ async def handle_alias_route(  # noqa: PLR0915
                             attempt_record=attempt_record,
                             add_alias_metadata_fn=add_alias_metadata_fn,
                         )
+                        if capacity_retry_coordinator is not None:
+                            await capacity_retry_coordinator.signal_success()
                         return response
 
                     early_pre_commit_error_class = (
@@ -1918,22 +1949,33 @@ async def handle_alias_route(  # noqa: PLR0915
                         _error_signals.plan_responses_pre_commit_retry(
                             error_class=early_pre_commit_error_class,
                             same_account_transient_attempts=(
-                                same_account_transient_attempts_by_slot.get(
-                                    _codex_oauth_candidate_slot(candidate),
-                                    0,
+                                capacity_retry_coordinator.retry_count
+                                if capacity_retry_coordinator is not None
+                                else (
+                                    same_account_transient_attempts_by_slot.get(
+                                        _codex_oauth_candidate_slot(candidate),
+                                        0,
+                                    )
+                                    + 1
                                 )
-                                + 1
                             ),
                             elapsed_seconds=(
-                                time.monotonic() - request_retry_started_at
+                                capacity_retry_coordinator.elapsed_seconds
+                                if capacity_retry_coordinator is not None
+                                else time.monotonic() - request_retry_started_at
                             ),
-                            budget=request_retry_budget,
+                            budget=(
+                                capacity_retry_coordinator.budget
+                                if capacity_retry_coordinator is not None
+                                else request_retry_budget
+                            ),
                             openai_alpha_capacity_retry_enabled=(
                                 _error_signals._is_openai_alpha_capacity_retry_enabled(
                                     request=request,
                                     candidate=candidate,
                                     is_codex_alias=is_codex_alias,
                                 )
+                                and capacity_retry_coordinator is not None
                             ),
                         )
                     )
@@ -2327,27 +2369,42 @@ async def handle_alias_route(  # noqa: PLR0915
                     deterministically_ineligible_candidate_keys.add(cooldown_key)
                 last_retryable_exc = failure_exc
                 account_slot = _codex_oauth_candidate_slot(candidate)
-                same_account_transient_attempts_by_slot[account_slot] = (
-                    same_account_transient_attempts_by_slot.get(account_slot, 0) + 1
-                    if error_class
-                    in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
-                    else same_account_transient_attempts_by_slot.get(account_slot, 0)
-                )
+                if capacity_retry_coordinator is None:
+                    same_account_transient_attempts_by_slot[account_slot] = (
+                        same_account_transient_attempts_by_slot.get(account_slot, 0)
+                        + 1
+                        if error_class
+                        in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
+                        else same_account_transient_attempts_by_slot.get(
+                            account_slot, 0
+                        )
+                    )
                 pre_commit_retry_plan = _error_signals.plan_responses_pre_commit_retry(
                     error_class=error_class,
                     same_account_transient_attempts=(
-                        same_account_transient_attempts_by_slot.get(account_slot, 0)
+                        capacity_retry_coordinator.retry_count
+                        if capacity_retry_coordinator is not None
+                        else same_account_transient_attempts_by_slot.get(
+                            account_slot, 0
+                        )
                     ),
                     elapsed_seconds=(
-                        time.monotonic() - request_retry_started_at
+                        capacity_retry_coordinator.elapsed_seconds
+                        if capacity_retry_coordinator is not None
+                        else time.monotonic() - request_retry_started_at
                     ),
-                    budget=request_retry_budget,
+                    budget=(
+                        capacity_retry_coordinator.budget
+                        if capacity_retry_coordinator is not None
+                        else request_retry_budget
+                    ),
                     openai_alpha_capacity_retry_enabled=(
                         _error_signals._is_openai_alpha_capacity_retry_enabled(
                             request=request,
                             candidate=candidate,
                             is_codex_alias=is_codex_alias,
                         )
+                        and capacity_retry_coordinator is not None
                     ),
                 )
                 prefer_account_failover = _prefer_codex_oauth_account_failover(
@@ -2378,7 +2435,15 @@ async def handle_alias_route(  # noqa: PLR0915
                         add_alias_metadata_fn=add_alias_metadata_fn,
                     )
                     if wait_seconds > 0:
-                        await asyncio.sleep(wait_seconds)
+                        if capacity_retry_coordinator is not None:
+                            wakeup_reason = (
+                                await capacity_retry_coordinator.sleep_with_wakeup(
+                                    wait_seconds
+                                )
+                            )
+                            capacity_retry_coordinator.record_retry(wakeup_reason)
+                        else:
+                            await asyncio.sleep(wait_seconds)
                     attempt_record = _codex_auto_agent_candidate_public_shape(
                         candidate,
                         lane_key=selection.get("lane_key"),

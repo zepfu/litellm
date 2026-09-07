@@ -18726,7 +18726,7 @@ async def test_codex_auto_agent_alias_code_falls_through_from_spark_to_live_grok
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_agent_native_openai_keeps_shared_transient_retry_enabled():
+async def test_codex_auto_agent_native_openai_is_alias_managed_for_transient_retries():
     request = _build_codex_auto_agent_request()
     request_body = {
         "model": "gpt-5.3-codex-spark",
@@ -18758,7 +18758,7 @@ async def test_codex_auto_agent_native_openai_keeps_shared_transient_retry_enabl
         503,
         504,
     ]
-    assert call_kwargs["caller_managed_hidden_retry"] is False
+    assert call_kwargs["caller_managed_hidden_retry"] is True
     assert call_kwargs["expected_target_family"] == "openai"
     assert call_kwargs["egress_credential_family"] == "openai"
     assert call_kwargs["stream"] is True
