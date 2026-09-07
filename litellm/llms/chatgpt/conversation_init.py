@@ -663,7 +663,11 @@ def sanitize_conversation_init_boundary(  # noqa: PLR0915 - boundary projection
         }
 
     status_code, payload_raw, envelope_redacted = _split_boundary_envelope(raw)
-    native_capture_present = "native_capture" in raw
+    retained_native_capture_error = raw.get("native_capture_error")
+    native_capture_field_present = "native_capture" in raw
+    native_capture_present = native_capture_field_present or (
+        retained_native_capture_error in _NATIVE_CAPTURE_ERRORS
+    )
     raw_native_capture = raw.get("native_capture")
     raw_browser_challenge = raw.get("browser_challenge")
     browser_challenge = (
@@ -671,7 +675,7 @@ def sanitize_conversation_init_boundary(  # noqa: PLR0915 - boundary projection
     )
     native_capture, native_capture_error = (
         _sanitize_native_capture(raw.get("native_capture"))
-        if native_capture_present
+        if native_capture_field_present
         else (None, None)
     )
     if native_capture is not None and native_capture_error is None:
@@ -680,7 +684,6 @@ def sanitize_conversation_init_boundary(  # noqa: PLR0915 - boundary projection
             payload_raw,
             native_capture["account_hash"],
         )
-    retained_native_capture_error = raw.get("native_capture_error")
     if (
         native_capture_error is None
         and retained_native_capture_error in _NATIVE_CAPTURE_ERRORS
@@ -3520,6 +3523,17 @@ def _collect_bound_conversation_init_snapshot(  # noqa: PLR0915 - bound state
             telemetry_class="browser_challenge",
             reusable=reusable,
         )
+    status_failure = _http_status_failure(sanitized.get("status_code"))
+    if status_failure is not None:
+        return _bound_capture_failure(
+            summary,
+            source_path=source_path,
+            expected_account_hash=expected_account_hash,
+            error=f"http_{status_failure}",
+            telemetry_status=status_failure,
+            telemetry_class="auth" if status_failure == "auth" else "http_error",
+            reusable=reusable,
+        )
     if summary["native_capture_error"]:
         return _bound_capture_failure(
             summary,
@@ -3590,17 +3604,6 @@ def _collect_bound_conversation_init_snapshot(  # noqa: PLR0915 - bound state
             account_identity_fields=identity_fields,
         )
 
-    status_failure = _http_status_failure(sanitized.get("status_code"))
-    if status_failure is not None:
-        return _bound_capture_failure(
-            summary,
-            source_path=source_path,
-            expected_account_hash=expected_account_hash,
-            error=f"http_{status_failure}",
-            telemetry_status=status_failure,
-            telemetry_class="auth" if status_failure == "auth" else "http_error",
-            reusable=reusable,
-        )
     summary["account_identity_hashed"] = True
     summary["account_hash"] = sanitized["account_hash"]
     summary["account_identity_verified"] = True
@@ -3821,7 +3824,11 @@ def _destination_has_reusable_snapshot(path: str) -> bool:
         raw = load_conversation_init_source(path)
     except ChatGPTConversationInitError:
         return False
-    sanitized = sanitize_conversation_init_boundary(raw, source_path=path)
+    sanitized = sanitize_conversation_init_boundary(
+        raw,
+        source_path=path,
+        _allow_verified_envelope_identity=True,
+    )
     return _snapshot_is_persistable(sanitized)
 
 
@@ -3970,8 +3977,13 @@ def _resolve_account_identity_source(
     source_identity_hash: Optional[str],
 ) -> Optional[str]:
     if isinstance(raw, Mapping):
-        if "native_capture" in raw:
+        retained_native_capture_error = raw.get("native_capture_error")
+        if "native_capture" in raw or (
+            retained_native_capture_error in _NATIVE_CAPTURE_ERRORS
+        ):
             if account_hash:
+                return CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
+            if retained_native_capture_error in _NATIVE_CAPTURE_ERRORS:
                 return CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
             return None
         retained = raw.get("account_identity_source")
