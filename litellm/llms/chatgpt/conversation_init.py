@@ -2189,7 +2189,7 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
     failure: Optional[Dict[str, Any]] = None
     browser_challenge = False
     boundary_error = False
-    init_routed = False
+    init_fetch_id: Optional[str] = None
     # Leave the existing worker deadline some room to close its owned target.
     capture_deadline = deadline - min(2.0, _remaining_browser_timeout(deadline) / 5)
 
@@ -2201,13 +2201,13 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
             and parsed.path == CHATGPT_CONVERSATION_INIT_PATH
         )
 
-    def guard_request(route: Any) -> None:
-        nonlocal boundary_error, init_routed
-        request = route.request
-        parsed = urlsplit(request.url)
-        redirected = request.redirected_from
+    def guard_request(event: Mapping[str, Any]) -> None:
+        nonlocal boundary_error, init_fetch_id
+        request = event.get("request", {})
+        parsed = urlsplit(request.get("url", ""))
+        redirected = event.get("redirectedRequestId")
         forbidden = (
-            request.is_navigation_request()
+            event.get("resourceType") == "Document"
             and (
                 parsed.scheme != "https"
                 or parsed.netloc != target.netloc
@@ -2216,28 +2216,37 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
             )
         ) or (
             redirected is not None
-            and (is_init(request.url) or is_init(redirected.url))
+            and (
+                is_init(request.get("url", ""))
+                or redirected == init_fetch_id
+            )
         )
         # No model-message route is needed to render an empty page.
         forbidden = forbidden or (
             parsed.path in {"/backend-api/conversation", "/backend-api/f/conversation"}
-            and request.method == "POST"
+            and request.get("method") == "POST"
         )
-        if is_init(request.url):
-            forbidden = forbidden or init_routed
-            init_routed = True
+        if is_init(request.get("url", "")):
+            forbidden = forbidden or init_fetch_id is not None
+            init_fetch_id = event["requestId"]
         if forbidden:
             boundary_error = True
         if forbidden or boundary_error or failure is not None:
-            route.abort()
+            session.send(
+                "Fetch.failRequest",
+                {"requestId": event["requestId"], "errorReason": "BlockedByClient"},
+            )
         else:
-            route.continue_()
+            session.send("Fetch.continueRequest", {"requestId": event["requestId"]})
 
     def request_seen(event: Mapping[str, Any]) -> None:
         nonlocal boundary_error
         request = event.get("request", {})
         request_id = event.get("requestId")
-        if request_id == capture.get("request_id") and event.get("redirectResponse"):
+        if event.get("redirectResponse") and (
+            request_id == capture.get("request_id")
+            or is_init(request.get("url", ""))
+        ):
             boundary_error = True
         if capture or not is_init(request.get("url", "")):
             return
@@ -2289,11 +2298,26 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
         challenged = _native_init_header(headers, "cf-mitigated") == "challenge"
         browser_challenge = browser_challenge or challenged
         if status in {401, 403, 429} or challenged:
-            failure = {
+            candidate = {
                 "status_code": status,
                 "retry_after_seconds": _native_init_retry_after(headers),
                 "correlated": request_id == capture.get("request_id"),
             }
+            # A later authentication response must not erase throttle backoff.
+            if failure is None or (
+                status == 429 and failure.get("status_code") != 429
+            ):
+                failure = candidate
+            elif status == 429 and failure.get("status_code") == 429:
+                delays = [
+                    delay
+                    for delay in (
+                        failure.get("retry_after_seconds"),
+                        candidate["retry_after_seconds"],
+                    )
+                    if delay is not None
+                ]
+                failure["retry_after_seconds"] = max(delays) if delays else None
 
     def loading_finished(event: Mapping[str, Any]) -> None:
         if event.get("requestId") == capture.get("request_id"):
@@ -2334,7 +2358,7 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
         }
 
     try:
-        page.route("**/*", guard_request)
+        session.on("Fetch.requestPaused", guard_request)
         session.on("Network.requestWillBeSent", request_seen)
         session.on("Network.requestWillBeSentExtraInfo", extra_seen)
         session.on("Network.responseReceived", response_seen)
@@ -2347,6 +2371,11 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
                 "maxResourceBufferSize": MAX_CONVERSATION_INIT_SOURCE_BYTES,
                 "maxPostDataSize": 0,
             },
+        )
+        session.send("Network.setBypassServiceWorker", {"bypass": True})
+        session.send(
+            "Fetch.enable",
+            {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]},
         )
         try:
             page.goto(
@@ -2373,9 +2402,22 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
                     raise OracleBrowserBoundaryUnavailable(
                         "Native Oracle init ExtraInfo account did not match inventory."
                     )
-                body = session.send(
-                    "Network.getResponseBody", {"requestId": request_id}
-                )
+                try:
+                    body = session.send(
+                        "Network.getResponseBody", {"requestId": request_id}
+                    )
+                except Exception:
+                    if failure is not None:
+                        return envelope(None, failed=True)
+                    raise
+                # Synchronous CDP calls can dispatch queued network callbacks.
+                if failure is not None:
+                    return envelope(None, failed=True)
+                if boundary_error:
+                    raise OracleBrowserBoundaryUnavailable(
+                        "Native Oracle init boundary changed during response capture."
+                    )
+                _raise_if_browser_deadline_expired(capture_deadline)
                 content = body.get("body", "")
                 if len(content) > MAX_CONVERSATION_INIT_SOURCE_BYTES:
                     raise OracleBrowserBoundaryUnavailable(
@@ -2389,11 +2431,17 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
                     payload = None
                 return envelope(payload)
             if page.evaluate(
-                "() => /verify you are human|checking your browser|just a moment/i"
-                ".test(document.title + ' ' + (document.body?.innerText || ''))"
+                "() => [...document.querySelectorAll("
+                "'form#challenge-form[action*=\"__cf_chl\"],"
+                "form#challenge-form[action^=\"/cdn-cgi/challenge-platform/\"],"
+                "#challenge-running')].some(node => {"
+                "const rect = node.getBoundingClientRect();"
+                "return rect.width > 0 && rect.height > 0 &&"
+                "getComputedStyle(node).visibility !== 'hidden';})"
             ):
                 browser_challenge = True
-                failure = {**page_response, "correlated": False}
+                if failure is None:
+                    failure = {**page_response, "correlated": False}
                 return envelope(None, failed=True)
             page.wait_for_timeout(50)
     finally:
@@ -2481,6 +2529,13 @@ def _run_oracle_browser_capture_in_worker(
     context = _oracle_browser_process_context(playwright_factory)
     receiver, sender = context.Pipe(duplex=False)
     private_process_group = context.RawValue("q", 0)
+    owned_target = context.RawArray("c", 256)
+    # Publish the state last so a kill cannot expose a partially copied ID.
+    creation_state = context.RawValue("b", 0)
+    creation_url = "about:blank#oracle-native-init-" + os.urandom(16).hex()
+    # Keep cleanup inside the caller's deadline, even if capture is SIGKILLed.
+    cleanup_budget = min(3.0, max(0.0, _remaining_browser_timeout(deadline)) / 4)
+    capture_deadline = deadline - cleanup_budget
     process = context.Process(
         target=_oracle_browser_capture_worker,
         args=(
@@ -2488,10 +2543,13 @@ def _run_oracle_browser_capture_in_worker(
             cdp_endpoint,
             page_target_id,
             request_url,
-            deadline,
+            capture_deadline,
             playwright_factory,
             private_process_group,
             expected_account_hash,
+            owned_target,
+            creation_state,
+            creation_url,
         ),
     )
     try:
@@ -2504,8 +2562,8 @@ def _run_oracle_browser_capture_in_worker(
         ) from exc
     sender.close()
     try:
-        message = _receive_oracle_browser_worker_message(receiver, deadline)
-        remaining_seconds = _remaining_browser_timeout(deadline)
+        message = _receive_oracle_browser_worker_message(receiver, capture_deadline)
+        remaining_seconds = _remaining_browser_timeout(capture_deadline)
         if remaining_seconds <= 0:
             raise OracleBrowserBoundaryUnavailable(
                 "Oracle browser conversation-init capture timed out."
@@ -2523,7 +2581,17 @@ def _run_oracle_browser_capture_in_worker(
     finally:
         receiver.close()
         _terminate_oracle_browser_worker(process, private_process_group.value)
-        process.join(timeout=0)
+        process.join(timeout=min(0.1, max(0.0, _remaining_browser_timeout(deadline))))
+        target_id = owned_target.value if creation_state.value == 2 else b""
+        if creation_state.value:
+            _close_owned_oracle_target(
+                cdp_endpoint=cdp_endpoint,
+                target_id=target_id.decode("ascii") if target_id else None,
+                anchor_target_id=page_target_id,
+                creation_url=creation_url,
+                deadline=deadline,
+                playwright_factory=playwright_factory,
+            )
 
 
 def _oracle_browser_capture_worker(
@@ -2535,11 +2603,15 @@ def _oracle_browser_capture_worker(
     playwright_factory: Optional[Callable[[], Any]],
     private_process_group: Any,
     expected_account_hash: str,
+    owned_target: Any,
+    creation_state: Any,
+    creation_url: str,
 ) -> None:
     _enter_oracle_browser_worker_process_group(private_process_group)
     playwright = None
     browser = None
     owned_page = None
+    target_session = None
     result = None
     successful = False
     try:
@@ -2565,7 +2637,16 @@ def _oracle_browser_capture_worker(
                 "context anchor for the conversation-init request."
             )
         _raise_if_browser_deadline_expired(deadline)
-        owned_page = source_page.context.new_page()
+        target_session = browser.new_browser_cdp_session()
+        owned_page = _create_owned_oracle_page(
+            target_session,
+            source_page,
+            page_target_id,
+            owned_target,
+            creation_state,
+            creation_url,
+            deadline,
+        )
         result = _observe_native_oracle_init(
             owned_page,
             request_url=request_url,
@@ -2577,9 +2658,18 @@ def _oracle_browser_capture_worker(
     except Exception:
         successful = False
     finally:
-        if owned_page is not None:
+        if owned_target.value and target_session is not None:
             try:
-                owned_page.close()
+                closed = target_session.send(
+                    "Target.closeTarget",
+                    {"targetId": owned_target.value.decode("ascii")},
+                )
+                if closed.get("success") is not True:
+                    raise OracleBrowserBoundaryUnavailable(
+                        "Oracle browser did not close its owned target."
+                    )
+                creation_state.value = 0
+                owned_target.value = b""
             except Exception:
                 successful = False
         try:
@@ -2604,6 +2694,136 @@ def _oracle_browser_capture_worker(
                 pass
         finally:
             sender.close()
+
+
+def _create_owned_oracle_page(
+    target_session: Any,
+    source_page: Any,
+    anchor_target_id: str,
+    owned_target: Any,
+    creation_state: Any,
+    creation_url: str,
+    deadline: float,
+) -> Any:
+    anchor = target_session.send(
+        "Target.getTargetInfo", {"targetId": anchor_target_id}
+    )["targetInfo"]
+    create_options = {"url": creation_url}
+    if anchor.get("browserContextId"):
+        create_options["browserContextId"] = anchor["browserContextId"]
+    # Publish ownership before waiting for Playwright's Page or starting capture.
+    with source_page.context.expect_page(
+        timeout=_browser_timeout_milliseconds(_remaining_browser_timeout(deadline))
+    ) as page_event:
+        creation_state.value = 1
+        created = target_session.send("Target.createTarget", create_options)
+        target_id = _validate_page_target_id(created["targetId"])
+        if target_id == anchor_target_id:
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser returned the context anchor as an owned target."
+            )
+        owned_target.value = target_id.encode("ascii")
+        creation_state.value = 2
+    candidate = page_event.value
+    if _page_target_id(source_page.context, candidate) != target_id:
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle browser owned page did not match its created target."
+        )
+    return candidate
+
+
+def _close_owned_oracle_target(
+    *,
+    cdp_endpoint: str,
+    target_id: Optional[str],
+    anchor_target_id: str,
+    creation_url: str,
+    deadline: float,
+    playwright_factory: Optional[Callable[[], Any]],
+) -> None:
+    """Give exact-target cleanup its own bounded, killable driver."""
+    if target_id == anchor_target_id:
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle browser cleanup cannot close the context anchor."
+        )
+    if target_id is not None:
+        _validate_page_target_id(target_id)
+    _raise_if_browser_deadline_expired(deadline)
+    context = _oracle_browser_process_context(playwright_factory)
+    private_process_group = context.RawValue("q", 0)
+    closed = context.RawValue("b", False)
+    process = context.Process(
+        target=_oracle_browser_close_target_worker,
+        args=(
+            cdp_endpoint,
+            target_id,
+            anchor_target_id,
+            creation_url,
+            deadline,
+            playwright_factory,
+            private_process_group,
+            closed,
+        ),
+    )
+    process.start()
+    try:
+        process.join(timeout=max(0.0, _remaining_browser_timeout(deadline)))
+        if not closed.value:
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser owned-target cleanup was not confirmed."
+            )
+    finally:
+        _terminate_oracle_browser_worker(process, private_process_group.value)
+        process.join(timeout=0)
+
+
+def _oracle_browser_close_target_worker(
+    cdp_endpoint: str,
+    target_id: Optional[str],
+    anchor_target_id: str,
+    creation_url: str,
+    deadline: float,
+    playwright_factory: Optional[Callable[[], Any]],
+    private_process_group: Any,
+    closed: Any,
+) -> None:
+    _enter_oracle_browser_worker_process_group(private_process_group)
+    playwright = None
+    browser = None
+    try:
+        _raise_if_browser_deadline_expired(deadline)
+        playwright = _start_playwright_from_factory(playwright_factory)
+        browser = playwright.chromium.connect_over_cdp(
+            cdp_endpoint,
+            timeout=_browser_timeout_milliseconds(
+                _remaining_browser_timeout(deadline)
+            ),
+        )
+        session = browser.new_browser_cdp_session()
+        # Only this published target may be closed; never close the browser.
+        targets = session.send("Target.getTargets").get("targetInfos", ())
+        if target_id is None:
+            # A lost createTarget reply is recoverable only by the unique URL
+            # assigned before creation, never by host, page title, or account.
+            matches = [
+                info.get("targetId")
+                for info in targets
+                if info.get("url") == creation_url
+                and info.get("type") == "page"
+                and info.get("targetId") != anchor_target_id
+            ]
+            if len(matches) != 1 or not isinstance(matches[0], str):
+                return
+            target_id = matches[0]
+        if not any(info.get("targetId") == target_id for info in targets):
+            closed.value = True
+        else:
+            result = session.send("Target.closeTarget", {"targetId": target_id})
+            closed.value = result.get("success") is True
+    except Exception:
+        closed.value = False
+    finally:
+        _disconnect_attached_browser(playwright, browser)
 
 
 def _receive_oracle_browser_worker_message(
