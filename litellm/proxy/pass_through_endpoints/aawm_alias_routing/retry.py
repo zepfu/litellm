@@ -188,3 +188,56 @@ def exponential_backoff_seconds(
     if jitter_seconds > 0:
         delay += random.uniform(0.0, jitter_seconds)
     return max(0.0, float(delay))
+
+
+# ---------------------------------------------------------------------------
+# OpenAI alpha capacity retry schedule and request-wide budget primitives
+# ---------------------------------------------------------------------------
+
+_OPENAI_ALPHA_CAPACITY_RETRY_SCHEDULE: tuple[float, ...] = (
+    15.0,
+    30.0,
+    60.0,
+    120.0,
+    240.0,
+)
+_OPENAI_ALPHA_CAPACITY_RETRY_DEADLINE_SECONDS: float = 7200.0  # 2 hours
+
+
+def openai_alpha_capacity_retry_wait_seconds(attempt_number: int) -> float:
+    """Progressive backoff: 15, 30, 60, 120, 240, 240, 240, ...
+
+    ``attempt_number`` is 0-based (the number of same-account transient
+    attempts already consumed).  Returns the wait for the **next** attempt.
+    """
+    schedule = _OPENAI_ALPHA_CAPACITY_RETRY_SCHEDULE
+    idx = max(0, attempt_number)
+    if idx < len(schedule):
+        return float(schedule[idx])
+    return float(schedule[-1])
+
+
+def openai_alpha_capacity_retry_within_deadline(
+    *,
+    elapsed_seconds: float,
+    next_wait_seconds: float,
+    deadline_seconds: float = _OPENAI_ALPHA_CAPACITY_RETRY_DEADLINE_SECONDS,
+) -> bool:
+    """Check whether another retry fits within the request-wide deadline.
+
+    Returns ``False`` when the projected total would exceed the deadline or
+    the deadline is zero / negative (disabled).
+    """
+    if deadline_seconds <= 0.0:
+        return False
+    return (elapsed_seconds + max(0.0, next_wait_seconds)) <= deadline_seconds
+
+
+@dataclass(frozen=True)
+class OpenAIAlphaCapacityRetryBudget:
+    """Typed request-wide retry budget for OpenAI alpha capacity retries.
+
+    Owned by the retry-policy layer; the candidate loop integrates via this contract.
+    """
+    schedule: tuple[float, ...] = _OPENAI_ALPHA_CAPACITY_RETRY_SCHEDULE
+    deadline_seconds: float = _OPENAI_ALPHA_CAPACITY_RETRY_DEADLINE_SECONDS

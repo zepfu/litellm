@@ -4364,6 +4364,17 @@ async def _perform_codex_auto_agent_native_openai_request(
         "stream": True,
     }
     is_streaming_request = bool(request_body.get("stream"))
+    # The candidate loop attaches this coordinator only for eligible alpha
+    # OpenAI capacity-retry requests. Preserve stock hidden transport retries
+    # for every native OpenAI request without that shared owner.
+    caller_managed_hidden_retry = (
+        getattr(
+            getattr(request, "state", None),
+            "aawm_openai_capacity_retry",
+            None,
+        )
+        is not None
+    )
     resolved_headers = (
         dict(custom_headers)
         if custom_headers is not None
@@ -4390,7 +4401,7 @@ async def _perform_codex_auto_agent_native_openai_request(
             expected_target_family="openai",
             # RR-054 #24
             retryable_upstream_status_codes=list(_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES_DEFAULT),
-            caller_managed_hidden_retry=False,
+            caller_managed_hidden_retry=caller_managed_hidden_retry,
         )
     except Exception as exc:
         provider_returned = bool(getattr(exc, "_aawm_provider_returned", False))

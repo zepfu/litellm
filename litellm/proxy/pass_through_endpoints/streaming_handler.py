@@ -611,6 +611,8 @@ class PassThroughStreamingHandler:
     @staticmethod
     def _classify_responses_pre_commit_error(
         error_payload: Optional[Dict[str, Any]],
+        *,
+        openai_alpha_capacity_retry_enabled: bool = False,
     ) -> tuple[str, str, bool]:
         error_code, error_type, error_message = (
             PassThroughStreamingHandler._extract_responses_stream_error_fields(
@@ -663,6 +665,20 @@ class PassThroughStreamingHandler:
             )
         ):
             return "usage_limit_reached", "usage_limit_reached", False
+        if (
+            openai_alpha_capacity_retry_enabled
+            and error_code in {"server_is_overloaded", "capacity_exhausted"}
+            and error_type not in {
+                "authentication_error",
+                "authorization_error",
+                "permission_error",
+                "invalid_request_error",
+                "token_invalidated",
+                "insufficient_quota",
+                "usage_limit_reached",
+            }
+        ):
+            return "server_overloaded", "transient_capacity", True
         if any(
             marker in joined
             for marker in (
@@ -736,10 +752,12 @@ class PassThroughStreamingHandler:
         event_type: Optional[str],
         pre_commit_retry_exhausted: bool = False,
         retry_after_seconds: float = RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
+        openai_alpha_capacity_retry_enabled: bool = False,
     ) -> ResponsesStreamPreCommitFailure:
         error_class, classification, retryable = (
             PassThroughStreamingHandler._classify_responses_pre_commit_error(
-                error_payload
+                error_payload,
+                openai_alpha_capacity_retry_enabled=openai_alpha_capacity_retry_enabled,
             )
         )
         extracted_code, extracted_type, extracted_message = (
@@ -851,6 +869,7 @@ class PassThroughStreamingHandler:
         response: httpx.Response,
         *,
         max_buffer_bytes: int = _RESPONSES_PRE_COMMIT_MAX_BUFFER_BYTES,
+        openai_alpha_capacity_retry_enabled: bool = False,
     ) -> tuple[httpx.Response, Optional[ResponsesStreamPreCommitFailure]]:
         """Hold lifecycle-only Responses bytes until a commit or pre-SSE failure."""
         peeked: List[bytes] = []
@@ -877,6 +896,7 @@ class PassThroughStreamingHandler:
                     PassThroughStreamingHandler._build_responses_pre_commit_failure(
                         error_payload=error_payload,
                         event_type=event_type,
+                        openai_alpha_capacity_retry_enabled=openai_alpha_capacity_retry_enabled,
                     ),
                 )
             if decision == "substantive":
@@ -890,6 +910,7 @@ class PassThroughStreamingHandler:
                 PassThroughStreamingHandler._build_responses_pre_commit_failure(
                     error_payload=error_payload,
                     event_type=event_type,
+                    openai_alpha_capacity_retry_enabled=openai_alpha_capacity_retry_enabled,
                 ),
             )
         return _PrefixedHttpxByteStream(response, peeked, iterator), None

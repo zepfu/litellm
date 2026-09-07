@@ -35,6 +35,7 @@ import asyncio
 import copy
 import hashlib
 import inspect
+import time
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 import httpx
@@ -70,6 +71,15 @@ from .interfaces import (
     MatchProviderAttributedModelUnavailableFn,
     RecordCodexFailureEvidenceFn,
     ResolveCooldownPublicationFn,
+)
+from .durable import get_aawm_alias_routing_state_namespace
+from .pre_commit_retry import (
+    ClientDisconnectedCancellation,
+    OpenAIAlphaCapacityRetryBudget,
+    OpenAIAlphaCapacityRetryCoordinator,
+    _build_openai_capacity_target_identity,
+    await_with_client_disconnect,
+    get_or_create_openai_alpha_capacity_retry_coordinator,
 )
 from .schema_rejections import (
     SCHEMA_REJECTION_KEY,
@@ -763,7 +773,9 @@ async def handle_alias_route(  # noqa: PLR0915
     _emit_auto_agent_alias_no_candidate_event = _lpe._emit_auto_agent_alias_no_candidate_event
     _get_safe_kimi_code_probe_failure_metadata = _lpe._get_safe_kimi_code_probe_failure_metadata
     _classify_kimi_code_auto_agent_probe_failure = _lpe._classify_kimi_code_auto_agent_probe_failure
-    _classify_codex_auto_agent_retryable_exhaustion = _lpe._classify_codex_auto_agent_retryable_exhaustion
+    _classify_codex_auto_agent_retryable_exhaustion_impl = (
+        _lpe._classify_codex_auto_agent_retryable_exhaustion
+    )
     _is_codex_auto_agent_grok_account_quota_exhaustion = _lpe._is_codex_auto_agent_grok_account_quota_exhaustion
     _get_codex_auto_agent_cooldown_seconds = _lpe._get_codex_auto_agent_cooldown_seconds
     _record_codex_failure_evidence = _lpe._record_codex_failure_evidence
@@ -824,6 +836,62 @@ async def handle_alias_route(  # noqa: PLR0915
     add_alias_metadata_fn = services.add_alias_metadata_fn
     raise_redispatch_required_fn = services.raise_redispatch_fn
     is_codex_alias = validate_alias_family(alias_family) == "codex"
+
+    def _get_openai_alpha_capacity_retry_coordinator(
+        candidate: dict[str, Any],
+    ) -> Optional[OpenAIAlphaCapacityRetryCoordinator]:
+        if not _error_signals._is_openai_alpha_capacity_retry_enabled(
+            request=request,
+            candidate=candidate,
+            is_codex_alias=is_codex_alias,
+        ):
+            return None
+        return get_or_create_openai_alpha_capacity_retry_coordinator(
+            request,
+            target_identity=_build_openai_capacity_target_identity(
+                provider="openai",
+                model=str(candidate.get("model") or ""),
+                upstream_url=_lpe._codex_oauth_responses_target_url(),
+            ),
+            namespace=get_aawm_alias_routing_state_namespace(),
+        )
+
+    def _classify_codex_auto_agent_retryable_exhaustion(
+        exc: Any,
+        *,
+        candidate: Optional[dict[str, Any]] = None,
+        attempted_provider_call: bool = True,
+    ) -> Optional[str]:
+        classifier_kwargs: dict[str, Any] = {
+            "candidate": candidate,
+            "attempted_provider_call": attempted_provider_call,
+        }
+        try:
+            classifier_signature = inspect.signature(
+                _classify_codex_auto_agent_retryable_exhaustion_impl
+            )
+        except (TypeError, ValueError):
+            classifier_signature = None
+        if classifier_signature is None or (
+            "openai_alpha_capacity_retry_enabled"
+            in classifier_signature.parameters
+            or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in classifier_signature.parameters.values()
+            )
+        ):
+            classifier_kwargs["openai_alpha_capacity_retry_enabled"] = (
+                _error_signals._is_openai_alpha_capacity_retry_enabled(
+                    request=request,
+                    candidate=candidate,
+                    is_codex_alias=is_codex_alias,
+                )
+            )
+        return _classify_codex_auto_agent_retryable_exhaustion_impl(
+            exc,
+            **classifier_kwargs,
+        )
+
     replay_safety = (
         _session_affinity_mod().classify_session_owner_replay_safety_body(
             prepared_request_body
@@ -842,6 +910,9 @@ async def handle_alias_route(  # noqa: PLR0915
     request_outcome = _attempt_records._auto_agent_alias_request_outcome_state(request)
     request_outcome["attempts"] = attempts
     last_retryable_exc: Optional[Exception] = None
+    last_capacity_failure_exc: Optional[Exception] = None
+    last_capacity_failure_class: Optional[str] = None
+    last_capacity_failure_target_identity: Optional[str] = None
     has_continuation_state = _codex_auto_agent_request_has_continuation_state(prepared_request_body)
     has_previous_response_id = bool(
         prepared_request_body.get("previous_response_id")
@@ -854,6 +925,8 @@ async def handle_alias_route(  # noqa: PLR0915
     native_grok_continuation_transient_provider_attempts = 0
     provider_candidate_attempts = 0
     same_account_transient_attempts_by_slot: dict[Optional[str], int] = {}
+    request_retry_started_at = time.monotonic()
+    request_retry_budget = OpenAIAlphaCapacityRetryBudget()
     token_invalidated_reload_attempts: set[str] = set()
     account_failover_replay_safe = (
         replay_safety.safe
@@ -1013,6 +1086,8 @@ async def handle_alias_route(  # noqa: PLR0915
         exc: Exception,
         *,
         extra_fields: Optional[Mapping[str, Any]] = None,
+        preserve_upstream_failure: bool = False,
+        capacity_retry_expired: bool = False,
     ) -> Any:
         last_attempt = attempts[-1] if attempts else {}
         cursor_sanitized_proto_structure = (
@@ -1035,7 +1110,56 @@ async def handle_alias_route(  # noqa: PLR0915
             candidate=candidate,
         )
         terminal_exc: Optional[HTTPException] = None
-        if _is_cursor_session_continuation_failure(exc, candidate=candidate):
+        if preserve_upstream_failure:
+            source_exc = exc
+            wire_headers = _passthrough_helpers._get_passthrough_terminal_wire_headers(
+                source_exc
+            )
+            if isinstance(source_exc, HTTPException):
+                terminal_exc = source_exc
+                terminal_exc.headers = wire_headers
+            else:
+                source_detail = getattr(source_exc, "detail", None)
+                if source_detail is None:
+                    source_detail = getattr(source_exc, "body", None)
+                if source_detail is None:
+                    source_detail = getattr(source_exc, "message", None) or str(
+                        source_exc
+                    )
+                terminal_exc = HTTPException(
+                    status_code=(
+                        _passthrough_helpers._extract_exception_status_code(source_exc)
+                        or status.HTTP_502_BAD_GATEWAY
+                    ),
+                    detail=copy.deepcopy(source_detail),
+                    headers=wire_headers,
+                )
+                for field in (
+                    "attempted_provider_call",
+                    "_aawm_provider_returned",
+                    "_aawm_openai_capacity_expired",
+                    "body",
+                    "code",
+                    "message",
+                    "openai_code",
+                    "param",
+                    "provider_specific_fields",
+                    "type",
+                    "upstream_headers",
+                ):
+                    if hasattr(source_exc, field):
+                        setattr(terminal_exc, field, getattr(source_exc, field))
+            if isinstance(terminal_exc.detail, bytes):
+                payload = _passthrough_helpers._coerce_upstream_error_payload(
+                    terminal_exc.detail
+                )
+                terminal_exc.detail = (
+                    payload
+                    if payload is not None
+                    else terminal_exc.detail.decode("utf-8", errors="replace")
+                )
+            setattr(terminal_exc, "_aawm_openai_capacity_expired", True)
+        elif _is_cursor_session_continuation_failure(exc, candidate=candidate):
             detail = getattr(exc, "detail", None)
             if not isinstance(detail, dict):
                 detail = {
@@ -1179,19 +1303,182 @@ async def handle_alias_route(  # noqa: PLR0915
                 request,
                 last_attempt,
             )
-        _emit_auto_agent_alias_no_candidate_event(
+        if capacity_retry_expired:
+            _emit_auto_agent_alias_pre_attempt_terminal_event(
+                alias_family=alias_family,
+                alias_model=alias_model,
+                request=request,
+                request_body=prepared_request_body,
+                event_type="openai_capacity_retry_deadline_exhausted",
+                candidate_status="terminal_openai_capacity_retry_expired",
+                failure_phase="openai_capacity_retry_deadline",
+                error_status_code=terminal_exc.status_code,
+                failure_class=attempt_record.get("error_class"),
+                candidate=candidate,
+                selection=selection,
+                attempts=attempts,
+                extra_fields={
+                    "attempted_provider_call": bool(
+                        attempt_record.get("attempted_provider_call")
+                    ),
+                    "terminal_outcome": "retryable_upstream_capacity_exhausted",
+                    "fallback_result": "capacity_retry_deadline_exhausted",
+                    "agent_session_killed": False,
+                    "retryable": True,
+                    **dict(extra_fields or {}),
+                },
+            )
+        else:
+            _emit_auto_agent_alias_no_candidate_event(
+                alias_family=alias_family,
+                alias_model=alias_model,
+                request=request,
+                request_body=prepared_request_body,
+                exc=terminal_exc,
+                attempts=attempts,
+                traversal_budget_exhausted=(
+                    provider_candidate_attempts >= max_candidate_attempts
+                ),
+                extra_fields=extra_fields,
+            )
+        raise terminal_exc from None
+
+    def _remember_capacity_failure(
+        *,
+        failure_exc: Exception,
+        error_class: Optional[str],
+        attempted_provider_call: bool,
+    ) -> None:
+        nonlocal last_capacity_failure_class
+        nonlocal last_capacity_failure_exc
+        nonlocal last_capacity_failure_target_identity
+        if (
+            capacity_retry_coordinator is None
+            or not attempted_provider_call
+            or error_class not in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
+        ):
+            return
+        last_capacity_failure_exc = failure_exc
+        last_capacity_failure_class = str(error_class)
+        last_capacity_failure_target_identity = capacity_retry_coordinator.target_identity
+
+    def _capacity_expiry_source(
+        *,
+        failure_exc: Exception,
+        error_class: Optional[str],
+    ) -> Optional[tuple[Exception, str]]:
+        if capacity_retry_coordinator is None:
+            return None
+        target_identity = capacity_retry_coordinator.target_identity
+        same_target_prior_failure = (
+            last_capacity_failure_exc is not None
+            and last_capacity_failure_target_identity == target_identity
+        )
+        if getattr(failure_exc, "_aawm_openai_capacity_expired", False):
+            return (
+                failure_exc,
+                str(error_class or last_capacity_failure_class or "upstream_timeout"),
+            )
+        if capacity_retry_coordinator.terminal_reason == "deadline_exhausted":
+            if same_target_prior_failure and last_capacity_failure_exc is not None:
+                return (
+                    last_capacity_failure_exc,
+                    last_capacity_failure_class or "capacity_exhausted",
+                )
+            return failure_exc, str(error_class or "upstream_timeout")
+        if (
+            capacity_retry_coordinator.remaining_seconds <= 0
+            and (
+                error_class == "upstream_timeout"
+                or _extract_adapter_exception_status_code(failure_exc) == 504
+                or isinstance(failure_exc, httpx.TimeoutException)
+            )
+        ):
+            if same_target_prior_failure and last_capacity_failure_exc is not None:
+                return (
+                    last_capacity_failure_exc,
+                    last_capacity_failure_class or "capacity_exhausted",
+                )
+            return failure_exc, "upstream_timeout"
+        return None
+
+    def _new_capacity_deadline_timeout() -> Exception:
+        return HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail={
+                "error": {
+                    "message": (
+                        "OpenAI capacity retry deadline expired before "
+                        "another upstream failure was captured."
+                    ),
+                    "type": "upstream_timeout",
+                    "code": "openai_capacity_retry_deadline_exhausted",
+                }
+            },
+        )
+
+    def _terminate_alias_capacity_retry_expiry(
+        *,
+        failure_exc: Exception,
+        error_class: Optional[str],
+        kimi_failure_metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
+        assert capacity_retry_coordinator is not None
+        expiry_attempted_provider_call = bool(
+            attempt_record.get("attempted_provider_call")
+        )
+        terminal_error_class = str(error_class or "upstream_timeout")
+        terminal_exc = failure_exc
+        if not getattr(terminal_exc, "_aawm_openai_capacity_expired", False):
+            terminal_exc = (
+                _passthrough_helpers._mark_passthrough_capacity_exception_terminal(
+                    terminal_exc
+                )
+            )
+        terminal_status_code = _passthrough_helpers._extract_exception_status_code(
+            terminal_exc
+        )
+        if terminal_status_code is None and terminal_error_class == "upstream_timeout":
+            terminal_status_code = status.HTTP_504_GATEWAY_TIMEOUT
+        if capacity_retry_coordinator.terminal_reason != "deadline_exhausted":
+            capacity_retry_coordinator.record_terminal(
+                "deadline_exhausted",
+                error_class=terminal_error_class,
+                status_code=terminal_status_code,
+            )
+        attempt_record.pop("cooldown_seconds", None)
+        attempt_record["cooldown_scope"] = "none"
+        _update_codex_auto_agent_retryable_attempt_record(
+            attempt_record=attempt_record,
+            exc=terminal_exc,
+            error_class=terminal_error_class,
+            cooldown_seconds=0.0,
+            cooldown_scope="none",
+            alias_model=alias_model,
+            candidate=candidate,
+            kimi_failure_metadata=kimi_failure_metadata,
+        )
+        attempt_record["failure_phase"] = "openai_capacity_retry_deadline"
+        attempt_record["status"] = "terminal_openai_capacity_retry_expired"
+        _record_auto_agent_alias_attempt_failure(
             alias_family=alias_family,
             alias_model=alias_model,
             request=request,
-            request_body=prepared_request_body,
-            exc=terminal_exc,
+            prepared_request_body=prepared_request_body,
+            selection=selection,
             attempts=attempts,
-            traversal_budget_exhausted=(
-                provider_candidate_attempts >= max_candidate_attempts
-            ),
-            extra_fields=extra_fields,
+            attempt_record=attempt_record,
+            error_class=terminal_error_class,
+            add_alias_metadata_fn=add_alias_metadata_fn,
         )
-        raise terminal_exc from None
+        _raise_terminal_alias_failure(
+            terminal_exc,
+            preserve_upstream_failure=True,
+            capacity_retry_expired=True,
+            extra_fields={
+                "attempted_provider_call": expiry_attempted_provider_call,
+            },
+        )
 
     while provider_candidate_attempts < max_candidate_attempts:
         try:
@@ -1291,25 +1578,10 @@ async def handle_alias_route(  # noqa: PLR0915
             raise
         candidate = selection["candidate"]
         cooldown_key = str(selection["cooldown_key"])
-        if cooldown_key in failed_provider_candidate_keys:
-            if attempts:
-                _mark_auto_agent_alias_request_terminal_failure(
-                    request,
-                    attempts[-1],
-                )
-            _raise_terminal_alias_failure(last_retryable_exc or HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail={
-                    "error": {
-                        "message": "No further eligible Codex auto-agent candidates.",
-                        "type": "provider_terminal_error",
-                        "code": "all_candidates_unavailable",
-                    }
-                },
-            ))
+        capacity_retry_coordinator = (
+            _get_openai_alpha_capacity_retry_coordinator(candidate)
+        )
         failover_ordinal = int(selection.get("failover_ordinal") or 0)
-        if failover_ordinal == 0:
-            provider_candidate_attempts += 1
         attempt_record = _codex_auto_agent_candidate_public_shape(
             candidate,
             lane_key=selection.get("lane_key"),
@@ -1326,6 +1598,45 @@ async def handle_alias_route(  # noqa: PLR0915
             if value is not None:
                 attempt_record[field] = value
         attempt_record["attempted_provider_call"] = False
+        if (
+            capacity_retry_coordinator is not None
+            and (
+                capacity_retry_coordinator.terminal_reason == "deadline_exhausted"
+                or capacity_retry_coordinator.remaining_seconds <= 0
+            )
+        ):
+            deadline_failure = (
+                last_capacity_failure_exc or _new_capacity_deadline_timeout()
+            )
+            expiry_source = _capacity_expiry_source(
+                failure_exc=deadline_failure,
+                error_class="upstream_timeout",
+            )
+            if expiry_source is None:
+                expiry_source = (deadline_failure, "upstream_timeout")
+            attempts.append(attempt_record)
+            _terminate_alias_capacity_retry_expiry(
+                failure_exc=expiry_source[0],
+                error_class=expiry_source[1],
+            )
+        if cooldown_key in failed_provider_candidate_keys:
+            if attempts:
+                _mark_auto_agent_alias_request_terminal_failure(
+                    request,
+                    attempts[-1],
+                )
+            _raise_terminal_alias_failure(last_retryable_exc or HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={
+                    "error": {
+                        "message": "No further eligible Codex auto-agent candidates.",
+                        "type": "provider_terminal_error",
+                        "code": "all_candidates_unavailable",
+                    }
+                },
+            ))
+        if failover_ordinal == 0:
+            provider_candidate_attempts += 1
         # D1-564: provider/account lane admission after selection and before
         # attempt-start / probe lock / provider I/O. Separate from cooldown and
         # session ownership. Fail-fast only: never queue/sleep/background-retry.
@@ -1633,20 +1944,45 @@ async def handle_alias_route(  # noqa: PLR0915
                                     attempted_provider_call = False
                                 raise
 
-                        run_with_lease_renewal = getattr(
-                            sa,
-                            "run_with_session_owner_lease_renewal",
-                            None,
-                        )
-                        if callable(run_with_lease_renewal):
-                            response = await run_with_lease_renewal(
-                                session_owner_lease,
-                                _perform_candidate_request,
+                        async def _run_candidate_operation() -> Response:
+                            run_with_lease_renewal = getattr(
+                                sa,
+                                "run_with_session_owner_lease_renewal",
+                                None,
                             )
-                        else:
+                            if callable(run_with_lease_renewal):
+                                return await run_with_lease_renewal(
+                                    session_owner_lease,
+                                    _perform_candidate_request,
+                                )
                             # Keep older extracted-host test seams usable while
                             # the runtime host rolls out the renewal helper.
-                            response = await _perform_candidate_request()
+                            return await _perform_candidate_request()
+
+                        try:
+                            if capacity_retry_coordinator is not None:
+                                response = await await_with_client_disconnect(
+                                    _run_candidate_operation,
+                                    request=request,
+                                )
+                            else:
+                                response = await _run_candidate_operation()
+                        except ClientDisconnectedCancellation:
+                            if capacity_retry_coordinator is not None:
+                                capacity_retry_coordinator.record_terminal(
+                                    "client_disconnected",
+                                    error_class="client_disconnected",
+                                    status_code=None,
+                                )
+                            raise
+                        except asyncio.CancelledError:
+                            if capacity_retry_coordinator is not None:
+                                capacity_retry_coordinator.record_terminal(
+                                    "cancelled",
+                                    error_class="cancelled",
+                                    status_code=None,
+                                )
+                            raise
                         is_auto_review = (
                             alias_model in {"codex-auto-review", "auto-review"}
                             or sa.get_request_codex_auto_review_parent_session_identity(
@@ -1810,6 +2146,15 @@ async def handle_alias_route(  # noqa: PLR0915
                     # lock entry while retaining a pre-acquired probe lock).
                     fresh_codex_auth_error_class: Optional[str] = None
                     if probe_failure_exc is not None:
+                        premarked_expiry = _capacity_expiry_source(
+                            failure_exc=probe_failure_exc,
+                            error_class=None,
+                        )
+                        if premarked_expiry is not None:
+                            _terminate_alias_capacity_retry_expiry(
+                                failure_exc=premarked_expiry[0],
+                                error_class=premarked_expiry[1],
+                            )
                         fresh_codex_auth_error_class = _classify_codex_fresh_auth_failure(
                             probe_failure_exc,
                             candidate=candidate,
@@ -1873,6 +2218,13 @@ async def handle_alias_route(  # noqa: PLR0915
                             attempt_record=attempt_record,
                             add_alias_metadata_fn=add_alias_metadata_fn,
                         )
+                        if capacity_retry_coordinator is not None:
+                            await capacity_retry_coordinator.signal_success()
+                            capacity_retry_coordinator.record_terminal(
+                                "success",
+                                error_class="success",
+                                status_code=getattr(response, "status_code", 200),
+                            )
                         return response
 
                     early_pre_commit_error_class = (
@@ -1914,14 +2266,58 @@ async def handle_alias_route(  # noqa: PLR0915
                         _error_signals.plan_responses_pre_commit_retry(
                             error_class=early_pre_commit_error_class,
                             same_account_transient_attempts=(
-                                same_account_transient_attempts_by_slot.get(
-                                    _codex_oauth_candidate_slot(candidate),
-                                    0,
+                                capacity_retry_coordinator.retry_count
+                                if capacity_retry_coordinator is not None
+                                else (
+                                    same_account_transient_attempts_by_slot.get(
+                                        _codex_oauth_candidate_slot(candidate),
+                                        0,
+                                    )
+                                    + 1
                                 )
-                                + 1
+                            ),
+                            elapsed_seconds=(
+                                capacity_retry_coordinator.elapsed_seconds
+                                if capacity_retry_coordinator is not None
+                                else time.monotonic() - request_retry_started_at
+                            ),
+                            budget=(
+                                capacity_retry_coordinator.budget
+                                if capacity_retry_coordinator is not None
+                                else request_retry_budget
+                            ),
+                            openai_alpha_capacity_retry_enabled=(
+                                _error_signals._is_openai_alpha_capacity_retry_enabled(
+                                    request=request,
+                                    candidate=candidate,
+                                    is_codex_alias=is_codex_alias,
+                                )
+                                and capacity_retry_coordinator is not None
                             ),
                         )
                     )
+                    _remember_capacity_failure(
+                        failure_exc=probe_failure_exc,
+                        error_class=early_pre_commit_error_class,
+                        attempted_provider_call=attempted_provider_call,
+                    )
+                    if early_pre_commit_retry_plan["action"] == "deadline_exhausted":
+                        expiry_source = _capacity_expiry_source(
+                            failure_exc=probe_failure_exc,
+                            error_class=early_pre_commit_error_class,
+                        )
+                        if expiry_source is None:
+                            expiry_source = (
+                                probe_failure_exc,
+                                str(
+                                    early_pre_commit_error_class
+                                    or "upstream_timeout"
+                                ),
+                            )
+                        _terminate_alias_capacity_retry_expiry(
+                            failure_exc=expiry_source[0],
+                            error_class=expiry_source[1],
+                        )
                     prefer_account_failover = (
                         _prefer_codex_oauth_account_failover(
                             candidate=candidate,
@@ -2206,8 +2602,6 @@ async def handle_alias_route(  # noqa: PLR0915
                             or None
                         ),
                     )
-                if attempted_provider_call:
-                    failed_provider_candidate_keys.add(cooldown_key)
                 kimi_failure_metadata = _get_safe_kimi_code_probe_failure_metadata(
                     failure_exc,
                     candidate=candidate,
@@ -2245,8 +2639,38 @@ async def handle_alias_route(  # noqa: PLR0915
                         failure_class=error_class,
                         error_code=attempt_record.get("error_code"),
                     )
+                _remember_capacity_failure(
+                    failure_exc=failure_exc,
+                    error_class=error_class,
+                    attempted_provider_call=attempted_provider_call,
+                )
+                expiry_source = _capacity_expiry_source(
+                    failure_exc=failure_exc,
+                    error_class=error_class,
+                )
+                if expiry_source is not None:
+                    _terminate_alias_capacity_retry_expiry(
+                        failure_exc=expiry_source[0],
+                        error_class=expiry_source[1],
+                        kimi_failure_metadata=kimi_failure_metadata,
+                    )
+                if capacity_retry_coordinator is not None:
+                    capacity_error_status_code = (
+                        _extract_adapter_exception_status_code(failure_exc)
+                    )
+                    if (
+                        error_class
+                        not in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
+                    ):
+                        capacity_retry_coordinator.record_terminal(
+                            "non_capacity_error",
+                            error_class=error_class or "unknown",
+                            status_code=capacity_error_status_code,
+                        )
                 if error_class is None:
                     raise _proxy_exception_for_unclassified_probe_failure(failure_exc)
+                if attempted_provider_call:
+                    failed_provider_candidate_keys.add(cooldown_key)
                 deterministically_ineligible = (
                     _error_signals._is_codex_auto_agent_candidate_deterministically_ineligible(
                         failure_exc
@@ -2312,16 +2736,42 @@ async def handle_alias_route(  # noqa: PLR0915
                     deterministically_ineligible_candidate_keys.add(cooldown_key)
                 last_retryable_exc = failure_exc
                 account_slot = _codex_oauth_candidate_slot(candidate)
-                same_account_transient_attempts_by_slot[account_slot] = (
-                    same_account_transient_attempts_by_slot.get(account_slot, 0) + 1
-                    if error_class
-                    in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
-                    else same_account_transient_attempts_by_slot.get(account_slot, 0)
-                )
+                if capacity_retry_coordinator is None:
+                    same_account_transient_attempts_by_slot[account_slot] = (
+                        same_account_transient_attempts_by_slot.get(account_slot, 0)
+                        + 1
+                        if error_class
+                        in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
+                        else same_account_transient_attempts_by_slot.get(
+                            account_slot, 0
+                        )
+                    )
                 pre_commit_retry_plan = _error_signals.plan_responses_pre_commit_retry(
                     error_class=error_class,
                     same_account_transient_attempts=(
-                        same_account_transient_attempts_by_slot.get(account_slot, 0)
+                        capacity_retry_coordinator.retry_count
+                        if capacity_retry_coordinator is not None
+                        else same_account_transient_attempts_by_slot.get(
+                            account_slot, 0
+                        )
+                    ),
+                    elapsed_seconds=(
+                        capacity_retry_coordinator.elapsed_seconds
+                        if capacity_retry_coordinator is not None
+                        else time.monotonic() - request_retry_started_at
+                    ),
+                    budget=(
+                        capacity_retry_coordinator.budget
+                        if capacity_retry_coordinator is not None
+                        else request_retry_budget
+                    ),
+                    openai_alpha_capacity_retry_enabled=(
+                        _error_signals._is_openai_alpha_capacity_retry_enabled(
+                            request=request,
+                            candidate=candidate,
+                            is_codex_alias=is_codex_alias,
+                        )
+                        and capacity_retry_coordinator is not None
                     ),
                 )
                 prefer_account_failover = _prefer_codex_oauth_account_failover(
@@ -2352,7 +2802,37 @@ async def handle_alias_route(  # noqa: PLR0915
                         add_alias_metadata_fn=add_alias_metadata_fn,
                     )
                     if wait_seconds > 0:
-                        await asyncio.sleep(wait_seconds)
+                        if capacity_retry_coordinator is not None:
+                            try:
+                                wakeup_reason = await await_with_client_disconnect(
+                                    lambda: capacity_retry_coordinator.sleep_with_wakeup(
+                                        wait_seconds,
+                                        error_class=error_class,
+                                        status_code=capacity_error_status_code,
+                                    ),
+                                    request=request,
+                                )
+                            except ClientDisconnectedCancellation:
+                                capacity_retry_coordinator.record_terminal(
+                                    "client_disconnected",
+                                    error_class=error_class or "client_disconnected",
+                                    status_code=capacity_error_status_code,
+                                )
+                                raise
+                            except asyncio.CancelledError:
+                                capacity_retry_coordinator.record_terminal(
+                                    "cancelled",
+                                    error_class=error_class or "cancelled",
+                                    status_code=capacity_error_status_code,
+                                )
+                                raise
+                            capacity_retry_coordinator.record_retry(
+                                wakeup_reason,
+                                error_class=error_class,
+                                status_code=capacity_error_status_code,
+                            )
+                        else:
+                            await asyncio.sleep(wait_seconds)
                     attempt_record = _codex_auto_agent_candidate_public_shape(
                         candidate,
                         lane_key=selection.get("lane_key"),

@@ -18726,44 +18726,108 @@ async def test_codex_auto_agent_alias_code_falls_through_from_spark_to_live_grok
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_agent_native_openai_keeps_shared_transient_retry_enabled():
+@pytest.mark.parametrize(
+    ("alpha_enabled", "expected_send_count"),
+    [
+        (False, 2),
+        (True, 1),
+    ],
+    ids=["baseline-hidden-retry", "alpha-single-send"],
+)
+async def test_codex_auto_agent_native_openai_owns_hidden_retry_only_for_alpha(
+    monkeypatch,
+    alpha_enabled,
+    expected_send_count,
+):
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry import (
+        OpenAIAlphaCapacityRetryCoordinator,
+    )
+
     request = _build_codex_auto_agent_request()
     request_body = {
         "model": "gpt-5.3-codex-spark",
         "input": "hello",
         "litellm_metadata": {"requested_model_alias": "work"},
     }
-    upstream_response = Response(content='{"id":"resp_123"}')
+    target_url = "https://chatgpt.com/backend-api/codex/responses"
+    upstream_request = httpx.Request("POST", target_url)
+    transient_failure = httpx.ReadTimeout(
+        "transient upstream failure",
+        request=upstream_request,
+    )
+    recovered_response = httpx.Response(
+        status_code=200,
+        headers={"content-type": "text/event-stream"},
+        content=b'event: response.completed\ndata: {"type":"response.completed"}\n\n',
+        request=upstream_request,
+    )
+    if alpha_enabled:
+        monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+        request.state.aawm_openai_capacity_retry = (
+            OpenAIAlphaCapacityRetryCoordinator(
+                target_identity="openai:gpt-5.3-codex-spark"
+            )
+        )
+        send_results = [transient_failure]
+    else:
+        monkeypatch.delenv("AAWM_LITELLM_ENVIRONMENT", raising=False)
+        send_results = [transient_failure, recovered_response]
+
+    mock_client = MagicMock()
+    mock_client.build_request.return_value = upstream_request
+    mock_client.send = AsyncMock(side_effect=send_results)
+    mock_client_obj = MagicMock()
+    mock_client_obj.client = mock_client
 
     with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
-        new=AsyncMock(return_value=upstream_response),
-    ) as mock_pass_through:
-        response = await _perform_codex_auto_agent_native_openai_request(
-            request=request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-            target_url="https://chatgpt.com/backend-api/codex/responses",
-            api_key=None,
-            forward_headers=True,
-            request_body=request_body,
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client",
+        return_value=mock_client_obj,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+        new=AsyncMock(),
+    ) as mock_hidden_retry_sleep, patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints._aawm_session_owner_pre_send_guard",
+        new=AsyncMock(),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints._aawm_session_owner_on_upstream_result",
+        new=AsyncMock(),
+    ), patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj"
+    ) as mock_logging_obj:
+        mock_logging_obj.pre_call_hook = AsyncMock(
+            side_effect=lambda **kwargs: kwargs["data"]
         )
+        mock_logging_obj.post_call_success_hook = AsyncMock()
+        mock_logging_obj.post_call_failure_hook = AsyncMock()
 
-    assert response is upstream_response
-    call_kwargs = mock_pass_through.await_args.kwargs
-    assert call_kwargs["retryable_upstream_status_codes"] == [
-        429,
-        500,
-        502,
-        503,
-        504,
-    ]
-    assert call_kwargs["caller_managed_hidden_retry"] is False
-    assert call_kwargs["expected_target_family"] == "openai"
-    assert call_kwargs["egress_credential_family"] == "openai"
-    assert call_kwargs["stream"] is True
-    assert call_kwargs["custom_body"]["store"] is False
-    assert call_kwargs["custom_body"]["stream"] is True
+        if alpha_enabled:
+            with pytest.raises(Exception):
+                await _perform_codex_auto_agent_native_openai_request(
+                    request=request,
+                    fastapi_response=MagicMock(spec=Response),
+                    user_api_key_dict=MagicMock(),
+                    target_url=target_url,
+                    api_key=None,
+                    forward_headers=True,
+                    request_body=request_body,
+                )
+        else:
+            response = await _perform_codex_auto_agent_native_openai_request(
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                target_url=target_url,
+                api_key=None,
+                forward_headers=True,
+                request_body=request_body,
+            )
+            assert isinstance(response, StreamingResponse)
+
+    assert mock_client.send.await_count == expected_send_count
+    if alpha_enabled:
+        mock_hidden_retry_sleep.assert_not_awaited()
+    else:
+        mock_hidden_retry_sleep.assert_awaited_once()
 
 
 @pytest.mark.asyncio

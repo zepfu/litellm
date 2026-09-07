@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import ast
 import json
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,11 +35,18 @@ from starlette.requests import Request
 from litellm.proxy.pass_through_endpoints import aawm_alias_routing as package
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import candidate_loop
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    pre_commit_retry as pre_commit_retry_module,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import session_affinity
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import snapshot_select
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
     DEFAULT_CONFIG_DIR,
     compile_directory,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry import (
+    _build_openai_capacity_target_identity,
+    get_or_create_openai_alpha_capacity_retry_coordinator,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
     AliasRoutingStateManager,
@@ -50,6 +58,9 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
 )
 from litellm.proxy._types import ProxyException
+from litellm.proxy.pass_through_endpoints.streaming_handler import (
+    ResponsesStreamPreCommitFailure,
+)
 
 PACKAGE_DIR = Path(package.__file__).resolve().parent
 GOD_PATH = Path(lpe.__file__).resolve()
@@ -2541,6 +2552,1092 @@ async def test_candidate_loop_ineligible_falls_through_without_request_local_sta
         "aawm_alias_request_local_cooldown_until",
         None,
     ) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("non_capacity_terminal", [False, True])
+async def test_candidate_loop_capacity_retries_use_one_request_coordinator(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+    non_capacity_terminal: bool,
+) -> None:
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    namespace = "openai-054-driver-test"
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_STATE_NAMESPACE", namespace)
+    target_url = "https://chatgpt.com/backend-api/codex/responses"
+    monkeypatch.setattr(
+        lpe,
+        "_codex_oauth_responses_target_url",
+        lambda: target_url,
+    )
+    monkeypatch.setattr(
+        pre_commit_retry_module,
+        "_resolve_redis_for_capacity_wakeup",
+        lambda: None,
+    )
+
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        url=SimpleNamespace(path="/openai_passthrough/v1/responses"),
+    )
+
+    async def _is_disconnected() -> bool:
+        return False
+
+    request.is_disconnected = _is_disconnected
+
+    candidate = {
+        "provider": "openai",
+        "model": "gpt-5.4-codex",
+        "route_family": "codex_responses",
+    }
+    target_identity = _build_openai_capacity_target_identity(
+        provider="openai",
+        model=candidate["model"],
+        upstream_url=target_url,
+    )
+    selection_calls: list[dict[str, Any]] = []
+    provider_calls: list[str] = []
+    waits: list[float] = []
+    reentry_snapshots: list[tuple[bool, float, float]] = []
+    failure_records: list[dict[str, Any]] = []
+    wait_metadata: list[dict[str, Any]] = []
+    retry_logs: list[Any] = []
+    terminal_logs: list[dict[str, Any]] = []
+    success_response = SimpleNamespace(status_code=201)
+    terminal_failure = HTTPException(status_code=401, detail="Invalid credential")
+    setattr(terminal_failure, "error_class", "provider_terminal_error")
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        selection_calls.append(kwargs)
+        return {
+            "candidate": dict(candidate),
+            "lane_key": "codex-oauth:test",
+            "cooldown_key": "openai:gpt-5.4-codex",
+            "selection_reason": "first_available",
+            "skipped": [],
+        }
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> object:
+        del candidate_body
+        provider_calls.append(candidate["model"])
+        coordinator = request.state.aawm_openai_capacity_retry
+        reentered = get_or_create_openai_alpha_capacity_retry_coordinator(
+            request,
+            target_identity=target_identity,
+            namespace=namespace,
+        )
+        reentry_snapshots.append(
+            (
+                reentered is coordinator,
+                coordinator._start_monotonic,
+                coordinator.deadline_seconds,
+            )
+        )
+        if len(provider_calls) <= 2:
+            raise ResponsesStreamPreCommitFailure(
+                error_class="server_overloaded",
+                classification="transient_capacity",
+                retryable=True,
+                message="overloaded",
+                status_code=502,
+            )
+        if non_capacity_terminal:
+            raise terminal_failure
+        return success_response
+
+    async def _no_active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _owner_guard(**_kwargs: Any) -> object:
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    async def _sleep_with_wakeup(
+        _coordinator: object,
+        wait_seconds: float,
+        **metadata: Any,
+    ) -> str:
+        waits.append(wait_seconds)
+        wait_metadata.append(metadata)
+        return "timer"
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(self, _lease: object) -> None:
+            return None
+
+    session_affinity_seam = SimpleNamespace(
+        is_replay_safe_session_owner_redispatch_body=lambda _body: True,
+        resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
+        get_request_codex_auto_review_parent_session_identity=lambda _request: None,
+        build_session_owner_attributes=lambda **_kwargs: {},
+        ensure_session_owner_guard_for_request=_owner_guard,
+        get_request_session_owner_lease=lambda _request: None,
+        finalize_session_owner_lease_on_success=_noop_async,
+        finalize_session_owner_lease_on_failure=_noop_async,
+    )
+
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: session_affinity_seam,
+    )
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        pre_commit_retry_module.OpenAIAlphaCapacityRetryCoordinator,
+        "sleep_with_wakeup",
+        _sleep_with_wakeup,
+    )
+    monkeypatch.setattr(
+        pre_commit_retry_module, "_emit_capacity_retry_log", retry_logs.append
+    )
+    monkeypatch.setattr(
+        pre_commit_retry_module,
+        "_emit_openai_capacity_terminal_log",
+        lambda **kwargs: terminal_logs.append(kwargs),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_no_candidate_event",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_started",
+        lambda **kwargs: kwargs["prepared_request_body"],
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_failure",
+        lambda **kwargs: failure_records.append(kwargs),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_success",
+        lambda **kwargs: kwargs["attempt_record"],
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_codex_failure_evidence",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        lambda exc, **_kwargs: getattr(exc, "error_class", None),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_plan_codex_oauth_account_failover",
+        lambda *_args, **_kwargs: False,
+    )
+
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=lpe._resolve_auto_agent_cooldown_publication_plan,
+        publish_cooldown_memory_fn=lambda **_kwargs: None,
+        persist_cooldown_fn=_noop_async,
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=lambda body, **_kwargs: body,
+        raise_redispatch_fn=None,
+    )
+
+    with pytest.raises(HTTPException) if non_capacity_terminal else nullcontext():
+        response = await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="work",
+            request=request,
+            prepared_request_body={"model": "work", "input": "dispatch basic"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_no_active_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    coordinator = request.state.aawm_openai_capacity_retry
+    if not non_capacity_terminal:
+        assert response is success_response
+    assert provider_calls == ["gpt-5.4-codex"] * 3
+    assert waits == [15.0, 30.0]
+    assert wait_metadata == [
+        {"error_class": "server_overloaded", "status_code": 502},
+    ] * 2
+    assert [(entry.error_class, entry.status_code) for entry in retry_logs] == [
+        ("server_overloaded", 502),
+    ] * 2
+    assert len(terminal_logs) == 1
+    assert terminal_logs[0]["terminal_reason"] == (
+        "non_capacity_error" if non_capacity_terminal else "success"
+    )
+    assert terminal_logs[0]["error_class"] == (
+        "provider_terminal_error" if non_capacity_terminal else "success"
+    )
+    assert terminal_logs[0]["status_code"] == (
+        401 if non_capacity_terminal else 201
+    )
+    assert len(failure_records) == (3 if non_capacity_terminal else 2)
+    assert len(selection_calls) == 1
+    assert coordinator.retry_count == 2
+    assert coordinator.target_identity == target_identity
+    assert coordinator.deadline_seconds == 7200.0
+    assert all(snapshot[0] for snapshot in reentry_snapshots)
+    assert len({snapshot[1] for snapshot in reentry_snapshots}) == 1
+    assert {snapshot[2] for snapshot in reentry_snapshots} == {7200.0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expiry_mode", ["planner_deadline", "in_flight"])
+@pytest.mark.parametrize(
+    "failure_kind", ["sse", "raw_http", "wrapped_json_bytes", "wrapped_text_bytes"]
+)
+async def test_candidate_loop_capacity_expiry_preserves_upstream_failure(  # noqa: PLR0915
+    expiry_mode: str,
+    failure_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from fastapi.exception_handlers import http_exception_handler
+    from litellm.proxy._types import ProxyException
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        _PassthroughHiddenRetryBudgetTimeout,
+    )
+
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_STATE_NAMESPACE", "openai-054-expiry-test")
+    target_url = "https://chatgpt.com/backend-api/codex/responses"
+    monkeypatch.setattr(
+        lpe,
+        "_codex_oauth_responses_target_url",
+        lambda: target_url,
+    )
+
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        url=SimpleNamespace(path="/openai_passthrough/v1/responses"),
+    )
+
+    async def _is_disconnected() -> bool:
+        return False
+
+    request.is_disconnected = _is_disconnected
+    candidate = {
+        "provider": "openai",
+        "model": "gpt-5.4-codex",
+        "route_family": "codex_responses",
+    }
+    target_identity = _build_openai_capacity_target_identity(
+        provider="openai",
+        model=candidate["model"],
+        upstream_url=target_url,
+    )
+    selection_calls: list[dict[str, Any]] = []
+    provider_calls: list[int] = []
+    waits: list[float] = []
+    publication_calls: list[str] = []
+    failover_calls: list[dict[str, Any]] = []
+    redispatch_calls: list[dict[str, Any]] = []
+    failure_records: list[dict[str, Any]] = []
+    terminal_records: list[tuple[str, Optional[str], Optional[int]]] = []
+    emitted: list[dict[str, Any]] = []
+    persisted: list[list[dict[str, Any]]] = []
+    monkeypatch.setattr(
+        lpe, "_emit_auto_agent_alias_route_event",
+        lambda event, **_kwargs: emitted.append(event),
+    )
+    monkeypatch.setattr(
+        lpe, "_persist_auto_agent_alias_audit_only_events_best_effort",
+        lambda events, **_kwargs: persisted.append(events),
+    )
+    upstream_detail = {
+        "error": {
+            "message": "upstream overloaded body",
+            "type": "server_error",
+            "code": "server_overloaded",
+            "retryable": True,
+        }
+    }
+    raw_body = json.dumps(upstream_detail)
+
+    class _Coordinator:
+        def __init__(self) -> None:
+            self.target_identity = target_identity
+            self.retry_count = 0
+            self.elapsed_seconds = 0.0
+            self.remaining_seconds = 3600.0
+            self.budget = SimpleNamespace(
+                deadline_seconds=0.0 if expiry_mode == "planner_deadline" else 7200.0
+            )
+            self.terminal_reason = ""
+
+        async def signal_success(self) -> None:
+            return None
+
+        async def sleep_with_wakeup(
+            self, wait_seconds: float, **_metadata: Any
+        ) -> str:
+            waits.append(wait_seconds)
+            return "timer"
+
+        def record_retry(self, _wakeup_reason: str, **_metadata: Any) -> None:
+            self.retry_count += 1
+
+        def record_terminal(
+            self,
+            reason: str,
+            *,
+            error_class: Optional[str] = None,
+            status_code: Optional[int] = None,
+        ) -> None:
+            terminal_records.append((reason, error_class, status_code))
+            self.terminal_reason = reason
+
+    coordinator = _Coordinator()
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        selection_calls.append(kwargs)
+        return {
+            "candidate": dict(candidate),
+            "lane_key": "codex-oauth:test",
+            "cooldown_key": "openai:gpt-5.4-codex",
+            "selection_reason": "first_available",
+            "skipped": [],
+        }
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> object:
+        del candidate_body
+        provider_calls.append(len(provider_calls) + 1)
+        if expiry_mode == "in_flight" and len(provider_calls) == 2:
+            coordinator.remaining_seconds = 0.0
+            raise _PassthroughHiddenRetryBudgetTimeout(
+                "upstream request timed out"
+            )
+        if failure_kind.startswith("wrapped_"):
+            body = (
+                raw_body.encode()
+                if failure_kind == "wrapped_json_bytes"
+                else b"upstream overloaded body"
+            )
+            upstream_response = httpx.Response(
+                529,
+                request=httpx.Request("POST", target_url),
+                content=body,
+                headers={"Retry-After": "17", "Content-Type": "application/json"},
+            )
+            upstream_response.headers.update(
+                {"Content-Length": "1", "Transfer-Encoding": "chunked",
+                 "Content-Encoding": "gzip"}
+            )
+            mock_request = MagicMock(spec=Request)
+            mock_request.method = "POST"
+            mock_request.url = SimpleNamespace(
+                path="/openai_passthrough/v1/responses"
+            )
+            mock_request.headers = {"content-type": "application/json"}
+            mock_request.query_params = {}
+            mock_request.state = SimpleNamespace()
+            mock_request.is_disconnected = AsyncMock(return_value=False)
+            custom_body = {"model": candidate["model"], "stream": True}
+            client = MagicMock()
+            client.client.send = AsyncMock(return_value=upstream_response)
+
+            async def run_with_renewal(_lease, operation):
+                return await operation()
+
+            with patch.object(
+                pte, "_aawm_session_owner_pre_send_guard", new=AsyncMock()
+            ), patch.object(
+                session_affinity, "get_request_session_owner_lease", return_value=None
+            ), patch.object(
+                session_affinity, "run_with_session_owner_lease_renewal",
+                new=run_with_renewal,
+            ), patch.object(
+                session_affinity, "finalize_request_session_owner_lease",
+                new=AsyncMock(),
+            ), patch.object(
+                pte, "get_async_httpx_client", return_value=client
+            ), patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as logging_obj:
+                logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+                logging_obj.post_call_failure_hook = AsyncMock()
+                with pytest.raises(ProxyException) as wrapped:
+                    await pte.pass_through_request(
+                        request=mock_request,
+                        target=target_url,
+                        custom_headers={},
+                        user_api_key_dict=MagicMock(),
+                        custom_body=custom_body,
+                        custom_llm_provider="openai",
+                        stream=True,
+                        caller_managed_hidden_retry=True,
+                    )
+            client.client.send.assert_awaited_once()
+            assert wrapped.value.detail == body
+            assert wrapped.value.upstream_headers["retry-after"] == "17"
+            assert "Retry-After" not in wrapped.value.headers
+            wrapped.value.error_class = "server_overloaded"
+            raise wrapped.value
+        if failure_kind == "raw_http":
+            upstream_request = httpx.Request("POST", target_url)
+            upstream_response = httpx.Response(
+                529,
+                request=upstream_request,
+                text=raw_body,
+            )
+            upstream_response.headers.update(
+                {
+                    "Retry-After": "999999",
+                    "Content-Length": "1",
+                    "Transfer-Encoding": "chunked",
+                    "Content-Encoding": "gzip",
+                    "X-Upstream-Trace": "capacity-123",
+                }
+            )
+            raw_failure = httpx.HTTPStatusError(
+                "server_overloaded",
+                request=upstream_request,
+                response=upstream_response,
+            )
+            setattr(raw_failure, "error_class", "server_overloaded")
+            raise raw_failure
+        raise ResponsesStreamPreCommitFailure(
+            error_class="server_overloaded",
+            classification="transient_capacity",
+            retryable=True,
+            retry_after_seconds=23.0,
+            error_code="server_overloaded",
+            error_type="server_error",
+            status_code=529,
+            message="upstream overloaded body",
+        )
+
+    async def _no_active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _persist_or_publish(*_args: Any, **_kwargs: Any) -> None:
+        publication_calls.append("publication")
+
+    async def _owner_guard(**_kwargs: Any) -> object:
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(self, _lease: object) -> None:
+            return None
+
+    session_affinity_seam = SimpleNamespace(
+        is_replay_safe_session_owner_redispatch_body=lambda _body: True,
+        resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
+        get_request_codex_auto_review_parent_session_identity=lambda _request: None,
+        build_session_owner_attributes=lambda **_kwargs: {},
+        ensure_session_owner_guard_for_request=_owner_guard,
+        get_request_session_owner_lease=lambda _request: None,
+        finalize_session_owner_lease_on_success=_noop_async,
+        finalize_session_owner_lease_on_failure=_noop_async,
+    )
+
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: session_affinity_seam,
+    )
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        candidate_loop,
+        "get_or_create_openai_alpha_capacity_retry_coordinator",
+        lambda request, **_kwargs: (
+            setattr(request.state, "aawm_openai_capacity_retry", coordinator)
+            or coordinator
+        ),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_started",
+        lambda **kwargs: kwargs["prepared_request_body"],
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_failure",
+        lambda **kwargs: failure_records.append(kwargs),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_success",
+        lambda **kwargs: kwargs["attempt_record"],
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_no_candidate_event",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_codex_failure_evidence",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        lambda exc, **_kwargs: getattr(exc, "error_class", None),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_plan_codex_oauth_account_failover",
+        lambda *args, **kwargs: (
+            failover_calls.append({"args": args, "kwargs": kwargs}) or False
+        ),
+    )
+
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=lambda **_kwargs: (
+            candidate_loop.CooldownPublicationPlan()
+        ),
+        publish_cooldown_memory_fn=_persist_or_publish,
+        persist_cooldown_fn=_persist_or_publish,
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=lambda body, **_kwargs: body,
+        raise_redispatch_fn=lambda **kwargs: redispatch_calls.append(kwargs),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="work",
+            request=request,
+            prepared_request_body={"model": "work", "input": "dispatch basic"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_no_active_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    assert provider_calls == ([1] if expiry_mode == "planner_deadline" else [1, 2])
+    assert len(selection_calls) == 1
+    assert waits == ([] if expiry_mode == "planner_deadline" else [15.0])
+    assert publication_calls == []
+    assert failover_calls == []
+    assert redispatch_calls == []
+    assert len(failure_records) == len(provider_calls)
+    assert terminal_records == [("deadline_exhausted", "server_overloaded", 529)]
+    assert exc_info.value.status_code == 529
+    expected_detail = (
+        raw_body if failure_kind == "raw_http"
+        else "upstream overloaded body" if failure_kind == "wrapped_text_bytes"
+        else upstream_detail
+    )
+    assert exc_info.value.detail == expected_detail
+    assert exc_info.value.headers == {
+        "Retry-After": (
+            "7200" if failure_kind == "raw_http"
+            else "17" if failure_kind.startswith("wrapped_") else "23"
+        ),
+    }
+    assert getattr(exc_info.value, "_aawm_openai_capacity_expired", False) is True
+    assert len(emitted) == 1
+    event = emitted[0]
+    assert event["event_type"] == "openai_capacity_retry_deadline_exhausted"
+    assert event["terminal_outcome"] == "retryable_upstream_capacity_exhausted"
+    assert event["fallback_result"] == "capacity_retry_deadline_exhausted"
+    assert event["agent_session_killed"] is False
+    assert event["redispatch_required"] is False
+    assert event["retryable"] is True
+    assert event["attempted_provider_call"] is True
+    assert event["failure_phase"] == "openai_capacity_retry_deadline"
+    assert event["failure_class"] == "server_overloaded"
+    assert event["error_status_code"] == 529
+    assert persisted[-1][-1] == event
+    response = await http_exception_handler(request, exc_info.value)
+    assert response.status_code == 529
+    assert json.loads(response.body) == {"detail": expected_detail}
+    assert response.headers["retry-after"] == exc_info.value.headers["Retry-After"]
+    assert "transfer-encoding" not in response.headers
+    assert "content-encoding" not in response.headers
+    assert int(response.headers["content-length"]) == len(response.body)
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_capacity_expiry_without_prior_failure_returns_504(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_STATE_NAMESPACE", "openai-054-expiry-test")
+    target_url = "https://chatgpt.com/backend-api/codex/responses"
+    monkeypatch.setattr(
+        lpe,
+        "_codex_oauth_responses_target_url",
+        lambda: target_url,
+    )
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        url=SimpleNamespace(path="/openai_passthrough/v1/responses"),
+    )
+    candidate = {
+        "provider": "openai",
+        "model": "gpt-5.4-codex",
+        "route_family": "codex_responses",
+    }
+    provider_calls: list[None] = []
+    publication_calls: list[None] = []
+    redispatch_calls: list[dict[str, Any]] = []
+    terminal_records: list[tuple[str, Optional[str], Optional[int]]] = []
+    emitted: list[dict[str, Any]] = []
+    persisted: list[list[dict[str, Any]]] = []
+    monkeypatch.setattr(
+        lpe, "_emit_auto_agent_alias_route_event",
+        lambda event, **_kwargs: emitted.append(event),
+    )
+    monkeypatch.setattr(
+        lpe, "_persist_auto_agent_alias_audit_only_events_best_effort",
+        lambda events, **_kwargs: persisted.append(events),
+    )
+
+    class _Coordinator:
+        target_identity = "openai:gpt-5.4-codex@chatgpt.com/backend-api/codex/responses"
+        retry_count = 0
+        elapsed_seconds = 7200.0
+        remaining_seconds = 0.0
+        budget = SimpleNamespace(deadline_seconds=7200.0)
+        terminal_reason = ""
+
+        def record_terminal(
+            self,
+            reason: str,
+            *,
+            error_class: Optional[str] = None,
+            status_code: Optional[int] = None,
+        ) -> None:
+            terminal_records.append((reason, error_class, status_code))
+            self.terminal_reason = reason
+
+    coordinator = _Coordinator()
+
+    async def _select(**_kwargs: Any) -> dict[str, Any]:
+        return {
+            "candidate": dict(candidate),
+            "lane_key": "codex-oauth:test",
+            "cooldown_key": "openai:gpt-5.4-codex",
+            "selection_reason": "first_available",
+            "skipped": [],
+        }
+
+    async def _perform(**_kwargs: Any) -> object:
+        provider_calls.append(None)
+        return {"unexpected": True}
+
+    async def _no_active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _owner_guard(**_kwargs: Any) -> object:
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            raise AssertionError("expired alias must stop before lane admission")
+
+        async def release_provider_lane_admission(self, _lease: object) -> None:
+            return None
+
+    session_affinity_seam = SimpleNamespace(
+        is_replay_safe_session_owner_redispatch_body=lambda _body: True,
+        resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
+        get_request_codex_auto_review_parent_session_identity=lambda _request: None,
+        build_session_owner_attributes=lambda **_kwargs: {},
+        ensure_session_owner_guard_for_request=_owner_guard,
+        get_request_session_owner_lease=lambda _request: None,
+        finalize_session_owner_lease_on_success=_noop_async,
+        finalize_session_owner_lease_on_failure=_noop_async,
+    )
+
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: session_affinity_seam,
+    )
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        candidate_loop,
+        "get_or_create_openai_alpha_capacity_retry_coordinator",
+        lambda request, **_kwargs: (
+            setattr(request.state, "aawm_openai_capacity_retry", coordinator)
+            or coordinator
+        ),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_started",
+        lambda **kwargs: kwargs["prepared_request_body"],
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_failure",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_no_candidate_event",
+        lambda **_kwargs: None,
+    )
+
+    async def _publish(*_args: Any, **_kwargs: Any) -> None:
+        publication_calls.append(None)
+
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=lambda **_kwargs: (
+            candidate_loop.CooldownPublicationPlan()
+        ),
+        publish_cooldown_memory_fn=_publish,
+        persist_cooldown_fn=_publish,
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=lambda body, **_kwargs: body,
+        raise_redispatch_fn=lambda **kwargs: redispatch_calls.append(kwargs),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="work",
+            request=request,
+            prepared_request_body={"model": "work", "input": "dispatch basic"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_no_active_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    assert provider_calls == []
+    assert publication_calls == []
+    assert redispatch_calls == []
+    assert terminal_records == [("deadline_exhausted", "upstream_timeout", 504)]
+    assert exc_info.value.status_code == 504
+    assert exc_info.value.headers == {"Retry-After": "10"}
+    assert "all_candidates_unavailable" not in str(exc_info.value.detail)
+    assert len(emitted) == 1
+    event = emitted[0]
+    assert event["terminal_outcome"] == "retryable_upstream_capacity_exhausted"
+    assert event["fallback_result"] == "capacity_retry_deadline_exhausted"
+    assert event["agent_session_killed"] is False
+    assert event["retryable"] is True
+    assert event["attempted_provider_call"] is False
+    assert event["error_status_code"] == 504
+    assert persisted[-1][-1] == event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase",
+    ("io_disconnect", "wait_disconnect", "wait_cancel"),
+)
+async def test_candidate_loop_alpha_disconnect_cancels_io_or_wait(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    namespace = "openai-054-alias-disconnect-test"
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_STATE_NAMESPACE", namespace)
+    target_url = "https://chatgpt.com/backend-api/codex/responses"
+    monkeypatch.setattr(lpe, "_codex_oauth_responses_target_url", lambda: target_url)
+    monkeypatch.setattr(
+        pre_commit_retry_module,
+        "_resolve_redis_for_capacity_wakeup",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        pre_commit_retry_module,
+        "_CLIENT_DISCONNECT_POLL_SECONDS",
+        0.001,
+    )
+
+    disconnect_requested = False
+    disconnect_polls = 0
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        url=SimpleNamespace(path="/openai_passthrough/v1/responses"),
+    )
+
+    async def _is_disconnected() -> bool:
+        nonlocal disconnect_polls
+        disconnect_polls += 1
+        return disconnect_requested
+
+    request.is_disconnected = _is_disconnected
+    candidate = {
+        "provider": "openai",
+        "model": "gpt-5.4-codex",
+        "route_family": "codex_responses",
+    }
+    selection_calls: list[dict[str, Any]] = []
+    provider_calls: list[str] = []
+    failure_records: list[dict[str, Any]] = []
+    terminal_logs: list[dict[str, Any]] = []
+    cooldown_calls: list[dict[str, Any]] = []
+    wait_calls: list[dict[str, Any]] = []
+    provider_started = asyncio.Event()
+    provider_cancelled = asyncio.Event()
+    wait_started = asyncio.Event()
+    wait_cancelled = asyncio.Event()
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        selection_calls.append(kwargs)
+        return {
+            "candidate": dict(candidate),
+            "lane_key": "codex-oauth:test",
+            "cooldown_key": "openai:gpt-5.4-codex",
+            "selection_reason": "first_available",
+            "skipped": [],
+        }
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> object:
+        del candidate_body
+        provider_calls.append(candidate["model"])
+        if phase == "io_disconnect":
+            provider_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                provider_cancelled.set()
+                raise
+        if len(provider_calls) == 1:
+            raise ResponsesStreamPreCommitFailure(
+                error_class="server_overloaded",
+                classification="transient_capacity",
+                retryable=True,
+                message="overloaded",
+                status_code=502,
+            )
+        raise AssertionError("disconnect/cancellation must prevent another call")
+
+    async def _no_active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _owner_guard(**_kwargs: Any) -> object:
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    async def _sleep_with_wakeup(
+        _coordinator: object,
+        wait_seconds: float,
+        **metadata: Any,
+    ) -> str:
+        wait_calls.append(
+            {
+                "wait_seconds": wait_seconds,
+                "metadata": metadata,
+            }
+        )
+        wait_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            wait_cancelled.set()
+            raise
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(self, _lease: object) -> None:
+            return None
+
+    session_affinity_seam = SimpleNamespace(
+        is_replay_safe_session_owner_redispatch_body=lambda _body: True,
+        resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
+        get_request_codex_auto_review_parent_session_identity=lambda _request: None,
+        build_session_owner_attributes=lambda **_kwargs: {},
+        ensure_session_owner_guard_for_request=_owner_guard,
+        get_request_session_owner_lease=lambda _request: None,
+        finalize_session_owner_lease_on_success=_noop_async,
+        finalize_session_owner_lease_on_failure=_noop_async,
+    )
+
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: session_affinity_seam,
+    )
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        pre_commit_retry_module.OpenAIAlphaCapacityRetryCoordinator,
+        "sleep_with_wakeup",
+        _sleep_with_wakeup,
+    )
+    monkeypatch.setattr(
+        pre_commit_retry_module,
+        "_emit_openai_capacity_terminal_log",
+        lambda **kwargs: terminal_logs.append(kwargs),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_no_candidate_event",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_started",
+        lambda **kwargs: kwargs["prepared_request_body"],
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_failure",
+        lambda **kwargs: failure_records.append(kwargs),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_success",
+        lambda **kwargs: kwargs["attempt_record"],
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_codex_failure_evidence",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        lambda exc, **_kwargs: getattr(exc, "error_class", None),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_plan_codex_oauth_account_failover",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "execute_cooldown_publication_transaction",
+        lambda **kwargs: cooldown_calls.append(kwargs),
+    )
+
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=lpe._resolve_auto_agent_cooldown_publication_plan,
+        publish_cooldown_memory_fn=lambda **_kwargs: None,
+        persist_cooldown_fn=_noop_async,
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=lambda body, **_kwargs: body,
+        raise_redispatch_fn=None,
+    )
+    route_task = asyncio.create_task(
+        candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="work",
+            request=request,
+            prepared_request_body={"model": "work", "input": "dispatch basic"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_no_active_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+    )
+
+    if phase == "io_disconnect":
+        await asyncio.wait_for(provider_started.wait(), timeout=1.0)
+        disconnect_requested = True
+    else:
+        await asyncio.wait_for(wait_started.wait(), timeout=1.0)
+        if phase == "wait_disconnect":
+            disconnect_requested = True
+        else:
+            route_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(route_task, timeout=1.0)
+
+    assert provider_calls == ["gpt-5.4-codex"]
+    assert len(selection_calls) == 1
+    assert (
+        provider_cancelled.is_set()
+        if phase == "io_disconnect"
+        else wait_cancelled.is_set()
+    )
+    assert len(terminal_logs) == 1
+    assert terminal_logs[0]["terminal_reason"] == (
+        "cancelled" if phase == "wait_cancel" else "client_disconnected"
+    )
+    assert terminal_logs[0]["error_class"] == (
+        "client_disconnected" if phase == "io_disconnect" else "server_overloaded"
+    )
+    assert terminal_logs[0]["status_code"] == (
+        None if phase == "io_disconnect" else 502
+    )
+    assert len(wait_calls) == (0 if phase == "io_disconnect" else 1)
+    assert len(failure_records) == (0 if phase == "io_disconnect" else 1)
+    assert cooldown_calls == []
+    assert request.state.aawm_openai_capacity_retry.retry_count == 0
+
+    polls_after_exit = disconnect_polls
+    await asyncio.sleep(0.02)
+    assert disconnect_polls == polls_after_exit
 
 
 @pytest.mark.asyncio

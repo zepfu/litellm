@@ -392,6 +392,17 @@ schedule is `5s, 15s, 30s, 60s, 120s` and applies to upstream
 `408`/`500`/`502`/`503`/`504`/`529` statuses plus pre-first-byte transport
 connectivity failures such as DNS resolution errors and request timeouts.
 
+For alpha OpenAI/Codex `/openai_passthrough/responses` actual capacity errors,
+the specialized policy instead gives each request one request-wide two-hour
+budget, with waits of `15s, 30s, 60s, 120s, 240s, 240s, ...`. This does not
+change the general hidden-retry policy elsewhere. Before the response is
+committed, an upstream `response.failed` is included in this capacity path;
+there is no replay of substantive or committed output and no unsafe
+continuation. Cancellation or client disconnect stops the retry. Quota,
+authentication, and non-capacity failures are excluded. A successful
+same-upstream request on another worker can wake waiting requests, and expiry
+reports a truthful `Retry-After`.
+
 `429` rate-limit responses are not hidden-retried. They should surface to the
 client with available retry/reset metadata so alias selection and quota
 observation can make the next decision without burning extra quota. Expected

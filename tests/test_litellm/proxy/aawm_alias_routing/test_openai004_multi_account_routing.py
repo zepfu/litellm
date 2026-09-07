@@ -2659,6 +2659,113 @@ async def test_candidate_loop_transient_capacity_retries_same_account_before_fai
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_code", "expected_class", "should_retry"),
+    [
+        ("server_is_overloaded", "server_overloaded", True),
+        ("capacity_exhausted", "capacity_exhausted", True),
+        ("invalid_api_key", "provider_terminal_error", False),
+        ("insufficient_quota", "usage_limit_reached", False),
+    ],
+)
+async def test_candidate_loop_classifies_alpha_openai_exact_capacity_codes(
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    expected_class: str,
+    should_retry: bool,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        error_signals._classify_codex_auto_agent_retryable_exhaustion,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_extract_adapter_exception_status_code",
+        lambda exc: getattr(exc, "status_code", None),
+    )
+    sleep = AsyncMock(return_value="timer")
+    monkeypatch.setattr(
+        candidate_loop.OpenAIAlphaCapacityRetryCoordinator,
+        "sleep_with_wakeup",
+        sleep,
+    )
+    request = _request()
+    request.scope["path"] = "/openai_passthrough/v1/responses"
+    request.scope["raw_path"] = b"/openai_passthrough/v1/responses"
+    monkeypatch.setattr(request, "is_disconnected", AsyncMock(return_value=False))
+    performed = 0
+
+    async def _select(**_kwargs: Any) -> dict[str, Any]:
+        return _account_selection(
+            "account1",
+            "hash-account-1",
+            failover_ordinal=0,
+            credential_affinity="interchangeable",
+        )
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> Response:
+        nonlocal performed
+        performed += 1
+        if performed == 1:
+            exc = HTTPException(
+                status_code=503,
+                detail={
+                    "error": {
+                        "code": error_code,
+                        "type": "server_error",
+                        "message": "Please try again later.",
+                    }
+                },
+            )
+            setattr(exc, "_aawm_provider_returned", True)
+            raise exc
+        return Response(content=b"recovered")
+
+    operation = candidate_loop.handle_alias_route(
+        _loop_services(
+            select_candidate=_select,
+            perform_candidate=_perform,
+        ),
+        alias_family="codex_auto_agent",
+        alias_model="basic",
+        request=request,
+        prepared_request_body={"model": "basic"},
+        max_candidate_attempts=1,
+        get_active_cooldown_state_fn=_zero_cooldown,
+        attempts_metadata_key="codex_auto_agent_attempts",
+        skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+        no_candidate_detail="no candidate",
+        log_label="Codex",
+    )
+
+    if should_retry:
+        response = await operation
+        assert response.body == b"recovered"
+        assert performed == 2
+        sleep.assert_awaited_once_with(
+            15.0, error_class=expected_class, status_code=503
+        )
+    else:
+        with pytest.raises((HTTPException, ProxyException)):
+            await operation
+        assert performed == 1
+        sleep.assert_not_awaited()
+    request_outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
+    captured_attempts = list(request_outcome.get("attempts") or [])
+    if should_retry:
+        assert captured_attempts[0]["pre_commit_retry"]["error_class"] == expected_class
+    else:
+        assert captured_attempts[0]["error_class"] == expected_class
+
+
+@pytest.mark.asyncio
 async def test_cfg040_fresh_codex_traverses_to_luna_after_pre_stream_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
