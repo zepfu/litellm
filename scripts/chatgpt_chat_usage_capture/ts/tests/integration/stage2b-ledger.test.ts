@@ -12,7 +12,7 @@ import type {
   ConversationSummary,
   MessageRecord,
 } from "../../src/contracts/records.js";
-import { collectorScopeKey, scopeKey } from "../../src/ledger/identity.js";
+import { collectorScopeKey, scopeKey, stableId } from "../../src/ledger/identity.js";
 import { Ledger } from "../../src/ledger/store.js";
 import type {
   LedgerScope,
@@ -43,6 +43,32 @@ const mappingReviewed: ModelMappingVersion = {
     },
     {
       slug: "model-final",
+      family: "astra_pro",
+      reviewed: true,
+      source: "operator-review",
+    },
+  ],
+};
+
+const mappingFreshness: ModelMappingVersion = {
+  ...mappingReviewed,
+  version: "mapping-freshness-v2",
+  rules: [
+    ...mappingReviewed.rules,
+    {
+      slug: "model-a",
+      family: "astra_pro",
+      reviewed: true,
+      source: "operator-review",
+    },
+    {
+      slug: "model-b",
+      family: "astra_pro",
+      reviewed: true,
+      source: "operator-review",
+    },
+    {
+      slug: "model-resolved",
       family: "astra_pro",
       reviewed: true,
       source: "operator-review",
@@ -1009,6 +1035,211 @@ describe("D1-752 Stage 2B ledger", () => {
         (item) => String((item.payload as Record<string, unknown>).recordedFinalModelRaw),
       ),
     ).toEqual(["model-a", "model-b", "model-a"]);
+    ledger.close();
+  });
+
+  it("uses replay freshness to quarantine delayed message changes and accept later recovery", () => {
+    const directory = mkdtempSync(join(tmpdir(), "stage2b-message-freshness-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    const account = scope("account-message-freshness", "provider-user", "workspace", "quota");
+    ledger.upsertAccount(account);
+    const conversationId = "conversation-message-freshness";
+    const messageId = "message-final";
+    const ingest = (finalModel: string, observedAt: string) =>
+      ledger.ingestConversation(
+        account,
+        progressDetail(
+          conversationId,
+          "finished_successfully",
+          true,
+          finalModel,
+          "2026-09-07T10:00:00.000Z",
+        ),
+        mappingReviewed,
+        context(`run-message-freshness-${finalModel}-${observedAt}`, conversationId, observedAt),
+      );
+
+    ingest("model-b", "2026-09-07T13:00:00.000Z");
+    const replay = ingest("model-b", "2026-09-07T15:00:00.000Z");
+    expect(replay.observationInserted).toBe(false);
+    expect(
+      ledger.messageRevisions(account, conversationId, messageId).map((item) =>
+        String((item.payload as Record<string, unknown>).recordedFinalModelRaw),
+      ),
+    ).toEqual(["model-b"]);
+    expect(
+      ledger.activityProvenance(
+        account,
+        "message",
+        stableId("message", conversationId, messageId),
+      )[0]?.last_seen_at,
+    ).toBe("2026-09-07T15:00:00.000Z");
+
+    ingest("model-a", "2026-09-07T14:00:00.000Z");
+    expect(
+      ledger.messagesFor(account, conversationId).find((item) => item.messageId === messageId)
+        ?.recordedFinalModelRaw,
+    ).toBe("model-b");
+    expect(
+      (ledger.db
+        .prepare(
+          "SELECT updated_at FROM message_records WHERE scope_key=? AND conversation_id=? AND message_id=?",
+        )
+        .get(scopeKey(account), conversationId, messageId) as { updated_at: string }).updated_at,
+    ).toBe("2026-09-07T13:00:00.000Z");
+    expect(
+      ledger.messageRevisions(account, conversationId, messageId).map((item) =>
+        String((item.payload as Record<string, unknown>).recordedFinalModelRaw),
+      ),
+    ).toEqual(["model-b", "model-a"]);
+
+    ingest("model-c", "2026-09-07T16:00:00.000Z");
+    expect(
+      ledger.messagesFor(account, conversationId).find((item) => item.messageId === messageId)
+        ?.recordedFinalModelRaw,
+    ).toBe("model-c");
+    expect(
+      ledger.messageRevisions(account, conversationId, messageId).map((item) =>
+        String((item.payload as Record<string, unknown>).recordedFinalModelRaw),
+      ),
+    ).toEqual(["model-b", "model-a", "model-c"]);
+    ledger.close();
+  });
+
+  it("keeps attempt freshness separate from replay and mapping projection timestamps", () => {
+    const directory = mkdtempSync(join(tmpdir(), "stage2b-attempt-freshness-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    const account = scope("account-attempt-freshness", "provider-user", "workspace", "quota");
+    ledger.upsertAccount(account);
+    const conversationId = "conversation-attempt-freshness";
+    const attemptFor = (finalModel: string) =>
+      reconstructAttempts(
+        progressDetail(
+          conversationId,
+          "finished_successfully",
+          true,
+          finalModel,
+          "2026-09-07T10:00:00.000Z",
+        ).messages,
+        {
+          scope: account,
+          conversationId,
+          mapping: mappingUnmapped,
+        },
+      )[0]!;
+
+    const first = ledger.upsertAttempt(
+      account,
+      attemptFor("model-b"),
+      context("run-attempt-freshness-1", conversationId, "2026-09-07T13:00:00.000Z"),
+      mappingUnmapped,
+    );
+    const attemptId = first.attemptId;
+    ledger.upsertAttempt(
+      account,
+      attemptFor("model-b"),
+      context("run-attempt-freshness-replay", conversationId, "2026-09-07T15:00:00.000Z"),
+      mappingUnmapped,
+    );
+    expect(ledger.attemptRevisions(account, attemptId)).toHaveLength(1);
+    expect(
+      ledger.activityProvenance(account, "attempt", attemptId)[0]?.last_seen_at,
+    ).toBe("2026-09-07T15:00:00.000Z");
+
+    const stale = ledger.upsertAttempt(
+      account,
+      attemptFor("model-a"),
+      context("run-attempt-freshness-stale", conversationId, "2026-09-07T14:00:00.000Z"),
+      mappingUnmapped,
+    );
+    expect(stale.status).toBe("deduplicated");
+    expect(ledger.listAttempts(account)[0]?.recordedFinalModelRaw).toBe("model-b");
+    expect(
+      ledger.attemptRevisions(account, attemptId).map((item) =>
+        String((item.payload as Record<string, unknown>).recordedFinalModelRaw),
+      ),
+    ).toEqual(["model-b", "model-a"]);
+
+    const recovery = ledger.upsertAttempt(
+      account,
+      attemptFor("model-c"),
+      context("run-attempt-freshness-recovery", conversationId, "2026-09-07T16:00:00.000Z"),
+      mappingUnmapped,
+    );
+    expect(recovery.status).toBe("updated");
+    expect(ledger.listAttempts(account)[0]?.recordedFinalModelRaw).toBe("model-c");
+    expect(
+      ledger.attemptRevisions(account, attemptId).map((item) =>
+        String((item.payload as Record<string, unknown>).recordedFinalModelRaw),
+      ),
+    ).toEqual(["model-b", "model-a", "model-c"]);
+    ledger.close();
+  });
+
+  it("accepts raw evidence after a later mapping reclassification", () => {
+    const directory = mkdtempSync(join(tmpdir(), "stage2b-reclass-freshness-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    const account = scope("account-reclass-freshness", "provider-user", "workspace", "quota");
+    ledger.upsertAccount(account);
+    const conversationId = "conversation-reclass-freshness";
+
+    ledger.ingestConversation(
+      account,
+      progressDetail(
+        conversationId,
+        "finished_successfully",
+        true,
+        "model-b",
+        "2026-09-07T10:00:00.000Z",
+      ),
+      mappingUnmapped,
+      context("run-reclass-freshness-b", conversationId, "2026-09-07T13:00:00.000Z"),
+    );
+    const attemptId = String(ledger.listAttempts(account)[0]?.attemptId);
+    expect(
+      ledger.activityProvenance(account, "attempt", attemptId)[0]?.last_seen_at,
+    ).toBe("2026-09-07T13:00:00.000Z");
+
+    expect(
+      ledger.reclassifyAttempts(
+        account,
+        mappingFreshness,
+        "2026-09-07T15:00:00.000Z",
+      ),
+    ).toBe(1);
+    expect(
+      (ledger.db
+        .prepare("SELECT updated_at FROM attempts WHERE attempt_id=?")
+        .get(attemptId) as { updated_at: string }).updated_at,
+    ).toBe("2026-09-07T15:00:00.000Z");
+    expect(
+      ledger.activityProvenance(account, "attempt", attemptId)[0]?.last_seen_at,
+    ).toBe("2026-09-07T13:00:00.000Z");
+
+    ledger.ingestConversation(
+      account,
+      progressDetail(
+        conversationId,
+        "finished_successfully",
+        true,
+        "model-a",
+        "2026-09-07T10:00:00.000Z",
+      ),
+      mappingFreshness,
+      context("run-reclass-freshness-a", conversationId, "2026-09-07T14:00:00.000Z"),
+    );
+    expect(
+      ledger.messagesFor(account, conversationId).find(
+        (item) => item.messageId === "message-final",
+      )?.recordedFinalModelRaw,
+    ).toBe("model-a");
+    expect(ledger.listAttempts(account)[0]?.recordedFinalModelRaw).toBe("model-a");
+    expect(
+      ledger.activityProvenance(account, "attempt", attemptId)[0]?.last_seen_at,
+    ).toBe("2026-09-07T14:00:00.000Z");
     ledger.close();
   });
 

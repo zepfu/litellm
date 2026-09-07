@@ -504,6 +504,13 @@ export class Ledger {
       String(previous.revision_fingerprint) === revisionFingerprint &&
       String(previous.collector_account_id) === scope.collectorAccountId
     ) {
+      this.recordActivityProvenance(
+        key,
+        "observation",
+        String(previous.observation_id),
+        scope.collectorAccountId,
+        context.observedAt,
+      );
       return { observationId: String(previous.observation_id), inserted: false };
     }
     const revisionNumber = Number(previous?.revision_number ?? 0) + 1;
@@ -851,6 +858,7 @@ export class Ledger {
   ): { inserted: boolean; revision: number; revisionFingerprint: string } {
     const key = scopeKey(scope);
     const initial = sanitizeMessage(record, context.observedAt);
+    const activityId = stableId("message", initial.conversationId, initial.messageId);
     const current = this.db
       .prepare(
         `
@@ -861,6 +869,12 @@ export class Ledger {
         `,
       )
       .get(key, initial.conversationId, initial.messageId) as SqlRow | undefined;
+    const rawObservedAt = this.latestRawObservationAt(
+      key,
+      "message",
+      activityId,
+      current?.updated_at,
+    );
     const clean: LedgerMessage = {
       ...initial,
       quarantine: mergeQuarantines(
@@ -896,7 +910,7 @@ export class Ledger {
       this.recordActivityProvenance(
         key,
         "message",
-        stableId("message", clean.conversationId, clean.messageId),
+        activityId,
         scope.collectorAccountId,
         context.observedAt,
       );
@@ -910,7 +924,7 @@ export class Ledger {
     const revision = reuseHistoryRevision
       ? Number(latestRevision?.revision ?? 0)
       : Number(latestRevision?.revision ?? current?.revision ?? 0) + 1;
-    const freshEvidence = !isOlderEvidence(context.observedAt, current?.updated_at);
+    const freshEvidence = !isOlderEvidence(context.observedAt, rawObservedAt);
     const revisionId = stableId(
       key,
       clean.conversationId,
@@ -1043,7 +1057,7 @@ export class Ledger {
     this.recordActivityProvenance(
       key,
       "message",
-      stableId("message", clean.conversationId, clean.messageId),
+      activityId,
       scope.collectorAccountId,
       context.observedAt,
     );
@@ -1156,6 +1170,12 @@ export class Ledger {
     const current = this.db
       .prepare("SELECT * FROM attempts WHERE attempt_id=? AND scope_key=?")
       .get(canonicalAttemptId, key) as SqlRow | undefined;
+    const rawObservedAt = this.latestRawObservationAt(
+      key,
+      "attempt",
+      canonicalAttemptId,
+      current?.updated_at,
+    );
     const inheritedQuarantine = mergeQuarantines(
       parseQuarantine(current?.quarantine_json),
       quarantineFromWarnings(parseJsonArray(current?.warnings_json)),
@@ -1223,7 +1243,7 @@ export class Ledger {
       latestRevision &&
       String(latestRevision.projection_fingerprint) === projectionFingerprint &&
       String(latestRevision.collector_account_id) === scope.collectorAccountId;
-    const freshEvidence = !isOlderEvidence(context.observedAt, current?.updated_at);
+    const freshEvidence = !isOlderEvidence(context.observedAt, rawObservedAt);
     let status: "inserted" | "updated" | "deduplicated";
     let revision: number;
     let currentChanged = false;
@@ -1275,9 +1295,7 @@ export class Ledger {
           projectionFingerprint,
           payload,
           context,
-          isOlderEvidence(context.observedAt, current.updated_at)
-            ? "stale_ingest"
-            : "ingest",
+          freshEvidence ? "ingest" : "stale_ingest",
         );
       }
       if (freshEvidence) {
@@ -1294,7 +1312,7 @@ export class Ledger {
         status = "deduplicated";
       }
     }
-    if (!current || !isOlderEvidence(context.observedAt, current.updated_at)) {
+    if (!current || freshEvidence) {
       for (const duplicateAttemptId of mergeableOwnerIds) {
         if (duplicateAttemptId !== cleanAttempt.attemptId) {
           this.retireDuplicateAttempt(
@@ -2489,6 +2507,26 @@ export class Ledger {
         seenAt,
         seenAt,
       );
+  }
+
+  private latestRawObservationAt(
+    activityScopeKey: string,
+    activityKind: string,
+    activityId: string,
+    fallback?: unknown,
+  ): string | null {
+    // Projection timestamps can move during reclassification. Raw evidence
+    // ordering must use the durable last-seen observation instead.
+    const row = this.db
+      .prepare(
+        `
+        SELECT MAX(last_seen_at) AS last_seen_at
+        FROM activity_provenance
+        WHERE scope_key=? AND activity_kind=? AND activity_id=?
+        `,
+      )
+      .get(activityScopeKey, activityKind, activityId) as SqlRow | undefined;
+    return nullableString(row?.last_seen_at) ?? nullableString(fallback);
   }
 
   private recordMappingHistory(

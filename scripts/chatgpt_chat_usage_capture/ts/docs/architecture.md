@@ -107,6 +107,9 @@ Legacy evidence IDs and revision occurrences remain available; duplicate owner
 activity converges, and checkpoints remain collector-local. Consecutive
 identical evidence from one collector deduplicates; A-B-A changes retain all
 three occurrences. Older evidence does not replace newer current projections.
+Raw message and attempt ordering uses `activity_provenance.last_seen_at`;
+current-row `updated_at` remains a projection timestamp and therefore does not
+let mapping reclassification reject later raw evidence.
 
 `src/normalize/reconstruct.ts` groups linked user, analysis, reasoning, tool,
 and final nodes into generations. Distinct generation evidence preserves

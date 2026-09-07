@@ -14,6 +14,13 @@ appends an immutable revision pointing to the previous occurrence.
 The collection run ID and observation time are provenance, not evidence
 content. They do not cause an identical replay to count again.
 
+Raw observation freshness is tracked separately from the current projection.
+`activity_provenance.last_seen_at` is the ordering watermark for message and
+attempt evidence, so an identical replay advances freshness without creating a
+revision. The `updated_at` value on a current message or attempt row records
+the projection update instead; mapping reclassification may move that
+timestamp without making later raw evidence stale.
+
 ## Attempts
 
 An attempt is reconstructed from a user prompt and its reachable generation
