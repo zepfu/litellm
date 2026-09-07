@@ -347,7 +347,8 @@ describe("D1-752 Stage 2B ledger", () => {
     expect(report.observedAttemptsByResolvedModel).toEqual({
       "model-resolved": 1,
     });
-    expect(report.modelMismatches).toBe(1);
+    expect(report.modelMismatches).toBe(0);
+    expect(report.rawSlugDifferences).toBe(1);
     ledger.close();
   });
 

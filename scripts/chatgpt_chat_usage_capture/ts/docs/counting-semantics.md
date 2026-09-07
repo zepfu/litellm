@@ -59,8 +59,22 @@ attempts and records mapping history; it does not create another attempt.
 
 ## Reports
 
-The raw-model report uses a half-open elapsed interval `[start, end)`. It
-reports requested raw-model attempts, completed recorded-final raw-model
-answers, resolved raw-model observations, mismatches, unknown time, ambiguous
-time, excluded surfaces, and shared/imported/copied exclusions independently.
-It does not calculate remaining quota, reset periods, or provider charges.
+The raw-model report uses a half-open elapsed interval `[start, end)`. A point
+exactly at `start` is included and a point exactly at `end` is excluded.
+Definite raw-model totals include only eligible Chat attempts whose time
+membership is definite and whose fragment is not unresolved. Straddling
+intervals, unknown-time attempts, and unresolved fragments remain in
+`possibleAttemptIds` and the possible raw-model maps when their evidence is
+available; possible membership is qualified evidence and must not be added to
+definite totals or treated as a bucket assignment.
+
+Requested and recorded-final family mismatches compare the mapped family
+fields. `rawSlugDifferences` separately preserves cases where the raw
+requested and recorded-final slugs differ even when both map to one family.
+Unclassified attempts are counted by distinct attempt ID. The uncertainty
+category counters can overlap for one attempt and therefore are not additive.
+
+The report also exposes unknown time, ambiguous time, unresolved fragments,
+unknown model evidence, excluded surfaces, and shared/imported/copied
+exclusions independently. It does not calculate remaining quota, reset
+periods, or provider charges.
