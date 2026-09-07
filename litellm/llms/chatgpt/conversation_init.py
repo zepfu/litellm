@@ -1889,8 +1889,10 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
     origin = f"https://{target.netloc}"
     session = page.context.new_cdp_session(page)
     capture: Dict[str, Any] = {}
+    page_response: Dict[str, Any] = {}
     extra_hashes: Dict[str, Optional[str]] = {}
     failure: Optional[Dict[str, Any]] = None
+    browser_challenge = False
     boundary_error = False
     init_routed = False
     # Leave the existing worker deadline some room to close its owned target.
@@ -1968,11 +1970,19 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
             )
 
     def response_seen(event: Mapping[str, Any]) -> None:
-        nonlocal failure, boundary_error
+        nonlocal failure, boundary_error, browser_challenge
         response = event.get("response", {})
         status = response.get("status")
         headers = response.get("headers", {})
         request_id = event.get("requestId")
+        if (
+            event.get("type") == "Document"
+            and response.get("url") == origin + "/"
+        ):
+            page_response.update(
+                status_code=status,
+                retry_after_seconds=_native_init_retry_after(headers),
+            )
         if request_id == capture.get("request_id"):
             if not is_init(response.get("url", "")) or 300 <= status < 400:
                 boundary_error = True
@@ -1981,10 +1991,9 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
                 status_code=status,
                 retry_after_seconds=_native_init_retry_after(headers),
             )
-        if (
-            status in {401, 403, 429}
-            or _native_init_header(headers, "cf-mitigated") == "challenge"
-        ):
+        challenged = _native_init_header(headers, "cf-mitigated") == "challenge"
+        browser_challenge = browser_challenge or challenged
+        if status in {401, 403, 429} or challenged:
             failure = {
                 "status_code": status,
                 "retry_after_seconds": _native_init_retry_after(headers),
@@ -2018,6 +2027,7 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
             ),
             "request_method": capture.get("method"),
             "request_body_omitted": capture.get("body_omitted"),
+            "browser_challenge": browser_challenge,
         }
         retry_after = state.get("retry_after_seconds")
         if retry_after is not None:
@@ -2087,9 +2097,9 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
                 "() => /verify you are human|checking your browser|just a moment/i"
                 ".test(document.title + ' ' + (document.body?.innerText || ''))"
             ):
-                raise OracleBrowserBoundaryUnavailable(
-                    "Native Oracle page requires a browser challenge."
-                )
+                browser_challenge = True
+                failure = {**page_response, "correlated": False}
+                return envelope(None, failed=True)
             page.wait_for_timeout(50)
     finally:
         session.detach()
