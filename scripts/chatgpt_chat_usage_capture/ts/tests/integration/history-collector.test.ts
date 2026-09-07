@@ -488,7 +488,7 @@ describe("Stage-2A history collection", () => {
     });
   });
 
-  it("discovers historical summaries beyond the range end and bounds message evidence at that end", async () => {
+  it("keeps explicit incremental candidates and full message evidence beyond the range end", async () => {
     const reader = new ScriptedReader();
     const committedMessages: string[][] = [];
     const candidate = summary("conv-historical", {
@@ -525,18 +525,24 @@ describe("Stage-2A history collection", () => {
         committedMessages.push(page.messages.map((item) => item.messageId));
       },
     }).collect({
-      mode: "backfill",
+      mode: "incremental",
       range: EXPLICIT_RANGE,
     });
 
     expect(result.conversations).toHaveLength(1);
     expect(result.conversations[0]?.messages.map((item) => item.messageId)).toEqual([
       "msg-before-end",
+      "msg-at-end",
+      "msg-after-end",
     ]);
     expect(
       result.conversations[0]?.detail?.messages.map((item) => item.messageId),
-    ).toEqual(["msg-before-end"]);
-    expect(committedMessages.flat()).toEqual(["msg-before-end"]);
+    ).toEqual(["msg-before-end", "msg-at-end", "msg-after-end"]);
+    expect(committedMessages.flat()).toEqual([
+      "msg-before-end",
+      "msg-at-end",
+      "msg-after-end",
+    ]);
   });
 
   it("rereads the leading index page and leaves changing scans partial", async () => {
@@ -817,11 +823,19 @@ describe("Stage-2A history collection", () => {
       );
     }
     const store = new MemoryCheckpointStore();
+    const auditCountsAtCommit: number[] = [];
     const collector = new HistoryCollector(reader, {
       accountId: "fixture-primary",
       store,
       clock: { now: () => NOW },
       maxIndexPagesPerScope: 1,
+      onPageCommit: (page) => {
+        if (page.summary.conversationId === "conv-older-audit" && page.detail) {
+          auditCountsAtCommit.push(
+            store.loadDiscovery("active")?.olderHistoryAudit?.conversationsAudited ?? -1,
+          );
+        }
+      },
     });
 
     const first = await collector.collect({
@@ -840,12 +854,43 @@ describe("Stage-2A history collection", () => {
       olderHistoryAudit: { enabled: true, maxPages: 1 },
     });
     expect(second.coverage.olderHistoryAudit.active.status).toBe("complete");
+    expect(second.coverage.olderHistoryAudit.active.conversationsAudited).toBe(1);
+    expect(auditCountsAtCommit).toEqual([0]);
     expect(second.conversations.map((item) => item.summary.conversationId)).toContain(
       "conv-older-audit",
     );
     expect(store.loadDiscovery("active")?.olderHistoryAudit?.lastCompletedAt).toBe(
       "2026-09-07T13:00:00.000Z",
     );
+  });
+
+  it("keeps an older-history audit partial when selected detail acquisition fails", async () => {
+    const reader = new ScriptedReader();
+    const older = summary("conv-older-audit-failure", {
+      updatedAt: "2026-08-01T12:00:00.000Z",
+    });
+    addCompleteIndex(reader, [older], []);
+
+    const store = new MemoryCheckpointStore();
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    }).collect({
+      mode: "incremental",
+      olderHistoryAudit: { enabled: true, maxPages: 1 },
+    });
+
+    expect(result.coverage.active.olderHistoryAudit).toMatchObject({
+      status: "partial",
+      conversationsAudited: 0,
+      lastCompletedAt: null,
+    });
+    expect(store.loadDiscovery("active")?.olderHistoryAudit).toMatchObject({
+      status: "partial",
+      conversationsAudited: 0,
+      lastCompletedAt: null,
+    });
   });
 
   it("uses the 48-hour overlap for incremental discovery but honors explicit ranges over newer watermarks", async () => {

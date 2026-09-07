@@ -477,8 +477,9 @@ export function adaptConversationIndex(
     exhausted = !hasMissingConversations;
     paginationState = exhausted ? "complete" : "unknown";
   } else if (itemsRaw.length < limit) {
-    exhausted = !hasMissingConversations;
-    paginationState = exhausted ? "complete" : "unknown";
+    warnings.push("missing_pagination_controls");
+    continuation = pageEnd > offset ? pageEnd : offset;
+    paginationState = "unknown";
   } else {
     continuation = pageEnd;
     paginationState = "continuation";
@@ -486,7 +487,7 @@ export function adaptConversationIndex(
 
   let coverage: AdaptedPage<ConversationSummary>["coverage"] = "validated_page";
   if (paginationState === "unknown") {
-    coverage = "unrecognized";
+    coverage = hasMissingConversations ? "unrecognized" : "partial";
   } else if (
     paginationState === "contradictory" ||
     warnings.length > 0
@@ -759,7 +760,7 @@ function messageFromNode(
     children,
     role: authorRole,
     channel: sanitizeToken(message.channel) ?? sanitizeToken(metadata.channel),
-    createdAt: optionalString(message.create_time ?? node.create_time),
+    createdAt: messageCreatedAt(message, node, options.warnings),
     status: sanitizeToken(message.status) ?? sanitizeToken(metadata.status),
     endTurn: typeof message.end_turn === "boolean" ? message.end_turn : null,
     requestedModelRaw:
@@ -873,6 +874,31 @@ function conversationUpdateTime(
     : "conversation_missing_update_time";
   warnings.push(warning);
   return { value: null, warning };
+}
+
+function messageCreatedAt(
+  message: Record<string, unknown>,
+  node: Record<string, unknown>,
+  warnings: string[],
+): string | null {
+  let invalidTimestamp = false;
+  for (const raw of [message.create_time, node.create_time]) {
+    if (raw === null || raw === undefined || raw === "") {
+      continue;
+    }
+    const value = normalizeTimestamp(raw);
+    if (value !== null) {
+      if (invalidTimestamp) {
+        warnings.push("message_invalid_created_at");
+      }
+      return value;
+    }
+    invalidTimestamp = true;
+  }
+  if (invalidTimestamp) {
+    warnings.push("message_invalid_created_at");
+  }
+  return null;
 }
 
 function readIndexPaginationControls(
