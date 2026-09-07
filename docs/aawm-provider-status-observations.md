@@ -776,25 +776,66 @@ This path has two cooperating pieces:
   authenticated no-body POST from an existing ChatGPT page. It does not launch
   Chrome, create a persistent context, read browser cookies or storage, export
   credentials, or return response headers.
-- Sidecar file consumer: `scripts/run_provider_status_observations_loop.py`
-  rereads that snapshot from a regular file. The sidecar never HTTP-calls
-  chatgpt.com, never reads Oracle cookies, and never ships `authenticator.py`,
+- Sidecar task: `scripts/run_provider_status_observations_loop.py` retains a
+  legacy regular-file consumer and optionally runs bound live capture through
+  the public collector. The sidecar never directly HTTP-calls `chatgpt.com`,
+  never reads Oracle cookies, and never ships `authenticator.py`,
   `common_utils.py`, or `httpx`.
 
 The sidecar image copies only `conversation_init.py` and touches
 `litellm/llms/chatgpt/__init__.py`. Persist uses the existing
-`rate_limit_observations` insert path. Account identifiers and collector source
-paths are hashed; titles, names, usernames, workspace fields, feature notes,
-emails, cookies, token values, and unknown string fields are redacted. Strings
-are retained only for explicit telemetry fields such as model/feature identity,
-status, state, mode, window, and reset timestamps. Finite numeric token usage
-counters such as `input_tokens`, `output_tokens`, and `token_limit` remain
-available in sanitized projections. Snapshot `raw_provider_fields` omit
-`observed_at` so repeated identical polls do not defeat dedup. Empty
-`model_limits`, `limits_progress`, or `blocked_features` collections, and
-absent fields, are `empty_unknown` / `absent_unknown`. They are not proof of
-unlimited capacity or zero usage. HTTP 400/403, authentication loss, malformed
-JSON, and non-init shapes retain the last valid observation.
+`rate_limit_observations` insert path. Conversation-init writes use
+`AAWM_CODEX_QUOTA_DSN` through the same DSN resolver as Codex quota writes,
+falling back to the general provider-status DSN. Account identifiers and
+collector source paths are hashed; titles, names, usernames, workspace fields,
+feature notes, emails, cookies, token values, and unknown string fields are
+redacted. Strings are retained only for explicit telemetry fields such as
+model/feature identity, status, state, mode, window, and reset timestamps.
+Finite numeric token usage counters such as `input_tokens`, `output_tokens`,
+and `token_limit` remain available in sanitized projections. Snapshot
+`raw_provider_fields` omit `observed_at` so repeated identical polls do not
+defeat dedup. Empty `model_limits`, `limits_progress`, or `blocked_features`
+collections, and absent fields, are `empty_unknown` / `absent_unknown`. They
+are not proof of unlimited capacity or zero usage.
+
+When `AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS` is absent, the sidecar
+preserves legacy file-only mode. That mode covers only the one
+configured snapshot path and must not be described as live all-account
+coverage. The existing last-good file behavior applies only to this mode.
+
+When the binding variable is present, its exact nonsecret interface is a JSON
+object keyed by the `LITELLM_CODEX_OAUTH_INVENTORY` label:
+
+```json
+{
+  "account1": {
+    "cdp_endpoint": "http://127.0.0.1:9222",
+    "page_target_id": "target-id-for-account1"
+  },
+  "account2": {
+    "cdp_endpoint": "http://127.0.0.1:9223",
+    "page_target_id": "target-id-for-account2"
+  }
+}
+```
+
+The value is supplied through
+`AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS` (or the matching CLI
+option). Bound mode iterates
+`_require_codex_oauth_inventory(config).ordered_records(enabled_only=True)`
+with no model filter, so every enabled inventory account needs a matching
+binding. Each account is captured to a separate fresh sanitized temporary
+path. The sidecar parses and persists only when the current capture was
+written, the collector returned `account_identity_verified=true`, and its
+canonical-12 `account_hash` matches the inventory pin. A source-path hash is
+never accepted for bound persistence. Missing bindings, missing or invalid
+OAuth credentials, unavailable browser dependencies, unreachable CDP targets,
+and identity mismatches are isolated in explicit per-account coverage and do
+not cause another account's current capture to be persisted incorrectly. A
+retained old snapshot is never counted as a fresh bound capture.
+Bound telemetry reports `capture_coverage_status` separately from
+`persistence_coverage_status`; `fresh_capture_count` counts only current
+identity-verified bound captures, so legacy file rereads leave it at zero.
 
 Relevant environment variables:
 
@@ -806,21 +847,29 @@ Relevant environment variables:
   default `/run/aawm/chatgpt/conversation-init.json`.
 - `AAWM_CHATGPT_CONVERSATION_INIT_URL`: documented POST URL. The sidecar does
   not fetch this URL.
+- `AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS`: optional nonsecret JSON
+  object mapping inventory labels to `cdp_endpoint` and `page_target_id`;
+  enables bound per-account live capture.
 - `AAWM_CHATGPT_CONVERSATION_INIT_BROWSER_CDP_ENDPOINT`: optional CDP endpoint
-  used by the attach-only Oracle browser entry point.
+  used by direct attach-only collector calls; bound sidecar mode uses the
+  endpoint from each account binding.
 - `ORACLE_BROWSER_CDP_ENDPOINT`: fallback CDP endpoint for the established
   Oracle browser boundary. The default is `http://127.0.0.1:9222`.
 
-The live boundary requires all of the following at runtime: an already-running
-authenticated Oracle browser with an existing ChatGPT page, a reachable CDP
-endpoint, and Playwright installed in the process that invokes the public
-entry point. The default Oracle profile
+Bound live mode requires all of the following at runtime: an already-running
+authenticated Oracle browser with an existing ChatGPT page for each configured
+target, a reachable per-account CDP endpoint and target id, and Playwright
+installed in the process that invokes the public entry point. The default
+Oracle profile
 `/home/zepfu/.oracle/browser-profile` is a locked shared profile and must not
 be opened by a competing persistent browser context; CDP attachment is the
-only supported collection path here. The current focused tests use fakes and
-do not establish live authenticated acceptance or live quota counts. If the
-existing browser is not running or its CDP endpoint is unavailable, the
-collector fails closed and the sidecar retains its last good snapshot.
+only supported collection path here. As of September 7, 2026, the existing
+provider-status image installs `psycopg` but does not install Playwright, and
+the inspected deployment has no browser mounts or listeners on ports 9222,
+9223, or 9333. Those are integration prerequisites, not source-level
+acceptance evidence. Until they are supplied, bound capture fails closed per
+account without inserting a row; no deployment change is implied by this
+source wiring.
 
 ## Alibaba Token Plan quota polling
 

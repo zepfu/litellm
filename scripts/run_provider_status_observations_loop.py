@@ -17,6 +17,7 @@ import signal
 import socket
 import ssl
 import sys
+import tempfile
 import time
 import traceback
 import urllib.error
@@ -90,6 +91,7 @@ from litellm.secret_managers.grok_oidc_auth_path import (
     resolve_grok_oidc_auth_path,
 )
 from litellm.secret_managers.codex_oauth_inventory import (
+    CODEX_OAUTH_ACCOUNT_HASH_LENGTH,
     CODEX_OAUTH_INVENTORY_ENV,
     CodexOAuthCredentialRecord,
     CodexOAuthCredentialSnapshot,
@@ -122,6 +124,7 @@ from litellm.llms.chatgpt.conversation_init import (
     CHATGPT_CONVERSATION_INIT_DEFAULT_URL,
     ChatGPTConversationInitError,
     collect_conversation_init_observations,
+    collect_conversation_init_snapshot_from_oracle_browser,
 )
 
 
@@ -367,6 +370,10 @@ DEFAULT_CHATGPT_CONVERSATION_INIT_SOURCE_PATH = (
     "/run/aawm/chatgpt/conversation-init.json"
 )
 DEFAULT_CHATGPT_CONVERSATION_INIT_URL = CHATGPT_CONVERSATION_INIT_DEFAULT_URL
+DEFAULT_CHATGPT_CONVERSATION_INIT_BROWSER_TIMEOUT_SECONDS = 30.0
+CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV = (
+    "AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS"
+)
 DEFAULT_GROK_BILLING_POLL_ENABLED = False
 DEFAULT_GROK_BILLING_POLL_INTERVAL_SECONDS = 600.0
 DEFAULT_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS = 30.0
@@ -1386,6 +1393,14 @@ FROM ranked
 
 
 @dataclass(frozen=True)
+class ChatGPTConversationInitAccountBinding:
+    """Nonsecret CDP target binding for one Codex OAuth inventory label."""
+
+    cdp_endpoint: str
+    page_target_id: str
+
+
+@dataclass(frozen=True)
 class ProviderStatusLoopConfig:
     apply: bool
     dsn: Optional[str]
@@ -1523,6 +1538,9 @@ class ProviderStatusLoopConfig:
         DEFAULT_CHATGPT_CONVERSATION_INIT_SOURCE_PATH
     )
     chatgpt_conversation_init_url: str = DEFAULT_CHATGPT_CONVERSATION_INIT_URL
+    chatgpt_conversation_init_account_bindings: Optional[
+        Dict[str, "ChatGPTConversationInitAccountBinding"]
+    ] = None
     grok_billing_url: str = DEFAULT_GROK_BILLING_URL
     grok_billing_client_version: Optional[str] = None
     grok_billing_client_version_source: Optional[str] = None
@@ -1968,6 +1986,62 @@ def _env_int(name: str, default: int) -> int:
     if raw_value is None or raw_value == "":
         return default
     return int(raw_value)
+
+
+def _parse_chatgpt_conversation_init_account_bindings(
+    raw_value: Optional[str],
+) -> Optional[Dict[str, ChatGPTConversationInitAccountBinding]]:
+    if raw_value is None or not str(raw_value).strip():
+        return None
+    try:
+        parsed = json.loads(str(raw_value))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} must be valid JSON."
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise SystemExit(
+            f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} must be a JSON object "
+            "keyed by Codex OAuth inventory label."
+        )
+
+    bindings: Dict[str, ChatGPTConversationInitAccountBinding] = {}
+    allowed_fields = {"cdp_endpoint", "page_target_id"}
+    for raw_label, raw_binding in parsed.items():
+        if not isinstance(raw_label, str) or not raw_label.strip():
+            raise SystemExit(
+                f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} labels must be "
+                "non-empty strings."
+            )
+        label = raw_label.strip()
+        if not isinstance(raw_binding, dict):
+            raise SystemExit(
+                f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} entry "
+                f"'{label}' must be an object."
+            )
+        unknown_fields = set(raw_binding) - allowed_fields
+        if unknown_fields:
+            raise SystemExit(
+                f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} entry "
+                f"'{label}' has unsupported fields."
+            )
+        cdp_endpoint = raw_binding.get("cdp_endpoint")
+        page_target_id = raw_binding.get("page_target_id")
+        if (
+            not isinstance(cdp_endpoint, str)
+            or not cdp_endpoint.strip()
+            or not isinstance(page_target_id, str)
+            or not page_target_id.strip()
+        ):
+            raise SystemExit(
+                f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} entry "
+                f"'{label}' requires non-empty cdp_endpoint and page_target_id."
+            )
+        bindings[label] = ChatGPTConversationInitAccountBinding(
+            cdp_endpoint=cdp_endpoint.strip(),
+            page_target_id=page_target_id.strip(),
+        )
+    return bindings
 
 
 def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
@@ -3133,6 +3207,15 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "https://chatgpt.com/backend-api/conversation/init."
         ),
     )
+    parser.add_argument(
+        "--chatgpt-conversation-init-account-bindings",
+        default=os.getenv(CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV),
+        help=(
+            "Optional nonsecret JSON object mapping Codex OAuth inventory labels "
+            "to {cdp_endpoint,page_target_id}. When absent, retain legacy "
+            "file-only conversation-init polling."
+        ),
+    )
 
     codex_credit_group = parser.add_mutually_exclusive_group()
     codex_credit_group.add_argument(
@@ -3651,6 +3734,11 @@ def _validate_codex_reset_credit_poll_config_args(args: argparse.Namespace) -> N
 def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConfig:
     args = _build_parser().parse_args(argv)
     _validate_config_args(args)
+    chatgpt_conversation_init_account_bindings = (
+        _parse_chatgpt_conversation_init_account_bindings(
+            args.chatgpt_conversation_init_account_bindings
+        )
+    )
     grok_billing_http_method = str(args.grok_billing_http_method).strip().upper()
     codex_oauth_inventory = _load_codex_inventory_for_config(
         refresh_enabled=args.codex_oauth_refresh_enabled,
@@ -3804,6 +3892,9 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         chatgpt_conversation_init_url=str(
             args.chatgpt_conversation_init_url
         ).strip(),
+        chatgpt_conversation_init_account_bindings=(
+            chatgpt_conversation_init_account_bindings
+        ),
         grok_billing_url=args.grok_billing_url,
         grok_billing_client_version=args.grok_billing_client_version,
         grok_billing_client_version_source=(
@@ -8385,7 +8476,7 @@ def _persist_chatgpt_conversation_init_observations(
 ) -> int:
     if not payloads:
         return 0
-    dsn = _resolve_dsn(config)
+    dsn = _resolve_codex_quota_dsn(config)
     inserted_count = 0
     try:
         with probes.psycopg.connect(dsn) as conn:
@@ -13630,7 +13721,451 @@ def _run_cursor_agent_usage_poll_task(
     }
 
 
-def _run_chatgpt_conversation_init_poll_task(
+def _chatgpt_conversation_init_poll_summary(
+    *,
+    collector_source: str,
+    coverage_mode: str,
+    coverage_scope: str,
+) -> Dict[str, Any]:
+    return {
+        "attempted": True,
+        "persisted": False,
+        "skipped": False,
+        "observation_count": 0,
+        "inserted_count": 0,
+        "status_code": None,
+        "telemetry_class": None,
+        "telemetry_status": None,
+        "error_class": None,
+        "error_message": None,
+        "last_good_state_retained": False,
+        "collector_source": collector_source,
+        "request_method": "POST",
+        "request_body_omitted": True,
+        "has_model_message": False,
+        "has_conversation_content": False,
+        "coverage_mode": coverage_mode,
+        "coverage_scope": coverage_scope,
+        "coverage_status": "not_attempted",
+        "capture_coverage_status": "not_attempted",
+        "persistence_coverage_status": "not_attempted",
+        "account_coverage": [],
+        "bound_account_count": None,
+        "fresh_capture_count": 0,
+        "persisted_account_count": 0,
+        "unmatched_binding_labels": [],
+    }
+
+
+def _is_canonical_codex_account_hash(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == CODEX_OAUTH_ACCOUNT_HASH_LENGTH
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _new_chatgpt_conversation_init_account_coverage(
+    record: CodexOAuthCredentialRecord,
+    *,
+    binding_configured: bool,
+) -> Dict[str, Any]:
+    return {
+        "account_label": record.label,
+        "expected_account_hash": record.expected_account_hash,
+        "binding_configured": binding_configured,
+        "auth_status": "not_attempted",
+        "capture_status": "not_attempted",
+        "persistence_status": "not_attempted",
+        "collector_written": False,
+        "account_identity_verified": False,
+        "verified_account_hash": None,
+        "parser_account_identity_source": None,
+        "observation_count": 0,
+        "inserted_count": 0,
+        "persisted": False,
+        "fresh_capture": False,
+        "status_code": None,
+        "telemetry_class": None,
+        "error_class": None,
+        "error_message": None,
+    }
+
+
+def _set_chatgpt_account_failure(
+    coverage: Dict[str, Any],
+    *,
+    stage: str,
+    error_class: str,
+    error_message: str,
+    telemetry_class: Optional[str] = None,
+    capture_status: str = "failed",
+    status_field: str = "capture_status",
+) -> None:
+    coverage["failure_stage"] = stage
+    coverage[status_field] = capture_status
+    coverage["error_class"] = _redacted_summary_field(error_class)
+    coverage["error_message"] = _redacted_failure_message(error_message)
+    if telemetry_class is not None:
+        coverage["telemetry_class"] = telemetry_class
+
+
+def _set_chatgpt_account_capture_exception(
+    coverage: Dict[str, Any],
+    exc: Exception,
+) -> None:
+    telemetry_class = getattr(exc, "telemetry_class", None)
+    if isinstance(exc, (ImportError, ModuleNotFoundError)):
+        stage = "dependency"
+        telemetry_class = "dependency_unavailable"
+        capture_status = "dependency_unavailable"
+    elif telemetry_class == "auth":
+        stage = "capture"
+        capture_status = "auth_failed"
+    elif telemetry_class == "dependency_unavailable":
+        stage = "capture"
+        capture_status = "dependency_unavailable"
+    else:
+        stage = "capture"
+        telemetry_class = telemetry_class or "malformed_telemetry"
+        capture_status = "capture_failed"
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        coverage["status_code"] = status_code
+    _set_chatgpt_account_failure(
+        coverage,
+        stage=stage,
+        error_class=exc.__class__.__name__,
+        error_message=str(exc),
+        telemetry_class=telemetry_class,
+        capture_status=capture_status,
+    )
+
+
+def _chatgpt_account_coverage_status(success_count: int, total_count: int) -> str:
+    if not total_count:
+        return "no_enabled_accounts"
+    if success_count == total_count:
+        return "complete"
+    return "partial" if success_count else "failed"
+
+
+def _stamp_chatgpt_conversation_init_account_hash(
+    payloads: Sequence[tuple[Any, ...]],
+    *,
+    parser_summary: Mapping[str, Any],
+    account_hash: str,
+) -> List[tuple[Any, ...]]:
+    if parser_summary.get("account_identity_source") != "provider_payload":
+        raise ValueError(
+            "Bound conversation-init parser returned no provider identity."
+        )
+    if not parser_summary.get("account_identity_hashed"):
+        raise ValueError(
+            "Bound conversation-init parser returned no provider identity."
+        )
+
+    stamped: List[tuple[Any, ...]] = []
+    for payload in payloads:
+        if len(payload) < 4:
+            raise ValueError(
+                "Bound conversation-init parser returned an invalid insert tuple."
+            )
+        stamped.append(
+            tuple(payload[:3]) + (account_hash,) + tuple(payload[4:])
+        )
+    return stamped
+
+
+def _collect_bound_chatgpt_conversation_init_account(
+    config: ProviderStatusLoopConfig,
+    record: CodexOAuthCredentialRecord,
+    binding: ChatGPTConversationInitAccountBinding,
+    *,
+    observed_at: datetime,
+) -> tuple[List[tuple[Any, ...]], Dict[str, Any]]:
+    coverage = _new_chatgpt_conversation_init_account_coverage(
+        record,
+        binding_configured=True,
+    )
+
+    try:
+        credential = load_codex_oauth_credential(record)
+        if credential.account_hash != record.expected_account_hash:
+            _set_chatgpt_account_failure(
+                coverage,
+                stage="auth_identity",
+                error_class="CodexOAuthIdentityMismatchError",
+                error_message=(
+                    f"Codex OAuth credential '{record.label}' does not match "
+                    "its configured account identity."
+                ),
+                telemetry_class="auth",
+                capture_status="auth_mismatch",
+            )
+            return [], coverage
+        coverage["auth_status"] = "verified"
+    except Exception as exc:
+        _set_chatgpt_account_failure(
+            coverage,
+            stage="auth",
+            error_class=exc.__class__.__name__,
+            error_message=str(exc),
+            telemetry_class="auth",
+            capture_status="auth_failed",
+        )
+        return [], coverage
+
+    try:
+        source_parent = Path(
+            config.chatgpt_conversation_init_source_path
+        ).expanduser().parent
+        source_parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=f".conversation-init-{record.expected_account_hash}-",
+            dir=str(source_parent),
+        ) as snapshot_dir:
+            snapshot_path = str(Path(snapshot_dir) / "snapshot.json")
+            collector_summary = (
+                collect_conversation_init_snapshot_from_oracle_browser(
+                    snapshot_path,
+                    cdp_endpoint=binding.cdp_endpoint,
+                    page_target_id=binding.page_target_id,
+                    expected_account_hash=record.expected_account_hash,
+                    timeout_seconds=(
+                        DEFAULT_CHATGPT_CONVERSATION_INIT_BROWSER_TIMEOUT_SECONDS
+                    ),
+                    request_url=config.chatgpt_conversation_init_url,
+                )
+            )
+            coverage["collector_written"] = bool(
+                collector_summary.get("written")
+            )
+            coverage["status_code"] = collector_summary.get("status_code")
+            coverage["telemetry_class"] = collector_summary.get("telemetry_class")
+            coverage["account_identity_verified"] = bool(
+                collector_summary.get("account_identity_verified")
+            )
+            verified_account_hash = collector_summary.get("account_hash")
+            coverage["verified_account_hash"] = verified_account_hash
+
+            if not coverage["collector_written"]:
+                _set_chatgpt_account_failure(
+                    coverage,
+                    stage="capture",
+                    error_class=(
+                        collector_summary.get("error_class")
+                        or "ChatGPTConversationInitCaptureNotWritten"
+                    ),
+                    error_message=(
+                        collector_summary.get("error_message")
+                        or "Current conversation-init capture was not written."
+                    ),
+                    telemetry_class=collector_summary.get("telemetry_class"),
+                    capture_status=(
+                        "dependency_unavailable"
+                        if collector_summary.get("telemetry_class")
+                        == "dependency_unavailable"
+                        else "capture_failed"
+                    ),
+                )
+                return [], coverage
+
+            identity_failure: Optional[tuple[str, str, str]] = None
+            if not coverage["account_identity_verified"]:
+                identity_failure = (
+                    "ChatGPTConversationInitIdentityUnverified",
+                    "Conversation-init capture did not verify the browser "
+                    "account identity.",
+                    "identity_unverified",
+                )
+            elif (
+                not _is_canonical_codex_account_hash(verified_account_hash)
+                or verified_account_hash != record.expected_account_hash
+            ):
+                identity_failure = (
+                    "ChatGPTConversationInitIdentityMismatch",
+                    "Conversation-init capture returned an invalid or "
+                    "unexpected account identity hash.",
+                    "identity_mismatch",
+                )
+            if identity_failure is not None:
+                _set_chatgpt_account_failure(
+                    coverage,
+                    stage="identity",
+                    error_class=identity_failure[0],
+                    error_message=identity_failure[1],
+                    telemetry_class="auth",
+                    capture_status=identity_failure[2],
+                )
+                return [], coverage
+
+            payloads, parser_summary = collect_conversation_init_observations(
+                snapshot_path,
+                observed_at=observed_at,
+                request_url=config.chatgpt_conversation_init_url,
+            )
+            coverage["parser_account_identity_source"] = parser_summary.get(
+                "account_identity_source"
+            )
+            if not payloads:
+                _set_chatgpt_account_failure(
+                    coverage,
+                    stage="parse",
+                    error_class="ChatGPTConversationInitNoCurrentObservations",
+                    error_message=(
+                        "Current identity-verified conversation-init capture "
+                        "produced no observations."
+                    ),
+                    telemetry_class=parser_summary.get("telemetry_class"),
+                    capture_status="parse_failed",
+                )
+                return [], coverage
+
+            bound_payloads = _stamp_chatgpt_conversation_init_account_hash(
+                payloads,
+                parser_summary=parser_summary,
+                account_hash=record.expected_account_hash,
+            )
+            coverage["observation_count"] = len(bound_payloads)
+            coverage["fresh_capture"] = True
+            coverage["capture_status"] = "parsed"
+            return bound_payloads, coverage
+    except Exception as exc:
+        _set_chatgpt_account_capture_exception(coverage, exc)
+    return [], coverage
+
+
+def _run_chatgpt_conversation_init_bound_poll(  # noqa: PLR0915
+    config: ProviderStatusLoopConfig,
+    summary: Dict[str, Any],
+    *,
+    observed_at: datetime,
+) -> None:
+    try:
+        inventory = _require_codex_oauth_inventory(config)
+    except Exception as exc:
+        summary["coverage_status"] = "inventory_unavailable"
+        summary["capture_coverage_status"] = "inventory_unavailable"
+        summary["persistence_coverage_status"] = "inventory_unavailable"
+        summary["error_class"] = exc.__class__.__name__
+        summary["error_message"] = _redacted_failure_message(str(exc))
+        summary["telemetry_class"] = "auth"
+        return
+
+    records = inventory.ordered_records(enabled_only=True)
+    bindings = config.chatgpt_conversation_init_account_bindings or {}
+    labels = {record.label for record in records}
+    summary["bound_account_count"] = len(records)
+    summary["unmatched_binding_labels"] = sorted(
+        label for label in bindings if label not in labels
+    )
+
+    for record in records:
+        binding = bindings.get(record.label)
+        if binding is None:
+            coverage = _new_chatgpt_conversation_init_account_coverage(
+                record,
+                binding_configured=False,
+            )
+            _set_chatgpt_account_failure(
+                coverage,
+                stage="binding",
+                error_class="ChatGPTConversationInitBindingMissing",
+                error_message=(
+                    f"No browser binding configured for Codex OAuth account "
+                    f"'{record.label}'."
+                ),
+                telemetry_class="configuration",
+                capture_status="missing_binding",
+            )
+            summary["account_coverage"].append(coverage)
+            continue
+
+        payloads, coverage = _collect_bound_chatgpt_conversation_init_account(
+            config,
+            record,
+            binding,
+            observed_at=observed_at,
+        )
+
+        summary["observation_count"] += coverage["observation_count"]
+        if payloads and config.apply:
+            try:
+                coverage["inserted_count"] = (
+                    _persist_chatgpt_conversation_init_observations(
+                        config,
+                        payloads,
+                    )
+                )
+                coverage["persisted"] = True
+                coverage["persistence_status"] = "persisted"
+                summary["inserted_count"] += coverage["inserted_count"]
+                summary["persisted"] = True
+            except Exception as exc:
+                skipped = isinstance(
+                    exc,
+                    probes.ProviderStatusDatabaseWriteSkipped,
+                )
+                persistence_status = (
+                    "database_write_skipped"
+                    if skipped
+                    else "database_write_failed"
+                )
+                _set_chatgpt_account_failure(
+                    coverage,
+                    stage="persistence",
+                    error_class=exc.__class__.__name__,
+                    error_message=str(exc),
+                    telemetry_class=persistence_status,
+                    capture_status=persistence_status,
+                    status_field="persistence_status",
+                )
+                summary["skipped"] = summary["skipped"] or skipped
+                summary["last_good_state_retained"] = True
+        elif payloads:
+            coverage["persistence_status"] = "not_applied"
+        summary["account_coverage"].append(coverage)
+
+    fresh_capture_count = sum(
+        1
+        for coverage in summary["account_coverage"]
+        if coverage.get("fresh_capture")
+    )
+    persisted_account_count = sum(
+        1
+        for coverage in summary["account_coverage"]
+        if coverage.get("persisted")
+    )
+    summary["fresh_capture_count"] = fresh_capture_count
+    summary["persisted_account_count"] = persisted_account_count
+    capture_status = _chatgpt_account_coverage_status(
+        fresh_capture_count,
+        len(records),
+    )
+    persistence_status = (
+        "not_applied"
+        if not config.apply
+        else _chatgpt_account_coverage_status(
+            persisted_account_count,
+            len(records),
+        )
+    )
+    summary["capture_coverage_status"] = capture_status
+    summary["persistence_coverage_status"] = persistence_status
+    if not records:
+        summary["coverage_status"] = "no_enabled_accounts"
+    elif not config.apply:
+        summary["coverage_status"] = capture_status
+    elif capture_status == "complete" and persistence_status == "complete":
+        summary["coverage_status"] = "complete"
+    elif fresh_capture_count or persisted_account_count:
+        summary["coverage_status"] = "partial"
+    else:
+        summary["coverage_status"] = "failed"
+
+
+def _run_chatgpt_conversation_init_poll_task(  # noqa: PLR0915
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
     *,
@@ -13648,65 +14183,78 @@ def _run_chatgpt_conversation_init_poll_task(
 
     state.chatgpt_conversation_init_last_attempt_monotonic = now_monotonic
     observed_at = datetime.now(timezone.utc)
-    summary: Dict[str, Any] = {
-        "attempted": True,
-        "persisted": False,
-        "skipped": False,
-        "observation_count": 0,
-        "inserted_count": 0,
-        "status_code": None,
-        "telemetry_class": None,
-        "telemetry_status": None,
-        "error_class": None,
-        "error_message": None,
-        "last_good_state_retained": False,
-        "collector_source": "file",
-        "request_method": "POST",
-        "request_body_omitted": True,
-        "has_model_message": False,
-        "has_conversation_content": False,
-    }
-    try:
-        payloads, parser_summary = collect_conversation_init_observations(
-            config.chatgpt_conversation_init_source_path,
+    bound_mode = config.chatgpt_conversation_init_account_bindings is not None
+    summary = _chatgpt_conversation_init_poll_summary(
+        collector_source=(
+            "oracle_browser_bound_per_account" if bound_mode else "file"
+        ),
+        coverage_mode="bound_live" if bound_mode else "file_only_legacy",
+        coverage_scope=(
+            "enabled_codex_oauth_inventory_accounts"
+            if bound_mode
+            else "single_configured_snapshot"
+        ),
+    )
+    if bound_mode:
+        _run_chatgpt_conversation_init_bound_poll(
+            config,
+            summary,
             observed_at=observed_at,
-            request_url=config.chatgpt_conversation_init_url,
         )
-        summary.update(parser_summary)
-        summary["observation_count"] = len(payloads)
-        if config.apply and payloads:
-            summary["inserted_count"] = (
-                _persist_chatgpt_conversation_init_observations(
-                    config,
-                    payloads,
-                )
+    else:
+        try:
+            payloads, parser_summary = collect_conversation_init_observations(
+                config.chatgpt_conversation_init_source_path,
+                observed_at=observed_at,
+                request_url=config.chatgpt_conversation_init_url,
             )
-            summary["persisted"] = True
-        if not payloads:
+            summary.update(parser_summary)
+            summary["observation_count"] = len(payloads)
+            summary["capture_coverage_status"] = (
+                "legacy_file_snapshot" if payloads else "no_current_snapshot"
+            )
+            if config.apply and payloads:
+                summary["inserted_count"] = (
+                    _persist_chatgpt_conversation_init_observations(
+                        config,
+                        payloads,
+                    )
+                )
+                summary["persisted"] = True
+                summary["persistence_coverage_status"] = "persisted"
+            elif payloads:
+                summary["persistence_coverage_status"] = "not_applied"
+            if payloads:
+                summary["coverage_status"] = "single_snapshot"
+            else:
+                summary["coverage_status"] = "no_current_snapshot"
+                summary["last_good_state_retained"] = True
+                if summary.get("telemetry_class") is None:
+                    status = summary.get("telemetry_status")
+                    if status == "auth":
+                        summary["telemetry_class"] = "auth"
+                    elif status in {"malformed", "missing_account_identity"}:
+                        summary["telemetry_class"] = "malformed_telemetry"
+                    elif status:
+                        summary["telemetry_class"] = "http_error"
+        except probes.ProviderStatusDatabaseWriteSkipped as exc:
+            summary["error_class"] = exc.__class__.__name__
+            summary["error_message"] = _redacted_failure_message(str(exc))
+            summary["telemetry_class"] = "database_write_skipped"
+            summary["skipped"] = True
             summary["last_good_state_retained"] = True
-            if summary.get("telemetry_class") is None:
-                status = summary.get("telemetry_status")
-                if status == "auth":
-                    summary["telemetry_class"] = "auth"
-                elif status in {"malformed", "missing_account_identity"}:
-                    summary["telemetry_class"] = "malformed_telemetry"
-                elif status:
-                    summary["telemetry_class"] = "http_error"
-    except probes.ProviderStatusDatabaseWriteSkipped as exc:
-        summary["error_class"] = exc.__class__.__name__
-        summary["error_message"] = _redacted_failure_message(str(exc))
-        summary["telemetry_class"] = "database_write_skipped"
-        summary["skipped"] = True
-        summary["last_good_state_retained"] = True
-    except Exception as exc:
-        summary["error_class"] = exc.__class__.__name__
-        summary["error_message"] = _redacted_failure_message(str(exc))
-        summary["last_good_state_retained"] = True
-        if isinstance(exc, ChatGPTConversationInitError):
-            summary["status_code"] = exc.status_code
-            summary["telemetry_class"] = exc.telemetry_class
-        else:
-            summary["telemetry_class"] = "malformed_telemetry"
+            summary["coverage_status"] = "database_write_skipped"
+            summary["persistence_coverage_status"] = "database_write_skipped"
+        except Exception as exc:
+            summary["error_class"] = exc.__class__.__name__
+            summary["error_message"] = _redacted_failure_message(str(exc))
+            summary["last_good_state_retained"] = True
+            summary["coverage_status"] = "no_current_snapshot"
+            if isinstance(exc, ChatGPTConversationInitError):
+                summary["status_code"] = exc.status_code
+                summary["telemetry_class"] = exc.telemetry_class
+            else:
+                summary["telemetry_class"] = "malformed_telemetry"
 
     return {
         "event": "chatgpt_conversation_init_poll",
