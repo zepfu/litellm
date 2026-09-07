@@ -2131,6 +2131,7 @@ async def test_central_coordinator_replaces_legacy_precommit_cap():
     coordinator.within_deadline = MagicMock(return_value=True)
     coordinator.sleep_with_wakeup = AsyncMock(return_value="timer")
     coordinator.record_retry = MagicMock()
+    coordinator.record_terminal = MagicMock()
     coordinator.signal_success = AsyncMock()
 
     attempts = 0
@@ -2162,6 +2163,23 @@ async def test_central_coordinator_replaces_legacy_precommit_cap():
         "timer",
         "timer",
     ]
+    assert [
+        call.kwargs for call in coordinator.sleep_with_wakeup.call_args_list
+    ] == [
+        {"error_class": "server_overloaded", "status_code": 503},
+        {"error_class": "server_overloaded", "status_code": 503},
+    ]
+    assert [
+        call.kwargs for call in coordinator.record_retry.call_args_list
+    ] == [
+        {"error_class": "server_overloaded", "status_code": 503},
+        {"error_class": "server_overloaded", "status_code": 503},
+    ]
+    coordinator.record_terminal.assert_called_once_with(
+        "success",
+        error_class="success",
+        status_code=200,
+    )
 
 
 @pytest.mark.asyncio
@@ -2218,6 +2236,7 @@ async def test_central_coordinator_retries_raw_http_overload_then_succeeds(
     coordinator.next_wait_seconds.return_value = 15.0
     coordinator.sleep_with_wakeup = AsyncMock(return_value="timer")
     coordinator.record_retry = MagicMock()
+    coordinator.record_terminal = MagicMock()
     coordinator.signal_success = AsyncMock()
 
     attempts = 0
@@ -2239,9 +2258,22 @@ async def test_central_coordinator_retries_raw_http_overload_then_succeeds(
 
     assert result == "committed"
     assert attempts == 2
-    coordinator.sleep_with_wakeup.assert_awaited_once_with(15.0)
-    coordinator.record_retry.assert_called_once_with("timer")
+    coordinator.sleep_with_wakeup.assert_awaited_once_with(
+        15.0,
+        error_class=f"http_status_{status_code}",
+        status_code=status_code,
+    )
+    coordinator.record_retry.assert_called_once_with(
+        "timer",
+        error_class=f"http_status_{status_code}",
+        status_code=status_code,
+    )
     coordinator.signal_success.assert_awaited_once()
+    coordinator.record_terminal.assert_called_once_with(
+        "success",
+        error_class="success",
+        status_code=200,
+    )
     if isinstance(overload_exception, HTTPException):
         assert overload_exception.status_code == status_code
         assert overload_exception.detail == overload_payload
@@ -2441,6 +2473,7 @@ async def test_central_coordinator_exits_raw_http_quota_or_auth_immediately(
         side_effect=AssertionError("non-capacity HTTP error must not sleep")
     )
     coordinator.record_retry = MagicMock()
+    coordinator.record_terminal = MagicMock()
 
     async def operation():
         raise exception
@@ -2457,6 +2490,15 @@ async def test_central_coordinator_exits_raw_http_quota_or_auth_immediately(
     assert raised.value is exception
     coordinator.sleep_with_wakeup.assert_not_awaited()
     coordinator.record_retry.assert_not_called()
+    coordinator.record_terminal.assert_called_once_with(
+        "non_capacity_error",
+        error_class=(
+            "http_status_429"
+            if exception_kind == "http_exception"
+            else f"http_status_{status_code}"
+        ),
+        status_code=status_code,
+    )
 
 
 @pytest.mark.asyncio
@@ -2468,6 +2510,7 @@ async def test_central_coordinator_uses_remaining_deadline_once_per_attempt():
     coordinator.next_wait_seconds = MagicMock(return_value=15.0)
     coordinator.sleep_with_wakeup = AsyncMock(return_value="timer")
     coordinator.record_retry = MagicMock()
+    coordinator.record_terminal = MagicMock()
     coordinator.signal_success = AsyncMock()
 
     attempts = 0
@@ -2521,6 +2564,11 @@ async def test_central_coordinator_uses_remaining_deadline_once_per_attempt():
 
     assert result == "committed"
     assert timeout_values == [7200.0, 7185.0]
+    coordinator.record_terminal.assert_called_once_with(
+        "success",
+        error_class="success",
+        status_code=200,
+    )
 
 
 @pytest.mark.asyncio
@@ -2539,6 +2587,7 @@ async def test_central_coordinator_uses_repeating_capacity_schedule():
     ]
     coordinator.sleep_with_wakeup = AsyncMock(return_value="timer")
     coordinator.record_retry = MagicMock()
+    coordinator.record_terminal = MagicMock()
     coordinator.signal_success = AsyncMock()
 
     attempts = 0
@@ -2570,6 +2619,19 @@ async def test_central_coordinator_uses_repeating_capacity_schedule():
         for call in coordinator.sleep_with_wakeup.call_args_list
     ] == [15.0, 30.0, 60.0, 120.0, 240.0, 240.0]
     assert coordinator.record_retry.call_count == 6
+    assert all(
+        call.kwargs == {"error_class": "server_overloaded", "status_code": 503}
+        for call in coordinator.sleep_with_wakeup.call_args_list
+    )
+    assert all(
+        call.kwargs == {"error_class": "server_overloaded", "status_code": 503}
+        for call in coordinator.record_retry.call_args_list
+    )
+    coordinator.record_terminal.assert_called_once_with(
+        "success",
+        error_class="success",
+        status_code=200,
+    )
 
 
 @pytest.mark.asyncio
@@ -2581,6 +2643,7 @@ async def test_central_coordinator_does_not_tight_loop_non_capacity_retryable():
         side_effect=AssertionError("non-capacity retry must not sleep")
     )
     coordinator.record_retry = MagicMock()
+    coordinator.record_terminal = MagicMock()
 
     attempts = 0
 
@@ -2601,6 +2664,11 @@ async def test_central_coordinator_does_not_tight_loop_non_capacity_retryable():
     assert attempts == 1
     coordinator.sleep_with_wakeup.assert_not_awaited()
     coordinator.record_retry.assert_not_called()
+    coordinator.record_terminal.assert_called_once_with(
+        "non_capacity_error",
+        error_class="upstream_connectivity_failure",
+        status_code=None,
+    )
 
 
 def test_candidate_loop_planner_calls_pass_live_elapsed_and_deadline():

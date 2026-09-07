@@ -1831,6 +1831,21 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
             )
             if openai_capacity_coordinator is not None:
                 await openai_capacity_coordinator.signal_success()
+                success_response = (
+                    result[0] if isinstance(result, tuple) and result else result
+                )
+                success_status_code = getattr(
+                    success_response,
+                    "status_code",
+                    200,
+                )
+                if not isinstance(success_status_code, int):
+                    success_status_code = 200
+                openai_capacity_coordinator.record_terminal(
+                    "success",
+                    error_class="success",
+                    status_code=success_status_code,
+                )
             if attempt_number > 1:
                 _record_passthrough_hidden_retry_metadata(
                     kwargs,
@@ -1966,6 +1981,12 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 openai_capacity_coordinator is None
                 and attempt_number >= max_attempts
             ):
+                if openai_capacity_coordinator is not None:
+                    openai_capacity_coordinator.record_terminal(
+                        "non_capacity_error",
+                        error_class=failure_class,
+                        status_code=status_code,
+                    )
                 _record_passthrough_hidden_retry_metadata(
                     kwargs,
                     attempt_number=attempt_number,
@@ -2054,9 +2075,15 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
             )
             if openai_capacity_coordinator is not None:
                 wakeup_reason = await openai_capacity_coordinator.sleep_with_wakeup(
-                    wait_seconds
+                    wait_seconds,
+                    error_class=failure_class,
+                    status_code=status_code,
                 )
-                openai_capacity_coordinator.record_retry(wakeup_reason)
+                openai_capacity_coordinator.record_retry(
+                    wakeup_reason,
+                    error_class=failure_class,
+                    status_code=status_code,
+                )
             else:
                 await _passthrough_hidden_retry_sleep(wait_seconds)
 
