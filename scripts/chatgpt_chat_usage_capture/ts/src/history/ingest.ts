@@ -258,6 +258,16 @@ export async function collectIntoLedger(
   }
 
   if (result.status === "blocked") {
+    if (result.accountState.status === "paused") {
+      ledger.transaction(() => {
+        ledger.upsertAccount(scope, {
+          authState: result.identity.authState,
+          planPolicyId: account.planPolicyId || null,
+          enabled: account.enabled,
+        });
+        store.persist();
+      });
+    }
     return { ...result, ledger: summary };
   }
   assertCollectedIdentity(result.identity, scope);
@@ -317,6 +327,14 @@ function assertCollectedIdentity(
   identity: HistoryPageCommit["identity"],
   scope: LedgerScope,
 ): void {
+  if (
+    identity.authState === "paused" &&
+    identity.providerUserId === null &&
+    identity.workspaceId === null &&
+    identity.quotaOwnerId === null
+  ) {
+    return;
+  }
   if (
     identity.providerUserId !== scope.providerUserId ||
     identity.workspaceId !== scope.workspaceId ||

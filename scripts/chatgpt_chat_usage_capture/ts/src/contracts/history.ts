@@ -21,6 +21,14 @@ export type HistoryCollectionMode =
   | "backfill"
   | "incremental"
   | "reconciliation";
+export type HistoryAccountPauseReason = "authentication" | "cooldown";
+export interface HistoryAccountState {
+  status: "ready" | "paused";
+  reason: HistoryAccountPauseReason | null;
+  pausedAt: string | null;
+  cooldownUntil: string | null;
+  lastError: string | null;
+}
 export type CheckpointStatus =
   | "not_started"
   | "in_progress"
@@ -111,6 +119,8 @@ export interface RevisitEntry {
 }
 
 export interface HistoryCheckpointStore {
+  loadAccountState(): HistoryAccountState;
+  saveAccountState(state: HistoryAccountState): void;
   loadDiscovery(scope: HistoryScope): DiscoveryCheckpoint | null;
   saveDiscovery(checkpoint: DiscoveryCheckpoint): void;
   listRevisits(): RevisitEntry[];
@@ -230,6 +240,7 @@ export interface HistoryCollectionResult {
   range: HistoryRange;
   scanStartedAt: string;
   status: "complete" | "partial" | "blocked";
+  accountState: HistoryAccountState;
   identity: IdentityRecord;
   scopes: ScopeCoverageResult[];
   conversations: AcquiredConversation[];

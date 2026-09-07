@@ -5,7 +5,9 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  AuthenticationRequiredError,
   ChatGPTHistoryAdapter,
+  RateLimitedError,
   type HistoryTransport,
 } from "../../src/adapters/chatgpt/adapter.js";
 import { FixtureTransport } from "../../src/adapters/chatgpt/fixture-transport.js";
@@ -57,7 +59,9 @@ class ScriptedReader implements HistoryReader {
     HistoryScope,
     AdaptedPage<ConversationSummary>[]
   >();
+  readonly indexErrors = new Map<string, Error>();
   readonly details = new Map<string, ConversationDetailProjection>();
+  readonly detailErrors = new Map<string, Error>();
   readonly messagePages = new Map<
     string,
     Map<string, AdaptedPage<MessageRecord>>
@@ -88,6 +92,10 @@ class ScriptedReader implements HistoryReader {
       method: "GET",
       path: `/backend-api/conversations?scope=${scope}&offset=${offset}`,
     });
+    const error = this.indexErrors.get(`${scope}:${offset}`);
+    if (error) {
+      throw error;
+    }
     const sequence = this.indexSequences.get(scope);
     if (sequence && sequence.length > 0) {
       return sequence.shift()!;
@@ -105,6 +113,10 @@ class ScriptedReader implements HistoryReader {
       method: "GET",
       path: `/backend-api/conversations/${conversationId}`,
     });
+    const error = this.detailErrors.get(conversationId);
+    if (error) {
+      throw error;
+    }
     const detail = this.details.get(conversationId);
     if (!detail) {
       throw new Error("missing_detail");
@@ -340,6 +352,226 @@ describe("Stage-2A history collection", () => {
     expect(checkpoint?.continuation).toBe(1);
     expect(checkpoint?.lastCompleteDiscoveryStartedAt).toBeNull();
     expect(checkpoint?.paginationState).toBe("budget_exhausted");
+  });
+
+  it.each([
+    {
+      label: "numeric",
+      retryAfter: "120",
+      cooldownUntil: "2026-09-07T12:02:00.000Z",
+    },
+    {
+      label: "date",
+      retryAfter: "Mon, 07 Sep 2026 12:05:00 GMT",
+      cooldownUntil: "2026-09-07T12:05:00.000Z",
+    },
+  ])(
+    "pauses all account reads after a $label Retry-After response",
+    async ({ retryAfter, cooldownUntil }) => {
+      const reader = new ScriptedReader();
+      const candidate = summary("conv-rate-limited");
+      reader.indexPages.set(
+        "active",
+        new Map([[0, indexPage([candidate], 1, false, "continuation")]]),
+      );
+      reader.indexPages.set("archived", new Map([[0, indexPage([])]]));
+      reader.indexErrors.set(
+        "active:1",
+        new RateLimitedError("rate limited", {
+          retryAfter,
+          path: "/backend-api/conversations",
+        }),
+      );
+
+      const store = new MemoryCheckpointStore();
+      const result = await new HistoryCollector(reader, {
+        accountId: "fixture-primary",
+        store,
+        clock: { now: () => NOW },
+      }).collect({
+        mode: "backfill",
+        range: EXPLICIT_RANGE,
+      });
+
+      expect(result.status).toBe("partial");
+      expect(result.identity.authState).toBe("paused");
+      expect(result.accountState).toEqual({
+        status: "paused",
+        reason: "cooldown",
+        pausedAt: NOW.toISOString(),
+        cooldownUntil,
+        lastError: "rate_limited",
+      });
+      expect(store.loadDiscovery("active")).toMatchObject({
+        status: "partial",
+        continuation: 1,
+        pagesFetched: 1,
+      });
+      expect(reader.requests).toEqual([
+        { method: "GET", path: "/api/auth/session" },
+        {
+          method: "GET",
+          path: "/backend-api/conversations?scope=active&offset=0",
+        },
+        {
+          method: "GET",
+          path: "/backend-api/conversations?scope=active&offset=1",
+        },
+      ]);
+      expect(reader.requests.some((request) => request.path.includes("archived")))
+        .toBe(false);
+      expect(
+        reader.requests.some((request) =>
+          request.path.includes("conv-rate-limited"),
+        ),
+      ).toBe(false);
+    },
+  );
+
+  it("pauses all remaining scopes and details after an authentication challenge", async () => {
+    const reader = new ScriptedReader();
+    const challenged = summary("conv-auth-challenge");
+    const later = summary("conv-after-auth-challenge");
+    const archived = summary("conv-archived");
+    addCompleteIndex(reader, [challenged, later], [archived]);
+    reader.detailErrors.set(
+      challenged.conversationId,
+      new AuthenticationRequiredError("login required", {
+        status: 403,
+        path: `/backend-api/conversations/${challenged.conversationId}`,
+      }),
+    );
+    reader.details.set(later.conversationId, detail(later.conversationId));
+    reader.messagePages.set(
+      later.conversationId,
+      new Map([["latest", completePage([])]]),
+    );
+
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store: new MemoryCheckpointStore(),
+      clock: { now: () => NOW },
+    }).collect({
+      mode: "backfill",
+      range: EXPLICIT_RANGE,
+    });
+
+    expect(result.status).toBe("partial");
+    expect(result.identity.authState).toBe("paused");
+    expect(result.accountState).toMatchObject({
+      status: "paused",
+      reason: "authentication",
+      cooldownUntil: null,
+      lastError: "auth_required",
+    });
+    expect(result.conversations.map((item) => item.summary.conversationId)).toEqual([
+      challenged.conversationId,
+    ]);
+    expect(result.conversations[0]?.revisit?.reason).toBe("detail_unavailable");
+    const challengeRequestIndex = reader.requests.findIndex((request) =>
+      request.path.includes(challenged.conversationId),
+    );
+    expect(challengeRequestIndex).toBeGreaterThan(-1);
+    expect(reader.requests.slice(challengeRequestIndex)).toEqual([
+      {
+        method: "GET",
+        path: `/backend-api/conversations/${challenged.conversationId}`,
+      },
+    ]);
+    expect(
+      reader.requests.some((request) =>
+        request.path.includes(later.conversationId),
+      ),
+    ).toBe(false);
+  });
+
+  it("does not issue a request during a persisted cooldown after restart", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "usage-capture-cooldown-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "history.sqlite");
+    const ledger = new Ledger(path);
+    ledger.upsertAccount(LEDGER_SCOPE);
+    const store = new SqliteCheckpointStore(ledger, LEDGER_SCOPE);
+    const reader = new ScriptedReader();
+    reader.indexErrors.set(
+      "active:0",
+      new RateLimitedError("rate limited", {
+        retryAfter: "3600",
+        path: "/backend-api/conversations",
+      }),
+    );
+
+    const first = await new HistoryCollector(reader, {
+      accountId: LEDGER_SCOPE.collectorAccountId,
+      store,
+      clock: { now: () => NOW },
+    }).collect({
+      mode: "backfill",
+      range: EXPLICIT_RANGE,
+    });
+    expect(first.accountState.cooldownUntil).toBe("2026-09-07T13:00:00.000Z");
+    ledger.transaction(() => store.persist());
+    ledger.close();
+
+    const reopened = new Ledger(path);
+    const restored = new SqliteCheckpointStore(reopened, LEDGER_SCOPE);
+    const resumedReader = new ScriptedReader();
+    const resumed = await new HistoryCollector(resumedReader, {
+      accountId: LEDGER_SCOPE.collectorAccountId,
+      store: restored,
+      clock: { now: () => new Date("2026-09-07T12:30:00.000Z") },
+    }).collect({
+      mode: "incremental",
+    });
+
+    expect(resumed.status).toBe("blocked");
+    expect(resumed.identity.authState).toBe("paused");
+    expect(resumed.accountState.cooldownUntil).toBe(
+      "2026-09-07T13:00:00.000Z",
+    );
+    expect(resumedReader.requests).toEqual([]);
+    reopened.close();
+  });
+
+  it("persists an authentication pause when the session read is challenged", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "usage-capture-auth-pause-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    const account = defaultConfig().accounts[0]!;
+    Object.assign(account, {
+      id: LEDGER_SCOPE.collectorAccountId,
+      expectedProviderUserId: LEDGER_SCOPE.providerUserId,
+      expectedWorkspaceId: LEDGER_SCOPE.workspaceId,
+      quotaOwnerId: LEDGER_SCOPE.quotaOwnerId,
+    });
+    const reader = new ScriptedReader();
+    reader.identity = {
+      ...reader.identity,
+      authState: "auth_required",
+      identityErrors: [],
+    };
+
+    const result = await collectIntoLedger(
+      reader,
+      ledger,
+      account,
+      { mode: "backfill", range: EXPLICIT_RANGE, now: NOW },
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.identity.authState).toBe("paused");
+    expect(ledger.listAccounts()[0]?.authState).toBe("paused");
+    const persisted = ledger.db
+      .prepare("SELECT state_json FROM history_state")
+      .get() as { state_json: string };
+    expect(JSON.parse(persisted.state_json).accountState).toMatchObject({
+      status: "paused",
+      reason: "authentication",
+    });
+    expect(reader.requests).toEqual([
+      { method: "GET", path: "/api/auth/session" },
+    ]);
+    ledger.close();
   });
 
   it("stops at a message page budget and queues the conversation for revisit", async () => {

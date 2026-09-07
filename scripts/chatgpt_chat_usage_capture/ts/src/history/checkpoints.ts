@@ -1,5 +1,6 @@
 import type {
   DiscoveryCheckpoint,
+  HistoryAccountState,
   HistoryCheckpointStore,
   HistoryScope,
   RevisitEntry,
@@ -13,13 +14,23 @@ import { assertNoSecrets } from "../security/sanitizer.js";
 interface PersistedHistoryState {
   stateVersion: typeof HISTORY_STATE_VERSION;
   accountId: string;
+  accountState?: HistoryAccountState;
   checkpoints: Partial<Record<HistoryScope, DiscoveryCheckpoint>>;
   revisits: RevisitEntry[];
 }
 
 export class MemoryCheckpointStore implements HistoryCheckpointStore {
+  private accountState: HistoryAccountState = readyAccountState();
   private readonly checkpoints = new Map<HistoryScope, DiscoveryCheckpoint>();
   private readonly revisits = new Map<string, RevisitEntry>();
+
+  loadAccountState(): HistoryAccountState {
+    return clone(this.accountState);
+  }
+
+  saveAccountState(state: HistoryAccountState): void {
+    this.accountState = clone(normalizeAccountState(state));
+  }
 
   loadDiscovery(scope: HistoryScope): DiscoveryCheckpoint | null {
     const checkpoint = this.checkpoints.get(scope);
@@ -82,6 +93,7 @@ export class SqliteCheckpointStore extends MemoryCheckpointStore {
         this.saveDiscovery(checkpoint);
       }
     }
+    this.saveAccountState(normalizeAccountState(state.accountState));
     for (const revisit of state.revisits) {
       this.upsertRevisit(revisit);
     }
@@ -94,6 +106,7 @@ export class SqliteCheckpointStore extends MemoryCheckpointStore {
     const state: PersistedHistoryState = {
       stateVersion: HISTORY_STATE_VERSION,
       accountId: this.scope.collectorAccountId,
+      accountState: this.loadAccountState(),
       checkpoints: {},
       revisits: this.listRevisits(),
     };
@@ -129,5 +142,51 @@ function normalizeRevisit(entry: RevisitEntry): RevisitEntry {
       Number.isInteger(entry.detailPagesFetched) && entry.detailPagesFetched >= 0
         ? entry.detailPagesFetched
         : 0,
+  };
+}
+
+function readyAccountState(): HistoryAccountState {
+  return {
+    status: "ready",
+    reason: null,
+    pausedAt: null,
+    cooldownUntil: null,
+    lastError: null,
+  };
+}
+
+function normalizeAccountState(
+  state: HistoryAccountState | undefined,
+): HistoryAccountState {
+  if (!state) {
+    return readyAccountState();
+  }
+  if (state.status === "ready") {
+    return readyAccountState();
+  }
+  if (
+    state.status !== "paused" ||
+    (state.reason !== "authentication" && state.reason !== "cooldown")
+  ) {
+    throw new Error("history account state is invalid");
+  }
+  if (
+    state.pausedAt !== null &&
+    !Number.isFinite(new Date(state.pausedAt).getTime())
+  ) {
+    throw new Error("history account pause timestamp is invalid");
+  }
+  if (
+    state.cooldownUntil !== null &&
+    !Number.isFinite(new Date(state.cooldownUntil).getTime())
+  ) {
+    throw new Error("history account cooldown deadline is invalid");
+  }
+  return {
+    status: "paused",
+    reason: state.reason,
+    pausedAt: state.pausedAt,
+    cooldownUntil: state.cooldownUntil,
+    lastError: state.lastError ?? null,
   };
 }

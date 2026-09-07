@@ -7,6 +7,7 @@ import {
 } from "../adapters/chatgpt/adapter.js";
 import type {
   AcquiredConversation,
+  HistoryAccountState,
   DiscoveryCheckpoint,
   HistoryCollectionOptions,
   HistoryCollectionRequest,
@@ -156,7 +157,63 @@ export class HistoryCollector {
         "older-history audit page budget",
       );
     }
-    const identity = await this.readIdentity();
+    const persistedAccountState = this.options.store.loadAccountState();
+    if (isActiveCooldown(persistedAccountState, now)) {
+      return blockedResult(
+        this.options.accountId,
+        request.mode,
+        requestedRange,
+        scanStartedAt,
+        pausedIdentity(null, persistedAccountState),
+        accountPauseWarning(persistedAccountState),
+        persistedAccountState,
+      );
+    }
+    if (
+      persistedAccountState.status === "paused" &&
+      persistedAccountState.reason === "cooldown"
+    ) {
+      this.options.store.saveAccountState(readyAccountState());
+    }
+
+    let identity = await this.readIdentity(now);
+    if (identity.authState === "auth_required") {
+      const accountState = this.pauseForError(
+        new AuthenticationRequiredError(
+          "authentication required during session inspection",
+          { status: 401, path: "/api/auth/session" },
+        ),
+        now,
+      );
+      identity = pausedIdentity(identity, accountState);
+      return blockedResult(
+        this.options.accountId,
+        request.mode,
+        requestedRange,
+        scanStartedAt,
+        identity,
+        accountPauseWarning(accountState),
+        accountState,
+      );
+    }
+    if (
+      identity.authState === "paused" &&
+      this.options.store.loadAccountState().status === "paused"
+    ) {
+      const accountState = this.options.store.loadAccountState();
+      return blockedResult(
+        this.options.accountId,
+        request.mode,
+        requestedRange,
+        scanStartedAt,
+        pausedIdentity(identity, accountState),
+        accountPauseWarning(accountState),
+        accountState,
+      );
+    }
+    if (identity.authState === "ready") {
+      this.options.store.saveAccountState(readyAccountState());
+    }
 
     if (identity.authState !== "ready" || identity.surface !== "chat") {
       return blockedResult(
@@ -166,6 +223,7 @@ export class HistoryCollector {
         scanStartedAt,
         identity,
         "history collection requires a verified ready Chat identity",
+        this.options.store.loadAccountState(),
       );
     }
 
@@ -175,6 +233,9 @@ export class HistoryCollector {
     let pagesFetched = 0;
 
     for (const scope of ["active", "archived"] as const) {
+      if (this.options.store.loadAccountState().status === "paused") {
+        break;
+      }
       const discovery = await this.discoverScope(
         scope,
         request,
@@ -201,6 +262,9 @@ export class HistoryCollector {
           });
         }
       }
+      if (this.options.store.loadAccountState().status === "paused") {
+        break;
+      }
     }
 
     const scanTime = now.getTime();
@@ -225,6 +289,9 @@ export class HistoryCollector {
     const conversations: AcquiredConversation[] = [];
     let detailPagesFetched = 0;
     for (const candidate of candidates.values()) {
+      if (this.options.store.loadAccountState().status === "paused") {
+        break;
+      }
       const acquisition = await this.acquireConversation(
         candidate,
         now,
@@ -248,12 +315,22 @@ export class HistoryCollector {
           ...acquisition.warnings,
         ],
       });
+      if (this.options.store.loadAccountState().status === "paused") {
+        break;
+      }
     }
 
     const revisits = this.options.store.listRevisits();
+    const accountState = this.options.store.loadAccountState();
+    if (accountState.status === "paused") {
+      identity = pausedIdentity(identity, accountState);
+      warnings.push(accountPauseWarning(accountState));
+    }
     const coverage = this.buildCoverage(scopeResults, conversations, warnings);
     const status =
-      coverage.overall === "complete" && revisits.length === 0
+      accountState.status !== "paused" &&
+      coverage.overall === "complete" &&
+      revisits.length === 0
         ? "complete"
         : "partial";
     this.advanceWatermarksIfEligible(
@@ -271,6 +348,7 @@ export class HistoryCollector {
       range: requestedRange,
       scanStartedAt,
       status,
+      accountState,
       identity,
       scopes: scopeResults,
       conversations,
@@ -282,10 +360,14 @@ export class HistoryCollector {
     };
   }
 
-  private async readIdentity(): Promise<IdentityRecord> {
+  private async readIdentity(now: Date): Promise<IdentityRecord> {
     try {
       return await this.reader.inspectSessionIdentity();
     } catch (error) {
+      if (isAccountStopError(error)) {
+        const accountState = this.pauseForError(error, now);
+        return pausedIdentity(null, accountState, errorCode(error));
+      }
       return {
         providerUserId: null,
         workspaceId: null,
@@ -298,6 +380,24 @@ export class HistoryCollector {
         identityErrors: [errorCode(error)],
       };
     }
+  }
+
+  private pauseForError(
+    error: unknown,
+    now: Date,
+  ): HistoryAccountState {
+    const accountState: HistoryAccountState = {
+      status: "paused",
+      reason: isRateLimitedError(error) ? "cooldown" : "authentication",
+      pausedAt: now.toISOString(),
+      cooldownUntil:
+        error instanceof HttpStatusError
+          ? retryAfterDeadline(error.retryAfter, now)
+          : null,
+      lastError: errorCode(error),
+    };
+    this.options.store.saveAccountState(accountState);
+    return accountState;
   }
 
   private async discoverScope(
@@ -381,6 +481,10 @@ export class HistoryCollector {
         });
       } catch (error) {
         warnings.push(`index_${errorCode(error)}`);
+        if (isAccountStopError(error)) {
+          const accountState = this.pauseForError(error, now);
+          warnings.push(accountPauseWarning(accountState));
+        }
         status = "partial";
         paginationState = "unknown";
         continuation = offset;
@@ -541,6 +645,10 @@ export class HistoryCollector {
           }
         }
       } catch (error) {
+        if (isAccountStopError(error)) {
+          const accountState = this.pauseForError(error, now);
+          warnings.push(accountPauseWarning(accountState));
+        }
         status = "partial";
         paginationState = "unknown";
         continuation = 0;
@@ -576,7 +684,10 @@ export class HistoryCollector {
     }
 
     let auditState = priorAudit;
-    if (request.olderHistoryAudit?.enabled) {
+    if (
+      request.olderHistoryAudit?.enabled &&
+      this.options.store.loadAccountState().status !== "paused"
+    ) {
       const audit = await this.auditOlderHistory(
         scope,
         request,
@@ -676,6 +787,10 @@ export class HistoryCollector {
     };
 
     while (pagesFetched < pageBudget) {
+      if (this.options.store.loadAccountState().status === "paused") {
+        state = { ...state, status: "partial", continuation: offset };
+        break;
+      }
       if (seenOffsets.has(offset)) {
         warnings.push("older_history_audit_repeated_offset");
         state = {
@@ -697,6 +812,10 @@ export class HistoryCollector {
         });
       } catch (error) {
         warnings.push(`older_history_audit_${errorCode(error)}`);
+        if (isAccountStopError(error)) {
+          const accountState = this.pauseForError(error, now);
+          warnings.push(accountPauseWarning(accountState));
+        }
         state = {
           ...state,
           status: "partial",
@@ -823,6 +942,13 @@ export class HistoryCollector {
         },
       );
     } catch (error) {
+      const accountState = isAccountStopError(error)
+        ? this.pauseForError(error, now)
+        : null;
+      const pageWarnings = [
+        `detail_${errorCode(error)}`,
+        ...(accountState ? [accountPauseWarning(accountState)] : []),
+      ];
       const revisit = this.saveRevisit(
         candidate,
         now,
@@ -835,13 +961,15 @@ export class HistoryCollector {
         accountId: this.options.accountId,
         mode: request.mode,
         scanStartedAt,
-        identity,
+        identity: accountState
+          ? pausedIdentity(identity, accountState, errorCode(error))
+          : identity,
         summary: candidate.summary,
         scopes: [...candidate.scopes].sort(),
         detail: null,
         messages: [],
         coverage: "partial",
-        warnings: [`detail_${errorCode(error)}`],
+        warnings: pageWarnings,
         pageKind: "detail",
         pageNumber: existingRevisit?.detailPagesFetched ?? 0,
         nextContinuation: revisit.continuation,
@@ -852,7 +980,7 @@ export class HistoryCollector {
         messages: [],
         revisit,
         coverage: "partial",
-        warnings: [`detail_${errorCode(error)}`],
+        warnings: pageWarnings,
         detailPagesFetched: 0,
       };
     }
@@ -1014,7 +1142,13 @@ export class HistoryCollector {
         );
       } catch (error) {
         const reason = classifyRevisitReason(error);
-        warnings.push(`messages_${errorCode(error)}`);
+        const accountState = isAccountStopError(error)
+          ? this.pauseForError(error, now)
+          : null;
+        warnings.push(
+          `messages_${errorCode(error)}`,
+          ...(accountState ? [accountPauseWarning(accountState)] : []),
+        );
         const revisit = this.saveRevisit(
           candidate,
           now,
@@ -1028,7 +1162,9 @@ export class HistoryCollector {
           accountId: this.options.accountId,
           mode,
           scanStartedAt,
-          identity,
+          identity: accountState
+            ? pausedIdentity(identity, accountState, errorCode(error))
+            : identity,
           summary: candidate.summary,
           scopes: [...candidate.scopes].sort(),
           detail: {
@@ -1967,6 +2103,90 @@ function errorCode(error: unknown): string {
   return "adapter_error";
 }
 
+function isAccountStopError(error: unknown): boolean {
+  return (
+    error instanceof AuthenticationRequiredError ||
+    (error instanceof HttpStatusError &&
+      [401, 403, 429].includes(error.status))
+  );
+}
+
+function isRateLimitedError(error: unknown): boolean {
+  return (
+    error instanceof RateLimitedError ||
+    (error instanceof HttpStatusError && error.status === 429)
+  );
+}
+
+function retryAfterDeadline(value: string | null, now: Date): string | null {
+  if (value === null) {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+    const seconds = Number(trimmed);
+    const deadline = now.getTime() + seconds * 1000;
+    const date = new Date(deadline);
+    return Number.isFinite(seconds) && Number.isFinite(date.getTime())
+      ? date.toISOString()
+      : null;
+  }
+  const date = new Date(trimmed);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+function readyAccountState(): HistoryAccountState {
+  return {
+    status: "ready",
+    reason: null,
+    pausedAt: null,
+    cooldownUntil: null,
+    lastError: null,
+  };
+}
+
+function isActiveCooldown(
+  state: HistoryAccountState,
+  now: Date,
+): boolean {
+  if (state.status !== "paused" || state.reason !== "cooldown") {
+    return false;
+  }
+  if (state.cooldownUntil === null) {
+    return true;
+  }
+  return new Date(state.cooldownUntil).getTime() > now.getTime();
+}
+
+function accountPauseWarning(state: HistoryAccountState): string {
+  return state.reason === "cooldown"
+    ? "account_paused_cooldown"
+    : "account_paused_authentication";
+}
+
+function pausedIdentity(
+  identity: IdentityRecord | null,
+  state: HistoryAccountState,
+  errorCodeValue?: string,
+): IdentityRecord {
+  return {
+    providerUserId: identity?.providerUserId ?? null,
+    workspaceId: identity?.workspaceId ?? null,
+    quotaOwnerId: identity?.quotaOwnerId ?? null,
+    surface: identity?.surface ?? "unknown",
+    authState: "paused",
+    identityErrors: uniqueWarnings([
+      ...(identity?.identityErrors ?? []),
+      accountPauseWarning(state),
+      ...(state.lastError ? [state.lastError] : []),
+      ...(errorCodeValue ? [errorCodeValue] : []),
+    ]),
+  };
+}
+
 function unknownScopeCoverage(scope: HistoryScope): ScopeCoverageResult {
   return {
     scope,
@@ -1989,6 +2209,7 @@ function blockedResult(
   scanStartedAt: string,
   identity: IdentityRecord,
   warning: string,
+  accountState: HistoryAccountState,
 ): HistoryCollectionResult {
   const active = unknownScopeCoverage("active");
   const archived = unknownScopeCoverage("archived");
@@ -1998,6 +2219,7 @@ function blockedResult(
     range,
     scanStartedAt,
     status: "blocked",
+    accountState,
     identity,
     scopes: [active, archived],
     conversations: [],
