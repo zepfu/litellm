@@ -2805,13 +2805,20 @@ async def test_candidate_loop_capacity_retries_use_one_request_coordinator(  # n
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("expiry_mode", ["planner_deadline", "in_flight"])
-@pytest.mark.parametrize("failure_kind", ["sse", "raw_http"])
+@pytest.mark.parametrize(
+    "failure_kind", ["sse", "raw_http", "wrapped_json_bytes", "wrapped_text_bytes"]
+)
 async def test_candidate_loop_capacity_expiry_preserves_upstream_failure(  # noqa: PLR0915
     expiry_mode: str,
     failure_kind: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import httpx
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from fastapi.exception_handlers import http_exception_handler
+    from litellm.proxy._types import ProxyException
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
 
     from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
         _PassthroughHiddenRetryBudgetTimeout,
@@ -2920,6 +2927,72 @@ async def test_candidate_loop_capacity_expiry_preserves_upstream_failure(  # noq
             raise _PassthroughHiddenRetryBudgetTimeout(
                 "upstream request timed out"
             )
+        if failure_kind.startswith("wrapped_"):
+            body = (
+                raw_body.encode()
+                if failure_kind == "wrapped_json_bytes"
+                else b"upstream overloaded body"
+            )
+            upstream_response = httpx.Response(
+                529,
+                request=httpx.Request("POST", target_url),
+                content=body,
+                headers={"Retry-After": "17", "Content-Type": "application/json"},
+            )
+            upstream_response.headers.update(
+                {"Content-Length": "1", "Transfer-Encoding": "chunked",
+                 "Content-Encoding": "gzip"}
+            )
+            mock_request = MagicMock(spec=Request)
+            mock_request.method = "POST"
+            mock_request.url = SimpleNamespace(
+                path="/openai_passthrough/v1/responses"
+            )
+            mock_request.headers = {"content-type": "application/json"}
+            mock_request.query_params = {}
+            mock_request.state = SimpleNamespace()
+            mock_request.is_disconnected = AsyncMock(return_value=False)
+            custom_body = {"model": candidate["model"], "stream": True}
+            client = MagicMock()
+            client.client.send = AsyncMock(return_value=upstream_response)
+
+            async def run_with_renewal(_lease, operation):
+                return await operation()
+
+            with patch.object(
+                pte, "_aawm_session_owner_pre_send_guard", new=AsyncMock()
+            ), patch.object(
+                session_affinity, "get_request_session_owner_lease", return_value=None
+            ), patch.object(
+                session_affinity, "run_with_session_owner_lease_renewal",
+                new=run_with_renewal,
+            ), patch.object(
+                session_affinity, "finalize_request_session_owner_lease",
+                new=AsyncMock(),
+            ), patch.object(
+                pte, "get_async_httpx_client", return_value=client
+            ), patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as logging_obj:
+                logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+                logging_obj.post_call_failure_hook = AsyncMock()
+                with pytest.raises(ProxyException) as wrapped:
+                    await pte.pass_through_request(
+                        request=mock_request,
+                        target=target_url,
+                        custom_headers={},
+                        user_api_key_dict=MagicMock(),
+                        custom_body=custom_body,
+                        custom_llm_provider="openai",
+                        stream=True,
+                        caller_managed_hidden_retry=True,
+                    )
+            client.client.send.assert_awaited_once()
+            assert wrapped.value.detail == body
+            assert wrapped.value.upstream_headers["retry-after"] == "17"
+            assert "Retry-After" not in wrapped.value.headers
+            wrapped.value.error_class = "server_overloaded"
+            raise wrapped.value
         if failure_kind == "raw_http":
             upstream_request = httpx.Request("POST", target_url)
             upstream_response = httpx.Response(
@@ -3079,13 +3152,26 @@ async def test_candidate_loop_capacity_expiry_preserves_upstream_failure(  # noq
     assert len(failure_records) == len(provider_calls)
     assert terminal_records == [("deadline_exhausted", "server_overloaded", 529)]
     assert exc_info.value.status_code == 529
-    assert exc_info.value.detail == (
-        raw_body if failure_kind == "raw_http" else upstream_detail
+    expected_detail = (
+        raw_body if failure_kind == "raw_http"
+        else "upstream overloaded body" if failure_kind == "wrapped_text_bytes"
+        else upstream_detail
     )
+    assert exc_info.value.detail == expected_detail
     assert exc_info.value.headers == {
-        "Retry-After": "7200" if failure_kind == "raw_http" else "23",
+        "Retry-After": (
+            "7200" if failure_kind == "raw_http"
+            else "17" if failure_kind.startswith("wrapped_") else "23"
+        ),
     }
     assert getattr(exc_info.value, "_aawm_openai_capacity_expired", False) is True
+    response = await http_exception_handler(request, exc_info.value)
+    assert response.status_code == 529
+    assert json.loads(response.body) == {"detail": expected_detail}
+    assert response.headers["retry-after"] == exc_info.value.headers["Retry-After"]
+    assert "transfer-encoding" not in response.headers
+    assert "content-encoding" not in response.headers
+    assert int(response.headers["content-length"]) == len(response.body)
 
 
 @pytest.mark.asyncio
