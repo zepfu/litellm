@@ -1827,15 +1827,85 @@ class TestCoordinatorLogging:
                     wakeup_reason="timer",
                     terminal_reason="",
                     commit_state="pre_commit",
+                    phase="pre_wait",
+                    error_class="server_overloaded",
+                    status_code=502,
                 )
             )
         assert "openai_alpha_capacity_retry" in caplog.text
+        assert "phase=pre_wait" in caplog.text
         assert "target_class=openai:gpt" in caplog.text
         assert "target_hash=abc123" in caplog.text
+        assert "error_class=server_overloaded" in caplog.text
+        assert "status_code=502" in caplog.text
         assert "ordinal=0" in caplog.text
+        assert "selected_delay=15.0" in caplog.text
         assert "wait=15.0" in caplog.text
         assert "wakeup=timer" in caplog.text
         assert "commit=pre_commit" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_sleep_emits_sanitized_pre_wait_before_wait_and_retry(
+        self, monkeypatch
+    ):
+        clock = [100.0]
+        emitted = []
+
+        def emit(entry):
+            emitted.append(entry)
+
+        async def fake_wait_for(awaitable, timeout):
+            emitted.append(("wait", timeout))
+            awaitable.close()
+            clock[0] += timeout
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr(
+            pre_commit_retry_module.time,
+            "monotonic",
+            lambda: clock[0],
+        )
+        monkeypatch.setattr(
+            pre_commit_retry_module,
+            "_emit_capacity_retry_log",
+            emit,
+        )
+        monkeypatch.setattr(
+            pre_commit_retry_module.asyncio,
+            "wait_for",
+            fake_wait_for,
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry."
+            "_resolve_redis_for_capacity_wakeup",
+            return_value=None,
+        ):
+            coordinator = OpenAIAlphaCapacityRetryCoordinator(
+                target_identity="openai:gpt\nsecret",
+            )
+            wakeup_reason = await coordinator.sleep_with_wakeup(
+                0.05,
+                error_class="server_overloaded\nsecret",
+                status_code=502,
+            )
+            coordinator.record_retry(wakeup_reason)
+
+        assert wakeup_reason == "timer"
+        assert emitted[0].phase == "pre_wait"
+        assert emitted[0].target_class == "openai:gpt_secret"
+        assert emitted[0].error_class == "server_overloaded_secret"
+        assert emitted[0].status_code == 502
+        assert emitted[0].retry_ordinal == 0
+        assert emitted[0].wait_seconds == 0.05
+        assert emitted[0].wakeup_reason == "pending"
+        assert emitted[1][0] == "wait"
+        assert emitted[2].phase == "retry"
+        assert emitted[2].retry_ordinal == 0
+        assert emitted[2].wait_seconds == 0.05
+        assert emitted[2].wakeup_reason == "timer"
+        assert emitted[2].error_class == "server_overloaded_secret"
+        assert emitted[2].status_code == 502
 
     def test_emit_terminal_log(self, caplog):
         import logging as _logging
@@ -1847,10 +1917,17 @@ class TestCoordinatorLogging:
                 elapsed_seconds=100.0,
                 deadline_seconds=7200.0,
                 terminal_reason="deadline_exhausted",
+                error_class="server_overloaded",
+                status_code=503,
             )
         assert "openai_alpha_capacity_terminal" in caplog.text
+        assert "phase=terminal" in caplog.text
         assert "target_class=openai:gpt" in caplog.text
+        assert "error_class=server_overloaded" in caplog.text
+        assert "status_code=503" in caplog.text
+        assert "ordinal=5" in caplog.text
         assert "retries=5" in caplog.text
+        assert "remaining=7100.0" in caplog.text
         assert "reason=deadline_exhausted" in caplog.text
 
 

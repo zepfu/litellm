@@ -124,6 +124,37 @@ def _hash_target_identity(target_identity: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+_LOG_SAFE_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
+    "._:/@-"
+)
+_LOG_VALUE_MAX_LENGTH = 160
+
+
+def _sanitize_log_value(
+    value: Any,
+    *,
+    fallback: str = "unknown",
+    max_length: int = _LOG_VALUE_MAX_LENGTH,
+) -> str:
+    """Return a bounded, single-line log token without request data."""
+    if value is None:
+        return fallback
+    try:
+        text = str(value).strip()
+    except Exception:
+        return fallback
+    if not text:
+        return fallback
+    sanitized = "".join(
+        character if character in _LOG_SAFE_CHARACTERS else "_"
+        for character in text
+    )
+    return sanitized[:max_length] or fallback
+
+
 @dataclass(frozen=True)
 class CapacityRetryLogEntry:
     """Structured Docker-log record emitted for every wait and retry."""
@@ -135,27 +166,50 @@ class CapacityRetryLogEntry:
     elapsed_seconds: float
     deadline_seconds: float
     remaining_seconds: float
-    wakeup_reason: str  # "timer" | "peer_success"
+    wakeup_reason: str  # "pending" | "timer" | "peer_success" | "none"
     terminal_reason: str  # empty unless terminal
     commit_state: str  # "pre_commit" | "deadline_exhausted" | "terminal"
+    phase: str = "retry"  # "pre_wait" | "retry"
+    error_class: str = "unknown"
+    status_code: Optional[int] = None
 
 
 def _emit_capacity_retry_log(entry: CapacityRetryLogEntry) -> None:
+    target_class = _sanitize_log_value(entry.target_class)
+    target_hash = _sanitize_log_value(entry.target_hash)
+    error_class = _sanitize_log_value(entry.error_class)
+    status_code = _sanitize_log_value(entry.status_code)
+    phase = _sanitize_log_value(entry.phase, fallback="retry")
+    wakeup_reason = _sanitize_log_value(entry.wakeup_reason)
+    terminal_reason = _sanitize_log_value(
+        entry.terminal_reason,
+        fallback="",
+    )
+    commit_state = _sanitize_log_value(
+        entry.commit_state,
+        fallback="pre_commit",
+    )
     logger.info(
         "openai_alpha_capacity_retry "
-        "target_class=%s target_hash=%s ordinal=%d "
-        "wait=%.1fs elapsed=%.1fs deadline=%.1fs remaining=%.1fs "
+        "phase=%s target_class=%s target_hash=%s "
+        "error_class=%s status_code=%s ordinal=%d "
+        "selected_delay=%.1fs wait=%.1fs "
+        "elapsed=%.1fs deadline=%.1fs remaining=%.1fs "
         "wakeup=%s terminal=%s commit=%s",
-        entry.target_class,
-        entry.target_hash,
+        phase,
+        target_class,
+        target_hash,
+        error_class,
+        status_code,
         entry.retry_ordinal,
+        entry.wait_seconds,
         entry.wait_seconds,
         entry.elapsed_seconds,
         entry.deadline_seconds,
         entry.remaining_seconds,
-        entry.wakeup_reason,
-        entry.terminal_reason,
-        entry.commit_state,
+        wakeup_reason,
+        terminal_reason,
+        commit_state,
     )
 
 
@@ -167,17 +221,35 @@ def _emit_openai_capacity_terminal_log(
     elapsed_seconds: float,
     deadline_seconds: float,
     terminal_reason: str,
+    error_class: Optional[str] = None,
+    status_code: Optional[int] = None,
+    wakeup_reason: str = "none",
+    wait_seconds: float = 0.0,
+    remaining_seconds: Optional[float] = None,
 ) -> None:
+    if remaining_seconds is None:
+        remaining_seconds = max(0.0, deadline_seconds - elapsed_seconds)
     logger.info(
         "openai_alpha_capacity_terminal "
-        "target_class=%s target_hash=%s retries=%d "
-        "elapsed=%.1fs deadline=%.1fs reason=%s",
-        target_class,
-        target_hash,
+        "phase=terminal target_class=%s target_hash=%s "
+        "error_class=%s status_code=%s ordinal=%d "
+        "selected_delay=%.1fs wait=%.1fs "
+        "elapsed=%.1fs deadline=%.1fs remaining=%.1fs "
+        "wakeup=%s terminal=%s reason=%s commit=terminal retries=%d",
+        _sanitize_log_value(target_class),
+        _sanitize_log_value(target_hash),
+        _sanitize_log_value(error_class),
+        _sanitize_log_value(status_code),
         total_retries,
+        wait_seconds,
+        wait_seconds,
         elapsed_seconds,
         deadline_seconds,
-        terminal_reason,
+        remaining_seconds,
+        _sanitize_log_value(wakeup_reason),
+        _sanitize_log_value(terminal_reason, fallback=""),
+        _sanitize_log_value(terminal_reason, fallback=""),
+        total_retries,
     )
 
 
@@ -278,6 +350,7 @@ class OpenAIAlphaCapacityRetryCoordinator:
     ):
         self._target_identity = target_identity
         self._target_hash = _hash_target_identity(target_identity)
+        self._target_class = _sanitize_log_value(target_identity)
         self._budget = budget or OpenAIAlphaCapacityRetryBudget()
         self._namespace = _resolve_openai_capacity_namespace(namespace)
         self._local_event_key = _capacity_wakeup_scope_key(
@@ -286,6 +359,9 @@ class OpenAIAlphaCapacityRetryCoordinator:
         self._start_monotonic = time.monotonic()
         self._retry_count = 0
         self._terminal_reason: str = ""
+        self._last_error_class: Optional[str] = None
+        self._last_status_code: Optional[int] = None
+        self._pending_wait_seconds: Optional[float] = None
         self._redis_cache = _resolve_redis_for_capacity_wakeup()
         self._redis_key = (
             _build_openai_capacity_success_redis_key(target_identity, namespace)
@@ -340,6 +416,7 @@ class OpenAIAlphaCapacityRetryCoordinator:
 
         self._target_identity = target_identity
         self._target_hash = _hash_target_identity(target_identity)
+        self._target_class = _sanitize_log_value(target_identity)
         self._namespace = resolved_namespace
         self._redis_cache = _resolve_redis_for_capacity_wakeup()
         self._redis_key = (
@@ -391,7 +468,13 @@ class OpenAIAlphaCapacityRetryCoordinator:
             self._target_identity, self._namespace
         )
 
-    async def sleep_with_wakeup(self, wait_seconds: float) -> str:
+    async def sleep_with_wakeup(
+        self,
+        wait_seconds: float,
+        *,
+        error_class: Optional[str] = None,
+        status_code: Optional[int] = None,
+    ) -> str:
         """Sleep for *wait_seconds* with cross-worker success wakeup.
 
         Returns ``"timer"`` if the full interval elapsed, ``"peer_success"``
@@ -400,6 +483,11 @@ class OpenAIAlphaCapacityRetryCoordinator:
         if wait_seconds <= 0:
             return "timer"
 
+        self.record_pre_wait(
+            wait_seconds,
+            error_class=error_class,
+            status_code=status_code,
+        )
         wakeup = _CapacityWakeupState()
         local_events = self._local_events
         sleep_local_event_key = self._local_event_key
@@ -466,15 +554,78 @@ class OpenAIAlphaCapacityRetryCoordinator:
 
         return wakeup.wakeup_reason
 
-    def record_retry(self, wakeup_reason: str) -> None:
+    def _remember_log_metadata(
+        self,
+        *,
+        error_class: Optional[str],
+        status_code: Optional[int],
+    ) -> tuple[str, Optional[int]]:
+        if error_class is not None:
+            self._last_error_class = error_class
+        if status_code is not None:
+            self._last_status_code = status_code
+        return (
+            _sanitize_log_value(self._last_error_class),
+            self._last_status_code,
+        )
+
+    def record_pre_wait(
+        self,
+        wait_seconds: float,
+        *,
+        error_class: Optional[str] = None,
+        status_code: Optional[int] = None,
+    ) -> None:
+        """Emit the retry record before entering the existing wait loop."""
+        wait_seconds = float(wait_seconds)
+        resolved_error_class, resolved_status_code = self._remember_log_metadata(
+            error_class=error_class,
+            status_code=status_code,
+        )
+        self._pending_wait_seconds = wait_seconds
+        _emit_capacity_retry_log(
+            CapacityRetryLogEntry(
+                target_class=self._target_class,
+                target_hash=self._target_hash,
+                retry_ordinal=self._retry_count,
+                wait_seconds=wait_seconds,
+                elapsed_seconds=self.elapsed_seconds,
+                deadline_seconds=self.deadline_seconds,
+                remaining_seconds=self.remaining_seconds,
+                wakeup_reason="pending",
+                terminal_reason="",
+                commit_state="pre_commit",
+                phase="pre_wait",
+                error_class=resolved_error_class,
+                status_code=resolved_status_code,
+            )
+        )
+
+    def record_retry(
+        self,
+        wakeup_reason: str,
+        *,
+        error_class: Optional[str] = None,
+        status_code: Optional[int] = None,
+        terminal_reason: Optional[str] = None,
+    ) -> None:
         """Record a retry attempt and emit structured log."""
+        resolved_error_class, resolved_status_code = self._remember_log_metadata(
+            error_class=error_class,
+            status_code=status_code,
+        )
         ordinal = self._retry_count
-        wait_seconds = self.next_wait_seconds()
+        wait_seconds = (
+            self._pending_wait_seconds
+            if self._pending_wait_seconds is not None
+            else self.next_wait_seconds()
+        )
+        self._pending_wait_seconds = None
         self._retry_count += 1
 
         _emit_capacity_retry_log(
             CapacityRetryLogEntry(
-                target_class=self._target_identity,
+                target_class=self._target_class,
                 target_hash=self._target_hash,
                 retry_ordinal=ordinal,
                 wait_seconds=wait_seconds,
@@ -482,21 +633,39 @@ class OpenAIAlphaCapacityRetryCoordinator:
                 deadline_seconds=self.deadline_seconds,
                 remaining_seconds=self.remaining_seconds,
                 wakeup_reason=wakeup_reason,
-                terminal_reason="",
+                terminal_reason=(
+                    terminal_reason if terminal_reason is not None else ""
+                ),
                 commit_state="pre_commit",
+                phase="retry",
+                error_class=resolved_error_class,
+                status_code=resolved_status_code,
             )
         )
 
-    def record_terminal(self, reason: str) -> None:
+    def record_terminal(
+        self,
+        reason: str,
+        *,
+        error_class: Optional[str] = None,
+        status_code: Optional[int] = None,
+    ) -> None:
         """Record terminal exhaustion and emit structured log."""
+        _, resolved_status_code = self._remember_log_metadata(
+            error_class=error_class,
+            status_code=status_code,
+        )
         self._terminal_reason = reason
         _emit_openai_capacity_terminal_log(
-            target_class=self._target_identity,
+            target_class=self._target_class,
             target_hash=self._target_hash,
             total_retries=self._retry_count,
             elapsed_seconds=self.elapsed_seconds,
             deadline_seconds=self.deadline_seconds,
             terminal_reason=reason,
+            error_class=self._last_error_class,
+            status_code=resolved_status_code,
+            remaining_seconds=self.remaining_seconds,
         )
 
     def wakeup_event(self) -> asyncio.Event:
