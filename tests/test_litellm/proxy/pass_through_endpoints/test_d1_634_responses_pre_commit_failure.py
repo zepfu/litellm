@@ -2075,6 +2075,167 @@ async def test_central_coordinator_replaces_legacy_precommit_cap():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exception_kind", "status_code"),
+    [
+        ("http_exception", 429),
+        ("http_status_error", 502),
+        ("http_exception", 503),
+    ],
+)
+async def test_central_coordinator_retries_raw_http_overload_then_succeeds(
+    exception_kind: str,
+    status_code: int,
+):
+    overload_payload = {
+        "error": {
+            "type": "server_overloaded",
+            "code": "server_overloaded",
+            "message": "The upstream server is overloaded.",
+        }
+    }
+    headers = {"Retry-After": "1", "X-Upstream": "capacity"}
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    response = httpx.Response(
+        status_code,
+        request=request,
+        content=json.dumps(overload_payload).encode("utf-8"),
+        headers=headers,
+    )
+    overload_exception: Exception
+    if exception_kind == "http_exception":
+        overload_exception = HTTPException(
+            status_code=status_code,
+            detail=overload_payload,
+            headers=headers,
+        )
+    else:
+        overload_exception = httpx.HTTPStatusError(
+            "upstream overload",
+            request=request,
+            response=response,
+        )
+
+    coordinator = MagicMock()
+    coordinator.deadline_seconds = 7200.0
+    coordinator.remaining_seconds = 7200.0
+    coordinator.within_deadline.return_value = True
+    coordinator.next_wait_seconds.return_value = 15.0
+    coordinator.sleep_with_wakeup = AsyncMock(return_value="timer")
+    coordinator.record_retry = MagicMock()
+    coordinator.signal_success = AsyncMock()
+
+    attempts = 0
+
+    async def operation():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise overload_exception
+        return "committed"
+
+    result = await _execute_passthrough_pre_first_byte_with_hidden_retries(
+        kwargs={},
+        operation_name="stream_pre_first_byte",
+        operation=operation,
+        caller_managed_hidden_retry=False,
+        openai_capacity_coordinator=coordinator,
+    )
+
+    assert result == "committed"
+    assert attempts == 2
+    coordinator.sleep_with_wakeup.assert_awaited_once_with(15.0)
+    coordinator.record_retry.assert_called_once_with("timer")
+    coordinator.signal_success.assert_awaited_once()
+    if isinstance(overload_exception, HTTPException):
+        assert overload_exception.status_code == status_code
+        assert overload_exception.detail == overload_payload
+        assert overload_exception.headers == headers
+    else:
+        assert overload_exception.response.status_code == status_code
+        assert overload_exception.response.content == json.dumps(
+            overload_payload
+        ).encode("utf-8")
+        assert overload_exception.response.headers["retry-after"] == "1"
+        assert overload_exception.response.headers["x-upstream"] == "capacity"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exception_kind", "error_payload"),
+    [
+        (
+            "http_exception",
+            {
+                "error": {
+                    "type": "usage_limit_reached",
+                    "code": "usage_limit_reached",
+                    "message": "Quota exhausted.",
+                }
+            },
+        ),
+        (
+            "http_status_error",
+            {
+                "error": {
+                    "type": "invalid_api_key",
+                    "code": "invalid_api_key",
+                    "message": "Authentication failed.",
+                }
+            },
+        ),
+    ],
+)
+async def test_central_coordinator_exits_raw_http_quota_or_auth_immediately(
+    exception_kind: str,
+    error_payload: dict[str, Any],
+):
+    status_code = 429 if exception_kind == "http_exception" else 503
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    response = httpx.Response(
+        status_code,
+        request=request,
+        content=json.dumps(error_payload).encode("utf-8"),
+    )
+    if exception_kind == "http_exception":
+        exception: Exception = HTTPException(
+            status_code=status_code,
+            detail=error_payload,
+            headers={"X-Upstream": "quota"},
+        )
+    else:
+        exception = httpx.HTTPStatusError(
+            "upstream terminal error",
+            request=request,
+            response=response,
+        )
+
+    coordinator = MagicMock()
+    coordinator.deadline_seconds = 7200.0
+    coordinator.remaining_seconds = 7200.0
+    coordinator.sleep_with_wakeup = AsyncMock(
+        side_effect=AssertionError("non-capacity HTTP error must not sleep")
+    )
+    coordinator.record_retry = MagicMock()
+
+    async def operation():
+        raise exception
+
+    with pytest.raises(type(exception)) as raised:
+        await _execute_passthrough_pre_first_byte_with_hidden_retries(
+            kwargs={},
+            operation_name="stream_pre_first_byte",
+            operation=operation,
+            caller_managed_hidden_retry=False,
+            openai_capacity_coordinator=coordinator,
+        )
+
+    assert raised.value is exception
+    coordinator.sleep_with_wakeup.assert_not_awaited()
+    coordinator.record_retry.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_central_coordinator_uses_remaining_deadline_once_per_attempt():
     coordinator = OpenAIAlphaCapacityRetryCoordinator(
         target_identity="openai:gpt",

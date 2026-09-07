@@ -1432,6 +1432,43 @@ def _classify_passthrough_hidden_retry_failure(
     return None, exc.__class__.__name__, None
 
 
+def _classify_passthrough_raw_http_error(
+    exc: Exception,
+    *,
+    status_code: Optional[int],
+) -> Optional[Tuple[str, str, bool]]:
+    if not isinstance(exc, (HTTPException, httpx.HTTPStatusError)):
+        return None
+    if status_code not in {
+        status.HTTP_429_TOO_MANY_REQUESTS,
+        status.HTTP_502_BAD_GATEWAY,
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+    }:
+        return None
+
+    detail: Any = getattr(exc, "detail", None)
+    if detail is None and isinstance(exc, httpx.HTTPStatusError):
+        try:
+            detail = exc.response.content
+        except Exception:
+            detail = None
+
+    payload = _coerce_upstream_error_payload(detail)
+    error_text = _extract_passthrough_upstream_error_text(exc)
+    if payload is None:
+        payload = _coerce_upstream_error_payload(error_text)
+    if payload is None and error_text.strip():
+        payload = {"message": error_text}
+    if payload is None:
+        return None
+
+    if not payload.get("message") and error_text.strip():
+        payload = {**payload, "message": error_text}
+    return PassThroughStreamingHandler._classify_responses_pre_commit_error(
+        payload
+    )
+
+
 def _is_passthrough_pre_first_byte_hidden_retryable(
     exc: Exception,
     *,
@@ -1780,14 +1817,34 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 url=url,
                 custom_llm_provider=custom_llm_provider,
             )
+            raw_http_classification = _classify_passthrough_raw_http_error(
+                exc,
+                status_code=status_code,
+            )
+            if raw_http_classification is not None:
+                _, raw_failure_classification, _ = raw_http_classification
+                failure_classification = raw_failure_classification
+            raw_http_capacity_overload = bool(
+                raw_http_classification is not None
+                and raw_http_classification[0]
+                in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
+                and raw_http_classification[2]
+            )
             if (
                 openai_capacity_coordinator is not None
-                and isinstance(exc, ResponsesStreamPreCommitFailure)
-                and exc.error_class in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
-                and exc.retryable
+                and (
+                    (
+                        isinstance(exc, ResponsesStreamPreCommitFailure)
+                        and exc.error_class
+                        in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
+                        and exc.retryable
+                    )
+                    or raw_http_capacity_overload
+                )
             ):
                 if not openai_capacity_coordinator.within_deadline():
-                    exc.pre_commit_retry_exhausted = True
+                    if isinstance(exc, ResponsesStreamPreCommitFailure):
+                        exc.pre_commit_retry_exhausted = True
                     openai_capacity_coordinator.record_terminal(
                         "deadline_exhausted"
                     )
