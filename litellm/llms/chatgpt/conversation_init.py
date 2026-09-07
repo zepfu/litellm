@@ -21,6 +21,7 @@ Live authenticated Oracle-browser proof remains a separate acceptance gate.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -29,6 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
     Any,
+    Callable,
     Dict,
     Iterable,
     List,
@@ -40,6 +42,7 @@ from typing import (
     runtime_checkable,
 )
 from urllib import request as urllib_request
+from urllib.parse import urlsplit
 
 CHATGPT_CONVERSATION_INIT_PROVIDER = "chatgpt"
 CHATGPT_CONVERSATION_INIT_SOURCE = "chatgpt_conversation_init"
@@ -59,6 +62,12 @@ CHATGPT_CONVERSATION_INIT_ACCOUNT_IDENTITY_SOURCE = (
 CHATGPT_CONVERSATION_INIT_SOURCE_IDENTITY_SOURCE = (
     "chatgpt.conversation_init.collector_source_path"
 )
+CHATGPT_CONVERSATION_INIT_BROWSER_CDP_ENDPOINT_ENV = (
+    "AAWM_CHATGPT_CONVERSATION_INIT_BROWSER_CDP_ENDPOINT"
+)
+ORACLE_BROWSER_CDP_ENDPOINT_ENV = "ORACLE_BROWSER_CDP_ENDPOINT"
+DEFAULT_ORACLE_BROWSER_CDP_ENDPOINT = "http://127.0.0.1:9222"
+ORACLE_BROWSER_BOUNDARY_NAME = "oracle_browser_cdp_attach"
 
 
 # Truncation does not silently claim completeness.
@@ -124,6 +133,10 @@ _SECRET_KEY_MARKERS = (
     "passwd",
     "secret",
     "bearer",
+    "token",
+    "session",
+    "storage",
+    "indexeddb",
     "private_key",
     "privatekey",
     "email",
@@ -162,6 +175,7 @@ _IDENTITY_FIELD_NAMES = (
 )
 _PII_FIELD_NAMES = (
     "title",
+    "titles",
     "display_name",
     "displayname",
     "full_name",
@@ -171,6 +185,7 @@ _PII_FIELD_NAMES = (
     "last_name",
     "lastname",
     "username",
+    "usernames",
     "user_name",
     "workspace",
     "workspace_name",
@@ -178,8 +193,47 @@ _PII_FIELD_NAMES = (
     "feature_note",
     "featurenote",
     "note",
+    "notes",
     "description",
     "email",
+)
+_SAFE_STRING_FIELD_NAMES = {
+    _name.lower()
+    for _name in (
+        *_IDENTITY_FIELD_NAMES,
+        "default_model_slug",
+        "intended_default_model_slug",
+        "reset_after",
+        "reset_at",
+        "resets_at",
+        "unit",
+        "status",
+        "state",
+        "mode",
+        "version",
+        "category",
+        "period",
+        "window",
+    )
+}
+_SAFE_UNKNOWN_CONTEXT_MARKERS = (
+    "capability",
+    "capabilities",
+    "feature",
+    "features",
+    "usage",
+    "usages",
+    "limit",
+    "limits",
+    "quota",
+    "quotas",
+    "progress",
+    "blocked",
+    "flag",
+    "flags",
+    "availability",
+    "supported",
+    "enabled",
 )
 
 _REMAINING_KEYS = ("remaining", "remaining_count", "remainingCount", "left")
@@ -779,6 +833,7 @@ def _redact_mapping(
     *,
     depth: int,
     parent_key: Optional[str] = None,
+    allow_unknown_strings: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], int]:
     redacted_count = 0
     payload: Dict[str, Any] = {}
@@ -786,6 +841,7 @@ def _redact_mapping(
     items = list(mapping.items())[:MAX_PROJECTION_OBJECT_KEYS]
     parent_normalized = _normalize_key(parent_key) if parent_key else ""
     identity_container = parent_normalized in _ACCOUNT_IDENTITY_CONTAINERS
+    safe_context = allow_unknown_strings or _is_safe_unknown_context(parent_key)
     for key, value in items:
         name = str(key)
         normalized = _normalize_key(name)
@@ -794,14 +850,19 @@ def _redact_mapping(
             or _is_pii_field_name(name)
             or normalized in _ACCOUNT_IDENTITY_KEYS
             or (identity_container and normalized == "id")
+            or (identity_container and normalized == "name")
+            or _is_unsafe_mapping_key(name)
         ):
-            schema[name] = {"kind": "redacted"}
+            schema[_schema_key_for_redaction(name)] = {"kind": "redacted"}
             redacted_count += 1
             continue
         redacted_value, node, nested_redacted = _redact_value(
             value,
             depth=depth + 1,
             parent_key=name,
+            allow_unknown_strings=(
+                safe_context or _is_safe_unknown_context(name)
+            ),
         )
         redacted_count += nested_redacted
         schema[name] = node
@@ -815,6 +876,7 @@ def _redact_value(
     *,
     depth: int,
     parent_key: Optional[str] = None,
+    allow_unknown_strings: bool = False,
 ) -> Tuple[Any, Dict[str, Any], int]:
     if depth > MAX_PROJECTION_DEPTH:
         return None, {"kind": "truncated"}, 0
@@ -829,7 +891,11 @@ def _redact_value(
             return None, {"kind": "redacted"}, 1
         return value, {"kind": "float", "value": value}, 0
     if isinstance(value, str):
-        if _is_unsafe_string(value):
+        if not _is_safe_string_value(
+            value,
+            field_name=parent_key,
+            allow_unknown_strings=allow_unknown_strings,
+        ):
             return None, {"kind": "redacted"}, 1
         clipped = value if len(value) <= MAX_SAFE_STRING_LENGTH else value[:MAX_SAFE_STRING_LENGTH]
         kind = "slug" if _SLUG_RE.match(clipped) else "string"
@@ -839,6 +905,7 @@ def _redact_value(
             value,
             depth=depth,
             parent_key=parent_key,
+            allow_unknown_strings=allow_unknown_strings,
         )
         fingerprint = _schema_fingerprint(nested_schema)
         object_node: Dict[str, Any] = {
@@ -846,6 +913,7 @@ def _redact_value(
             "keys": sorted(nested_schema),
             "schema_fingerprint": fingerprint,
             "state": "present" if nested_schema else "empty_unknown",
+            "projection": nested_payload,
         }
         return nested_payload, object_node, redacted
     if isinstance(value, list):
@@ -855,7 +923,10 @@ def _redact_value(
         bounded = value[:MAX_PROJECTION_LIST_ITEMS]
         for item in bounded:
             nested_value, item_node, nested_redacted = _redact_value(
-                item, depth=depth + 1, parent_key=parent_key
+                item,
+                depth=depth + 1,
+                parent_key=parent_key,
+                allow_unknown_strings=allow_unknown_strings
             )
             redacted += nested_redacted
             item_kinds.append(str(item_node.get("kind") or "unknown"))
@@ -870,6 +941,7 @@ def _redact_value(
             "length": len(value),
             "state": state,
             "item_kinds": sorted(set(item_kinds)),
+            "projection": items,
         }
         return items, list_node, redacted
     return None, {"kind": "redacted"}, 1
@@ -1286,29 +1358,74 @@ def _is_pii_field_name(name: str) -> bool:
     return False
 
 
+def _is_safe_unknown_context(name: Optional[str]) -> bool:
+    normalized = _normalize_key(name) if name else ""
+    return bool(
+        normalized
+        and any(marker in normalized for marker in _SAFE_UNKNOWN_CONTEXT_MARKERS)
+    )
+
+
+def _is_unsafe_mapping_key(name: str) -> bool:
+    """Reject dynamic keys that can carry personal data before persistence."""
+    text = str(name)
+    return (
+        len(text) > MAX_SAFE_STRING_LENGTH
+        or any(character.isspace() for character in text)
+        or _is_unsafe_string(text)
+    )
+
+
+def _schema_key_for_redaction(_name: str) -> str:
+    """Avoid persisting arbitrary sensitive key names in the schema."""
+    return "redacted_field"
+
+
+def _is_safe_telemetry_string(value: str) -> bool:
+    text = value.strip()
+    if not text or len(text) > MAX_SAFE_STRING_LENGTH:
+        return False
+    if any(ord(character) < 32 for character in text):
+        return False
+    if _is_unsafe_string(text):
+        return False
+    return bool(_SLUG_RE.match(text) or _is_timestamp_value(text))
+
+
+def _is_safe_string_value(
+    value: str,
+    *,
+    field_name: Optional[str],
+    allow_unknown_strings: bool,
+) -> bool:
+    """Allow only known telemetry strings or enum-like unknown values."""
+    normalized = _normalize_key(field_name) if field_name else ""
+    if normalized in _SAFE_STRING_FIELD_NAMES:
+        return _is_safe_telemetry_string(value)
+    if allow_unknown_strings:
+        return _is_safe_telemetry_string(value)
+    return False
+
+
 def _entry_projections(entry: Mapping[str, Any]) -> Dict[str, Any]:
     projections: Dict[str, Any] = {}
     for key, value in list(entry.items())[:MAX_PROJECTION_OBJECT_KEYS]:
         name = str(key)
-        if name == "_identity" or _is_secret_key(name) or _is_pii_field_name(name):
+        if (
+            name == "_identity"
+            or _is_secret_key(name)
+            or _is_pii_field_name(name)
+            or _normalize_key(name) == "name"
+        ):
             continue
-        if isinstance(value, bool):
-            projections[name] = value
-        elif isinstance(value, (int, float)) and not isinstance(value, bool):
-            if isinstance(value, float) and (value != value or value in {float("inf"), float("-inf")}):
-                continue
-            projections[name] = value
-        elif isinstance(value, str) and not _is_unsafe_string(value):
-            if _is_pii_field_value(value):
-                continue
-            if _is_timestamp_value(value):
-                continue
-            clipped = value if len(value) <= MAX_SAFE_STRING_LENGTH else value[:MAX_SAFE_STRING_LENGTH]
-            projections[name] = clipped
-        elif value is None:
-            projections[name] = None
-        else:
-            projections[name] = {"kind": _json_kind(value)}
+        projected, node, _redacted = _redact_value(
+            value,
+            depth=1,
+            parent_key=name,
+            allow_unknown_strings=_is_safe_unknown_context(name),
+        )
+        if node.get("kind") != "redacted":
+            projections[name] = projected
     return projections
 
 
@@ -1512,6 +1629,204 @@ class ConversationInitTransport(Protocol):
         """Execute the no-body POST contract and return a raw envelope."""
 
 
+class OracleBrowserBoundaryUnavailable(ChatGPTConversationInitError):
+    """The existing Oracle browser boundary cannot safely serve this poll."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, telemetry_class="auth")
+
+
+_ORACLE_BROWSER_FETCH_SCRIPT = """
+async (url) => {
+  const response = await fetch(url, {
+    method: "POST",
+    credentials: "include"
+  });
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch (_) {
+    payload = null;
+  }
+  return {
+    status_code: response.status,
+    payload
+  };
+}
+"""
+
+
+class OracleBrowserConversationInitTransport:
+    """Attach to an existing Oracle browser and issue the frontend POST.
+
+    This transport deliberately uses CDP attachment and an existing ChatGPT
+    page. It never launches a browser, creates a persistent context, reads
+    cookies or storage, or returns response headers.
+    """
+
+    boundary_name = ORACLE_BROWSER_BOUNDARY_NAME
+
+    def __init__(
+        self,
+        *,
+        cdp_endpoint: Optional[str] = None,
+        timeout_seconds: float = 30.0,
+        playwright_factory: Optional[Callable[[], Any]] = None,
+    ) -> None:
+        endpoint = cdp_endpoint
+        if endpoint is None:
+            endpoint = os.getenv(CHATGPT_CONVERSATION_INIT_BROWSER_CDP_ENDPOINT_ENV)
+        if endpoint is None:
+            endpoint = os.getenv(ORACLE_BROWSER_CDP_ENDPOINT_ENV)
+        self.cdp_endpoint = (
+            str(endpoint or DEFAULT_ORACLE_BROWSER_CDP_ENDPOINT).strip()
+        )
+        if not self.cdp_endpoint:
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser CDP endpoint is not configured."
+            )
+        if timeout_seconds <= 0:
+            raise ValueError("Oracle browser CDP timeout must be greater than 0.")
+        self.timeout_seconds = timeout_seconds
+        self._playwright_factory = playwright_factory
+
+    def fetch(self, request: urllib_request.Request) -> Mapping[str, Any]:
+        _validate_oracle_browser_request(request)
+        playwright = None
+        browser = None
+        try:
+            playwright = self._start_playwright()
+            browser = playwright.chromium.connect_over_cdp(
+                self.cdp_endpoint,
+                timeout=int(self.timeout_seconds * 1000),
+            )
+            page = _find_existing_chatgpt_page(browser, request.full_url)
+            if page is None:
+                raise OracleBrowserBoundaryUnavailable(
+                    "Oracle browser has no existing ChatGPT page for the "
+                    "conversation-init request."
+                )
+            result = page.evaluate(_ORACLE_BROWSER_FETCH_SCRIPT, request.full_url)
+            return _coerce_browser_response(result)
+        except OracleBrowserBoundaryUnavailable:
+            raise
+        except ChatGPTConversationInitError:
+            raise
+        except Exception as exc:
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser boundary is unavailable for conversation-init."
+            ) from exc
+        finally:
+            _disconnect_attached_browser(playwright, browser)
+
+    def _start_playwright(self) -> Any:
+        if self._playwright_factory is not None:
+            return self._playwright_factory()
+        try:
+            playwright_api = importlib.import_module("playwright.sync_api")
+            sync_playwright = playwright_api.sync_playwright
+        except (ImportError, AttributeError) as exc:
+            raise OracleBrowserBoundaryUnavailable(
+                "Live Oracle browser collection requires Playwright in the "
+                "browser-boundary environment."
+            ) from exc
+        try:
+            return sync_playwright().start()
+        except Exception as exc:
+            raise OracleBrowserBoundaryUnavailable(
+                "Live Oracle browser collection could not start Playwright."
+            ) from exc
+
+
+def build_oracle_browser_conversation_init_transport(
+    *,
+    cdp_endpoint: Optional[str] = None,
+    timeout_seconds: float = 30.0,
+) -> OracleBrowserConversationInitTransport:
+    """Build the attach-only transport for the established Oracle boundary."""
+
+    return OracleBrowserConversationInitTransport(
+        cdp_endpoint=cdp_endpoint,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _validate_oracle_browser_request(request: urllib_request.Request) -> None:
+    if request_has_conversation_content(request):
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle conversation-init transport requires POST with no body."
+        )
+    parsed = urlsplit(request.full_url)
+    if parsed.scheme != "https" or parsed.hostname not in {
+        "chatgpt.com",
+        "www.chatgpt.com",
+        "chat.openai.com",
+    }:
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle conversation-init transport only permits ChatGPT HTTPS."
+        )
+    if parsed.path != CHATGPT_CONVERSATION_INIT_PATH:
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle conversation-init transport only permits the "
+            "conversation-init path."
+        )
+
+
+def _find_existing_chatgpt_page(browser: Any, request_url: str) -> Any:
+    target_host = urlsplit(request_url).hostname
+    if not target_host:
+        return None
+    for context in getattr(browser, "contexts", ()):
+        for page in getattr(context, "pages", ()):
+            page_url = str(getattr(page, "url", "") or "")
+            page_host = urlsplit(page_url).hostname
+            if page_host == target_host:
+                return page
+    return None
+
+
+def _coerce_browser_response(result: Any) -> Mapping[str, Any]:
+    if not isinstance(result, Mapping):
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle browser returned no conversation-init response."
+        )
+    status_code = result.get("status_code")
+    if isinstance(status_code, bool) or not isinstance(
+        status_code, (int, float, str)
+    ):
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle browser returned an invalid conversation-init status."
+        )
+    try:
+        status = int(status_code)
+    except (TypeError, ValueError) as exc:
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle browser returned an invalid conversation-init status."
+        ) from exc
+    return {
+        "status_code": status,
+        "payload": result.get("payload"),
+    }
+
+
+def _disconnect_attached_browser(playwright: Any, browser: Any) -> None:
+    """Disconnect the driver without closing Oracle's browser or profile."""
+    if browser is not None:
+        disconnect = getattr(browser, "disconnect", None)
+        if callable(disconnect):
+            try:
+                disconnect()
+            except Exception:
+                pass
+    if playwright is not None:
+        stop = getattr(playwright, "stop", None)
+        if callable(stop):
+            try:
+                stop()
+            except Exception:
+                pass
+
+
 def write_conversation_init_snapshot(path: str, snapshot: Mapping[str, Any]) -> None:
     """Atomically write a credential-safe snapshot; refuse symlink destinations."""
 
@@ -1652,10 +1967,46 @@ def collect_conversation_init_snapshot(
     return summary
 
 
+def collect_conversation_init_snapshot_from_oracle_browser(
+    source_path: str,
+    *,
+    cdp_endpoint: Optional[str] = None,
+    request_url: Optional[str] = None,
+    timeout_seconds: float = 30.0,
+) -> Dict[str, Any]:
+    """Collect conversation-init through the existing Oracle browser.
+
+    The caller must provide an already-running Oracle browser with an existing
+    authenticated ChatGPT page and a reachable CDP endpoint. This function
+    never launches Chrome, opens a page, reads browser storage, or exports
+    credentials.
+    """
+
+    transport = build_oracle_browser_conversation_init_transport(
+        cdp_endpoint=cdp_endpoint,
+        timeout_seconds=timeout_seconds,
+    )
+    summary = collect_conversation_init_snapshot(
+        source_path,
+        transport=transport,
+        request_url=request_url,
+    )
+    summary["collector_source"] = ORACLE_BROWSER_BOUNDARY_NAME
+    summary["browser_boundary"] = ORACLE_BROWSER_BOUNDARY_NAME
+    summary["live_authenticated_oracle_browser"] = bool(
+        summary.get("written")
+        and isinstance(summary.get("status_code"), int)
+        and 200 <= int(summary["status_code"]) < 300
+        and summary.get("account_identity_hashed")
+    )
+    return summary
+
+
 def _collector_summary(contract: Mapping[str, Any], source_path: str) -> Dict[str, Any]:
     return {
         "written": False,
         "collector_source": "browser_boundary",
+        "browser_boundary": None,
         "live_authenticated_oracle_browser": False,
         "request_method": contract.get("method"),
         "request_path": contract.get("path"),

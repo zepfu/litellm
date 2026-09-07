@@ -17,9 +17,13 @@ from litellm.llms.chatgpt.conversation_init import (
     CHATGPT_CONVERSATION_INIT_SOURCE,
     ChatGPTConversationInitCollector,
     ChatGPTConversationInitError,
+    OracleBrowserBoundaryUnavailable,
+    OracleBrowserConversationInitTransport,
+    build_conversation_init_request,
     build_conversation_init_rate_limit_tuples,
     collect_conversation_init_observations,
     collect_conversation_init_snapshot,
+    collect_conversation_init_snapshot_from_oracle_browser,
     conversation_init_request_contract,
     hash_chatgpt_conversation_init_account_identity,
     hash_chatgpt_conversation_init_source_identity,
@@ -288,6 +292,134 @@ def test_sanitize_redacts_feature_note() -> None:
         assert "feature_note" not in projections, "feature_note leaked into projections"
 
 
+def test_sanitize_fails_closed_for_unknown_personal_and_token_fields() -> None:
+    raw = _with_identity(
+        {
+            "type": "conversation_init",
+            "default_model_slug": "gpt-6-pro",
+            "model_limits": [],
+            "limits_progress": [],
+            "blocked_features": [],
+            "localStorage": {"private_state": "browser-state-secret"},
+            "sessionToken": "session-token-secret",
+            "titles": ["Private chat with Jane"],
+            "usernames": ["jane_doe"],
+            "workspace": "Acme Corp",
+            "notes": ["private operator note"],
+            "unknown_value": "Jane Doe",
+            "opaque_value": "opaque-token-secret",
+        }
+    )
+    raw["user"] = {**raw["user"], "name": "Jane Doe"}
+
+    sanitized = sanitize_conversation_init_boundary(raw)
+    serialized = json.dumps(sanitized, sort_keys=True)
+    persisted_projection = json.dumps(
+        {
+            "payload": sanitized["payload"],
+            "payload_schema": sanitized["payload_schema"],
+        },
+        sort_keys=True,
+    )
+
+    for secret_or_personal_value in (
+        "Jane Doe",
+        "browser-state-secret",
+        "session-token-secret",
+        "Private chat with Jane",
+        "jane_doe",
+        "Acme Corp",
+        "private operator note",
+        "opaque-token-secret",
+    ):
+        assert secret_or_personal_value not in serialized
+    for sensitive_key in (
+        "localStorage",
+        "sessionToken",
+        "titles",
+        "usernames",
+        "workspace",
+        "notes",
+    ):
+        assert sensitive_key not in persisted_projection
+    assert sanitized["payload"]["user"] == {}
+    assert sanitized["redacted_field_count"] >= 7
+
+
+def test_sanitize_preserves_safe_unknown_nested_values_and_changes_history() -> None:
+    def payload_for(state: str, remaining: int) -> dict:
+        return _with_identity(
+            {
+                "type": "conversation_init",
+                "default_model_slug": "gpt-6-pro",
+                "model_limits": [],
+                "limits_progress": [
+                    {
+                        "feature": "deep_research",
+                        "remaining": 5,
+                        "future_capability": {
+                            "state": state,
+                            "remaining": remaining,
+                            "enabled": True,
+                            "sessionToken": "nested-token-secret",
+                        },
+                        "future_usage": {
+                            "window": "rolling",
+                            "used": 1,
+                            "status": "active",
+                        },
+                    }
+                ],
+                "blocked_features": [],
+            }
+        )
+
+    first = sanitize_conversation_init_boundary(payload_for("enabled", 4))
+    second = sanitize_conversation_init_boundary(payload_for("disabled", 3))
+    first_observations, _ = parse_conversation_init_observations(
+        first,
+        observed_at=datetime.now(timezone.utc),
+    )
+    second_observations, _ = parse_conversation_init_observations(
+        second,
+        observed_at=datetime.now(timezone.utc),
+    )
+
+    first_snapshot = first_observations[0]["raw_provider_fields"]
+    second_snapshot = second_observations[0]["raw_provider_fields"]
+    first_feature = next(
+        row
+        for row in first_observations
+        if row["quota_key"] == "chatgpt_conversation_init:feature:deep_research"
+    )
+    second_feature = next(
+        row
+        for row in second_observations
+        if row["quota_key"] == "chatgpt_conversation_init:feature:deep_research"
+    )
+
+    first_projection = first["payload"]["limits_progress"][0]
+    assert first_projection["future_capability"] == {
+        "state": "enabled",
+        "remaining": 4,
+        "enabled": True,
+    }
+    assert first_projection["future_usage"] == {
+        "window": "rolling",
+        "used": 1,
+        "status": "active",
+    }
+    assert "nested-token-secret" not in json.dumps(first, sort_keys=True)
+    assert (
+        first_snapshot["top_level_projections"]
+        != second_snapshot["top_level_projections"]
+    )
+    assert (
+        first_feature["raw_provider_fields"]["entry_projections"]
+        != second_feature["raw_provider_fields"]["entry_projections"]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Parsing tests
 # ---------------------------------------------------------------------------
@@ -494,10 +626,172 @@ class _ExplodingTransport:
         raise RuntimeError("transport exploded")
 
 
+class _FakeOraclePage:
+    def __init__(self, envelope):
+        self.url = "https://chatgpt.com/"
+        self.envelope = envelope
+        self.evaluate_calls = []
+
+    def evaluate(self, script, url):
+        self.evaluate_calls.append((script, url))
+        return self.envelope
+
+
+class _FakeOracleContext:
+    def __init__(self, pages):
+        self.pages = pages
+
+
+class _FakeOracleBrowser:
+    def __init__(self, pages):
+        self.contexts = [_FakeOracleContext(pages)]
+        self.disconnect_calls = 0
+        self.close_calls = 0
+
+    def disconnect(self):
+        self.disconnect_calls += 1
+
+    def close(self):
+        self.close_calls += 1
+        raise AssertionError("attached Oracle browser must not be closed")
+
+
+class _FakeOracleChromium:
+    def __init__(self, browser):
+        self.browser = browser
+        self.connect_calls = []
+        self.persistent_launch_calls = 0
+
+    def connect_over_cdp(self, endpoint, *, timeout):
+        self.connect_calls.append((endpoint, timeout))
+        return self.browser
+
+    def launch_persistent_context(self, *args, **kwargs):
+        self.persistent_launch_calls += 1
+        raise AssertionError("transport must not launch a persistent context")
+
+
+class _FakeOraclePlaywright:
+    def __init__(self, browser):
+        self.chromium = _FakeOracleChromium(browser)
+        self.stop_calls = 0
+
+    def stop(self):
+        self.stop_calls += 1
+
+
 def test_build_request_has_no_conversation_content() -> None:
     request = conversation_init_request_contract()
     built = urllib_request.Request(request["url"], data=None, method="POST")
     assert request_has_conversation_content(built) is False
+
+
+def test_oracle_transport_attaches_and_posts_without_storage_or_browser_launch() -> None:
+    page = _FakeOraclePage(
+        {
+            "status_code": 200,
+            "payload": _with_identity(_VALID_PAYLOAD),
+        }
+    )
+    browser = _FakeOracleBrowser([page])
+    playwright = _FakeOraclePlaywright(browser)
+    transport = OracleBrowserConversationInitTransport(
+        cdp_endpoint="http://127.0.0.1:9222",
+        playwright_factory=lambda: playwright,
+    )
+    request = build_conversation_init_request()
+
+    response = transport.fetch(request)
+
+    assert response["status_code"] == 200
+    assert request.get_method() == "POST"
+    assert request.data is None
+    assert playwright.chromium.connect_calls == [
+        ("http://127.0.0.1:9222", 30000)
+    ]
+    assert playwright.chromium.persistent_launch_calls == 0
+    assert browser.disconnect_calls == 1
+    assert browser.close_calls == 0
+    assert playwright.stop_calls == 1
+    assert len(page.evaluate_calls) == 1
+    script, evaluated_url = page.evaluate_calls[0]
+    lowered_script = script.lower()
+    assert evaluated_url == CHATGPT_CONVERSATION_INIT_DEFAULT_URL
+    assert 'method: "post"' in lowered_script
+    assert '"body"' not in lowered_script
+    for forbidden_browser_access in (
+        "document.cookie",
+        "localstorage",
+        "sessionstorage",
+        "indexeddb",
+        "storage_state",
+        "cookies",
+    ):
+        assert forbidden_browser_access not in lowered_script
+
+
+def test_oracle_transport_fails_closed_without_existing_chatgpt_page() -> None:
+    page = _FakeOraclePage({"status_code": 200, "payload": _VALID_PAYLOAD})
+    page.url = "https://example.test/"
+    browser = _FakeOracleBrowser([page])
+    playwright = _FakeOraclePlaywright(browser)
+    transport = OracleBrowserConversationInitTransport(
+        playwright_factory=lambda: playwright,
+    )
+
+    with pytest.raises(OracleBrowserBoundaryUnavailable):
+        transport.fetch(build_conversation_init_request())
+
+    assert page.evaluate_calls == []
+    assert browser.disconnect_calls == 1
+    assert browser.close_calls == 0
+    assert playwright.stop_calls == 1
+
+
+def test_oracle_transport_rejects_request_body() -> None:
+    browser = _FakeOracleBrowser([])
+    playwright = _FakeOraclePlaywright(browser)
+    transport = OracleBrowserConversationInitTransport(
+        playwright_factory=lambda: playwright,
+    )
+    request = urllib_request.Request(
+        CHATGPT_CONVERSATION_INIT_DEFAULT_URL,
+        data=b"{}",
+        method="POST",
+    )
+
+    with pytest.raises(OracleBrowserBoundaryUnavailable):
+        transport.fetch(request)
+
+    assert playwright.chromium.connect_calls == []
+    assert browser.disconnect_calls == 0
+    assert playwright.stop_calls == 0
+
+
+def test_public_oracle_browser_entry_point_uses_attach_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "conversation-init.json"
+    transport = _FixtureTransport(
+        {"status_code": 200, "payload": _with_identity(_VALID_PAYLOAD)}
+    )
+    monkeypatch.setattr(
+        "litellm.llms.chatgpt.conversation_init.build_oracle_browser_conversation_init_transport",
+        lambda **kwargs: transport,
+    )
+
+    summary = collect_conversation_init_snapshot_from_oracle_browser(
+        str(source),
+        cdp_endpoint="http://127.0.0.1:9222",
+    )
+
+    assert summary["written"] is True
+    assert summary["collector_source"] == "oracle_browser_cdp_attach"
+    assert summary["browser_boundary"] == "oracle_browser_cdp_attach"
+    assert summary["live_authenticated_oracle_browser"] is True
+    assert summary["request_body_omitted"] is True
+    assert request_has_conversation_content(transport.requests[0]) is False
 
 
 def test_collector_writes_sanitized_snapshot(tmp_path: Path) -> None:

@@ -770,7 +770,12 @@ This path has two cooperating pieces:
   accepts an injected transport, issues the no-body POST contract, redacts
   cookies, tokens, headers, raw storage, and personal fields, then atomically
   writes a credential-safe JSON snapshot. It refuses symlink destinations.
-  Fixture transports make this unit-testable without live auth.
+  Fixture transports make this unit-testable without live auth. The public
+  `collect_conversation_init_snapshot_from_oracle_browser(...)` entry point
+  attaches to an existing Oracle browser over CDP and evaluates only the
+  authenticated no-body POST from an existing ChatGPT page. It does not launch
+  Chrome, create a persistent context, read browser cookies or storage, export
+  credentials, or return response headers.
 - Sidecar file consumer: `scripts/run_provider_status_observations_loop.py`
   rereads that snapshot from a regular file. The sidecar never HTTP-calls
   chatgpt.com, never reads Oracle cookies, and never ships `authenticator.py`,
@@ -797,10 +802,21 @@ Relevant environment variables:
   default `/run/aawm/chatgpt/conversation-init.json`.
 - `AAWM_CHATGPT_CONVERSATION_INIT_URL`: documented POST URL. The sidecar does
   not fetch this URL.
+- `AAWM_CHATGPT_CONVERSATION_INIT_BROWSER_CDP_ENDPOINT`: optional CDP endpoint
+  used by the attach-only Oracle browser entry point.
+- `ORACLE_BROWSER_CDP_ENDPOINT`: fallback CDP endpoint for the established
+  Oracle browser boundary. The default is `http://127.0.0.1:9222`.
 
-Live authenticated Oracle-browser proof remains an explicit acceptance gap.
-Fixture collector coverage does not claim live counts or a successful
-authenticated POST from the Oracle browser.
+The live boundary requires all of the following at runtime: an already-running
+authenticated Oracle browser with an existing ChatGPT page, a reachable CDP
+endpoint, and Playwright installed in the process that invokes the public
+entry point. The default Oracle profile
+`/home/zepfu/.oracle/browser-profile` is a locked shared profile and must not
+be opened by a competing persistent browser context; CDP attachment is the
+only supported collection path here. The current focused tests use fakes and
+do not establish live authenticated acceptance or live quota counts. If the
+existing browser is not running or its CDP endpoint is unavailable, the
+collector fails closed and the sidecar retains its last good snapshot.
 
 ## Alibaba Token Plan quota polling
 
