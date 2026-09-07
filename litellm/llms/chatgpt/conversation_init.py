@@ -28,8 +28,11 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import multiprocessing
 import os
 import re
+import select
+import signal
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -87,6 +90,8 @@ _TRUNCATION_WARNING = "truncated"
 
 INVALID_CONVERSATION_INIT_METHODS = ("GET", "HEAD")
 MAX_CONVERSATION_INIT_SOURCE_BYTES = 1_000_000
+_ORACLE_BROWSER_IPC_FRAME_BYTES = 4096
+_ORACLE_BROWSER_IPC_MAX_BYTES = MAX_CONVERSATION_INIT_SOURCE_BYTES
 MAX_PROJECTION_DEPTH = 5
 MAX_PROJECTION_LIST_ITEMS = 200
 MAX_PROJECTION_OBJECT_KEYS = 200
@@ -1808,6 +1813,11 @@ class OracleBrowserBoundaryUnavailable(ChatGPTConversationInitError):
 
 _ORACLE_BROWSER_FETCH_SCRIPT = """
 async (request) => {
+  const expectedHost = String(request.expected_host || "").toLowerCase();
+  const executingHost = String(window.location.hostname || "").toLowerCase();
+  if (!expectedHost || executingHost !== expectedHost) {
+    throw new Error("conversation-init browser target host changed");
+  }
   const controller = new AbortController();
   const timeoutMs = Math.max(1, Number(request.timeout_ms));
   let timeoutId = null;
@@ -1821,6 +1831,7 @@ async (request) => {
     const response = await fetch(request.url, {
       method: "POST",
       credentials: "include",
+      redirect: "error",
       signal: controller.signal
     });
     let payload = null;
@@ -1884,54 +1895,14 @@ class OracleBrowserConversationInitTransport:
     def fetch(self, request: urllib_request.Request) -> Mapping[str, Any]:
         _validate_oracle_browser_request(request)
         deadline = time.monotonic() + self.timeout_seconds
-        playwright = None
-        browser = None
         try:
-            playwright = self._start_playwright()
-            remaining_seconds = _remaining_browser_timeout(deadline)
-            if remaining_seconds <= 0:
-                raise OracleBrowserBoundaryUnavailable(
-                    "Oracle browser conversation-init capture timed out."
-                )
-            browser = playwright.chromium.connect_over_cdp(
-                self.cdp_endpoint,
-                timeout=_browser_timeout_milliseconds(remaining_seconds),
-            )
-            remaining_seconds = _remaining_browser_timeout(deadline)
-            if remaining_seconds <= 0:
-                raise OracleBrowserBoundaryUnavailable(
-                    "Oracle browser conversation-init capture timed out."
-                )
-            page = _find_existing_chatgpt_page(
-                browser,
-                self.page_target_id,
-                request.full_url,
+            return _run_oracle_browser_capture_in_worker(
+                cdp_endpoint=self.cdp_endpoint,
+                page_target_id=self.page_target_id,
+                request_url=request.full_url,
                 deadline=deadline,
+                playwright_factory=self._playwright_factory,
             )
-            if page is None:
-                raise OracleBrowserBoundaryUnavailable(
-                    "Oracle browser has no existing ChatGPT CDP target for the "
-                    "conversation-init request."
-                )
-            remaining_seconds = _remaining_browser_timeout(deadline)
-            if remaining_seconds <= 0:
-                raise OracleBrowserBoundaryUnavailable(
-                    "Oracle browser conversation-init capture timed out."
-                )
-            result = page.evaluate(
-                _ORACLE_BROWSER_FETCH_SCRIPT,
-                {
-                    "url": request.full_url,
-                    "timeout_ms": _browser_timeout_milliseconds(
-                        remaining_seconds
-                    ),
-                },
-            )
-            if _remaining_browser_timeout(deadline) <= 0:
-                raise OracleBrowserBoundaryUnavailable(
-                    "Oracle browser conversation-init capture timed out."
-                )
-            return _coerce_browser_response(result)
         except OracleBrowserBoundaryUnavailable:
             raise
         except ChatGPTConversationInitError:
@@ -1940,26 +1911,334 @@ class OracleBrowserConversationInitTransport:
             raise OracleBrowserBoundaryUnavailable(
                 "Oracle browser boundary is unavailable for conversation-init."
             ) from exc
-        finally:
-            _disconnect_attached_browser(playwright, browser)
 
     def _start_playwright(self) -> Any:
-        if self._playwright_factory is not None:
-            return self._playwright_factory()
-        try:
-            playwright_api = importlib.import_module("playwright.sync_api")
-            sync_playwright = playwright_api.sync_playwright
-        except (ImportError, AttributeError) as exc:
+        return _start_playwright_from_factory(self._playwright_factory)
+
+
+def _run_oracle_browser_capture_in_worker(
+    *,
+    cdp_endpoint: str,
+    page_target_id: str,
+    request_url: str,
+    deadline: float,
+    playwright_factory: Optional[Callable[[], Any]],
+) -> Mapping[str, Any]:
+    context = _oracle_browser_process_context(playwright_factory)
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_oracle_browser_capture_worker,
+        args=(
+            sender,
+            cdp_endpoint,
+            page_target_id,
+            request_url,
+            deadline,
+            playwright_factory,
+        ),
+    )
+    try:
+        process.start()
+    except Exception as exc:
+        sender.close()
+        receiver.close()
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle browser boundary worker could not start."
+        ) from exc
+    sender.close()
+    try:
+        message = _receive_oracle_browser_worker_message(receiver, deadline)
+        remaining_seconds = _remaining_browser_timeout(deadline)
+        if remaining_seconds <= 0:
             raise OracleBrowserBoundaryUnavailable(
-                "Live Oracle browser collection requires Playwright in the "
-                "browser-boundary environment."
-            ) from exc
-        try:
-            return sync_playwright().start()
-        except Exception as exc:
+                "Oracle browser conversation-init capture timed out."
+            )
+        process.join(remaining_seconds)
+        if process.is_alive():
             raise OracleBrowserBoundaryUnavailable(
-                "Live Oracle browser collection could not start Playwright."
+                "Oracle browser conversation-init cleanup timed out."
+            )
+        if not isinstance(message, Mapping) or message.get("ok") is not True:
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser boundary is unavailable for conversation-init."
+            )
+        return _coerce_browser_response(message.get("result"))
+    finally:
+        receiver.close()
+        if process.is_alive():
+            _terminate_oracle_browser_worker(process)
+        process.join(timeout=0)
+
+
+def _oracle_browser_capture_worker(
+    sender: Any,
+    cdp_endpoint: str,
+    page_target_id: str,
+    request_url: str,
+    deadline: float,
+    playwright_factory: Optional[Callable[[], Any]],
+) -> None:
+    _enter_oracle_browser_worker_process_group()
+    playwright = None
+    browser = None
+    result = None
+    successful = False
+    try:
+        _raise_if_browser_deadline_expired(deadline)
+        playwright = _start_playwright_from_factory(playwright_factory)
+        _raise_if_browser_deadline_expired(deadline)
+        browser = playwright.chromium.connect_over_cdp(
+            cdp_endpoint,
+            timeout=_browser_timeout_milliseconds(
+                _remaining_browser_timeout(deadline)
+            ),
+        )
+        _raise_if_browser_deadline_expired(deadline)
+        page = _find_existing_chatgpt_page(
+            browser,
+            page_target_id,
+            request_url,
+            deadline=deadline,
+        )
+        if page is None:
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser has no existing ChatGPT CDP target for the "
+                "conversation-init request."
+            )
+        target_host = urlsplit(request_url).hostname
+        if not target_host:
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser conversation-init request has no host."
+            )
+        _raise_if_browser_deadline_expired(deadline)
+        result = page.evaluate(
+            _ORACLE_BROWSER_FETCH_SCRIPT,
+            {
+                "url": request_url,
+                "expected_host": target_host,
+                "timeout_ms": _browser_timeout_milliseconds(
+                    _remaining_browser_timeout(deadline)
+                ),
+            },
+        )
+        _raise_if_browser_deadline_expired(deadline)
+        successful = True
+    except Exception:
+        successful = False
+    finally:
+        try:
+            _disconnect_attached_browser(playwright, browser)
+        except Exception:
+            successful = False
+        try:
+            _send_oracle_browser_worker_message(
+                sender,
+                {
+                    "ok": successful,
+                    "result": result if successful else None,
+                },
+            )
+        except Exception:
+            try:
+                _send_oracle_browser_worker_message(
+                    sender,
+                    {"ok": False, "result": None},
+                )
+            except Exception:
+                pass
+        finally:
+            sender.close()
+
+
+def _receive_oracle_browser_worker_message(
+    receiver: Any,
+    deadline: float,
+) -> Mapping[str, Any]:
+    pipe_buffer = bytearray()
+    payload = bytearray()
+    while True:
+        frame = _read_oracle_browser_worker_frame(
+            receiver,
+            pipe_buffer,
+            deadline,
+        )
+        if not frame:
+            break
+        if len(payload) + len(frame) > _ORACLE_BROWSER_IPC_MAX_BYTES:
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser boundary worker response exceeded the size limit."
+            )
+        payload.extend(frame)
+    try:
+        message = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle browser boundary worker returned an invalid response."
+        ) from exc
+    if not isinstance(message, Mapping):
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle browser boundary worker returned an invalid response."
+        )
+    return message
+
+
+def _read_oracle_browser_worker_frame(
+    receiver: Any,
+    pipe_buffer: bytearray,
+    deadline: float,
+) -> bytes:
+    try:
+        pipe_fd = receiver.fileno()
+        os.set_blocking(pipe_fd, False)
+    except (AttributeError, OSError) as exc:
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle browser boundary worker pipe is unavailable."
+        ) from exc
+    _fill_oracle_browser_pipe_buffer(
+        pipe_fd,
+        pipe_buffer,
+        4,
+        deadline,
+    )
+    frame_length = int.from_bytes(pipe_buffer[:4], byteorder="big", signed=True)
+    del pipe_buffer[:4]
+    if frame_length < 0 or frame_length > _ORACLE_BROWSER_IPC_FRAME_BYTES:
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle browser boundary worker returned an invalid response."
+        )
+    _fill_oracle_browser_pipe_buffer(
+        pipe_fd,
+        pipe_buffer,
+        frame_length,
+        deadline,
+    )
+    frame = bytes(pipe_buffer[:frame_length])
+    del pipe_buffer[:frame_length]
+    return frame
+
+
+def _fill_oracle_browser_pipe_buffer(
+    pipe_fd: int,
+    pipe_buffer: bytearray,
+    required_bytes: int,
+    deadline: float,
+) -> None:
+    while len(pipe_buffer) < required_bytes:
+        remaining_seconds = _remaining_browser_timeout(deadline)
+        if remaining_seconds <= 0:
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser conversation-init capture timed out."
+            )
+        try:
+            readable, _, _ = select.select(
+                [pipe_fd],
+                [],
+                [],
+                remaining_seconds,
+            )
+        except (OSError, ValueError) as exc:
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser boundary worker pipe is unavailable."
             ) from exc
+        if not readable:
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser conversation-init capture timed out."
+            )
+        try:
+            chunk = os.read(pipe_fd, 65536)
+        except BlockingIOError:
+            continue
+        except OSError as exc:
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser boundary worker ended without a response."
+            ) from exc
+        if not chunk:
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser boundary worker ended without a response."
+            )
+        pipe_buffer.extend(chunk)
+
+
+def _send_oracle_browser_worker_message(sender: Any, message: Mapping[str, Any]) -> None:
+    serialized = json.dumps(
+        dict(message),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(serialized) > _ORACLE_BROWSER_IPC_MAX_BYTES:
+        serialized = b'{"ok":false,"result":null}'
+    for offset in range(0, len(serialized), _ORACLE_BROWSER_IPC_FRAME_BYTES):
+        sender.send_bytes(
+            serialized[offset : offset + _ORACLE_BROWSER_IPC_FRAME_BYTES]
+        )
+    sender.send_bytes(b"")
+
+
+def _oracle_browser_process_context(
+    playwright_factory: Optional[Callable[[], Any]],
+) -> Any:
+    if playwright_factory is not None and os.name == "posix":
+        return multiprocessing.get_context("fork")
+    return multiprocessing.get_context("spawn")
+
+
+def _enter_oracle_browser_worker_process_group() -> None:
+    if os.name == "posix":
+        try:
+            os.setsid()
+        except OSError:
+            pass
+
+
+def _terminate_oracle_browser_worker(process: Any) -> None:
+    process_id = getattr(process, "pid", None)
+    if os.name == "posix" and isinstance(process_id, int):
+        try:
+            os.killpg(process_id, signal.SIGKILL)
+            return
+        except OSError:
+            pass
+    kill = getattr(process, "kill", None)
+    if callable(kill):
+        try:
+            kill()
+            return
+        except OSError:
+            pass
+    terminate = getattr(process, "terminate", None)
+    if callable(terminate):
+        try:
+            terminate()
+        except OSError:
+            pass
+
+
+def _start_playwright_from_factory(
+    playwright_factory: Optional[Callable[[], Any]],
+) -> Any:
+    if playwright_factory is not None:
+        return playwright_factory()
+    try:
+        playwright_api = importlib.import_module("playwright.sync_api")
+        sync_playwright = playwright_api.sync_playwright
+    except (ImportError, AttributeError) as exc:
+        raise OracleBrowserBoundaryUnavailable(
+            "Live Oracle browser collection requires Playwright in the "
+            "browser-boundary environment."
+        ) from exc
+    try:
+        return sync_playwright().start()
+    except Exception as exc:
+        raise OracleBrowserBoundaryUnavailable(
+            "Live Oracle browser collection could not start Playwright."
+        ) from exc
+
+
+def _raise_if_browser_deadline_expired(deadline: float) -> None:
+    if _remaining_browser_timeout(deadline) <= 0:
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle browser conversation-init capture timed out."
+        )
 
 
 def build_oracle_browser_conversation_init_transport(
