@@ -37,6 +37,21 @@ import type {
 
 type SqlRow = Record<string, unknown>;
 type SqliteDatabase = InstanceType<typeof Database>;
+type AttemptAliasOwner = {
+  aliasKind: string;
+  aliasValue: string;
+  attemptId: string;
+  identityBasis: string;
+  completedAnswer: boolean;
+  tombstone: boolean;
+};
+
+const MERGEABLE_ATTEMPT_ALIAS_KINDS = new Set([
+  "branch",
+  "generation",
+  "message",
+  "prompt",
+]);
 
 export interface AccountRow extends LedgerScope {
   authState: string;
@@ -688,19 +703,57 @@ export class Ledger {
     context: IngestContext,
   ): { status: "inserted" | "updated" | "deduplicated"; aliasConflicts: number } {
     const key = scopeKey(scope);
-    const payload = attemptPayload(attempt);
+    const aliases = uniqueAttemptAliases(attempt.aliases);
+    const aliasOwners = this.findAttemptAliasOwners(scope, aliases);
+    const mergeableOwnerIds = new Set(
+      aliasOwners
+        .filter(
+          (owner) =>
+            owner.attemptId !== attempt.attemptId &&
+            MERGEABLE_ATTEMPT_ALIAS_KINDS.has(owner.aliasKind),
+        )
+        .map((owner) => owner.attemptId),
+    );
+    const canonicalAttemptId = this.selectCanonicalAttemptId(
+      attempt,
+      aliases,
+      aliasOwners,
+      mergeableOwnerIds,
+    );
+    const persistedAttempt =
+      canonicalAttemptId === attempt.attemptId
+        ? { ...attempt, aliases }
+        : { ...attempt, attemptId: canonicalAttemptId, aliases };
+    const payload = attemptPayload(persistedAttempt);
     const projectionFingerprint = fingerprint(payload);
     const current = this.db
       .prepare("SELECT * FROM attempts WHERE attempt_id=? AND scope_key=?")
-      .get(attempt.attemptId, key) as SqlRow | undefined;
+      .get(persistedAttempt.attemptId, key) as SqlRow | undefined;
     let status: "inserted" | "updated" | "deduplicated";
     let revision: number;
     if (!current) {
       revision = 1;
-      this.insertAttemptRow(scope, attempt, revision, projectionFingerprint, context.observedAt);
-      this.insertAttemptRevision(scope, attempt, revision, projectionFingerprint, payload, context, "ingest");
+      this.insertAttemptRow(
+        scope,
+        persistedAttempt,
+        revision,
+        projectionFingerprint,
+        context.observedAt,
+      );
+      this.insertAttemptRevision(
+        scope,
+        persistedAttempt,
+        revision,
+        projectionFingerprint,
+        payload,
+        context,
+        "ingest",
+      );
       status = "inserted";
-    } else if (current.projection_fingerprint === projectionFingerprint) {
+    } else if (
+      current.projection_fingerprint === projectionFingerprint &&
+      Number(current.tombstone) === 0
+    ) {
       revision = Number(current.revision);
       status = "deduplicated";
     } else {
@@ -718,12 +771,38 @@ export class Ledger {
         context,
         "prior_projection",
       );
-      this.updateAttemptRow(scope, attempt, revision, projectionFingerprint, context.observedAt);
-      this.insertAttemptRevision(scope, attempt, revision, projectionFingerprint, payload, context, "ingest");
+      this.updateAttemptRow(
+        scope,
+        persistedAttempt,
+        revision,
+        projectionFingerprint,
+        context.observedAt,
+      );
+      this.insertAttemptRevision(
+        scope,
+        persistedAttempt,
+        revision,
+        projectionFingerprint,
+        payload,
+        context,
+        "ingest",
+      );
       status = "updated";
     }
+
+    for (const duplicateAttemptId of mergeableOwnerIds) {
+      if (duplicateAttemptId !== persistedAttempt.attemptId) {
+        this.retireDuplicateAttempt(
+          scope,
+          duplicateAttemptId,
+          persistedAttempt.attemptId,
+          context.observedAt,
+        );
+      }
+    }
+
     let aliasConflicts = 0;
-    for (const [kind, value] of attempt.aliases) {
+    for (const [kind, value] of persistedAttempt.aliases) {
       if (!value) {
         continue;
       }
@@ -775,18 +854,175 @@ export class Ledger {
           scope.quotaOwnerId,
           kind,
           value,
-          attempt.attemptId,
+          persistedAttempt.attemptId,
           context.observedAt,
           context.observedAt,
         );
     }
-    for (const messageId of attempt.evidenceMessageIds) {
-      this.attachEvidence(attempt.attemptId, "message", messageId, scope);
+    for (const messageId of persistedAttempt.evidenceMessageIds) {
+      this.attachEvidence(persistedAttempt.attemptId, "message", messageId, scope);
+    }
+    if (mergeableOwnerIds.size > 0 && status === "inserted") {
+      status = "updated";
     }
     if (status === "inserted" || status === "updated") {
-      this.recordMappingHistory(scope, attempt, context.observedAt, "ingest");
+      this.recordMappingHistory(scope, persistedAttempt, context.observedAt, "ingest");
     }
     return { status, aliasConflicts };
+  }
+
+  private findAttemptAliasOwners(
+    scope: LedgerScope,
+    aliases: Array<[string, string]>,
+  ): AttemptAliasOwner[] {
+    const owners: AttemptAliasOwner[] = [];
+    const statement = this.db.prepare(
+      `
+      SELECT a.alias_kind, a.alias_value, a.attempt_id,
+             t.identity_basis, t.completed_answer, t.tombstone
+      FROM attempt_aliases a
+      JOIN attempts t
+        ON t.scope_key=a.scope_key AND t.attempt_id=a.attempt_id
+      WHERE a.scope_key=? AND a.alias_kind=? AND a.alias_value=?
+      `,
+    );
+    for (const [aliasKind, aliasValue] of aliases) {
+      const row = statement.get(
+        scopeKey(scope),
+        aliasKind,
+        aliasValue,
+      ) as SqlRow | undefined;
+      if (!row) {
+        continue;
+      }
+      owners.push({
+        aliasKind: String(row.alias_kind),
+        aliasValue: String(row.alias_value),
+        attemptId: String(row.attempt_id),
+        identityBasis: String(row.identity_basis),
+        completedAnswer: Number(row.completed_answer) === 1,
+        tombstone: Number(row.tombstone) === 1,
+      });
+    }
+    return owners;
+  }
+
+  private selectCanonicalAttemptId(
+    attempt: ReconstructedAttempt,
+    aliases: Array<[string, string]>,
+    aliasOwners: AttemptAliasOwner[],
+    mergeableOwnerIds: Set<string>,
+  ): string {
+    const candidates = [
+      {
+        attemptId: attempt.attemptId,
+        identityBasis: attempt.identityBasis,
+        completedAnswer: attempt.completedAnswer,
+        tombstone: false,
+        hasPromptAlias: aliases.some(([kind]) => kind === "prompt"),
+      },
+      ...[...mergeableOwnerIds].map((attemptId) => {
+        const owners = aliasOwners.filter((owner) => owner.attemptId === attemptId);
+        const first = owners[0];
+        return {
+          attemptId,
+          identityBasis: first?.identityBasis ?? "unresolved",
+          completedAnswer: owners.some((owner) => owner.completedAnswer),
+          tombstone: owners.every((owner) => owner.tombstone),
+          hasPromptAlias: owners.some((owner) => owner.aliasKind === "prompt"),
+        };
+      }),
+    ];
+    return [...candidates].sort((left, right) => {
+      return (
+        (Number(left.tombstone) - Number(right.tombstone)) ||
+        (identityRank(right.identityBasis) - identityRank(left.identityBasis)) ||
+        (Number(right.hasPromptAlias) - Number(left.hasPromptAlias)) ||
+        (Number(right.completedAnswer) - Number(left.completedAnswer)) ||
+        left.attemptId.localeCompare(right.attemptId)
+      );
+    })[0]?.attemptId ?? attempt.attemptId;
+  }
+
+  private retireDuplicateAttempt(
+    scope: LedgerScope,
+    duplicateAttemptId: string,
+    canonicalAttemptId: string,
+    updatedAt: string,
+  ): void {
+    const key = scopeKey(scope);
+    const duplicateAliases = this.db
+      .prepare(
+        `
+        SELECT *
+        FROM attempt_aliases
+        WHERE scope_key=? AND attempt_id=?
+        `,
+      )
+      .all(key, duplicateAttemptId)
+      .map((row: unknown) => row as SqlRow);
+    const aliasInsert = this.db.prepare(
+      `
+      INSERT OR IGNORE INTO attempt_aliases(
+        scope_key, collector_account_id, provider, provider_user_id,
+        workspace_id, quota_owner_id, alias_kind, alias_value, attempt_id,
+        ambiguous, first_seen_at, last_seen_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+    );
+    for (const alias of duplicateAliases) {
+      aliasInsert.run(
+        key,
+        String(alias.collector_account_id),
+        String(alias.provider),
+        nullableString(alias.provider_user_id),
+        nullableString(alias.workspace_id),
+        nullableString(alias.quota_owner_id),
+        String(alias.alias_kind),
+        String(alias.alias_value),
+        canonicalAttemptId,
+        Number(alias.ambiguous),
+        String(alias.first_seen_at),
+        String(alias.last_seen_at),
+      );
+    }
+    this.db
+      .prepare("DELETE FROM attempt_aliases WHERE scope_key=? AND attempt_id=?")
+      .run(key, duplicateAttemptId);
+
+    this.db
+      .prepare(
+        `
+        INSERT OR IGNORE INTO attempt_evidence(
+          attempt_id, evidence_kind, evidence_id, scope_key
+        )
+        SELECT ?, evidence_kind, evidence_id, scope_key
+        FROM attempt_evidence
+        WHERE attempt_id=? AND scope_key=?
+        `,
+      )
+      .run(canonicalAttemptId, duplicateAttemptId, key);
+    this.db
+      .prepare("DELETE FROM attempt_evidence WHERE attempt_id=? AND scope_key=?")
+      .run(duplicateAttemptId, key);
+
+    const row = this.db
+      .prepare("SELECT warnings_json FROM attempts WHERE attempt_id=? AND scope_key=?")
+      .get(duplicateAttemptId, key) as SqlRow | undefined;
+    const marker = `retired_duplicate:${canonicalAttemptId}`;
+    const warnings = parseJsonArray(row?.warnings_json);
+    if (!warnings.includes(marker)) {
+      warnings.push(marker);
+    }
+    this.db
+      .prepare(
+        `
+        UPDATE attempts
+        SET tombstone=1, warnings_json=?, updated_at=?
+        WHERE attempt_id=? AND scope_key=?
+        `,
+      )
+      .run(JSON.stringify(warnings.sort()), updatedAt, duplicateAttemptId, key);
   }
 
   listAttempts(scope: LedgerScope, includeTombstones = false): Array<Record<string, unknown>> {
@@ -1308,7 +1544,7 @@ export class Ledger {
           recorded_final_model_raw=?, resolved_model_raw=?, requested_family=?,
           recorded_final_family=?, resolved_family=?, mapping_version=?, outcome=?,
           completed_answer=?, generation_started=?, surface=?, origin=?,
-          revision=?, projection_fingerprint=?, warnings_json=?, updated_at=?
+          revision=?, projection_fingerprint=?, warnings_json=?, tombstone=0, updated_at=?
         WHERE attempt_id=? AND scope_key=?
         `,
       )
@@ -1563,6 +1799,37 @@ function attemptPayload(
     evidenceMessageIds: [...attempt.evidenceMessageIds].sort(),
     warnings: [...attempt.warnings].sort(),
   };
+}
+
+function uniqueAttemptAliases(
+  aliases: ReadonlyArray<[string, string]>,
+): Array<[string, string]> {
+  const seen = new Set<string>();
+  const unique: Array<[string, string]> = [];
+  for (const [kind, value] of aliases) {
+    const key = `${kind}\u0000${value}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push([kind, value]);
+  }
+  return unique;
+}
+
+function identityRank(identityBasis: string): number {
+  switch (identityBasis) {
+    case "generation":
+      return 4;
+    case "request":
+      return 3;
+    case "prompt":
+      return 2;
+    case "provisional":
+      return 1;
+    default:
+      return 0;
+  }
 }
 
 function messageFromRow(row: SqlRow): MessageRecord {

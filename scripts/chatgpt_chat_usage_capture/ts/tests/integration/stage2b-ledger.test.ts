@@ -84,7 +84,7 @@ describe("D1-752 Stage 2B ledger", () => {
       ledger.db
         .prepare("SELECT COUNT(*) AS count FROM attempt_aliases")
         .get() as { count: number },
-    ).toEqual({ count: 8 });
+    ).toEqual({ count: 10 });
     ledger.close();
   });
 
@@ -165,6 +165,302 @@ describe("D1-752 Stage 2B ledger", () => {
     });
     expect(attempts).toHaveLength(1);
     expect(attempts[0]?.recordedFinalModelRaw).toBe("model-new");
+  });
+
+  it("groups disjoint generations when linkage is only visible in either graph direction", () => {
+    const account = scope("account-bidirectional", "provider-user", "workspace", "quota");
+    const conversationId = "conversation-bidirectional";
+    const messages = [
+      message({
+        conversationId,
+        messageId: "message-user",
+        nodeId: "node-user",
+        role: "user",
+        children: ["node-a-progress", "node-b-progress"],
+        createdAt: "2026-09-07T10:00:00.000Z",
+        requestedModelRaw: "model-requested",
+      }),
+      message({
+        conversationId,
+        messageId: "message-a-progress",
+        nodeId: "node-a-progress",
+        parentId: "node-user",
+        role: "assistant",
+        channel: "analysis",
+        createdAt: "2026-09-07T10:00:01.000Z",
+        status: "finished_successfully",
+        generationId: "generation-a",
+      }),
+      message({
+        conversationId,
+        messageId: "message-a-final",
+        nodeId: "node-a-final",
+        parentId: "node-a-progress",
+        role: "assistant",
+        createdAt: "2026-09-07T10:00:02.000Z",
+        status: "finished_successfully",
+        endTurn: true,
+        recordedFinalModelRaw: "model-final",
+      }),
+      message({
+        conversationId,
+        messageId: "message-b-progress",
+        nodeId: "node-b-progress",
+        parentId: "node-user",
+        role: "assistant",
+        channel: "analysis",
+        createdAt: "2026-09-07T10:01:01.000Z",
+        status: "finished_successfully",
+      }),
+      message({
+        conversationId,
+        messageId: "message-b-final",
+        nodeId: "node-b-final",
+        parentId: "node-b-progress",
+        role: "assistant",
+        createdAt: "2026-09-07T10:01:02.000Z",
+        status: "finished_successfully",
+        endTurn: true,
+        recordedFinalModelRaw: "model-final",
+        generationId: "generation-b",
+      }),
+    ];
+
+    const attempts = reconstructAttempts(messages, {
+      scope: account,
+      conversationId,
+      mapping: mappingReviewed,
+    });
+
+    expect(attempts).toHaveLength(2);
+    expect(attempts.every((attempt) => attempt.completedAnswer)).toBe(true);
+    const nonPromptEvidence = attempts.map(
+      (attempt) =>
+        new Set(attempt.evidenceMessageIds.filter((id) => id !== "message-user")),
+    );
+    expect(nonPromptEvidence[0] && nonPromptEvidence[1]).toBeTruthy();
+    expect(
+      [...(nonPromptEvidence[0] ?? [])].some((id) =>
+        (nonPromptEvidence[1] ?? new Set()).has(id),
+      ),
+    ).toBe(false);
+    expect(
+      new Set(
+        attempts.flatMap((attempt) =>
+          attempt.aliases
+            .filter(([kind]) => kind === "generation")
+            .map(([, value]) => value),
+        ),
+      ),
+    ).toEqual(
+      new Set([
+        `${conversationId}:generation-a`,
+        `${conversationId}:generation-b`,
+      ]),
+    );
+  });
+
+  it("merges later linkage into one active attempt and retires the provisional row", () => {
+    const directory = mkdtempSync(join(tmpdir(), "stage2b-linkage-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    const account = scope("account-linkage", "provider-user", "workspace", "quota");
+    ledger.upsertAccount(account);
+
+    const provisional = progressDetail(
+      "conversation-linkage",
+      "finished_successfully",
+      true,
+      "model-final",
+    );
+    provisional.messages[1] = {
+      ...provisional.messages[1]!,
+      generationId: null,
+      requestId: null,
+    };
+    ledger.ingestConversation(
+      account,
+      provisional,
+      mappingReviewed,
+      context("run-linkage-1", "conversation-linkage", "2026-09-07T12:00:00.000Z"),
+    );
+
+    const linked = ledger.ingestConversation(
+      account,
+      progressDetail("conversation-linkage", "finished_successfully", true, "model-final"),
+      mappingReviewed,
+      context("run-linkage-2", "conversation-linkage", "2026-09-07T12:05:00.000Z"),
+    );
+
+    expect(linked.attemptUpdated).toBe(1);
+    expect(ledger.listAttempts(account)).toHaveLength(1);
+    expect(ledger.listAttempts(account)[0]?.identityBasis).toBe("generation");
+    expect(ledger.listAttempts(account, true)).toHaveLength(2);
+    expect(
+      ledger.listAttempts(account, true).filter((attempt) => attempt.tombstone),
+    ).toHaveLength(1);
+    expect(
+      ledger.db
+        .prepare(
+          "SELECT attempt_id FROM attempt_aliases WHERE scope_key=? AND alias_kind='generation'",
+        )
+        .get(scopeKey(account)),
+    ).toEqual({ attempt_id: ledger.listAttempts(account)[0]?.attemptId });
+    expect(
+      ledger.db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM attempt_evidence WHERE scope_key=? AND evidence_kind='message'",
+        )
+        .get(scopeKey(account)),
+    ).toEqual({ count: 2 });
+    ledger.close();
+  });
+
+  it("does not inherit prompt time or model into a later regeneration", () => {
+    const account = scope("account-regeneration", "provider-user", "workspace", "quota");
+    const conversationId = "conversation-regeneration";
+    const attempts = reconstructAttempts(
+      [
+        message({
+          conversationId,
+          messageId: "message-user",
+          nodeId: "node-user",
+          role: "user",
+          children: ["node-original", "node-regenerated"],
+          createdAt: "2026-09-07T10:00:00.000Z",
+          requestedModelRaw: "model-requested",
+        }),
+        message({
+          conversationId,
+          messageId: "message-original",
+          nodeId: "node-original",
+          parentId: "node-user",
+          role: "assistant",
+          createdAt: "2026-09-07T10:00:02.000Z",
+          status: "finished_successfully",
+          endTurn: true,
+          recordedFinalModelRaw: "model-final",
+          generationId: "generation-original",
+        }),
+        message({
+          conversationId,
+          messageId: "message-regenerated",
+          nodeId: "node-regenerated",
+          parentId: "node-user",
+          role: "assistant",
+          createdAt: "2026-09-07T10:10:02.000Z",
+          status: "finished_successfully",
+          endTurn: true,
+          recordedFinalModelRaw: "model-final",
+          generationId: "generation-regenerated",
+        }),
+      ],
+      {
+        scope: account,
+        conversationId,
+        mapping: mappingReviewed,
+      },
+    );
+
+    const original = attempts.find((attempt) =>
+      attempt.aliases.some(
+        ([kind, value]) =>
+          kind === "generation" && value === `${conversationId}:generation-original`,
+      ),
+    );
+    const regenerated = attempts.find((attempt) =>
+      attempt.aliases.some(
+        ([kind, value]) =>
+          kind === "generation" && value === `${conversationId}:generation-regenerated`,
+      ),
+    );
+    expect(original?.requestedModelRaw).toBe("model-requested");
+    expect(original?.attemptTime).toBe("2026-09-07T10:00:00.000Z");
+    expect(regenerated?.requestedModelRaw).toBeNull();
+    expect(regenerated?.attemptTime).toBeNull();
+    expect(regenerated?.earliestPossibleAt).toBeNull();
+    expect(regenerated?.latestPossibleAt).toBeNull();
+  });
+
+  it("does not fabricate request bounds from a final-only response", () => {
+    const account = scope("account-final-only", "provider-user", "workspace", "quota");
+    const conversationId = "conversation-final-only";
+    const attempts = reconstructAttempts(
+      [
+        message({
+          conversationId,
+          messageId: "message-final-only",
+          nodeId: "node-final-only",
+          role: "assistant",
+          createdAt: "2026-09-07T10:00:02.000Z",
+          status: "finished_successfully",
+          endTurn: true,
+          recordedFinalModelRaw: "model-final",
+        }),
+      ],
+      {
+        scope: account,
+        conversationId,
+        mapping: mappingReviewed,
+      },
+    );
+
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]?.timeBasis).toBe("unknown");
+    expect(attempts[0]?.attemptTime).toBeNull();
+    expect(attempts[0]?.earliestPossibleAt).toBeNull();
+    expect(attempts[0]?.latestPossibleAt).toBeNull();
+  });
+
+  it("classifies rejection after observed generation start separately", () => {
+    const account = scope("account-rejection", "provider-user", "workspace", "quota");
+    const conversationId = "conversation-rejection";
+    const attempts = reconstructAttempts(
+      [
+        message({
+          conversationId,
+          messageId: "message-user",
+          nodeId: "node-user",
+          role: "user",
+          children: ["node-progress"],
+          createdAt: "2026-09-07T10:00:00.000Z",
+        }),
+        message({
+          conversationId,
+          messageId: "message-progress",
+          nodeId: "node-progress",
+          parentId: "node-user",
+          children: ["node-rejected"],
+          role: "assistant",
+          channel: "analysis",
+          createdAt: "2026-09-07T10:00:01.000Z",
+          status: "in_progress",
+          generationId: "generation-rejected",
+          requestId: "request-rejected",
+        }),
+        message({
+          conversationId,
+          messageId: "message-rejected",
+          nodeId: "node-rejected",
+          parentId: "node-progress",
+          role: "assistant",
+          createdAt: "2026-09-07T10:00:02.000Z",
+          status: "moderation_blocked",
+          endTurn: true,
+          generationId: "generation-rejected",
+          requestId: "request-rejected",
+        }),
+      ],
+      {
+        scope: account,
+        conversationId,
+        mapping: mappingReviewed,
+      },
+    );
+
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]?.generationStarted).toBe(true);
+    expect(attempts[0]?.outcome).toBe("rejected_after_start");
   });
 
   it("deduplicates replay and preserves in-progress to completed revisions", () => {
