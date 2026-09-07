@@ -806,6 +806,12 @@ _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS = frozenset(
         "UPSTREAM_BUSY",
     }
 )
+_CODEX_AUTO_AGENT_OPENAI_ALPHA_CAPACITY_ERROR_TOKENS = frozenset(
+    {
+        "server_is_overloaded",
+        "capacity_exhausted",
+    }
+)
 _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS = frozenset(
     {
         "429",
@@ -1829,6 +1835,9 @@ _aawm_error_signals.configure_error_signals_runtime(
     durable_cooldown_error_classes=_CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES,
     capacity_error_tokens=_CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS,
     rate_limit_error_tokens=_CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS,
+    openai_alpha_capacity_error_tokens=(
+        _CODEX_AUTO_AGENT_OPENAI_ALPHA_CAPACITY_ERROR_TOKENS
+    ),
     native_grok_backoff_base_seconds=_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_BASE_SECONDS,
     native_grok_backoff_max_seconds=_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS,
     native_grok_backoff_jitter_seconds=_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_JITTER_SECONDS,

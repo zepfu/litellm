@@ -107,6 +107,12 @@ _CAPACITY_ERROR_TOKENS = frozenset(
         "UPSTREAM_BUSY",
     }
 )
+_OPENAI_ALPHA_CAPACITY_ERROR_TOKENS = frozenset(
+    {
+        "server_is_overloaded",
+        "capacity_exhausted",
+    }
+)
 _RATE_LIMIT_ERROR_TOKENS = frozenset(
     {
         "429",
@@ -194,6 +200,7 @@ def _configure_seams(request):
         "_is_known_grok_personal_team_spending_limit_response",
         "_CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES",
         "_CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS",
+        "_CODEX_AUTO_AGENT_OPENAI_ALPHA_CAPACITY_ERROR_TOKENS",
         "_CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS",
         "_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_BASE_SECONDS",
         "_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS",
@@ -220,6 +227,7 @@ def _configure_seams(request):
         durable_cooldown_error_classes=_DURABLE_COOLDOWN_ERROR_CLASSES,
         capacity_error_tokens=_CAPACITY_ERROR_TOKENS,
         rate_limit_error_tokens=_RATE_LIMIT_ERROR_TOKENS,
+        openai_alpha_capacity_error_tokens=_OPENAI_ALPHA_CAPACITY_ERROR_TOKENS,
     )
     yield
     for name, value in previous_runtime.items():
@@ -887,6 +895,15 @@ class TestErrorTokens:
         _add_codex_auto_agent_text_error_tokens(tokens, "currently experiencing high demand")
         assert "HIGH_DEMAND" in tokens
 
+    @pytest.mark.parametrize(
+        "message",
+        ["server_is_overloaded", "capacity_exhausted"],
+    )
+    def test_add_text_tokens_openai_alpha_exact_capacity_codes(self, message: str):
+        tokens: set[str] = set()
+        _add_codex_auto_agent_text_error_tokens(tokens, message)
+        assert message in tokens
+
     def test_add_text_tokens_rate_limit(self):
         tokens: set[str] = set()
         _add_codex_auto_agent_text_error_tokens(tokens, "too many requests")
@@ -981,6 +998,112 @@ class TestClassification:
     def test_classify_server_overloaded(self):
         exc = _FakeExc(message="server_overloaded")
         assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "server_overloaded"
+
+    @pytest.mark.parametrize(
+        ("code", "expected"),
+        [
+            ("server_is_overloaded", "server_overloaded"),
+            ("capacity_exhausted", "capacity_exhausted"),
+        ],
+    )
+    def test_classify_alpha_openai_exact_capacity_codes(
+        self,
+        code: str,
+        expected: str,
+    ):
+        exc = _FakeExc(
+            detail={
+                "error": {
+                    "code": code,
+                    "type": "server_error",
+                    "message": "Please try again later.",
+                }
+            },
+            status_code=502,
+            _aawm_provider_returned=True,
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=_CODEX_RESPONSES_CANDIDATE,
+                attempted_provider_call=True,
+                openai_alpha_capacity_retry_enabled=True,
+            )
+            == expected
+        )
+
+    def test_exact_capacity_codes_require_alpha_openai_alias_scope(self):
+        exc = _FakeExc(
+            detail={
+                "error": {
+                    "code": "capacity_exhausted",
+                    "type": "server_error",
+                    "message": "Please try again later.",
+                }
+            },
+            status_code=502,
+            _aawm_provider_returned=True,
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=_CODEX_RESPONSES_CANDIDATE,
+            )
+            == "upstream_transient_internal"
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate={**_CODEX_RESPONSES_CANDIDATE, "provider": "xai"},
+                attempted_provider_call=True,
+                openai_alpha_capacity_retry_enabled=True,
+            )
+            == "upstream_transient_internal"
+        )
+
+    @pytest.mark.parametrize(
+        ("error", "status_code", "expected"),
+        [
+            (
+                {
+                    "code": "capacity_exhausted",
+                    "type": "insufficient_quota",
+                    "message": "Quota exhausted.",
+                },
+                429,
+                "usage_limit_reached",
+            ),
+            (
+                {
+                    "code": "server_is_overloaded",
+                    "type": "authentication_error",
+                    "message": "Invalid API key.",
+                },
+                401,
+                "provider_terminal_error",
+            ),
+        ],
+    )
+    def test_exact_capacity_codes_preserve_quota_and_auth_precedence(
+        self,
+        error: dict[str, str],
+        status_code: int,
+        expected: str,
+    ):
+        exc = _FakeExc(
+            detail={"error": error},
+            status_code=status_code,
+            _aawm_provider_returned=True,
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=_CODEX_RESPONSES_CANDIDATE,
+                attempted_provider_call=True,
+                openai_alpha_capacity_retry_enabled=True,
+            )
+            == expected
+        )
 
     def test_classify_rate_limited_by_token(self):
         exc = _FakeExc(message="too many requests")

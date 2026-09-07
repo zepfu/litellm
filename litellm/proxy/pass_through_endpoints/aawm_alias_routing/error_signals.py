@@ -512,6 +512,7 @@ _is_known_grok_personal_team_spending_limit_response: Optional[Callable[..., boo
 # Shared constant seams (authoritative in god module)
 _CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES: Optional[frozenset[str]] = None
 _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS: Optional[frozenset[str]] = None
+_CODEX_AUTO_AGENT_OPENAI_ALPHA_CAPACITY_ERROR_TOKENS: Optional[frozenset[str]] = None
 _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS: Optional[frozenset[str]] = None
 _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_BASE_SECONDS: float = 0.05
 _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS: float = 1.0
@@ -543,6 +544,7 @@ def configure_error_signals_runtime(  # noqa: PLR0915
     durable_cooldown_error_classes: frozenset[str],
     capacity_error_tokens: frozenset[str],
     rate_limit_error_tokens: frozenset[str],
+    openai_alpha_capacity_error_tokens: frozenset[str] = frozenset(),
     native_grok_backoff_base_seconds: float = 0.05,
     native_grok_backoff_max_seconds: float = 1.0,
     native_grok_backoff_jitter_seconds: float = 0.05,
@@ -556,6 +558,7 @@ def configure_error_signals_runtime(  # noqa: PLR0915
     global _is_known_grok_personal_team_spending_limit_response
     global _CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES
     global _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS
+    global _CODEX_AUTO_AGENT_OPENAI_ALPHA_CAPACITY_ERROR_TOKENS
     global _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS
     global _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_BASE_SECONDS
     global _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS
@@ -571,6 +574,9 @@ def configure_error_signals_runtime(  # noqa: PLR0915
     )
     _CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES = durable_cooldown_error_classes
     _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS = capacity_error_tokens
+    _CODEX_AUTO_AGENT_OPENAI_ALPHA_CAPACITY_ERROR_TOKENS = (
+        openai_alpha_capacity_error_tokens
+    )
     _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS = rate_limit_error_tokens
     _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_BASE_SECONDS = (
         native_grok_backoff_base_seconds
@@ -594,6 +600,7 @@ def configure_error_signals_runtime(  # noqa: PLR0915
         _host_globals_ref["_is_known_grok_personal_team_spending_limit_response"] = _mod["_is_known_grok_personal_team_spending_limit_response"]
         _host_globals_ref["_CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES"] = _mod["_CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES"]
         _host_globals_ref["_CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS"] = _mod["_CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS"]
+        _host_globals_ref["_CODEX_AUTO_AGENT_OPENAI_ALPHA_CAPACITY_ERROR_TOKENS"] = _mod["_CODEX_AUTO_AGENT_OPENAI_ALPHA_CAPACITY_ERROR_TOKENS"]
         _host_globals_ref["_CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS"] = _mod["_CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS"]
         _host_globals_ref["_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_BASE_SECONDS"] = _mod["_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_BASE_SECONDS"]
         _host_globals_ref["_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS"] = _mod["_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS"]
@@ -658,6 +665,10 @@ def _add_codex_auto_agent_text_error_tokens(
     ):
         tokens.add("MODEL_OVERLOADED")
         tokens.add("server_overloaded")
+    if "server_is_overloaded" in text_lower:
+        tokens.add("server_is_overloaded")
+    if "capacity_exhausted" in text_lower:
+        tokens.add("capacity_exhausted")
     if "busy upstream" in text_lower or ("upstream" in text_lower and "busy" in text_lower):
         tokens.add("UPSTREAM_BUSY")
     if "rate_limit_exceeded" in text_lower or "rate limit" in text_lower:
@@ -2309,11 +2320,101 @@ def is_openai_responses_unpersisted_item_not_found_error(
     return _openai_responses_unpersisted_item_not_found_message(exc) is not None
 
 
+_OPENAI_ALPHA_CAPACITY_QUOTA_ERROR_TOKENS = frozenset(
+    {
+        "insufficient_quota",
+        "quota_exceeded",
+        "quota_exhausted",
+        "usage_limit_reached",
+    }
+)
+_OPENAI_ALPHA_CAPACITY_AUTH_ERROR_TOKENS = frozenset(
+    {
+        "api_key_invalid",
+        "auth_error",
+        "authentication_error",
+        "authorization_error",
+        "credential_error",
+        "forbidden",
+        "forbidden_error",
+        "invalid_api_key",
+        "invalid_credentials",
+        "invalid_token",
+        "unauthorized",
+        "unauthorized_error",
+    }
+)
+_OPENAI_ALPHA_CAPACITY_QUOTA_TEXT_MARKERS = (
+    "quota exceeded",
+    "quota exhausted",
+    "quota limit",
+    "usage limit",
+    "weekly limit",
+)
+_OPENAI_ALPHA_CAPACITY_AUTH_TEXT_MARKERS = (
+    "authentication",
+    "authorization",
+    "credential",
+    "forbidden",
+    "invalid api key",
+    "invalid token",
+    "unauthorized",
+)
+
+
+def _classify_openai_alpha_capacity_error_code(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]],
+    tokens: set[str],
+    attempted_provider_call: bool,
+    openai_alpha_capacity_retry_enabled: bool,
+) -> Optional[str]:
+    """Classify exact OpenAI alpha capacity codes without widening shared policy."""
+    assert _CODEX_AUTO_AGENT_OPENAI_ALPHA_CAPACITY_ERROR_TOKENS is not None
+    if (
+        not openai_alpha_capacity_retry_enabled
+        or not attempted_provider_call
+        or getattr(exc, "_aawm_provider_returned", False) is not True
+        or not isinstance(candidate, dict)
+        or candidate.get("provider") != _CODEX_AUTO_AGENT_NATIVE_PROVIDER
+        or candidate.get("route_family") != "codex_responses"
+    ):
+        return None
+
+    normalized_tokens = {
+        str(token).strip().lower() for token in tokens if str(token).strip()
+    }
+    exact_codes = normalized_tokens & {
+        str(token).strip().lower()
+        for token in _CODEX_AUTO_AGENT_OPENAI_ALPHA_CAPACITY_ERROR_TOKENS
+    }
+    if not exact_codes:
+        return None
+
+    text_lower = _codex_auto_agent_error_text(exc).lower()
+    if (
+        normalized_tokens & _OPENAI_ALPHA_CAPACITY_QUOTA_ERROR_TOKENS
+        or any(marker in text_lower for marker in _OPENAI_ALPHA_CAPACITY_QUOTA_TEXT_MARKERS)
+    ):
+        return "usage_limit_reached"
+    if (
+        _extract_adapter_exception_status_code(exc) in {401, 403}
+        or normalized_tokens & _OPENAI_ALPHA_CAPACITY_AUTH_ERROR_TOKENS
+        or any(marker in text_lower for marker in _OPENAI_ALPHA_CAPACITY_AUTH_TEXT_MARKERS)
+    ):
+        return "provider_terminal_error"
+    if "server_is_overloaded" in exact_codes:
+        return "server_overloaded"
+    return "capacity_exhausted"
+
+
 def _classify_codex_auto_agent_retryable_exhaustion(
     exc: Any,
     *,
     candidate: Optional[dict[str, Any]] = None,
     attempted_provider_call: bool = True,
+    openai_alpha_capacity_retry_enabled: bool = False,
 ) -> Optional[str]:
     if _is_codex_auto_agent_continuation_state_unavailable(
         exc,
@@ -2367,6 +2468,15 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return "usage_limit_reached"
     if "usage_limit_reached" in tokens:
         return "usage_limit_reached"
+    openai_alpha_capacity_error_class = _classify_openai_alpha_capacity_error_code(
+        exc,
+        candidate=candidate,
+        tokens=tokens,
+        attempted_provider_call=attempted_provider_call,
+        openai_alpha_capacity_retry_enabled=openai_alpha_capacity_retry_enabled,
+    )
+    if openai_alpha_capacity_error_class is not None:
+        return openai_alpha_capacity_error_class
     if "server_overloaded" in tokens or tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS:
         if "server_overloaded" in tokens:
             return "server_overloaded"

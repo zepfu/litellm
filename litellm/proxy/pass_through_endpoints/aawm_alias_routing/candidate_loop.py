@@ -771,7 +771,9 @@ async def handle_alias_route(  # noqa: PLR0915
     _emit_auto_agent_alias_no_candidate_event = _lpe._emit_auto_agent_alias_no_candidate_event
     _get_safe_kimi_code_probe_failure_metadata = _lpe._get_safe_kimi_code_probe_failure_metadata
     _classify_kimi_code_auto_agent_probe_failure = _lpe._classify_kimi_code_auto_agent_probe_failure
-    _classify_codex_auto_agent_retryable_exhaustion = _lpe._classify_codex_auto_agent_retryable_exhaustion
+    _classify_codex_auto_agent_retryable_exhaustion_impl = (
+        _lpe._classify_codex_auto_agent_retryable_exhaustion
+    )
     _is_codex_auto_agent_grok_account_quota_exhaustion = _lpe._is_codex_auto_agent_grok_account_quota_exhaustion
     _get_codex_auto_agent_cooldown_seconds = _lpe._get_codex_auto_agent_cooldown_seconds
     _record_codex_failure_evidence = _lpe._record_codex_failure_evidence
@@ -850,6 +852,42 @@ async def handle_alias_route(  # noqa: PLR0915
                 upstream_url=_lpe._codex_oauth_responses_target_url(),
             ),
             namespace=get_aawm_alias_routing_state_namespace(),
+        )
+
+    def _classify_codex_auto_agent_retryable_exhaustion(
+        exc: Any,
+        *,
+        candidate: Optional[dict[str, Any]] = None,
+        attempted_provider_call: bool = True,
+    ) -> Optional[str]:
+        classifier_kwargs: dict[str, Any] = {
+            "candidate": candidate,
+            "attempted_provider_call": attempted_provider_call,
+        }
+        try:
+            classifier_signature = inspect.signature(
+                _classify_codex_auto_agent_retryable_exhaustion_impl
+            )
+        except (TypeError, ValueError):
+            classifier_signature = None
+        if classifier_signature is None or (
+            "openai_alpha_capacity_retry_enabled"
+            in classifier_signature.parameters
+            or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in classifier_signature.parameters.values()
+            )
+        ):
+            classifier_kwargs["openai_alpha_capacity_retry_enabled"] = (
+                _error_signals._is_openai_alpha_capacity_retry_enabled(
+                    request=request,
+                    candidate=candidate,
+                    is_codex_alias=is_codex_alias,
+                )
+            )
+        return _classify_codex_auto_agent_retryable_exhaustion_impl(
+            exc,
+            **classifier_kwargs,
         )
 
     replay_safety = (
