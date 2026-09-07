@@ -1,4 +1,5 @@
 import type { ReconstructedAttempt } from "../ledger/types.js";
+import { canonicalJson } from "../ledger/identity.js";
 
 export const WORKING_ESTIMATOR = "requested_if_known_else_recorded_final" as const;
 export const WORKING_ESTIMATE_LABEL =
@@ -17,7 +18,8 @@ export type UncertainDebitCategory =
   | "unknown_acceptance"
   | "rejected_after_start"
   | "conflicting_models"
-  | "unresolved_duplicate_identity";
+  | "unresolved_duplicate_identity"
+  | "conflicting_duplicate_identity";
 
 export type UnclassifiedQuotaReason =
   | "unknown_surface"
@@ -27,7 +29,8 @@ export type UnclassifiedQuotaReason =
   | "not_generation_started"
   | "unknown_model"
   | "ineligible_family"
-  | "window_membership_unknown";
+  | "window_membership_unknown"
+  | "conflicting_duplicate_identity";
 
 export type QuotaAttemptDisposition =
   | "counted"
@@ -129,6 +132,7 @@ export interface QuotaAttemptAssessment {
 export interface QuotaDiscrepancy {
   kind: "local_usage_exceeds_capacity";
   excess: number;
+  qualification: "qualified" | "diagnostic_only";
 }
 
 export interface QuotaBucketEstimate {
@@ -183,6 +187,7 @@ const UNCERTAIN_DEBIT_CATEGORIES: readonly UncertainDebitCategory[] = [
   "rejected_after_start",
   "conflicting_models",
   "unresolved_duplicate_identity",
+  "conflicting_duplicate_identity",
 ];
 
 const UNCLASSIFIED_REASONS: readonly UnclassifiedQuotaReason[] = [
@@ -194,6 +199,7 @@ const UNCLASSIFIED_REASONS: readonly UnclassifiedQuotaReason[] = [
   "unknown_model",
   "ineligible_family",
   "window_membership_unknown",
+  "conflicting_duplicate_identity",
 ];
 
 export interface EstimatedFamilySelection {
@@ -268,6 +274,7 @@ function classifyQuotaAttemptWithIndexes(
 ): QuotaAttemptAssessment {
   const selected = selectEstimatedFamily(attempt);
   const emptyMembership: Record<string, WindowMembership> = {};
+  const uncertainDebitCategories = uncertainDebitCategoriesFor(attempt);
 
   const scopeReason = scopeReasonFor(attempt, ownership);
   if (scopeReason !== null) {
@@ -307,7 +314,7 @@ function classifyQuotaAttemptWithIndexes(
       applicableBucketIds: [],
       contributedBucketIds: [],
       membershipByBucket: emptyMembership,
-      uncertainDebitCategories: [],
+      uncertainDebitCategories,
       unclassifiedReasons: ["not_generation_started"],
     };
   }
@@ -321,7 +328,7 @@ function classifyQuotaAttemptWithIndexes(
       applicableBucketIds: [],
       contributedBucketIds: [],
       membershipByBucket: emptyMembership,
-      uncertainDebitCategories: [],
+      uncertainDebitCategories,
       unclassifiedReasons: ["unknown_model"],
     };
   }
@@ -339,7 +346,7 @@ function classifyQuotaAttemptWithIndexes(
       applicableBucketIds: [],
       contributedBucketIds: [],
       membershipByBucket: emptyMembership,
-      uncertainDebitCategories: [],
+      uncertainDebitCategories,
       unclassifiedReasons: ["ineligible_family"],
     };
   }
@@ -360,7 +367,6 @@ function classifyQuotaAttemptWithIndexes(
   const hasUncertainMembership = applicableBuckets.some((bucket) =>
     isUncertainMembership(membershipByBucket[bucket.bucketId]),
   );
-  const uncertainDebitCategories = uncertainDebitCategoriesFor(attempt);
   const hasCandidateMembership =
     contributedBucketIds.length > 0 || hasUncertainMembership;
 
@@ -375,7 +381,7 @@ function classifyQuotaAttemptWithIndexes(
         .sort(),
       contributedBucketIds: [],
       membershipByBucket,
-      uncertainDebitCategories: [],
+      uncertainDebitCategories,
       unclassifiedReasons: [],
     };
   }
@@ -445,10 +451,7 @@ export function estimateQuota(input: QuotaEstimatorInput): QuotaEstimate {
     policy,
   );
   const uncertainAttemptMode = input.uncertainAttemptMode ?? "exclude";
-  const attempts = [...input.attempts].sort((left, right) =>
-    left.attemptId.localeCompare(right.attemptId),
-  );
-  assertUniqueAttemptIds(attempts);
+  const normalized = normalizeAttempts(input.attempts);
 
   const bucketStates = new Map<string, MutableBucketEstimate>();
   for (const bucket of policy.buckets) {
@@ -474,14 +477,26 @@ export function estimateQuota(input: QuotaEstimatorInput): QuotaEstimate {
   const windowMembershipUnknownAttemptIds = new Set<string>();
   const assessments: QuotaAttemptAssessment[] = [];
 
-  for (const attempt of attempts) {
-    const assessment = classifyQuotaAttemptWithIndexes(
-      attempt,
-      policy,
-      windows,
-      input.ownership,
-      uncertainAttemptMode,
-    );
+  const attemptIds = [
+    ...new Set([...normalized.byId.keys(), ...normalized.conflictingIds]),
+  ].sort();
+  for (const attemptId of attemptIds) {
+    let assessment: QuotaAttemptAssessment;
+    if (normalized.conflictingIds.has(attemptId)) {
+      assessment = conflictingDuplicateAssessment(attemptId);
+    } else {
+      const attempt = normalized.byId.get(attemptId);
+      if (attempt === undefined) {
+        throw new Error(`missing normalized quota attempt ${attemptId}`);
+      }
+      assessment = classifyQuotaAttemptWithIndexes(
+        attempt,
+        policy,
+        windows,
+        input.ownership,
+        uncertainAttemptMode,
+      );
+    }
     assessments.push(assessment);
 
     if (assessment.disposition === "counted") {
@@ -618,15 +633,17 @@ function buildBucketEstimate(
   const workingUsageEstimate = state.window?.status === "known"
     ? state.usage
     : null;
-  const remainderKnown =
+  const unclampedRemainderKnown =
     state.window?.status === "known" &&
-    coverage === "complete" &&
     state.membershipComplete &&
     workingUsageEstimate !== null;
-  const workingRemainingUnclamped = remainderKnown
+  const workingRemainingUnclamped = unclampedRemainderKnown
     ? state.policy.capacity - (workingUsageEstimate ?? 0)
     : null;
-  const workingRemainingEstimate = workingRemainingUnclamped === null
+  const remainderQualified =
+    unclampedRemainderKnown && coverage === "complete";
+  const workingRemainingEstimate =
+    !remainderQualified || workingRemainingUnclamped === null
     ? null
     : Math.max(0, workingRemainingUnclamped);
   const discrepancy =
@@ -634,6 +651,8 @@ function buildBucketEstimate(
       ? {
           kind: "local_usage_exceeds_capacity" as const,
           excess: Math.abs(workingRemainingUnclamped),
+          qualification:
+            coverage === "complete" ? ("qualified" as const) : ("diagnostic_only" as const),
         }
       : null;
 
@@ -749,6 +768,7 @@ function uncertainDebitCategoriesFor(
       categories.add("cancelled_after_start");
       break;
     case "completion_unknown":
+    case "unresolved":
       categories.add("unknown_acceptance");
       break;
     case "rejected_after_start":
@@ -910,16 +930,55 @@ function validateOwnership(ownership: QuotaOwnershipExpectation): void {
   }
 }
 
-function assertUniqueAttemptIds(
+interface NormalizedAttempts {
+  byId: Map<string, ReconstructedAttempt>;
+  conflictingIds: Set<string>;
+}
+
+function normalizeAttempts(
   attempts: ReadonlyArray<ReconstructedAttempt>,
-): void {
-  const ids = new Set<string>();
+): NormalizedAttempts {
+  const grouped = new Map<string, ReconstructedAttempt[]>();
   for (const attempt of attempts) {
-    if (ids.has(attempt.attemptId)) {
-      throw new Error(`duplicate quota attempt ${attempt.attemptId}`);
+    const group = grouped.get(attempt.attemptId);
+    if (group === undefined) {
+      grouped.set(attempt.attemptId, [attempt]);
+    } else {
+      group.push(attempt);
     }
-    ids.add(attempt.attemptId);
   }
+
+  const byId = new Map<string, ReconstructedAttempt>();
+  const conflictingIds = new Set<string>();
+  for (const attemptId of [...grouped.keys()].sort()) {
+    const group = grouped.get(attemptId);
+    if (group === undefined || group.length === 0) {
+      continue;
+    }
+    const fingerprints = new Set(group.map((attempt) => canonicalJson(attempt)));
+    if (fingerprints.size === 1) {
+      byId.set(attemptId, group[0] as ReconstructedAttempt);
+    } else {
+      conflictingIds.add(attemptId);
+    }
+  }
+  return { byId, conflictingIds };
+}
+
+function conflictingDuplicateAssessment(
+  attemptId: string,
+): QuotaAttemptAssessment {
+  return {
+    attemptId,
+    disposition: "unclassified",
+    selectedFamily: null,
+    basis: null,
+    applicableBucketIds: [],
+    contributedBucketIds: [],
+    membershipByBucket: {},
+    uncertainDebitCategories: ["conflicting_duplicate_identity"],
+    unclassifiedReasons: ["conflicting_duplicate_identity"],
+  };
 }
 
 function makeCategorySets<T extends string>(
