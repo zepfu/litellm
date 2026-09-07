@@ -1841,57 +1841,266 @@ class OracleBrowserBoundaryUnavailable(ChatGPTConversationInitError):
         super().__init__(message, telemetry_class="auth")
 
 
-_ORACLE_BROWSER_FETCH_SCRIPT = """
-async (request) => {
-  const expectedHost = String(request.expected_host || "").toLowerCase();
-  const executingHost = String(window.location.hostname || "").toLowerCase();
-  if (!expectedHost || executingHost !== expectedHost) {
-    throw new Error("conversation-init browser target host changed");
-  }
-  const controller = new AbortController();
-  const timeoutMs = Math.max(1, Number(request.timeout_ms));
-  let timeoutId = null;
-  const timeout = new Promise((_, reject) => {
-    timeoutId = setTimeout(() => {
-      controller.abort();
-      reject(new Error("conversation-init browser fetch timed out"));
-    }, timeoutMs);
-  });
-  const fetchResponse = (async () => {
-    const response = await fetch(request.url, {
-      method: "POST",
-      credentials: "include",
-      redirect: "error",
-      signal: controller.signal
-    });
-    let payload = null;
-    try {
-      payload = await response.json();
-    } catch (_) {
-      payload = null;
-    }
-    return {
-      status_code: response.status,
-      payload
-    };
-  })();
-  try {
-    return await Promise.race([fetchResponse, timeout]);
-  } finally {
-    if (timeoutId !== null) {
-      clearTimeout(timeoutId);
-    }
-  }
-}
-"""
+def _native_init_header(headers: Mapping[str, Any], name: str) -> Any:
+    for key in headers:
+        if key.lower() == name:
+            return headers[key]
+    return None
+
+
+def _native_init_account_hash(headers: Mapping[str, Any]) -> Optional[str]:
+    value = _native_init_header(headers, "chatgpt-account-id")
+    if not isinstance(value, str) or value.strip() == "default":
+        return None
+    return hash_chatgpt_conversation_init_canonical_account_id(value)
+
+
+def _native_init_retry_after(headers: Mapping[str, Any]) -> Optional[float]:
+    from email.utils import parsedate_to_datetime
+    from math import isfinite
+
+    value = _native_init_header(headers, "retry-after")
+    if not isinstance(value, str):
+        return None
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        try:
+            parsed = parsedate_to_datetime(value)
+            if parsed.tzinfo is None:
+                return None
+            seconds = max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return seconds if isfinite(seconds) and seconds >= 0 else None
+
+
+def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture lifetime
+    page: Any,
+    *,
+    request_url: str,
+    expected_account_hash: str,
+    deadline: float,
+) -> Mapping[str, Any]:
+    """Capture one native request without retaining its body or credentials."""
+    import base64
+
+    target = urlsplit(request_url)
+    origin = f"https://{target.netloc}"
+    session = page.context.new_cdp_session(page)
+    capture: Dict[str, Any] = {}
+    extra_hashes: Dict[str, Optional[str]] = {}
+    failure: Optional[Dict[str, Any]] = None
+    boundary_error = False
+    init_routed = False
+    # Leave the existing worker deadline some room to close its owned target.
+    capture_deadline = deadline - min(2.0, _remaining_browser_timeout(deadline) / 5)
+
+    def is_init(url: str) -> bool:
+        parsed = urlsplit(url)
+        return (
+            parsed.scheme == "https"
+            and parsed.netloc == target.netloc
+            and parsed.path == CHATGPT_CONVERSATION_INIT_PATH
+        )
+
+    def guard_request(route: Any) -> None:
+        nonlocal boundary_error, init_routed
+        request = route.request
+        parsed = urlsplit(request.url)
+        redirected = request.redirected_from
+        forbidden = (
+            request.is_navigation_request()
+            and (
+                parsed.scheme != "https"
+                or parsed.netloc != target.netloc
+                or parsed.path not in {"", "/"}
+                or redirected is not None
+            )
+        ) or (
+            redirected is not None
+            and (is_init(request.url) or is_init(redirected.url))
+        )
+        # No model-message route is needed to render an empty page.
+        forbidden = forbidden or (
+            parsed.path in {"/backend-api/conversation", "/backend-api/f/conversation"}
+            and request.method == "POST"
+        )
+        if is_init(request.url):
+            forbidden = forbidden or init_routed
+            init_routed = True
+        if forbidden:
+            boundary_error = True
+        if forbidden or boundary_error or failure is not None:
+            route.abort()
+        else:
+            route.continue_()
+
+    def request_seen(event: Mapping[str, Any]) -> None:
+        nonlocal boundary_error
+        request = event.get("request", {})
+        request_id = event.get("requestId")
+        if request_id == capture.get("request_id") and event.get("redirectResponse"):
+            boundary_error = True
+        if capture or not is_init(request.get("url", "")):
+            return
+        capture.update(
+            request_id=request_id,
+            account_hash=_native_init_account_hash(request.get("headers", {})),
+            method=request.get("method"),
+            body_omitted=(
+                not request.get("hasPostData", False) and "postData" not in request
+            ),
+        )
+        if (
+            capture["method"] != "POST"
+            or capture["account_hash"] != expected_account_hash
+        ):
+            boundary_error = True
+
+    def extra_seen(event: Mapping[str, Any]) -> None:
+        request_id = event.get("requestId")
+        if isinstance(request_id, str) and (
+            len(extra_hashes) < 256 or request_id == capture.get("request_id")
+        ):
+            extra_hashes[request_id] = _native_init_account_hash(
+                event.get("headers", {})
+            )
+
+    def response_seen(event: Mapping[str, Any]) -> None:
+        nonlocal failure, boundary_error
+        response = event.get("response", {})
+        status = response.get("status")
+        headers = response.get("headers", {})
+        request_id = event.get("requestId")
+        if request_id == capture.get("request_id"):
+            if not is_init(response.get("url", "")) or 300 <= status < 400:
+                boundary_error = True
+                return
+            capture.update(
+                status_code=status,
+                retry_after_seconds=_native_init_retry_after(headers),
+            )
+        if (
+            status in {401, 403, 429}
+            or _native_init_header(headers, "cf-mitigated") == "challenge"
+        ):
+            failure = {
+                "status_code": status,
+                "retry_after_seconds": _native_init_retry_after(headers),
+                "correlated": request_id == capture.get("request_id"),
+            }
+
+    def loading_finished(event: Mapping[str, Any]) -> None:
+        if event.get("requestId") == capture.get("request_id"):
+            capture["finished"] = True
+
+    def loading_failed(event: Mapping[str, Any]) -> None:
+        nonlocal boundary_error
+        if event.get("requestId") == capture.get("request_id"):
+            boundary_error = True
+
+    def envelope(payload: Any, failed: bool = False) -> Mapping[str, Any]:
+        state = failure if failed and failure is not None else capture
+        request_id = capture.get("request_id")
+        verified = (
+            capture.get("account_hash") == expected_account_hash
+            and extra_hashes.get(request_id) == expected_account_hash
+        )
+        native: Dict[str, Any] = {
+            "account_hash": expected_account_hash if verified else None,
+            "identity_source": "native_request_header",
+            "selector_evidence": (
+                "request_and_extra_info" if verified else "unverified"
+            ),
+            "request_response_correlated": (
+                bool(state.get("correlated")) if failed else True
+            ),
+            "request_method": capture.get("method"),
+            "request_body_omitted": capture.get("body_omitted"),
+        }
+        retry_after = state.get("retry_after_seconds")
+        if retry_after is not None:
+            native["retry_after_seconds"] = retry_after
+        return {
+            "status_code": state.get("status_code"),
+            "payload": payload,
+            "native_capture": native,
+        }
+
+    try:
+        page.route("**/*", guard_request)
+        session.on("Network.requestWillBeSent", request_seen)
+        session.on("Network.requestWillBeSentExtraInfo", extra_seen)
+        session.on("Network.responseReceived", response_seen)
+        session.on("Network.loadingFinished", loading_finished)
+        session.on("Network.loadingFailed", loading_failed)
+        session.send(
+            "Network.enable",
+            {
+                "maxTotalBufferSize": MAX_CONVERSATION_INIT_SOURCE_BYTES * 2,
+                "maxResourceBufferSize": MAX_CONVERSATION_INIT_SOURCE_BYTES,
+                "maxPostDataSize": 0,
+            },
+        )
+        try:
+            page.goto(
+                origin + "/",
+                wait_until="commit",
+                timeout=_browser_timeout_milliseconds(
+                    _remaining_browser_timeout(capture_deadline)
+                ),
+            )
+        except Exception:
+            if failure is None:
+                raise
+        while True:
+            if failure is not None:
+                return envelope(None, failed=True)
+            if boundary_error:
+                raise OracleBrowserBoundaryUnavailable(
+                    "Native Oracle init identity, method, or redirect was rejected."
+                )
+            _raise_if_browser_deadline_expired(capture_deadline)
+            request_id = capture.get("request_id")
+            if capture.get("finished") and request_id in extra_hashes:
+                if extra_hashes[request_id] != expected_account_hash:
+                    raise OracleBrowserBoundaryUnavailable(
+                        "Native Oracle init ExtraInfo account did not match inventory."
+                    )
+                body = session.send(
+                    "Network.getResponseBody", {"requestId": request_id}
+                )
+                content = body.get("body", "")
+                if len(content) > MAX_CONVERSATION_INIT_SOURCE_BYTES:
+                    raise OracleBrowserBoundaryUnavailable(
+                        "Native Oracle init response exceeded the size limit."
+                    )
+                if body.get("base64Encoded"):
+                    content = base64.b64decode(content, validate=True).decode("utf-8")
+                try:
+                    payload = json.loads(content)
+                except ValueError:
+                    payload = None
+                return envelope(payload)
+            if page.evaluate(
+                "() => /verify you are human|checking your browser|just a moment/i"
+                ".test(document.title + ' ' + (document.body?.innerText || ''))"
+            ):
+                raise OracleBrowserBoundaryUnavailable(
+                    "Native Oracle page requires a browser challenge."
+                )
+            page.wait_for_timeout(50)
+    finally:
+        session.detach()
 
 
 class OracleBrowserConversationInitTransport:
-    """Attach to an existing Oracle browser and issue the frontend POST.
+    """Observe native init traffic in a dedicated page of Oracle's context.
 
-    This transport deliberately uses CDP attachment and an existing ChatGPT
-    page. It never launches a browser, creates a persistent context, reads
-    cookies or storage, or returns response headers.
+    The pinned existing target identifies the context only. This transport
+    never navigates that target, launches a browser, reads cookies or storage,
+    fabricates an init request, or returns request bodies or credentials.
     """
 
     boundary_name = ORACLE_BROWSER_BOUNDARY_NAME
@@ -1901,6 +2110,7 @@ class OracleBrowserConversationInitTransport:
         *,
         cdp_endpoint: Optional[str] = None,
         page_target_id: str,
+        expected_account_hash: str,
         timeout_seconds: float = 30.0,
         playwright_factory: Optional[Callable[[], Any]] = None,
     ) -> None:
@@ -1919,6 +2129,13 @@ class OracleBrowserConversationInitTransport:
         if timeout_seconds <= 0:
             raise ValueError("Oracle browser CDP timeout must be greater than 0.")
         self.page_target_id = _validate_page_target_id(page_target_id)
+        if not isinstance(expected_account_hash, str) or not re.fullmatch(
+            r"[0-9a-f]{12}", expected_account_hash
+        ):
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser requires a canonical inventory account hash."
+            )
+        self.expected_account_hash = expected_account_hash
         self.timeout_seconds = timeout_seconds
         self._playwright_factory = playwright_factory
 
@@ -1929,6 +2146,7 @@ class OracleBrowserConversationInitTransport:
             return _run_oracle_browser_capture_in_worker(
                 cdp_endpoint=self.cdp_endpoint,
                 page_target_id=self.page_target_id,
+                expected_account_hash=self.expected_account_hash,
                 request_url=request.full_url,
                 deadline=deadline,
                 playwright_factory=self._playwright_factory,
@@ -1950,6 +2168,7 @@ def _run_oracle_browser_capture_in_worker(
     *,
     cdp_endpoint: str,
     page_target_id: str,
+    expected_account_hash: str,
     request_url: str,
     deadline: float,
     playwright_factory: Optional[Callable[[], Any]],
@@ -1967,6 +2186,7 @@ def _run_oracle_browser_capture_in_worker(
             deadline,
             playwright_factory,
             private_process_group,
+            expected_account_hash,
         ),
     )
     try:
@@ -2009,10 +2229,12 @@ def _oracle_browser_capture_worker(
     deadline: float,
     playwright_factory: Optional[Callable[[], Any]],
     private_process_group: Any,
+    expected_account_hash: str,
 ) -> None:
     _enter_oracle_browser_worker_process_group(private_process_group)
     playwright = None
     browser = None
+    owned_page = None
     result = None
     successful = False
     try:
@@ -2026,38 +2248,35 @@ def _oracle_browser_capture_worker(
             ),
         )
         _raise_if_browser_deadline_expired(deadline)
-        page = _find_existing_chatgpt_page(
+        source_page = _find_existing_chatgpt_page(
             browser,
             page_target_id,
             request_url,
             deadline=deadline,
         )
-        if page is None:
+        if source_page is None:
             raise OracleBrowserBoundaryUnavailable(
-                "Oracle browser has no existing ChatGPT CDP target for the "
-                "conversation-init request."
-            )
-        target_host = urlsplit(request_url).hostname
-        if not target_host:
-            raise OracleBrowserBoundaryUnavailable(
-                "Oracle browser conversation-init request has no host."
+                "Oracle browser has no exact bound ChatGPT or about:blank "
+                "context anchor for the conversation-init request."
             )
         _raise_if_browser_deadline_expired(deadline)
-        result = page.evaluate(
-            _ORACLE_BROWSER_FETCH_SCRIPT,
-            {
-                "url": request_url,
-                "expected_host": target_host,
-                "timeout_ms": _browser_timeout_milliseconds(
-                    _remaining_browser_timeout(deadline)
-                ),
-            },
+        owned_page = source_page.context.new_page()
+        result = _observe_native_oracle_init(
+            owned_page,
+            request_url=request_url,
+            expected_account_hash=expected_account_hash,
+            deadline=deadline,
         )
         _raise_if_browser_deadline_expired(deadline)
         successful = True
     except Exception:
         successful = False
     finally:
+        if owned_page is not None:
+            try:
+                owned_page.close()
+            except Exception:
+                successful = False
         try:
             _disconnect_attached_browser(playwright, browser)
         except Exception:
@@ -2284,13 +2503,15 @@ def build_oracle_browser_conversation_init_transport(
     *,
     cdp_endpoint: Optional[str] = None,
     page_target_id: str,
+    expected_account_hash: str,
     timeout_seconds: float = 30.0,
 ) -> OracleBrowserConversationInitTransport:
-    """Build the attach-only transport for the established Oracle boundary."""
+    """Build native capture in an owned page of the pinned target's context."""
 
     return OracleBrowserConversationInitTransport(
         cdp_endpoint=cdp_endpoint,
         page_target_id=page_target_id,
+        expected_account_hash=expected_account_hash,
         timeout_seconds=timeout_seconds,
     )
 
@@ -2355,7 +2576,11 @@ def _find_existing_chatgpt_page(
                 )
             page_url = str(getattr(page, "url", "") or "")
             page_host = urlsplit(page_url).hostname
-            if page_host == target_host and _page_target_id(context, page) == page_target_id:
+            # A blank anchor selects context only; native headers prove identity.
+            if (
+                (page_url == "about:blank" or page_host == target_host)
+                and _page_target_id(context, page) == page_target_id
+            ):
                 return page
     return None
 
@@ -2419,9 +2644,9 @@ def _coerce_browser_response(result: Any) -> Mapping[str, Any]:
         "status_code": status,
         "payload": result.get("payload"),
     }
-    for key in _CANONICAL_ACCOUNT_ID_KEYS:
-        if key in result:
-            response[key] = result[key]
+    native = result.get("native_capture")
+    if isinstance(native, Mapping):
+        response["native_capture"] = dict(native)
     return response
 
 

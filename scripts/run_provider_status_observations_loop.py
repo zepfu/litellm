@@ -366,6 +366,7 @@ DEFAULT_CURSOR_AGENT_USAGE_POLL_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_CURSOR_AGENT_USAGE_DASHBOARD_URL = CURSOR_AGENT_DASHBOARD_HOST
 DEFAULT_CHATGPT_CONVERSATION_INIT_POLL_ENABLED = False
 DEFAULT_CHATGPT_CONVERSATION_INIT_POLL_INTERVAL_SECONDS = 600.0
+DEFAULT_CHATGPT_CONVERSATION_INIT_THROTTLE_BACKOFF_SECONDS = 600.0
 DEFAULT_CHATGPT_CONVERSATION_INIT_SOURCE_PATH = (
     "/run/aawm/chatgpt/conversation-init.json"
 )
@@ -1647,6 +1648,7 @@ class SidecarTaskState:
     xai_reset_poll_last_attempt_monotonic: Optional[float] = None
     cursor_agent_usage_last_attempt_monotonic: Optional[float] = None
     chatgpt_conversation_init_last_attempt_monotonic: Optional[float] = None
+    chatgpt_conversation_init_cooldown_until_monotonic: Optional[float] = None
     codex_reset_credit_last_attempt_monotonic_by_label: Dict[str, float] = (
         dataclass_field(default_factory=dict)
     )
@@ -13786,7 +13788,9 @@ def _new_chatgpt_conversation_init_account_coverage(
         "persisted": False,
         "fresh_capture": False,
         "status_code": None,
+        "retry_after_seconds": None,
         "telemetry_class": None,
+        "telemetry_status": None,
         "error_class": None,
         "error_message": None,
     }
@@ -13814,6 +13818,11 @@ def _set_chatgpt_account_capture_exception(
     coverage: Dict[str, Any],
     exc: Exception,
 ) -> None:
+    retry_after_seconds = _chatgpt_conversation_init_retry_after_seconds(
+        getattr(exc, "retry_after_seconds", None)
+    )
+    if retry_after_seconds is not None:
+        coverage["retry_after_seconds"] = retry_after_seconds
     telemetry_class = getattr(exc, "telemetry_class", None)
     if isinstance(exc, (ImportError, ModuleNotFoundError)):
         stage = "dependency"
@@ -13840,6 +13849,128 @@ def _set_chatgpt_account_capture_exception(
         telemetry_class=telemetry_class,
         capture_status=capture_status,
     )
+
+
+def _chatgpt_conversation_init_retry_after_seconds(
+    value: Any,
+) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return seconds
+
+
+def _chatgpt_conversation_init_is_throttled(
+    coverage: Mapping[str, Any],
+) -> bool:
+    status_code = coverage.get("status_code")
+    try:
+        if not isinstance(status_code, bool) and int(status_code) == 429:
+            return True
+    except (TypeError, ValueError):
+        pass
+
+    for key in (
+        "telemetry_status",
+        "telemetry_class",
+        "capture_status",
+        "error_class",
+    ):
+        value = coverage.get(key)
+        if not isinstance(value, str):
+            continue
+        normalized = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+        if normalized in {
+            "challenge",
+            "captcha",
+            "rate_limit",
+            "rate_limited",
+            "throttle",
+            "throttled",
+        } or "challenge" in normalized or "captcha" in normalized:
+            return True
+    return False
+
+
+def _chatgpt_conversation_init_throttle_seconds(
+    coverage: Mapping[str, Any],
+) -> float:
+    retry_after_seconds = _chatgpt_conversation_init_retry_after_seconds(
+        coverage.get("retry_after_seconds")
+    )
+    if retry_after_seconds is None:
+        return DEFAULT_CHATGPT_CONVERSATION_INIT_THROTTLE_BACKOFF_SECONDS
+    return max(
+        DEFAULT_CHATGPT_CONVERSATION_INIT_THROTTLE_BACKOFF_SECONDS,
+        retry_after_seconds,
+    )
+
+
+def _set_chatgpt_conversation_init_cooldown(
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+    coverage: Mapping[str, Any],
+) -> float:
+    cooldown_until = now_monotonic + _chatgpt_conversation_init_throttle_seconds(
+        coverage
+    )
+    prior_cooldown_until = state.chatgpt_conversation_init_cooldown_until_monotonic
+    if prior_cooldown_until is None or cooldown_until > prior_cooldown_until:
+        state.chatgpt_conversation_init_cooldown_until_monotonic = cooldown_until
+    return max(
+        0.0,
+        (
+            state.chatgpt_conversation_init_cooldown_until_monotonic
+            or cooldown_until
+        )
+        - now_monotonic,
+    )
+
+
+def _append_chatgpt_conversation_init_cooldown_skips(
+    summary: Dict[str, Any],
+    records: Sequence[CodexOAuthCredentialRecord],
+    bindings: Mapping[str, ChatGPTConversationInitAccountBinding],
+    *,
+    start_index: int,
+) -> None:
+    for record in records[start_index:]:
+        binding_configured = record.label in bindings
+        coverage = _new_chatgpt_conversation_init_account_coverage(
+            record,
+            binding_configured=binding_configured,
+        )
+        if binding_configured:
+            _set_chatgpt_account_failure(
+                coverage,
+                stage="shared_session_throttle",
+                error_class="ChatGPTConversationInitSharedSessionCooldown",
+                error_message=(
+                    "Conversation-init capture skipped because the shared "
+                    "browser session is cooling down after a throttle."
+                ),
+                telemetry_class="throttled",
+                capture_status="shared_session_cooldown",
+            )
+        else:
+            _set_chatgpt_account_failure(
+                coverage,
+                stage="binding",
+                error_class="ChatGPTConversationInitBindingMissing",
+                error_message=(
+                    f"No browser binding configured for Codex OAuth account "
+                    f"'{record.label}'."
+                ),
+                telemetry_class="configuration",
+                capture_status="missing_binding",
+            )
+        summary["account_coverage"].append(coverage)
 
 
 def _chatgpt_account_coverage_status(success_count: int, total_count: int) -> str:
@@ -13942,7 +14073,13 @@ def _collect_bound_chatgpt_conversation_init_account(
                 collector_summary.get("written")
             )
             coverage["status_code"] = collector_summary.get("status_code")
+            coverage["retry_after_seconds"] = (
+                _chatgpt_conversation_init_retry_after_seconds(
+                    collector_summary.get("retry_after_seconds")
+                )
+            )
             coverage["telemetry_class"] = collector_summary.get("telemetry_class")
+            coverage["telemetry_status"] = collector_summary.get("telemetry_status")
             coverage["account_identity_verified"] = bool(
                 collector_summary.get("account_identity_verified")
             )
@@ -14053,6 +14190,8 @@ def _run_chatgpt_conversation_init_bound_poll(  # noqa: PLR0915
     summary: Dict[str, Any],
     *,
     observed_at: datetime,
+    state: SidecarTaskState,
+    now_monotonic: float,
 ) -> None:
     try:
         inventory = _require_codex_oauth_inventory(config)
@@ -14073,7 +14212,7 @@ def _run_chatgpt_conversation_init_bound_poll(  # noqa: PLR0915
         label for label in bindings if label not in labels
     )
 
-    for record in records:
+    for record_index, record in enumerate(records):
         binding = bindings.get(record.label)
         if binding is None:
             coverage = _new_chatgpt_conversation_init_account_coverage(
@@ -14138,6 +14277,20 @@ def _run_chatgpt_conversation_init_bound_poll(  # noqa: PLR0915
         elif payloads:
             coverage["persistence_status"] = "not_applied"
         summary["account_coverage"].append(coverage)
+        if _chatgpt_conversation_init_is_throttled(coverage):
+            summary["last_good_state_retained"] = True
+            _set_chatgpt_conversation_init_cooldown(
+                state,
+                now_monotonic=now_monotonic,
+                coverage=coverage,
+            )
+            _append_chatgpt_conversation_init_cooldown_skips(
+                summary,
+                records,
+                bindings,
+                start_index=record_index + 1,
+            )
+            break
 
     fresh_capture_count = sum(
         1
@@ -14192,6 +14345,9 @@ def _run_chatgpt_conversation_init_poll_task(  # noqa: PLR0915
         < config.chatgpt_conversation_init_poll_interval_seconds
     ):
         return None
+    cooldown_until = state.chatgpt_conversation_init_cooldown_until_monotonic
+    if cooldown_until is not None and now_monotonic < cooldown_until:
+        return None
 
     state.chatgpt_conversation_init_last_attempt_monotonic = now_monotonic
     observed_at = datetime.now(timezone.utc)
@@ -14212,6 +14368,8 @@ def _run_chatgpt_conversation_init_poll_task(  # noqa: PLR0915
             config,
             summary,
             observed_at=observed_at,
+            state=state,
+            now_monotonic=now_monotonic,
         )
     else:
         try:
