@@ -63,7 +63,7 @@ describe("D1-752 Stage 2B ledger", () => {
     const directory = mkdtempSync(join(tmpdir(), "stage2b-ledger-"));
     temporaryDirectories.push(directory);
     const ledger = new Ledger(join(directory, "usage.sqlite"));
-    expect(ledger.schemaVersion).toBe(3);
+    expect(ledger.schemaVersion).toBe(4);
 
     const first = scope("account-one", "provider-user-one", "workspace-one", "quota-one");
     const second = scope("account-two", "provider-user-one", "workspace-one", "quota-one");

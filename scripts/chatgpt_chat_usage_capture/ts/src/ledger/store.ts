@@ -15,7 +15,9 @@ import type {
 } from "../contracts/records.js";
 import { reconstructAttempts } from "../normalize/reconstruct.js";
 import {
-  mapModelEvidence,
+  isMappingPublished,
+  normalizeMappingVersion,
+  resolveModelEvidence,
   suggestModelMappings,
   validateMappingVersion,
 } from "../normalize/model-mapping.js";
@@ -833,38 +835,80 @@ export class Ledger {
         `,
       )
       .all(scopeKey(scope), attemptId)
-      .map((row: unknown) => row as SqlRow);
+      .map((row: unknown) => {
+        const item = row as SqlRow;
+        return {
+          ...item,
+          warnings: parseJsonArray(item.warnings_json),
+          provenance: parseJsonObject(item.provenance_json),
+        };
+      });
   }
 
   saveModelMapping(mapping: ModelMappingVersion): void {
-    validateMappingVersion(mapping);
-    assertNoSecrets(mapping);
+    const candidate = normalizeMappingVersion(mapping);
+    validateMappingVersion(candidate);
+    assertNoSecrets(candidate);
+    const existingRow = this.db
+      .prepare("SELECT * FROM model_mapping_versions WHERE version=?")
+      .get(candidate.version) as SqlRow | undefined;
+    if (existingRow) {
+      const existing = this.modelMapping(candidate.version);
+      if (mappingFingerprint(existing) === mappingFingerprint(candidate)) {
+        return;
+      }
+      if (isMappingPublished(existing)) {
+        throw new LedgerError(
+          `published model mapping version is immutable: ${candidate.version}`,
+        );
+      }
+    }
+
+    const values = [
+      JSON.stringify(candidate.canonicalFamilies),
+      JSON.stringify(candidate.rules),
+      candidate.reviewStatus,
+      candidate.source,
+      candidate.createdAt,
+      candidate.reviewedAt ?? null,
+      candidate.reviewedBy ?? null,
+      candidate.changeKind ?? "prospective",
+      candidate.validFrom ?? null,
+      candidate.validUntil ?? null,
+      candidate.publishedAt ?? null,
+      candidate.supersedesVersion ?? null,
+      candidate.correctionOfVersion ?? null,
+      JSON.stringify(candidate.provenance ?? {}),
+      JSON.stringify(candidate.warnings ?? []),
+    ];
+    if (existingRow) {
+      this.db
+        .prepare(
+          `
+          UPDATE model_mapping_versions SET
+            canonical_families_json=?, rules_json=?, review_status=?,
+            source=?, created_at=?, reviewed_at=?, reviewed_by=?,
+            change_kind=?, valid_from=?, valid_until=?, published_at=?,
+            supersedes_version=?, correction_of_version=?,
+            provenance_json=?, warnings_json=?
+          WHERE version=?
+          `,
+        )
+        .run(...values, candidate.version);
+      return;
+    }
     this.db
       .prepare(
         `
         INSERT INTO model_mapping_versions(
           version, canonical_families_json, rules_json, review_status,
-          source, created_at, reviewed_at, reviewed_by
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(version) DO UPDATE SET
-          canonical_families_json=excluded.canonical_families_json,
-          rules_json=excluded.rules_json,
-          review_status=excluded.review_status,
-          source=excluded.source,
-          reviewed_at=excluded.reviewed_at,
-          reviewed_by=excluded.reviewed_by
+          source, created_at, reviewed_at, reviewed_by, change_kind,
+          valid_from, valid_until, published_at, supersedes_version,
+          correction_of_version, provenance_json, warnings_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       )
-      .run(
-        mapping.version,
-        JSON.stringify(mapping.canonicalFamilies),
-        JSON.stringify(mapping.rules),
-        mapping.reviewStatus,
-        mapping.source,
-        mapping.createdAt,
-        mapping.reviewedAt ?? null,
-        mapping.reviewedBy ?? null,
-      );
+      .run(candidate.version, ...values);
   }
 
   modelMapping(version: string): ModelMappingVersion {
@@ -874,7 +918,7 @@ export class Ledger {
     if (!row) {
       throw new LedgerError(`model mapping not found: ${version}`);
     }
-    return {
+    return normalizeMappingVersion({
       version: String(row.version),
       canonicalFamilies: parseJsonArray(row.canonical_families_json),
       rules: parseJsonUnknownArray(row.rules_json) as ModelMappingVersion["rules"],
@@ -883,7 +927,15 @@ export class Ledger {
       createdAt: String(row.created_at),
       reviewedAt: nullableString(row.reviewed_at),
       reviewedBy: nullableString(row.reviewed_by),
-    };
+      changeKind: (row.change_kind as ModelMappingVersion["changeKind"]) ?? "prospective",
+      validFrom: nullableString(row.valid_from),
+      validUntil: nullableString(row.valid_until),
+      publishedAt: nullableString(row.published_at),
+      supersedesVersion: nullableString(row.supersedes_version),
+      correctionOfVersion: nullableString(row.correction_of_version),
+      provenance: parseJsonObject(row.provenance_json),
+      warnings: parseJsonArray(row.warnings_json),
+    });
   }
 
   modelMappings(): ModelMappingVersion[] {
@@ -919,64 +971,111 @@ export class Ledger {
     recordedAt: string,
     source = "aggregate_rebuild",
   ): number {
-    validateMappingVersion(mapping);
+    const candidate = normalizeMappingVersion(mapping);
+    validateMappingVersion(candidate);
+    assertNoSecrets(candidate);
+    if (!isMappingPublished(candidate)) {
+      return 0;
+    }
     let changed = 0;
     for (const row of this.listAttempts(scope, true)) {
-      const requestedFamily = mapModelEvidence(
+      const attempt = rowToReconstructedAttempt(row, scope);
+      const applicationTime = attempt.attemptTime;
+      const requested = resolveModelEvidence(
         {
           slug: nullableString(row.requestedModelRaw),
           mode: nullableString(row.requestedModeRaw),
           reasoningEffort: nullableString(row.requestedReasoningEffortRaw),
         },
-        mapping,
+        candidate,
         scope.collectorAccountId,
+        { at: applicationTime },
       );
-      const recordedFinalFamily = mapModelEvidence(
+      const recordedFinal = resolveModelEvidence(
         {
           slug: nullableString(row.recordedFinalModelRaw),
           mode: null,
           reasoningEffort: null,
         },
-        mapping,
+        candidate,
         scope.collectorAccountId,
+        { at: applicationTime },
       );
-      const resolvedFamily = mapModelEvidence(
+      const resolved = resolveModelEvidence(
         {
           slug: nullableString(row.resolvedModelRaw),
           mode: null,
           reasoningEffort: null,
         },
-        mapping,
+        candidate,
         scope.collectorAccountId,
+        { at: applicationTime },
       );
+      if (!requested.applied || !recordedFinal.applied || !resolved.applied) {
+        continue;
+      }
+      const requestedFamily = requested.family;
+      const recordedFinalFamily = recordedFinal.family;
+      const resolvedFamily = resolved.family;
+      const nextWarnings = uniqueStrings([
+        ...attempt.warnings,
+        ...(candidate.warnings ?? []),
+        ...requested.warnings,
+        ...recordedFinal.warnings,
+        ...resolved.warnings,
+        `mapping_reclassified:${candidate.version}`,
+      ]);
       const current = [
         nullableString(row.requestedFamily),
         nullableString(row.recordedFinalFamily),
         nullableString(row.resolvedFamily),
         String(row.mappingVersion),
+        [...attempt.warnings].sort(),
       ];
       const next = [
         requestedFamily,
         recordedFinalFamily,
         resolvedFamily,
-        mapping.version,
+        candidate.version,
+        [...nextWarnings].sort(),
       ];
       if (JSON.stringify(current) === JSON.stringify(next)) {
         continue;
       }
-      const attempt = rowToReconstructedAttempt(row, scope);
       const projected = {
         ...attempt,
         requestedFamily,
         recordedFinalFamily,
         resolvedFamily,
-        mappingVersion: mapping.version,
+        mappingVersion: candidate.version,
+        warnings: nextWarnings,
       };
       const payload = attemptPayload(projected);
       const nextRevision = Number(row.revision) + 1;
       const projectionFingerprint = fingerprint(payload);
-      this.recordMappingHistory(scope, attempt, recordedAt, "prior_projection");
-      this.recordMappingHistory(scope, projected, recordedAt, source);
+      const provenance = {
+        source,
+        mapping_version: candidate.version,
+        previous_mapping_version: attempt.mappingVersion,
+        change_kind: candidate.changeKind ?? "prospective",
+        valid_from: candidate.validFrom ?? null,
+        valid_until: candidate.validUntil ?? null,
+        recorded_at: recordedAt,
+        ...(candidate.provenance ?? {}),
+      };
+      this.recordMappingHistory(scope, attempt, recordedAt, "prior_projection", {
+        warnings: attempt.warnings,
+        provenance: {
+          source: "prior_projection",
+          mapping_version: attempt.mappingVersion,
+          recorded_at: recordedAt,
+        },
+      });
+      this.recordMappingHistory(scope, projected, recordedAt, source, {
+        mapping: candidate,
+        warnings: nextWarnings,
+        provenance,
+      });
       this.updateAttemptRow(
         scope,
         projected,
@@ -991,7 +1090,7 @@ export class Ledger {
         projectionFingerprint,
         payload,
         {
-          runId: `mapping:${mapping.version}`,
+          runId: `mapping:${candidate.version}`,
           observedAt: recordedAt,
           sourceKind: "aggregate_rebuild",
           sourceId: attempt.attemptId,
@@ -1376,6 +1475,11 @@ export class Ledger {
     attempt: ReconstructedAttempt,
     recordedAt: string,
     source: string,
+    options: {
+      mapping?: ModelMappingVersion;
+      warnings?: string[];
+      provenance?: Record<string, unknown>;
+    } = {},
   ): void {
     const historyId = stableId(
       scopeKey(scope),
@@ -1388,8 +1492,9 @@ export class Ledger {
         INSERT OR IGNORE INTO attempt_mapping_history(
           history_id, attempt_id, scope_key, mapping_version,
           requested_family, recorded_final_family, resolved_family,
-          recorded_at, source
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          recorded_at, source, change_kind, valid_from, valid_until,
+          warnings_json, provenance_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       )
       .run(
@@ -1402,6 +1507,15 @@ export class Ledger {
         attempt.resolvedFamily,
         recordedAt,
         source,
+        options.mapping?.changeKind ?? "prospective",
+        options.mapping?.validFrom ?? null,
+        options.mapping?.validUntil ?? null,
+        JSON.stringify(options.warnings ?? attempt.warnings),
+        JSON.stringify(options.provenance ?? {
+          source,
+          mapping_version: attempt.mappingVersion,
+          recorded_at: recordedAt,
+        }),
       );
   }
 }
@@ -1657,6 +1771,32 @@ function rowToReconstructedAttempt(
     warnings: parseJsonArray(row.warnings),
     scope,
   };
+}
+
+function mappingFingerprint(mapping: ModelMappingVersion): string {
+  const normalized = normalizeMappingVersion(mapping);
+  return canonicalJson({
+    version: normalized.version,
+    canonicalFamilies: normalized.canonicalFamilies,
+    rules: normalized.rules,
+    reviewStatus: normalized.reviewStatus,
+    source: normalized.source,
+    createdAt: normalized.createdAt,
+    reviewedAt: normalized.reviewedAt ?? null,
+    reviewedBy: normalized.reviewedBy ?? null,
+    changeKind: normalized.changeKind ?? "prospective",
+    validFrom: normalized.validFrom ?? null,
+    validUntil: normalized.validUntil ?? null,
+    publishedAt: normalized.publishedAt ?? null,
+    supersedesVersion: normalized.supersedesVersion ?? null,
+    correctionOfVersion: normalized.correctionOfVersion ?? null,
+    provenance: normalized.provenance ?? {},
+    warnings: normalized.warnings ?? [],
+  });
+}
+
+function uniqueStrings(values: ReadonlyArray<string>): string[] {
+  return [...new Set(values)].sort();
 }
 
 function parseJsonObject(value: unknown): Record<string, unknown> {
