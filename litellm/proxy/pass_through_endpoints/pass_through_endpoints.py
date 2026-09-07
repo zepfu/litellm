@@ -5086,6 +5086,24 @@ async def pass_through_request(  # noqa: PLR0915
                         e,
                         error_content,
                     ) from e
+                if (
+                    response.status_code == status.HTTP_200_OK
+                    and capacity_retry_coordinator is not None
+                    and PassThroughStreamingHandler._is_openai_responses_stream(
+                        endpoint_type=endpoint_type,
+                        url_route=str(url),
+                        custom_llm_provider=custom_llm_provider,
+                    )
+                ):
+                    (
+                        response,
+                        pre_commit_failure,
+                    ) = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+                        response
+                    )
+                    if pre_commit_failure is not None:
+                        await response.aclose()
+                        raise pre_commit_failure
                 return response
 
             try:

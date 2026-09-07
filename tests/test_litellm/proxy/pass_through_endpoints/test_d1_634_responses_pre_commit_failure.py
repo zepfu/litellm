@@ -127,6 +127,19 @@ class _FakeUpstreamStream:
             yield chunk
 
 
+class _ClosableAsyncByteStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+        self.close_calls = 0
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+
+
 def _route_kwargs() -> dict[str, Any]:
     return {
         "litellm_params": {
@@ -2551,3 +2564,218 @@ async def test_nonstream_openai_passthrough_responses_hands_off_capacity_coordin
     assert coordinator._target_identity == (
         "openai:gpt-5.4@api.openai.com/v1/responses"
     )
+
+
+@pytest.mark.asyncio
+async def test_nonstream_alpha_openai_sse_precommit_overload_closes_and_propagates(
+    monkeypatch,
+):
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        pass_through_request,
+    )
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.url = SimpleNamespace(path="/openai_passthrough/v1/responses")
+    mock_request.headers = {"content-type": "application/json"}
+    mock_request.query_params = {}
+    mock_request.state = SimpleNamespace()
+    custom_body = {"model": "gpt-5.4"}
+    stream = _ClosableAsyncByteStream(_failed_lifecycle_stream())
+    upstream_response = httpx.Response(
+        status_code=200,
+        headers={"content-type": "text/event-stream"},
+        stream=stream,
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+    captured: dict[str, Any] = {}
+
+    async def execute_hidden_retries(**kwargs):
+        captured.update(kwargs)
+        try:
+            return await kwargs["operation"]()
+        except BaseException as exc:
+            captured["exception"] = exc
+            raise
+
+    async def run_with_renewal(_lease, operation):
+        return await operation()
+
+    with patch.object(
+        pte,
+        "_aawm_session_owner_pre_send_guard",
+        new=AsyncMock(),
+    ), patch.object(
+        sa,
+        "get_request_session_owner_lease",
+        return_value=None,
+    ), patch.object(
+        sa,
+        "run_with_session_owner_lease_renewal",
+        new=run_with_renewal,
+    ), patch.object(
+        sa,
+        "finalize_request_session_owner_lease",
+        new=AsyncMock(),
+    ), patch.object(
+        pte,
+        "_execute_passthrough_pre_first_byte_with_hidden_retries",
+        new=execute_hidden_retries,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+        new=AsyncMock(return_value=upstream_response),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+    ) as mock_get_client, patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj"
+    ) as mock_logging_obj:
+        mock_client_obj = MagicMock()
+        mock_client_obj.client = MagicMock()
+        mock_get_client.return_value = mock_client_obj
+        mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+        mock_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
+
+        with pytest.raises(ProxyException):
+            await pass_through_request(
+                request=mock_request,
+                target="https://api.openai.com/v1/responses",
+                custom_headers={},
+                user_api_key_dict=MagicMock(),
+                custom_body=custom_body,
+                custom_llm_provider="openai",
+                stream=False,
+            )
+
+    assert isinstance(captured["exception"], ResponsesStreamPreCommitFailure)
+    assert captured["exception"].error_class == "server_overloaded"
+    assert stream.close_calls == 1
+    assert upstream_response.is_closed is True
+
+
+@pytest.mark.asyncio
+async def test_nonstream_alpha_openai_sse_substantive_bytes_survive_precommit_peek(
+    monkeypatch,
+):
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        pass_through_request,
+    )
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.url = SimpleNamespace(path="/openai_passthrough/v1/responses")
+    mock_request.headers = {"content-type": "application/json"}
+    mock_request.query_params = {}
+    mock_request.state = SimpleNamespace()
+    custom_body = {"model": "gpt-5.4"}
+    chunks = [
+        _sse(
+            "response.created",
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_substantive",
+                    "status": "in_progress",
+                    "model": "gpt-5.4",
+                    "output": [],
+                },
+            },
+        ),
+        _sse(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "delta": "hello",
+            },
+        ),
+        _sse(
+            "response.completed",
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_substantive",
+                    "status": "completed",
+                    "model": "gpt-5.4",
+                    "output": [],
+                },
+            },
+        ),
+    ]
+    stream = _ClosableAsyncByteStream(chunks)
+    upstream_response = httpx.Response(
+        status_code=200,
+        headers={"content-type": "text/event-stream"},
+        stream=stream,
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+
+    captured: dict[str, Any] = {}
+
+    class _StopAfterPeek(Exception):
+        pass
+
+    async def run_with_renewal(_lease, operation):
+        captured["response"] = await operation()
+        raise _StopAfterPeek
+
+    with patch.object(
+        pte,
+        "_aawm_session_owner_pre_send_guard",
+        new=AsyncMock(),
+    ), patch.object(
+        sa,
+        "get_request_session_owner_lease",
+        return_value=None,
+    ), patch.object(
+        sa,
+        "run_with_session_owner_lease_renewal",
+        new=run_with_renewal,
+    ), patch.object(
+        sa,
+        "finalize_request_session_owner_lease",
+        new=AsyncMock(),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+        new=AsyncMock(return_value=upstream_response),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+    ) as mock_get_client, patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj"
+    ) as mock_logging_obj, patch.object(
+        OpenAIAlphaCapacityRetryCoordinator,
+        "signal_success",
+        new_callable=AsyncMock,
+    ) as signal_success:
+        mock_client_obj = MagicMock()
+        mock_client_obj.client = MagicMock()
+        mock_get_client.return_value = mock_client_obj
+        mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+        mock_logging_obj.post_call_success_hook = AsyncMock()
+        mock_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
+
+        with pytest.raises(ProxyException):
+            await pass_through_request(
+                request=mock_request,
+                target="https://api.openai.com/v1/responses",
+                custom_headers={},
+                user_api_key_dict=MagicMock(),
+                custom_body=custom_body,
+                custom_llm_provider="openai",
+                stream=False,
+            )
+
+    replayed = [chunk async for chunk in captured["response"].aiter_bytes()]
+    await captured["response"].aclose()
+    assert replayed == chunks
+    signal_success.assert_awaited_once()
+    assert stream.close_calls == 1
