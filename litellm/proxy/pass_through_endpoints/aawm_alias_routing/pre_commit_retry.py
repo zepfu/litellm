@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional, TypeVar
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from starlette.requests import Request
 
@@ -353,7 +354,7 @@ async def _signal_openai_capacity_success(
     target_identity: str,
     namespace: Optional[str] = None,
 ) -> None:
-    """Increment the capacity-success epoch for cross-worker wakeup."""
+    """Publish a fresh capacity-success generation for cross-worker wakeup."""
     resolved_namespace = _resolve_openai_capacity_namespace(namespace)
     scope_key = _capacity_wakeup_scope_key(target_identity, resolved_namespace)
     for event in tuple(_LOCAL_CAPACITY_WAKEUP_EVENTS.get(scope_key, ())):
@@ -366,8 +367,10 @@ async def _signal_openai_capacity_success(
         client = redis_cache.init_async_client()
         if client is None:
             return
-        await client.incr(key)
-        await client.expire(key, _OPENAI_CAPACITY_SUCCESS_EPOCH_TTL_SECONDS)
+        # A counter can reuse an old waiter's epoch after the key expires.
+        await client.set(
+            key, uuid4().int, ex=_OPENAI_CAPACITY_SUCCESS_EPOCH_TTL_SECONDS
+        )
     except Exception:
         pass
 
@@ -544,8 +547,11 @@ class OpenAIAlphaCapacityRetryCoordinator:
             status_code=status_code,
         )
         wakeup = _CapacityWakeupState()
-        local_events = self._local_events
         sleep_local_event_key = self._local_event_key
+        local_events = _LOCAL_CAPACITY_WAKEUP_EVENTS.setdefault(
+            sleep_local_event_key, set()
+        )
+        self._local_events = local_events
         local_events.add(wakeup.event)
         redis_cache = self._redis_cache
         redis_key = self._redis_key

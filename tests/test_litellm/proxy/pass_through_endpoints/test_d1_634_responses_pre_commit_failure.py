@@ -1601,19 +1601,29 @@ class TestCoordinatorSleepWakeup:
                 target_identity=target_identity,
                 namespace=namespace,
             )
-            sleep_task = asyncio.create_task(
-                coordinator.sleep_with_wakeup(1.0)
-            )
-            for _ in range(3):
-                await asyncio.sleep(0)
-                if _LOCAL_CAPACITY_WAKEUP_EVENTS.get((namespace, target_identity)):
-                    break
-            assert _LOCAL_CAPACITY_WAKEUP_EVENTS.get((namespace, target_identity))
-
-            await _signal_openai_capacity_success(target_identity, namespace)
-            reason = await asyncio.wait_for(sleep_task, timeout=0.2)
-
-        assert reason == "peer_success"
+            for _ in range(2):
+                sleep_task = asyncio.create_task(
+                    coordinator.sleep_with_wakeup(1.0)
+                )
+                try:
+                    for _ in range(3):
+                        await asyncio.sleep(0)
+                        if _LOCAL_CAPACITY_WAKEUP_EVENTS.get(
+                            (namespace, target_identity)
+                        ):
+                            break
+                    assert _LOCAL_CAPACITY_WAKEUP_EVENTS.get(
+                        (namespace, target_identity)
+                    )
+                    await _signal_openai_capacity_success(target_identity, namespace)
+                    reason = await asyncio.wait_for(sleep_task, timeout=0.2)
+                    assert reason == "peer_success"
+                    assert (namespace, target_identity) not in (
+                        _LOCAL_CAPACITY_WAKEUP_EVENTS
+                    )
+                finally:
+                    sleep_task.cancel()
+                    await asyncio.gather(sleep_task, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_wakeup_event_returns_event(self):
@@ -1650,12 +1660,11 @@ class TestCoordinatorSleepWakeup:
         manager.get_dual_cache.assert_called_once_with()
 
     @pytest.mark.asyncio
-    async def test_signal_success_increments_redis_epoch_and_refreshes_ttl(self):
+    async def test_signal_success_sets_redis_generation_with_ttl(self):
         target_identity = "openai:redis-signal"
         namespace = "aawm-routing-alpha-v1"
         redis_client = SimpleNamespace(
-            incr=AsyncMock(return_value=4),
-            expire=AsyncMock(return_value=True),
+            set=AsyncMock(return_value=True),
         )
         redis_cache = SimpleNamespace(
             init_async_client=MagicMock(return_value=redis_client)
@@ -1692,8 +1701,65 @@ class TestCoordinatorSleepWakeup:
             target_identity, namespace
         )
         assert event.is_set()
-        redis_client.incr.assert_awaited_once_with(redis_key)
-        redis_client.expire.assert_awaited_once_with(redis_key, 300)
+        redis_client.set.assert_awaited_once()
+        generation = redis_client.set.await_args.args[1]
+        assert isinstance(generation, int)
+        assert generation > 0
+        redis_client.set.assert_awaited_once_with(redis_key, generation, ex=300)
+
+    @pytest.mark.asyncio
+    async def test_sleep_wakes_on_success_after_redis_generation_expires(self):
+        target_identity = "openai:redis-recreated"
+        namespace = "aawm-routing-alpha-v1"
+        module = (
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry"
+        )
+        now = 0.0
+        stored = {}
+        baseline_read = asyncio.Event()
+
+        async def set_generation(key, value, *, ex):
+            stored[key] = (str(value).encode(), now + ex)
+            return True
+
+        async def get_generation(key):
+            baseline_read.set()
+            if key in stored and stored[key][1] <= now:
+                del stored[key]
+            return stored[key][0] if key in stored else None
+
+        redis_client = SimpleNamespace(
+            set=AsyncMock(side_effect=set_generation),
+            get=AsyncMock(side_effect=get_generation),
+        )
+        redis_cache = SimpleNamespace(
+            init_async_client=MagicMock(return_value=redis_client)
+        )
+        key = _build_openai_capacity_success_redis_key(target_identity, namespace)
+        with (
+            patch(f"{module}._resolve_redis_for_capacity_wakeup", return_value=redis_cache),
+            patch(f"{module}._OPENAI_CAPACITY_SUCCESS_POLL_SECONDS", 0.005),
+        ):
+            await _signal_openai_capacity_success(target_identity, namespace)
+            original_generation = stored[key][0]
+            coordinator = OpenAIAlphaCapacityRetryCoordinator(
+                target_identity=target_identity, namespace=namespace
+            )
+            sleep_task = asyncio.create_task(coordinator.sleep_with_wakeup(1.0))
+            try:
+                await asyncio.wait_for(baseline_read.wait(), timeout=0.2)
+                now = 301.0
+                assert await redis_client.get(key) is None
+                assert not sleep_task.done()
+                # Model a publisher in another worker: only Redis is shared.
+                with patch(f"{module}._LOCAL_CAPACITY_WAKEUP_EVENTS", {}):
+                    await _signal_openai_capacity_success(target_identity, namespace)
+                assert stored[key][0] != original_generation
+                assert await asyncio.wait_for(sleep_task, timeout=0.2) == "peer_success"
+            finally:
+                sleep_task.cancel()
+                await asyncio.gather(sleep_task, return_exceptions=True)
+        assert (namespace, target_identity) not in _LOCAL_CAPACITY_WAKEUP_EVENTS
 
     @pytest.mark.asyncio
     async def test_sleep_with_wakeup_reads_redis_epoch_change(self):
