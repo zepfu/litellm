@@ -875,6 +875,14 @@ acceptance evidence. Until they are supplied, bound capture fails closed per
 account without inserting a row; no deployment change is implied by this
 source wiring.
 
+The current native conversation-init response lacks canonical account fields.
+Even ready CDP and an authenticated page are insufficient until an authoritative
+same-context identity source is established. The missing identity read is an
+implementation gap, not merely session or dependency configuration. Bound
+capture fails closed and per-account coverage preserves the collector's
+`account_identity_verification_error`: `missing_authoritative_account_id` or
+`account_identity_mismatch`.
+
 ## Alibaba Token Plan quota polling
 
 The provider-status sidecar can poll the authenticated ModelStudio Token Plan
