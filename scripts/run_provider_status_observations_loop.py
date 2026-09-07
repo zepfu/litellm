@@ -13856,13 +13856,24 @@ def _stamp_chatgpt_conversation_init_account_hash(
     parser_summary: Mapping[str, Any],
     account_hash: str,
 ) -> List[tuple[Any, ...]]:
-    if parser_summary.get("account_identity_source") != "provider_payload":
+    identity_source = parser_summary.get("account_identity_source")
+    if identity_source not in {
+        "provider_payload",
+        "native_request_header",
+    }:
         raise ValueError(
-            "Bound conversation-init parser returned no provider identity."
+            "Bound conversation-init parser returned no bound identity."
         )
     if not parser_summary.get("account_identity_hashed"):
         raise ValueError(
-            "Bound conversation-init parser returned no provider identity."
+            "Bound conversation-init parser returned no bound identity."
+        )
+    if identity_source == "native_request_header" and (
+        not parser_summary.get("account_identity_verified")
+        or parser_summary.get("account_hash") != account_hash
+    ):
+        raise ValueError(
+            "Bound conversation-init parser returned unverified native identity."
         )
 
     stamped: List[tuple[Any, ...]] = []

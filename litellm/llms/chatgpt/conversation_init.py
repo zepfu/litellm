@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+from math import isfinite
 import multiprocessing
 import os
 import re
@@ -72,6 +73,12 @@ CHATGPT_CONVERSATION_INIT_BROWSER_ACCOUNT_IDENTITY_SOURCE = (
     "chatgpt.conversation_init.oracle_browser.account_id"
 )
 CHATGPT_CONVERSATION_INIT_VERIFIED_PAYLOAD_IDENTITY_SOURCE = "provider_payload"
+CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE = (
+    "native_request_header"
+)
+CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_SELECTOR_EVIDENCE = (
+    "request_and_extra_info"
+)
 CHATGPT_CONVERSATION_INIT_SOURCE_IDENTITY_SOURCE = (
     "chatgpt.conversation_init.collector_source_path"
 )
@@ -139,6 +146,11 @@ _ENVELOPE_KEYS = {
     "payload_state",
     "redacted_field_count",
     "source_identity_hash",
+    "native_capture",
+    "native_capture_error",
+    "browser_challenge",
+    "retry_after_seconds",
+    "request_body_omitted",
 }
 _PAYLOAD_ENVELOPE_KEYS = ("body", "payload", "response", "json", "data")
 _SECRET_KEY_MARKERS = (
@@ -196,6 +208,21 @@ _CANONICAL_ACTIVE_ACCOUNT_ID_PATHS = (
 )
 _CANONICAL_ACCOUNT_ID_PROVENANCE_FIELDS = frozenset(
     ".".join(path) for path in _CANONICAL_ACTIVE_ACCOUNT_ID_PATHS
+)
+_NATIVE_CAPTURE_ERRORS = frozenset(
+    {
+        "native_capture_incomplete",
+        "native_capture_invalid_account_hash",
+        "native_capture_invalid_identity_source",
+        "native_capture_incomplete_selector_evidence",
+        "native_capture_uncorrelated",
+        "native_capture_invalid_request_method",
+        "native_capture_invalid_body_observation",
+        "native_capture_invalid_browser_challenge",
+        "conflicting_native_payload_account_id",
+        "native_payload_identity_mismatch",
+        "invalid_retry_after_seconds",
+    }
 )
 _CANONICAL_ACCOUNT_HASH_RE = re.compile(
     rf"^[0-9a-f]{{{CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_LENGTH}}}$"
@@ -514,7 +541,92 @@ def load_conversation_init_source(path: str) -> Any:
         ) from exc
 
 
-def sanitize_conversation_init_boundary(
+def _parse_retry_after_seconds(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        seconds = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if not isfinite(seconds) or seconds < 0:
+        return None
+    return seconds
+
+
+def _sanitize_native_capture(
+    value: Any,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    if not isinstance(value, Mapping):
+        return None, "native_capture_incomplete"
+    if not _is_canonical_account_hash(value.get("account_hash")):
+        return None, "native_capture_invalid_account_hash"
+    if (
+        value.get("identity_source")
+        != CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
+    ):
+        return None, "native_capture_invalid_identity_source"
+    if (
+        value.get("selector_evidence")
+        != CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_SELECTOR_EVIDENCE
+    ):
+        return None, "native_capture_incomplete_selector_evidence"
+    if value.get("request_response_correlated") is not True:
+        return None, "native_capture_uncorrelated"
+    if value.get("request_method") != CHATGPT_CONVERSATION_INIT_METHOD:
+        return None, "native_capture_invalid_request_method"
+    if not isinstance(value.get("request_body_omitted"), bool):
+        return None, "native_capture_invalid_body_observation"
+    if "browser_challenge" in value and not isinstance(
+        value.get("browser_challenge"), bool
+    ):
+        return None, "native_capture_invalid_browser_challenge"
+
+    retry_after_seconds = None
+    if "retry_after_seconds" in value and value.get("retry_after_seconds") is not None:
+        retry_after_seconds = _parse_retry_after_seconds(
+            value.get("retry_after_seconds")
+        )
+        if retry_after_seconds is None:
+            return None, "invalid_retry_after_seconds"
+
+    result: Dict[str, Any] = {
+        "account_hash": value["account_hash"],
+        "identity_source": CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE,
+        "selector_evidence": (
+            CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_SELECTOR_EVIDENCE
+        ),
+        "request_response_correlated": True,
+        "request_method": CHATGPT_CONVERSATION_INIT_METHOD,
+        "request_body_omitted": value["request_body_omitted"],
+    }
+    if "browser_challenge" in value:
+        result["browser_challenge"] = value["browser_challenge"]
+    if retry_after_seconds is not None:
+        result["retry_after_seconds"] = retry_after_seconds
+    return result, None
+
+
+def _native_payload_identity_error(
+    raw: Any,
+    payload: Any,
+    native_account_hash: str,
+) -> Optional[str]:
+    account_id, _identity_fields, identity_error = (
+        _extract_canonical_account_identity(raw, payload)
+    )
+    if identity_error not in (None, "missing_authoritative_account_id"):
+        return "conflicting_native_payload_account_id"
+    if account_id is None:
+        return None
+    payload_account_hash = hash_chatgpt_conversation_init_canonical_account_id(
+        account_id
+    )
+    if payload_account_hash != native_account_hash:
+        return "native_payload_identity_mismatch"
+    return None
+
+
+def sanitize_conversation_init_boundary(  # noqa: PLR0915 - boundary projection
     raw: Any,
     *,
     source_path: Optional[str] = None,
@@ -545,9 +657,77 @@ def sanitize_conversation_init_boundary(
             "account_identity_verification_source": None,
             "source_identity_hash": source_identity_hash,
             "redacted_field_count": 0,
+            "request_body_omitted": contract["body_omitted"],
+            "retry_after_seconds": None,
+            "browser_challenge": False,
         }
 
     status_code, payload_raw, envelope_redacted = _split_boundary_envelope(raw)
+    native_capture_present = "native_capture" in raw
+    raw_native_capture = raw.get("native_capture")
+    raw_browser_challenge = raw.get("browser_challenge")
+    browser_challenge = (
+        raw_browser_challenge if isinstance(raw_browser_challenge, bool) else False
+    )
+    native_capture, native_capture_error = (
+        _sanitize_native_capture(raw.get("native_capture"))
+        if native_capture_present
+        else (None, None)
+    )
+    if native_capture is not None and native_capture_error is None:
+        native_capture_error = _native_payload_identity_error(
+            raw,
+            payload_raw,
+            native_capture["account_hash"],
+        )
+    retained_native_capture_error = raw.get("native_capture_error")
+    if (
+        native_capture_error is None
+        and retained_native_capture_error in _NATIVE_CAPTURE_ERRORS
+    ):
+        native_capture_error = retained_native_capture_error
+    retry_after_seconds = (
+        native_capture.get("retry_after_seconds")
+        if isinstance(native_capture, Mapping)
+        else None
+    )
+    request_body_omitted = (
+        native_capture.get("request_body_omitted")
+        if isinstance(native_capture, Mapping)
+        else contract["body_omitted"]
+    )
+    if isinstance(raw_native_capture, Mapping):
+        raw_body_omitted = raw_native_capture.get("request_body_omitted")
+        if isinstance(raw_body_omitted, bool):
+            request_body_omitted = raw_body_omitted
+        raw_browser_challenge = raw_native_capture.get("browser_challenge")
+        if isinstance(raw_browser_challenge, bool):
+            browser_challenge = browser_challenge or raw_browser_challenge
+        raw_retry_after = raw_native_capture.get("retry_after_seconds")
+        if raw_retry_after is not None:
+            parsed_retry_after = _parse_retry_after_seconds(raw_retry_after)
+            if parsed_retry_after is None:
+                if native_capture_error is None:
+                    native_capture_error = "invalid_retry_after_seconds"
+            else:
+                retry_after_seconds = parsed_retry_after
+    if isinstance(native_capture, Mapping) and isinstance(
+        native_capture.get("browser_challenge"), bool
+    ):
+        browser_challenge = browser_challenge or native_capture["browser_challenge"]
+    if native_capture is None and isinstance(raw_native_capture, Mapping):
+        safe_native_capture: Dict[str, Any] = {}
+        if isinstance(raw_native_capture.get("request_body_omitted"), bool):
+            safe_native_capture["request_body_omitted"] = raw_native_capture[
+                "request_body_omitted"
+            ]
+        if isinstance(raw_native_capture.get("browser_challenge"), bool):
+            safe_native_capture["browser_challenge"] = raw_native_capture[
+                "browser_challenge"
+            ]
+        if retry_after_seconds is not None:
+            safe_native_capture["retry_after_seconds"] = retry_after_seconds
+        native_capture = safe_native_capture or None
     account_identity_verified = False
     account_identity_hash_algorithm = None
     account_identity_hash_length = None
@@ -561,6 +741,12 @@ def sanitize_conversation_init_boundary(
         account_identity_verified = True
         account_identity_hash_algorithm = CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_ALGORITHM
         account_identity_hash_length = CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_LENGTH
+    elif native_capture_present:
+        account_hash, account_identity_fields = (
+            (native_capture["account_hash"], ["native_capture.account_hash"])
+            if native_capture is not None and native_capture_error is None
+            else (None, [])
+        )
     else:
         account_hash, account_identity_fields = (
             hash_chatgpt_conversation_init_account_identity(payload_raw)
@@ -568,7 +754,14 @@ def sanitize_conversation_init_boundary(
             else (None, [])
         )
     if not account_hash:
-        account_hash, account_identity_fields = _retained_envelope_identity(raw)
+        if not native_capture_present:
+            account_hash, account_identity_fields = _retained_envelope_identity(raw)
+    if native_capture_error is not None:
+        account_hash = None
+        account_identity_fields = []
+        account_identity_verified = False
+        account_identity_hash_algorithm = None
+        account_identity_hash_length = None
     if isinstance(payload_raw, Mapping):
         payload, payload_schema, value_redacted = _redact_mapping(
             payload_raw,
@@ -588,7 +781,7 @@ def sanitize_conversation_init_boundary(
         source_identity_hash=source_identity_hash,
     )
 
-    return {
+    result = {
         "request": contract,
         "status_code": status_code,
         "payload": payload,
@@ -601,13 +794,61 @@ def sanitize_conversation_init_boundary(
         "account_identity_hash_algorithm": account_identity_hash_algorithm,
         "account_identity_hash_length": account_identity_hash_length,
         "account_identity_verification_source": (
-            CHATGPT_CONVERSATION_INIT_BROWSER_ACCOUNT_IDENTITY_SOURCE
+            (
+                CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
+                if account_identity_source
+                == CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
+                else CHATGPT_CONVERSATION_INIT_BROWSER_ACCOUNT_IDENTITY_SOURCE
+            )
             if account_identity_verified
             else None
         ),
         "source_identity_hash": source_identity_hash,
         "redacted_field_count": envelope_redacted + value_redacted,
+        "request_body_omitted": request_body_omitted,
+        "retry_after_seconds": retry_after_seconds,
+        "browser_challenge": browser_challenge,
     }
+    if native_capture is not None:
+        result["native_capture"] = native_capture
+    if native_capture_error is not None:
+        result["native_capture_error"] = native_capture_error
+    return result
+
+
+def _is_verified_bound_identity(
+    sanitized: Mapping[str, Any],
+    account_hash: Any,
+) -> bool:
+    if (
+        sanitized.get("account_identity_verified") is not True
+        or sanitized.get("native_capture_error") is not None
+        or sanitized.get("browser_challenge") is True
+        or not _is_canonical_account_hash(account_hash)
+        or sanitized.get("account_identity_hash_algorithm")
+        != CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_ALGORITHM
+        or sanitized.get("account_identity_hash_length")
+        != CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_LENGTH
+    ):
+        return False
+    source = sanitized.get("account_identity_source")
+    if source == CHATGPT_CONVERSATION_INIT_VERIFIED_PAYLOAD_IDENTITY_SOURCE:
+        return (
+            sanitized.get("account_identity_verification_source")
+            == CHATGPT_CONVERSATION_INIT_BROWSER_ACCOUNT_IDENTITY_SOURCE
+        )
+    if source != CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE:
+        return False
+    native_capture, native_capture_error = _sanitize_native_capture(
+        sanitized.get("native_capture")
+    )
+    return bool(
+        native_capture_error is None
+        and native_capture is not None
+        and native_capture.get("account_hash") == account_hash
+        and sanitized.get("account_identity_verification_source")
+        == CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
+    )
 
 
 def _resolve_parse_guard(
@@ -627,31 +868,34 @@ def _resolve_parse_guard(
     source_identity_hash = sanitized.get("source_identity_hash")
     account_identity_fields = list(sanitized.get("account_identity_fields") or [])
     account_identity_source = sanitized.get("account_identity_source")
-    account_identity_verified = (
-        sanitized.get("account_identity_verified") is True
-        and _is_canonical_account_hash(account_hash)
-        and sanitized.get("account_identity_source")
-        == CHATGPT_CONVERSATION_INIT_VERIFIED_PAYLOAD_IDENTITY_SOURCE
-        and sanitized.get("account_identity_verification_source")
-        == CHATGPT_CONVERSATION_INIT_BROWSER_ACCOUNT_IDENTITY_SOURCE
-        and sanitized.get("account_identity_hash_algorithm")
-        == CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_ALGORITHM
-        and sanitized.get("account_identity_hash_length")
-        == CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_LENGTH
+    native_capture_error = sanitized.get("native_capture_error")
+    account_identity_verified = _is_verified_bound_identity(
+        sanitized,
+        account_hash,
     )
-    if not account_hash and isinstance(source_identity_hash, str) and source_identity_hash:
+    if (
+        not account_hash
+        and native_capture_error is None
+        and isinstance(source_identity_hash, str)
+        and source_identity_hash
+    ):
         account_hash = source_identity_hash
         if not account_identity_fields:
             account_identity_fields = [
                 CHATGPT_CONVERSATION_INIT_SOURCE_IDENTITY_SOURCE
             ]
         account_identity_source = account_identity_source or "source_path"
+    request_body_omitted = sanitized.get("request_body_omitted")
+    if not isinstance(request_body_omitted, bool):
+        request_body_omitted = bool(request.get("body_omitted"))
+    retry_after_seconds = sanitized.get("retry_after_seconds")
+    browser_challenge = sanitized.get("browser_challenge") is True
 
     summary: Dict[str, Any] = {
         "source_version": CHATGPT_CONVERSATION_INIT_PARSER_VERSION,
         "request_method": request.get("method"),
         "request_path": request.get("path"),
-        "request_body_omitted": bool(request.get("body_omitted")),
+        "request_body_omitted": request_body_omitted,
         "has_model_message": False,
         "has_conversation_content": False,
         "status_code": status_code,
@@ -669,12 +913,20 @@ def _resolve_parse_guard(
             else None
         ),
         "account_identity_verification_source": (
-            CHATGPT_CONVERSATION_INIT_BROWSER_ACCOUNT_IDENTITY_SOURCE
+            sanitized.get("account_identity_verification_source")
             if account_identity_verified
             else None
         ),
         "account_identity_fields": account_identity_fields,
         "account_identity_source": account_identity_source,
+        "native_capture": (
+            dict(sanitized["native_capture"])
+            if isinstance(sanitized.get("native_capture"), Mapping)
+            else None
+        ),
+        "native_capture_error": native_capture_error,
+        "browser_challenge": browser_challenge,
+        "retry_after_seconds": retry_after_seconds,
         "model_limits_state": "absent_unknown",
         "limits_progress_state": "absent_unknown",
         "blocked_features_state": "absent_unknown",
@@ -688,6 +940,16 @@ def _resolve_parse_guard(
         "last_good_state_retained": False,
     }
 
+    if browser_challenge:
+        summary["telemetry_status"] = "auth"
+        summary["telemetry_class"] = "browser_challenge"
+        summary["last_good_state_retained"] = True
+        return {"error": True, "summary": summary}
+    if native_capture_error:
+        summary["telemetry_status"] = "malformed"
+        summary["telemetry_class"] = "malformed_telemetry"
+        summary["last_good_state_retained"] = True
+        return {"error": True, "summary": summary}
     http_error = _http_status_failure(status_code)
     if http_error is not None:
         summary["telemetry_status"] = http_error
@@ -896,12 +1158,25 @@ def collect_conversation_init_observations(
     summary["request_method"] = contract["method"]
     summary["request_path"] = contract["path"]
     summary["request_url"] = contract["url"]
-    summary["request_body_omitted"] = True
+    summary["request_body_omitted"] = bool(
+        sanitized.get("request_body_omitted")
+    )
     summary["has_model_message"] = False
     summary["has_conversation_content"] = False
     summary["collector_source"] = "file"
-    account_hash = sanitized.get("account_hash") or sanitized.get(
-        "source_identity_hash"
+    summary["native_capture"] = (
+        dict(sanitized["native_capture"])
+        if isinstance(sanitized.get("native_capture"), Mapping)
+        else None
+    )
+    summary["native_capture_error"] = sanitized.get("native_capture_error")
+    summary["browser_challenge"] = bool(sanitized.get("browser_challenge"))
+    summary["retry_after_seconds"] = sanitized.get("retry_after_seconds")
+    account_hash = (
+        None
+        if sanitized.get("native_capture_error")
+        else sanitized.get("account_hash")
+        or sanitized.get("source_identity_hash")
     )
     summary["account_hash"] = account_hash
     summary["account_identity_verified"] = bool(
@@ -914,7 +1189,12 @@ def collect_conversation_init_observations(
     summary["account_identity_verification_error"] = sanitized.get(
         "account_identity_verification_error"
     )
-    if observations and isinstance(account_hash, str) and account_hash:
+    if (
+        observations
+        and not summary["browser_challenge"]
+        and isinstance(account_hash, str)
+        and account_hash
+    ):
         payloads = build_conversation_init_rate_limit_tuples(
             observations,
             observed_at=observed,
@@ -1155,7 +1435,15 @@ def _snapshot_observation(
         "top_level_projections": dict(payload_schema),
         "empty_collections_are_unknown": True,
         "request_method": request.get("method"),
-        "request_body_omitted": bool(request.get("body_omitted")),
+        "request_body_omitted": summary["request_body_omitted"],
+        "account_identity_source": account_identity_source,
+        "native_capture": (
+            dict(summary["native_capture"])
+            if isinstance(summary.get("native_capture"), Mapping)
+            else None
+        ),
+        "browser_challenge": bool(summary.get("browser_challenge")),
+        "retry_after_seconds": summary.get("retry_after_seconds"),
     }
     evidence = {
         "signals": ["chatgpt_conversation_init", "chatgpt_conversation_init_snapshot"],
@@ -1169,13 +1457,20 @@ def _snapshot_observation(
         "account_identity_verification_source": summary.get(
             "account_identity_verification_source"
         ),
+        "native_capture": (
+            dict(summary["native_capture"])
+            if isinstance(summary.get("native_capture"), Mapping)
+            else None
+        ),
+        "browser_challenge": bool(summary.get("browser_challenge")),
+        "retry_after_seconds": summary.get("retry_after_seconds"),
         "account_hash": (
             summary.get("account_hash")
             if summary.get("account_identity_verified")
             else None
         ),
         "request_method": request.get("method"),
-        "request_body_omitted": True,
+        "request_body_omitted": summary["request_body_omitted"],
         "has_model_message": False,
         "empty_collections_are_unknown": True,
     }
@@ -2512,7 +2807,7 @@ class ChatGPTConversationInitCollector:
         )
 
 
-def collect_conversation_init_snapshot(
+def collect_conversation_init_snapshot(  # noqa: PLR0915 - collector state
     source_path: str,
     *,
     transport: ConversationInitTransport,
@@ -2557,7 +2852,25 @@ def collect_conversation_init_snapshot(
     summary["status_code"] = sanitized.get("status_code")
     summary["redacted_field_count"] = sanitized.get("redacted_field_count")
     summary["account_identity_hashed"] = bool(sanitized.get("account_hash"))
+    summary["account_hash"] = sanitized.get("account_hash")
+    summary["account_identity_source"] = sanitized.get(
+        "account_identity_source"
+    )
+    summary["account_identity_verified"] = bool(
+        sanitized.get("account_identity_verified")
+    )
     summary["payload_state"] = sanitized.get("payload_state")
+    summary["request_body_omitted"] = bool(
+        sanitized.get("request_body_omitted")
+    )
+    summary["retry_after_seconds"] = sanitized.get("retry_after_seconds")
+    summary["browser_challenge"] = bool(sanitized.get("browser_challenge"))
+    summary["native_capture"] = (
+        dict(sanitized["native_capture"])
+        if isinstance(sanitized.get("native_capture"), Mapping)
+        else None
+    )
+    summary["native_capture_error"] = sanitized.get("native_capture_error")
     writable = _snapshot_is_persistable(sanitized)
     reusable = _destination_has_reusable_snapshot(source_path)
     if not writable:
@@ -2622,6 +2935,7 @@ def collect_conversation_init_snapshot_from_oracle_browser(
         transport = build_oracle_browser_conversation_init_transport(
             cdp_endpoint=cdp_endpoint,
             page_target_id=page_target_id,
+            expected_account_hash=expected,
             timeout_seconds=timeout_seconds,
         )
     except (ChatGPTConversationInitError, ValueError) as exc:
@@ -2647,7 +2961,7 @@ def collect_conversation_init_snapshot_from_oracle_browser(
     )
 
 
-def _collect_bound_conversation_init_snapshot(
+def _collect_bound_conversation_init_snapshot(  # noqa: PLR0915 - bound state
     source_path: str,
     *,
     transport: ConversationInitTransport,
@@ -2704,8 +3018,102 @@ def _collect_bound_conversation_init_snapshot(
     summary["status_code"] = sanitized.get("status_code")
     summary["redacted_field_count"] = sanitized.get("redacted_field_count")
     summary["payload_state"] = sanitized.get("payload_state")
+    summary["request_body_omitted"] = bool(
+        sanitized.get("request_body_omitted")
+    )
+    summary["retry_after_seconds"] = sanitized.get("retry_after_seconds")
+    summary["browser_challenge"] = bool(sanitized.get("browser_challenge"))
+    summary["native_capture"] = (
+        dict(sanitized["native_capture"])
+        if isinstance(sanitized.get("native_capture"), Mapping)
+        else None
+    )
+    summary["native_capture_error"] = sanitized.get("native_capture_error")
+    summary["account_hash"] = sanitized.get("account_hash")
+    summary["account_identity_hashed"] = bool(sanitized.get("account_hash"))
+    summary["account_identity_source"] = sanitized.get("account_identity_source")
     summary["collector_source"] = ORACLE_BROWSER_BOUNDARY_NAME
     summary["browser_boundary"] = ORACLE_BROWSER_BOUNDARY_NAME
+
+    if summary["browser_challenge"]:
+        return _bound_capture_failure(
+            summary,
+            source_path=source_path,
+            expected_account_hash=expected_account_hash,
+            error="browser_challenge",
+            telemetry_status="auth",
+            telemetry_class="browser_challenge",
+            reusable=reusable,
+        )
+    if summary["native_capture_error"]:
+        return _bound_capture_failure(
+            summary,
+            source_path=source_path,
+            expected_account_hash=expected_account_hash,
+            error=summary["native_capture_error"],
+            telemetry_status="malformed",
+            telemetry_class="malformed_telemetry",
+            reusable=reusable,
+        )
+
+    _status_code, payload_raw, _envelope_redacted = _split_boundary_envelope(raw)
+    native_capture = sanitized.get("native_capture")
+    if isinstance(native_capture, Mapping):
+        native_account_hash = native_capture.get("account_hash")
+        if native_account_hash != expected_account_hash:
+            return _bound_capture_failure(
+                summary,
+                source_path=source_path,
+                expected_account_hash=expected_account_hash,
+                error="account_identity_mismatch",
+                telemetry_status="auth",
+                telemetry_class="auth",
+                reusable=reusable,
+            )
+        sanitized = _apply_verified_bound_identity(
+            sanitized,
+            account_hash=expected_account_hash,
+            account_identity_fields=sanitized.get("account_identity_fields")
+            or ["native_capture.account_hash"],
+            account_identity_source=(
+                CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
+            ),
+            account_identity_verification_source=(
+                CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
+            ),
+        )
+    else:
+        account_id, identity_fields, identity_error = (
+            _extract_canonical_account_identity(raw, payload_raw)
+        )
+        if identity_error is not None or account_id is None:
+            return _bound_capture_failure(
+                summary,
+                source_path=source_path,
+                expected_account_hash=expected_account_hash,
+                error=identity_error or "missing_authoritative_account_id",
+                telemetry_status="missing_account_identity",
+                telemetry_class="malformed_telemetry",
+                reusable=reusable,
+            )
+        actual_account_hash = (
+            hash_chatgpt_conversation_init_canonical_account_id(account_id)
+        )
+        if actual_account_hash != expected_account_hash:
+            return _bound_capture_failure(
+                summary,
+                source_path=source_path,
+                expected_account_hash=expected_account_hash,
+                error="account_identity_mismatch",
+                telemetry_status="auth",
+                telemetry_class="auth",
+                reusable=reusable,
+            )
+        sanitized = _apply_verified_bound_identity(
+            sanitized,
+            account_hash=actual_account_hash,
+            account_identity_fields=identity_fields,
+        )
 
     status_failure = _http_status_failure(sanitized.get("status_code"))
     if status_failure is not None:
@@ -2715,47 +3123,11 @@ def _collect_bound_conversation_init_snapshot(
             expected_account_hash=expected_account_hash,
             error=f"http_{status_failure}",
             telemetry_status=status_failure,
-            telemetry_class=(
-                "auth" if status_failure == "auth" else "http_error"
-            ),
+            telemetry_class="auth" if status_failure == "auth" else "http_error",
             reusable=reusable,
         )
-
-    _status_code, payload_raw, _envelope_redacted = _split_boundary_envelope(raw)
-    account_id, identity_fields, identity_error = (
-        _extract_canonical_account_identity(raw, payload_raw)
-    )
-    if identity_error is not None or account_id is None:
-        return _bound_capture_failure(
-            summary,
-            source_path=source_path,
-            expected_account_hash=expected_account_hash,
-            error=identity_error or "missing_authoritative_account_id",
-            telemetry_status="missing_account_identity",
-            telemetry_class="malformed_telemetry",
-            reusable=reusable,
-        )
-    actual_account_hash = hash_chatgpt_conversation_init_canonical_account_id(
-        account_id
-    )
-    if actual_account_hash != expected_account_hash:
-        return _bound_capture_failure(
-            summary,
-            source_path=source_path,
-            expected_account_hash=expected_account_hash,
-            error="account_identity_mismatch",
-            telemetry_status="auth",
-            telemetry_class="auth",
-            reusable=reusable,
-        )
-
-    sanitized = _apply_verified_bound_identity(
-        sanitized,
-        account_hash=actual_account_hash,
-        account_identity_fields=identity_fields,
-    )
     summary["account_identity_hashed"] = True
-    summary["account_hash"] = actual_account_hash
+    summary["account_hash"] = sanitized["account_hash"]
     summary["account_identity_verified"] = True
     summary["account_identity_fields"] = sanitized["account_identity_fields"]
     summary["account_identity_source"] = sanitized["account_identity_source"]
@@ -2851,7 +3223,7 @@ def _collector_summary(contract: Mapping[str, Any], source_path: str) -> Dict[st
         "request_method": contract.get("method"),
         "request_path": contract.get("path"),
         "request_url": contract.get("url"),
-        "request_body_omitted": True,
+        "request_body_omitted": bool(contract.get("body_omitted")),
         "has_model_message": False,
         "has_conversation_content": False,
         "status_code": None,
@@ -2865,6 +3237,10 @@ def _collector_summary(contract: Mapping[str, Any], source_path: str) -> Dict[st
         "account_identity_hash_length": None,
         "account_identity_verification_source": None,
         "account_identity_verification_error": None,
+        "native_capture": None,
+        "native_capture_error": None,
+        "browser_challenge": False,
+        "retry_after_seconds": None,
         "redacted_field_count": 0,
         "source_identity_hash": hash_chatgpt_conversation_init_source_identity(
             source_path
@@ -2881,17 +3257,21 @@ def _apply_verified_bound_identity(
     *,
     account_hash: str,
     account_identity_fields: Sequence[str],
+    account_identity_source: str = (
+        CHATGPT_CONVERSATION_INIT_VERIFIED_PAYLOAD_IDENTITY_SOURCE
+    ),
+    account_identity_verification_source: str = (
+        CHATGPT_CONVERSATION_INIT_BROWSER_ACCOUNT_IDENTITY_SOURCE
+    ),
 ) -> Dict[str, Any]:
     result = dict(sanitized)
     result["account_hash"] = account_hash
     result["account_identity_fields"] = _safe_identity_fields(
         account_identity_fields
     )
-    result["account_identity_source"] = (
-        CHATGPT_CONVERSATION_INIT_VERIFIED_PAYLOAD_IDENTITY_SOURCE
-    )
+    result["account_identity_source"] = account_identity_source
     result["account_identity_verification_source"] = (
-        CHATGPT_CONVERSATION_INIT_BROWSER_ACCOUNT_IDENTITY_SOURCE
+        account_identity_verification_source
     )
     result["account_identity_verified"] = True
     result["account_identity_hash_algorithm"] = (
@@ -2927,6 +3307,10 @@ def _snapshot_is_persistable(
     expected_account_hash: Optional[str] = None,
     require_verified_identity: bool = False,
 ) -> bool:
+    if sanitized.get("browser_challenge") is True:
+        return False
+    if sanitized.get("native_capture_error"):
+        return False
     if _http_status_failure(sanitized.get("status_code")) is not None:
         return False
     if sanitized.get("payload_state") != "present":
@@ -2936,20 +3320,14 @@ def _snapshot_is_persistable(
         return False
     if require_verified_identity:
         return bool(
-            sanitized.get("account_identity_verified") is True
-            and _is_canonical_account_hash(sanitized.get("account_hash"))
+            _is_verified_bound_identity(
+                sanitized,
+                sanitized.get("account_hash"),
+            )
             and (
                 expected_account_hash is None
                 or sanitized.get("account_hash") == expected_account_hash
             )
-            and sanitized.get("account_identity_source")
-            == CHATGPT_CONVERSATION_INIT_VERIFIED_PAYLOAD_IDENTITY_SOURCE
-            and sanitized.get("account_identity_verification_source")
-            == CHATGPT_CONVERSATION_INIT_BROWSER_ACCOUNT_IDENTITY_SOURCE
-            and sanitized.get("account_identity_hash_algorithm")
-            == CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_ALGORITHM
-            and sanitized.get("account_identity_hash_length")
-            == CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_LENGTH
         )
     return bool(sanitized.get("account_hash") or sanitized.get("source_identity_hash"))
 
@@ -2985,6 +3363,10 @@ def _destination_has_reusable_bound_snapshot(
 
 
 def _failure_telemetry_status(sanitized: Mapping[str, Any]) -> str:
+    if sanitized.get("browser_challenge") is True:
+        return "auth"
+    if sanitized.get("native_capture_error"):
+        return "malformed"
     http_error = _http_status_failure(sanitized.get("status_code"))
     if http_error is not None:
         return http_error
@@ -2994,6 +3376,8 @@ def _failure_telemetry_status(sanitized: Mapping[str, Any]) -> str:
 
 
 def _failure_telemetry_class(sanitized: Mapping[str, Any]) -> str:
+    if sanitized.get("browser_challenge") is True:
+        return "browser_challenge"
     status = _failure_telemetry_status(sanitized)
     if status == "auth":
         return "auth"
@@ -3028,13 +3412,28 @@ def _retained_bound_envelope_identity(
         return None, []
     if raw.get("account_identity_verified") is not True:
         return None, []
-    if raw.get("account_identity_source") != (
-        CHATGPT_CONVERSATION_INIT_VERIFIED_PAYLOAD_IDENTITY_SOURCE
-    ):
+    if raw.get("browser_challenge") is True:
         return None, []
-    if raw.get("account_identity_verification_source") != (
-        CHATGPT_CONVERSATION_INIT_BROWSER_ACCOUNT_IDENTITY_SOURCE
+    identity_source = raw.get("account_identity_source")
+    if identity_source == CHATGPT_CONVERSATION_INIT_VERIFIED_PAYLOAD_IDENTITY_SOURCE:
+        if raw.get("account_identity_verification_source") != (
+            CHATGPT_CONVERSATION_INIT_BROWSER_ACCOUNT_IDENTITY_SOURCE
+        ):
+            return None, []
+    elif (
+        identity_source
+        == CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
     ):
+        if raw.get("account_identity_verification_source") != (
+            CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
+        ):
+            return None, []
+        native_capture, native_capture_error = _sanitize_native_capture(
+            raw.get("native_capture")
+        )
+        if native_capture_error is not None or native_capture is None:
+            return None, []
+    else:
         return None, []
     if raw.get("account_identity_hash_algorithm") != (
         CHATGPT_CONVERSATION_INIT_ACCOUNT_HASH_ALGORITHM
@@ -3057,7 +3456,14 @@ def _retained_bound_envelope_identity(
         if isinstance(retained_fields, list)
         else []
     )
-    if not fields or any(
+    if not fields:
+        return None, []
+    if identity_source == CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE:
+        if fields != ["native_capture.account_hash"]:
+            return None, []
+        if native_capture["account_hash"] != account_hash:
+            return None, []
+    elif any(
         field not in _CANONICAL_ACCOUNT_ID_PROVENANCE_FIELDS for field in fields
     ):
         return None, []
@@ -3071,6 +3477,10 @@ def _resolve_account_identity_source(
     source_identity_hash: Optional[str],
 ) -> Optional[str]:
     if isinstance(raw, Mapping):
+        if "native_capture" in raw:
+            if account_hash:
+                return CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
+            return None
         retained = raw.get("account_identity_source")
         if (
             retained
