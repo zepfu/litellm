@@ -400,9 +400,7 @@ async def _fetch_capacity_success_epoch_with_deadline(
     if remaining <= 0:
         raise asyncio.TimeoutError
 
-    fetch_task = asyncio.create_task(
-        _fetch_capacity_success_epoch(redis_cache, key)
-    )
+    fetch_task = asyncio.create_task(_fetch_capacity_success_epoch(redis_cache, key))
     try:
         return await asyncio.wait_for(fetch_task, timeout=remaining)
     finally:
@@ -583,9 +581,10 @@ class OpenAIAlphaCapacityRetryCoordinator:
         if wait_seconds <= 0:
             return "timer"
 
-        wait_deadline = time.monotonic() + wait_seconds
-        request_deadline = self._start_monotonic + self.deadline_seconds
-        deadline = min(wait_deadline, request_deadline)
+        deadline = min(
+            time.monotonic() + wait_seconds,
+            self._start_monotonic + self.deadline_seconds,
+        )
         self.record_pre_wait(
             wait_seconds,
             error_class=error_class,
