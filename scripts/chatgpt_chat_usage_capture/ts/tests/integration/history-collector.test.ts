@@ -1502,7 +1502,7 @@ describe("Stage-2A history collection", () => {
     );
   });
 
-  it("starts a fresh follow-up clock for a new generation after the prior one completes", async () => {
+  it("starts a fresh follow-up clock and backoff after a heavily retried generation completes", async () => {
     const reader = new ScriptedReader();
     const candidate = summary("conv-generation-rotation");
     addCompleteIndex(reader, [candidate], []);
@@ -1550,6 +1550,7 @@ describe("Stage-2A history collection", () => {
       generationId: "generation-a",
       requestId: "request-a",
     });
+    store.upsertRevisit({ ...timedOut.revisits[0]!, attempts: 8 });
 
     const rotatedAt = new Date(
       timedOutAt.getTime() + OUTSTANDING_GENERATION_REVISIT_MAX_DELAY_MS,
@@ -1595,7 +1596,100 @@ describe("Stage-2A history collection", () => {
     expect(
       new Date(rotated.revisits[0]!.nextEligibleAt).getTime() -
         rotatedAt.getTime(),
-    ).toBeLessThan(OUTSTANDING_GENERATION_REVISIT_MAX_DELAY_MS);
+    ).toBe(OUTSTANDING_GENERATION_REVISIT_BASE_DELAY_MS);
+    expect(rotated.revisits[0]?.attempts).toBe(1);
+  });
+
+  it("retains unidentified prior generation state after sparse evidence and an unrelated completion", async () => {
+    const reader = new ScriptedReader();
+    const id = "conv-legacy-generation";
+    addCompleteIndex(reader, [summary(id)], []);
+    reader.details.set(id, detail(id));
+    reader.messagePages.set(id, new Map([["latest", completePage([
+      { ...message(id, "a"), status: "in_progress", endTurn: false },
+    ])]]));
+    const store = new MemoryCheckpointStore();
+    const collector = new HistoryCollector(reader, {
+      accountId: "fixture-primary", store,
+    });
+    const first = await collector.collect({ mode: "incremental", now: NOW });
+    const prior = first.revisits[0]!;
+    // Simulate a checkpoint written before generation identities were stored.
+    store.upsertRevisit({
+      ...prior,
+      outstandingGeneration: {
+        state: "nonterminal", since: NOW.toISOString(), timedOut: false,
+      } as RevisitEntry["outstandingGeneration"],
+    });
+    reader.messagePages.set(id, new Map([["latest", completePage([
+      { ...message(id, "a"), status: null, endTurn: false },
+      message(id, "unrelated-x"),
+    ])]]));
+    const next = await collector.collect({
+      mode: "incremental", now: new Date(prior.nextEligibleAt),
+    });
+    expect(next.revisits).toHaveLength(1);
+    expect(next.revisits[0]?.outstandingGeneration).toMatchObject({
+      state: "nonterminal", since: NOW.toISOString(), timedOut: false,
+      messageId: null, generationId: null, requestId: null,
+    });
+    expect(next.revisits[0]?.attempts).toBe(prior.attempts + 1);
+    expect(next.conversations[0]?.coverage).toBe("partial");
+  });
+
+  it("selects active B after ordered progress A and terminal A evidence", async () => {
+    const reader = new ScriptedReader();
+    const id = "conv-ordered-generations";
+    addCompleteIndex(reader, [summary(id)], []);
+    reader.details.set(id, detail(id));
+    reader.messagePages.set(id, new Map([["latest", completePage([
+      {
+        ...message(id, "a-progress"), generationId: "a",
+        status: "in_progress", endTurn: false,
+      },
+      { ...message(id, "a-final"), generationId: "a" },
+      {
+        ...message(id, "b-progress"), generationId: "b",
+        status: "in_progress", endTurn: false,
+      },
+    ])]]));
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary", store: new MemoryCheckpointStore(),
+    }).collect({ mode: "incremental", now: NOW });
+    expect(result.revisits[0]?.outstandingGeneration).toMatchObject({
+      generationId: "b", since: NOW.toISOString(), timedOut: false,
+      state: "nonterminal",
+    });
+    expect(result.conversations[0]?.messages).toHaveLength(3);
+  });
+
+  it("preserves and augments same-message identity across G-only and R-only unfinished rereads", async () => {
+    const reader = new ScriptedReader();
+    const id = "conv-compatible-generation";
+    addCompleteIndex(reader, [summary(id)], []);
+    reader.details.set(id, detail(id));
+    const pending = {
+      ...message(id, "m"), status: "in_progress", endTurn: false,
+    };
+    reader.messagePages.set(id, new Map([["latest", completePage([
+      { ...pending, generationId: "g" },
+    ])]]));
+    const store = new MemoryCheckpointStore();
+    const collector = new HistoryCollector(reader, {
+      accountId: "fixture-primary", store,
+    });
+    const first = await collector.collect({ mode: "incremental", now: NOW });
+    reader.messagePages.set(id, new Map([["latest", completePage([
+      { ...pending, generationId: null, requestId: "r" },
+    ])]]));
+    const second = await collector.collect({
+      mode: "incremental", now: new Date(first.revisits[0]!.nextEligibleAt),
+    });
+    expect(second.revisits[0]?.outstandingGeneration).toEqual({
+      state: "nonterminal", since: NOW.toISOString(), timedOut: false,
+      messageId: "m", generationId: "g", requestId: "r",
+    });
+    expect(second.revisits[0]?.attempts).toBe(2);
   });
 
   it("advances an outstanding-generation timeout when detail acquisition returns HTTP 503", async () => {

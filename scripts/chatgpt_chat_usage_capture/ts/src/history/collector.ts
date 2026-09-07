@@ -104,7 +104,7 @@ interface GenerationEvidence extends GenerationIdentity {
 }
 
 interface GenerationScan {
-  active: GenerationEvidence | null;
+  active: GenerationEvidence[];
   terminal: GenerationIdentity[];
 }
 
@@ -1941,7 +1941,14 @@ export class HistoryCollector {
           now,
         )
       : null;
-    const attempts = Math.max(
+    const priorGeneration = existing?.outstandingGeneration;
+    const newGeneration = outstandingGeneration !== null &&
+      (!priorGeneration ||
+        priorGeneration.since !== outstandingGeneration.since ||
+        ([priorGeneration.messageId, priorGeneration.generationId,
+          priorGeneration.requestId].some((value) => value !== null) &&
+          !sameGenerationIdentity(priorGeneration, outstandingGeneration)));
+    const attempts = newGeneration ? 1 : Math.max(
       1,
       (existing?.attempts ?? 0) + (incrementAttempt ? 1 : 0),
     );
@@ -2558,7 +2565,7 @@ function messagePageRevisitIssue(
 }
 
 function generationScan(messages: MessageRecord[]): GenerationScan {
-  let active: GenerationEvidence | null = null;
+  const active: GenerationEvidence[] = [];
   const terminal: GenerationIdentity[] = [];
   for (const message of messages) {
     if (message.role !== "assistant" && message.role !== "tool") {
@@ -2567,7 +2574,7 @@ function generationScan(messages: MessageRecord[]): GenerationScan {
     const status = (message.status ?? "").trim().toLowerCase();
     const identity = generationIdentityFor(message);
     if (NONTERMINAL_GENERATION_STATUSES.has(status)) {
-      active = preferGenerationEvidence(active, {
+      active.push({
         ...identity,
         state: "nonterminal",
         kind: "identified",
@@ -2589,7 +2596,7 @@ function generationScan(messages: MessageRecord[]): GenerationScan {
     const hasGenerationIdentity =
       identity.generationId !== null || identity.requestId !== null;
     if (hasGenerationIdentity) {
-      active = preferGenerationEvidence(active, {
+      active.push({
         ...identity,
         state: "unknown",
         kind: "identified",
@@ -2597,7 +2604,7 @@ function generationScan(messages: MessageRecord[]): GenerationScan {
       continue;
     }
     if (!status && message.endTurn === false) {
-      active = preferGenerationEvidence(active, {
+      active.push({
         ...identity,
         state: "unknown",
         kind: "sparse",
@@ -2627,13 +2634,13 @@ function generationStateFor(
   now: Date,
 ): OutstandingGenerationState | null {
   const scan = generationScan(messages);
-  const active =
-    scan.active &&
-    !scan.terminal.some((terminal) =>
-      sameGenerationIdentity(scan.active!, terminal),
-    )
-      ? scan.active
-      : null;
+  // Resolve every candidate before choosing one so a completed predecessor
+  // cannot hide another generation later in the same page.
+  const active = scan.active
+    .filter((candidate) => !scan.terminal.some((terminal) =>
+      sameGenerationIdentity(candidate, terminal),
+    ))
+    .reduce<GenerationEvidence | null>(preferGenerationEvidence, null);
   const existingState = existing?.outstandingGeneration ?? null;
 
   if (active?.kind === "sparse") {
@@ -2720,19 +2727,15 @@ function sameGenerationIdentity(
   left: GenerationIdentity,
   right: GenerationIdentity,
 ): boolean {
-  const leftStrong = [left.generationId, left.requestId].filter(
-    (value): value is string => value !== null,
-  );
-  const rightStrong = [right.generationId, right.requestId].filter(
-    (value): value is string => value !== null,
-  );
-  if (leftStrong.length > 0 && rightStrong.length > 0) {
-    return leftStrong.some((value) => rightStrong.includes(value));
+  for (const field of ["generationId", "requestId"] as const) {
+    if (left[field] !== null && right[field] !== null &&
+        left[field] !== right[field]) {
+      return false;
+    }
   }
-  if (left.messageId !== null && right.messageId !== null) {
-    return left.messageId === right.messageId;
-  }
-  return leftStrong.length === 0 && rightStrong.length === 0;
+  return (["messageId", "generationId", "requestId"] as const).some(
+    (field) => left[field] !== null && left[field] === right[field],
+  );
 }
 
 function terminallyResolves(
@@ -2740,15 +2743,7 @@ function terminallyResolves(
   existing: OutstandingGenerationState,
 ): boolean {
   const identity = generationIdentityForState(existing);
-  if (scan.terminal.some((terminal) => sameGenerationIdentity(identity, terminal))) {
-    return true;
-  }
-  return (
-    identity.messageId === null &&
-    identity.generationId === null &&
-    identity.requestId === null &&
-    scan.terminal.length > 0
-  );
+  return scan.terminal.some((terminal) => sameGenerationIdentity(identity, terminal));
 }
 
 function nextOutstandingGenerationAt(

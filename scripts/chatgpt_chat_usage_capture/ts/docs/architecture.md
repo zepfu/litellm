@@ -81,7 +81,11 @@ Generation revisits retain message, generation, and request identity. Sparse
 same-message evidence with `status=null` and `end_turn=false` does not provide
 terminal evidence, and a transport failure still advances an existing timeout
 from its original `since` timestamp. A completed generation does not transfer
-its timeout state to a distinct active generation.
+its timeout state or retry count to a distinct active generation, whose initial
+revisit delay is 15 minutes. Terminal evidence is matched before selecting an
+outstanding candidate; an unrelated completion cannot resolve an unidentified
+legacy revisit. Compatible same-message rereads preserve the clock and augment
+missing identity fields rather than treating their absence as a conflict.
 
 `src/history/checkpoints.ts` buffers the checkpoint contract in memory.
 `SqliteCheckpointStore` loads/saves the account's per-scope state and revisits
