@@ -1315,6 +1315,9 @@ def test_openai_alpha_capacity_budget_custom():
 
 import time as _time_module
 
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    pre_commit_retry as pre_commit_retry_module,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry import (
     _LOCAL_CAPACITY_WAKEUP_EVENTS,
     OpenAIAlphaCapacityRetryCoordinator,
@@ -1326,6 +1329,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry im
     _resolve_redis_for_capacity_wakeup,
     _signal_openai_capacity_success,
     CapacityRetryLogEntry,
+    get_or_create_openai_alpha_capacity_retry_coordinator,
 )
 
 
@@ -1470,6 +1474,82 @@ class TestCoordinatorBasic:
             target_identity="openai:gpt",
         )
         assert coordinator.deadline_seconds == 7200.0
+
+
+class TestCoordinatorRequestCarrier:
+    @staticmethod
+    def _request() -> Request:
+        return Request(
+            scope={
+                "type": "http",
+                "method": "POST",
+                "path": "/openai_passthrough/responses",
+                "headers": [],
+            }
+        )
+
+    def test_same_request_reuses_one_coordinator_and_preserves_ledger(
+        self, monkeypatch
+    ):
+        clock = [100.0]
+        monkeypatch.setattr(
+            pre_commit_retry_module.time,
+            "monotonic",
+            lambda: clock[0],
+        )
+        request = self._request()
+
+        coordinator = get_or_create_openai_alpha_capacity_retry_coordinator(
+            request,
+            target_identity="openai:first",
+            namespace="alpha-v1",
+            budget=OpenAIAlphaCapacityRetryBudget(deadline_seconds=7200.0),
+        )
+        coordinator.record_retry("timer")
+        clock[0] = 137.5
+
+        rebound = get_or_create_openai_alpha_capacity_retry_coordinator(
+            request,
+            target_identity="openai:second",
+            namespace="alpha-v2",
+            budget=OpenAIAlphaCapacityRetryBudget(deadline_seconds=1.0),
+        )
+
+        assert rebound is coordinator
+        assert request.state.aawm_openai_capacity_retry is coordinator
+        assert coordinator.target_identity == "openai:second"
+        assert coordinator.namespace == "alpha-v2"
+        assert coordinator._start_monotonic == 100.0
+        assert coordinator.elapsed_seconds == pytest.approx(37.5)
+        assert coordinator.deadline_seconds == 7200.0
+        assert coordinator.retry_count == 1
+        assert coordinator.next_wait_seconds() == 30.0
+
+    def test_different_requests_get_independent_coordinators(self):
+        first_request = self._request()
+        second_request = self._request()
+
+        first = get_or_create_openai_alpha_capacity_retry_coordinator(
+            first_request,
+            target_identity="openai:gpt",
+        )
+        repeated = get_or_create_openai_alpha_capacity_retry_coordinator(
+            first_request,
+            target_identity="openai:gpt",
+        )
+        second = get_or_create_openai_alpha_capacity_retry_coordinator(
+            second_request,
+            target_identity="openai:gpt",
+        )
+
+        first.record_retry("timer")
+
+        assert repeated is first
+        assert second is not first
+        assert first_request.state.aawm_openai_capacity_retry is first
+        assert second_request.state.aawm_openai_capacity_retry is second
+        assert first.retry_count == 1
+        assert second.retry_count == 0
 
 
 class TestCoordinatorSleepWakeup:

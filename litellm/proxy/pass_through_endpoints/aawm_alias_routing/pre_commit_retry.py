@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
+from starlette.requests import Request
+
 from .durable import get_aawm_alias_routing_state_namespace
 from .retry import (
     OpenAIAlphaCapacityRetryBudget,
@@ -35,6 +37,7 @@ logger = logging.getLogger("LiteLLMProxy")
 _OPENAI_CAPACITY_SUCCESS_KEY_PREFIX = "aawm:openai_capacity_success"
 _OPENAI_CAPACITY_SUCCESS_EPOCH_TTL_SECONDS = 300  # 5 min stale-success expiry
 _OPENAI_CAPACITY_SUCCESS_POLL_SECONDS = 1.0
+_OPENAI_CAPACITY_RETRY_STATE_KEY = "aawm_openai_capacity_retry"
 _LOCAL_CAPACITY_WAKEUP_EVENTS: dict[tuple[str, str], set[asyncio.Event]] = {}
 
 
@@ -294,6 +297,60 @@ class OpenAIAlphaCapacityRetryCoordinator:
         )
 
     @property
+    def target_identity(self) -> str:
+        return self._target_identity
+
+    @property
+    def namespace(self) -> str:
+        return self._namespace
+
+    def rebind_target(
+        self,
+        *,
+        target_identity: str,
+        namespace: Optional[str] = None,
+    ) -> None:
+        """Update target-scoped wakeup state without resetting request state."""
+        resolved_namespace = (
+            self._namespace
+            if namespace is None
+            else _resolve_openai_capacity_namespace(namespace)
+        )
+        if (
+            target_identity == self._target_identity
+            and resolved_namespace == self._namespace
+        ):
+            return
+
+        previous_local_event_key = self._local_event_key
+        previous_local_events = self._local_events
+        self._local_event_key = _capacity_wakeup_scope_key(
+            target_identity, resolved_namespace
+        )
+        if self._local_event_key != previous_local_event_key:
+            if (
+                not previous_local_events
+                and _LOCAL_CAPACITY_WAKEUP_EVENTS.get(previous_local_event_key)
+                is previous_local_events
+            ):
+                _LOCAL_CAPACITY_WAKEUP_EVENTS.pop(previous_local_event_key, None)
+            self._local_events = _LOCAL_CAPACITY_WAKEUP_EVENTS.setdefault(
+                self._local_event_key, set()
+            )
+
+        self._target_identity = target_identity
+        self._target_hash = _hash_target_identity(target_identity)
+        self._namespace = resolved_namespace
+        self._redis_cache = _resolve_redis_for_capacity_wakeup()
+        self._redis_key = (
+            _build_openai_capacity_success_redis_key(
+                target_identity, resolved_namespace
+            )
+            if self._redis_cache is not None
+            else None
+        )
+
+    @property
     def elapsed_seconds(self) -> float:
         return time.monotonic() - self._start_monotonic
 
@@ -344,7 +401,9 @@ class OpenAIAlphaCapacityRetryCoordinator:
             return "timer"
 
         wakeup = _CapacityWakeupState()
-        self._local_events.add(wakeup.event)
+        local_events = self._local_events
+        sleep_local_event_key = self._local_event_key
+        local_events.add(wakeup.event)
         redis_cache = self._redis_cache
         redis_key = self._redis_key
 
@@ -397,9 +456,13 @@ class OpenAIAlphaCapacityRetryCoordinator:
                 except asyncio.TimeoutError:
                     pass
         finally:
-            self._local_events.discard(wakeup.event)
-            if not self._local_events:
-                _LOCAL_CAPACITY_WAKEUP_EVENTS.pop(self._local_event_key, None)
+            local_events.discard(wakeup.event)
+            if (
+                not local_events
+                and _LOCAL_CAPACITY_WAKEUP_EVENTS.get(sleep_local_event_key)
+                is local_events
+            ):
+                _LOCAL_CAPACITY_WAKEUP_EVENTS.pop(sleep_local_event_key, None)
 
         return wakeup.wakeup_reason
 
@@ -444,3 +507,31 @@ class OpenAIAlphaCapacityRetryCoordinator:
         event = asyncio.Event()
         self._local_events.add(event)
         return event
+
+
+def get_or_create_openai_alpha_capacity_retry_coordinator(
+    request: Request,
+    *,
+    target_identity: str,
+    namespace: str = "default",
+    budget: Optional[OpenAIAlphaCapacityRetryBudget] = None,
+) -> OpenAIAlphaCapacityRetryCoordinator:
+    """Return the one capacity retry coordinator carried by *request*."""
+    coordinator = getattr(
+        request.state,
+        _OPENAI_CAPACITY_RETRY_STATE_KEY,
+        None,
+    )
+    if coordinator is None:
+        coordinator = OpenAIAlphaCapacityRetryCoordinator(
+            target_identity=target_identity,
+            budget=budget,
+            namespace=namespace,
+        )
+        setattr(request.state, _OPENAI_CAPACITY_RETRY_STATE_KEY, coordinator)
+    else:
+        coordinator.rebind_target(
+            target_identity=target_identity,
+            namespace=namespace,
+        )
+    return coordinator
