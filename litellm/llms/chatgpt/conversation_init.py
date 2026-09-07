@@ -694,7 +694,7 @@ def sanitize_conversation_init_boundary(  # noqa: PLR0915 - boundary projection
     request_body_omitted = (
         native_capture.get("request_body_omitted")
         if isinstance(native_capture, Mapping)
-        else contract["body_omitted"]
+        else None if native_capture_present else contract["body_omitted"]
     )
     if isinstance(raw_native_capture, Mapping):
         raw_body_omitted = raw_native_capture.get("request_body_omitted")
@@ -851,7 +851,7 @@ def _is_verified_bound_identity(
     )
 
 
-def _resolve_parse_guard(
+def _resolve_parse_guard(  # noqa: PLR0915 - parser guard ordering
     sanitized: Mapping[str, Any],
 ) -> Dict[str, Any]:
     """Resolve identity, payload, and early-return guard for parsing."""
@@ -887,7 +887,13 @@ def _resolve_parse_guard(
         account_identity_source = account_identity_source or "source_path"
     request_body_omitted = sanitized.get("request_body_omitted")
     if not isinstance(request_body_omitted, bool):
-        request_body_omitted = bool(request.get("body_omitted"))
+        request_body_omitted = (
+            None
+            if native_capture_error is not None
+            or account_identity_source
+            == CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
+            else bool(request.get("body_omitted"))
+        )
     retry_after_seconds = sanitized.get("retry_after_seconds")
     browser_challenge = sanitized.get("browser_challenge") is True
 
@@ -956,6 +962,15 @@ def _resolve_parse_guard(
         summary["telemetry_class"] = (
             "auth" if http_error == "auth" else "http_error"
         )
+        summary["last_good_state_retained"] = True
+        return {"error": True, "summary": summary}
+    if (
+        account_identity_source
+        == CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
+        and not account_identity_verified
+    ):
+        summary["telemetry_status"] = "auth"
+        summary["telemetry_class"] = "auth"
         summary["last_good_state_retained"] = True
         return {"error": True, "summary": summary}
     if sanitized.get("payload_state") != "present" or not isinstance(payload, Mapping):
@@ -1158,9 +1173,7 @@ def collect_conversation_init_observations(
     summary["request_method"] = contract["method"]
     summary["request_path"] = contract["path"]
     summary["request_url"] = contract["url"]
-    summary["request_body_omitted"] = bool(
-        sanitized.get("request_body_omitted")
-    )
+    summary["request_body_omitted"] = sanitized.get("request_body_omitted")
     summary["has_model_message"] = False
     summary["has_conversation_content"] = False
     summary["collector_source"] = "file"
@@ -1189,8 +1202,14 @@ def collect_conversation_init_observations(
     summary["account_identity_verification_error"] = sanitized.get(
         "account_identity_verification_error"
     )
+    native_identity_verified = (
+        summary.get("account_identity_source")
+        != CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
+        or summary.get("account_identity_verified") is True
+    )
     if (
         observations
+        and native_identity_verified
         and not summary["browser_challenge"]
         and isinstance(account_hash, str)
         and account_hash
@@ -2860,9 +2879,7 @@ def collect_conversation_init_snapshot(  # noqa: PLR0915 - collector state
         sanitized.get("account_identity_verified")
     )
     summary["payload_state"] = sanitized.get("payload_state")
-    summary["request_body_omitted"] = bool(
-        sanitized.get("request_body_omitted")
-    )
+    summary["request_body_omitted"] = sanitized.get("request_body_omitted")
     summary["retry_after_seconds"] = sanitized.get("retry_after_seconds")
     summary["browser_challenge"] = bool(sanitized.get("browser_challenge"))
     summary["native_capture"] = (
@@ -3018,9 +3035,7 @@ def _collect_bound_conversation_init_snapshot(  # noqa: PLR0915 - bound state
     summary["status_code"] = sanitized.get("status_code")
     summary["redacted_field_count"] = sanitized.get("redacted_field_count")
     summary["payload_state"] = sanitized.get("payload_state")
-    summary["request_body_omitted"] = bool(
-        sanitized.get("request_body_omitted")
-    )
+    summary["request_body_omitted"] = sanitized.get("request_body_omitted")
     summary["retry_after_seconds"] = sanitized.get("retry_after_seconds")
     summary["browser_challenge"] = bool(sanitized.get("browser_challenge"))
     summary["native_capture"] = (
@@ -3311,6 +3326,15 @@ def _snapshot_is_persistable(
         return False
     if sanitized.get("native_capture_error"):
         return False
+    if (
+        sanitized.get("account_identity_source")
+        == CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
+        and not _is_verified_bound_identity(
+            sanitized,
+            sanitized.get("account_hash"),
+        )
+    ):
+        return False
     if _http_status_failure(sanitized.get("status_code")) is not None:
         return False
     if sanitized.get("payload_state") != "present":
@@ -3370,6 +3394,15 @@ def _failure_telemetry_status(sanitized: Mapping[str, Any]) -> str:
     http_error = _http_status_failure(sanitized.get("status_code"))
     if http_error is not None:
         return http_error
+    if (
+        sanitized.get("account_identity_source")
+        == CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
+        and not _is_verified_bound_identity(
+            sanitized,
+            sanitized.get("account_hash"),
+        )
+    ):
+        return "auth"
     if not sanitized.get("account_hash") and not sanitized.get("source_identity_hash"):
         return "missing_account_identity"
     return "malformed"
