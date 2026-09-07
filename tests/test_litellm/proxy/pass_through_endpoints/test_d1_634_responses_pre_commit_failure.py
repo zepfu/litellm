@@ -2348,6 +2348,41 @@ async def test_central_coordinator_preserves_last_capacity_failure_on_expiry():
     assert raised.value.status_code == 502
     assert raised.value.detail == terminal_payload
     assert raised.value.headers == {"Retry-After": "999999"}
+    coordinator.record_terminal.assert_called_once_with(
+        "deadline_exhausted", error_class="server_overloaded", status_code=502
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_capacity", [False, True])
+async def test_legacy_budget_timeout_preserves_original_exception(prior_capacity):
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+
+    timeout = pte._PassthroughHiddenRetryBudgetTimeout("expired")
+    capacity = HTTPException(
+        status_code=503,
+        detail={"error": {"code": "server_overloaded"}},
+        headers={"Retry-After": "20"},
+    )
+    outcomes = [capacity, timeout] if prior_capacity else [timeout]
+
+    async def fake_await(*args, **kwargs):
+        raise outcomes.pop(0)
+
+    with patch.object(
+        pte, "_await_passthrough_pre_first_byte_operation", new=fake_await
+    ), patch.object(pte.asyncio, "sleep", new=AsyncMock()):
+        with pytest.raises(pte._PassthroughHiddenRetryBudgetTimeout) as raised:
+            await _execute_passthrough_pre_first_byte_with_hidden_retries(
+                kwargs={},
+                operation=AsyncMock(),
+                operation_name="non_stream_pre_first_byte",
+                caller_managed_hidden_retry=False,
+                custom_llm_provider="other",
+            )
+    assert raised.value is timeout
+    assert not outcomes
+    assert pte._get_passthrough_terminal_wire_headers(capacity) == {}
 
 
 @pytest.mark.asyncio
@@ -3124,8 +3159,17 @@ async def test_nonstream_alpha_openai_sse_substantive_bytes_survive_precommit_pe
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "upstream_retry_after", "expired", "expected_retry_after"),
+    [
+        ("sse", "999999", True, "7200"),
+        ("raw", None, True, "10"),
+        ("raw", "17", True, "17"),
+        ("http", "17", False, None),
+    ],
+)
 async def test_stream_capacity_failure_retry_after_reaches_proxy_wire_headers(
-    monkeypatch,
+    monkeypatch, kind, upstream_retry_after, expired, expected_retry_after,
 ):
     monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
     from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
@@ -3152,9 +3196,40 @@ async def test_stream_capacity_failure_retry_after_reaches_proxy_wire_headers(
         pre_commit_retry_exhausted=True,
         message="The upstream server is overloaded.",
     )
+    if kind == "raw":
+        terminal_failure = httpx.HTTPStatusError(
+            "capacity",
+            request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+            response=httpx.Response(
+                503,
+                json={"error": {"code": "server_overloaded", "message": "capacity"}},
+                headers=(
+                    {"Retry-After": upstream_retry_after}
+                    if upstream_retry_after is not None else {}
+                ),
+            ),
+        )
+    elif kind == "http":
+        terminal_failure = HTTPException(
+            status_code=503, detail="capacity",
+            headers={"Retry-After": upstream_retry_after},
+        )
 
     async def execute_hidden_retries(**kwargs):
-        raise terminal_failure
+        if not expired:
+            raise terminal_failure
+        coordinator = MagicMock()
+        coordinator.deadline_seconds = 7200.0
+        coordinator.remaining_seconds = 1.0
+        coordinator.elapsed_seconds = 7200.0
+        coordinator.within_deadline.return_value = False
+        return await _execute_passthrough_pre_first_byte_with_hidden_retries(
+            kwargs={},
+            operation=AsyncMock(side_effect=terminal_failure),
+            operation_name="stream_pre_first_byte",
+            caller_managed_hidden_retry=False,
+            openai_capacity_coordinator=coordinator,
+        )
 
     async def run_with_renewal(_lease, operation):
         return await operation()
@@ -3202,10 +3277,13 @@ async def test_stream_capacity_failure_retry_after_reaches_proxy_wire_headers(
             )
 
     assert raised.value.code == "503"
-    assert raised.value.detail == terminal_failure.detail
-    assert raised.value.headers["Retry-After"] == "7200"
+    expected_detail = (
+        terminal_failure.response.text if kind == "raw" else terminal_failure.detail
+    )
+    assert raised.value.detail == expected_detail
+    assert raised.value.headers.get("Retry-After") == expected_retry_after
 
     response = await openai_exception_handler(mock_request, raised.value)
     assert response.status_code == 503
-    assert response.headers["retry-after"] == "7200"
-    assert terminal_failure.message in response.body.decode("utf-8")
+    assert response.headers.get("retry-after") == expected_retry_after
+    assert json.loads(response.body)["error"]["message"] == str(expected_detail)

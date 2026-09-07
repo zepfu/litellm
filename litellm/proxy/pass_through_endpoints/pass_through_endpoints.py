@@ -845,13 +845,16 @@ def _build_http_exception_from_upstream_status_error(
 
 
 def _get_passthrough_terminal_wire_headers(exc: Exception) -> Dict[str, str]:
-    """Expose only a bounded upstream Retry-After on the proxy response."""
+    """Expose retry metadata only for coordinator-owned capacity expiry."""
+    if not getattr(exc, "_aawm_openai_capacity_expired", False):
+        return {}
+    fallback = {"Retry-After": "10"}
     headers = getattr(exc, "headers", None)
     if not hasattr(headers, "items"):
         response = getattr(exc, "response", None)
         headers = getattr(response, "headers", None)
     if not hasattr(headers, "items"):
-        return {}
+        return fallback
 
     for header_name, header_value in headers.items():
         if str(header_name).lower() != "retry-after":
@@ -859,9 +862,9 @@ def _get_passthrough_terminal_wire_headers(exc: Exception) -> Dict[str, str]:
         try:
             retry_after_seconds = float(str(header_value).strip())
         except (TypeError, ValueError):
-            return {}
+            return fallback
         if not isfinite(retry_after_seconds) or retry_after_seconds < 0:
-            return {}
+            return fallback
         bounded_retry_after = min(
             retry_after_seconds,
             _PASSTHROUGH_TERMINAL_RETRY_AFTER_MAX_SECONDS,
@@ -869,26 +872,31 @@ def _get_passthrough_terminal_wire_headers(exc: Exception) -> Dict[str, str]:
         if bounded_retry_after == int(bounded_retry_after):
             return {"Retry-After": str(int(bounded_retry_after))}
         return {"Retry-After": str(bounded_retry_after)}
-    return {}
+    return fallback
 
 
 def _mark_passthrough_capacity_exception_terminal(
     exc: Exception,
-) -> None:
-    if not isinstance(exc, ResponsesStreamPreCommitFailure):
-        return
-
-    exc.pre_commit_retry_exhausted = True
-    try:
-        retry_after_seconds = float(exc.retry_after_seconds)
-    except (TypeError, ValueError):
-        retry_after_seconds = 10.0
-    if not isfinite(retry_after_seconds) or retry_after_seconds <= 0:
-        retry_after_seconds = 10.0
-    exc.retry_after_seconds = min(
-        retry_after_seconds,
-        _PASSTHROUGH_TERMINAL_RETRY_AFTER_MAX_SECONDS,
-    )
+) -> Exception:
+    if isinstance(exc, ResponsesStreamPreCommitFailure):
+        exc.pre_commit_retry_exhausted = True
+        try:
+            retry_after_seconds = float(exc.retry_after_seconds)
+        except (TypeError, ValueError):
+            retry_after_seconds = 10.0
+        if not isfinite(retry_after_seconds) or retry_after_seconds <= 0:
+            retry_after_seconds = 10.0
+        exc.retry_after_seconds = min(
+            retry_after_seconds,
+            _PASSTHROUGH_TERMINAL_RETRY_AFTER_MAX_SECONDS,
+        )
+        exc = exc.as_http_exception()
+    elif isinstance(exc, httpx.HTTPStatusError):
+        exc = _build_http_exception_from_upstream_status_error(
+            exc, exc.response.text
+        )
+    setattr(exc, "_aawm_openai_capacity_expired", True)
+    return exc
 
 
 def _extract_exception_status_code(exc: Exception) -> Optional[int]:
@@ -1901,11 +1909,35 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     budget_seconds,
                     elapsed_seconds,
                 )
+                if openai_capacity_coordinator is None:
+                    raise
                 if last_capacity_exception is not None:
-                    _mark_passthrough_capacity_exception_terminal(
-                        last_capacity_exception
+                    terminal_status, terminal_class, _ = (
+                        _classify_passthrough_hidden_retry_failure(
+                            last_capacity_exception
+                        )
                     )
-                    raise last_capacity_exception from exc
+                    raw_terminal = _classify_passthrough_raw_http_error(
+                        last_capacity_exception, status_code=terminal_status
+                    )
+                    if raw_terminal is not None:
+                        terminal_class = raw_terminal[0]
+                    terminal_exception = (
+                        _mark_passthrough_capacity_exception_terminal(
+                            last_capacity_exception
+                        )
+                    )
+                    openai_capacity_coordinator.record_terminal(
+                        "deadline_exhausted",
+                        error_class=terminal_class,
+                        status_code=_extract_exception_status_code(terminal_exception),
+                    )
+                    raise terminal_exception from exc
+                openai_capacity_coordinator.record_terminal(
+                    "deadline_exhausted",
+                    error_class=failure_class,
+                    status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                )
                 raise HTTPException(
                     status_code=status.HTTP_504_GATEWAY_TIMEOUT,
                     detail=str(exc),
@@ -1940,17 +1972,23 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 )
                 or raw_http_capacity_overload
             )
-            if capacity_failure:
-                last_capacity_exception = exc
             if (
                 openai_capacity_coordinator is not None
                 and capacity_failure
             ):
+                last_capacity_exception = exc
                 if not openai_capacity_coordinator.within_deadline():
-                    if isinstance(exc, ResponsesStreamPreCommitFailure):
-                        exc.pre_commit_retry_exhausted = True
+                    terminal_exception = (
+                        _mark_passthrough_capacity_exception_terminal(exc)
+                    )
                     openai_capacity_coordinator.record_terminal(
-                        "deadline_exhausted"
+                        "deadline_exhausted",
+                        error_class=(
+                            raw_http_classification[0]
+                            if raw_http_classification is not None
+                            else failure_class
+                        ),
+                        status_code=_extract_exception_status_code(terminal_exception),
                     )
                     _record_passthrough_hidden_retry_metadata(
                         kwargs,
@@ -1967,7 +2005,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         budget_seconds=openai_capacity_coordinator.deadline_seconds,
                         elapsed_seconds=openai_capacity_coordinator.elapsed_seconds,
                     )
-                    raise
+                    raise terminal_exception
                 wait_seconds = openai_capacity_coordinator.next_wait_seconds()
                 should_retry = True
             elif openai_capacity_coordinator is not None:
