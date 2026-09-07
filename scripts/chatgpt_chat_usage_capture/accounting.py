@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from .config import CollectorConfig, QuotaBucket, QuotaPolicy, WINDOW_TYPES
 from .ledger import Ledger
 from .privacy import SURFACE_CHAT
+from .reconstruct import map_family
 from .timeutil import (
     calendar_day_bounds,
     ensure_utc,
@@ -27,6 +28,39 @@ WORKING_ESTIMATOR = "requested_if_known_else_recorded_final"
 
 class AccountingError(ValueError):
     """Invalid accounting or window operation."""
+
+
+def reclassify_attempt_projections(
+    attempts: Sequence[Mapping[str, Any]],
+    *,
+    mapping_version: str,
+    mapping_rules: Sequence[Mapping[str, object]],
+) -> list[dict[str, Any]]:
+    """Recompute derived families from retained raw model evidence."""
+    projected: list[dict[str, Any]] = []
+    for attempt in attempts:
+        item = dict(attempt)
+        item["requested_family"] = map_family(
+            item.get("requested_model_raw"),
+            item.get("requested_mode_raw"),
+            item.get("requested_reasoning_effort_raw"),
+            mapping_rules,
+        )
+        item["recorded_final_family"] = map_family(
+            item.get("recorded_final_model_raw"),
+            None,
+            None,
+            mapping_rules,
+        )
+        item["resolved_family"] = map_family(
+            item.get("resolved_model_raw"),
+            None,
+            None,
+            mapping_rules,
+        )
+        item["mapping_version"] = mapping_version
+        projected.append(item)
+    return projected
 
 
 def evaluate_window(
@@ -379,6 +413,73 @@ def json_pending(raw: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _rebuild_preview(
+    config: CollectorConfig,
+    ledger: Ledger,
+    *,
+    account_id: str,
+    evaluated_at: datetime,
+    attempts: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    account = config.account(account_id)
+    policy = config.policy_for(account)
+    report_end = evaluated_at
+    report_start = report_end - config.default_lookback
+    summary = summarize_attempts(
+        attempts,
+        config,
+        start=report_start,
+        end=report_end + timedelta(microseconds=1),
+    )
+    calendar = calendar_table(
+        summary["in_range"],
+        report_start,
+        report_end,
+        config.application.report_timezone,
+        config,
+    )
+    bucket_summaries: list[dict[str, Any]] = []
+    working_by_bucket: dict[str, Optional[int]] = {}
+    for bucket in policy.buckets:
+        stored = ledger.get_window(account.id, bucket.id)
+        window = evaluate_window(
+            bucket,
+            stored,
+            now=evaluated_at,
+            report_end=evaluated_at,
+        )
+        window_summary = summarize_attempts(
+            attempts,
+            config,
+            start=window["start"] if window["known"] else None,
+            end=window["end"] if window["known"] else None,
+        )
+        bucket_summaries.append(
+            bucket_view(
+                ledger,
+                config,
+                account.id,
+                policy,
+                bucket,
+                evaluated_at=evaluated_at,
+                summary=window_summary,
+            )
+        )
+        usage = bucket_usage(
+            bucket,
+            window_summary["working"],
+            window_summary["in_range"],
+            config,
+        )
+        working_by_bucket[bucket.id] = usage if window["known"] else None
+    return {
+        "calendar_days": calendar,
+        "quota_buckets": bucket_summaries,
+        "working_quota_usage_estimate_by_bucket": working_by_bucket,
+        "observed_attempts_by_requested_family": dict(summary["observed_requested"]),
+    }
+
+
 def rebuild_aggregates(
     config: CollectorConfig,
     ledger: Ledger,
@@ -387,12 +488,38 @@ def rebuild_aggregates(
     apply: bool = False,
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
-    """Deterministically rebuild daily aggregates and publish a revision only after commit."""
-    from .reporting import build_report
-
+    """Rebuild current projections from retained evidence and publish atomically."""
     account = config.account(account_id)
     evaluated_at = ensure_utc(now or datetime.now(timezone.utc))
-    preview = build_report(config, ledger, account_id=account.id, now=evaluated_at)
+    retained_attempts = ledger.list_attempts(account.id)
+    projected_attempts = reclassify_attempt_projections(
+        retained_attempts,
+        mapping_version=config.model_mapping.version,
+        mapping_rules=config.model_mapping.exact_rules,
+    )
+    mapping_changes = sum(
+        1
+        for before, after in zip(retained_attempts, projected_attempts)
+        if (
+            before.get("mapping_version"),
+            before.get("requested_family"),
+            before.get("recorded_final_family"),
+            before.get("resolved_family"),
+        )
+        != (
+            after.get("mapping_version"),
+            after.get("requested_family"),
+            after.get("recorded_final_family"),
+            after.get("resolved_family"),
+        )
+    )
+    preview = _rebuild_preview(
+        config,
+        ledger,
+        account_id=account.id,
+        evaluated_at=evaluated_at,
+        attempts=projected_attempts,
+    )
     payload: dict[str, Any] = {
         "account_id": account.id,
         "policy_id": account.plan_policy_id,
@@ -402,6 +529,7 @@ def rebuild_aggregates(
         "quota_buckets": preview.get("quota_buckets") or [],
         "working_quota_usage_estimate_by_bucket": preview.get("working_quota_usage_estimate_by_bucket") or {},
         "observed_attempts_by_requested_family": preview.get("observed_attempts_by_requested_family") or {},
+        "mapping_reclassified_attempts": mapping_changes,
         "label": "Working estimate; not an official remaining quota",
     }
     warnings: list[str] = []
@@ -418,6 +546,7 @@ def rebuild_aggregates(
         "account_id": account.id,
         "dry_run": not apply,
         "revision_id": None,
+        "reclassified_attempts": mapping_changes,
         "payload": payload,
         "warnings": warnings,
     }
@@ -425,6 +554,11 @@ def rebuild_aggregates(
         return result
     revision_id = str(uuid4())
     with ledger.transaction():
+        persisted_changes = ledger.reclassify_attempt_mappings(
+            account.id,
+            projected_attempts,
+            recorded_at=evaluated_at,
+        )
         for row in payload["calendar_days"]:
             ledger.upsert_daily_aggregate(
                 account_id=account.id,
@@ -443,6 +577,7 @@ def rebuild_aggregates(
             payload=payload,
         )
     result["revision_id"] = revision_id
+    result["reclassified_attempts"] = persisted_changes
     result["published"] = True
     return result
 

@@ -7,13 +7,13 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Optional
+from typing import Any, Iterator, Mapping, Optional, Sequence
 
 from .models import AttemptRecord, ConversationSummary, MessageRecord
 from .privacy import SURFACE_CHAT, assert_no_secrets, evidence_identity
 from .timeutil import isoformat_utc, parse_datetime
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LEDGER_APPLICATION = "chatgpt-chat-usage-capture"
 
 DDL = """
@@ -144,6 +144,20 @@ CREATE TABLE IF NOT EXISTS attempts (
     revision INTEGER NOT NULL DEFAULT 1,
     warnings_json TEXT,
     tombstone INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS attempt_mapping_history (
+    mapping_history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    collector_account_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    mapping_version TEXT NOT NULL,
+    requested_family TEXT,
+    recorded_final_family TEXT,
+    resolved_family TEXT,
+    recorded_at TEXT NOT NULL,
+    source TEXT NOT NULL,
+    UNIQUE (attempt_id, mapping_version),
+    FOREIGN KEY (attempt_id) REFERENCES attempts(attempt_id)
 );
 
 CREATE TABLE IF NOT EXISTS attempt_aliases (
@@ -730,8 +744,7 @@ class Ledger:
                 """
                 INSERT INTO attempt_aliases (collector_account_id, alias_kind, alias_value, attempt_id)
                 VALUES (?, ?, ?, ?)
-                ON CONFLICT(collector_account_id, alias_kind, alias_value) DO UPDATE SET
-                    attempt_id=excluded.attempt_id
+                ON CONFLICT(collector_account_id, alias_kind, alias_value) DO NOTHING
                 """,
                 (account_id, kind, value, attempt_id),
             )
@@ -752,6 +765,47 @@ class Ledger:
         ).fetchone()
         if row:
             return row["attempt_id"]
+
+        generation_aliases = [
+            (kind, value) for kind, value in attempt.aliases if kind == "generation"
+        ]
+        if generation_aliases:
+            # A request ID is grouping evidence only. Once a generation ID is
+            # present, an exact generation match wins. A request alias may
+            # still upgrade a provisional attempt that has no generation ID.
+            for kind, value in generation_aliases:
+                row = self.conn.execute(
+                    """
+                    SELECT attempt_id FROM attempt_aliases
+                    WHERE collector_account_id=? AND alias_kind=? AND alias_value=?
+                    """,
+                    (account_id, kind, value),
+                ).fetchone()
+                if row:
+                    return row["attempt_id"]
+            for kind, value in attempt.aliases:
+                if kind == "generation":
+                    continue
+                row = self.conn.execute(
+                    """
+                    SELECT attempt_id FROM attempt_aliases
+                    WHERE collector_account_id=? AND alias_kind=? AND alias_value=?
+                    """,
+                    (account_id, kind, value),
+                ).fetchone()
+                if row:
+                    generation = self.conn.execute(
+                        """
+                        SELECT 1 FROM attempt_aliases
+                        WHERE collector_account_id=? AND alias_kind='generation' AND attempt_id=?
+                        LIMIT 1
+                        """,
+                        (account_id, row["attempt_id"]),
+                    ).fetchone()
+                    if generation is None:
+                        return row["attempt_id"]
+            return None
+
         for kind, value in attempt.aliases:
             row = self.conn.execute(
                 """
@@ -761,8 +815,142 @@ class Ledger:
                 (account_id, kind, value),
             ).fetchone()
             if row:
-                return row["attempt_id"]
+                generation = self.conn.execute(
+                    """
+                    SELECT 1 FROM attempt_aliases
+                    WHERE collector_account_id=? AND alias_kind='generation' AND attempt_id=?
+                    LIMIT 1
+                    """,
+                    (account_id, row["attempt_id"]),
+                ).fetchone()
+                if generation is None:
+                    return row["attempt_id"]
         return None
+
+    def reclassify_attempt_mappings(
+        self,
+        account_id: str,
+        projections: Sequence[Mapping[str, Any]],
+        *,
+        recorded_at: datetime,
+        source: str = "aggregate_rebuild",
+    ) -> int:
+        """Persist current mapping projections while retaining prior versions."""
+        changed = 0
+        recorded_stamp = isoformat_utc(recorded_at) or ""
+        for projection in projections:
+            attempt_id = str(projection.get("attempt_id") or "")
+            if not attempt_id:
+                continue
+            row = self.conn.execute(
+                """
+                SELECT mapping_version, requested_family, recorded_final_family, resolved_family
+                FROM attempts
+                WHERE collector_account_id=? AND attempt_id=?
+                """,
+                (account_id, attempt_id),
+            ).fetchone()
+            if row is None:
+                continue
+            next_values = (
+                projection.get("mapping_version"),
+                projection.get("requested_family"),
+                projection.get("recorded_final_family"),
+                projection.get("resolved_family"),
+            )
+            current_values = (
+                row["mapping_version"],
+                row["requested_family"],
+                row["recorded_final_family"],
+                row["resolved_family"],
+            )
+            if next_values == current_values:
+                continue
+            self._record_mapping_history(
+                account_id=account_id,
+                attempt_id=attempt_id,
+                mapping_version=str(row["mapping_version"]),
+                requested_family=row["requested_family"],
+                recorded_final_family=row["recorded_final_family"],
+                resolved_family=row["resolved_family"],
+                recorded_at=recorded_stamp,
+                source="prior_projection",
+            )
+            self._record_mapping_history(
+                account_id=account_id,
+                attempt_id=attempt_id,
+                mapping_version=str(projection.get("mapping_version") or ""),
+                requested_family=projection.get("requested_family"),
+                recorded_final_family=projection.get("recorded_final_family"),
+                resolved_family=projection.get("resolved_family"),
+                recorded_at=recorded_stamp,
+                source=source,
+            )
+            self.conn.execute(
+                """
+                UPDATE attempts
+                SET requested_family=?, recorded_final_family=?, resolved_family=?,
+                    mapping_version=?, revision=revision+1
+                WHERE collector_account_id=? AND attempt_id=?
+                """,
+                (
+                    projection.get("requested_family"),
+                    projection.get("recorded_final_family"),
+                    projection.get("resolved_family"),
+                    projection.get("mapping_version"),
+                    account_id,
+                    attempt_id,
+                ),
+            )
+            changed += 1
+        return changed
+
+    def _record_mapping_history(
+        self,
+        *,
+        account_id: str,
+        attempt_id: str,
+        mapping_version: str,
+        requested_family: Any,
+        recorded_final_family: Any,
+        resolved_family: Any,
+        recorded_at: str,
+        source: str,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO attempt_mapping_history (
+                collector_account_id, attempt_id, mapping_version,
+                requested_family, recorded_final_family, resolved_family,
+                recorded_at, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(attempt_id, mapping_version) DO NOTHING
+            """,
+            (
+                account_id,
+                attempt_id,
+                mapping_version,
+                requested_family,
+                recorded_final_family,
+                resolved_family,
+                recorded_at,
+                source,
+            ),
+        )
+
+    def list_attempt_mapping_history(
+        self, account_id: str, attempt_id: Optional[str] = None
+    ) -> list[dict[str, Any]]:
+        sql = """
+            SELECT * FROM attempt_mapping_history
+            WHERE collector_account_id=?
+        """
+        params: list[Any] = [account_id]
+        if attempt_id is not None:
+            sql += " AND attempt_id=?"
+            params.append(attempt_id)
+        sql += " ORDER BY mapping_history_id"
+        return [dict(row) for row in self.conn.execute(sql, params).fetchall()]
 
     def list_attempts(
         self,

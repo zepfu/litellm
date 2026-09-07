@@ -12,6 +12,13 @@ from .privacy import SURFACE_CHAT
 
 PROVISIONAL_PREFIX = "provisional:"
 
+_SUCCESS_STATUSES = frozenset({"completed", "finished_successfully"})
+_NONTERMINAL_STATUSES = frozenset(
+    {"in_progress", "streaming", "generating", "pending", "incomplete"}
+)
+_FAILED_STATUSES = frozenset({"error", "failed", "cancelled", "interrupted"})
+_REJECTED_STATUSES = frozenset({"rejected", "moderation_blocked"})
+
 
 def reconstruct_attempts(
     messages: Sequence[MessageRecord],
@@ -160,7 +167,7 @@ def _attempt_from_group(
         resolved_family=None,
         mapping_version=mapping_version,
         outcome=outcome,
-        completed_answer=final is not None and outcome in {"completed", "completed_inferred"},
+        completed_answer=final is not None and outcome == "completed",
         generation_started=any(
             item.role == "assistant" or item.status in {"in_progress", "finished_successfully"}
             for item in group
@@ -180,13 +187,22 @@ def _final_answer(group: Sequence[MessageRecord]) -> Optional[MessageRecord]:
         for item in group
         if item.role == "assistant"
         and item.channel not in {"tool", "commentary", "reasoning"}
-        and (item.end_turn is True or item.status in {"finished_successfully", "completed", None})
+        and _is_completed_answer(item)
     ]
-    if not candidates:
-        candidates = [item for item in group if item.role == "assistant" and item.channel not in {"tool"}]
     if not candidates:
         return None
     return sorted(candidates, key=lambda item: item.created_at or datetime.min)[-1]
+
+
+def _is_completed_answer(item: MessageRecord) -> bool:
+    status = _normalized_status(item.status)
+    if status in _NONTERMINAL_STATUSES or status in _FAILED_STATUSES or status in _REJECTED_STATUSES:
+        return False
+    return status in _SUCCESS_STATUSES or item.end_turn is True
+
+
+def _normalized_status(status: Optional[str]) -> str:
+    return (status or "").strip().lower()
 
 
 def _attempt_timing(
@@ -207,12 +223,12 @@ def _attempt_timing(
 
 
 def _outcome(group: Sequence[MessageRecord], final: Optional[MessageRecord]) -> str:
-    statuses = {item.status for item in group if item.status}
-    if "rejected" in statuses or "moderation_blocked" in statuses:
+    statuses = {_normalized_status(item.status) for item in group if item.status}
+    if statuses & _REJECTED_STATUSES:
         return "rejected_before_start"
-    if any(item.status in {"cancelled", "interrupted"} for item in group) and final is None:
+    if statuses & {"cancelled", "interrupted"} and final is None:
         return "cancelled_after_start"
-    if any(item.status in {"error", "failed"} for item in group) and final is None:
+    if statuses & {"error", "failed"} and final is None:
         return "failed_after_start"
     if final is not None:
         return "completed"
