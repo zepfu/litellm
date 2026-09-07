@@ -1,0 +1,7 @@
+{
+  "user": { "id": "user-abc123" },
+  "workspace_id": "ws-xyz",
+  "account": { "id": "user-abc123", "workspace_id": "ws-xyz", "quota_owner_id": "user-abc123" },
+  "quota_owner_id": "user-abc123",
+  "surface": "chat"
+}

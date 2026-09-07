@@ -1,0 +1,29 @@
+{
+  "messages": [
+    {
+      "id": "msg-001",
+      "author": { "role": "user" },
+      "create_time": "2026-09-05T10:00:00Z",
+      "metadata": { "requested_model": "gpt-5.6-astra-pro", "surface": "chat" },
+      "end_turn": true,
+      "status": "finished_successfully"
+    },
+    {
+      "id": "msg-002",
+      "author": { "role": "assistant" },
+      "create_time": "2026-09-05T10:00:05Z",
+      "metadata": { "model_slug": "gpt-5.6-astra-pro", "surface": "chat" },
+      "end_turn": true,
+      "status": "finished_successfully"
+    },
+    {
+      "id": "msg-003",
+      "author": { "role": "user" },
+      "create_time": "2026-09-05T12:00:00Z",
+      "metadata": { "requested_model": "gpt-5.6-astra-pro", "surface": "chat" },
+      "end_turn": true,
+      "status": "finished_successfully"
+    }
+  ],
+  "page_info": { "has_previous_page": false, "start_cursor": null }
+}

@@ -1,0 +1,648 @@
+/**
+ * Read-only ChatGPT history adapter.
+ *
+ * All application-issued requests are GET-only and restricted to an explicit
+ * allowlist of history and session routes. The adapter never submits prompts,
+ * never archives/renames/deletes conversations, and never issues any mutating
+ * call. Responses are adapted into sanitized projections before leaving this
+ * module.
+ */
+
+import { ADAPTER_VERSION } from "../../contracts/records.js";
+import type {
+  AdaptedPage,
+  CapabilityRecord,
+  ConversationDetailProjection,
+  ConversationSummary,
+  MessageRecord,
+  Surface,
+} from "../../contracts/records.js";
+import {
+  classifySurface,
+  sanitizeMetadata,
+  sanitizeToken,
+} from "../../security/sanitizer.js";
+import { emptyCapabilities, inspectSession } from "../../normalize/identity.js";
+import type {
+  ExpectedIdentity,
+  SessionPayload,
+} from "../../normalize/identity.js";
+
+export const MODERN_INDEX = "/backend-api/conversations";
+export const MODERN_DETAIL = "/backend-api/conversations/{conversation_id}";
+export const MODERN_MESSAGES = "/backend-api/conversations/{conversation_id}/messages";
+export const LEGACY_DETAIL = "/backend-api/conversation/{conversation_id}";
+export const SESSION_ROUTE = "/api/auth/session";
+export const INIT_ROUTE = "/backend-api/conversation/init";
+
+export const ALLOWED_METHODS = new Set(["GET"]);
+export const ALLOWED_PATH_PREFIXES = [
+  "/backend-api/conversations",
+  "/backend-api/conversation/",
+  "/api/auth/session",
+] as const;
+
+const RETRY_AFTER_HEADER_KEYS = ["Retry-After", "retry-after"];
+
+export class AdapterError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AdapterError";
+  }
+}
+
+export class AuthenticationRequiredError extends AdapterError {
+  readonly status: number;
+  readonly path: string;
+
+  constructor(message: string, options: { status: number; path: string }) {
+    super(message);
+    this.name = "AuthenticationRequiredError";
+    this.status = options.status;
+    this.path = options.path;
+  }
+}
+
+export class RateLimitedError extends AdapterError {
+  readonly status: number;
+  readonly retryAfter: string | null;
+  readonly path: string | null;
+
+  constructor(
+    message: string,
+    options: { status?: number; retryAfter?: string | null; path?: string | null } = {},
+  ) {
+    super(message);
+    this.name = "RateLimitedError";
+    this.status = options.status ?? 429;
+    this.retryAfter = options.retryAfter ?? null;
+    this.path = options.path ?? null;
+  }
+}
+
+export interface HistoryTransport {
+  request(
+    method: string,
+    path: string,
+    params?: Record<string, unknown>,
+  ): Promise<Record<string, unknown>>;
+}
+
+export function isAllowedPath(path: string): boolean {
+  if (path === MODERN_INDEX || path === SESSION_ROUTE || path === INIT_ROUTE) {
+    return path !== INIT_ROUTE;
+  }
+  const segments = path.split("/");
+  const conversationId = segments[3];
+  if (!conversationId || sanitizeToken(conversationId) === null) {
+    return false;
+  }
+  if (
+    segments.length === 4 &&
+    segments[1] === "backend-api" &&
+    segments[2] === "conversations"
+  ) {
+    return true;
+  }
+  if (
+    segments.length === 5 &&
+    segments[1] === "backend-api" &&
+    segments[2] === "conversations" &&
+    segments[4] === "messages"
+  ) {
+    return true;
+  }
+  return (
+    segments.length === 4 &&
+    segments[1] === "backend-api" &&
+    segments[2] === "conversation"
+  );
+}
+
+export class ChatGPTHistoryAdapter {
+  readonly schemaVersion = ADAPTER_VERSION;
+  readonly capabilities: CapabilityRecord = emptyCapabilities();
+
+  constructor(
+    private readonly transport: HistoryTransport,
+    private readonly expectedIdentity: ExpectedIdentity = {},
+  ) {}
+
+  async inspectSessionIdentity() {
+    let payload: Record<string, unknown>;
+    try {
+      payload = await this.transport.request("GET", SESSION_ROUTE);
+      raiseIfAuthenticationRequired(payload, SESSION_ROUTE);
+      raiseIfRateLimited(payload, SESSION_ROUTE);
+    } catch (error) {
+      if (error instanceof AuthenticationRequiredError) {
+        return {
+          providerUserId: null,
+          workspaceId: null,
+          quotaOwnerId: null,
+          surface: "unknown" as Surface,
+          authState: "auth_required" as const,
+          identityErrors: [],
+        };
+      }
+      throw error;
+    }
+    return inspectSession(payload as SessionPayload, this.expectedIdentity);
+  }
+
+  async listConversations(options: {
+    archived: boolean;
+    offset?: number;
+    limit?: number;
+    order?: string;
+  }): Promise<AdaptedPage<ConversationSummary>> {
+    const offset = options.offset ?? 0;
+    const limit = options.limit ?? 100;
+    const order = options.order ?? "updated";
+    const payload = await this.transport.request("GET", MODERN_INDEX, {
+      offset,
+      limit,
+      order,
+      is_archived: String(options.archived),
+    });
+    raiseIfAuthenticationRequired(payload, MODERN_INDEX);
+    raiseIfRateLimited(payload, MODERN_INDEX);
+    return adaptConversationIndex(payload, {
+      archived: options.archived,
+      offset,
+      limit,
+    });
+  }
+
+  async fetchConversation(
+    conversationId: string,
+  ): Promise<ConversationDetailProjection> {
+    const modernPath = conversationPath(MODERN_DETAIL, conversationId);
+    const payload = await this.transport.request("GET", modernPath, {
+      include_has_versions: "true",
+      num_turns: 100,
+    });
+    raiseIfAuthenticationRequired(payload, modernPath);
+    raiseIfRateLimited(payload, modernPath);
+    const status = numberOr(payload.http_status, 200);
+    if (status === 404 || status === 405) {
+      const legacyPath = conversationPath(LEGACY_DETAIL, conversationId);
+      const legacyPayload = await this.transport.request("GET", legacyPath);
+      raiseIfAuthenticationRequired(legacyPayload, legacyPath);
+      raiseIfRateLimited(legacyPayload, legacyPath);
+      return adaptConversationDetail(legacyPayload, conversationId);
+    }
+    return adaptConversationDetail(payload, conversationId);
+  }
+
+  async fetchMessages(
+    conversationId: string,
+    options: { before?: string | null; numTurns?: number; conversationSurface?: Surface } = {},
+  ): Promise<AdaptedPage<MessageRecord>> {
+    const params: Record<string, unknown> = {
+      include_has_versions: "true",
+      num_turns: options.numTurns ?? 100,
+    };
+    if (options.before) {
+      params.before = options.before;
+    }
+    const path = conversationPath(MODERN_MESSAGES, conversationId);
+    const payload = await this.transport.request("GET", path, params);
+    raiseIfAuthenticationRequired(payload, path);
+    raiseIfRateLimited(payload, path);
+    return adaptMessagePage(payload, {
+      conversationId,
+      conversationSurface: options.conversationSurface ?? "unknown",
+    });
+  }
+
+  async close(): Promise<void> {
+    const closer = (this.transport as { close?: () => Promise<void> | void }).close;
+    if (typeof closer === "function") {
+      await closer.call(this.transport);
+    }
+  }
+}
+
+export function adaptConversationIndex(
+  payload: Record<string, unknown>,
+  options: { archived: boolean; offset: number; limit: number },
+): AdaptedPage<ConversationSummary> {
+  const { archived, offset, limit } = options;
+  if (payload.content_type === "text/html" || typeof payload.items === "string") {
+    throw new AdapterError("unrecognized conversation index: HTML or non-list items");
+  }
+  const itemsRaw = Array.isArray(payload.items)
+    ? payload.items
+    : Array.isArray(payload.conversations)
+      ? payload.conversations
+      : null;
+  if (!itemsRaw) {
+    return {
+      items: [],
+      continuation: null,
+      exhausted: false,
+      schemaVersion: ADAPTER_VERSION,
+      coverage: "unrecognized",
+      warnings: ["missing items array"],
+    };
+  }
+  const summaries: ConversationSummary[] = [];
+  const warnings: string[] = [];
+  for (const item of itemsRaw) {
+    if (!isRecord(item)) {
+      warnings.push("non-object conversation item");
+      continue;
+    }
+    const conversationId = sanitizeToken(
+      item.id ?? item.conversation_id ?? "",
+    );
+    if (!conversationId) {
+      warnings.push("conversation missing id");
+      continue;
+    }
+    summaries.push({
+      conversationId,
+      createdAt: optionalString(item.create_time ?? item.created_at),
+      updatedAt: optionalString(
+        item.update_time ?? item.updated_at ?? item.create_time,
+      ),
+      isArchived: typeof item.is_archived === "boolean" ? item.is_archived : archived,
+      workspaceId: optionalString(item.workspace_id),
+      projectId: optionalString(item.gizmo_id ?? item.project_id),
+      surface: classifySurface(item, { default: null }) as Surface,
+      origin: optionalString(item.origin),
+      hasVersions:
+        typeof item.has_versions === "boolean" ? item.has_versions : null,
+      currentNode: optionalString(item.current_node),
+      coverage: "validated_page",
+    });
+  }
+
+  const total = typeof payload.total === "number" ? payload.total : null;
+  let continuation: string | number | null = null;
+  let exhausted = false;
+  if (total !== null && offset + itemsRaw.length >= total) {
+    exhausted = true;
+  } else if (payload.has_missing_conversations) {
+    exhausted = false;
+    warnings.push("index reported missing conversations");
+  } else if (itemsRaw.length < limit) {
+    exhausted = true;
+  } else {
+    continuation = offset + itemsRaw.length;
+  }
+
+  let coverage: AdaptedPage<ConversationSummary>["coverage"] = "validated_page";
+  if (warnings.length > 0) {
+    coverage = "partial";
+  }
+  if (total === null && continuation === null && !exhausted) {
+    coverage = "unrecognized";
+  }
+
+  return {
+    items: summaries,
+    continuation,
+    exhausted,
+    schemaVersion: ADAPTER_VERSION,
+    coverage,
+    warnings,
+  };
+}
+
+export function adaptConversationDetail(
+  payload: Record<string, unknown>,
+  conversationId: string,
+): ConversationDetailProjection {
+  const surface = classifySurface(payload, { default: null }) as Surface;
+  const page = adaptMessagePage(payload, {
+    conversationId,
+    conversationSurface: surface,
+  });
+  return {
+    conversationId,
+    createdAt: optionalString(payload.create_time ?? payload.created_at),
+    updatedAt: optionalString(payload.update_time ?? payload.updated_at),
+    currentNode: optionalString(payload.current_node),
+    surface,
+    messages: page.items,
+    coverage: page.coverage,
+    warnings: page.warnings,
+  };
+}
+
+export function adaptMessagePage(
+  payload: Record<string, unknown>,
+  options: { conversationId: string; conversationSurface?: Surface },
+): AdaptedPage<MessageRecord> {
+  const { conversationId, conversationSurface = "unknown" } = options;
+  const warnings: string[] = [];
+  const records: MessageRecord[] = [];
+  const hasMapping = isRecord(payload.mapping);
+  const hasMessages = "messages" in payload;
+  const messagesRaw = payload.messages;
+
+  if (hasMapping) {
+    records.push(
+      ...iterMappingMessages(payload.mapping as Record<string, unknown>, {
+        conversationId,
+        warnings,
+        conversationSurface: classifySurface(payload, {
+          default: conversationSurface,
+        }) as Surface,
+      }),
+    );
+  } else if (hasMessages && Array.isArray(messagesRaw)) {
+    for (const item of messagesRaw) {
+      if (isRecord(item)) {
+        const record = messageFromNode(item, {
+          conversationId,
+          warnings,
+          conversationSurface,
+        });
+        if (record) {
+          records.push(record);
+        } else {
+          warnings.push("message item missing id");
+        }
+      } else {
+        warnings.push("non-object message item");
+      }
+    }
+  } else {
+    warnings.push("unrecognized_detail_shape");
+    if (hasMessages) {
+      warnings.push("messages_not_array");
+    }
+    if ("mapping" in payload) {
+      warnings.push("mapping_not_object");
+    }
+    return {
+      items: records,
+      continuation: null,
+      exhausted: false,
+      schemaVersion: ADAPTER_VERSION,
+      coverage: "unrecognized",
+      warnings,
+    };
+  }
+
+  if (hasMapping && !hasMessages && !("page_info" in payload)) {
+    return {
+      items: records,
+      continuation: null,
+      exhausted: true,
+      schemaVersion: ADAPTER_VERSION,
+      coverage: warnings.length > 0 ? "partial" : "validated_page",
+      warnings,
+    };
+  }
+
+  const pageInfo = payload.page_info;
+  if (!isRecord(pageInfo)) {
+    warnings.push("missing_pagination_controls");
+    return {
+      items: records,
+      continuation: null,
+      exhausted: false,
+      schemaVersion: ADAPTER_VERSION,
+      coverage: "unrecognized",
+      warnings,
+    };
+  }
+
+  const cursor = pageInfo.start_cursor;
+  const hasPrevious = pageInfo.has_previous_page;
+  let exhausted = false;
+  let continuation: string | number | null = null;
+  let invalidPagination = false;
+  if (typeof hasPrevious !== "boolean") {
+    warnings.push("non_boolean_has_previous_page");
+    invalidPagination = true;
+  } else if (hasPrevious) {
+    if (typeof cursor !== "string" || !cursor.trim()) {
+      warnings.push("has_previous_page_without_start_cursor");
+      invalidPagination = true;
+    } else {
+      continuation = cursor.trim();
+    }
+  } else if (cursor !== null && cursor !== undefined && cursor !== "") {
+    warnings.push("terminal_page_has_cursor");
+    invalidPagination = true;
+  } else {
+    exhausted = true;
+  }
+  if (payload.repeated_cursor) {
+    warnings.push("repeated_cursor");
+    exhausted = false;
+    continuation = null;
+  }
+
+  const coverage = invalidPagination
+    ? "unrecognized"
+    : warnings.length > 0
+      ? "partial"
+      : "validated_page";
+
+  return {
+    items: records,
+    continuation,
+    exhausted,
+    schemaVersion: ADAPTER_VERSION,
+    coverage,
+    warnings,
+  };
+}
+
+function iterMappingMessages(
+  mapping: Record<string, unknown>,
+  options: {
+    conversationId: string;
+    warnings: string[];
+    conversationSurface: Surface;
+  },
+): MessageRecord[] {
+  const records: MessageRecord[] = [];
+  for (const [nodeId, node] of Object.entries(mapping)) {
+    if (!isRecord(node)) {
+      options.warnings.push(`non-object mapping node ${nodeId}`);
+      continue;
+    }
+    const record = messageFromNode(node, {
+      conversationId: options.conversationId,
+      nodeId: String(nodeId),
+      warnings: options.warnings,
+      conversationSurface: options.conversationSurface,
+    });
+    if (record) {
+      records.push(record);
+    }
+  }
+  return records;
+}
+
+function messageFromNode(
+  node: Record<string, unknown>,
+  options: {
+    conversationId: string;
+    nodeId?: string;
+    warnings: string[];
+    conversationSurface: Surface;
+  },
+): MessageRecord | null {
+  const messageRaw = node.message;
+  const message: Record<string, unknown> = isRecord(messageRaw) ? messageRaw : node;
+  const messageId =
+    sanitizeToken(message.id) ??
+    sanitizeToken(node.id) ??
+    sanitizeToken(options.nodeId);
+  if (!messageId) {
+    options.warnings.push("message missing id");
+    return null;
+  }
+
+  const authorRaw = message.author;
+  const author: Record<string, unknown> = isRecord(authorRaw) ? authorRaw : {};
+  const authorRole = sanitizeToken(author.role);
+  const metadataRaw = message.metadata;
+  const metadata = sanitizeMetadata(isRecord(metadataRaw) ? metadataRaw : {});
+
+  const childrenRaw = Array.isArray(node.children)
+    ? node.children
+    : Array.isArray(message.children)
+      ? message.children
+      : [];
+  const children = childrenRaw
+    .map((item) => sanitizeToken(item))
+    .filter((item): item is string => item !== null);
+
+  let requested: unknown;
+  if (authorRole === "user") {
+    requested =
+      metadata.requested_model ??
+      metadata.requested_model_slug ??
+      metadata.model_slug;
+  } else {
+    requested = metadata.requested_model;
+  }
+
+  let recorded: unknown = null;
+  if (authorRole === "assistant") {
+    recorded =
+      metadata.model_slug ??
+      sanitizeMetadata({ model_slug: message.model_slug }).model_slug;
+  }
+
+  const conversationSurface = classifySurface(message, {
+    default: classifySurface(metadata, { default: options.conversationSurface }),
+  }) as Surface;
+
+  return {
+    conversationId: options.conversationId,
+    messageId,
+    nodeId: sanitizeToken(node.id) ?? sanitizeToken(options.nodeId) ?? messageId,
+    parentId:
+      sanitizeToken(node.parent) ??
+      sanitizeToken(message.parent) ??
+      sanitizeToken(metadata.parent_id),
+    children,
+    role: authorRole,
+    channel: sanitizeToken(message.channel) ?? sanitizeToken(metadata.channel),
+    createdAt: optionalString(message.create_time ?? node.create_time),
+    status: sanitizeToken(message.status) ?? sanitizeToken(metadata.status),
+    endTurn: typeof message.end_turn === "boolean" ? message.end_turn : null,
+    requestedModelRaw:
+      authorRole === "user"
+        ? sanitizeToken(requested)
+        : sanitizeToken(metadata.requested_model),
+    requestedModeRaw: sanitizeToken(metadata.requested_mode),
+    requestedReasoningEffortRaw: sanitizeToken(metadata.reasoning_effort),
+    recordedFinalModelRaw: sanitizeToken(recorded),
+    generationId:
+      sanitizeToken(metadata.generation_id) ??
+      sanitizeToken(metadata.message_request_id),
+    requestId: sanitizeToken(metadata.request_id),
+    surface: conversationSurface,
+    origin:
+      sanitizeToken(metadata.origin) ??
+      (metadata.from_shared === true ? "shared" : null),
+    metadata,
+  };
+}
+
+export function raiseIfRateLimited(
+  payload: Record<string, unknown>,
+  path: string,
+): void {
+  const status = numberOr(payload.http_status, 200);
+  if (status !== 429) {
+    return;
+  }
+  const headers = isRecord(payload.headers) ? payload.headers : {};
+  let retryAfter: unknown = payload.retry_after;
+  if (retryAfter === null || retryAfter === undefined) {
+    for (const key of RETRY_AFTER_HEADER_KEYS) {
+      if (headers[key] !== undefined) {
+        retryAfter = headers[key];
+        break;
+      }
+    }
+  }
+  throw new RateLimitedError(
+    `rate limited (429) for ${path}; no legacy fallback and not quota exhaustion`,
+    {
+      status: 429,
+      retryAfter: retryAfter === null || retryAfter === undefined ? null : String(retryAfter),
+      path,
+    },
+  );
+}
+
+export function raiseIfAuthenticationRequired(
+  payload: Record<string, unknown>,
+  path: string,
+): void {
+  const status = numberOr(payload.http_status, 200);
+  const contentType = String(payload.content_type ?? "").toLowerCase();
+  if (![401, 403].includes(status) && !contentType.startsWith("text/html")) {
+    return;
+  }
+  throw new AuthenticationRequiredError(
+    `authentication required (${status}) for ${path}; legacy fallback is disabled`,
+    {
+      status: [401, 403].includes(status) ? status : 401,
+      path,
+    },
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function conversationPath(template: string, conversationId: string): string {
+  const safeId = sanitizeToken(conversationId);
+  if (safeId === null || safeId.includes("/")) {
+    throw new AdapterError("conversation id is not a safe path token");
+  }
+  return template.replace("{conversation_id}", safeId);
+}
+
+function optionalString(value: unknown): string | null {
+  if (value === null || value === undefined || value === "" || value === false) {
+    return null;
+  }
+  if (value === true) {
+    return "true";
+  }
+  return String(value);
+}
+
+function numberOr(value: unknown, fallback: number): number {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
