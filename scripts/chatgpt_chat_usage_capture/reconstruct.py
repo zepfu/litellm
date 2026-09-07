@@ -18,6 +18,7 @@ _NONTERMINAL_STATUSES = frozenset(
 )
 _FAILED_STATUSES = frozenset({"error", "failed", "cancelled", "interrupted"})
 _REJECTED_STATUSES = frozenset({"rejected", "moderation_blocked"})
+_NON_ANSWER_CHANNELS = frozenset({"tool", "commentary", "analysis", "reasoning"})
 
 
 def reconstruct_attempts(
@@ -186,7 +187,7 @@ def _final_answer(group: Sequence[MessageRecord]) -> Optional[MessageRecord]:
         item
         for item in group
         if item.role == "assistant"
-        and item.channel not in {"tool", "commentary", "reasoning"}
+        and item.channel not in _NON_ANSWER_CHANNELS
         and _is_completed_answer(item)
     ]
     if not candidates:
@@ -198,7 +199,7 @@ def _is_completed_answer(item: MessageRecord) -> bool:
     status = _normalized_status(item.status)
     if status in _NONTERMINAL_STATUSES or status in _FAILED_STATUSES or status in _REJECTED_STATUSES:
         return False
-    return status in _SUCCESS_STATUSES or item.end_turn is True
+    return item.end_turn is True and status in _SUCCESS_STATUSES
 
 
 def _normalized_status(status: Optional[str]) -> str:
