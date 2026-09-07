@@ -41,6 +41,12 @@ interface NodeGroup {
   branchRoot: string | null;
 }
 
+interface AttemptGraph {
+  byKey: Map<string, GraphNode>;
+  children: Map<string, Set<string>>;
+  parents: Map<string, Set<string>>;
+}
+
 export function reconstructAttempts(
   messages: ReadonlyArray<MessageRecord>,
   options: {
@@ -53,9 +59,10 @@ export function reconstructAttempts(
   const graph = buildGraph(normalized);
   const attempts: ReconstructedAttempt[] = [];
   const claimed = new Set<string>();
+  const claimedEvidenceMessageIds = new Set<string>();
 
   for (const user of sortedMessages(normalized).filter((item) => item.role === "user")) {
-    const descendants = descendantsForUser(user, graph);
+    const descendants = descendantsForUser(user, graph, claimedEvidenceMessageIds);
     const groups = groupsForUser(user, descendants, graph);
     if (groups.length === 0) {
       groups.push({
@@ -73,6 +80,9 @@ export function reconstructAttempts(
         options,
         shouldUsePromptEvidence(user, group, groups, promptGroup),
       );
+      for (const node of group.nodes) {
+        claimedEvidenceMessageIds.add(node.record.messageId);
+      }
       if (!claimed.has(attempt.attemptId)) {
         claimed.add(attempt.attemptId);
         attempts.push(attempt);
@@ -231,10 +241,7 @@ function buildAttempt(
   return { ...record, scope: options.scope };
 }
 
-function buildGraph(messages: ReadonlyArray<MessageRecord>): {
-  byKey: Map<string, GraphNode>;
-  children: Map<string, Set<string>>;
-} {
+function buildGraph(messages: ReadonlyArray<MessageRecord>): AttemptGraph {
   const byKey = new Map<string, GraphNode>();
   for (const record of messages) {
     const key = record.nodeId ?? record.messageId;
@@ -261,30 +268,36 @@ function buildGraph(messages: ReadonlyArray<MessageRecord>): {
     }
     children.set(node.key, links);
   }
-  return { byKey, children };
+  const parents = new Map<string, Set<string>>();
+  for (const [parentKey, childKeys] of children) {
+    for (const childKey of childKeys) {
+      const linkedParents = parents.get(childKey) ?? new Set<string>();
+      linkedParents.add(parentKey);
+      parents.set(childKey, linkedParents);
+    }
+  }
+  return { byKey, children, parents };
 }
 
 function descendantsForUser(
   user: MessageRecord,
-  graph: { byKey: Map<string, GraphNode>; children: Map<string, Set<string>> },
+  graph: AttemptGraph,
+  claimedEvidenceMessageIds: ReadonlySet<string>,
 ): GraphNode[] {
   const userNode = graph.byKey.get(user.nodeId ?? user.messageId);
   if (!userNode) {
     return [];
   }
-  const roots = graph.children.get(userNode.key) ?? new Set<string>();
-  if (roots.size === 0) {
-    for (const candidate of new Set(graph.byKey.values())) {
-      if (
-        candidate.record.role !== "user" &&
-        candidate.record.parentId !== null &&
-        (candidate.record.parentId === userNode.key ||
-          candidate.record.parentId === user.messageId)
-      ) {
-        roots.add(candidate.key);
-      }
-    }
-  }
+  const candidates = graphNodes(graph).filter(
+    (node) =>
+      node.key !== userNode.key &&
+      !claimedEvidenceMessageIds.has(node.record.messageId),
+  );
+  const roots = new Set(
+    graphNeighbors(userNode, candidates, graph)
+      .filter((node) => node.record.role !== "user")
+      .map((node) => node.key),
+  );
   const visited = new Set<string>();
   const output: GraphNode[] = [];
   const queue = [...roots].sort();
@@ -299,16 +312,19 @@ function descendantsForUser(
       continue;
     }
     output.push(node);
-    for (const child of graph.children.get(node.key) ?? []) {
-      if (!visited.has(child)) {
-        queue.push(child);
+    for (const neighbor of graphNeighbors(node, candidates, graph)) {
+      if (neighbor.record.role !== "user" && !visited.has(neighbor.key)) {
+        queue.push(neighbor.key);
       }
     }
     queue.sort();
   }
   const branchRoots = new Map<string, string>();
   for (const node of output) {
-    branchRoots.set(node.key, roots.has(node.key) ? node.key : branchRootFor(node, output, roots));
+    branchRoots.set(
+      node.key,
+      roots.has(node.key) ? node.key : branchRootFor(node, output, roots, graph),
+    );
   }
   return output.map((node) => ({
     ...node,
@@ -319,7 +335,7 @@ function descendantsForUser(
 function groupsForUser(
   user: MessageRecord,
   nodes: GraphNode[],
-  graph: { byKey: Map<string, GraphNode>; children: Map<string, Set<string>> },
+  graph: AttemptGraph,
 ): NodeGroup[] {
   if (nodes.length === 0) {
     return [];
@@ -369,7 +385,7 @@ function groupsForUser(
     const branchRoot = parts[0] ?? "";
     const requestId = parts[1] ?? "";
     const groupNodes = expandIdentityGroup(seeds, nodes.filter((node) => !assigned.has(node.key)), graph, (node) =>
-      node.record.requestId === requestId ||
+      (node.record.requestId === requestId && node.branchRoot === branchRoot) ||
       (node.record.requestId === null && node.branchRoot === branchRoot),
     );
     groupNodes.forEach((node) => assigned.add(node.key));
@@ -401,7 +417,7 @@ function groupsForUser(
 
 function groupsForOrphans(
   nodes: GraphNode[],
-  graph: { byKey: Map<string, GraphNode>; children: Map<string, Set<string>> },
+  graph: AttemptGraph,
 ): NodeGroup[] {
   const groups: NodeGroup[] = [];
   const assigned = new Set<string>();
@@ -451,7 +467,7 @@ function groupsForOrphans(
       nodes.filter((node) => !assigned.has(node.key)),
       graph,
       (node) =>
-        node.record.requestId === requestId ||
+        (node.record.requestId === requestId && node.branchRoot === branchRoot) ||
         (node.record.requestId === null && node.branchRoot === branchRoot),
     );
     if (groupNodes.length === 0) {
@@ -494,7 +510,7 @@ function groupsForOrphans(
 function expandIdentityGroup(
   seeds: GraphNode[],
   candidates: GraphNode[],
-  graph: { byKey: Map<string, GraphNode>; children: Map<string, Set<string>> },
+  graph: AttemptGraph,
   accepts: (node: GraphNode) => boolean,
 ): GraphNode[] {
   const candidateKeys = new Set(candidates.map((node) => node.key));
@@ -518,7 +534,7 @@ function expandIdentityGroup(
 
 function generationLinksFor(
   nodes: GraphNode[],
-  graph: { byKey: Map<string, GraphNode>; children: Map<string, Set<string>> },
+  graph: AttemptGraph,
 ): Map<string, Set<string>> {
   const links = new Map<string, Set<string>>();
   for (const node of nodes) {
@@ -552,7 +568,7 @@ function generationLinksFor(
 function graphNeighbors(
   node: GraphNode,
   candidates: GraphNode[],
-  graph: { byKey: Map<string, GraphNode>; children: Map<string, Set<string>> },
+  graph: AttemptGraph,
 ): GraphNode[] {
   const candidateKeys = new Set(candidates.map((candidate) => candidate.key));
   const neighborKeys = new Set<string>();
@@ -561,14 +577,9 @@ function graphNeighbors(
       neighborKeys.add(child);
     }
   }
-  for (const candidate of candidates) {
-    if (
-      candidate.record.parentId === node.key ||
-      candidate.record.parentId === node.record.messageId ||
-      node.record.parentId === candidate.key ||
-      node.record.parentId === candidate.record.messageId
-    ) {
-      neighborKeys.add(candidate.key);
+  for (const parent of graph.parents.get(node.key) ?? []) {
+    if (candidateKeys.has(parent)) {
+      neighborKeys.add(parent);
     }
   }
   return [...neighborKeys]
@@ -581,21 +592,45 @@ function promptEvidenceGroupFor(
   user: MessageRecord,
   groups: NodeGroup[],
 ): NodeGroup | null {
-  const explicitGroups = groups.filter((group) =>
-    group.nodes.some(
-      (node) =>
-        (user.generationId !== null && node.record.generationId === user.generationId) ||
-        (user.requestId !== null && node.record.requestId === user.requestId),
-    ),
-  );
-  if (user.generationId !== null || user.requestId !== null) {
-    return explicitGroups[0] ?? null;
+  if (user.generationId !== null) {
+    const generationGroups = groups.filter((group) =>
+      group.nodes.some((node) => node.record.generationId === user.generationId),
+    );
+    return generationGroups.length === 1 ? generationGroups[0] ?? null : null;
   }
-  const generationGroups = groups.filter(hasGenerationSpecificIdentity);
-  if (generationGroups.length === 0) {
-    return groups[0] ?? null;
+  if (user.requestId !== null) {
+    const requestGroups = groups.filter((group) =>
+      group.nodes.some((node) => node.record.requestId === user.requestId),
+    );
+    return requestGroups.length === 1 ? requestGroups[0] ?? null : null;
   }
-  return [...generationGroups].sort(compareGroupEvidence)[0] ?? null;
+  const generationGroups = groups.filter((group) => group.identityBasis === "generation");
+  if (generationGroups.length > 0) {
+    if (
+      generationGroups.length > 1 &&
+      reusedRequestAcrossGroups(generationGroups)
+    ) {
+      return null;
+    }
+    return [...generationGroups].sort(compareGroupEvidence)[0] ?? null;
+  }
+  const requestGroups = groups.filter((group) => group.identityBasis === "request");
+  if (requestGroups.length === 1) {
+    return requestGroups[0] ?? null;
+  }
+  return groups.find((group) => group.nodes.length === 0) ?? null;
+}
+
+function reusedRequestAcrossGroups(groups: ReadonlyArray<NodeGroup>): boolean {
+  const groupCounts = new Map<string, number>();
+  for (const group of groups) {
+    for (const requestId of uniqueStrings(
+      group.nodes.map((node) => node.record.requestId),
+    )) {
+      groupCounts.set(requestId, (groupCounts.get(requestId) ?? 0) + 1);
+    }
+  }
+  return [...groupCounts.values()].some((count) => count > 1);
 }
 
 function shouldUsePromptEvidence(
@@ -604,15 +639,17 @@ function shouldUsePromptEvidence(
   groups: NodeGroup[],
   promptGroup: NodeGroup | null,
 ): boolean {
+  if (group.nodes.length === 0) {
+    return group === promptGroup;
+  }
+  if (group.identityBasis === "provisional") {
+    return false;
+  }
   if (user.generationId !== null || user.requestId !== null) {
-    return group.nodes.some(
-      (node) =>
-        (user.generationId !== null && node.record.generationId === user.generationId) ||
-        (user.requestId !== null && node.record.requestId === user.requestId),
-    );
+    return group === promptGroup;
   }
   if (!hasGenerationSpecificIdentity(group)) {
-    return true;
+    return false;
   }
   if (groups.filter(hasGenerationSpecificIdentity).length <= 1) {
     return true;
@@ -740,8 +777,8 @@ function timingFor(
   if (final !== null && preFinalTimes.length > 0 && times.length > 0) {
     return {
       attemptTime: null,
-      timeBasis: "bounded_interval",
-      earliestPossibleAt: preFinalTimes[0] ?? null,
+      timeBasis: "response_observed",
+      earliestPossibleAt: null,
       latestPossibleAt: times.at(-1) ?? null,
     };
   }
@@ -798,25 +835,36 @@ function firstMetadataString(
   return null;
 }
 
-function branchRootFor(node: GraphNode, nodes: GraphNode[], roots: Set<string>): string {
-  let current = node;
+function branchRootFor(
+  node: GraphNode,
+  nodes: GraphNode[],
+  roots: Set<string>,
+  graph: AttemptGraph,
+): string {
+  const queue = [node];
   const visited = new Set<string>();
-  while (!visited.has(current.key)) {
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (visited.has(current.key)) {
+      continue;
+    }
     visited.add(current.key);
     if (roots.has(current.key)) {
       return current.key;
     }
-    const parent = nodes.find(
-      (candidate) =>
-        candidate.key === current.record.parentId ||
-        candidate.record.messageId === current.record.parentId,
-    );
-    if (!parent) {
-      return current.key;
+    for (const neighbor of graphNeighbors(current, nodes, graph)) {
+      if (!visited.has(neighbor.key)) {
+        queue.push(neighbor);
+      }
     }
-    current = parent;
   }
   return node.key;
+}
+
+function graphNodes(graph: AttemptGraph): GraphNode[] {
+  return [...new Map(
+    [...graph.byKey.values()].map((node) => [node.key, node] as const),
+  ).values()];
 }
 
 function deduplicateMessages(messages: ReadonlyArray<MessageRecord>): MessageRecord[] {

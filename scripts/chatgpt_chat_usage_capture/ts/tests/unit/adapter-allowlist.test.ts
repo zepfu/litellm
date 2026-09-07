@@ -8,6 +8,7 @@ import {
   LegacyFallbackNotApprovedError,
   RateLimitedError,
   adaptConversationIndex,
+  adaptMessagePage,
   assertAllowedRequest,
   isAllowedPath,
   INIT_ROUTE,
@@ -136,6 +137,21 @@ describe("route allowlist", () => {
     expect(page.warnings).toContain("short_page_before_reported_total");
   });
 
+  it("does not treat a short page without pagination controls as exhausted", () => {
+    const page = adaptConversationIndex(
+      {
+        items: [{ id: "conv-001", update_time: "2026-09-07T00:00:00Z" }],
+      },
+      { archived: false, offset: 0, limit: 2 },
+    );
+
+    expect(page.exhausted).toBe(false);
+    expect(page.continuation).toBe(1);
+    expect(page.paginationState).toBe("unknown");
+    expect(page.coverage).toBe("partial");
+    expect(page.warnings).toContain("missing_pagination_controls");
+  });
+
   it("keeps missing and invalid update timestamps unresolved", () => {
     const page = adaptConversationIndex(
       {
@@ -166,6 +182,40 @@ describe("route allowlist", () => {
     expect(page.coverage).toBe("partial");
     expect(page.warnings).toContain("conversation_missing_update_time");
     expect(page.warnings).toContain("conversation_invalid_update_time");
+  });
+
+  it("normalizes numeric message timestamps and marks invalid timestamps partial", () => {
+    const page = adaptMessagePage(
+      {
+        messages: [
+          {
+            id: "msg-epoch",
+            author: { role: "user" },
+            create_time: 1788739200,
+          },
+          {
+            id: "msg-string-epoch",
+            author: { role: "assistant" },
+            create_time: "1788739201000",
+          },
+          {
+            id: "msg-invalid-time",
+            author: { role: "assistant" },
+            create_time: "not-a-timestamp",
+          },
+        ],
+        page_info: { has_previous_page: false, start_cursor: null },
+      },
+      { conversationId: "conv-001" },
+    );
+
+    expect(page.items.map((item) => item.createdAt)).toEqual([
+      "2026-09-07T00:00:00.000Z",
+      "2026-09-07T00:00:01.000Z",
+      null,
+    ]);
+    expect(page.coverage).toBe("partial");
+    expect(page.warnings).toContain("message_invalid_created_at");
   });
 
   it("honors returned index pagination controls", () => {

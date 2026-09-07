@@ -158,8 +158,11 @@ describe("CLI", () => {
       .toBe(0);
     const report = lastResult();
     expect(report.includedAttempts).toBe(3);
-    expect(report.observedAttemptsByRequestedModel).toEqual({ "gpt-5.6-astra-pro": 2 });
-    expect(report.completedAnswersByRecordedFinalModel).toEqual({ "gpt-5.6-astra-pro": 2 });
+    // Provisional branches cannot inherit the prompt's requested-model evidence.
+    expect(report.observedAttemptsByRequestedModel).toEqual({});
+    expect(report.completedAnswersByRecordedFinalModel).toEqual({});
+    expect(report.possibleCompletedAnswersByRecordedFinalModel)
+      .toEqual({ "gpt-5.6-astra-pro": 2 });
     expect(report.modelMismatches).toBe(0);
     expect(report.coverageGaps.some(
       (gap: { reason: string }) => gap.reason === "incomplete_history_coverage",
@@ -173,9 +176,13 @@ describe("CLI", () => {
       end,
     });
 
-    // Renamed conversations do not move their old attempts into a recent report.
+    // Unknown-time provisional branches remain possible, never definite,
+    // regardless of the conversation's newer update time.
     expect(await run(["report", ...localArgs, "--last-hours", "24", "--until", end])).toBe(0);
-    expect(lastResult().includedAttempts).toBe(0);
+    expect(lastResult().includedAttempts).toBe(2);
+    expect(lastResult().possibleAttemptIds).toHaveLength(2);
+    expect(lastResult().observedAttemptsByRequestedModel).toEqual({});
+    expect(lastResult().completedAnswersByRecordedFinalModel).toEqual({});
     expect(await run(["models", ...localArgs])).toBe(0);
     expect(lastResult()).toMatchObject({
       mapping_version: "initial-unmapped",

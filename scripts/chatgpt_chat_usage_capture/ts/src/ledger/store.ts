@@ -16,9 +16,11 @@ import type {
 import { reconstructAttempts } from "../normalize/reconstruct.js";
 import {
   isMappingPublished,
+  ModelMappingError,
   normalizeMappingVersion,
   resolveModelEvidence,
   suggestModelMappings,
+  validateMappingOwnerConsistency,
   validateMappingVersion,
 } from "../normalize/model-mapping.js";
 import {
@@ -38,8 +40,12 @@ import {
 import type {
   IngestContext,
   IngestResult,
+  LedgerMessage,
+  LedgerQuarantine,
   LedgerScope,
+  MappingOwnerBinding,
   ModelMappingVersion,
+  QuarantinedTimestampEvidence,
   ReconstructedAttempt,
   StoredMessage,
 } from "./types.js";
@@ -53,6 +59,7 @@ type AttemptAliasOwner = {
   identityBasis: string;
   completedAnswer: boolean;
   tombstone: boolean;
+  generationAliases: string[];
 };
 
 const MERGEABLE_ATTEMPT_ALIAS_KINDS = new Set([
@@ -169,24 +176,23 @@ export class Ledger {
         .all()
         .map((row: unknown) => [Number((row as SqlRow).version), row as SqlRow]),
     );
-    const versions = new Set<number>();
-    for (const migration of migrations) {
-      if (versions.has(migration.version)) {
-        throw new LedgerError(`duplicate migration version: ${migration.version}`);
-      }
-      versions.add(migration.version);
-      const prior = applied.get(migration.version);
-      if (prior) {
-        if (prior.name !== migration.name || prior.checksum !== fingerprint(migration.sql)) {
-          throw new LedgerError(`applied migration does not match source: ${migration.version}`);
+    this.transaction(() => {
+      const versions = new Set<number>();
+      let migrateActivity = false;
+      for (const migration of migrations) {
+        if (versions.has(migration.version)) {
+          throw new LedgerError(`duplicate migration version: ${migration.version}`);
         }
-        continue;
-      }
-      this.transaction(() => {
+        versions.add(migration.version);
+        const prior = applied.get(migration.version);
+        if (prior) {
+          if (prior.name !== migration.name || prior.checksum !== fingerprint(migration.sql)) {
+            throw new LedgerError(`applied migration does not match source: ${migration.version}`);
+          }
+          continue;
+        }
         this.db.exec(migration.sql);
-        if (migration.version === 5) {
-          this.migrateActivityScopes();
-        }
+        migrateActivity ||= migration.version === 5;
         this.db
           .prepare(
             "INSERT INTO schema_migrations(version, name, checksum, applied_at) VALUES (?, ?, ?, ?)",
@@ -197,8 +203,13 @@ export class Ledger {
             fingerprint(migration.sql),
             new Date().toISOString(),
           );
-      });
-    }
+      }
+      // The owner conversion uses current ledger writes, including quarantine.
+      // Apply every pending schema change first, in the same transaction.
+      if (migrateActivity) {
+        this.migrateActivityScopes();
+      }
+    });
   }
 
   private migrateActivityScopes(): void {
@@ -351,6 +362,9 @@ export class Ledger {
       profilePath?: string | null;
     } = {},
   ): void {
+    for (const mapping of this.modelMappings()) {
+      this.assertMappingOwnerConsistency(mapping, scope);
+    }
     const now = new Date().toISOString();
     this.db
       .prepare(
@@ -456,6 +470,7 @@ export class Ledger {
     scope: LedgerScope,
     context: IngestContext,
     payload: Record<string, unknown>,
+    quarantine: LedgerQuarantine = clearQuarantine(),
   ): { observationId: string; inserted: boolean } {
     const sanitized = observationProjection(payload, {
       sourceKind: context.sourceKind,
@@ -463,13 +478,12 @@ export class Ledger {
       evidenceId: context.sourceId,
     });
     assertNoSecrets(sanitized);
-    const revisionFingerprint = fingerprint(stableObservationPayload(sanitized));
     const key = scopeKey(scope);
     const previous = this.db
       .prepare(
         `
         SELECT observation_id, revision_number, revision_fingerprint,
-               collector_account_id
+               collector_account_id, quarantine_json
         FROM observations
         WHERE scope_key=? AND source_kind=? AND source_id=?
         ORDER BY revision_number DESC
@@ -477,6 +491,14 @@ export class Ledger {
         `,
       )
       .get(key, context.sourceKind, context.sourceId) as SqlRow | undefined;
+    const persistedQuarantine = mergeQuarantines(
+      parseQuarantine(previous?.quarantine_json),
+      quarantine,
+    );
+    assertNoSecrets(persistedQuarantine);
+    const revisionFingerprint = fingerprint(
+      observationFingerprintPayload(sanitized, persistedQuarantine),
+    );
     if (
       previous &&
       String(previous.revision_fingerprint) === revisionFingerprint &&
@@ -506,8 +528,8 @@ export class Ledger {
           provider_user_id, workspace_id, quota_owner_id, source_kind, source_id,
           revision_fingerprint, revision_number, surface, conversation_id,
           payload_json, observed_at, run_id, schema_version, provenance_json,
-          supersedes_observation_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          supersedes_observation_id, quarantine_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       )
       .run(
@@ -534,6 +556,7 @@ export class Ledger {
         context.schemaVersion,
         JSON.stringify(provenance),
         previous?.observation_id ?? null,
+        JSON.stringify(persistedQuarantine),
       );
     this.recordActivityProvenance(
       key,
@@ -553,14 +576,20 @@ export class Ledger {
     summary?: ConversationSummary,
   ): IngestResult {
     validateMappingVersion(mapping);
+    this.assertMappingOwnerConsistency(mapping, scope);
     return this.transaction(() => {
-      const futureMessageIds = new Set(
-        detail.messages
-          .filter((message) => isFutureTimestamp(message.createdAt, context.observedAt))
-          .map((message) => message.messageId),
-      );
       const sanitizedMessages = detail.messages.map((message) =>
         sanitizeMessage(message, context.observedAt),
+      );
+      const observationQuarantine = mergeQuarantines(
+        quarantineForTimestampFields(
+          [
+            { field: "createdAt", value: detail.createdAt },
+            { field: "updatedAt", value: detail.updatedAt },
+          ],
+          context.observedAt,
+        ),
+        ...sanitizedMessages.map((message) => message.quarantine),
       );
       const observation = this.insertObservation(
         scope,
@@ -577,16 +606,23 @@ export class Ledger {
           coverage: detail.coverage,
           warnings: detail.warnings,
         },
+        observationQuarantine,
       );
       if (summary) {
-        this.upsertConversation(scope, summary, context.runId, context.observedAt);
+        this.upsertConversation(
+          scope,
+          summary,
+          context.runId,
+          context.observedAt,
+          observationQuarantine,
+        );
       } else {
         this.upsertConversation(
           scope,
           {
             conversationId: detail.conversationId,
-            createdAt: safeTimestamp(detail.createdAt, context.observedAt),
-            updatedAt: safeTimestamp(detail.updatedAt, context.observedAt),
+            createdAt: detail.createdAt,
+            updatedAt: detail.updatedAt,
             isArchived: false,
             workspaceId: scope.workspaceId,
             projectId: null,
@@ -598,6 +634,7 @@ export class Ledger {
           },
           context.runId,
           context.observedAt,
+          observationQuarantine,
         );
       }
 
@@ -623,14 +660,7 @@ export class Ledger {
       let attemptDeduplicated = 0;
       let aliasConflicts = 0;
       for (const attempt of attempts) {
-        const preparedAttempt = futureMessageIds.size === 0
-          ? attempt
-          : {
-              ...attempt,
-              warnings: futureMessageIdsHasEvidence(attempt, futureMessageIds)
-                ? [...new Set([...attempt.warnings, "future_timestamp_quarantined"])]
-                : attempt.warnings,
-            };
+        const preparedAttempt = applyMessageQuarantine(attempt, messages);
         const result = this.upsertAttempt(scope, preparedAttempt, context, mapping);
         attemptInserted += result.status === "inserted" ? 1 : 0;
         attemptUpdated += result.status === "updated" ? 1 : 0;
@@ -682,10 +712,40 @@ export class Ledger {
     summary: ConversationSummary,
     runId: string,
     observedAt?: string,
+    quarantine?: LedgerQuarantine,
   ): void {
     const key = scopeKey(scope);
     const createdAt = safeTimestamp(summary.createdAt, observedAt);
     const updatedAt = safeTimestamp(summary.updatedAt, observedAt);
+    const incomingQuarantine = mergeQuarantines(
+      quarantine,
+      observedAt === undefined
+        ? clearQuarantine()
+        : quarantineForTimestampFields(
+            [
+              { field: "createdAt", value: summary.createdAt },
+              { field: "updatedAt", value: summary.updatedAt },
+            ],
+            observedAt,
+          ),
+    );
+    const current = this.db
+      .prepare(
+        `
+        SELECT warnings_json, quarantine_json
+        FROM conversation_state
+        WHERE scope_key=? AND conversation_id=?
+        `,
+      )
+      .get(key, summary.conversationId) as SqlRow | undefined;
+    const persistedQuarantine = mergeQuarantines(
+      parseQuarantine(current?.quarantine_json),
+      incomingQuarantine,
+    );
+    const warnings = uniqueStrings([
+      ...parseJsonArray(current?.warnings_json),
+      ...persistedQuarantine.warnings,
+    ]);
     this.db
       .prepare(
         `
@@ -693,8 +753,8 @@ export class Ledger {
           scope_key, collector_account_id, provider, provider_user_id,
           workspace_id, quota_owner_id, conversation_id, created_at, updated_at,
           is_archived, surface, origin, current_node, page_coverage,
-          warnings_json, last_seen_run_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          warnings_json, last_seen_run_id, quarantine_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(scope_key, conversation_id) DO UPDATE SET
           created_at=COALESCE(excluded.created_at, conversation_state.created_at),
           updated_at=CASE
@@ -746,6 +806,7 @@ export class Ledger {
             THEN excluded.warnings_json
             ELSE conversation_state.warnings_json
           END,
+          quarantine_json=excluded.quarantine_json,
           last_seen_run_id=CASE
             WHEN conversation_state.updated_at IS NULL
               OR excluded.updated_at IS NULL
@@ -770,8 +831,9 @@ export class Ledger {
         summary.origin,
         summary.currentNode,
         summary.coverage,
-        JSON.stringify([]),
+        JSON.stringify(warnings),
         runId,
+        JSON.stringify(persistedQuarantine),
       );
     this.recordActivityProvenance(
       key,
@@ -787,20 +849,28 @@ export class Ledger {
     record: MessageRecord,
     context: IngestContext,
   ): { inserted: boolean; revision: number; revisionFingerprint: string } {
-    const clean = sanitizeMessage(record, context.observedAt);
-    assertNoSecrets(clean);
     const key = scopeKey(scope);
-    const payload = messagePayload(clean);
-    const revisionFingerprint = fingerprint(payload);
+    const initial = sanitizeMessage(record, context.observedAt);
     const current = this.db
       .prepare(
         `
-        SELECT revision, revision_fingerprint, updated_at
+        SELECT revision, revision_fingerprint, updated_at,
+               collector_account_id, quarantine_json
         FROM message_records
         WHERE scope_key=? AND conversation_id=? AND message_id=?
         `,
       )
-      .get(key, clean.conversationId, clean.messageId) as SqlRow | undefined;
+      .get(key, initial.conversationId, initial.messageId) as SqlRow | undefined;
+    const clean: LedgerMessage = {
+      ...initial,
+      quarantine: mergeQuarantines(
+        parseQuarantine(current?.quarantine_json),
+        initial.quarantine,
+      ),
+    };
+    assertNoSecrets(clean);
+    const payload = messageRevisionPayload(clean);
+    const revisionFingerprint = fingerprint(messageFingerprintPayload(clean));
     const latestRevision = this.db
       .prepare(
         `
@@ -812,10 +882,16 @@ export class Ledger {
         `,
       )
       .get(key, clean.conversationId, clean.messageId) as SqlRow | undefined;
-    if (
+    const currentMatches =
+      current &&
+      String(current.revision_fingerprint) === revisionFingerprint &&
+      String(current.collector_account_id) === scope.collectorAccountId;
+    const latestHistoryMatches =
       latestRevision &&
       String(latestRevision.revision_fingerprint) === revisionFingerprint &&
-      String(latestRevision.collector_account_id) === scope.collectorAccountId
+      String(latestRevision.collector_account_id) === scope.collectorAccountId;
+    if (
+      currentMatches
     ) {
       this.recordActivityProvenance(
         key,
@@ -826,11 +902,15 @@ export class Ledger {
       );
       return {
         inserted: false,
-        revision: Number(current?.revision ?? latestRevision.revision),
+        revision: Number(current?.revision ?? latestRevision?.revision ?? 0),
         revisionFingerprint,
       };
     }
-    const revision = Number(latestRevision?.revision ?? current?.revision ?? 0) + 1;
+    const reuseHistoryRevision = Boolean(latestHistoryMatches);
+    const revision = reuseHistoryRevision
+      ? Number(latestRevision?.revision ?? 0)
+      : Number(latestRevision?.revision ?? current?.revision ?? 0) + 1;
+    const freshEvidence = !isOlderEvidence(context.observedAt, current?.updated_at);
     const revisionId = stableId(
       key,
       clean.conversationId,
@@ -838,33 +918,36 @@ export class Ledger {
       String(revision),
       revisionFingerprint,
     );
-    this.db
-      .prepare(
-        `
-        INSERT INTO message_revisions(
-          revision_id, scope_key, collector_account_id, provider,
-          provider_user_id, workspace_id, quota_owner_id, conversation_id,
-          message_id, revision, revision_fingerprint, payload_json,
-          observed_at, run_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `,
-      )
-      .run(
-        revisionId,
-        key,
-        scope.collectorAccountId,
-        scope.provider,
-        scope.providerUserId,
-        scope.workspaceId,
-        scope.quotaOwnerId,
-        clean.conversationId,
-        clean.messageId,
-        revision,
-        revisionFingerprint,
-        JSON.stringify(payload),
-        context.observedAt,
-        context.runId,
-      );
+    if (!reuseHistoryRevision) {
+      this.db
+        .prepare(
+          `
+          INSERT INTO message_revisions(
+            revision_id, scope_key, collector_account_id, provider,
+            provider_user_id, workspace_id, quota_owner_id, conversation_id,
+            message_id, revision, revision_fingerprint, payload_json,
+            observed_at, run_id, quarantine_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `,
+        )
+        .run(
+          revisionId,
+          key,
+          scope.collectorAccountId,
+          scope.provider,
+          scope.providerUserId,
+          scope.workspaceId,
+          scope.quotaOwnerId,
+          clean.conversationId,
+          clean.messageId,
+          revision,
+          revisionFingerprint,
+          JSON.stringify(payload),
+          context.observedAt,
+          context.runId,
+          JSON.stringify(clean.quarantine),
+        );
+    }
     if (!current) {
       this.db
         .prepare(
@@ -875,8 +958,8 @@ export class Ledger {
             parent_id, children_json, role, channel, created_at, status, end_turn,
             requested_model_raw, requested_mode_raw, requested_reasoning_effort_raw,
             recorded_final_model_raw, generation_id, request_id, surface, origin,
-            metadata_json, revision, revision_fingerprint, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            metadata_json, revision, revision_fingerprint, updated_at, quarantine_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `,
         )
         .run(
@@ -908,8 +991,9 @@ export class Ledger {
           revision,
           revisionFingerprint,
           context.observedAt,
+          JSON.stringify(clean.quarantine),
         );
-    } else if (!isOlderEvidence(context.observedAt, current.updated_at)) {
+    } else if (freshEvidence) {
       this.db
         .prepare(
           `
@@ -920,7 +1004,7 @@ export class Ledger {
             end_turn=?, requested_model_raw=?, requested_mode_raw=?,
             requested_reasoning_effort_raw=?, recorded_final_model_raw=?,
             generation_id=?, request_id=?, surface=?, origin=?, metadata_json=?,
-            revision=?, revision_fingerprint=?, updated_at=?
+            revision=?, revision_fingerprint=?, updated_at=?, quarantine_json=?
           WHERE scope_key=? AND conversation_id=? AND message_id=?
           `,
         )
@@ -950,6 +1034,7 @@ export class Ledger {
           revision,
           revisionFingerprint,
           context.observedAt,
+          JSON.stringify(clean.quarantine),
           key,
           clean.conversationId,
           clean.messageId,
@@ -962,10 +1047,14 @@ export class Ledger {
       scope.collectorAccountId,
       context.observedAt,
     );
-    return { inserted: true, revision, revisionFingerprint };
+    return {
+      inserted: !reuseHistoryRevision || freshEvidence || !current,
+      revision,
+      revisionFingerprint,
+    };
   }
 
-  messagesFor(scope: LedgerScope, conversationId: string): MessageRecord[] {
+  messagesFor(scope: LedgerScope, conversationId: string): LedgerMessage[] {
     const rows = this.db
       .prepare(
         `
@@ -996,7 +1085,11 @@ export class Ledger {
       .all(scopeKey(scope), conversationId, messageId)
       .map((row: unknown) => {
         const item = row as SqlRow;
-        return { ...item, payload: parseJsonObject(item.payload_json) };
+        return {
+          ...item,
+          payload: parseJsonObject(item.payload_json),
+          quarantine: parseQuarantine(item.quarantine_json),
+        };
       });
   }
 
@@ -1012,61 +1105,104 @@ export class Ledger {
   } {
     const key = scopeKey(scope);
     const incomingAttempt = sanitizeAttempt(attempt, context.observedAt);
+    let cleanAttempt = incomingAttempt;
+    let effectiveMapping: ModelMappingVersion | undefined;
     const aliases = uniqueAttemptAliases(incomingAttempt.aliases);
     const aliasOwners = this.findAttemptAliasOwners(scope, aliases);
+    const incomingGenerationAliases = new Set(
+      aliases
+        .filter(([aliasKind]) => aliasKind === "generation")
+        .map(([, aliasValue]) => aliasValue),
+    );
     const mergeableOwnerIds = new Set(
       aliasOwners
         .filter(
           (owner) =>
             owner.attemptId !== incomingAttempt.attemptId &&
-            MERGEABLE_ATTEMPT_ALIAS_KINDS.has(owner.aliasKind),
+            MERGEABLE_ATTEMPT_ALIAS_KINDS.has(owner.aliasKind) &&
+            !conflictingGenerationAliases(
+              incomingGenerationAliases,
+              owner.generationAliases,
+            ),
         )
         .map((owner) => owner.attemptId),
     );
+    if (incomingGenerationAliases.size === 0) {
+      const authoritativeOwnerIdentities = new Set(
+        [...mergeableOwnerIds]
+          .map((attemptId) =>
+            generationIdentityKey(
+              aliasOwners.find((owner) => owner.attemptId === attemptId)
+                ?.generationAliases ?? [],
+            ),
+          )
+          .filter((identity) => identity !== ""),
+      );
+      if (authoritativeOwnerIdentities.size > 1) {
+        for (const attemptId of [...mergeableOwnerIds]) {
+          const owner = aliasOwners.find((candidate) => candidate.attemptId === attemptId);
+          if (owner && owner.generationAliases.length > 0) {
+            mergeableOwnerIds.delete(attemptId);
+          }
+        }
+      }
+    }
     const canonicalAttemptId = this.selectCanonicalAttemptId(
       incomingAttempt,
       aliases,
       aliasOwners,
       mergeableOwnerIds,
     );
-    const cleanAttempt = {
-      ...incomingAttempt,
-      attemptId: canonicalAttemptId,
-      aliases,
-    };
+    const current = this.db
+      .prepare("SELECT * FROM attempts WHERE attempt_id=? AND scope_key=?")
+      .get(canonicalAttemptId, key) as SqlRow | undefined;
+    const inheritedQuarantine = mergeQuarantines(
+      parseQuarantine(current?.quarantine_json),
+      quarantineFromWarnings(parseJsonArray(current?.warnings_json)),
+      incomingAttempt.quarantine,
+    );
+    cleanAttempt = sanitizeAttempt(
+      {
+        ...incomingAttempt,
+        attemptId: canonicalAttemptId,
+        aliases,
+        quarantine: inheritedQuarantine,
+        warnings: uniqueStrings([
+          ...incomingAttempt.warnings,
+          ...inheritedQuarantine.warnings,
+        ]),
+      },
+      context.observedAt,
+    );
     if (canonicalAttemptId !== incomingAttempt.attemptId &&
         this.db.prepare("SELECT 1 FROM attempts WHERE attempt_id=? AND scope_key=?")
           .get(incomingAttempt.attemptId, key)) {
       mergeableOwnerIds.add(incomingAttempt.attemptId);
     }
-    const current = this.db
-      .prepare("SELECT * FROM attempts WHERE attempt_id=? AND scope_key=?")
-      .get(cleanAttempt.attemptId, key) as SqlRow | undefined;
-    if (current && mapping) {
-      const applied = resolveModelEvidence(
-        { slug: null, mode: null, reasoningEffort: null },
-        mapping,
-        scope.collectorAccountId,
-        { at: cleanAttempt.attemptTime },
-      ).applied;
-      if (!applied) {
-        cleanAttempt.requestedFamily = nullableString(current.requested_family);
-        cleanAttempt.recordedFinalFamily = nullableString(current.recorded_final_family);
-        cleanAttempt.resolvedFamily = nullableString(current.resolved_family);
-        cleanAttempt.mappingVersion = String(current.mapping_version);
-      }
-      if (cleanAttempt.mappingVersion === current.mapping_version) {
-        cleanAttempt.warnings = uniqueStrings([
-          ...cleanAttempt.warnings,
-          ...parseJsonArray(current.warnings_json).filter((warning) =>
-            warning.startsWith("mapping_") || mapping.warnings?.includes(warning),
-          ),
-        ]);
+    if (mapping) {
+      validateMappingVersion(mapping);
+      this.assertMappingOwnerConsistency(mapping, scope);
+      const projection = this.projectAttemptMapping(scope, cleanAttempt, mapping);
+      if (
+        current &&
+        rawEvidenceMatchesCurrent(current, cleanAttempt) &&
+        (projection.mapping === null ||
+          projection.mapping.version === String(current.mapping_version))
+      ) {
+        cleanAttempt = preserveCurrentMappingProjection(
+          cleanAttempt,
+          current,
+          mapping,
+        );
+        effectiveMapping = projection.mapping ?? undefined;
+      } else {
+        cleanAttempt = projection.attempt;
+        effectiveMapping = projection.mapping ?? mapping;
       }
     }
     const payload = attemptPayload(cleanAttempt);
     assertNoSecrets(payload);
-    const projectionFingerprint = fingerprint(payload);
+    const projectionFingerprint = fingerprint(attemptFingerprintPayload(cleanAttempt));
     const latestRevision = this.db
       .prepare(
         `
@@ -1078,6 +1214,16 @@ export class Ledger {
         `,
       )
       .get(cleanAttempt.attemptId, key) as SqlRow | undefined;
+    const currentMatches =
+      current &&
+      String(current.projection_fingerprint) === projectionFingerprint &&
+      String(current.collector_account_id) === scope.collectorAccountId &&
+      Number(current.tombstone) === 0;
+    const latestHistoryMatches =
+      latestRevision &&
+      String(latestRevision.projection_fingerprint) === projectionFingerprint &&
+      String(latestRevision.collector_account_id) === scope.collectorAccountId;
+    const freshEvidence = !isOlderEvidence(context.observedAt, current?.updated_at);
     let status: "inserted" | "updated" | "deduplicated";
     let revision: number;
     let currentChanged = false;
@@ -1101,17 +1247,15 @@ export class Ledger {
       );
       status = "inserted";
       currentChanged = true;
-    } else if (
-      latestRevision &&
-      String(latestRevision.projection_fingerprint) === projectionFingerprint &&
-      String(latestRevision.collector_account_id) === scope.collectorAccountId &&
-      Number(current.tombstone) === 0
-    ) {
+    } else if (currentMatches) {
       revision = Number(current.revision);
       status = "deduplicated";
     } else {
-      revision = Number(latestRevision?.revision ?? current.revision ?? 0) + 1;
-      if (!latestRevision) {
+      const reuseHistoryRevision = Boolean(latestHistoryMatches);
+      revision = reuseHistoryRevision
+        ? Number(latestRevision?.revision ?? 0)
+        : Number(latestRevision?.revision ?? current.revision ?? 0) + 1;
+      if (!reuseHistoryRevision && !latestRevision) {
         const priorAttempt = this.loadAttemptRecord(scope, current);
         this.insertAttemptRevision(
           scope,
@@ -1123,18 +1267,20 @@ export class Ledger {
           "prior_projection",
         );
       }
-      this.insertAttemptRevision(
-        scope,
-        cleanAttempt,
-        revision,
-        projectionFingerprint,
-        payload,
-        context,
-        isOlderEvidence(context.observedAt, current.updated_at)
-          ? "stale_ingest"
-          : "ingest",
-      );
-      if (!isOlderEvidence(context.observedAt, current.updated_at)) {
+      if (!reuseHistoryRevision) {
+        this.insertAttemptRevision(
+          scope,
+          cleanAttempt,
+          revision,
+          projectionFingerprint,
+          payload,
+          context,
+          isOlderEvidence(context.observedAt, current.updated_at)
+            ? "stale_ingest"
+            : "ingest",
+        );
+      }
+      if (freshEvidence) {
         this.updateAttemptRow(
           scope,
           cleanAttempt,
@@ -1176,7 +1322,17 @@ export class Ledger {
       status = "updated";
     }
     if (currentChanged) {
-      this.recordMappingHistory(scope, cleanAttempt, context.observedAt, "ingest");
+      this.recordMappingHistory(
+        scope,
+        cleanAttempt,
+        context.observedAt,
+        mappingHistorySource(context.sourceKind),
+        effectiveMapping
+          ? {
+              mapping: effectiveMapping,
+            }
+          : undefined,
+      );
     }
     return { attemptId: cleanAttempt.attemptId, status, aliasConflicts };
   }
@@ -1194,6 +1350,14 @@ export class Ledger {
       JOIN attempts t
         ON t.scope_key=a.scope_key AND t.attempt_id=a.attempt_id
       WHERE a.scope_key=? AND a.alias_kind=? AND a.alias_value=?
+        `,
+    );
+    const generationStatement = this.db.prepare(
+      `
+      SELECT alias_value
+      FROM attempt_aliases
+      WHERE scope_key=? AND attempt_id=? AND alias_kind='generation'
+      ORDER BY alias_value
       `,
     );
     for (const [aliasKind, aliasValue] of aliases) {
@@ -1212,6 +1376,9 @@ export class Ledger {
         identityBasis: String(row.identity_basis),
         completedAnswer: Number(row.completed_answer) === 1,
         tombstone: Number(row.tombstone) === 1,
+        generationAliases: generationStatement
+          .all(scopeKey(scope), String(row.attempt_id))
+          .map((item: unknown) => String((item as SqlRow).alias_value)),
       });
     }
     return owners;
@@ -1341,7 +1508,11 @@ export class Ledger {
       .all(scopeKey(scope), attemptId)
       .map((row: unknown) => {
         const item = row as SqlRow;
-        return { ...item, payload: parseJsonObject(item.payload_json) };
+        return {
+          ...item,
+          payload: parseJsonObject(item.payload_json),
+          quarantine: parseQuarantine(item.quarantine_json),
+        };
       });
   }
 
@@ -1373,6 +1544,7 @@ export class Ledger {
     const candidate = normalizeMappingVersion(mapping);
     validateMappingVersion(candidate);
     assertNoSecrets(candidate);
+    this.assertMappingOwnerConsistency(candidate);
     const existingRow = this.db
       .prepare("SELECT * FROM model_mapping_versions WHERE version=?")
       .get(candidate.version) as SqlRow | undefined;
@@ -1473,6 +1645,7 @@ export class Ledger {
     scope: LedgerScope,
     mapping: ModelMappingVersion,
   ) {
+    this.assertMappingOwnerConsistency(mapping, scope);
     return suggestModelMappings(
       this.listAttempts(scope).map((attempt) => ({
         requestedModelRaw: nullableString(attempt.requestedModelRaw),
@@ -1489,6 +1662,154 @@ export class Ledger {
     );
   }
 
+  private assertMappingOwnerConsistency(
+    mapping: ModelMappingVersion,
+    extraScope?: LedgerScope,
+  ): void {
+    try {
+      validateMappingOwnerConsistency(mapping, this.mappingOwnerBindings(extraScope));
+    } catch (error) {
+      if (error instanceof ModelMappingError) {
+        throw new LedgerError(error.message);
+      }
+      throw error;
+    }
+  }
+
+  private mappingOwnerBindings(extraScope?: LedgerScope): MappingOwnerBinding[] {
+    const bindings = [
+      ...this.listAccounts(),
+      ...(extraScope ? [extraScope] : []),
+    ];
+    const seen = new Set<string>();
+    return bindings
+      .map((scope) => ({
+        collectorAccountId: scope.collectorAccountId,
+        canonicalOwnerKey: scopeKey(scope),
+      }))
+      .filter((binding) => {
+        const key = `${binding.collectorAccountId}\u0000${binding.canonicalOwnerKey}`;
+        if (seen.has(key)) {
+          return false;
+        }
+        seen.add(key);
+        return true;
+      });
+  }
+
+  private projectAttemptMapping(
+    scope: LedgerScope,
+    attempt: ReconstructedAttempt,
+    requestedMapping: ModelMappingVersion,
+  ): {
+    attempt: ReconstructedAttempt;
+    mapping: ModelMappingVersion | null;
+  } {
+    const applicationTime = attempt.attemptTime;
+    const requestedResolution = resolveModelEvidence(
+      { slug: null, mode: null, reasoningEffort: null },
+      requestedMapping,
+      scope.collectorAccountId,
+      { at: applicationTime },
+    );
+    const effectiveMapping = requestedResolution.applied
+      ? requestedMapping
+      : this.findApplicableStoredMapping(
+          scope,
+          requestedMapping,
+          applicationTime,
+        );
+    if (effectiveMapping === null) {
+      return {
+        attempt: {
+          ...attempt,
+          requestedFamily: null,
+          recordedFinalFamily: null,
+          resolvedFamily: null,
+          mappingVersion: requestedMapping.version,
+          warnings: uniqueStrings([
+            ...attempt.warnings,
+            ...requestedResolution.warnings,
+            `mapping_unresolved:${requestedMapping.version}`,
+          ]),
+        },
+        mapping: null,
+      };
+    }
+
+    const requested = resolveModelEvidence(
+      {
+        slug: attempt.requestedModelRaw,
+        mode: attempt.requestedModeRaw,
+        reasoningEffort: attempt.requestedReasoningEffortRaw,
+      },
+      effectiveMapping,
+      scope.collectorAccountId,
+      { at: applicationTime },
+    );
+    const recordedFinal = resolveModelEvidence(
+      {
+        slug: attempt.recordedFinalModelRaw,
+        mode: null,
+        reasoningEffort: null,
+      },
+      effectiveMapping,
+      scope.collectorAccountId,
+      { at: applicationTime },
+    );
+    const resolved = resolveModelEvidence(
+      {
+        slug: attempt.resolvedModelRaw,
+        mode: null,
+        reasoningEffort: null,
+      },
+      effectiveMapping,
+      scope.collectorAccountId,
+      { at: applicationTime },
+    );
+    const fallbackWarnings =
+      effectiveMapping.version === requestedMapping.version ||
+      effectiveMapping.version === attempt.mappingVersion
+        ? []
+        : [`mapping_fallback:${effectiveMapping.version}`];
+    return {
+      attempt: {
+        ...attempt,
+        requestedFamily: requested.family,
+        recordedFinalFamily: recordedFinal.family,
+        resolvedFamily: resolved.family,
+        mappingVersion: effectiveMapping.version,
+        warnings: uniqueStrings([
+          ...attempt.warnings,
+          ...requested.warnings,
+          ...recordedFinal.warnings,
+          ...resolved.warnings,
+          ...fallbackWarnings,
+        ]),
+      },
+      mapping: effectiveMapping,
+    };
+  }
+
+  private findApplicableStoredMapping(
+    scope: LedgerScope,
+    requestedMapping: ModelMappingVersion,
+    applicationTime: string | null,
+  ): ModelMappingVersion | null {
+    return this.modelMappings()
+      .filter((mapping) => mapping.version !== requestedMapping.version)
+      .filter((mapping) =>
+        resolveModelEvidence(
+          { slug: null, mode: null, reasoningEffort: null },
+          mapping,
+          scope.collectorAccountId,
+          { at: applicationTime },
+        ).applied,
+      )
+      .sort(compareMappingRecency)
+      .at(-1) ?? null;
+  }
+
   reclassifyAttempts(
     scope: LedgerScope,
     mapping: ModelMappingVersion,
@@ -1498,56 +1819,32 @@ export class Ledger {
     const candidate = normalizeMappingVersion(mapping);
     validateMappingVersion(candidate);
     assertNoSecrets(candidate);
+    this.assertMappingOwnerConsistency(candidate, scope);
     if (!isMappingPublished(candidate)) {
       return 0;
     }
     let changed = 0;
     for (const row of this.listAttempts(scope)) {
       const attempt = rowToReconstructedAttempt(row, scope);
-      const applicationTime = attempt.attemptTime;
-      const requested = resolveModelEvidence(
-        {
-          slug: nullableString(row.requestedModelRaw),
-          mode: nullableString(row.requestedModeRaw),
-          reasoningEffort: nullableString(row.requestedReasoningEffortRaw),
-        },
-        candidate,
-        scope.collectorAccountId,
-        { at: applicationTime },
-      );
-      const recordedFinal = resolveModelEvidence(
-        {
-          slug: nullableString(row.recordedFinalModelRaw),
-          mode: null,
-          reasoningEffort: null,
-        },
-        candidate,
-        scope.collectorAccountId,
-        { at: applicationTime },
-      );
-      const resolved = resolveModelEvidence(
-        {
-          slug: nullableString(row.resolvedModelRaw),
-          mode: null,
-          reasoningEffort: null,
-        },
-        candidate,
-        scope.collectorAccountId,
-        { at: applicationTime },
-      );
-      if (!requested.applied || !recordedFinal.applied || !resolved.applied) {
+      const projection = this.projectAttemptMapping(scope, attempt, candidate);
+      if (projection.mapping === null) {
         continue;
       }
-      const requestedFamily = requested.family;
-      const recordedFinalFamily = recordedFinal.family;
-      const resolvedFamily = resolved.family;
+      const effectiveMapping = projection.mapping ?? candidate;
+      const mappedAttempt = projection.attempt;
+      const projectionChanged =
+        mappedAttempt.requestedFamily !== attempt.requestedFamily ||
+        mappedAttempt.recordedFinalFamily !== attempt.recordedFinalFamily ||
+        mappedAttempt.resolvedFamily !== attempt.resolvedFamily ||
+        mappedAttempt.mappingVersion !== attempt.mappingVersion;
+      const reclassificationWarning =
+        projection.mapping?.version === candidate.version || projectionChanged
+          ? [`mapping_reclassified:${effectiveMapping.version}`]
+          : [];
       const nextWarnings = uniqueStrings([
-        ...attempt.warnings,
+        ...mappedAttempt.warnings,
         ...(candidate.warnings ?? []),
-        ...requested.warnings,
-        ...recordedFinal.warnings,
-        ...resolved.warnings,
-        `mapping_reclassified:${candidate.version}`,
+        ...reclassificationWarning,
       ]);
       const current = [
         nullableString(row.requestedFamily),
@@ -1557,36 +1854,35 @@ export class Ledger {
         [...attempt.warnings].sort(),
       ];
       const next = [
-        requestedFamily,
-        recordedFinalFamily,
-        resolvedFamily,
-        candidate.version,
+        mappedAttempt.requestedFamily,
+        mappedAttempt.recordedFinalFamily,
+        mappedAttempt.resolvedFamily,
+        mappedAttempt.mappingVersion,
         [...nextWarnings].sort(),
       ];
       if (JSON.stringify(current) === JSON.stringify(next)) {
         continue;
       }
       const projected = {
-        ...attempt,
-        requestedFamily,
-        recordedFinalFamily,
-        resolvedFamily,
-        mappingVersion: candidate.version,
+        ...mappedAttempt,
         warnings: nextWarnings,
       };
       const payload = attemptPayload(projected);
       assertNoSecrets(payload);
       const nextRevision = this.nextAttemptRevision(scope, attempt.attemptId) + 1;
-      const projectionFingerprint = fingerprint(payload);
+      const projectionFingerprint = fingerprint(attemptFingerprintPayload(projected));
       const provenance = {
         source,
-        mapping_version: candidate.version,
+        mapping_version: effectiveMapping.version,
+        ...(effectiveMapping.version === candidate.version
+          ? {}
+          : { requested_mapping_version: candidate.version }),
         previous_mapping_version: attempt.mappingVersion,
-        change_kind: candidate.changeKind ?? "prospective",
-        valid_from: candidate.validFrom ?? null,
-        valid_until: candidate.validUntil ?? null,
+        change_kind: effectiveMapping.changeKind ?? "prospective",
+        valid_from: effectiveMapping.validFrom ?? null,
+        valid_until: effectiveMapping.validUntil ?? null,
         recorded_at: recordedAt,
-        ...(candidate.provenance ?? {}),
+        ...(effectiveMapping.provenance ?? {}),
       };
       this.recordMappingHistory(scope, attempt, recordedAt, "prior_projection", {
         warnings: attempt.warnings,
@@ -1597,7 +1893,7 @@ export class Ledger {
         },
       });
       this.recordMappingHistory(scope, projected, recordedAt, source, {
-        mapping: candidate,
+        mapping: effectiveMapping,
         warnings: nextWarnings,
         provenance,
       });
@@ -1658,7 +1954,7 @@ export class Ledger {
     return nullableString(row?.origin);
   }
 
-  private reconstructionMessages(scope: LedgerScope, conversationId: string): MessageRecord[] {
+  private reconstructionMessages(scope: LedgerScope, conversationId: string): LedgerMessage[] {
     const origin = this.conversationOrigin(scope, conversationId);
     return this.messagesFor(scope, conversationId).map((message) =>
       origin !== null && message.origin === null ? { ...message, origin } : message,
@@ -1670,9 +1966,12 @@ export class Ledger {
     mapping: ModelMappingVersion,
     recordedAt: string,
   ): number {
+    validateMappingVersion(mapping);
+    this.assertMappingOwnerConsistency(mapping, scope);
     let changed = 0;
     for (const conversationId of this.conversations(scope)) {
-      const attempts = reconstructAttempts(this.reconstructionMessages(scope, conversationId), {
+      const messages = this.reconstructionMessages(scope, conversationId);
+      const attempts = reconstructAttempts(messages, {
         scope,
         conversationId,
         mapping,
@@ -1680,7 +1979,7 @@ export class Ledger {
       for (const attempt of attempts) {
         const result = this.upsertAttempt(
           scope,
-          attempt,
+          applyMessageQuarantine(attempt, messages),
           {
             runId: `rebuild:${mapping.version}`,
             observedAt: recordedAt,
@@ -1904,8 +2203,8 @@ export class Ledger {
           recorded_final_model_raw, resolved_model_raw, requested_family,
           recorded_final_family, resolved_family, mapping_version, outcome,
           completed_answer, generation_started, surface, origin, revision,
-          projection_fingerprint, warnings_json, tombstone, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+          projection_fingerprint, warnings_json, quarantine_json, tombstone, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
         `,
       )
       .run(
@@ -1939,6 +2238,7 @@ export class Ledger {
         revision,
         projectionFingerprint,
         JSON.stringify(attempt.warnings),
+        JSON.stringify(normalizeQuarantine(attempt.quarantine)),
         updatedAt,
       );
   }
@@ -1960,7 +2260,8 @@ export class Ledger {
           recorded_final_model_raw=?, resolved_model_raw=?, requested_family=?,
           recorded_final_family=?, resolved_family=?, mapping_version=?, outcome=?,
           completed_answer=?, generation_started=?, surface=?, origin=?,
-          revision=?, projection_fingerprint=?, warnings_json=?, tombstone=0, updated_at=?
+          revision=?, projection_fingerprint=?, warnings_json=?, quarantine_json=?,
+          tombstone=0, updated_at=?
         WHERE attempt_id=? AND scope_key=?
         `,
       )
@@ -1988,6 +2289,7 @@ export class Ledger {
         revision,
         projectionFingerprint,
         JSON.stringify(attempt.warnings),
+        JSON.stringify(normalizeQuarantine(attempt.quarantine)),
         updatedAt,
         attempt.attemptId,
         scopeKey(scope),
@@ -2008,8 +2310,8 @@ export class Ledger {
         `
         INSERT OR IGNORE INTO attempt_revisions(
           attempt_id, revision, scope_key, collector_account_id,
-          projection_fingerprint, payload_json, recorded_at, source
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          projection_fingerprint, payload_json, recorded_at, source, quarantine_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       )
       .run(
@@ -2021,6 +2323,11 @@ export class Ledger {
         JSON.stringify(payload),
         context.observedAt,
         source,
+        JSON.stringify(
+          normalizeQuarantine(
+            "quarantine" in attempt ? attempt.quarantine : payload.quarantine,
+          ),
+        ),
       );
   }
 
@@ -2275,10 +2582,21 @@ function scopeFromRow(row: SqlRow): LedgerScope {
 function sanitizeMessage(
   record: MessageRecord,
   observedAt?: string,
-): MessageRecord {
-  const clean: MessageRecord = {
-    conversationId: sanitizeToken(record.conversationId) ?? "unknown-conversation",
-    messageId: sanitizeToken(record.messageId) ?? "unknown-message",
+): LedgerMessage {
+  const conversationId = sanitizeToken(record.conversationId) ?? "unknown-conversation";
+  const messageId = sanitizeToken(record.messageId) ?? "unknown-message";
+  const quarantine = mergeQuarantines(
+    normalizeQuarantine((record as Partial<LedgerMessage>).quarantine),
+    observedAt === undefined
+      ? clearQuarantine()
+      : quarantineForTimestampFields(
+          [{ field: "createdAt", value: record.createdAt, messageId }],
+          observedAt,
+        ),
+  );
+  const clean: LedgerMessage = {
+    conversationId,
+    messageId,
     nodeId: sanitizeToken(record.nodeId) ?? null,
     parentId: sanitizeToken(record.parentId) ?? null,
     children: record.children
@@ -2298,6 +2616,7 @@ function sanitizeMessage(
     surface: record.surface,
     origin: sanitizeToken(record.origin) ?? null,
     metadata: sanitizeMetadata(record.metadata),
+    quarantine,
   };
   return clean;
 }
@@ -2306,11 +2625,17 @@ function sanitizeAttempt(
   attempt: ReconstructedAttempt,
   observedAt: string,
 ): ReconstructedAttempt {
-  const futureTimestamp = [
-    attempt.attemptTime,
-    attempt.earliestPossibleAt,
-    attempt.latestPossibleAt,
-  ].some((value) => isFutureTimestamp(value, observedAt));
+  const quarantine = mergeQuarantines(
+    attempt.quarantine,
+    quarantineForTimestampFields(
+      [
+        { field: "attemptTime", value: attempt.attemptTime },
+        { field: "earliestPossibleAt", value: attempt.earliestPossibleAt },
+        { field: "latestPossibleAt", value: attempt.latestPossibleAt },
+      ],
+      observedAt,
+    ),
+  );
   const aliases = attempt.aliases
     .map(([kind, value]) => {
       const cleanKind = sanitizeToken(kind);
@@ -2323,12 +2648,10 @@ function sanitizeAttempt(
   const evidenceMessageIds = attempt.evidenceMessageIds
     .map((messageId) => sanitizeToken(messageId))
     .filter((messageId): messageId is string => messageId !== null);
-  const warnings = [...new Set(
-    attempt.warnings.filter((warning): warning is string => typeof warning === "string"),
-  )];
-  if (futureTimestamp) {
-    warnings.push("future_timestamp_quarantined");
-  }
+  const warnings = uniqueStrings([
+    ...attempt.warnings.filter((warning): warning is string => typeof warning === "string"),
+    ...quarantine.warnings,
+  ]);
   return {
     ...attempt,
     attemptTime: safeTimestamp(attempt.attemptTime, observedAt),
@@ -2336,18 +2659,64 @@ function sanitizeAttempt(
     latestPossibleAt: safeTimestamp(attempt.latestPossibleAt, observedAt),
     aliases,
     evidenceMessageIds,
-    warnings: [...new Set(warnings)],
+    warnings,
+    quarantine,
   };
 }
 
-function futureMessageIdsHasEvidence(
+function rawEvidenceMatchesCurrent(
+  current: SqlRow,
   attempt: ReconstructedAttempt,
-  messageIds: ReadonlySet<string>,
 ): boolean {
-  return attempt.evidenceMessageIds.some((messageId) => messageIds.has(messageId));
+  return (
+    nullableString(current.requested_model_raw) === attempt.requestedModelRaw &&
+    nullableString(current.requested_mode_raw) === attempt.requestedModeRaw &&
+    nullableString(current.requested_reasoning_effort_raw) ===
+      attempt.requestedReasoningEffortRaw &&
+    nullableString(current.recorded_final_model_raw) === attempt.recordedFinalModelRaw &&
+    nullableString(current.resolved_model_raw) === attempt.resolvedModelRaw
+  );
 }
 
-function messagePayload(record: MessageRecord): Record<string, unknown> {
+function preserveCurrentMappingProjection(
+  attempt: ReconstructedAttempt,
+  current: SqlRow,
+  mapping: ModelMappingVersion,
+): ReconstructedAttempt {
+  return {
+    ...attempt,
+    requestedFamily: nullableString(current.requested_family),
+    recordedFinalFamily: nullableString(current.recorded_final_family),
+    resolvedFamily: nullableString(current.resolved_family),
+    mappingVersion: String(current.mapping_version),
+    warnings: uniqueStrings([
+      ...attempt.warnings,
+      ...parseJsonArray(current.warnings_json).filter(
+        (warning) => warning.startsWith("mapping_") || mapping.warnings?.includes(warning),
+      ),
+    ]),
+  };
+}
+
+function applyMessageQuarantine(
+  attempt: ReconstructedAttempt,
+  messages: ReadonlyArray<LedgerMessage>,
+): ReconstructedAttempt {
+  const evidenceMessageIds = new Set(attempt.evidenceMessageIds);
+  const quarantine = mergeQuarantines(
+    attempt.quarantine,
+    ...messages
+      .filter((message) => evidenceMessageIds.has(message.messageId))
+      .map((message) => message.quarantine),
+  );
+  return {
+    ...attempt,
+    warnings: uniqueStrings([...attempt.warnings, ...quarantine.warnings]),
+    quarantine,
+  };
+}
+
+function messagePayload(record: LedgerMessage): Record<string, unknown> {
   return {
     conversationId: record.conversationId,
     messageId: record.messageId,
@@ -2368,6 +2737,71 @@ function messagePayload(record: MessageRecord): Record<string, unknown> {
     surface: record.surface,
     origin: record.origin,
     metadata: record.metadata,
+  };
+}
+
+function messageRevisionPayload(record: LedgerMessage): Record<string, unknown> {
+  return {
+    ...messagePayload(record),
+    quarantine: normalizeQuarantine(record.quarantine),
+  };
+}
+
+function messageFingerprintPayload(record: LedgerMessage): Record<string, unknown> {
+  return fingerprintPayload(
+    messageRevisionPayload(record),
+    record.quarantine,
+  );
+}
+
+function attemptFingerprintPayload(attempt: ReconstructedAttempt): Record<string, unknown> {
+  return fingerprintPayload(attemptPayload(attempt), attempt.quarantine);
+}
+
+function observationFingerprintPayload(
+  payload: Record<string, unknown>,
+  quarantine: LedgerQuarantine,
+): Record<string, unknown> {
+  const stablePayload = stableObservationPayload(payload);
+  const stableQuarantine = quarantineFingerprint(quarantine);
+  return isEmptyQuarantineFingerprint(stableQuarantine)
+    ? stablePayload
+    : { payload: stablePayload, quarantine: stableQuarantine };
+}
+
+function fingerprintPayload(
+  payload: Record<string, unknown>,
+  quarantine: LedgerQuarantine | null | undefined,
+): Record<string, unknown> {
+  const stableQuarantine = quarantineFingerprint(quarantine);
+  if (isEmptyQuarantineFingerprint(stableQuarantine)) {
+    const { quarantine: _quarantine, ...legacyPayload } = payload;
+    return legacyPayload;
+  }
+  return { ...payload, quarantine: stableQuarantine };
+}
+
+function isEmptyQuarantineFingerprint(
+  quarantine: Record<string, unknown>,
+): boolean {
+  return quarantine.state === "clear" &&
+    Array.isArray(quarantine.warnings) &&
+    quarantine.warnings.length === 0 &&
+    Array.isArray(quarantine.timestamps) &&
+    quarantine.timestamps.length === 0;
+}
+
+function quarantineFingerprint(
+  quarantine: LedgerQuarantine | null | undefined,
+): Record<string, unknown> {
+  const normalized = mergeQuarantines(quarantine);
+  return {
+    state: normalized.state,
+    warnings: normalized.warnings,
+    timestamps: normalized.timestamps.map(({ field, value, messageId }) =>
+      messageId === undefined
+        ? { field, value }
+        : { field, value, messageId }),
   };
 }
 
@@ -2409,6 +2843,7 @@ function attemptPayload(
     | "aliases"
     | "evidenceMessageIds"
     | "warnings"
+    | "quarantine"
   >,
 ): Record<string, unknown> {
   return {
@@ -2438,6 +2873,7 @@ function attemptPayload(
     ),
     evidenceMessageIds: [...attempt.evidenceMessageIds].sort(),
     warnings: [...attempt.warnings].sort(),
+    quarantine: normalizeQuarantine(attempt.quarantine),
   };
 }
 
@@ -2472,7 +2908,22 @@ function identityRank(identityBasis: string): number {
   }
 }
 
-function messageFromRow(row: SqlRow): MessageRecord {
+function conflictingGenerationAliases(
+  incoming: ReadonlySet<string>,
+  existing: ReadonlyArray<string>,
+): boolean {
+  const stored = new Set(existing);
+  if (incoming.size === 0 || stored.size === 0) {
+    return false;
+  }
+  return incoming.size !== stored.size || [...incoming].some((alias) => !stored.has(alias));
+}
+
+function generationIdentityKey(aliases: ReadonlyArray<string>): string {
+  return [...new Set(aliases)].sort().join("\u0000");
+}
+
+function messageFromRow(row: SqlRow): LedgerMessage {
   return {
     conversationId: String(row.conversation_id),
     messageId: String(row.message_id),
@@ -2493,6 +2944,7 @@ function messageFromRow(row: SqlRow): MessageRecord {
     surface: String(row.surface) as MessageRecord["surface"],
     origin: nullableString(row.origin),
     metadata: parseJsonObject(row.metadata_json),
+    quarantine: parseQuarantine(row.quarantine_json),
   };
 }
 
@@ -2529,6 +2981,7 @@ function rowToAttemptPayload(row: SqlRow): Record<string, unknown> {
     projectionFingerprint: String(row.projection_fingerprint),
     warnings: parseJsonArray(row.warnings_json),
     tombstone: Number(row.tombstone) === 1,
+    quarantine: parseQuarantine(row.quarantine_json),
   };
 }
 
@@ -2562,6 +3015,7 @@ function rowToReconstructedAttempt(
     evidenceMessageIds: parseJsonArray(row.evidenceMessageIds),
     revision: Number(row.revision ?? 1),
     warnings: parseJsonArray(row.warnings),
+    quarantine: parseQuarantine(row.quarantine),
     scope,
   };
 }
@@ -2588,8 +3042,183 @@ function mappingFingerprint(mapping: ModelMappingVersion): string {
   });
 }
 
+function compareMappingRecency(
+  left: ModelMappingVersion,
+  right: ModelMappingVersion,
+): number {
+  return (
+    Number(left.changeKind === "historical_correction") -
+      Number(right.changeKind === "historical_correction") ||
+    (left.validFrom ?? "").localeCompare(right.validFrom ?? "") ||
+    left.createdAt.localeCompare(right.createdAt) ||
+    (left.publishedAt ?? "").localeCompare(right.publishedAt ?? "") ||
+    left.version.localeCompare(right.version)
+  );
+}
+
+function mappingHistorySource(sourceKind: string): string {
+  return sourceKind === "aggregate_rebuild" ? "aggregate_rebuild" : "ingest";
+}
+
 function uniqueStrings(values: ReadonlyArray<string>): string[] {
   return [...new Set(values)].sort();
+}
+
+const QUARANTINE_WARNING = "future_timestamp_quarantined";
+const QUARANTINE_FIELDS = new Set<QuarantinedTimestampEvidence["field"]>([
+  "createdAt",
+  "updatedAt",
+  "attemptTime",
+  "earliestPossibleAt",
+  "latestPossibleAt",
+]);
+
+function clearQuarantine(): LedgerQuarantine {
+  return {
+    state: "clear",
+    warnings: [],
+    timestamps: [],
+  };
+}
+
+function quarantineFromWarnings(warnings: ReadonlyArray<string>): LedgerQuarantine {
+  const retained = warnings.filter((warning) => warning === QUARANTINE_WARNING);
+  return retained.length === 0
+    ? clearQuarantine()
+    : {
+        state: "quarantined",
+        warnings: uniqueStrings(retained),
+        timestamps: [],
+      };
+}
+
+function quarantineForTimestampFields(
+  fields: ReadonlyArray<{
+    field: QuarantinedTimestampEvidence["field"];
+    value: string | null;
+    messageId?: string;
+  }>,
+  observedAt: string,
+): LedgerQuarantine {
+  const timestamps: QuarantinedTimestampEvidence[] = [];
+  for (const field of fields) {
+    if (field.value === null || !isFutureTimestamp(field.value, observedAt)) {
+      continue;
+    }
+    const evidence: QuarantinedTimestampEvidence = {
+      field: field.field,
+      value: field.value,
+      observedAt,
+    };
+    if (field.messageId !== undefined) {
+      evidence.messageId = field.messageId;
+    }
+    timestamps.push(evidence);
+  }
+  return timestamps.length === 0
+    ? clearQuarantine()
+    : {
+        state: "quarantined",
+        warnings: [QUARANTINE_WARNING],
+        timestamps,
+      };
+}
+
+function mergeQuarantines(
+  ...values: Array<LedgerQuarantine | null | undefined>
+): LedgerQuarantine {
+  const normalized = values.map((value) => normalizeQuarantine(value));
+  const timestamps = new Map<string, QuarantinedTimestampEvidence>();
+  for (const quarantine of normalized) {
+    for (const timestamp of quarantine.timestamps) {
+      const key = canonicalJson({
+        field: timestamp.field,
+        value: timestamp.value,
+        messageId: timestamp.messageId ?? null,
+      });
+      if (!timestamps.has(key)) {
+        timestamps.set(key, timestamp);
+      }
+    }
+  }
+  const mergedTimestamps = [...timestamps.values()].sort((left, right) =>
+    left.field.localeCompare(right.field) ||
+    left.value.localeCompare(right.value) ||
+    left.observedAt.localeCompare(right.observedAt) ||
+    (left.messageId ?? "").localeCompare(right.messageId ?? ""),
+  );
+  const warnings = uniqueStrings(normalized.flatMap((value) => value.warnings));
+  return {
+    state: normalized.some((value) => value.state === "quarantined") ||
+      mergedTimestamps.length > 0 ||
+      warnings.includes(QUARANTINE_WARNING)
+      ? "quarantined"
+      : "clear",
+    warnings,
+    timestamps: mergedTimestamps,
+  };
+}
+
+function parseQuarantine(value: unknown): LedgerQuarantine {
+  if (typeof value === "string") {
+    return normalizeQuarantine(parseJsonObject(value));
+  }
+  return normalizeQuarantine(value);
+}
+
+function normalizeQuarantine(value: unknown): LedgerQuarantine {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return clearQuarantine();
+  }
+  const raw = value as Record<string, unknown>;
+  const warnings = Array.isArray(raw.warnings)
+    ? raw.warnings.filter((warning): warning is string => typeof warning === "string")
+    : [];
+  const timestamps: QuarantinedTimestampEvidence[] = [];
+  if (Array.isArray(raw.timestamps)) {
+    for (const item of raw.timestamps) {
+      if (item === null || typeof item !== "object" || Array.isArray(item)) {
+        continue;
+      }
+      const candidate = item as Record<string, unknown>;
+      if (
+        !isQuarantineTimestampField(candidate.field) ||
+        typeof candidate.value !== "string" ||
+        !Number.isFinite(Date.parse(candidate.value)) ||
+        typeof candidate.observedAt !== "string" ||
+        !Number.isFinite(Date.parse(candidate.observedAt))
+      ) {
+        continue;
+      }
+      const evidence: QuarantinedTimestampEvidence = {
+        field: candidate.field,
+        value: candidate.value,
+        observedAt: candidate.observedAt,
+      };
+      const messageId = sanitizeToken(nullableString(candidate.messageId));
+      if (messageId !== null) {
+        evidence.messageId = messageId;
+      }
+      timestamps.push(evidence);
+    }
+  }
+  const state = raw.state === "quarantined" ||
+    timestamps.length > 0 ||
+    warnings.includes(QUARANTINE_WARNING)
+    ? "quarantined"
+    : "clear";
+  return {
+    state,
+    warnings: uniqueStrings(warnings),
+    timestamps,
+  };
+}
+
+function isQuarantineTimestampField(
+  value: unknown,
+): value is QuarantinedTimestampEvidence["field"] {
+  return typeof value === "string" &&
+    QUARANTINE_FIELDS.has(value as QuarantinedTimestampEvidence["field"]);
 }
 
 function parseJsonObject(value: unknown): Record<string, unknown> {

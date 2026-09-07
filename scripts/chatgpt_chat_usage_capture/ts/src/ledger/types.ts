@@ -14,6 +14,32 @@ export interface LedgerScope {
   surface: Surface;
 }
 
+export type QuarantineState = "clear" | "quarantined";
+
+export type QuarantineTimestampField =
+  | "createdAt"
+  | "updatedAt"
+  | "attemptTime"
+  | "earliestPossibleAt"
+  | "latestPossibleAt";
+
+export interface QuarantinedTimestampEvidence {
+  field: QuarantineTimestampField;
+  value: string;
+  observedAt: string;
+  messageId?: string;
+}
+
+export interface LedgerQuarantine {
+  state: QuarantineState;
+  warnings: string[];
+  timestamps: QuarantinedTimestampEvidence[];
+}
+
+export interface LedgerMessage extends MessageRecord {
+  quarantine: LedgerQuarantine;
+}
+
 export interface MappingRule {
   slug: string;
   mode?: string | null;
@@ -22,6 +48,11 @@ export interface MappingRule {
   collectorAccountId?: string | null;
   reviewed?: boolean;
   source?: string;
+}
+
+export interface MappingOwnerBinding {
+  collectorAccountId: string;
+  canonicalOwnerKey: string;
 }
 
 export type MappingChangeKind = "prospective" | "historical_correction";
@@ -60,7 +91,7 @@ export interface MappingResolution {
 
 export interface StoredMessage {
   scope: LedgerScope;
-  record: MessageRecord;
+  record: LedgerMessage;
   revision: number;
   revisionFingerprint: string;
 }
@@ -91,4 +122,5 @@ export interface IngestResult {
 
 export interface ReconstructedAttempt extends AttemptRecord {
   scope: LedgerScope;
+  quarantine?: LedgerQuarantine;
 }

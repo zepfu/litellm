@@ -63,7 +63,7 @@ describe("D1-752 Stage 2B ledger", () => {
     const directory = mkdtempSync(join(tmpdir(), "stage2b-ledger-"));
     temporaryDirectories.push(directory);
     const ledger = new Ledger(join(directory, "usage.sqlite"));
-    expect(ledger.schemaVersion).toBe(5);
+    expect(ledger.schemaVersion).toBe(6);
 
     const first = scope("account-one", "provider-user-one", "workspace-one", "quota-one");
     const second = scope("account-two", "provider-user-one", "workspace-one", "quota-one");
@@ -275,6 +275,59 @@ describe("D1-752 Stage 2B ledger", () => {
     );
   });
 
+  it("joins a generation through a child-only edge in the reverse direction", () => {
+    const account = scope("account-child-edge", "provider-user", "workspace", "quota");
+    const conversationId = "conversation-child-edge";
+    const attempts = reconstructAttempts(
+      [
+        message({
+          conversationId,
+          messageId: "message-user",
+          nodeId: "node-user",
+          role: "user",
+          children: ["node-generation"],
+          createdAt: "2026-09-07T10:00:00.000Z",
+          requestedModelRaw: "model-requested",
+        }),
+        message({
+          conversationId,
+          messageId: "message-generation",
+          nodeId: "node-generation",
+          role: "assistant",
+          children: ["node-final"],
+          channel: "analysis",
+          createdAt: "2026-09-07T10:00:01.000Z",
+          status: "finished_successfully",
+          generationId: "generation-child-edge",
+          requestId: "request-child-edge",
+        }),
+        message({
+          conversationId,
+          messageId: "message-final",
+          nodeId: "node-final",
+          role: "assistant",
+          createdAt: "2026-09-07T10:00:02.000Z",
+          status: "finished_successfully",
+          endTurn: true,
+          recordedFinalModelRaw: "model-final",
+        }),
+      ],
+      {
+        scope: account,
+        conversationId,
+        mapping: mappingReviewed,
+      },
+    );
+
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]?.completedAnswer).toBe(true);
+    expect(attempts[0]?.evidenceMessageIds).toEqual([
+      "message-final",
+      "message-generation",
+      "message-user",
+    ]);
+  });
+
   it("merges later linkage into one active attempt and retires the provisional row", () => {
     const directory = mkdtempSync(join(tmpdir(), "stage2b-linkage-"));
     temporaryDirectories.push(directory);
@@ -333,6 +386,114 @@ describe("D1-752 Stage 2B ledger", () => {
     expect(ledger.listAttempts(account, true).filter((attempt) => attempt.tombstone))
       .toHaveLength(1);
     expect(ledger.db.pragma("foreign_key_check")).toEqual([]);
+    ledger.close();
+  });
+
+  it("keeps conflicting generation attempts separate when weak aliases collide", () => {
+    const directory = mkdtempSync(join(tmpdir(), "stage2b-alias-generation-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    const account = scope("account-alias-generation", "provider-user", "workspace", "quota");
+    const conversationId = "conversation-alias-generation";
+    ledger.upsertAccount(account);
+
+    const makeAttempt = (
+      generationId: string,
+      messageId: string,
+      branchAlias: string,
+      promptAlias: string,
+    ) => {
+      const attempt = reconstructAttempts(
+        [
+          message({
+            conversationId,
+            messageId,
+            nodeId: messageId,
+            role: "assistant",
+            createdAt: "2026-09-07T10:00:02.000Z",
+            status: "finished_successfully",
+            endTurn: true,
+            recordedFinalModelRaw: "model-final",
+            generationId,
+            requestId: `request-${generationId}`,
+          }),
+        ],
+        {
+          scope: account,
+          conversationId,
+          mapping: mappingReviewed,
+        },
+      )[0];
+      if (!attempt) {
+        throw new Error(`missing reconstructed attempt for ${generationId}`);
+      }
+      return {
+        ...attempt,
+        aliases: [
+          ["generation", `${conversationId}:${generationId}`],
+          ["branch", `${conversationId}:${branchAlias}`],
+          ["prompt", `${conversationId}:${promptAlias}`],
+        ] as Array<[string, string]>,
+      };
+    };
+
+    const first = makeAttempt("generation-a", "message-a", "shared-branch", "prompt-a");
+    const second = makeAttempt("generation-b", "message-b", "branch-b", "shared-prompt");
+    const firstResult = ledger.upsertAttempt(
+      account,
+      first,
+      context("run-alias-a", conversationId, "2026-09-07T10:05:00.000Z"),
+    );
+    const secondResult = ledger.upsertAttempt(
+      account,
+      second,
+      context("run-alias-b", conversationId, "2026-09-07T10:06:00.000Z"),
+    );
+    const conflicting = makeAttempt(
+      "generation-c",
+      "message-c",
+      "shared-branch",
+      "prompt-a",
+    );
+    const conflictingResult = ledger.upsertAttempt(
+      account,
+      conflicting,
+      context("run-alias-c", conversationId, "2026-09-07T10:07:00.000Z"),
+    );
+    const bridge = {
+      ...first,
+      attemptId: "attempt-provisional-bridge",
+      identityBasis: "provisional",
+      aliases: [
+        ["branch", `${conversationId}:shared-branch`],
+        ["prompt", `${conversationId}:shared-prompt`],
+      ] as Array<[string, string]>,
+      evidenceMessageIds: ["message-bridge"],
+      warnings: [...new Set([...first.warnings, "provisional_identity"])],
+    };
+    const bridgeResult = ledger.upsertAttempt(
+      account,
+      bridge,
+      context("run-alias-bridge", conversationId, "2026-09-07T10:08:00.000Z"),
+    );
+
+    expect(firstResult.status).toBe("inserted");
+    expect(secondResult.status).toBe("inserted");
+    expect(secondResult.aliasConflicts).toBe(0);
+    expect(conflictingResult.status).toBe("inserted");
+    expect(conflictingResult.aliasConflicts).toBe(2);
+    expect(bridgeResult.status).toBe("inserted");
+    expect(bridgeResult.aliasConflicts).toBe(2);
+    expect(ledger.listAttempts(account)).toHaveLength(4);
+    expect(ledger.listAttempts(account, true).filter((attempt) => attempt.tombstone))
+      .toHaveLength(0);
+    expect(
+      ledger.db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM attempt_aliases WHERE scope_key=? AND alias_kind='generation'",
+        )
+        .get(scopeKey(account)),
+    ).toEqual({ count: 3 });
     ledger.close();
   });
 
@@ -402,6 +563,106 @@ describe("D1-752 Stage 2B ledger", () => {
     expect(regenerated?.latestPossibleAt).toBeNull();
   });
 
+  it("does not distribute prompt evidence through a reused request ID", () => {
+    const account = scope("account-reused-request", "provider-user", "workspace", "quota");
+    const conversationId = "conversation-reused-request";
+    const attempts = reconstructAttempts(
+      [
+        message({
+          conversationId,
+          messageId: "message-user",
+          nodeId: "node-user",
+          role: "user",
+          children: ["node-generation-a", "node-generation-b"],
+          createdAt: "2026-09-07T10:00:00.000Z",
+          requestedModelRaw: "model-requested",
+        }),
+        message({
+          conversationId,
+          messageId: "message-final-a",
+          nodeId: "node-generation-a",
+          parentId: "node-user",
+          role: "assistant",
+          createdAt: "2026-09-07T10:00:02.000Z",
+          status: "finished_successfully",
+          endTurn: true,
+          recordedFinalModelRaw: "model-final",
+          generationId: "generation-a",
+          requestId: "request-reused",
+        }),
+        message({
+          conversationId,
+          messageId: "message-final-b",
+          nodeId: "node-generation-b",
+          parentId: "node-user",
+          role: "assistant",
+          createdAt: "2026-09-07T10:01:02.000Z",
+          status: "finished_successfully",
+          endTurn: true,
+          recordedFinalModelRaw: "model-final",
+          generationId: "generation-b",
+          requestId: "request-reused",
+        }),
+      ],
+      {
+        scope: account,
+        conversationId,
+        mapping: mappingReviewed,
+      },
+    );
+
+    expect(attempts).toHaveLength(2);
+    expect(attempts.every((attempt) => attempt.requestedModelRaw === null)).toBe(true);
+    expect(attempts.every((attempt) => attempt.attemptTime === null)).toBe(true);
+    expect(
+      attempts.every((attempt) =>
+        attempt.warnings.includes("prompt_evidence_not_linked"),
+      ),
+    ).toBe(true);
+  });
+
+  it("does not let a provisional response branch inherit prompt evidence", () => {
+    const account = scope("account-provisional-prompt", "provider-user", "workspace", "quota");
+    const conversationId = "conversation-provisional-prompt";
+    const attempts = reconstructAttempts(
+      [
+        message({
+          conversationId,
+          messageId: "message-user",
+          nodeId: "node-user",
+          role: "user",
+          children: ["node-provisional"],
+          createdAt: "2026-09-07T10:00:00.000Z",
+          requestedModelRaw: "model-requested",
+        }),
+        message({
+          conversationId,
+          messageId: "message-provisional",
+          nodeId: "node-provisional",
+          parentId: "node-user",
+          role: "assistant",
+          createdAt: "2026-09-07T10:00:02.000Z",
+          status: "finished_successfully",
+          endTurn: true,
+          recordedFinalModelRaw: "model-final",
+        }),
+      ],
+      {
+        scope: account,
+        conversationId,
+        mapping: mappingReviewed,
+      },
+    );
+
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]?.identityBasis).toBe("provisional");
+    expect(attempts[0]?.requestedModelRaw).toBeNull();
+    expect(attempts[0]?.attemptTime).toBeNull();
+    expect(attempts[0]?.earliestPossibleAt).toBeNull();
+    expect(attempts[0]?.latestPossibleAt).toBeNull();
+    expect(attempts[0]?.recordedFinalModelRaw).toBe("model-final");
+  });
+
   it("does not fabricate request bounds from a final-only response", () => {
     const account = scope("account-final-only", "provider-user", "workspace", "quota");
     const conversationId = "conversation-final-only";
@@ -430,6 +691,50 @@ describe("D1-752 Stage 2B ledger", () => {
     expect(attempts[0]?.attemptTime).toBeNull();
     expect(attempts[0]?.earliestPossibleAt).toBeNull();
     expect(attempts[0]?.latestPossibleAt).toBeNull();
+  });
+
+  it("does not use response progress as a request lower bound", () => {
+    const account = scope("account-response-bound", "provider-user", "workspace", "quota");
+    const conversationId = "conversation-response-bound";
+    const attempts = reconstructAttempts(
+      [
+        message({
+          conversationId,
+          messageId: "message-progress",
+          nodeId: "node-progress",
+          role: "assistant",
+          children: ["node-final"],
+          channel: "analysis",
+          createdAt: "2026-09-07T10:00:01.000Z",
+          status: "in_progress",
+          generationId: "generation-response-bound",
+          requestId: "request-response-bound",
+        }),
+        message({
+          conversationId,
+          messageId: "message-final",
+          nodeId: "node-final",
+          role: "assistant",
+          createdAt: "2026-09-07T10:00:02.000Z",
+          status: "finished_successfully",
+          endTurn: true,
+          recordedFinalModelRaw: "model-final",
+          generationId: "generation-response-bound",
+          requestId: "request-response-bound",
+        }),
+      ],
+      {
+        scope: account,
+        conversationId,
+        mapping: mappingReviewed,
+      },
+    );
+
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]?.timeBasis).toBe("response_observed");
+    expect(attempts[0]?.attemptTime).toBeNull();
+    expect(attempts[0]?.earliestPossibleAt).toBeNull();
+    expect(attempts[0]?.latestPossibleAt).toBe("2026-09-07T10:00:02.000Z");
   });
 
   it("classifies rejection after observed generation start separately", () => {
@@ -632,6 +937,81 @@ describe("D1-752 Stage 2B ledger", () => {
     ledger.close();
   });
 
+  it("lets fresh evidence reuse a stale history payload without suppressing projection recovery", () => {
+    const directory = mkdtempSync(join(tmpdir(), "stage2b-stale-replay-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    const account = scope("account-stale-replay", "provider-user", "workspace", "quota");
+    ledger.upsertAccount(account);
+
+    ledger.ingestConversation(
+      account,
+      progressDetail(
+        "conversation-stale-replay",
+        "finished_successfully",
+        true,
+        "model-a",
+        "2026-09-07T10:00:00.000Z",
+      ),
+      mappingReviewed,
+      context("run-stale-replay-a", "conversation-stale-replay", "2026-09-07T12:00:00.000Z"),
+    );
+    ledger.ingestConversation(
+      account,
+      progressDetail(
+        "conversation-stale-replay",
+        "finished_successfully",
+        true,
+        "model-b",
+        "2026-09-07T10:02:00.000Z",
+      ),
+      mappingReviewed,
+      context("run-stale-replay-b", "conversation-stale-replay", "2026-09-07T13:00:00.000Z"),
+    );
+    ledger.ingestConversation(
+      account,
+      progressDetail(
+        "conversation-stale-replay",
+        "finished_successfully",
+        true,
+        "model-a",
+        "2026-09-07T10:01:00.000Z",
+      ),
+      mappingReviewed,
+      context("run-stale-replay-stale-a", "conversation-stale-replay", "2026-09-07T12:30:00.000Z"),
+    );
+
+    const freshReplay = ledger.ingestConversation(
+      account,
+      progressDetail(
+        "conversation-stale-replay",
+        "finished_successfully",
+        true,
+        "model-a",
+        "2026-09-07T10:01:00.000Z",
+      ),
+      mappingReviewed,
+      context("run-stale-replay-fresh-a", "conversation-stale-replay", "2026-09-07T14:00:00.000Z"),
+    );
+
+    expect(freshReplay.observationInserted).toBe(false);
+    expect(freshReplay.messageInserted).toBe(1);
+    expect(freshReplay.attemptUpdated).toBe(1);
+    expect(freshReplay.attemptDeduplicated).toBe(0);
+    expect(ledger.listAttempts(account)[0]?.recordedFinalModelRaw).toBe("model-a");
+    expect(
+      ledger.messageRevisions(account, "conversation-stale-replay", "message-final").map((item) =>
+        String((item.payload as Record<string, unknown>).recordedFinalModelRaw),
+      ),
+    ).toEqual(["model-a", "model-b", "model-a"]);
+    expect(
+      ledger.attemptRevisions(account, String(ledger.listAttempts(account)[0]?.attemptId)).map(
+        (item) => String((item.payload as Record<string, unknown>).recordedFinalModelRaw),
+      ),
+    ).toEqual(["model-a", "model-b", "model-a"]);
+    ledger.close();
+  });
+
   it("allowlists persisted context provenance and quarantines future timestamps", () => {
     const directory = mkdtempSync(join(tmpdir(), "stage2b-provenance-"));
     temporaryDirectories.push(directory);
@@ -686,9 +1066,76 @@ describe("D1-752 Stage 2B ledger", () => {
       (message) => message.messageId === "message-final",
     );
     expect(finalMessage?.createdAt).toBeNull();
+    expect(finalMessage?.quarantine).toMatchObject({
+      state: "quarantined",
+      warnings: ["future_timestamp_quarantined"],
+    });
+    expect(finalMessage?.quarantine?.timestamps).toContainEqual({
+      field: "createdAt",
+      value: "2026-09-07T13:00:00.000Z",
+      observedAt: "2026-09-07T12:00:00.000Z",
+      messageId: "message-final",
+    });
     const attempt = ledger.listAttempts(account)[0]!;
     expect(attempt.latestPossibleAt).toBe("2026-09-07T11:00:00.000Z");
     expect(attempt.warnings).toContain("future_timestamp_quarantined");
+    expect(attempt.quarantine).toMatchObject({
+      state: "quarantined",
+      warnings: ["future_timestamp_quarantined"],
+    });
+    expect(
+      (attempt.quarantine as { timestamps: Array<Record<string, string>> }).timestamps,
+    ).toContainEqual({
+      field: "createdAt",
+      value: "2026-09-07T13:00:00.000Z",
+      observedAt: "2026-09-07T12:00:00.000Z",
+      messageId: "message-final",
+    });
+    expect(
+      JSON.parse(
+        (ledger.db.prepare(
+          "SELECT quarantine_json FROM message_records WHERE message_id='message-final'",
+        ).get() as {
+          quarantine_json: string;
+        }).quarantine_json,
+      ),
+    ).toMatchObject({ state: "quarantined" });
+    expect(
+      JSON.parse(
+        (ledger.db.prepare("SELECT quarantine_json FROM observations").get() as {
+          quarantine_json: string;
+        }).quarantine_json,
+      ),
+    ).toMatchObject({ state: "quarantined" });
+    expect(
+      ledger.messageRevisions(account, "conversation-provenance", "message-final")[0]?.payload,
+    ).toMatchObject({
+      createdAt: null,
+      quarantine: {
+        timestamps: [
+          {
+            field: "createdAt",
+            value: "2026-09-07T13:00:00.000Z",
+            observedAt: "2026-09-07T12:00:00.000Z",
+            messageId: "message-final",
+          },
+        ],
+      },
+    });
+
+    expect(
+      ledger.rebuildAttemptsFromMessages(
+        account,
+        mappingReviewed,
+        "2026-09-07T14:00:00.000Z",
+      ),
+    ).toBe(0);
+    const rebuilt = ledger.listAttempts(account)[0]!;
+    expect(rebuilt.warnings).toContain("future_timestamp_quarantined");
+    expect(rebuilt.quarantine).toMatchObject({
+      state: "quarantined",
+      warnings: ["future_timestamp_quarantined"],
+    });
     ledger.close();
   });
 

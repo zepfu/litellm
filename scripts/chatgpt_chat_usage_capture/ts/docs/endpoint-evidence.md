@@ -53,14 +53,13 @@ remains `unknown`. `has_versions` is exposed as version metadata or
 active-branch-only evidence; it is not treated as proof that every branch was
 returned.
 
-The checkpoint store is the `history_state` table in the configured SQLite
-database; it contains no response body or browser state. Browser acquisition
-does not commit after each network page. Instead, sanitized observations,
-normalized evidence, coverage, revisits, and checkpoints commit together once
-per bounded collection result. A failed transaction leaves the previous result
-intact, and an interrupted acquisition replays from that prior durable state.
-Explicit backfill and reconciliation ranges are stored and used as requested;
-the incremental watermark is only consulted by an implicit refresh.
+In fixture-tested Stage 2 behavior, the checkpoint store is the `history_state`
+table in the configured SQLite database; it contains no response body or
+browser state. Each fetched page and its continuation/evidence are committed
+atomically. Successful earlier pages survive a later failure, and a restart
+resumes from the durable continuation. Explicit backfill and reconciliation
+ranges are stored and used as requested; the incremental watermark is only
+consulted by an implicit refresh.
 
 ## Fixture provenance
 

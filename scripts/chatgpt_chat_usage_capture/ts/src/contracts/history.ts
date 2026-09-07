@@ -15,12 +15,23 @@ export const DEFAULT_INDEX_PAGE_SIZE = 100;
 export const DEFAULT_MAX_INDEX_PAGES = 500;
 export const DEFAULT_MAX_MESSAGE_PAGES_PER_CONVERSATION = 100;
 export const DEFAULT_MAX_OLDER_HISTORY_AUDIT_PAGES = 1;
+export const OUTSTANDING_GENERATION_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+export const OUTSTANDING_GENERATION_REVISIT_BASE_DELAY_MS = 15 * 60 * 1000;
+export const OUTSTANDING_GENERATION_REVISIT_MAX_DELAY_MS = 6 * 60 * 60 * 1000;
 
 export type HistoryScope = "active" | "archived";
 export type HistoryCollectionMode =
   | "backfill"
   | "incremental"
   | "reconciliation";
+export type HistoryAccountPauseReason = "authentication" | "cooldown";
+export interface HistoryAccountState {
+  status: "ready" | "paused";
+  reason: HistoryAccountPauseReason | null;
+  pausedAt: string | null;
+  cooldownUntil: string | null;
+  lastError: string | null;
+}
 export type CheckpointStatus =
   | "not_started"
   | "in_progress"
@@ -45,6 +56,19 @@ export type OlderHistoryAuditStatus =
   | "in_progress"
   | "partial"
   | "complete";
+
+export type GenerationCompletionState = "nonterminal" | "unknown";
+
+export interface RevisitPageIssue {
+  reason: RevisitReason;
+  warnings: string[];
+}
+
+export interface OutstandingGenerationState {
+  state: GenerationCompletionState;
+  since: string;
+  timedOut: boolean;
+}
 
 export interface OlderHistoryAuditRequest {
   enabled: boolean;
@@ -71,6 +95,11 @@ export interface HistoryRange {
   end: string;
 }
 
+export interface DiscoveryCandidate {
+  summary: ConversationSummary;
+  missingUpdateTime: boolean;
+}
+
 export interface DiscoveryCheckpoint {
   stateVersion: typeof HISTORY_STATE_VERSION;
   accountId: string;
@@ -91,6 +120,10 @@ export interface DiscoveryCheckpoint {
   paginationState: PaginationState;
   warnings: string[];
   updatedAt: string;
+  /** SHA-256 fingerprint of the frozen offset-zero index page. */
+  headFingerprint?: string | null;
+  /** Candidates discovered by this scope and not yet durably acknowledged. */
+  candidateQueue?: DiscoveryCandidate[];
   olderHistoryAudit?: OlderHistoryAuditState;
 }
 
@@ -108,14 +141,32 @@ export interface RevisitEntry {
   lastError: string | null;
   detailPagesFetched: number;
   continuation: string | null;
+  /** Revision of the conversation when the saved continuation was issued. */
+  continuationRevision: string | null;
+  /** A page-shape/pagination issue that remains unresolved independently of budget. */
+  malformedPage: RevisitPageIssue | null;
+  /** Nonterminal or unproven generation completion remains unknown. */
+  outstandingGeneration: OutstandingGenerationState | null;
 }
 
 export interface HistoryCheckpointStore {
+  loadAccountState(): HistoryAccountState;
+  saveAccountState(state: HistoryAccountState): void;
   loadDiscovery(scope: HistoryScope): DiscoveryCheckpoint | null;
   saveDiscovery(checkpoint: DiscoveryCheckpoint): void;
+  acknowledgeCandidates(
+    conversationId: string,
+    scopes: readonly HistoryScope[],
+  ): void;
   listRevisits(): RevisitEntry[];
   upsertRevisit(entry: RevisitEntry): void;
   completeRevisit(accountId: string, conversationId: string): void;
+}
+
+export interface HistoryDiscoveryPageCommit {
+  checkpoint: DiscoveryCheckpoint;
+  identity: IdentityRecord;
+  scanStartedAt: string;
 }
 
 export interface HistoryPageCommit {
@@ -180,6 +231,9 @@ export interface HistoryCollectionOptions {
   maxIndexPagesPerScope?: number;
   maxMessagePagesPerConversation?: number;
   legacyFallbackApproved?: boolean;
+  onDiscoveryPageCommit?: (
+    page: HistoryDiscoveryPageCommit,
+  ) => Promise<void> | void;
   onPageCommit?: (
     page: HistoryPageCommit,
   ) => Promise<void> | void;
@@ -230,6 +284,7 @@ export interface HistoryCollectionResult {
   range: HistoryRange;
   scanStartedAt: string;
   status: "complete" | "partial" | "blocked";
+  accountState: HistoryAccountState;
   identity: IdentityRecord;
   scopes: ScopeCoverageResult[];
   conversations: AcquiredConversation[];

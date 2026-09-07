@@ -1,6 +1,64 @@
 # Integrated Stage-2 acceptance results
 
-## Remediation integration
+## Follow-up remediation integration
+
+Acceptance date: September 7, 2026. Exact base:
+`5f8012ba6c491b723c5f48e3d3a564646d696251`.
+Source scope remains `scripts/chatgpt_chat_usage_capture/ts` only.
+
+| Fix | Exact source commit |
+| --- | --- |
+| Docs | `e32fbe7827d20a676c223d97d6021d212e320a6f` |
+| Response cap | `e0674a5f6087a6fd554426f67ac528024a129519` |
+| Sanitizer budget | `e04d199599da155fe73d9466325cf02b31b39970` |
+| Reconstruction | `6c1eae83aea5ada733b1c282470f3c461c9ed00b` |
+| Revision/quarantine | `940ec58819c01742ff053880c8c499b8769ea241` |
+| Mapping | `b4000f90a08f338db05e2cc0f631d6cf42e50971` |
+| Account-wide stop | `8f7c7859f12f2444ad4bc324af1408cf9bca8799` |
+| Discovery durability | `44b53f96459086e5ef8a373ae120b6916ef2bf4f` |
+| Message continuation | `d5d389210c2ff69616844e69216cbb3c5971bfa5` |
+| Range/audit | `227fc55ee882bcba2c8df1e1173568636f1d3c19` |
+
+The full suite passes 146 tests in 15 files. Installation, critical audit,
+typecheck, lint, build, and diff checks pass. Audit reports zero vulnerabilities.
+Built fixture CLI inspect, backfill, repeated backfill, refresh, reconcile,
+report, models, rebuild preview, apply, and repeated apply pass.
+Three fixture attempts remain retained, with no definite requested-model or
+completed-answer counts and two possible completed answers. Provisional
+branches do not inherit prompt model or timestamp evidence. Unknown-time
+branches remain possible in a recent report, not definite usage.
+
+Populated schema-5 single-collector and shared-owner databases upgrade to
+schema 6 without changing existing rows across 16 data tables. A populated
+schema-3 database, generated from exact `f9fe690f188b24f37e322b207d363d46c349cf9f`
+source, upgrades to schema 6 retaining two observations, five message
+revisions, and three active attempts. Pending migrations and owner conversion
+are atomic, with conversion after quarantine columns exist. Applied migration
+1-5 contents remain unchanged. Foreign-key, integrity, and reopen checks pass.
+Rebuild preview/apply/repeat and collection replay pass after upgrades.
+First collection under changed sanitization can append observation revisions;
+subsequent identical replay inserts no evidence or attempts.
+
+Synthetic acceptance databases, relative to this package:
+`state/followup-cli-YtqeMA/usage.sqlite`,
+`state/followup-upgrade-WtSc80/single.sqlite`,
+`state/followup-upgrade-WtSc80/shared.sqlite`, and
+`state/followup-upgrade3-XzDXPG/usage.sqlite`.
+Artifacts are ignored and local-only.
+
+Discovery watermarks advance after clean discovery durably queues candidates,
+independently of detail revisits. Older-history audit completion waits for
+candidate acquisition. Explicit ranges retain full message evidence and use
+attempt-based report membership. Account-wide pauses, continuation revision
+checks, quarantine retention, and owner-consistent mapping coexist.
+No unresolved integration concern was identified. Live endpoint/profile
+acceptance remains unrun; fixture partial visibility and deferred stages remain.
+No live browser, container, Anthropic, Harness v2, or analysis files were touched.
+
+## Previous remediation integration
+
+The following records are historical; the follow-up gate above supersedes
+their counts, schema, and acquisition semantics.
 
 Acceptance date: September 7, 2026. Exact base:
 `f9fe690f188b24f37e322b207d363d46c349cf9f`.
@@ -43,8 +101,9 @@ closed.
 
 All checks used synthetic data, with no live browser, provider request,
 container, Python, Anthropic, Harness v2, or analysis-queue operation.
-Remaining spec concern: collector-specific mapping overrides can target shared
-owner activity; precedence for conflicting overrides is unspecified. See
+The base acceptance recorded a remaining shared-owner mapping concern.
+Collector-specific overrides for one canonical owner are now validated as one
+owner-scoped result, and conflicting effective overrides are rejected. See
 `known-limitations.md`.
 
 ## Original integration record

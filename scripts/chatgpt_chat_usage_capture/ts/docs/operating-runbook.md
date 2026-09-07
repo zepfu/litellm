@@ -61,14 +61,20 @@ remain local to the collector account even when activity is shared by owner.
   do not rotate accounts or copy credentials. A different identity needs a
   distinct local account ID.
 - `429`: transport throttling, not quota exhaustion. There is no automatic
-  retry/cooldown scheduler in Stage 2.
+  retry/cooldown scheduler in Stage 2. All account reads stop and a persisted
+  Retry-After cooldown blocks subsequent manual collection until eligible.
 - Schema drift, repeated cursors, or exhausted budgets: retain the database
   and review explicit pagination/coverage warnings.
 
 Historical backfill/reconciliation does not advance refresh watermarks.
-Refresh advances a scope only after clean discovery and detail acquisition with
-no pending revisits. A continuation from a different mode, range, or cutoff is
-not reused.
+Refresh advances a scope after clean discovery durably queues its candidates;
+detail revisits remain independent. Frozen acquisition metadata and a matching
+reread head are required to resume a saved index continuation.
+
+`collection.max_response_bytes` sets the response ceiling (default 33554432,
+32 MiB). Declared and actual response sizes are checked before JSON parsing.
+Sanitization remains bounded, with a 4096-node default and separate validation
+headroom for generated provenance.
 
 `complete` applies only to the declared available index/detail paths.
 `partial` retains known gaps; `unknown` means controls or scope could not be
@@ -96,8 +102,10 @@ Use `--mapping-version <stored-version>` for an explicit selection in
 collection, `models`, or `rebuild`; otherwise the latest stored version is used.
 Published versions are immutable. Event-time validity controls applicability;
 historical corrections require an explicit bounded interval. Inapplicable or
-draft mappings do not erase retained classifications. Keep overrides consistent
-across collectors for one owner; conflicting override precedence is unspecified.
+draft mappings never authorize a stale family to be retained after raw evidence
+changes: the applicable stored mapping is used, or the attempt remains
+explicitly unresolved. Collector-specific overrides are checked at canonical
+owner scope and conflicting overrides are rejected.
 
 ## Rebuild
 

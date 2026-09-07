@@ -62,7 +62,11 @@ Requested, recorded-final, and resolved raw model labels remain separate.
 Canonical families are derived through a versioned, reviewed exact mapping.
 Unmapped raw labels remain reportable. Published mappings are immutable;
 prospective versions and bounded historical corrections apply at event time.
-Draft or inapplicable mappings do not erase an existing classification.
+Changed raw evidence under an inapplicable mapping is re-evaluated with the
+applicable stored mapping; when none applies, all family fields remain
+unresolved with an explicit warning rather than retaining a stale family.
+Collector-specific overrides are validated at canonical-owner scope, so
+conflicting overrides for collectors sharing one owner are rejected.
 Reclassification preserves warnings and mapping provenance and does not create
 another attempt or reactivate a retired duplicate.
 

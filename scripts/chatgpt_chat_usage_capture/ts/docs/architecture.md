@@ -72,8 +72,9 @@ Backfill defaults to 14 elapsed days. Implicit refresh uses each scope's last
 clean implicit-refresh discovery start with a 48-hour overlap, without clamping
 an old watermark to the default range. Explicit ranges take precedence;
 historical scans do not advance refresh watermarks. Continuations resume only
-when mode, range, and cutoff match. Historical discovery includes conversations
-updated beyond the range end, but all page evidence respects its exclusive end.
+when frozen acquisition metadata and the reread head match. Explicit discovery
+includes conversations updated beyond the range end. Full message evidence is
+retained; report membership is bounded by attempt evidence, not acquisition time.
 Leading-page rereads leave changing indexes partial. Incomplete detail/message
 traversal and nonterminal generations retain revisits independently of cutoff.
 
@@ -87,16 +88,19 @@ lock spans browser requests. A failed page commit rolls back that page; prior
 successful pages and their continuations remain durable. Bad saved message
 continuations allow one bounded restart.
 
-Index completion and detail completion remain separate. Only clean implicit
-refresh scopes without incomplete details, warnings, or pending revisits
-advance their watermark. Observed Project and branch metadata still leave
+Index completion and detail completion remain separate. Clean implicit
+discovery advances its watermark once candidates are durably queued, even when
+detail work remains. Failed evidence commits retain candidates for restart.
+Observed Project and branch metadata still leave
 global visibility unproven. Older-history audit rotation is opt-in through the
-collector request API.
+collector request API; audit completion requires successful candidate acquisition.
 
 ## Ledger, reconstruction, and reports
 
-`src/ledger/store.ts` applies five ordered SQLite migrations with WAL, foreign
+`src/ledger/store.ts` applies six ordered SQLite migrations with WAL, foreign
 keys, and a busy timeout, checking applied migration names and checksums.
+Pending schemas and owner-scope conversion commit atomically; conversion runs
+after all required columns exist. Quarantine provenance survives revision replay.
 Migration 4 enables occurrence revisions and provenance; migration 5 adds
 mapping lifecycle columns and transactionally migrates legacy activity scopes.
 Legacy evidence IDs and revision occurrences remain available; duplicate owner
@@ -113,8 +117,12 @@ explicit rather than being guessed.
 Requested, recorded-final, and resolved model labels are independent. The
 initial mapping has canonical families but no slug rules. Published mappings
 are immutable, use event-time validity, and distinguish prospective changes
-from historical corrections. Rebuild preserves mapping warnings, linkage, and
-retired duplicates. Mapping history is separate from raw evidence.
+from historical corrections. Changed raw evidence uses the applicable stored
+mapping when the selected mapping is not yet applicable; without one, family
+fields remain unresolved. Collector-specific overrides are rejected when they
+would produce different results for collectors sharing one canonical owner.
+Rebuild preserves mapping warnings, lifecycle bounds, linkage, and retired
+duplicates. Mapping history is separate from raw evidence.
 `src/accounting/raw-model.ts` reports elapsed half-open intervals with
 mismatches, ambiguous/unknown times, surface/origin exclusions, and open
 coverage gaps. `src/accounting/reaggregate.ts` rebuilds from the same messages

@@ -5,7 +5,9 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  AuthenticationRequiredError,
   ChatGPTHistoryAdapter,
+  RateLimitedError,
   type HistoryTransport,
 } from "../../src/adapters/chatgpt/adapter.js";
 import { FixtureTransport } from "../../src/adapters/chatgpt/fixture-transport.js";
@@ -34,6 +36,11 @@ import type {
   HistoryScope,
   RevisitEntry,
 } from "../../src/contracts/history.js";
+import {
+  OUTSTANDING_GENERATION_REVISIT_BASE_DELAY_MS,
+  OUTSTANDING_GENERATION_REVISIT_MAX_DELAY_MS,
+  OUTSTANDING_GENERATION_TIMEOUT_MS,
+} from "../../src/contracts/history.js";
 
 const NOW = new Date("2026-09-07T12:00:00.000Z");
 const EXPLICIT_RANGE: HistoryRange = {
@@ -57,7 +64,9 @@ class ScriptedReader implements HistoryReader {
     HistoryScope,
     AdaptedPage<ConversationSummary>[]
   >();
+  readonly indexErrors = new Map<string, Error>();
   readonly details = new Map<string, ConversationDetailProjection>();
+  readonly detailErrors = new Map<string, Error>();
   readonly messagePages = new Map<
     string,
     Map<string, AdaptedPage<MessageRecord>>
@@ -88,6 +97,10 @@ class ScriptedReader implements HistoryReader {
       method: "GET",
       path: `/backend-api/conversations?scope=${scope}&offset=${offset}`,
     });
+    const error = this.indexErrors.get(`${scope}:${offset}`);
+    if (error) {
+      throw error;
+    }
     const sequence = this.indexSequences.get(scope);
     if (sequence && sequence.length > 0) {
       return sequence.shift()!;
@@ -105,6 +118,10 @@ class ScriptedReader implements HistoryReader {
       method: "GET",
       path: `/backend-api/conversations/${conversationId}`,
     });
+    const error = this.detailErrors.get(conversationId);
+    if (error) {
+      throw error;
+    }
     const detail = this.details.get(conversationId);
     if (!detail) {
       throw new Error("missing_detail");
@@ -342,6 +359,226 @@ describe("Stage-2A history collection", () => {
     expect(checkpoint?.paginationState).toBe("budget_exhausted");
   });
 
+  it.each([
+    {
+      label: "numeric",
+      retryAfter: "120",
+      cooldownUntil: "2026-09-07T12:02:00.000Z",
+    },
+    {
+      label: "date",
+      retryAfter: "Mon, 07 Sep 2026 12:05:00 GMT",
+      cooldownUntil: "2026-09-07T12:05:00.000Z",
+    },
+  ])(
+    "pauses all account reads after a $label Retry-After response",
+    async ({ retryAfter, cooldownUntil }) => {
+      const reader = new ScriptedReader();
+      const candidate = summary("conv-rate-limited");
+      reader.indexPages.set(
+        "active",
+        new Map([[0, indexPage([candidate], 1, false, "continuation")]]),
+      );
+      reader.indexPages.set("archived", new Map([[0, indexPage([])]]));
+      reader.indexErrors.set(
+        "active:1",
+        new RateLimitedError("rate limited", {
+          retryAfter,
+          path: "/backend-api/conversations",
+        }),
+      );
+
+      const store = new MemoryCheckpointStore();
+      const result = await new HistoryCollector(reader, {
+        accountId: "fixture-primary",
+        store,
+        clock: { now: () => NOW },
+      }).collect({
+        mode: "backfill",
+        range: EXPLICIT_RANGE,
+      });
+
+      expect(result.status).toBe("partial");
+      expect(result.identity.authState).toBe("paused");
+      expect(result.accountState).toEqual({
+        status: "paused",
+        reason: "cooldown",
+        pausedAt: NOW.toISOString(),
+        cooldownUntil,
+        lastError: "rate_limited",
+      });
+      expect(store.loadDiscovery("active")).toMatchObject({
+        status: "partial",
+        continuation: 1,
+        pagesFetched: 1,
+      });
+      expect(reader.requests).toEqual([
+        { method: "GET", path: "/api/auth/session" },
+        {
+          method: "GET",
+          path: "/backend-api/conversations?scope=active&offset=0",
+        },
+        {
+          method: "GET",
+          path: "/backend-api/conversations?scope=active&offset=1",
+        },
+      ]);
+      expect(reader.requests.some((request) => request.path.includes("archived")))
+        .toBe(false);
+      expect(
+        reader.requests.some((request) =>
+          request.path.includes("conv-rate-limited"),
+        ),
+      ).toBe(false);
+    },
+  );
+
+  it("pauses all remaining scopes and details after an authentication challenge", async () => {
+    const reader = new ScriptedReader();
+    const challenged = summary("conv-auth-challenge");
+    const later = summary("conv-after-auth-challenge");
+    const archived = summary("conv-archived");
+    addCompleteIndex(reader, [challenged, later], [archived]);
+    reader.detailErrors.set(
+      challenged.conversationId,
+      new AuthenticationRequiredError("login required", {
+        status: 403,
+        path: `/backend-api/conversations/${challenged.conversationId}`,
+      }),
+    );
+    reader.details.set(later.conversationId, detail(later.conversationId));
+    reader.messagePages.set(
+      later.conversationId,
+      new Map([["latest", completePage([])]]),
+    );
+
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store: new MemoryCheckpointStore(),
+      clock: { now: () => NOW },
+    }).collect({
+      mode: "backfill",
+      range: EXPLICIT_RANGE,
+    });
+
+    expect(result.status).toBe("partial");
+    expect(result.identity.authState).toBe("paused");
+    expect(result.accountState).toMatchObject({
+      status: "paused",
+      reason: "authentication",
+      cooldownUntil: null,
+      lastError: "auth_required",
+    });
+    expect(result.conversations.map((item) => item.summary.conversationId)).toEqual([
+      challenged.conversationId,
+    ]);
+    expect(result.conversations[0]?.revisit?.reason).toBe("detail_unavailable");
+    const challengeRequestIndex = reader.requests.findIndex((request) =>
+      request.path.includes(challenged.conversationId),
+    );
+    expect(challengeRequestIndex).toBeGreaterThan(-1);
+    expect(reader.requests.slice(challengeRequestIndex)).toEqual([
+      {
+        method: "GET",
+        path: `/backend-api/conversations/${challenged.conversationId}`,
+      },
+    ]);
+    expect(
+      reader.requests.some((request) =>
+        request.path.includes(later.conversationId),
+      ),
+    ).toBe(false);
+  });
+
+  it("does not issue a request during a persisted cooldown after restart", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "usage-capture-cooldown-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "history.sqlite");
+    const ledger = new Ledger(path);
+    ledger.upsertAccount(LEDGER_SCOPE);
+    const store = new SqliteCheckpointStore(ledger, LEDGER_SCOPE);
+    const reader = new ScriptedReader();
+    reader.indexErrors.set(
+      "active:0",
+      new RateLimitedError("rate limited", {
+        retryAfter: "3600",
+        path: "/backend-api/conversations",
+      }),
+    );
+
+    const first = await new HistoryCollector(reader, {
+      accountId: LEDGER_SCOPE.collectorAccountId,
+      store,
+      clock: { now: () => NOW },
+    }).collect({
+      mode: "backfill",
+      range: EXPLICIT_RANGE,
+    });
+    expect(first.accountState.cooldownUntil).toBe("2026-09-07T13:00:00.000Z");
+    ledger.transaction(() => store.persist());
+    ledger.close();
+
+    const reopened = new Ledger(path);
+    const restored = new SqliteCheckpointStore(reopened, LEDGER_SCOPE);
+    const resumedReader = new ScriptedReader();
+    const resumed = await new HistoryCollector(resumedReader, {
+      accountId: LEDGER_SCOPE.collectorAccountId,
+      store: restored,
+      clock: { now: () => new Date("2026-09-07T12:30:00.000Z") },
+    }).collect({
+      mode: "incremental",
+    });
+
+    expect(resumed.status).toBe("blocked");
+    expect(resumed.identity.authState).toBe("paused");
+    expect(resumed.accountState.cooldownUntil).toBe(
+      "2026-09-07T13:00:00.000Z",
+    );
+    expect(resumedReader.requests).toEqual([]);
+    reopened.close();
+  });
+
+  it("persists an authentication pause when the session read is challenged", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "usage-capture-auth-pause-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    const account = defaultConfig().accounts[0]!;
+    Object.assign(account, {
+      id: LEDGER_SCOPE.collectorAccountId,
+      expectedProviderUserId: LEDGER_SCOPE.providerUserId,
+      expectedWorkspaceId: LEDGER_SCOPE.workspaceId,
+      quotaOwnerId: LEDGER_SCOPE.quotaOwnerId,
+    });
+    const reader = new ScriptedReader();
+    reader.identity = {
+      ...reader.identity,
+      authState: "auth_required",
+      identityErrors: [],
+    };
+
+    const result = await collectIntoLedger(
+      reader,
+      ledger,
+      account,
+      { mode: "backfill", range: EXPLICIT_RANGE, now: NOW },
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.identity.authState).toBe("paused");
+    expect(ledger.listAccounts()[0]?.authState).toBe("paused");
+    const persisted = ledger.db
+      .prepare("SELECT state_json FROM history_state")
+      .get() as { state_json: string };
+    expect(JSON.parse(persisted.state_json).accountState).toMatchObject({
+      status: "paused",
+      reason: "authentication",
+    });
+    expect(reader.requests).toEqual([
+      { method: "GET", path: "/api/auth/session" },
+    ]);
+    ledger.close();
+  });
+
   it("stops at a message page budget and queues the conversation for revisit", async () => {
     const reader = new ScriptedReader();
     const candidate = summary("conv-message-budget");
@@ -432,11 +669,70 @@ describe("Stage-2A history collection", () => {
     expect(result.scopes.find((scope) => scope.scope === "active")).toMatchObject({
       coverage: "partial",
       paginationState: "repeated_cursor",
-      continuation: 0,
+      continuation: null,
     });
     expect(
       reader.requests.filter((request) => request.path.includes("scope=active")),
     ).toHaveLength(1);
+  });
+
+  it("invalidates a nonadvancing continuation and restarts at zero once", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-nonadvancing-discovery");
+    const firstPage = indexPage([candidate], 1, false, "continuation");
+    const badPage = indexPage([candidate], 1, false, "continuation");
+    reader.indexPages.set(
+      "active",
+      new Map([
+        [0, firstPage],
+        [1, badPage],
+      ]),
+    );
+    reader.indexPages.set("archived", new Map([[0, indexPage([])]]));
+    reader.details.set(candidate.conversationId, detail(candidate.conversationId));
+    reader.messagePages.set(
+      candidate.conversationId,
+      new Map([["latest", completePage([])]]),
+    );
+
+    const store = new MemoryCheckpointStore();
+    await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+      maxIndexPagesPerScope: 1,
+    }).collect({ mode: "incremental" });
+
+    reader.requests.length = 0;
+    reader.indexSequences.set("active", [
+      firstPage,
+      badPage,
+      indexPage([candidate]),
+      indexPage([candidate]),
+    ]);
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => new Date("2026-09-07T13:00:00.000Z") },
+    }).collect({
+      mode: "incremental",
+      now: new Date("2026-09-07T13:00:00.000Z"),
+    });
+    expect(
+      reader.requests
+        .filter((request) => request.path.includes("scope=active"))
+        .map((request) => request.path),
+    ).toEqual([
+      "/backend-api/conversations?scope=active&offset=0",
+      "/backend-api/conversations?scope=active&offset=1",
+      "/backend-api/conversations?scope=active&offset=0",
+      "/backend-api/conversations?scope=active&offset=0",
+    ]);
+    expect(result.scopes.find((scope) => scope.scope === "active")).toMatchObject({
+      continuation: null,
+    });
+    expect(result.warnings).toContain("nonadvancing_index_continuation");
+    expect(store.loadDiscovery("active")?.continuation).toBeNull();
   });
 
   it("acquires a conversation that becomes visible on a later index page", async () => {
@@ -488,7 +784,7 @@ describe("Stage-2A history collection", () => {
     });
   });
 
-  it("discovers historical summaries beyond the range end and bounds message evidence at that end", async () => {
+  it("keeps explicit incremental candidates and full message evidence beyond the range end", async () => {
     const reader = new ScriptedReader();
     const committedMessages: string[][] = [];
     const candidate = summary("conv-historical", {
@@ -525,18 +821,24 @@ describe("Stage-2A history collection", () => {
         committedMessages.push(page.messages.map((item) => item.messageId));
       },
     }).collect({
-      mode: "backfill",
+      mode: "incremental",
       range: EXPLICIT_RANGE,
     });
 
     expect(result.conversations).toHaveLength(1);
     expect(result.conversations[0]?.messages.map((item) => item.messageId)).toEqual([
       "msg-before-end",
+      "msg-at-end",
+      "msg-after-end",
     ]);
     expect(
       result.conversations[0]?.detail?.messages.map((item) => item.messageId),
-    ).toEqual(["msg-before-end"]);
-    expect(committedMessages.flat()).toEqual(["msg-before-end"]);
+    ).toEqual(["msg-before-end", "msg-at-end", "msg-after-end"]);
+    expect(committedMessages.flat()).toEqual([
+      "msg-before-end",
+      "msg-at-end",
+      "msg-after-end",
+    ]);
   });
 
   it("rereads the leading index page and leaves changing scans partial", async () => {
@@ -578,7 +880,7 @@ describe("Stage-2A history collection", () => {
     expect(result.status).toBe("partial");
     expect(result.scopes.find((scope) => scope.scope === "active")).toMatchObject({
       coverage: "partial",
-      continuation: 0,
+      continuation: null,
       pagesFetched: 3,
     });
     expect(result.warnings).toContain("leading_index_changed_during_scan");
@@ -768,6 +1070,9 @@ describe("Stage-2A history collection", () => {
       lastError: null,
       detailPagesFetched: 1,
       continuation: "stale-cursor",
+      continuationRevision: null,
+      malformedPage: null,
+      outstandingGeneration: null,
     });
 
     const result = await new HistoryCollector(reader, {
@@ -787,6 +1092,338 @@ describe("Stage-2A history collection", () => {
     expect(result.revisits).toHaveLength(0);
     expect(result.conversations[0]?.warnings).toContain(
       "messages_bad_continuation_restarting",
+    );
+  });
+
+  it("preserves a saved continuation when detail exposes a newer first cursor", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-saved-continuation");
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set("conv-saved-continuation", {
+      ...detail("conv-saved-continuation"),
+      continuation: "detail-first-cursor",
+      paginationState: "continuation",
+    });
+    reader.messagePages.set(
+      "conv-saved-continuation",
+      new Map([
+        [
+          "saved-cursor",
+          completePage([message("conv-saved-continuation", "msg-saved")]),
+        ],
+      ]),
+    );
+    const store = new MemoryCheckpointStore();
+    store.upsertRevisit({
+      stateVersion: 1,
+      accountId: "fixture-primary",
+      conversationId: "conv-saved-continuation",
+      scopes: ["active"],
+      status: "pending",
+      reason: "page_budget",
+      firstSeenAt: NOW.toISOString(),
+      lastSeenAt: NOW.toISOString(),
+      attempts: 1,
+      nextEligibleAt: NOW.toISOString(),
+      lastError: null,
+      detailPagesFetched: 1,
+      continuation: "saved-cursor",
+      continuationRevision: "2026-09-06T12:00:00.000Z|",
+      malformedPage: null,
+      outstandingGeneration: null,
+    });
+
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    }).collect({ mode: "incremental" });
+
+    expect(
+      reader.requests
+        .filter((request) =>
+          request.path.includes("conv-saved-continuation/messages"),
+        )
+        .map((request) => request.path),
+    ).toEqual([
+      "/backend-api/conversations/conv-saved-continuation/messages?before=saved-cursor",
+    ]);
+    expect(result.revisits[0]).toMatchObject({
+      reason: "incomplete_detail",
+      malformedPage: {
+        reason: "incomplete_detail",
+      },
+    });
+    expect(result.conversations[0]?.messages.map((item) => item.messageId)).toEqual([
+      "msg-saved",
+    ]);
+  });
+
+  it("restarts exactly once from newest when a saved continuation revision expires", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-expired-continuation");
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set("conv-expired-continuation", {
+      ...detail("conv-expired-continuation"),
+      updatedAt: "2026-09-07T11:00:00.000Z",
+      currentNode: "node-new",
+    });
+    reader.messagePages.set(
+      "conv-expired-continuation",
+      new Map([
+        [
+          "latest",
+          completePage([
+            message("conv-expired-continuation", "msg-newest"),
+          ]),
+        ],
+      ]),
+    );
+    const store = new MemoryCheckpointStore();
+    store.upsertRevisit({
+      stateVersion: 1,
+      accountId: "fixture-primary",
+      conversationId: "conv-expired-continuation",
+      scopes: ["active"],
+      status: "pending",
+      reason: "page_budget",
+      firstSeenAt: NOW.toISOString(),
+      lastSeenAt: NOW.toISOString(),
+      attempts: 1,
+      nextEligibleAt: NOW.toISOString(),
+      lastError: null,
+      detailPagesFetched: 1,
+      continuation: "saved-cursor",
+      continuationRevision: "2026-09-06T12:00:00.000Z|node-old",
+      malformedPage: null,
+      outstandingGeneration: null,
+    });
+
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    }).collect({ mode: "incremental" });
+
+    expect(
+      reader.requests
+        .filter((request) =>
+          request.path.includes("conv-expired-continuation/messages"),
+        )
+        .map((request) => request.path),
+    ).toEqual([
+      "/backend-api/conversations/conv-expired-continuation/messages?before=latest",
+    ]);
+    expect(result.revisits).toEqual([]);
+    expect(result.conversations[0]?.warnings).toContain(
+      "messages_saved_continuation_expired_restarting",
+    );
+  });
+
+  it("keeps malformed-page state separate from page-budget continuation progress", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-malformed-progress");
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set("conv-malformed-progress", detail("conv-malformed-progress"));
+    reader.messagePages.set(
+      "conv-malformed-progress",
+      new Map([
+        [
+          "latest",
+          {
+            ...continuationPage([], "cursor-1"),
+            coverage: "partial",
+            warnings: ["message_shape_warning"],
+          },
+        ],
+        ["cursor-1", continuationPage([], "cursor-2")],
+      ]),
+    );
+
+    const store = new MemoryCheckpointStore();
+    const collector = new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+      maxMessagePagesPerConversation: 1,
+    });
+    const first = await collector.collect({
+      mode: "backfill",
+      range: EXPLICIT_RANGE,
+    });
+    expect(first.revisits[0]).toMatchObject({
+      reason: "page_budget",
+      continuation: "cursor-1",
+      malformedPage: {
+        reason: "partial_detail",
+        warnings: ["message_shape_warning"],
+      },
+    });
+
+    const second = await collector.collect({
+      mode: "incremental",
+      now: new Date("2026-09-07T13:00:00.000Z"),
+    });
+    expect(second.revisits[0]).toMatchObject({
+      reason: "page_budget",
+      continuation: "cursor-2",
+      malformedPage: {
+        reason: "partial_detail",
+        warnings: ["message_shape_warning"],
+      },
+    });
+  });
+
+  it("clears malformed traversal state only after a validated terminal page", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-malformed-cleanup");
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set("conv-malformed-cleanup", detail("conv-malformed-cleanup"));
+    reader.messagePages.set(
+      "conv-malformed-cleanup",
+      new Map([
+        [
+          "latest",
+          {
+            ...completePage([]),
+            coverage: "partial",
+            warnings: ["message_shape_warning"],
+          },
+        ],
+      ]),
+    );
+
+    const store = new MemoryCheckpointStore();
+    const collector = new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    });
+    const first = await collector.collect({
+      mode: "backfill",
+      range: EXPLICIT_RANGE,
+    });
+    expect(first.revisits[0]).toMatchObject({
+      reason: "partial_detail",
+      continuation: null,
+      malformedPage: {
+        reason: "partial_detail",
+        warnings: ["message_shape_warning"],
+      },
+    });
+
+    reader.messagePages.set(
+      "conv-malformed-cleanup",
+      new Map([["latest", completePage([])]]),
+    );
+    const second = await collector.collect({
+      mode: "incremental",
+      now: new Date("2026-09-07T13:00:00.000Z"),
+    });
+    expect(second.revisits).toEqual([]);
+    expect(second.conversations[0]?.coverage).toBe("complete");
+  });
+
+  it("times out outstanding generations, backs off revisits, and preserves unknown completion", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-generation-timeout");
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set("conv-generation-timeout", detail("conv-generation-timeout"));
+    reader.messagePages.set(
+      "conv-generation-timeout",
+      new Map([
+        [
+          "latest",
+          completePage([
+            {
+              ...message("conv-generation-timeout", "msg-pending"),
+              status: "in_progress",
+              endTurn: false,
+            },
+          ]),
+        ],
+      ]),
+    );
+
+    const store = new MemoryCheckpointStore();
+    const collector = new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    });
+    const first = await collector.collect({
+      mode: "backfill",
+      range: EXPLICIT_RANGE,
+    });
+    const firstRevisit = first.revisits[0]!;
+    expect(firstRevisit.outstandingGeneration).toEqual({
+      state: "nonterminal",
+      since: NOW.toISOString(),
+      timedOut: false,
+    });
+    expect(
+      new Date(firstRevisit.nextEligibleAt).getTime() - NOW.getTime(),
+    ).toBe(OUTSTANDING_GENERATION_REVISIT_BASE_DELAY_MS);
+
+    const requestsBeforeEarlyPass = reader.requests.length;
+    const early = await collector.collect({
+      mode: "incremental",
+      now: new Date(
+        NOW.getTime() + OUTSTANDING_GENERATION_REVISIT_BASE_DELAY_MS / 2,
+      ),
+    });
+    expect(early.conversations).toEqual([]);
+    expect(reader.requests.length).toBeGreaterThan(requestsBeforeEarlyPass);
+    expect(
+      reader.requests
+        .slice(requestsBeforeEarlyPass)
+        .some((request) =>
+          request.path.includes("conv-generation-timeout/messages"),
+        ),
+    ).toBe(false);
+
+    reader.messagePages.set(
+      "conv-generation-timeout",
+      new Map([
+        [
+          "latest",
+          completePage([
+            {
+              ...message("conv-generation-timeout", "msg-pending"),
+              status: null,
+              endTurn: false,
+              generationId: "generation-1",
+              requestId: "request-1",
+            },
+          ]),
+        ],
+      ]),
+    );
+    const timedOutAt = new Date(
+      NOW.getTime() + OUTSTANDING_GENERATION_TIMEOUT_MS + 60_000,
+    );
+    const timedOut = await collector.collect({
+      mode: "incremental",
+      now: timedOutAt,
+    });
+    const timedOutRevisit = timedOut.revisits[0]!;
+    expect(timedOutRevisit.outstandingGeneration).toEqual({
+      state: "unknown",
+      since: NOW.toISOString(),
+      timedOut: true,
+    });
+    expect(
+      new Date(timedOutRevisit.nextEligibleAt).getTime() -
+        timedOutAt.getTime(),
+    ).toBe(OUTSTANDING_GENERATION_REVISIT_MAX_DELAY_MS);
+    expect(timedOut.conversations[0]?.messages[0]?.generationId).toBe(
+      "generation-1",
+    );
+    expect(timedOut.conversations[0]?.warnings).toContain(
+      "generation_completion_unknown",
+    );
+    expect(timedOut.conversations[0]?.warnings).toContain(
+      "nonterminal_generation_timeout",
     );
   });
 
@@ -817,11 +1454,19 @@ describe("Stage-2A history collection", () => {
       );
     }
     const store = new MemoryCheckpointStore();
+    const auditCountsAtCommit: number[] = [];
     const collector = new HistoryCollector(reader, {
       accountId: "fixture-primary",
       store,
       clock: { now: () => NOW },
       maxIndexPagesPerScope: 1,
+      onPageCommit: (page) => {
+        if (page.summary.conversationId === "conv-older-audit" && page.detail) {
+          auditCountsAtCommit.push(
+            store.loadDiscovery("active")?.olderHistoryAudit?.conversationsAudited ?? -1,
+          );
+        }
+      },
     });
 
     const first = await collector.collect({
@@ -840,12 +1485,43 @@ describe("Stage-2A history collection", () => {
       olderHistoryAudit: { enabled: true, maxPages: 1 },
     });
     expect(second.coverage.olderHistoryAudit.active.status).toBe("complete");
+    expect(second.coverage.olderHistoryAudit.active.conversationsAudited).toBe(1);
+    expect(auditCountsAtCommit).toEqual([0]);
     expect(second.conversations.map((item) => item.summary.conversationId)).toContain(
       "conv-older-audit",
     );
     expect(store.loadDiscovery("active")?.olderHistoryAudit?.lastCompletedAt).toBe(
-      "2026-09-07T13:00:00.000Z",
+      NOW.toISOString(),
     );
+  });
+
+  it("keeps an older-history audit partial when selected detail acquisition fails", async () => {
+    const reader = new ScriptedReader();
+    const older = summary("conv-older-audit-failure", {
+      updatedAt: "2026-08-01T12:00:00.000Z",
+    });
+    addCompleteIndex(reader, [older], []);
+
+    const store = new MemoryCheckpointStore();
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    }).collect({
+      mode: "incremental",
+      olderHistoryAudit: { enabled: true, maxPages: 1 },
+    });
+
+    expect(result.coverage.active.olderHistoryAudit).toMatchObject({
+      status: "partial",
+      conversationsAudited: 0,
+      lastCompletedAt: null,
+    });
+    expect(store.loadDiscovery("active")?.olderHistoryAudit).toMatchObject({
+      status: "partial",
+      conversationsAudited: 0,
+      lastCompletedAt: null,
+    });
   });
 
   it("uses the 48-hour overlap for incremental discovery but honors explicit ranges over newer watermarks", async () => {
@@ -965,7 +1641,7 @@ describe("Stage-2A history collection", () => {
     );
   });
 
-  it("resumes only when the frozen mode, range, and cutoff all match", async () => {
+  it("resumes only when frozen discovery metadata matches", async () => {
     const reader = new ScriptedReader();
     const candidate = summary("conv-resume");
     reader.indexPages.set(
@@ -983,25 +1659,31 @@ describe("Stage-2A history collection", () => {
     );
 
     const store = new MemoryCheckpointStore();
-    const partial = testCheckpoint("active", {
-      status: "partial",
-      mode: "backfill",
-      range: EXPLICIT_RANGE,
-      candidateCutoff: EXPLICIT_RANGE.start,
-      continuation: 1,
-      paginationState: "budget_exhausted",
-      lastCompleteDiscoveryStartedAt: null,
-    });
+    await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+      maxIndexPagesPerScope: 1,
+    }).collect({ mode: "backfill", range: EXPLICIT_RANGE });
+    const partial = store.loadDiscovery("active")!;
+    expect(partial.continuation).toBe(1);
+    expect(partial.headFingerprint).toBeTruthy();
 
-    store.saveDiscovery(partial);
+    reader.requests.length = 0;
     await new HistoryCollector(reader, {
       accountId: "fixture-primary",
       store,
       clock: { now: () => NOW },
     }).collect({ mode: "backfill", range: EXPLICIT_RANGE });
     expect(
-      reader.requests.find((request) => request.path.includes("scope=active"))?.path,
-    ).toContain("offset=1");
+      reader.requests
+        .filter((request) => request.path.includes("scope=active"))
+        .map((request) => request.path),
+    ).toEqual([
+      "/backend-api/conversations?scope=active&offset=0",
+      "/backend-api/conversations?scope=active&offset=1",
+      "/backend-api/conversations?scope=active&offset=0",
+    ]);
 
     reader.requests.length = 0;
     for (const mismatch of [
@@ -1077,6 +1759,85 @@ describe("Stage-2A history collection", () => {
     );
   });
 
+  it("freezes an implicit range and scan start while resuming discovery", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-frozen-discovery");
+    reader.indexPages.set(
+      "active",
+      new Map([
+        [0, indexPage([candidate], 1, false, "continuation")],
+        [1, indexPage([candidate])],
+      ]),
+    );
+    reader.indexPages.set("archived", new Map([[0, indexPage([])]]));
+    reader.details.set(candidate.conversationId, detail(candidate.conversationId));
+    reader.messagePages.set(
+      candidate.conversationId,
+      new Map([["latest", completePage([])]]),
+    );
+
+    const store = new MemoryCheckpointStore();
+    const first = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+      maxIndexPagesPerScope: 1,
+    }).collect({ mode: "incremental" });
+    const firstCheckpoint = store.loadDiscovery("active")!;
+    expect(firstCheckpoint).toMatchObject({
+      continuation: 1,
+      scanStartedAt: NOW.toISOString(),
+      range: first.range,
+    });
+    expect(firstCheckpoint.headFingerprint).toBeTruthy();
+
+    reader.requests.length = 0;
+    const later = new Date("2026-09-07T13:00:00.000Z");
+    const second = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => later },
+    }).collect({ mode: "incremental", now: later });
+
+    expect(second.range).toEqual(first.range);
+    expect(second.scanStartedAt).toBe(first.scanStartedAt);
+    expect(
+      reader.requests
+        .filter((request) => request.path.includes("scope=active"))
+        .map((request) => request.path),
+    ).toEqual([
+      "/backend-api/conversations?scope=active&offset=0",
+      "/backend-api/conversations?scope=active&offset=1",
+      "/backend-api/conversations?scope=active&offset=0",
+    ]);
+    expect(store.loadDiscovery("active")?.headFingerprint).toBe(
+      firstCheckpoint.headFingerprint,
+    );
+  });
+
+  it("advances a clean discovery watermark while detail work remains outstanding", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-detail-outstanding");
+    addCompleteIndex(reader, [candidate], []);
+    const store = new MemoryCheckpointStore();
+
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    }).collect({ mode: "incremental" });
+
+    expect(result.revisits).toMatchObject([
+      { conversationId: candidate.conversationId, reason: "incomplete_detail" },
+    ]);
+    expect(store.loadDiscovery("active")).toMatchObject({
+      status: "complete",
+      continuation: null,
+      lastCompleteDiscoveryStartedAt: NOW.toISOString(),
+      candidateQueue: [],
+    });
+  });
+
   it("uses the fourteen-day reconciliation range while acquiring outstanding work", async () => {
     const reader = new ScriptedReader();
     addCompleteIndex(reader, [], []);
@@ -1099,6 +1860,10 @@ describe("Stage-2A history collection", () => {
       nextEligibleAt: NOW.toISOString(),
       lastError: "adapter_error",
       detailPagesFetched: 1,
+      continuation: null,
+      continuationRevision: null,
+      malformedPage: null,
+      outstandingGeneration: null,
     });
 
     const result = await new HistoryCollector(reader, {
@@ -1156,6 +1921,16 @@ describe("Stage-2A history collection", () => {
       lastError: "adapter_error",
       detailPagesFetched: 1,
       continuation: "cursor-1",
+      continuationRevision: "revision-1",
+      malformedPage: {
+        reason: "partial_detail",
+        warnings: ["message_shape_warning"],
+      },
+      outstandingGeneration: {
+        state: "unknown",
+        since: "2026-09-06T12:00:00.000Z",
+        timedOut: true,
+      },
     };
     first.saveDiscovery(checkpoint);
     first.upsertRevisit(revisit);
@@ -1267,7 +2042,60 @@ describe("Stage-2A history collection", () => {
     }
   });
 
-  it("does not persist a failed page's mutated continuation", async () => {
+  it("atomically persists an index-page candidate queue before a later page fails", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "usage-capture-discovery-atomicity-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    ledger.upsertAccount(LEDGER_SCOPE);
+    const store = new SqliteCheckpointStore(ledger, LEDGER_SCOPE);
+    const reader = new ScriptedReader();
+    const first = summary("conv-discovery-queued");
+    const second = summary("conv-discovery-later");
+    reader.indexPages.set(
+      "active",
+      new Map([
+        [0, indexPage([first], 1, false, "continuation")],
+        [1, indexPage([second])],
+      ]),
+    );
+    reader.indexPages.set("archived", new Map([[0, indexPage([])]]));
+
+    let commits = 0;
+    try {
+      await expect(
+        new HistoryCollector(reader, {
+          accountId: "fixture-primary",
+          store,
+          clock: { now: () => NOW },
+          onDiscoveryPageCommit: () => {
+            commits += 1;
+            ledger.transaction(() => {
+              store.persist();
+              if (commits === 3) {
+                throw new Error("injected discovery checkpoint failure");
+              }
+            });
+          },
+        }).collect({ mode: "backfill", range: EXPLICIT_RANGE }),
+      ).rejects.toThrow("injected discovery checkpoint failure");
+
+      const durable = new SqliteCheckpointStore(ledger, LEDGER_SCOPE)
+        .loadDiscovery("active");
+      expect(commits).toBe(3);
+      expect(durable).toMatchObject({
+        status: "in_progress",
+        continuation: 1,
+        pagesFetched: 1,
+      });
+      expect(durable?.candidateQueue?.map((item) => item.summary.conversationId))
+        .toEqual([first.conversationId]);
+      expect(durable?.headFingerprint).toBeTruthy();
+    } finally {
+      ledger.close();
+    }
+  });
+
+  it("persists discovery state while rolling back failed detail evidence", async () => {
     const directory = mkdtempSync(join(tmpdir(), "usage-capture-page-atomicity-"));
     temporaryDirectories.push(directory);
     const ledger = new Ledger(join(directory, "usage.sqlite"));
@@ -1326,13 +2154,32 @@ describe("Stage-2A history collection", () => {
           now: new Date("2026-09-07T13:00:00.000Z"),
         }),
       ).rejects.toThrow("injected failed page");
-      expect(
+      const persistedAfterFailure = JSON.parse(
         (
           ledger.db
             .prepare("SELECT state_json FROM history_state")
             .get() as { state_json: string }
         ).state_json,
-      ).toBe(persistedBeforeFailure);
+      ) as {
+        checkpoints: Record<string, Record<string, unknown>>;
+        revisits: unknown[];
+      };
+      const priorState = JSON.parse(persistedBeforeFailure) as {
+        revisits: unknown[];
+      };
+      expect(persistedAfterFailure.checkpoints.active).toMatchObject({
+        mode: "incremental",
+        continuation: null,
+        lastCompleteDiscoveryStartedAt: "2026-09-07T13:00:00.000Z",
+        candidateQueue: [
+          {
+            summary: {
+              conversationId: candidate.conversationId,
+            },
+          },
+        ],
+      });
+      expect(persistedAfterFailure.revisits).toEqual(priorState.revisits);
     } finally {
       ledger.close();
     }

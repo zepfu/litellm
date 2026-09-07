@@ -13,9 +13,17 @@ export const ADAPTER_VERSION = "chatgpt-chat-history-v1";
 export const SURFACE_CHAT = "chat";
 
 export const DEFAULT_MAX_SANITIZER_DEPTH = 16;
-export const DEFAULT_MAX_SANITIZER_NODES = 1024;
+/**
+ * Sized for the configured 100-message history page while remaining bounded.
+ */
+export const DEFAULT_MAX_SANITIZER_NODES = 4096;
 export const DEFAULT_MAX_SANITIZER_DIAGNOSTICS = 32;
 export const DEFAULT_MAX_DIAGNOSTIC_KEY_LENGTH = 96;
+
+const MAX_SANITIZER_NODES = 100_000;
+const MAX_SANITIZER_DIAGNOSTICS = 256;
+const PROVENANCE_VALIDATION_NODE_RESERVE =
+  32 + MAX_SANITIZER_DIAGNOSTICS * 2;
 
 export type SanitizationStatus = "complete" | "incomplete" | "error";
 
@@ -308,14 +316,22 @@ function normalizeBudget(value: unknown, fallback: number, maximum: number): num
   return Math.min(Number(value), maximum);
 }
 
-function createTraversalState(options: SanitizerOptions = {}): TraversalState {
+function createTraversalState(
+  options: SanitizerOptions = {},
+  nodeReserve = 0,
+): TraversalState {
+  const configuredMaxNodes = normalizeBudget(
+    options.maxNodes,
+    DEFAULT_MAX_SANITIZER_NODES,
+    MAX_SANITIZER_NODES,
+  );
   return {
     maxDepth: normalizeBudget(options.maxDepth, DEFAULT_MAX_SANITIZER_DEPTH, 256),
-    maxNodes: normalizeBudget(options.maxNodes, DEFAULT_MAX_SANITIZER_NODES, 100_000),
+    maxNodes: configuredMaxNodes + nodeReserve,
     maxDiagnostics: normalizeBudget(
       options.maxDiagnostics,
       DEFAULT_MAX_SANITIZER_DIAGNOSTICS,
-      256,
+      MAX_SANITIZER_DIAGNOSTICS,
     ),
     maxDiagnosticKeyLength: normalizeBudget(
       options.maxDiagnosticKeyLength,
@@ -1276,7 +1292,7 @@ export function assertNoSecrets(
   path = "root",
   options: SanitizerOptions = {},
 ): void {
-  const state = createTraversalState(options);
+  const state = createTraversalState(options, PROVENANCE_VALIDATION_NODE_RESERVE);
   walkNoSecrets(value, path, state, 0);
   if (state.status !== "complete") {
     throw new PrivacyError(`secret check incomplete (${state.status})`);

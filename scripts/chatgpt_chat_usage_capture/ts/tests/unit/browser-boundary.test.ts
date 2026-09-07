@@ -31,6 +31,8 @@ import {
 } from "../../src/browser/session.js";
 import { SESSION_ROUTE } from "../../src/adapters/chatgpt/adapter.js";
 
+const MIB = 1024 * 1024;
+
 function makeConfig(profilePath: string) {
   return {
     adapter: "playwright_persistent_context" as const,
@@ -38,6 +40,7 @@ function makeConfig(profilePath: string) {
     headless: true,
     allowInteractiveLogin: false,
     requestTimeoutSeconds: 1,
+    maxResponseBytes: MAX_RESPONSE_BYTES,
   };
 }
 
@@ -126,6 +129,43 @@ describe("browser boundary", () => {
     );
   });
 
+  it("should use the 32 MiB default and accept a declared 16 MiB response without allocating it", async () => {
+    const profilePath = join(tempRoot, "personal-primary");
+    mkdirSync(profilePath);
+    const body = Buffer.from(JSON.stringify({ ok: true }));
+    const { response } = makeResponse(200, body, {
+      "content-type": "application/json",
+      "content-length": String(16 * MIB),
+    });
+    installContext(response);
+    const transport = new PlaywrightTransport(makeConfig(profilePath));
+
+    expect(MAX_RESPONSE_BYTES).toBe(32 * MIB);
+    await expect(transport.request("GET", SESSION_ROUTE)).resolves.toMatchObject({
+      ok: true,
+    });
+  });
+
+  it("should pass an overridden response ceiling to the production transport", async () => {
+    const profilePath = join(tempRoot, "personal-primary");
+    mkdirSync(profilePath);
+    const { response, readBody } = makeResponse(
+      200,
+      Buffer.from("{}"),
+      { "content-length": String(16 * MIB) },
+    );
+    installContext(response);
+    const transport = new PlaywrightTransport({
+      ...makeConfig(profilePath),
+      maxResponseBytes: 8 * MIB,
+    });
+
+    await expect(transport.request("GET", SESSION_ROUTE)).rejects.toThrow(
+      `${8 * MIB} byte limit`,
+    );
+    expect(readBody).not.toHaveBeenCalled();
+  });
+
   it("should fail closed on an HTTP redirect without parsing its body", async () => {
     const profilePath = join(tempRoot, "personal-primary");
     mkdirSync(profilePath);
@@ -159,7 +199,7 @@ describe("browser boundary", () => {
   });
 
   it("should reject an actual response larger than the byte ceiling before JSON parsing", async () => {
-    const body = Buffer.alloc(MAX_RESPONSE_BYTES + 1, 0x20);
+    const body = { byteLength: MAX_RESPONSE_BYTES + 1 } as Uint8Array;
     const { response } = makeResponse(200, body);
 
     await expect(adaptResponse(response)).rejects.toThrow(

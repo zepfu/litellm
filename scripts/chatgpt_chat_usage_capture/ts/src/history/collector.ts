@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import {
   AuthenticationRequiredError,
   CapabilityError,
@@ -7,17 +9,24 @@ import {
 } from "../adapters/chatgpt/adapter.js";
 import type {
   AcquiredConversation,
+  HistoryAccountState,
+  DiscoveryCandidate,
   DiscoveryCheckpoint,
+  GenerationCompletionState,
   HistoryCollectionOptions,
   HistoryCollectionRequest,
   HistoryCollectionResult,
   HistoryCoverageResult,
   HistoryRange,
+  HistoryDiscoveryPageCommit,
+  HistoryCheckpointStore,
   HistoryPageCommit,
   HistoryReader,
   HistoryScope,
   OlderHistoryAuditCoverage,
   OlderHistoryAuditState,
+  OutstandingGenerationState,
+  RevisitPageIssue,
   RevisitEntry,
   RevisitReason,
   ScopeCoverageResult,
@@ -30,6 +39,9 @@ import {
   DEFAULT_MAX_OLDER_HISTORY_AUDIT_PAGES,
   DEFAULT_OVERLAP_MS,
   HISTORY_STATE_VERSION,
+  OUTSTANDING_GENERATION_REVISIT_BASE_DELAY_MS,
+  OUTSTANDING_GENERATION_REVISIT_MAX_DELAY_MS,
+  OUTSTANDING_GENERATION_TIMEOUT_MS,
 } from "../contracts/history.js";
 import type {
   AdaptedPage,
@@ -52,6 +64,9 @@ interface ScopeDiscoveryResult {
   summaries: ConversationSummary[];
   coverage: ScopeCoverageResult;
   warnings: string[];
+  auditState: OlderHistoryAuditState;
+  auditCandidateIds: string[];
+  auditScanComplete: boolean;
 }
 
 interface DetailAcquisition {
@@ -61,6 +76,20 @@ interface DetailAcquisition {
   coverage: AcquiredConversation["coverage"];
   warnings: string[];
   detailPagesFetched: number;
+}
+
+interface RevisitOptions {
+  continuation?: string | null;
+  continuationRevision?: string | null;
+  malformedPage?: RevisitPageIssue | null;
+  outstandingGeneration?: OutstandingGenerationState | null;
+  nextEligibleAt?: string;
+  pagesFetched?: number;
+  incrementAttempt?: boolean;
+}
+
+interface AuditEvidence {
+  committedCandidateIds: Set<string>;
 }
 
 const TERMINAL_GENERATION_STATUSES = new Set([
@@ -122,7 +151,7 @@ export class HistoryCollector {
     request: HistoryCollectionRequest,
   ): Promise<HistoryCollectionResult> {
     const now = request.now ?? this.options.clock?.now() ?? new Date();
-    const scanStartedAt = now.toISOString();
+    const initialScanStartedAt = now.toISOString();
     const rangeOptions: {
       mode: HistoryCollectionRequest["mode"];
       now: Date;
@@ -136,7 +165,7 @@ export class HistoryCollector {
     if (request.range) {
       rangeOptions.range = request.range;
     }
-    const requestedRange = resolveRequestedRange(rangeOptions);
+    let requestedRange = resolveRequestedRange(rangeOptions);
     validatePositiveInteger(
       request.indexPageSize ?? this.indexPageSize,
       "index page size",
@@ -156,7 +185,72 @@ export class HistoryCollector {
         "older-history audit page budget",
       );
     }
-    const identity = await this.readIdentity();
+    const frozenAcquisition = frozenImplicitAcquisition(
+      this.options.store,
+      request,
+    );
+    const scanStartedAt =
+      frozenAcquisition?.scanStartedAt ?? initialScanStartedAt;
+    if (frozenAcquisition) {
+      requestedRange = frozenAcquisition.range;
+    }
+    const persistedAccountState = this.options.store.loadAccountState();
+    if (isActiveCooldown(persistedAccountState, now)) {
+      return blockedResult(
+        this.options.accountId,
+        request.mode,
+        requestedRange,
+        scanStartedAt,
+        pausedIdentity(null, persistedAccountState),
+        accountPauseWarning(persistedAccountState),
+        persistedAccountState,
+      );
+    }
+    if (
+      persistedAccountState.status === "paused" &&
+      persistedAccountState.reason === "cooldown"
+    ) {
+      this.options.store.saveAccountState(readyAccountState());
+    }
+
+    let identity = await this.readIdentity(now);
+    if (identity.authState === "auth_required") {
+      const accountState = this.pauseForError(
+        new AuthenticationRequiredError(
+          "authentication required during session inspection",
+          { status: 401, path: "/api/auth/session" },
+        ),
+        now,
+      );
+      identity = pausedIdentity(identity, accountState);
+      return blockedResult(
+        this.options.accountId,
+        request.mode,
+        requestedRange,
+        scanStartedAt,
+        identity,
+        accountPauseWarning(accountState),
+        accountState,
+      );
+    }
+    if (
+      identity.authState === "paused" &&
+      this.options.store.loadAccountState().status === "paused"
+    ) {
+      const accountState = this.options.store.loadAccountState();
+      return blockedResult(
+        this.options.accountId,
+        request.mode,
+        requestedRange,
+        scanStartedAt,
+        pausedIdentity(identity, accountState),
+        accountPauseWarning(accountState),
+        accountState,
+      );
+    }
+    if (identity.authState === "ready") {
+      this.options.store.saveAccountState(readyAccountState());
+    }
 
     if (identity.authState !== "ready" || identity.surface !== "chat") {
       return blockedResult(
@@ -166,22 +260,29 @@ export class HistoryCollector {
         scanStartedAt,
         identity,
         "history collection requires a verified ready Chat identity",
+        this.options.store.loadAccountState(),
       );
     }
 
     const candidates = new Map<string, Candidate>();
+    const discoveries: ScopeDiscoveryResult[] = [];
     const scopeResults: ScopeCoverageResult[] = [];
     const warnings: string[] = [];
     let pagesFetched = 0;
 
     for (const scope of ["active", "archived"] as const) {
-      const discovery = await this.discoverScope(
+      if (this.options.store.loadAccountState().status === "paused") {
+        break;
+      }
+      const discovery = await this.discoverScopeDurable(
         scope,
         request,
         requestedRange,
         now,
         scanStartedAt,
+        identity,
       );
+      discoveries.push(discovery);
       scopeResults.push(discovery.coverage);
       pagesFetched += discovery.coverage.pagesFetched;
       warnings.push(...discovery.warnings);
@@ -200,6 +301,9 @@ export class HistoryCollector {
             missingUpdateTime: summary.updatedAt === null,
           });
         }
+      }
+      if (this.options.store.loadAccountState().status === "paused") {
+        break;
       }
     }
 
@@ -222,18 +326,52 @@ export class HistoryCollector {
       });
     }
 
+    const auditEvidence = new Map<HistoryScope, AuditEvidence>(
+      discoveries.map((discovery) => [
+        discovery.scope,
+        { committedCandidateIds: new Set<string>() },
+      ]),
+    );
     const conversations: AcquiredConversation[] = [];
     let detailPagesFetched = 0;
+    const revisitByConversation = new Map(
+      this.options.store
+        .listRevisits()
+        .map((revisit) => [revisit.conversationId, revisit]),
+    );
     for (const candidate of candidates.values()) {
+      if (this.options.store.loadAccountState().status === "paused") {
+        break;
+      }
+      const revisit = revisitByConversation.get(candidate.summary.conversationId);
+      if (
+        revisit &&
+        new Date(revisit.nextEligibleAt).getTime() > scanTime
+      ) {
+        continue;
+      }
       const acquisition = await this.acquireConversation(
         candidate,
         now,
         request,
         identity,
         scanStartedAt,
-        requestedRange,
       );
       detailPagesFetched += acquisition.detailPagesFetched;
+      for (const discovery of discoveries) {
+        if (
+          discovery.auditCandidateIds.includes(
+            candidate.summary.conversationId,
+          ) &&
+          acquisition.detail !== null &&
+          acquisition.coverage === "complete" &&
+          acquisition.revisit === null
+        ) {
+          auditEvidence
+            .get(discovery.scope)
+            ?.committedCandidateIds.add(candidate.summary.conversationId);
+        }
+      }
       conversations.push({
         summary: candidate.summary,
         scopes: [...candidate.scopes].sort(),
@@ -248,22 +386,30 @@ export class HistoryCollector {
           ...acquisition.warnings,
         ],
       });
+      if (this.options.store.loadAccountState().status === "paused") {
+        break;
+      }
     }
 
-    const revisits = this.options.store.listRevisits();
-    const coverage = this.buildCoverage(scopeResults, conversations, warnings);
-    const status =
-      coverage.overall === "complete" && revisits.length === 0
-        ? "complete"
-        : "partial";
-    this.advanceWatermarksIfEligible(
-      request,
+    this.finalizeOlderHistoryAudits(
+      discoveries,
+      auditEvidence,
       scanStartedAt,
       now,
-      scopeResults,
-      conversations,
-      revisits,
     );
+    const revisits = this.options.store.listRevisits();
+    const accountState = this.options.store.loadAccountState();
+    if (accountState.status === "paused") {
+      identity = pausedIdentity(identity, accountState);
+      warnings.push(accountPauseWarning(accountState));
+    }
+    const coverage = this.buildCoverage(scopeResults, conversations, warnings);
+    const status =
+      accountState.status !== "paused" &&
+      coverage.overall === "complete" &&
+      revisits.length === 0
+        ? "complete"
+        : "partial";
 
     return {
       accountId: this.options.accountId,
@@ -271,6 +417,7 @@ export class HistoryCollector {
       range: requestedRange,
       scanStartedAt,
       status,
+      accountState,
       identity,
       scopes: scopeResults,
       conversations,
@@ -282,10 +429,14 @@ export class HistoryCollector {
     };
   }
 
-  private async readIdentity(): Promise<IdentityRecord> {
+  private async readIdentity(now: Date): Promise<IdentityRecord> {
     try {
       return await this.reader.inspectSessionIdentity();
     } catch (error) {
+      if (isAccountStopError(error)) {
+        const accountState = this.pauseForError(error, now);
+        return pausedIdentity(null, accountState, errorCode(error));
+      }
       return {
         providerUserId: null,
         workspaceId: null,
@@ -300,91 +451,275 @@ export class HistoryCollector {
     }
   }
 
-  private async discoverScope(
+  private pauseForError(
+    error: unknown,
+    now: Date,
+  ): HistoryAccountState {
+    const accountState: HistoryAccountState = {
+      status: "paused",
+      reason: isRateLimitedError(error) ? "cooldown" : "authentication",
+      pausedAt: now.toISOString(),
+      cooldownUntil:
+        error instanceof HttpStatusError
+          ? retryAfterDeadline(error.retryAfter, now)
+          : null,
+      lastError: errorCode(error),
+    };
+    this.options.store.saveAccountState(accountState);
+    return accountState;
+  }
+
+  private async discoverScopeDurable(
     scope: HistoryScope,
     request: HistoryCollectionRequest,
     requestedRange: HistoryRange,
     now: Date,
     scanStartedAt: string,
+    identity: IdentityRecord,
   ): Promise<ScopeDiscoveryResult> {
     const previous = this.options.store.loadDiscovery(scope);
     const explicitRange = request.range !== undefined;
-    const candidateCutoff = this.candidateCutoff(
+    const calculatedCandidateCutoff = this.candidateCutoff(
       request.mode,
       requestedRange,
       previous,
       explicitRange,
       request.overlapMs ?? this.overlapMs,
     );
+    const reuseFrozen = shouldReuseFrozenAcquisition(
+      previous,
+      request,
+      requestedRange,
+      calculatedCandidateCutoff,
+    );
+    const acquisitionRange = reuseFrozen ? previous!.range : requestedRange;
+    const candidateCutoff = reuseFrozen
+      ? previous!.candidateCutoff
+      : calculatedCandidateCutoff;
+    const acquisitionStartAt =
+      reuseFrozen && previous?.scanStartedAt
+        ? previous.scanStartedAt
+        : scanStartedAt;
+    const candidateUpperBound =
+      request.mode === "incremental" && request.range === undefined
+        ? acquisitionRange.end
+        : null;
     const warnings: string[] = [];
-    const summaries: ConversationSummary[] = [];
-    const summaryIds = new Set<string>();
+    const candidateQueue = normalizeCandidateQueue(previous?.candidateQueue);
+    const candidateById = new Map<string, DiscoveryCandidate>();
+    for (const candidate of candidateQueue) {
+      candidateById.set(candidate.summary.conversationId, candidate);
+    }
     const seenOffsets = new Set<number>();
     const priorAudit = normalizeOlderHistoryAudit(previous?.olderHistoryAudit);
     const pageBudget =
       request.maxIndexPagesPerScope ?? this.maxIndexPagesPerScope;
     const pageSize = request.indexPageSize ?? this.indexPageSize;
-    const shouldResume =
+    const canResumeContinuation =
+      reuseFrozen &&
       previous?.continuation !== null &&
       previous?.continuation !== undefined &&
-      previous.status !== "complete" &&
-      checkpointMatches(
-        previous,
-        request.mode,
-        requestedRange,
-        candidateCutoff,
-      );
-    let offset = shouldResume ? previous!.continuation! : 0;
+      Number.isInteger(previous.continuation) &&
+      previous.continuation >= 0 &&
+      previous.candidateQueue !== undefined &&
+      previous.headFingerprint !== undefined;
+    let offset = canResumeContinuation ? previous!.continuation! : 0;
     let pagesFetched = 0;
     let status: ScopeDiscoveryResult["coverage"]["status"] = "in_progress";
     let continuation: number | null = offset;
     let paginationState: PaginationState = "unknown";
     let leadingPage: AdaptedPage<ConversationSummary> | null = null;
+    let headFingerprint =
+      canResumeContinuation ? previous?.headFingerprint ?? null : null;
+    let restartUsed = false;
+    let pendingPage: {
+      offset: number;
+      page: AdaptedPage<ConversationSummary>;
+    } | null = null;
+    let stopIndexScan = false;
+    const restartAtZero = (): void => {
+      restartUsed = true;
+      offset = 0;
+      continuation = null;
+      paginationState = "unknown";
+      leadingPage = null;
+      headFingerprint = null;
+      pendingPage = null;
+      seenOffsets.clear();
+    };
 
-    this.options.store.saveDiscovery(
-      checkpointFor(
+    const enqueueCandidate = (summary: ConversationSummary): void => {
+      const existing = candidateById.get(summary.conversationId);
+      if (existing) {
+        if (isMoreRecent(summary.updatedAt, existing.summary.updatedAt)) {
+          existing.summary = summary;
+        }
+        existing.missingUpdateTime ||= summary.updatedAt === null;
+        return;
+      }
+      const candidate: DiscoveryCandidate = {
+        summary,
+        missingUpdateTime: summary.updatedAt === null,
+      };
+      candidateQueue.push(candidate);
+      candidateById.set(summary.conversationId, candidate);
+    };
+
+    const enqueuePageCandidates = (
+      items: ConversationSummary[],
+      force = false,
+    ): void => {
+      for (const summary of items) {
+        if (summary.updatedAt === null) {
+          warnings.push("conversation_missing_update_time");
+        } else if (!isValidInstant(summary.updatedAt)) {
+          warnings.push("conversation_invalid_update_time");
+        }
+        if (
+          force ||
+          isCandidateSummary(
+            summary,
+            candidateCutoff,
+            candidateUpperBound,
+          )
+        ) {
+          enqueueCandidate(summary);
+        }
+      }
+    };
+
+    const saveCheckpoint = async (
+      checkpointStatus: DiscoveryCheckpoint["status"],
+      checkpointPaginationState: PaginationState,
+      checkpointContinuation: number | null,
+      watermark = previous?.lastCompleteDiscoveryStartedAt ?? null,
+      auditState = priorAudit,
+    ): Promise<void> => {
+      const checkpoint = checkpointFor(
         this.options.accountId,
         scope,
         request.mode,
-        requestedRange,
+        acquisitionRange,
         candidateCutoff,
-        scanStartedAt,
-        offset,
+        acquisitionStartAt,
+        checkpointContinuation,
         pagesFetched,
         pageBudget,
-        previous?.lastCompleteDiscoveryStartedAt ?? null,
-        "in_progress",
-        "unknown",
+        watermark,
+        checkpointStatus,
+        checkpointPaginationState,
         warnings,
         now.toISOString(),
-        priorAudit,
-      ),
-    );
+        auditState,
+        candidateQueue,
+        headFingerprint,
+      );
+      this.options.store.saveDiscovery(checkpoint);
+      await this.commitDiscoveryCheckpoint(
+        checkpoint,
+        identity,
+        acquisitionStartAt,
+      );
+    };
 
-    while (pagesFetched < pageBudget) {
-      if (seenOffsets.has(offset)) {
-        warnings.push("repeated_index_offset");
-        status = "partial";
-        paginationState = "repeated_cursor";
-        continuation = offset;
-        break;
-      }
-      seenOffsets.add(offset);
+    await saveCheckpoint("in_progress", "unknown", offset);
 
-      let page;
+    if (canResumeContinuation && offset > 0) {
       try {
-        page = await this.reader.listConversations({
+        const headPage = await this.reader.listConversations({
           archived: scope === "archived",
-          offset,
+          offset: 0,
           limit: pageSize,
           order: "updated",
         });
+        pagesFetched += 1;
+        const currentHeadFingerprint = fingerprintIndexPage(headPage);
+        const resumeHeadIsValid =
+          currentHeadFingerprint === previous!.headFingerprint &&
+          headPage.coverage !== "unrecognized" &&
+          headPage.warnings.length === 0 &&
+          headPage.paginationState === "continuation" &&
+          headPage.continuation === previous!.continuation;
+        if (resumeHeadIsValid) {
+          leadingPage = headPage;
+          headFingerprint = currentHeadFingerprint;
+          enqueuePageCandidates(headPage.items);
+          seenOffsets.add(0);
+          continuation = previous!.continuation;
+          paginationState = "continuation";
+          if (pagesFetched >= pageBudget) {
+            warnings.push("index_page_budget_exhausted");
+            status = "partial";
+            paginationState = "budget_exhausted";
+            await saveCheckpoint(status, paginationState, continuation);
+            stopIndexScan = true;
+          } else {
+            offset = previous!.continuation!;
+          }
+        } else {
+          warnings.push(
+            currentHeadFingerprint === previous!.headFingerprint
+              ? "saved_head_not_validated_for_resume"
+              : "discovery_head_changed_restart",
+          );
+          restartAtZero();
+          pendingPage = { offset: 0, page: headPage };
+        }
       } catch (error) {
-        warnings.push(`index_${errorCode(error)}`);
+        warnings.push(`index_head_${errorCode(error)}`);
+        if (isAccountStopError(error)) {
+          const accountState = this.pauseForError(error, now);
+          warnings.push(accountPauseWarning(accountState));
+        }
         status = "partial";
         paginationState = "unknown";
-        continuation = offset;
+        continuation = null;
+        await saveCheckpoint(status, paginationState, continuation);
+        stopIndexScan = true;
+      }
+    }
+
+    while (!stopIndexScan && pagesFetched < pageBudget) {
+      const pageOffset = pendingPage?.offset ?? offset;
+      if (seenOffsets.has(pageOffset)) {
+        warnings.push("repeated_index_offset");
+        status = "partial";
+        paginationState = "repeated_cursor";
+        continuation = null;
+        await saveCheckpoint(status, paginationState, continuation);
+        if (!restartUsed && pageOffset > 0) {
+          restartAtZero();
+          status = "in_progress";
+          continue;
+        }
         break;
+      }
+      seenOffsets.add(pageOffset);
+
+      let page: AdaptedPage<ConversationSummary>;
+      if (pendingPage) {
+        page = pendingPage.page;
+        pendingPage = null;
+      } else {
+        try {
+          page = await this.reader.listConversations({
+            archived: scope === "archived",
+            offset: pageOffset,
+            limit: pageSize,
+            order: "updated",
+          });
+        } catch (error) {
+          warnings.push(`index_${errorCode(error)}`);
+          if (isAccountStopError(error)) {
+            const accountState = this.pauseForError(error, now);
+            warnings.push(accountPauseWarning(accountState));
+          }
+          status = "partial";
+          paginationState = "unknown";
+          continuation = pageOffset;
+          await saveCheckpoint(status, paginationState, continuation);
+          break;
+        }
       }
 
       pagesFetched += 1;
@@ -393,78 +728,61 @@ export class HistoryCollector {
       if (page.coverage === "unrecognized") {
         warnings.push("index_unrecognized_page");
       }
-      if (offset === 0 && leadingPage === null) {
+      if (pageOffset === 0 && leadingPage === null) {
         leadingPage = page;
+        headFingerprint = fingerprintIndexPage(page);
       }
-      for (const summary of page.items) {
-        if (summary.updatedAt === null) {
-          warnings.push("conversation_missing_update_time");
-        } else if (!isValidInstant(summary.updatedAt)) {
-          warnings.push("conversation_invalid_update_time");
-        }
-        if (
-          isCandidateSummary(
-            summary,
-            candidateCutoff,
-            request.mode === "incremental" ? requestedRange.end : null,
-          ) &&
-          !summaryIds.has(summary.conversationId)
-        ) {
-          summaries.push(summary);
-          summaryIds.add(summary.conversationId);
-        }
-      }
+      enqueuePageCandidates(page.items);
       if (
         page.paginationState === "unknown" ||
         page.paginationState === "contradictory" ||
         page.paginationState === "repeated_cursor"
       ) {
         status = "partial";
-        continuation =
-          typeof page.continuation === "number" ? page.continuation : offset;
+        continuation = null;
         warnings.push(`index_${page.paginationState}`);
+        await saveCheckpoint(status, paginationState, continuation);
+        if (
+          !restartUsed &&
+          pageOffset > 0 &&
+          (page.paginationState === "contradictory" ||
+            page.paginationState === "repeated_cursor")
+        ) {
+          restartAtZero();
+          status = "in_progress";
+          continue;
+        }
         break;
       }
+
       if (page.exhausted && page.paginationState === "complete") {
         if (page.coverage !== "validated_page") {
           warnings.push("index_unvalidated_terminal_page");
         }
         status = "complete";
         continuation = null;
-        this.options.store.saveDiscovery(
-          checkpointFor(
-            this.options.accountId,
-            scope,
-            request.mode,
-            requestedRange,
-            candidateCutoff,
-            scanStartedAt,
-            null,
-            pagesFetched,
-            pageBudget,
-            previous?.lastCompleteDiscoveryStartedAt ?? null,
-            status,
-            paginationState,
-            warnings,
-            now.toISOString(),
-            priorAudit,
-          ),
-        );
+        await saveCheckpoint(status, paginationState, continuation);
         break;
       }
+
       if (
         page.paginationState !== "continuation" ||
         typeof page.continuation !== "number" ||
-        page.continuation <= offset
+        page.continuation <= pageOffset
       ) {
         status = "partial";
-        continuation =
-          typeof page.continuation === "number" ? page.continuation : offset;
+        continuation = null;
         paginationState =
           page.paginationState === "continuation"
             ? "repeated_cursor"
             : "unknown";
         warnings.push("nonadvancing_index_continuation");
+        await saveCheckpoint(status, paginationState, continuation);
+        if (!restartUsed && pageOffset > 0) {
+          restartAtZero();
+          status = "in_progress";
+          continue;
+        }
         break;
       }
 
@@ -473,29 +791,12 @@ export class HistoryCollector {
         status = "partial";
         paginationState = "budget_exhausted";
         warnings.push("index_page_budget_exhausted");
+        await saveCheckpoint(status, paginationState, continuation);
         break;
       }
 
-      this.options.store.saveDiscovery(
-        checkpointFor(
-          this.options.accountId,
-          scope,
-          request.mode,
-          requestedRange,
-          candidateCutoff,
-          scanStartedAt,
-          continuation,
-          pagesFetched,
-          pageBudget,
-          previous?.lastCompleteDiscoveryStartedAt ?? null,
-          "in_progress",
-          paginationState,
-          warnings,
-          now.toISOString(),
-          priorAudit,
-        ),
-      );
       offset = page.continuation;
+      await saveCheckpoint("in_progress", paginationState, continuation);
     }
 
     if (status === "complete") {
@@ -504,47 +805,37 @@ export class HistoryCollector {
         reread = await this.reader.listConversations({
           archived: scope === "archived",
           offset: 0,
-          limit: request.indexPageSize ?? this.indexPageSize,
+          limit: pageSize,
           order: "updated",
         });
         pagesFetched += 1;
         warnings.push(...reread.warnings);
-        if (
-          leadingPage === null ||
-          indexPagesDiffer(leadingPage, reread)
-        ) {
+        if (reread.coverage === "unrecognized") {
+          warnings.push("index_unrecognized_page");
+        }
+        if (leadingPage === null || indexPagesDiffer(leadingPage, reread)) {
           status = "partial";
           paginationState = "continuation";
-          continuation = 0;
+          continuation = null;
           warnings.push(
             leadingPage === null
               ? "leading_index_baseline_unavailable"
               : "leading_index_changed_during_scan",
           );
-          for (const summary of reread.items) {
-            if (
-              summary.updatedAt === null ||
-              isCandidateSummary(
-                summary,
-                candidateCutoff,
-                request.mode === "incremental" ? requestedRange.end : null,
-              )
-            ) {
-              if (summary.updatedAt === null) {
-                warnings.push("conversation_missing_update_time");
-              }
-              if (!summaryIds.has(summary.conversationId)) {
-                summaries.push(summary);
-                summaryIds.add(summary.conversationId);
-              }
-            }
-          }
+          headFingerprint = fingerprintIndexPage(reread);
+          enqueuePageCandidates(reread.items);
+          await saveCheckpoint(status, paginationState, continuation);
         }
       } catch (error) {
+        if (isAccountStopError(error)) {
+          const accountState = this.pauseForError(error, now);
+          warnings.push(accountPauseWarning(accountState));
+        }
         status = "partial";
         paginationState = "unknown";
-        continuation = 0;
+        continuation = null;
         warnings.push(`leading_index_reread_${errorCode(error)}`);
+        await saveCheckpoint(status, paginationState, continuation);
       }
     }
 
@@ -552,42 +843,29 @@ export class HistoryCollector {
       status = "partial";
       paginationState = "budget_exhausted";
       warnings.push("index_page_budget_exhausted");
-    }
-    if (status !== "complete") {
-      this.options.store.saveDiscovery(
-        checkpointFor(
-          this.options.accountId,
-          scope,
-          request.mode,
-          requestedRange,
-          candidateCutoff,
-          scanStartedAt,
-          continuation,
-          pagesFetched,
-          pageBudget,
-          previous?.lastCompleteDiscoveryStartedAt ?? null,
-          status,
-          paginationState,
-          warnings,
-          now.toISOString(),
-          priorAudit,
-        ),
-      );
+      await saveCheckpoint(status, paginationState, continuation);
     }
 
     let auditState = priorAudit;
-    if (request.olderHistoryAudit?.enabled) {
+    let auditCandidateIds: string[] = [];
+    let auditScanComplete = false;
+    if (
+      request.olderHistoryAudit?.enabled &&
+      this.options.store.loadAccountState().status !== "paused"
+    ) {
       const audit = await this.auditOlderHistory(
         scope,
         request,
-        requestedRange,
+        acquisitionRange,
         now,
-        scanStartedAt,
+        acquisitionStartAt,
         priorAudit,
       );
       auditState = audit.state;
-      summaries.push(...audit.summaries);
+      auditCandidateIds = audit.selectedConversationIds;
+      auditScanComplete = audit.scanComplete;
       warnings.push(...audit.warnings);
+      enqueuePageCandidates(audit.summaries, true);
     } else {
       auditState = {
         ...priorAudit,
@@ -596,24 +874,19 @@ export class HistoryCollector {
       };
     }
 
-    this.options.store.saveDiscovery(
-      checkpointFor(
-        this.options.accountId,
-        scope,
-        request.mode,
-        requestedRange,
-        candidateCutoff,
-        scanStartedAt,
-        continuation,
-        pagesFetched,
-        pageBudget,
-        previous?.lastCompleteDiscoveryStartedAt ?? null,
-        status,
-        paginationState,
-        warnings,
-        now.toISOString(),
-        auditState,
-      ),
+    const cleanImplicitDiscovery =
+      request.mode === "incremental" &&
+      !explicitRange &&
+      status === "complete" &&
+      warnings.length === 0;
+    await saveCheckpoint(
+      status,
+      paginationState,
+      continuation,
+      cleanImplicitDiscovery
+        ? acquisitionStartAt
+        : previous?.lastCompleteDiscoveryStartedAt ?? null,
+      auditState,
     );
 
     const coverage =
@@ -624,13 +897,13 @@ export class HistoryCollector {
           : "partial";
     return {
       scope,
-      summaries,
+      summaries: candidateQueue.map((candidate) => candidate.summary),
       coverage: {
         scope,
         status,
         coverage,
         pagesFetched,
-        candidates: summaries.length,
+        candidates: candidateQueue.length,
         continuation,
         paginationState,
         candidateCutoff,
@@ -638,6 +911,9 @@ export class HistoryCollector {
         olderHistoryAudit: auditCoverage(auditState),
       },
       warnings,
+      auditState,
+      auditCandidateIds,
+      auditScanComplete,
     };
   }
 
@@ -652,6 +928,8 @@ export class HistoryCollector {
     summaries: ConversationSummary[];
     warnings: string[];
     state: OlderHistoryAuditState;
+    selectedConversationIds: string[];
+    scanComplete: boolean;
   }> {
     const pageBudget =
       request.olderHistoryAudit?.maxPages ??
@@ -664,8 +942,10 @@ export class HistoryCollector {
     let offset = rotate ? 0 : previous.continuation ?? 0;
     let pagesFetched = 0;
     const summaries: ConversationSummary[] = [];
+    const selectedConversationIds = new Set<string>();
     const warnings: string[] = [];
     const seenOffsets = new Set<number>();
+    let scanComplete = false;
     let state: OlderHistoryAuditState = {
       ...previous,
       enabled: true,
@@ -676,6 +956,10 @@ export class HistoryCollector {
     };
 
     while (pagesFetched < pageBudget) {
+      if (this.options.store.loadAccountState().status === "paused") {
+        state = { ...state, status: "partial", continuation: offset };
+        break;
+      }
       if (seenOffsets.has(offset)) {
         warnings.push("older_history_audit_repeated_offset");
         state = {
@@ -697,6 +981,10 @@ export class HistoryCollector {
         });
       } catch (error) {
         warnings.push(`older_history_audit_${errorCode(error)}`);
+        if (isAccountStopError(error)) {
+          const accountState = this.pauseForError(error, now);
+          warnings.push(accountPauseWarning(accountState));
+        }
         state = {
           ...state,
           status: "partial",
@@ -709,16 +997,15 @@ export class HistoryCollector {
       state = {
         ...state,
         pagesFetched: state.pagesFetched + 1,
-        conversationsAudited:
-          state.conversationsAudited + page.items.length,
         lastPageAt: now.toISOString(),
       };
       warnings.push(...page.warnings.map((warning) => `older_audit_${warning}`));
-      summaries.push(
-        ...page.items.filter((summary) =>
-          isOlderHistoryAuditCandidate(summary, requestedRange.start),
-        ),
-      );
+      for (const summary of page.items) {
+        if (isOlderHistoryAuditCandidate(summary, requestedRange.start)) {
+          summaries.push(summary);
+          selectedConversationIds.add(summary.conversationId);
+        }
+      }
 
       if (
         page.paginationState === "unknown" ||
@@ -735,13 +1022,12 @@ export class HistoryCollector {
         break;
       }
       if (page.exhausted && page.paginationState === "complete") {
-        const complete =
+        scanComplete =
           page.coverage === "validated_page" && page.warnings.length === 0;
         state = {
           ...state,
-          status: complete ? "complete" : "partial",
+          status: "partial",
           continuation: null,
-          lastCompletedAt: complete ? scanStartedAt : state.lastCompletedAt,
         };
         break;
       }
@@ -774,7 +1060,13 @@ export class HistoryCollector {
       warnings.push("older_history_audit_page_budget_exhausted");
       state = { ...state, status: "partial" };
     }
-    return { summaries, warnings, state };
+    return {
+      summaries,
+      warnings,
+      state,
+      selectedConversationIds: [...selectedConversationIds],
+      scanComplete,
+    };
   }
 
   private candidateCutoff(
@@ -804,7 +1096,6 @@ export class HistoryCollector {
     request: HistoryCollectionRequest,
     identity: IdentityRecord,
     scanStartedAt: string,
-    requestedRange: HistoryRange,
   ): Promise<DetailAcquisition> {
     const existingRevisit =
       this.options.store
@@ -823,6 +1114,13 @@ export class HistoryCollector {
         },
       );
     } catch (error) {
+      const accountState = isAccountStopError(error)
+        ? this.pauseForError(error, now)
+        : null;
+      const pageWarnings = [
+        `detail_${errorCode(error)}`,
+        ...(accountState ? [accountPauseWarning(accountState)] : []),
+      ];
       const revisit = this.saveRevisit(
         candidate,
         now,
@@ -835,13 +1133,15 @@ export class HistoryCollector {
         accountId: this.options.accountId,
         mode: request.mode,
         scanStartedAt,
-        identity,
+        identity: accountState
+          ? pausedIdentity(identity, accountState, errorCode(error))
+          : identity,
         summary: candidate.summary,
         scopes: [...candidate.scopes].sort(),
         detail: null,
         messages: [],
         coverage: "partial",
-        warnings: [`detail_${errorCode(error)}`],
+        warnings: pageWarnings,
         pageKind: "detail",
         pageNumber: existingRevisit?.detailPagesFetched ?? 0,
         nextContinuation: revisit.continuation,
@@ -852,27 +1152,37 @@ export class HistoryCollector {
         messages: [],
         revisit,
         coverage: "partial",
-        warnings: [`detail_${errorCode(error)}`],
+        warnings: pageWarnings,
         detailPagesFetched: 0,
       };
     }
 
-    const messages = messagesBeforeExclusiveEnd(
-      dedupeMessages(detail.messages),
-      requestedRange.end,
-    );
+    const messages = dedupeMessages(detail.messages);
     detail = { ...detail, messages };
-    const detailReason = detailRevisitReason(detail);
+    const detailRevision = conversationRevision(detail);
+    const detailIssue = detailRevisitIssue(detail);
     let detailRevisit = existingRevisit;
-    if (detailReason) {
+    if (detailIssue) {
       detailRevisit = this.saveRevisit(
         candidate,
         now,
-        detailReason,
+        detailIssue.reason,
         0,
         null,
         existingRevisit,
-        { continuation: detail.continuation },
+        {
+          continuation:
+            existingRevisit?.continuation ?? normalizedContinuation(detail.continuation),
+          continuationRevision:
+            existingRevisit?.continuation !== null &&
+            existingRevisit?.continuation !== undefined
+              ? existingRevisit.continuationRevision
+              : detailRevision,
+          malformedPage: mergePageIssues(
+            existingRevisit?.malformedPage ?? null,
+            detailIssue,
+          ),
+        },
       );
     }
     if (detail.detailRoute === "legacy") {
@@ -881,7 +1191,13 @@ export class HistoryCollector {
         now,
         messages,
         detailRevisit,
-        detailReason,
+        detailIssue?.reason ?? null,
+        0,
+        {
+          malformedPage:
+            detailIssue ?? existingRevisit?.malformedPage ?? null,
+          validatedExhaustion: isValidatedDetailExhaustion(detail),
+        },
       );
       await this.commitPage({
         accountId: this.options.accountId,
@@ -898,9 +1214,7 @@ export class HistoryCollector {
             : "complete",
         warnings: [
           ...detail.warnings,
-          ...(revisit?.reason === "nonterminal_generation"
-            ? ["nonterminal_generation_pending"]
-            : []),
+          ...revisitWarnings(revisit),
         ],
         pageKind: "detail",
         pageNumber: detailRevisit?.detailPagesFetched ?? 0,
@@ -958,7 +1272,9 @@ export class HistoryCollector {
       request.mode,
       identity,
       scanStartedAt,
-      requestedRange.end,
+      detailRevision,
+      detailIssue,
+      existingRevisit,
     );
     return {
       detail: { ...detail, messages: pageResult.messages },
@@ -983,7 +1299,9 @@ export class HistoryCollector {
     mode: HistoryCollectionRequest["mode"],
     identity: IdentityRecord,
     scanStartedAt: string,
-    rangeEnd: string,
+    detailRevision: string | null,
+    detailIssue: RevisitPageIssue | null,
+    persistedRevisit: RevisitEntry | null,
   ): Promise<{
     messages: MessageRecord[];
     revisit: RevisitEntry | null;
@@ -993,14 +1311,40 @@ export class HistoryCollector {
     const messages = [...initialMessages];
     const warnings: string[] = [];
     const seenCursors = new Set<string>();
-    let before =
-      existingRevisit?.continuation ??
-      (detail.paginationState === "continuation" ? detail.continuation : null);
+    const savedContinuation = normalizedContinuation(
+      existingRevisit?.continuation,
+    );
+    const continuationExpired =
+      savedContinuation !== null &&
+      isContinuationExpired(
+        existingRevisit?.continuationRevision ?? null,
+        detailRevision,
+      );
+    let before = continuationExpired
+      ? null
+      : savedContinuation ??
+        (detail.paginationState === "continuation"
+          ? normalizedContinuation(detail.continuation)
+          : null);
     let detailPagesFetched = 0;
     let currentRevisit = existingRevisit;
-    let continuationRestarted = false;
+    let continuationRestarted = continuationExpired;
     let pageNumber = existingRevisit?.detailPagesFetched ?? 0;
-    let retainedPageReason: RevisitReason | null = null;
+    let malformedPage = mergePageIssues(
+      persistedRevisit?.malformedPage ?? null,
+      detailIssue,
+    );
+    let restartValidationActive = continuationExpired;
+    const startedFromNewest =
+      continuationExpired ||
+      (persistedRevisit?.malformedPage !== null &&
+        persistedRevisit?.malformedPage !== undefined &&
+        persistedRevisit.continuation === null &&
+        detailIssue === null);
+
+    if (continuationExpired) {
+      warnings.push("messages_saved_continuation_expired_restarting");
+    }
 
     while (detailPagesFetched < pageBudget) {
       let page;
@@ -1014,7 +1358,13 @@ export class HistoryCollector {
         );
       } catch (error) {
         const reason = classifyRevisitReason(error);
-        warnings.push(`messages_${errorCode(error)}`);
+        const accountState = isAccountStopError(error)
+          ? this.pauseForError(error, now)
+          : null;
+        warnings.push(
+          `messages_${errorCode(error)}`,
+          ...(accountState ? [accountPauseWarning(accountState)] : []),
+        );
         const revisit = this.saveRevisit(
           candidate,
           now,
@@ -1022,13 +1372,26 @@ export class HistoryCollector {
           0,
           errorCode(error),
           currentRevisit,
-          { continuation: before, incrementAttempt: false },
+          {
+            continuation: before,
+            continuationRevision:
+              before === null ? null : detailRevision,
+            malformedPage,
+            outstandingGeneration: generationStateFor(
+              messages,
+              currentRevisit,
+              now,
+            ),
+            incrementAttempt: false,
+          },
         );
         await this.commitPage({
           accountId: this.options.accountId,
           mode,
           scanStartedAt,
-          identity,
+          identity: accountState
+            ? pausedIdentity(identity, accountState, errorCode(error))
+            : identity,
           summary: candidate.summary,
           scopes: [...candidate.scopes].sort(),
           detail: {
@@ -1051,29 +1414,51 @@ export class HistoryCollector {
         return {
           messages: dedupeMessages(messages),
           revisit,
-          warnings,
+          warnings: uniqueWarnings([
+            ...warnings,
+            ...revisitWarnings(revisit),
+          ]),
           detailPagesFetched,
         };
       }
       detailPagesFetched += 1;
       pageNumber += 1;
-      messages.push(...messagesBeforeExclusiveEnd(page.items, rangeEnd));
+      messages.push(...page.items);
       warnings.push(...page.warnings);
       const mergedMessages = dedupeMessages(messages);
-      const pageRevisitReason = messagePageRevisitReason(page);
+      const pageIssue = messagePageRevisitIssue(page);
+      malformedPage = mergePageIssues(malformedPage, pageIssue);
 
       if (page.paginationState === "complete" && page.exhausted) {
+        const validatedPage = isValidatedPageExhaustion(page);
+        const clearMalformedPage =
+          malformedPage !== null &&
+          (startedFromNewest || restartValidationActive) &&
+          detailIssue === null &&
+          pageIssue === null &&
+          isValidatedDetailExhaustion(detail) &&
+          validatedPage;
+        const effectiveMalformedPage = clearMalformedPage
+          ? null
+          : malformedPage;
         const revisit = this.finalizeRevisit(
           candidate,
           now,
           mergedMessages,
           currentRevisit,
-          detailRevisitReason(detail) ??
-            retainedPageReason ??
-            pageRevisitReason,
+          detailIssue?.reason ?? null,
           1,
+          {
+            malformedPage: effectiveMalformedPage,
+            validatedExhaustion:
+              isValidatedDetailExhaustion(detail) && validatedPage,
+          },
         );
-        const pageWarnings = uniqueWarnings([...detail.warnings, ...warnings]);
+        const pageWarnings = uniqueWarnings([
+          ...detail.warnings,
+          ...warnings,
+          ...revisitWarnings(revisit),
+        ]);
         await this.commitPage({
           accountId: this.options.accountId,
           mode,
@@ -1103,7 +1488,7 @@ export class HistoryCollector {
         return {
           messages: mergedMessages,
           revisit,
-          warnings,
+          warnings: pageWarnings,
           detailPagesFetched,
         };
       }
@@ -1120,7 +1505,15 @@ export class HistoryCollector {
         !continuationRestarted
       ) {
         continuationRestarted = true;
+        restartValidationActive = true;
         warnings.push("messages_bad_continuation_restarting");
+        const restartIssue =
+          pageIssue ??
+          ({
+            reason: "bad_continuation",
+            warnings: ["messages_bad_continuation_restarting"],
+          } satisfies RevisitPageIssue);
+        malformedPage = mergePageIssues(malformedPage, restartIssue);
         currentRevisit = this.saveRevisit(
           candidate,
           now,
@@ -1130,6 +1523,13 @@ export class HistoryCollector {
           currentRevisit,
           {
             continuation: null,
+            continuationRevision: null,
+            malformedPage,
+            outstandingGeneration: generationStateFor(
+              mergedMessages,
+              currentRevisit,
+              now,
+            ),
             pagesFetched: 1,
             incrementAttempt: false,
           },
@@ -1165,22 +1565,35 @@ export class HistoryCollector {
       if (
         invalidPagination
       ) {
-        const reason =
-          page.paginationState === "repeated_cursor"
-            ? "repeated_cursor"
-            : page.paginationState === "contradictory"
-              ? "contradictory_pagination"
-              : "unknown_pagination";
-        warnings.push(`messages_${page.paginationState}`);
+        const issue =
+          pageIssue ??
+          ({
+            reason:
+              page.paginationState === "repeated_cursor"
+                ? "repeated_cursor"
+                : page.paginationState === "contradictory"
+                  ? "contradictory_pagination"
+                  : "unknown_pagination",
+            warnings: [`messages_${page.paginationState}`],
+          } satisfies RevisitPageIssue);
+        malformedPage = mergePageIssues(malformedPage, issue);
+        warnings.push(...issue.warnings);
         const revisit = this.saveRevisit(
           candidate,
           now,
-          reason,
+          issue.reason,
           0,
           null,
           currentRevisit,
           {
             continuation: null,
+            continuationRevision: null,
+            malformedPage,
+            outstandingGeneration: generationStateFor(
+              mergedMessages,
+              currentRevisit,
+              now,
+            ),
             pagesFetched: 1,
             incrementAttempt: false,
           },
@@ -1211,7 +1624,10 @@ export class HistoryCollector {
         return {
           messages: mergedMessages,
           revisit,
-          warnings,
+          warnings: uniqueWarnings([
+            ...warnings,
+            ...revisitWarnings(revisit),
+          ]),
           detailPagesFetched,
         };
       }
@@ -1222,7 +1638,15 @@ export class HistoryCollector {
       if (seenCursors.has(cursor) || cursor === before) {
         if (before !== null && !continuationRestarted) {
           continuationRestarted = true;
+          restartValidationActive = true;
           warnings.push("messages_bad_continuation_restarting");
+          const restartIssue =
+            pageIssue ??
+            ({
+              reason: "bad_continuation",
+              warnings: ["messages_bad_continuation_restarting"],
+            } satisfies RevisitPageIssue);
+          malformedPage = mergePageIssues(malformedPage, restartIssue);
           currentRevisit = this.saveRevisit(
             candidate,
             now,
@@ -1231,9 +1655,16 @@ export class HistoryCollector {
             null,
             currentRevisit,
             {
-            continuation: null,
-            pagesFetched: 1,
-            incrementAttempt: false,
+              continuation: null,
+              continuationRevision: null,
+              malformedPage,
+              outstandingGeneration: generationStateFor(
+                mergedMessages,
+                currentRevisit,
+                now,
+              ),
+              pagesFetched: 1,
+              incrementAttempt: false,
             },
           );
           await this.commitPage({
@@ -1264,6 +1695,11 @@ export class HistoryCollector {
           continue;
         }
         warnings.push("messages_repeated_cursor");
+        const issue = {
+          reason: "repeated_cursor",
+          warnings: ["messages_repeated_cursor"],
+        } satisfies RevisitPageIssue;
+        malformedPage = mergePageIssues(malformedPage, issue);
         const revisit = this.saveRevisit(
           candidate,
           now,
@@ -1273,6 +1709,13 @@ export class HistoryCollector {
           currentRevisit,
           {
             continuation: null,
+            continuationRevision: null,
+            malformedPage,
+            outstandingGeneration: generationStateFor(
+              mergedMessages,
+              currentRevisit,
+              now,
+            ),
             pagesFetched: 1,
             incrementAttempt: false,
           },
@@ -1303,22 +1746,33 @@ export class HistoryCollector {
         return {
           messages: mergedMessages,
           revisit,
-          warnings,
+          warnings: uniqueWarnings([
+            ...warnings,
+            ...revisitWarnings(revisit),
+          ]),
           detailPagesFetched,
         };
       }
       seenCursors.add(cursor);
       before = cursor;
-      retainedPageReason ??= pageRevisitReason;
+      const progressReason =
+        pageIssue?.reason ?? malformedPage?.reason ?? "page_budget";
       currentRevisit = this.saveRevisit(
         candidate,
         now,
-        pageRevisitReason ?? "page_budget",
+        progressReason,
         0,
         null,
         currentRevisit,
         {
           continuation: cursor,
+          continuationRevision: detailRevision,
+          malformedPage,
+          outstandingGeneration: generationStateFor(
+            mergedMessages,
+            currentRevisit,
+            now,
+          ),
           pagesFetched: 1,
           incrementAttempt: false,
         },
@@ -1332,7 +1786,17 @@ export class HistoryCollector {
           0,
           null,
           currentRevisit,
-          { continuation: cursor, incrementAttempt: false },
+          {
+            continuation: cursor,
+            continuationRevision: detailRevision,
+            malformedPage,
+            outstandingGeneration: generationStateFor(
+              mergedMessages,
+              currentRevisit,
+              now,
+            ),
+            incrementAttempt: false,
+          },
         );
       }
       await this.commitPage({
@@ -1362,7 +1826,10 @@ export class HistoryCollector {
         return {
           messages: mergedMessages,
           revisit: currentRevisit,
-          warnings,
+          warnings: uniqueWarnings([
+            ...warnings,
+            ...revisitWarnings(currentRevisit),
+          ]),
           detailPagesFetched,
         };
       }
@@ -1376,73 +1843,63 @@ export class HistoryCollector {
       0,
       null,
       currentRevisit,
-      { continuation: before, incrementAttempt: false },
-    );
-    const boundedMessages = messagesBeforeExclusiveEnd(
-      dedupeMessages(messages),
-      rangeEnd,
+      {
+        continuation: before,
+        continuationRevision: before === null ? null : detailRevision,
+        malformedPage,
+        outstandingGeneration: generationStateFor(
+          messages,
+          currentRevisit,
+          now,
+        ),
+        incrementAttempt: false,
+      },
     );
     return {
-      messages: boundedMessages,
+      messages: dedupeMessages(messages),
       revisit,
-      warnings,
+      warnings: uniqueWarnings([...warnings, ...revisitWarnings(revisit)]),
       detailPagesFetched,
     };
   }
 
-  private advanceWatermarksIfEligible(
-    request: HistoryCollectionRequest,
+  private finalizeOlderHistoryAudits(
+    discoveries: ScopeDiscoveryResult[],
+    evidence: Map<HistoryScope, AuditEvidence>,
     scanStartedAt: string,
     now: Date,
-    scopes: ScopeCoverageResult[],
-    conversations: AcquiredConversation[],
-    revisits: RevisitEntry[],
   ): void {
-    if (
-      request.mode !== "incremental" ||
-      request.range !== undefined
-    ) {
-      return;
-    }
-    const updatedAt = now.toISOString();
-    for (const scope of ["active", "archived"] as const) {
-      // Optional project/branch gaps do not invalidate a complete scope scan.
-      const coverage = scopes.find((item) => item.scope === scope);
-      if (
-        !coverage ||
-        coverage.status !== "complete" ||
-        coverage.coverage !== "complete" ||
-        coverage.warnings.length > 0
-      ) {
+    for (const discovery of discoveries) {
+      if (!discovery.auditState.enabled) {
         continue;
       }
-      if (
-        conversations.some(
-          (conversation) =>
-            conversation.scopes.includes(scope) &&
-            (conversation.coverage !== "complete" ||
-              conversation.warnings.length > 0),
-        )
-      ) {
-        continue;
+      const committedCandidateIds =
+        evidence.get(discovery.scope)?.committedCandidateIds ??
+        new Set<string>();
+      const complete =
+        discovery.auditScanComplete &&
+        discovery.auditCandidateIds.every((conversationId) =>
+          committedCandidateIds.has(conversationId),
+        );
+      const auditState: OlderHistoryAuditState = {
+        ...discovery.auditState,
+        status: complete ? "complete" : "partial",
+        conversationsAudited:
+          discovery.auditState.conversationsAudited +
+          committedCandidateIds.size,
+        lastCompletedAt: complete
+          ? scanStartedAt
+          : discovery.auditState.lastCompletedAt,
+      };
+      const checkpoint = this.options.store.loadDiscovery(discovery.scope);
+      if (checkpoint) {
+        this.options.store.saveDiscovery({
+          ...checkpoint,
+          olderHistoryAudit: auditState,
+          updatedAt: now.toISOString(),
+        });
       }
-      if (revisits.some((revisit) => revisit.scopes.includes(scope))) {
-        continue;
-      }
-      const checkpoint = this.options.store.loadDiscovery(scope);
-      if (
-        !checkpoint ||
-        checkpoint.status !== "complete" ||
-        checkpoint.warnings.length > 0
-      ) {
-        continue;
-      }
-      this.options.store.saveDiscovery({
-        ...checkpoint,
-        lastCompleteDiscoveryStartedAt: scanStartedAt,
-        updatedAt,
-        lastPageAt: updatedAt,
-      });
+      discovery.coverage.olderHistoryAudit = auditState;
     }
   }
 
@@ -1453,15 +1910,29 @@ export class HistoryCollector {
     detailPagesFetched: number,
     lastError: string | null,
     existing: RevisitEntry | null,
-    options: {
-      continuation?: string | null;
-      pagesFetched?: number;
-      incrementAttempt?: boolean;
-    } = {},
+    options: RevisitOptions = {},
   ): RevisitEntry {
     const nowIso = now.toISOString();
     const pageDelta = options.pagesFetched ?? detailPagesFetched;
     const incrementAttempt = options.incrementAttempt ?? true;
+    const outstandingGeneration =
+      options.outstandingGeneration === undefined
+        ? existing?.outstandingGeneration ?? null
+        : options.outstandingGeneration;
+    const attempts = Math.max(
+      1,
+      (existing?.attempts ?? 0) + (incrementAttempt ? 1 : 0),
+    );
+    const continuation =
+      options.continuation === undefined
+        ? existing?.continuation ?? null
+        : normalizedContinuation(options.continuation);
+    const continuationRevision =
+      continuation === null
+        ? null
+        : options.continuationRevision === undefined
+          ? existing?.continuationRevision ?? null
+          : normalizedContinuationRevision(options.continuationRevision);
     const entry: RevisitEntry = {
       stateVersion: HISTORY_STATE_VERSION,
       accountId: this.options.accountId,
@@ -1471,17 +1942,21 @@ export class HistoryCollector {
       reason,
       firstSeenAt: existing?.firstSeenAt ?? nowIso,
       lastSeenAt: nowIso,
-      attempts: Math.max(
-        1,
-        (existing?.attempts ?? 0) + (incrementAttempt ? 1 : 0),
-      ),
-      nextEligibleAt: nowIso,
+      attempts,
+      nextEligibleAt:
+        options.nextEligibleAt ??
+        (outstandingGeneration
+          ? nextOutstandingGenerationAt(now, attempts, outstandingGeneration)
+          : nowIso),
       lastError,
       detailPagesFetched: (existing?.detailPagesFetched ?? 0) + pageDelta,
-      continuation:
-        options.continuation === undefined
-          ? existing?.continuation ?? null
-          : options.continuation,
+      continuation,
+      continuationRevision,
+      malformedPage:
+        options.malformedPage === undefined
+          ? existing?.malformedPage ?? null
+          : options.malformedPage,
+      outstandingGeneration,
     };
     this.options.store.upsertRevisit(entry);
     return entry;
@@ -1494,11 +1969,27 @@ export class HistoryCollector {
     existing: RevisitEntry | null,
     detailReason: RevisitReason | null,
     detailPagesFetched = 0,
+    options: {
+      malformedPage?: RevisitPageIssue | null;
+      validatedExhaustion?: boolean;
+    } = {},
   ): RevisitEntry | null {
-    const reason = hasOutstandingGeneration(messages)
+    const generationState = generationCompletionState(messages);
+    const malformedPage =
+      options.malformedPage === undefined
+        ? existing?.malformedPage ?? null
+        : options.malformedPage;
+    const reason = generationState
       ? "nonterminal_generation"
-      : detailReason;
+      : malformedPage?.reason ?? detailReason;
     if (reason) {
+      const outstandingGeneration = generationState
+        ? buildOutstandingGenerationState(
+            existing?.outstandingGeneration ?? null,
+            generationState,
+            now,
+          )
+        : null;
       return this.saveRevisit(
         candidate,
         now,
@@ -1508,6 +1999,30 @@ export class HistoryCollector {
         existing,
         {
           continuation: null,
+          continuationRevision: null,
+          malformedPage,
+          outstandingGeneration,
+          pagesFetched: detailPagesFetched,
+          incrementAttempt: generationState !== null && existing !== null,
+        },
+      );
+    }
+    if (options.validatedExhaustion !== true) {
+      if (!existing) {
+        return null;
+      }
+      return this.saveRevisit(
+        candidate,
+        now,
+        existing.reason,
+        0,
+        existing.lastError,
+        existing,
+        {
+          continuation: null,
+          continuationRevision: null,
+          malformedPage,
+          outstandingGeneration: null,
           pagesFetched: detailPagesFetched,
           incrementAttempt: false,
         },
@@ -1520,10 +2035,30 @@ export class HistoryCollector {
     return null;
   }
 
+  private async commitDiscoveryCheckpoint(
+    checkpoint: DiscoveryCheckpoint,
+    identity: IdentityRecord,
+    scanStartedAt: string,
+  ): Promise<void> {
+    if (this.options.onDiscoveryPageCommit) {
+      const page: HistoryDiscoveryPageCommit = {
+        checkpoint,
+        identity,
+        scanStartedAt,
+      };
+      await this.options.onDiscoveryPageCommit(page);
+    }
+  }
+
   private async commitPage(page: HistoryPageCommit): Promise<void> {
     if (this.options.onPageCommit) {
       await this.options.onPageCommit(page);
+      return;
     }
+    this.options.store.acknowledgeCandidates(
+      page.summary.conversationId,
+      page.scopes,
+    );
   }
 
   private buildCoverage(
@@ -1627,6 +2162,8 @@ function checkpointFor(
   warnings: string[],
   updatedAt: string,
   olderHistoryAudit: OlderHistoryAuditState,
+  candidateQueue: DiscoveryCandidate[] = [],
+  headFingerprint: string | null = null,
 ): DiscoveryCheckpoint {
   return {
     stateVersion: HISTORY_STATE_VERSION,
@@ -1645,6 +2182,11 @@ function checkpointFor(
     paginationState,
     warnings: [...new Set(warnings)],
     updatedAt,
+    candidateQueue: candidateQueue.map((candidate) => ({
+      summary: { ...candidate.summary },
+      missingUpdateTime: candidate.missingUpdateTime,
+    })),
+    headFingerprint,
     olderHistoryAudit,
   };
 }
@@ -1692,6 +2234,107 @@ function auditCoverage(
   return { ...normalizeOlderHistoryAudit(state) };
 }
 
+function frozenImplicitAcquisition(
+  store: HistoryCheckpointStore,
+  request: HistoryCollectionRequest,
+): { range: HistoryRange; scanStartedAt: string } | null {
+  if (request.mode !== "incremental" || request.range !== undefined) {
+    return null;
+  }
+  const unfinished = (["active", "archived"] as const)
+    .map((scope) => store.loadDiscovery(scope))
+    .filter(
+      (checkpoint): checkpoint is DiscoveryCheckpoint =>
+        checkpoint !== null &&
+        checkpoint.mode === "incremental" &&
+        (checkpoint.status !== "complete" || checkpoint.continuation !== null) &&
+        checkpoint.scanStartedAt !== null &&
+        isValidInstant(checkpoint.scanStartedAt) &&
+        validHistoryRange(checkpoint.range),
+    );
+  const first = unfinished[0];
+  if (!first || first.scanStartedAt === null) {
+    return null;
+  }
+  if (
+    unfinished.some(
+      (checkpoint) =>
+        checkpoint.scanStartedAt !== first.scanStartedAt ||
+        checkpoint.range.start !== first.range.start ||
+        checkpoint.range.end !== first.range.end,
+    )
+  ) {
+    return null;
+  }
+  return {
+    range: { ...first.range },
+    scanStartedAt: first.scanStartedAt,
+  };
+}
+
+function shouldReuseFrozenAcquisition(
+  previous: DiscoveryCheckpoint | null,
+  request: HistoryCollectionRequest,
+  requestedRange: HistoryRange,
+  candidateCutoff: string,
+): boolean {
+  if (
+    !previous ||
+    previous.mode !== request.mode ||
+    (previous.status === "complete" && previous.continuation === null) ||
+    previous.scanStartedAt === null ||
+    !isValidInstant(previous.scanStartedAt) ||
+    !validHistoryRange(previous.range)
+  ) {
+    return false;
+  }
+  return (
+    previous.range.start === requestedRange.start &&
+    previous.range.end === requestedRange.end &&
+    previous.candidateCutoff === candidateCutoff
+  );
+}
+
+function normalizeCandidateQueue(
+  queue: DiscoveryCandidate[] | undefined,
+): DiscoveryCandidate[] {
+  const normalized = new Map<string, DiscoveryCandidate>();
+  for (const candidate of queue ?? []) {
+    const summary = candidate?.summary;
+    const conversationId = summary?.conversationId;
+    if (typeof conversationId !== "string" || conversationId.trim() === "") {
+      continue;
+    }
+    const existing = normalized.get(conversationId);
+    const next: DiscoveryCandidate = {
+      summary: { ...summary },
+      missingUpdateTime:
+        candidate.missingUpdateTime === true || summary.updatedAt === null,
+    };
+    if (!existing) {
+      normalized.set(conversationId, next);
+      continue;
+    }
+    if (isMoreRecent(next.summary.updatedAt, existing.summary.updatedAt)) {
+      existing.summary = next.summary;
+    }
+    existing.missingUpdateTime ||= next.missingUpdateTime;
+  }
+  return [...normalized.values()];
+}
+
+function fingerprintIndexPage(page: AdaptedPage<ConversationSummary>): string {
+  return createHash("sha256")
+    .update(JSON.stringify(indexPageFingerprint(page)))
+    .digest("hex");
+}
+
+function validHistoryRange(range: HistoryRange): boolean {
+  const start = new Date(range.start).getTime();
+  const end = new Date(range.end).getTime();
+  return Number.isFinite(start) && Number.isFinite(end) && start < end;
+}
+
 function isOlderHistoryAuditCandidate(
   summary: ConversationSummary,
   cutoff: string,
@@ -1704,20 +2347,6 @@ function isOlderHistoryAuditCandidate(
   return !Number.isFinite(updatedAt) ||
     !Number.isFinite(cutoffTime) ||
     updatedAt < cutoffTime;
-}
-
-function checkpointMatches(
-  checkpoint: DiscoveryCheckpoint,
-  mode: HistoryCollectionRequest["mode"],
-  range: HistoryRange,
-  candidateCutoff: string,
-): boolean {
-  return (
-    checkpoint.mode === mode &&
-    checkpoint.candidateCutoff === candidateCutoff &&
-    checkpoint.range.start === range.start &&
-    checkpoint.range.end === range.end
-  );
 }
 
 function isCandidateSummary(
@@ -1744,26 +2373,6 @@ function isCandidateSummary(
     updatedAt.getTime() >= start.getTime() &&
     updatedAt.getTime() < end.getTime()
   );
-}
-
-function messagesBeforeExclusiveEnd(
-  messages: MessageRecord[],
-  rangeEnd: string,
-): MessageRecord[] {
-  const end = new Date(rangeEnd);
-  if (!Number.isFinite(end.getTime())) {
-    return messages;
-  }
-  return messages.filter((message) => {
-    if (message.createdAt === null) {
-      return true;
-    }
-    const createdAt = new Date(message.createdAt);
-    return (
-      !Number.isFinite(createdAt.getTime()) ||
-      createdAt.getTime() < end.getTime()
-    );
-  });
 }
 
 function isValidInstant(value: string): boolean {
@@ -1823,6 +2432,75 @@ function isMoreRecent(left: string | null, right: string | null): boolean {
   return new Date(left).getTime() > new Date(right).getTime();
 }
 
+function conversationRevision(
+  detail: ConversationDetailProjection,
+): string | null {
+  const updatedAt = detail.updatedAt?.trim() ?? "";
+  const currentNode = detail.currentNode?.trim() ?? "";
+  if (!updatedAt && !currentNode) {
+    return null;
+  }
+  return `${updatedAt}|${currentNode}`;
+}
+
+function normalizedContinuation(
+  continuation: string | null | undefined,
+): string | null {
+  return typeof continuation === "string" && continuation.trim()
+    ? continuation.trim()
+    : null;
+}
+
+function normalizedContinuationRevision(
+  revision: string | null | undefined,
+): string | null {
+  return typeof revision === "string" && revision.trim()
+    ? revision.trim()
+    : null;
+}
+
+function isContinuationExpired(
+  savedRevision: string | null,
+  currentRevision: string | null,
+): boolean {
+  return (
+    savedRevision !== null &&
+    currentRevision !== null &&
+    savedRevision !== currentRevision
+  );
+}
+
+function isValidatedDetailExhaustion(
+  detail: ConversationDetailProjection,
+): boolean {
+  return (
+    detail.coverage === "validated_page" &&
+    detail.paginationState === "complete" &&
+    detail.continuation === null &&
+    detail.warnings.length === 0
+  );
+}
+
+function isValidatedPageExhaustion<T>(
+  page: AdaptedPage<T>,
+): boolean {
+  return (
+    page.coverage === "validated_page" &&
+    page.paginationState === "complete" &&
+    page.exhausted &&
+    page.warnings.length === 0
+  );
+}
+
+function detailRevisitIssue(
+  detail: ConversationDetailProjection,
+): RevisitPageIssue | null {
+  const reason = detailRevisitReason(detail);
+  return reason
+    ? { reason, warnings: [...detail.warnings] }
+    : null;
+}
+
 function detailRevisitReason(
   detail: ConversationDetailProjection,
 ): RevisitReason | null {
@@ -1844,40 +2522,130 @@ function detailRevisitReason(
   return null;
 }
 
-function messagePageRevisitReason(
+function messagePageRevisitIssue(
   page: AdaptedPage<MessageRecord>,
-): RevisitReason | null {
-  if (page.coverage === "unrecognized") {
-    return "unrecognized_detail";
-  }
-  if (page.coverage === "partial" || page.warnings.length > 0) {
-    return "partial_detail";
-  }
-  return null;
+): RevisitPageIssue | null {
+  const reason =
+    page.paginationState === "repeated_cursor"
+      ? "repeated_cursor"
+      : page.paginationState === "contradictory"
+        ? "contradictory_pagination"
+        : page.paginationState === "unknown"
+          ? "unknown_pagination"
+          : page.coverage === "unrecognized"
+            ? "unrecognized_detail"
+            : page.coverage === "partial" || page.warnings.length > 0
+              ? "partial_detail"
+              : null;
+  return reason
+    ? { reason, warnings: [...page.warnings] }
+    : null;
 }
 
-function hasOutstandingGeneration(messages: MessageRecord[]): boolean {
-  return messages.some((message) => {
+function generationCompletionState(
+  messages: MessageRecord[],
+): GenerationCompletionState | null {
+  let unknown = false;
+  for (const message of messages) {
     if (message.role !== "assistant" && message.role !== "tool") {
-      return false;
+      continue;
     }
     const status = (message.status ?? "").trim().toLowerCase();
     if (NONTERMINAL_GENERATION_STATUSES.has(status)) {
-      return true;
+      return "nonterminal";
     }
     if (status && TERMINAL_GENERATION_STATUSES.has(status)) {
-      return false;
+      continue;
     }
     if (["cancelled", "error", "failed", "interrupted", "rejected"].includes(status)) {
-      return false;
+      continue;
     }
     const hasGenerationIdentity =
       message.generationId !== null || message.requestId !== null;
     if (!hasGenerationIdentity) {
-      return false;
+      continue;
     }
-    return message.endTurn !== true;
-  });
+    unknown = true;
+  }
+  return unknown ? "unknown" : null;
+}
+
+function generationStateFor(
+  messages: MessageRecord[],
+  existing: RevisitEntry | null,
+  now: Date,
+): OutstandingGenerationState | null {
+  const state = generationCompletionState(messages);
+  return state
+    ? buildOutstandingGenerationState(
+        existing?.outstandingGeneration ?? null,
+        state,
+        now,
+      )
+    : null;
+}
+
+function buildOutstandingGenerationState(
+  existing: OutstandingGenerationState | null,
+  state: GenerationCompletionState,
+  now: Date,
+): OutstandingGenerationState {
+  const since = existing?.since ?? now.toISOString();
+  const sinceMs = new Date(since).getTime();
+  const timedOut =
+    existing?.timedOut === true ||
+    (Number.isFinite(sinceMs) &&
+      now.getTime() - sinceMs >= OUTSTANDING_GENERATION_TIMEOUT_MS);
+  return {
+    state: existing?.state === "unknown" || timedOut ? "unknown" : state,
+    since,
+    timedOut,
+  };
+}
+
+function nextOutstandingGenerationAt(
+  now: Date,
+  attempts: number,
+  state: OutstandingGenerationState,
+): string {
+  const delay = state.timedOut
+    ? OUTSTANDING_GENERATION_REVISIT_MAX_DELAY_MS
+    : Math.min(
+        OUTSTANDING_GENERATION_REVISIT_BASE_DELAY_MS *
+          2 ** Math.max(0, attempts - 1),
+        OUTSTANDING_GENERATION_REVISIT_MAX_DELAY_MS,
+      );
+  return new Date(now.getTime() + delay).toISOString();
+}
+
+function revisitWarnings(revisit: RevisitEntry | null): string[] {
+  const state = revisit?.outstandingGeneration;
+  if (!state) {
+    return [];
+  }
+  return [
+    "nonterminal_generation_pending",
+    ...(state.state === "unknown"
+      ? ["generation_completion_unknown"]
+      : []),
+    ...(state.timedOut ? ["nonterminal_generation_timeout"] : []),
+  ];
+}
+
+function mergePageIssues(
+  left: RevisitPageIssue | null,
+  right: RevisitPageIssue | null,
+): RevisitPageIssue | null {
+  if (!left) {
+    return right;
+  }
+  if (!right) {
+    return left;
+  }
+  return {
+    reason: left.reason,
+    warnings: [...new Set([...left.warnings, ...right.warnings])],
+  };
 }
 
 function dedupeMessages(messages: MessageRecord[]): MessageRecord[] {
@@ -1967,6 +2735,90 @@ function errorCode(error: unknown): string {
   return "adapter_error";
 }
 
+function isAccountStopError(error: unknown): boolean {
+  return (
+    error instanceof AuthenticationRequiredError ||
+    (error instanceof HttpStatusError &&
+      [401, 403, 429].includes(error.status))
+  );
+}
+
+function isRateLimitedError(error: unknown): boolean {
+  return (
+    error instanceof RateLimitedError ||
+    (error instanceof HttpStatusError && error.status === 429)
+  );
+}
+
+function retryAfterDeadline(value: string | null, now: Date): string | null {
+  if (value === null) {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+    const seconds = Number(trimmed);
+    const deadline = now.getTime() + seconds * 1000;
+    const date = new Date(deadline);
+    return Number.isFinite(seconds) && Number.isFinite(date.getTime())
+      ? date.toISOString()
+      : null;
+  }
+  const date = new Date(trimmed);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+function readyAccountState(): HistoryAccountState {
+  return {
+    status: "ready",
+    reason: null,
+    pausedAt: null,
+    cooldownUntil: null,
+    lastError: null,
+  };
+}
+
+function isActiveCooldown(
+  state: HistoryAccountState,
+  now: Date,
+): boolean {
+  if (state.status !== "paused" || state.reason !== "cooldown") {
+    return false;
+  }
+  if (state.cooldownUntil === null) {
+    return true;
+  }
+  return new Date(state.cooldownUntil).getTime() > now.getTime();
+}
+
+function accountPauseWarning(state: HistoryAccountState): string {
+  return state.reason === "cooldown"
+    ? "account_paused_cooldown"
+    : "account_paused_authentication";
+}
+
+function pausedIdentity(
+  identity: IdentityRecord | null,
+  state: HistoryAccountState,
+  errorCodeValue?: string,
+): IdentityRecord {
+  return {
+    providerUserId: identity?.providerUserId ?? null,
+    workspaceId: identity?.workspaceId ?? null,
+    quotaOwnerId: identity?.quotaOwnerId ?? null,
+    surface: identity?.surface ?? "unknown",
+    authState: "paused",
+    identityErrors: uniqueWarnings([
+      ...(identity?.identityErrors ?? []),
+      accountPauseWarning(state),
+      ...(state.lastError ? [state.lastError] : []),
+      ...(errorCodeValue ? [errorCodeValue] : []),
+    ]),
+  };
+}
+
 function unknownScopeCoverage(scope: HistoryScope): ScopeCoverageResult {
   return {
     scope,
@@ -1989,6 +2841,7 @@ function blockedResult(
   scanStartedAt: string,
   identity: IdentityRecord,
   warning: string,
+  accountState: HistoryAccountState,
 ): HistoryCollectionResult {
   const active = unknownScopeCoverage("active");
   const archived = unknownScopeCoverage("archived");
@@ -1998,6 +2851,7 @@ function blockedResult(
     range,
     scanStartedAt,
     status: "blocked",
+    accountState,
     identity,
     scopes: [active, archived],
     conversations: [],

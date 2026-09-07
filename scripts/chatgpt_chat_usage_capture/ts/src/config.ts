@@ -13,7 +13,7 @@ import {
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
-import type { BrowserConfig } from "./browser/session.js";
+import { MAX_RESPONSE_BYTES, type BrowserConfig } from "./browser/session.js";
 import {
   DEFAULT_BACKFILL_DAYS,
   DEFAULT_INDEX_PAGE_SIZE,
@@ -42,6 +42,7 @@ export interface CollectionConfig {
   indexPageSize: number;
   maxIndexPagesPerScope: number;
   maxPagesPerConversationPerRun: number;
+  maxResponseBytes: number;
 }
 
 export interface ApplicationConfig {
@@ -76,6 +77,7 @@ const COLLECTION_KEYS = new Set([
   "max_index_pages_per_scope",
   "max_pages_per_conversation_per_run",
   "max_message_pages_per_conversation",
+  "max_response_bytes",
 ]);
 
 export function loadConfig(path: string): Stage1Config {
@@ -147,6 +149,7 @@ export function loadConfig(path: string): Stage1Config {
         headless: browserRaw.headless === true,
         allowInteractiveLogin: browserRaw.allow_interactive_login === true,
         requestTimeoutSeconds: collection.requestTimeoutSeconds,
+        maxResponseBytes: collection.maxResponseBytes,
       },
       collection,
     };
@@ -189,6 +192,7 @@ export function defaultConfig(): Stage1Config {
           headless: false,
           allowInteractiveLogin: true,
           requestTimeoutSeconds: 30,
+          maxResponseBytes: MAX_RESPONSE_BYTES,
         },
         collection: defaultCollectionConfig(),
       },
@@ -198,6 +202,7 @@ export function defaultConfig(): Stage1Config {
 
 export function defaultCollectionConfig(
   requestTimeoutSeconds = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+  maxResponseBytes = MAX_RESPONSE_BYTES,
 ): CollectionConfig {
   return {
     requestTimeoutSeconds,
@@ -206,6 +211,7 @@ export function defaultCollectionConfig(
     indexPageSize: DEFAULT_INDEX_PAGE_SIZE,
     maxIndexPagesPerScope: DEFAULT_MAX_INDEX_PAGES,
     maxPagesPerConversationPerRun: DEFAULT_MAX_MESSAGE_PAGES_PER_CONVERSATION,
+    maxResponseBytes,
   };
 }
 
@@ -233,7 +239,11 @@ export function saveConfig(config: Stage1Config, path: string): void {
     },
     accounts: config.accounts.map((account) => {
       const collection =
-        account.collection ?? defaultCollectionConfig(account.browser.requestTimeoutSeconds);
+        account.collection ??
+        defaultCollectionConfig(
+          account.browser.requestTimeoutSeconds,
+          account.browser.maxResponseBytes,
+        );
       return {
         id: account.id,
         enabled: account.enabled,
@@ -257,6 +267,7 @@ export function saveConfig(config: Stage1Config, path: string): void {
           max_index_pages_per_scope: collection.maxIndexPagesPerScope,
           max_pages_per_conversation_per_run:
             collection.maxPagesPerConversationPerRun,
+          max_response_bytes: collection.maxResponseBytes,
         },
       };
     }),
@@ -315,6 +326,11 @@ function parseCollectionConfig(
     `${path}.overlap_duration`,
     DEFAULT_OVERLAP_MS,
   );
+  const maxResponseBytes = positiveInteger(
+    raw.max_response_bytes,
+    `${path}.max_response_bytes`,
+    MAX_RESPONSE_BYTES,
+  );
 
   return {
     requestTimeoutSeconds,
@@ -335,6 +351,7 @@ function parseCollectionConfig(
       `${path}.max_pages_per_conversation_per_run`,
       DEFAULT_MAX_MESSAGE_PAGES_PER_CONVERSATION,
     ),
+    maxResponseBytes,
   };
 }
 
