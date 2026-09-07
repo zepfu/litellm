@@ -665,10 +665,6 @@ def _add_codex_auto_agent_text_error_tokens(
     ):
         tokens.add("MODEL_OVERLOADED")
         tokens.add("server_overloaded")
-    if "server_is_overloaded" in text_lower:
-        tokens.add("server_is_overloaded")
-    if "capacity_exhausted" in text_lower:
-        tokens.add("capacity_exhausted")
     if "busy upstream" in text_lower or ("upstream" in text_lower and "busy" in text_lower):
         tokens.add("UPSTREAM_BUSY")
     if "rate_limit_exceeded" in text_lower or "rate limit" in text_lower:
@@ -2385,14 +2381,19 @@ def _classify_openai_alpha_capacity_error_code(
     normalized_tokens = {
         str(token).strip().lower() for token in tokens if str(token).strip()
     }
-    exact_codes = normalized_tokens & {
+    normalized_capacity_codes = {
         str(token).strip().lower()
         for token in _CODEX_AUTO_AGENT_OPENAI_ALPHA_CAPACITY_ERROR_TOKENS
     }
+    text_lower = _codex_auto_agent_error_text(exc).lower()
+    exact_codes = normalized_tokens & normalized_capacity_codes
+    if not exact_codes:
+        exact_codes = {
+            code for code in normalized_capacity_codes if code in text_lower
+        }
     if not exact_codes:
         return None
 
-    text_lower = _codex_auto_agent_error_text(exc).lower()
     if (
         normalized_tokens & _OPENAI_ALPHA_CAPACITY_QUOTA_ERROR_TOKENS
         or any(marker in text_lower for marker in _OPENAI_ALPHA_CAPACITY_QUOTA_TEXT_MARKERS)

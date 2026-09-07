@@ -895,15 +895,6 @@ class TestErrorTokens:
         _add_codex_auto_agent_text_error_tokens(tokens, "currently experiencing high demand")
         assert "HIGH_DEMAND" in tokens
 
-    @pytest.mark.parametrize(
-        "message",
-        ["server_is_overloaded", "capacity_exhausted"],
-    )
-    def test_add_text_tokens_openai_alpha_exact_capacity_codes(self, message: str):
-        tokens: set[str] = set()
-        _add_codex_auto_agent_text_error_tokens(tokens, message)
-        assert message in tokens
-
     def test_add_text_tokens_rate_limit(self):
         tokens: set[str] = set()
         _add_codex_auto_agent_text_error_tokens(tokens, "too many requests")
@@ -1000,25 +991,47 @@ class TestClassification:
         assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "server_overloaded"
 
     @pytest.mark.parametrize(
-        ("code", "expected"),
+        ("error", "expected"),
         [
-            ("server_is_overloaded", "server_overloaded"),
-            ("capacity_exhausted", "capacity_exhausted"),
+            (
+                {
+                    "code": "server_is_overloaded",
+                    "type": "server_error",
+                    "message": "Please try again later.",
+                },
+                "server_overloaded",
+            ),
+            (
+                {
+                    "code": "capacity_exhausted",
+                    "type": "server_error",
+                    "message": "Please try again later.",
+                },
+                "capacity_exhausted",
+            ),
+            (
+                {
+                    "type": "server_error",
+                    "message": "server_is_overloaded",
+                },
+                "server_overloaded",
+            ),
+            (
+                {
+                    "type": "server_error",
+                    "message": "capacity_exhausted",
+                },
+                "capacity_exhausted",
+            ),
         ],
     )
     def test_classify_alpha_openai_exact_capacity_codes(
         self,
-        code: str,
+        error: dict[str, str],
         expected: str,
     ):
         exc = _FakeExc(
-            detail={
-                "error": {
-                    "code": code,
-                    "type": "server_error",
-                    "message": "Please try again later.",
-                }
-            },
+            detail={"error": error},
             status_code=502,
             _aawm_provider_returned=True,
         )
