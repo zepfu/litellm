@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import ast
 import json
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -2554,8 +2555,10 @@ async def test_candidate_loop_ineligible_falls_through_without_request_local_sta
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("non_capacity_terminal", [False, True])
 async def test_candidate_loop_capacity_retries_use_one_request_coordinator(  # noqa: PLR0915
     monkeypatch: pytest.MonkeyPatch,
+    non_capacity_terminal: bool,
 ) -> None:
     monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
     namespace = "openai-054-driver-test"
@@ -2591,6 +2594,12 @@ async def test_candidate_loop_capacity_retries_use_one_request_coordinator(  # n
     waits: list[float] = []
     reentry_snapshots: list[tuple[bool, float, float]] = []
     failure_records: list[dict[str, Any]] = []
+    wait_metadata: list[dict[str, Any]] = []
+    retry_logs: list[Any] = []
+    terminal_logs: list[dict[str, Any]] = []
+    success_response = SimpleNamespace(status_code=201)
+    terminal_failure = HTTPException(status_code=401, detail="Invalid credential")
+    setattr(terminal_failure, "error_class", "provider_terminal_error")
 
     async def _select(**kwargs: Any) -> dict[str, Any]:
         selection_calls.append(kwargs)
@@ -2628,8 +2637,11 @@ async def test_candidate_loop_capacity_retries_use_one_request_coordinator(  # n
                 classification="transient_capacity",
                 retryable=True,
                 message="overloaded",
+                status_code=502,
             )
-        return {"ok": True}
+        if non_capacity_terminal:
+            raise terminal_failure
+        return success_response
 
     async def _no_active_cooldown(_key: str) -> tuple[float, str]:
         return 0.0, "memory"
@@ -2648,8 +2660,10 @@ async def test_candidate_loop_capacity_retries_use_one_request_coordinator(  # n
     async def _sleep_with_wakeup(
         _coordinator: object,
         wait_seconds: float,
+        **metadata: Any,
     ) -> str:
         waits.append(wait_seconds)
+        wait_metadata.append(metadata)
         return "timer"
 
     class _Admission:
@@ -2681,6 +2695,19 @@ async def test_candidate_loop_capacity_retries_use_one_request_coordinator(  # n
         pre_commit_retry_module.OpenAIAlphaCapacityRetryCoordinator,
         "sleep_with_wakeup",
         _sleep_with_wakeup,
+    )
+    monkeypatch.setattr(
+        pre_commit_retry_module, "_emit_capacity_retry_log", retry_logs.append
+    )
+    monkeypatch.setattr(
+        pre_commit_retry_module,
+        "_emit_openai_capacity_terminal_log",
+        lambda **kwargs: terminal_logs.append(kwargs),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_no_candidate_event",
+        lambda **_kwargs: None,
     )
     monkeypatch.setattr(
         lpe,
@@ -2724,25 +2751,43 @@ async def test_candidate_loop_capacity_retries_use_one_request_coordinator(  # n
         raise_redispatch_fn=None,
     )
 
-    response = await candidate_loop.handle_alias_route(
-        services,
-        alias_family="codex_auto_agent",
-        alias_model="work",
-        request=request,
-        prepared_request_body={"model": "work", "input": "dispatch basic"},
-        max_candidate_attempts=1,
-        get_active_cooldown_state_fn=_no_active_cooldown,
-        attempts_metadata_key="codex_auto_agent_attempts",
-        skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
-        no_candidate_detail="no candidates",
-        log_label="Codex",
-    )
+    with pytest.raises(HTTPException) if non_capacity_terminal else nullcontext():
+        response = await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="work",
+            request=request,
+            prepared_request_body={"model": "work", "input": "dispatch basic"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_no_active_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
 
     coordinator = request.state.aawm_openai_capacity_retry
-    assert response == {"ok": True}
+    if not non_capacity_terminal:
+        assert response is success_response
     assert provider_calls == ["gpt-5.4-codex"] * 3
     assert waits == [15.0, 30.0]
-    assert len(failure_records) == 2
+    assert wait_metadata == [
+        {"error_class": "server_overloaded", "status_code": 502},
+    ] * 2
+    assert [(entry.error_class, entry.status_code) for entry in retry_logs] == [
+        ("server_overloaded", 502),
+    ] * 2
+    assert len(terminal_logs) == 1
+    assert terminal_logs[0]["terminal_reason"] == (
+        "non_capacity_error" if non_capacity_terminal else "success"
+    )
+    assert terminal_logs[0]["error_class"] == (
+        "provider_terminal_error" if non_capacity_terminal else "success"
+    )
+    assert terminal_logs[0]["status_code"] == (
+        401 if non_capacity_terminal else 201
+    )
+    assert len(failure_records) == (3 if non_capacity_terminal else 2)
     assert len(selection_calls) == 1
     assert coordinator.retry_count == 2
     assert coordinator.target_identity == target_identity

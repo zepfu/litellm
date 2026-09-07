@@ -1908,6 +1908,11 @@ async def handle_alias_route(  # noqa: PLR0915
                         )
                         if capacity_retry_coordinator is not None:
                             await capacity_retry_coordinator.signal_success()
+                            capacity_retry_coordinator.record_terminal(
+                                "success",
+                                error_class="success",
+                                status_code=getattr(response, "status_code", 200),
+                            )
                         return response
 
                     early_pre_commit_error_class = (
@@ -2302,6 +2307,19 @@ async def handle_alias_route(  # noqa: PLR0915
                         failure_class=error_class,
                         error_code=attempt_record.get("error_code"),
                     )
+                if capacity_retry_coordinator is not None:
+                    capacity_error_status_code = (
+                        _extract_adapter_exception_status_code(failure_exc)
+                    )
+                    if (
+                        error_class
+                        not in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
+                    ):
+                        capacity_retry_coordinator.record_terminal(
+                            "non_capacity_error",
+                            error_class=error_class or "unknown",
+                            status_code=capacity_error_status_code,
+                        )
                 if error_class is None:
                     raise _proxy_exception_for_unclassified_probe_failure(failure_exc)
                 deterministically_ineligible = (
@@ -2438,10 +2456,16 @@ async def handle_alias_route(  # noqa: PLR0915
                         if capacity_retry_coordinator is not None:
                             wakeup_reason = (
                                 await capacity_retry_coordinator.sleep_with_wakeup(
-                                    wait_seconds
+                                    wait_seconds,
+                                    error_class=error_class,
+                                    status_code=capacity_error_status_code,
                                 )
                             )
-                            capacity_retry_coordinator.record_retry(wakeup_reason)
+                            capacity_retry_coordinator.record_retry(
+                                wakeup_reason,
+                                error_class=error_class,
+                                status_code=capacity_error_status_code,
+                            )
                         else:
                             await asyncio.sleep(wait_seconds)
                     attempt_record = _codex_auto_agent_candidate_public_shape(
