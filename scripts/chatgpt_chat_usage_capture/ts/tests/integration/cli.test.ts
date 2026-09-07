@@ -4,15 +4,31 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("../../src/browser/bootstrap.js", async () => {
+  const actual = await vi.importActual<
+    typeof import("../../src/browser/bootstrap.js")
+  >("../../src/browser/bootstrap.js");
+  return {
+    ...actual,
+    bootstrapAccount: vi.fn(),
+  };
+});
+
 import { run } from "../../src/cli/main.js";
+import { bootstrapAccount } from "../../src/browser/bootstrap.js";
 import { defaultConfig, loadConfig, saveConfig } from "../../src/config.js";
+import { emptyCapabilities } from "../../src/normalize/identity.js";
 import { Ledger } from "../../src/ledger/store.js";
-import { SqliteCheckpointStore } from "../../src/history/checkpoints.js";
+import {
+  SqliteCheckpointStore,
+} from "../../src/history/checkpoints.js";
+import { configuredScope } from "../../src/history/ingest.js";
 
 describe("CLI", () => {
   let stateDirectory: string;
 
   beforeEach(() => {
+    vi.clearAllMocks();
     stateDirectory = mkdtempSync(join(tmpdir(), "usage-capture-state-"));
   });
 
@@ -104,6 +120,79 @@ describe("CLI", () => {
     );
     expect(persisted.state).toBe("ready");
     expect(persisted.identity.providerUserId).toBe("user-abc123");
+  });
+
+  it("clears an authentication pause only after interactive bootstrap verification", async () => {
+    const config = defaultConfig();
+    const account = config.accounts[0]!;
+    account.id = "fixture-primary";
+    account.expectedProviderUserId = "user-abc123";
+    account.expectedWorkspaceId = "ws-xyz";
+    account.quotaOwnerId = "user-abc123";
+    config.application.stateDirectory = stateDirectory;
+    config.application.databasePath = join(stateDirectory, "ledger.sqlite");
+    const configPath = join(stateDirectory, "config.json");
+    saveConfig(config, configPath);
+
+    const ledger = new Ledger(config.application.databasePath);
+    const scope = configuredScope(account);
+    ledger.upsertAccount(scope, { authState: "paused" });
+    const store = new SqliteCheckpointStore(ledger, scope);
+    store.saveAccountState({
+      status: "paused",
+      reason: "authentication",
+      pausedAt: "2026-09-07T12:00:00.000Z",
+      cooldownUntil: null,
+      lastError: "auth_required",
+    });
+    ledger.transaction(() => store.persist());
+    ledger.close();
+
+    vi.mocked(bootstrapAccount).mockResolvedValueOnce({
+      state: "ready",
+      accountId: account.id,
+      profilePath: account.browser.profilePath,
+      identity: {
+        providerUserId: "user-abc123",
+        workspaceId: "ws-xyz",
+        quotaOwnerId: "user-abc123",
+        surface: "chat",
+        authState: "ready",
+        identityErrors: [],
+      },
+      capabilities: emptyCapabilities(),
+      interactiveLoginUsed: true,
+      liveVerification: "passed",
+      notes: [],
+    });
+    const output = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    expect(
+      await run([
+        "bootstrap",
+        "--config",
+        configPath,
+        "--interactive-login",
+      ]),
+    ).toBe(0);
+
+    const reopened = new Ledger(config.application.databasePath);
+    try {
+      const restored = new SqliteCheckpointStore(reopened, scope);
+      expect(restored.loadAccountState()).toEqual({
+        status: "ready",
+        reason: null,
+        pausedAt: null,
+        cooldownUntil: null,
+        lastError: null,
+      });
+      expect(reopened.listAccounts()[0]?.authState).toBe("ready");
+      expect(output.mock.calls.at(-1)?.[0]).toContain(
+        "cleared persisted authentication pause after verified interactive recovery",
+      );
+    } finally {
+      reopened.close();
+    }
   });
 
   it("collects, replays, reports, and rebuilds through one configured SQLite database", async () => {

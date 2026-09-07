@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   AuthenticationRequiredError,
@@ -19,7 +19,10 @@ import {
 import { Ledger } from "../../src/ledger/store.js";
 import type { LedgerScope } from "../../src/ledger/types.js";
 import { defaultConfig } from "../../src/config.js";
-import { collectIntoLedger } from "../../src/history/ingest.js";
+import {
+  collectIntoLedger,
+  recoverAuthenticationPauseAfterInteractiveLogin,
+} from "../../src/history/ingest.js";
 import { emptyCapabilities } from "../../src/normalize/identity.js";
 import type {
   AdaptedPage,
@@ -72,6 +75,8 @@ class ScriptedReader implements HistoryReader {
     Map<string, AdaptedPage<MessageRecord>>
   >();
   readonly messageErrors = new Map<string, Error>();
+  /** Extra error to throw from the next inspectSessionIdentity() call. */
+  identityError: Error | null = null;
   identity: IdentityRecord = {
     providerUserId: "user-abc123",
     workspaceId: "ws-xyz",
@@ -83,6 +88,11 @@ class ScriptedReader implements HistoryReader {
 
   async inspectSessionIdentity(): Promise<IdentityRecord> {
     this.requests.push({ method: "GET", path: "/api/auth/session" });
+    const error = this.identityError;
+    this.identityError = null;
+    if (error) {
+      throw error;
+    }
     return this.identity;
   }
 
@@ -363,16 +373,18 @@ describe("Stage-2A history collection", () => {
     {
       label: "numeric",
       retryAfter: "120",
-      cooldownUntil: "2026-09-07T12:02:00.000Z",
+      cooldownUntil: "2026-09-07T12:12:00.000Z",
+      receiptAt: "2026-09-07T12:10:00.000Z",
     },
     {
       label: "date",
-      retryAfter: "Mon, 07 Sep 2026 12:05:00 GMT",
-      cooldownUntil: "2026-09-07T12:05:00.000Z",
+      retryAfter: "Mon, 07 Sep 2026 12:20:00 GMT",
+      cooldownUntil: "2026-09-07T12:20:00.000Z",
+      receiptAt: "2026-09-07T12:10:00.000Z",
     },
   ])(
     "pauses all account reads after a $label Retry-After response",
-    async ({ retryAfter, cooldownUntil }) => {
+    async ({ retryAfter, cooldownUntil, receiptAt }) => {
       const reader = new ScriptedReader();
       const candidate = summary("conv-rate-limited");
       reader.indexPages.set(
@@ -389,10 +401,11 @@ describe("Stage-2A history collection", () => {
       );
 
       const store = new MemoryCheckpointStore();
+      const clockSamples = [NOW, new Date(receiptAt)];
       const result = await new HistoryCollector(reader, {
         accountId: "fixture-primary",
         store,
-        clock: { now: () => NOW },
+        clock: { now: () => clockSamples.shift() ?? NOW },
       }).collect({
         mode: "backfill",
         range: EXPLICIT_RANGE,
@@ -403,10 +416,11 @@ describe("Stage-2A history collection", () => {
       expect(result.accountState).toEqual({
         status: "paused",
         reason: "cooldown",
-        pausedAt: NOW.toISOString(),
+        pausedAt: receiptAt,
         cooldownUntil,
         lastError: "rate_limited",
       });
+      expect(result.scanStartedAt).toBe(NOW.toISOString());
       expect(store.loadDiscovery("active")).toMatchObject({
         status: "partial",
         continuation: 1,
@@ -432,6 +446,51 @@ describe("Stage-2A history collection", () => {
       ).toBe(false);
     },
   );
+
+  it("does not shorten numeric Retry-After when the receipt clock fails", async () => {
+    const receivedAt = new Date("2026-09-07T12:10:00.000Z");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(receivedAt);
+    try {
+      const reader = new ScriptedReader();
+      reader.indexPages.set(
+        "active",
+        new Map([[0, indexPage([], 1, false, "continuation")]]),
+      );
+      reader.indexErrors.set(
+        "active:1",
+        new RateLimitedError("rate limited", {
+          retryAfter: "120",
+          path: "/backend-api/conversations",
+        }),
+      );
+      const clockSamples = [NOW];
+      const result = await new HistoryCollector(reader, {
+        accountId: "fixture-primary",
+        store: new MemoryCheckpointStore(),
+        clock: {
+          now: () => {
+            const sample = clockSamples.shift();
+            if (sample) {
+              return sample;
+            }
+            throw new Error("clock unavailable");
+          },
+        },
+      }).collect({
+        mode: "backfill",
+        range: EXPLICIT_RANGE,
+      });
+
+      expect(result.scanStartedAt).toBe(NOW.toISOString());
+      expect(result.accountState.pausedAt).toBe(receivedAt.toISOString());
+      expect(result.accountState.cooldownUntil).toBe(
+        "2026-09-07T12:12:00.000Z",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it("pauses all remaining scopes and details after an authentication challenge", async () => {
     const reader = new ScriptedReader();
@@ -550,11 +609,10 @@ describe("Stage-2A history collection", () => {
       quotaOwnerId: LEDGER_SCOPE.quotaOwnerId,
     });
     const reader = new ScriptedReader();
-    reader.identity = {
-      ...reader.identity,
-      authState: "auth_required",
-      identityErrors: [],
-    };
+    reader.identityError = new AuthenticationRequiredError("login required", {
+      status: 401,
+      path: "/api/auth/session",
+    });
 
     const result = await collectIntoLedger(
       reader,
@@ -576,6 +634,35 @@ describe("Stage-2A history collection", () => {
     expect(reader.requests).toEqual([
       { method: "GET", path: "/api/auth/session" },
     ]);
+
+    const blockedAgain = await collectIntoLedger(
+      reader,
+      ledger,
+      account,
+      { mode: "incremental", now: NOW },
+    );
+    expect(blockedAgain.status).toBe("blocked");
+    expect(blockedAgain.accountState.reason).toBe("authentication");
+    expect(reader.requests).toEqual([
+      { method: "GET", path: "/api/auth/session" },
+    ]);
+
+    expect(
+      recoverAuthenticationPauseAfterInteractiveLogin(
+        ledger,
+        account,
+        reader.identity,
+      ),
+    ).toBe(true);
+    const resumed = await collectIntoLedger(
+      reader,
+      ledger,
+      account,
+      { mode: "incremental", now: NOW },
+    );
+    expect(resumed.status).not.toBe("blocked");
+    expect(resumed.accountState.status).toBe("ready");
+    expect(ledger.listAccounts()[0]?.authState).toBe("ready");
     ledger.close();
   });
 

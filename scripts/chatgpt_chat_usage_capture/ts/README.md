@@ -99,10 +99,13 @@ node bin/usage-capture.mjs models --config ./config.json
 node bin/usage-capture.mjs rebuild --config ./config.json
 ```
 
-Interactive login is opt-in: `bootstrap --interactive-login`. Missing or
-mismatched identity blocks collection. A stored collector account cannot be
-rebound to a different identity/workspace/quota owner; use a distinct account
-ID instead. No command submits prompts or mutates provider data.
+Interactive login is opt-in: `bootstrap --interactive-login`. When collection
+is paused for authentication, that command is the explicit recovery entry:
+only a verified interactive ready Chat identity clears the persisted pause.
+Read-only inspection cannot clear it. Missing or mismatched identity blocks
+collection. A stored collector account cannot be rebound to a different
+identity/workspace/quota owner; use a distinct account ID instead. No command
+submits prompts or mutates provider data.
 
 `backfill --since` accepts an elapsed duration such as `30d` or an ISO-8601
 instant. `--until` is exclusive. `reconcile` requires `--since`.

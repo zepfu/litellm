@@ -44,6 +44,7 @@ import {
   assertAccountBinding,
   collectIntoLedger,
   configuredScope,
+  recoverAuthenticationPauseAfterInteractiveLogin,
   selectMapping,
 } from "../history/ingest.js";
 import {
@@ -191,6 +192,31 @@ async function runBootstrap(args: CliArgs): Promise<number> {
     interactiveLogin: args.interactiveLogin,
     stateDirectory: resolve(args.stateDirectory ?? config.application.stateDirectory),
   });
+  if (
+    args.interactiveLogin &&
+    result.state === "ready" &&
+    result.interactiveLoginUsed
+  ) {
+    const databasePath = resolveDatabasePath(config, args);
+    if (existsSync(databasePath)) {
+      const ledger = new Ledger(databasePath);
+      try {
+        if (
+          recoverAuthenticationPauseAfterInteractiveLogin(
+            ledger,
+            account,
+            result.identity,
+          )
+        ) {
+          result.notes.push(
+            "cleared persisted authentication pause after verified interactive recovery",
+          );
+        }
+      } finally {
+        ledger.close();
+      }
+    }
+  }
   printBootstrapResult(result);
   return result.state === "ready" ? 0 : 1;
 }
@@ -603,6 +629,7 @@ Bootstrap and capability commands:
       Write a starter JSON config (schema_version 1) for the dedicated profile.
 
   bootstrap --config <path> [--account <id>] [--state-directory <path>]
+      [--database <path>]
       [--interactive-login]
       Verify the dedicated browser profile and bind identity, workspace, and
       quota owner. Interactive login is explicit and opt-in only.

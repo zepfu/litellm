@@ -14,9 +14,13 @@ user-owned browser profile and one `application.database_path`. Do not point
 at a normal browser profile or copy authentication state.
 
 Run `bootstrap`, then `inspect-capabilities`, then `backfill`.
-Interactive login requires `bootstrap --interactive-login`. Inspection covers
-the first index pages only; backfill performs traversal. Fixture acceptance
-uses `fixture_history` plus `--fixture-root`, without live authentication.
+Interactive login requires `bootstrap --interactive-login`. If collection
+pauses for authentication, rerun that command with `--interactive-login`; only
+an interactive login followed by verified ready Chat identity clears the
+persisted authentication pause. Read-only inspection and ordinary collection
+never clear it. Inspection covers the first index pages only; backfill
+performs traversal. Fixture acceptance uses `fixture_history` plus
+`--fixture-root`, without live authentication.
 
 ## Collection
 
@@ -58,8 +62,10 @@ remain local to the collector account even when activity is shared by owner.
   revisits. An interrupted uncommitted run is replayed.
 - Exact or older range: use `backfill` or `reconcile --since ... --until ...`.
 - Authentication or identity failure: repair the dedicated session or binding;
-  do not rotate accounts or copy credentials. A different identity needs a
-  distinct local account ID.
+  use `bootstrap --interactive-login` for explicit interactive recovery. The
+  collector clears an authentication pause only after that command verifies the
+  configured ready Chat identity. Do not rotate accounts or copy credentials.
+  A different identity needs a distinct local account ID.
 - `429`: transport throttling, not quota exhaustion. There is no automatic
   retry/cooldown scheduler in Stage 2. All account reads stop and a persisted
   Retry-After cooldown blocks subsequent manual collection until eligible.

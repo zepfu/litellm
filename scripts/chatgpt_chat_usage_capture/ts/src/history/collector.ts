@@ -211,6 +211,21 @@ export class HistoryCollector {
       persistedAccountState.reason === "cooldown"
     ) {
       this.options.store.saveAccountState(readyAccountState());
+    } else if (
+      persistedAccountState.status === "paused" &&
+      persistedAccountState.reason !== "cooldown"
+    ) {
+      // A persisted non-cooldown pause requires explicit verified recovery
+      // (rerun bootstrap); read-only identity inspection cannot clear it.
+      return blockedResult(
+        this.options.accountId,
+        request.mode,
+        requestedRange,
+        scanStartedAt,
+        pausedIdentity(null, persistedAccountState),
+        accountPauseWarning(persistedAccountState),
+        persistedAccountState,
+      );
     }
 
     let identity = await this.readIdentity(now);
@@ -247,9 +262,6 @@ export class HistoryCollector {
         accountPauseWarning(accountState),
         accountState,
       );
-    }
-    if (identity.authState === "ready") {
-      this.options.store.saveAccountState(readyAccountState());
     }
 
     if (identity.authState !== "ready" || identity.surface !== "chat") {
@@ -455,18 +467,49 @@ export class HistoryCollector {
     error: unknown,
     now: Date,
   ): HistoryAccountState {
+    // Numeric Retry-After is relative to response receipt, not run start; a
+    // run captured 10 minutes before the 429 must not shorten the deadline.
+    const receivedAt =
+      error instanceof HttpStatusError && error.retryAfter !== null
+        ? this.responseReceivedAt(now)
+        : now;
     const accountState: HistoryAccountState = {
       status: "paused",
       reason: isRateLimitedError(error) ? "cooldown" : "authentication",
-      pausedAt: now.toISOString(),
+      pausedAt: receivedAt.toISOString(),
       cooldownUntil:
         error instanceof HttpStatusError
-          ? retryAfterDeadline(error.retryAfter, now)
+          ? retryAfterDeadline(error.retryAfter, receivedAt)
           : null,
       lastError: errorCode(error),
     };
     this.options.store.saveAccountState(accountState);
     return accountState;
+  }
+
+  private responseReceivedAt(fallback: Date): Date {
+    const wallClock = new Date();
+    let sampled = wallClock;
+    try {
+      if (this.options.clock) {
+        sampled = this.options.clock.now();
+      }
+    } catch {
+      sampled = wallClock;
+    }
+    const fallbackMs = fallback.getTime();
+    const sampledMs = sampled.getTime();
+    const candidateMs = Number.isFinite(sampledMs)
+      ? sampledMs
+      : wallClock.getTime();
+    if (!Number.isFinite(candidateMs)) {
+      return fallback;
+    }
+    return new Date(
+      Number.isFinite(fallbackMs)
+        ? Math.max(candidateMs, fallbackMs)
+        : candidateMs,
+    );
   }
 
   private async discoverScopeDurable(

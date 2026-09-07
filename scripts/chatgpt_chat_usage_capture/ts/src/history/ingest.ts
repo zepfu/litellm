@@ -8,13 +8,17 @@ import type {
   HistoryPageCommit,
   HistoryReader,
 } from "../contracts/history.js";
+import type { IdentityRecord } from "../contracts/records.js";
 import { ADAPTER_VERSION } from "../contracts/records.js";
 import { scopeKey } from "../ledger/identity.js";
 import { Ledger, LedgerError } from "../ledger/store.js";
 import type { LedgerScope, ModelMappingVersion } from "../ledger/types.js";
 import { INITIAL_MODEL_MAPPING } from "../normalize/model-mapping.js";
 import { assertNoSecrets } from "../security/sanitizer.js";
-import { SqliteCheckpointStore } from "./checkpoints.js";
+import {
+  clearAuthenticationPauseAfterInteractiveRecovery,
+  SqliteCheckpointStore,
+} from "./checkpoints.js";
 import { HistoryCollector } from "./collector.js";
 
 export interface PersistedHistoryResult extends HistoryCollectionResult {
@@ -57,6 +61,42 @@ export function assertAccountBinding(ledger: Ledger, scope: LedgerScope): void {
       "configured identity differs from the ledger binding; use a distinct account id",
     );
   }
+}
+
+export function recoverAuthenticationPauseAfterInteractiveLogin(
+  ledger: Ledger,
+  account: AccountConfig,
+  identity: IdentityRecord,
+): boolean {
+  if (identity.authState !== "ready" || identity.surface !== "chat") {
+    return false;
+  }
+  const scope = configuredScope(account);
+  assertCollectedIdentity(identity, scope);
+  const stored = ledger.listAccounts().find(
+    (candidate) => candidate.collectorAccountId === scope.collectorAccountId,
+  );
+  if (!stored) {
+    return false;
+  }
+  assertAccountBinding(ledger, scope);
+  const store = new SqliteCheckpointStore(ledger, scope);
+  const state = store.loadAccountState();
+  if (state.status !== "paused" || state.reason !== "authentication") {
+    return false;
+  }
+  ledger.transaction(() => {
+    if (!clearAuthenticationPauseAfterInteractiveRecovery(store)) {
+      return;
+    }
+    ledger.upsertAccount(scope, {
+      authState: "ready",
+      planPolicyId: account.planPolicyId || null,
+      enabled: account.enabled,
+    });
+    store.persist();
+  });
+  return true;
 }
 
 export function selectMapping(

@@ -148,6 +148,21 @@ export class SqliteCheckpointStore extends MemoryCheckpointStore {
   }
 }
 
+/**
+ * Clear an authentication pause only after an explicit interactive recovery
+ * has verified the bound identity. Read-only inspection must not call this.
+ */
+export function clearAuthenticationPauseAfterInteractiveRecovery(
+  store: HistoryCheckpointStore,
+): boolean {
+  const state = store.loadAccountState();
+  if (state.status !== "paused" || state.reason !== "authentication") {
+    return false;
+  }
+  store.saveAccountState(readyAccountState());
+  return true;
+}
+
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }

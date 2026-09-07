@@ -47,6 +47,10 @@ an existing local account.
 Live access requires an existing profile unless interactive login was explicitly
 authorized. Downloads are disabled, and browser storage never leaves the
 profile. Fixture mode uses the same adapter without constructing a browser.
+When an account is paused for authentication, only `bootstrap
+--interactive-login` can clear the persisted pause, and only after the
+interactive session verifies the configured ready Chat identity. Read-only
+capability inspection cannot reset account state.
 
 `src/adapters/chatgpt/adapter.ts` and both transports enforce exact GET-only
 route shapes and safe conversation IDs. `401`, `403`, HTML auth pages, and
