@@ -593,6 +593,16 @@ class Collector:
                     reason="detail_pagination_incomplete",
                     now=now,
                 )
+                # Preserve the retry path even when a later index page omits
+                # this conversation after the incomplete detail fetch.
+                self.ledger.conn.execute(
+                    """
+                    UPDATE conversation_state
+                    SET pending=1, page_coverage=?
+                    WHERE collector_account_id=? AND conversation_id=?
+                    """,
+                    (coverage, account.id, summary.conversation_id),
+                )
             if coverage == "validated_page":
                 self.ledger.mark_conversation_fetched(
                     account.id,
