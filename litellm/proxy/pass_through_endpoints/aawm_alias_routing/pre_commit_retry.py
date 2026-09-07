@@ -74,7 +74,7 @@ async def await_with_client_disconnect(
 
     disconnect_task = asyncio.create_task(_wait_for_client_disconnect(request))
     try:
-        operation_task = asyncio.create_task(operation())
+        operation_task: asyncio.Future[Any] = asyncio.ensure_future(operation())
     except BaseException:
         disconnect_task.cancel()
         await asyncio.gather(disconnect_task, return_exceptions=True)
@@ -427,7 +427,9 @@ class OpenAIAlphaCapacityRetryCoordinator:
         self._pending_wait_seconds: Optional[float] = None
         self._redis_cache = _resolve_redis_for_capacity_wakeup()
         self._redis_key = (
-            _build_openai_capacity_success_redis_key(target_identity, namespace)
+            _build_openai_capacity_success_redis_key(
+                target_identity, self._namespace
+            )
             if self._redis_cache is not None
             else None
         )

@@ -858,7 +858,11 @@ def _get_passthrough_terminal_wire_headers(exc: Exception) -> Dict[str, str]:
     if not hasattr(headers, "items"):
         return fallback
 
-    for header_name, header_value in headers.items():
+    header_items = getattr(headers, "items", None)
+    if not callable(header_items):
+        return fallback
+
+    for header_name, header_value in header_items():
         if str(header_name).lower() != "retry-after":
             continue
         try:
