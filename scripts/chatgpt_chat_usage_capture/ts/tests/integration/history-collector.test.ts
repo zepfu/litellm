@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   AuthenticationRequiredError,
   ChatGPTHistoryAdapter,
+  HttpStatusError,
   RateLimitedError,
   type HistoryTransport,
 } from "../../src/adapters/chatgpt/adapter.js";
@@ -1037,6 +1038,74 @@ describe("Stage-2A history collection", () => {
     expect(result.conversations[0]?.coverage).toBe("partial");
   });
 
+  it("retains a revisit when the same generation becomes sparse without terminal evidence", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-sparse-generation");
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set(candidate.conversationId, detail(candidate.conversationId));
+    reader.messagePages.set(
+      candidate.conversationId,
+      new Map([
+        [
+          "latest",
+          completePage([
+            {
+              ...message(candidate.conversationId, "msg-sparse"),
+              status: "in_progress",
+              endTurn: false,
+            },
+          ]),
+        ],
+      ]),
+    );
+
+    const store = new MemoryCheckpointStore();
+    const collector = new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    });
+    const first = await collector.collect({
+      mode: "backfill",
+      range: EXPLICIT_RANGE,
+    });
+    expect(first.revisits[0]?.outstandingGeneration).toMatchObject({
+      state: "nonterminal",
+      since: NOW.toISOString(),
+      timedOut: false,
+      messageId: "msg-sparse",
+    });
+
+    reader.messagePages.set(
+      candidate.conversationId,
+      new Map([
+        [
+          "latest",
+          completePage([
+            {
+              ...message(candidate.conversationId, "msg-sparse"),
+              status: null,
+              endTurn: false,
+            },
+          ]),
+        ],
+      ]),
+    );
+    const second = await collector.collect({
+      mode: "incremental",
+      now: new Date(NOW.getTime() + OUTSTANDING_GENERATION_REVISIT_BASE_DELAY_MS),
+    });
+
+    expect(second.revisits).toHaveLength(1);
+    expect(second.revisits[0]?.reason).toBe("nonterminal_generation");
+    expect(second.revisits[0]?.outstandingGeneration).toMatchObject({
+      state: "nonterminal",
+      since: NOW.toISOString(),
+      timedOut: false,
+      messageId: "msg-sparse",
+    });
+  });
+
   it("invalidates one bad saved continuation and performs only one bounded restart", async () => {
     const reader = new ScriptedReader();
     const candidate = summary("conv-bad-continuation");
@@ -1360,6 +1429,9 @@ describe("Stage-2A history collection", () => {
       state: "nonterminal",
       since: NOW.toISOString(),
       timedOut: false,
+      messageId: "msg-pending",
+      generationId: null,
+      requestId: null,
     });
     expect(
       new Date(firstRevisit.nextEligibleAt).getTime() - NOW.getTime(),
@@ -1411,6 +1483,9 @@ describe("Stage-2A history collection", () => {
       state: "unknown",
       since: NOW.toISOString(),
       timedOut: true,
+      messageId: "msg-pending",
+      generationId: "generation-1",
+      requestId: "request-1",
     });
     expect(
       new Date(timedOutRevisit.nextEligibleAt).getTime() -
@@ -1425,6 +1500,166 @@ describe("Stage-2A history collection", () => {
     expect(timedOut.conversations[0]?.warnings).toContain(
       "nonterminal_generation_timeout",
     );
+  });
+
+  it("starts a fresh follow-up clock for a new generation after the prior one completes", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-generation-rotation");
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set(candidate.conversationId, detail(candidate.conversationId));
+    reader.messagePages.set(
+      candidate.conversationId,
+      new Map([
+        [
+          "latest",
+          completePage([
+            {
+              ...message(candidate.conversationId, "msg-generation-a"),
+              status: "in_progress",
+              endTurn: false,
+              generationId: "generation-a",
+              requestId: "request-a",
+            },
+          ]),
+        ],
+      ]),
+    );
+
+    const store = new MemoryCheckpointStore();
+    const collector = new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    });
+    await collector.collect({
+      mode: "backfill",
+      range: EXPLICIT_RANGE,
+    });
+
+    const timedOutAt = new Date(
+      NOW.getTime() + OUTSTANDING_GENERATION_TIMEOUT_MS + 60_000,
+    );
+    const timedOut = await collector.collect({
+      mode: "incremental",
+      now: timedOutAt,
+    });
+    expect(timedOut.revisits[0]?.outstandingGeneration).toMatchObject({
+      state: "unknown",
+      since: NOW.toISOString(),
+      timedOut: true,
+      generationId: "generation-a",
+      requestId: "request-a",
+    });
+
+    const rotatedAt = new Date(
+      timedOutAt.getTime() + OUTSTANDING_GENERATION_REVISIT_MAX_DELAY_MS,
+    );
+    reader.messagePages.set(
+      candidate.conversationId,
+      new Map([
+        [
+          "latest",
+          completePage([
+            {
+              ...message(candidate.conversationId, "msg-generation-a"),
+              status: "finished_successfully",
+              endTurn: true,
+              generationId: "generation-a",
+              requestId: "request-a",
+            },
+            {
+              ...message(candidate.conversationId, "msg-generation-b"),
+              status: "in_progress",
+              endTurn: false,
+              generationId: "generation-b",
+              requestId: "request-b",
+            },
+          ]),
+        ],
+      ]),
+    );
+    const rotated = await collector.collect({
+      mode: "incremental",
+      now: rotatedAt,
+    });
+    const rotatedGeneration = rotated.revisits[0]?.outstandingGeneration;
+
+    expect(rotatedGeneration).toEqual({
+      state: "nonterminal",
+      since: rotatedAt.toISOString(),
+      timedOut: false,
+      messageId: "msg-generation-b",
+      generationId: "generation-b",
+      requestId: "request-b",
+    });
+    expect(
+      new Date(rotated.revisits[0]!.nextEligibleAt).getTime() -
+        rotatedAt.getTime(),
+    ).toBeLessThan(OUTSTANDING_GENERATION_REVISIT_MAX_DELAY_MS);
+  });
+
+  it("advances an outstanding-generation timeout when detail acquisition returns HTTP 503", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-generation-503");
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set(candidate.conversationId, detail(candidate.conversationId));
+    reader.messagePages.set(
+      candidate.conversationId,
+      new Map([
+        [
+          "latest",
+          completePage([
+            {
+              ...message(candidate.conversationId, "msg-503"),
+              status: "in_progress",
+              endTurn: false,
+              generationId: "generation-503",
+              requestId: "request-503",
+            },
+          ]),
+        ],
+      ]),
+    );
+
+    const store = new MemoryCheckpointStore();
+    const collector = new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    });
+    await collector.collect({
+      mode: "backfill",
+      range: EXPLICIT_RANGE,
+    });
+
+    reader.detailErrors.set(
+      candidate.conversationId,
+      new HttpStatusError("service unavailable", {
+        status: 503,
+        path: `/backend-api/conversations/${candidate.conversationId}`,
+      }),
+    );
+    const failedAt = new Date(
+      NOW.getTime() + OUTSTANDING_GENERATION_TIMEOUT_MS + 60_000,
+    );
+    const failed = await collector.collect({
+      mode: "incremental",
+      now: failedAt,
+    });
+    const failedRevisit = failed.revisits[0]!;
+
+    expect(failedRevisit.lastError).toBe("http_503");
+    expect(failedRevisit.outstandingGeneration).toEqual({
+      state: "unknown",
+      since: NOW.toISOString(),
+      timedOut: true,
+      messageId: "msg-503",
+      generationId: "generation-503",
+      requestId: "request-503",
+    });
+    expect(
+      new Date(failedRevisit.nextEligibleAt).getTime() - failedAt.getTime(),
+    ).toBe(OUTSTANDING_GENERATION_REVISIT_MAX_DELAY_MS);
   });
 
   it("rotates opt-in older-history audit progress and reports its coverage", async () => {
@@ -1930,6 +2165,9 @@ describe("Stage-2A history collection", () => {
         state: "unknown",
         since: "2026-09-06T12:00:00.000Z",
         timedOut: true,
+        messageId: "msg-revisit",
+        generationId: "generation-revisit",
+        requestId: "request-revisit",
       },
     };
     first.saveDiscovery(checkpoint);

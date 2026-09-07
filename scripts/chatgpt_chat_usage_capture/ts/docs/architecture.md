@@ -77,6 +77,11 @@ includes conversations updated beyond the range end. Full message evidence is
 retained; report membership is bounded by attempt evidence, not acquisition time.
 Leading-page rereads leave changing indexes partial. Incomplete detail/message
 traversal and nonterminal generations retain revisits independently of cutoff.
+Generation revisits retain message, generation, and request identity. Sparse
+same-message evidence with `status=null` and `end_turn=false` does not provide
+terminal evidence, and a transport failure still advances an existing timeout
+from its original `since` timestamp. A completed generation does not transfer
+its timeout state to a distinct active generation.
 
 `src/history/checkpoints.ts` buffers the checkpoint contract in memory.
 `SqliteCheckpointStore` loads/saves the account's per-scope state and revisits

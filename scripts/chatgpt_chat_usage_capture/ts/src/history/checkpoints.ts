@@ -208,6 +208,18 @@ function normalizeOutstandingGeneration(
     state: state.timedOut ? "unknown" : state.state,
     since: state.since,
     timedOut: state.timedOut === true,
+    messageId:
+      typeof state.messageId === "string" && state.messageId.trim()
+        ? state.messageId.trim()
+        : null,
+    generationId:
+      typeof state.generationId === "string" && state.generationId.trim()
+        ? state.generationId.trim()
+        : null,
+    requestId:
+      typeof state.requestId === "string" && state.requestId.trim()
+        ? state.requestId.trim()
+        : null,
   };
 }
 

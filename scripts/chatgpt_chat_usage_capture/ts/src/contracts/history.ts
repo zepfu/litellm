@@ -68,6 +68,12 @@ export interface OutstandingGenerationState {
   state: GenerationCompletionState;
   since: string;
   timedOut: boolean;
+  /** Message identity used to reconnect sparse follow-up evidence. */
+  messageId: string | null;
+  /** Strong upstream generation identity when present. */
+  generationId: string | null;
+  /** Request identity when present; scoped to the conversation. */
+  requestId: string | null;
 }
 
 export interface OlderHistoryAuditRequest {

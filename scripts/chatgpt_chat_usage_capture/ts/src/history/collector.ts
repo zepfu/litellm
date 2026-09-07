@@ -92,6 +92,22 @@ interface AuditEvidence {
   committedCandidateIds: Set<string>;
 }
 
+interface GenerationIdentity {
+  messageId: string | null;
+  generationId: string | null;
+  requestId: string | null;
+}
+
+interface GenerationEvidence extends GenerationIdentity {
+  state: GenerationCompletionState;
+  kind: "identified" | "sparse";
+}
+
+interface GenerationScan {
+  active: GenerationEvidence | null;
+  terminal: GenerationIdentity[];
+}
+
 const TERMINAL_GENERATION_STATUSES = new Set([
   "completed",
   "done",
@@ -1915,10 +1931,16 @@ export class HistoryCollector {
     const nowIso = now.toISOString();
     const pageDelta = options.pagesFetched ?? detailPagesFetched;
     const incrementAttempt = options.incrementAttempt ?? true;
-    const outstandingGeneration =
+    const requestedOutstandingGeneration =
       options.outstandingGeneration === undefined
         ? existing?.outstandingGeneration ?? null
         : options.outstandingGeneration;
+    const outstandingGeneration = requestedOutstandingGeneration
+      ? refreshOutstandingGenerationTimeout(
+          requestedOutstandingGeneration,
+          now,
+        )
+      : null;
     const attempts = Math.max(
       1,
       (existing?.attempts ?? 0) + (incrementAttempt ? 1 : 0),
@@ -1974,7 +1996,7 @@ export class HistoryCollector {
       validatedExhaustion?: boolean;
     } = {},
   ): RevisitEntry | null {
-    const generationState = generationCompletionState(messages);
+    const generationState = generationStateFor(messages, existing, now);
     const malformedPage =
       options.malformedPage === undefined
         ? existing?.malformedPage ?? null
@@ -1983,13 +2005,6 @@ export class HistoryCollector {
       ? "nonterminal_generation"
       : malformedPage?.reason ?? detailReason;
     if (reason) {
-      const outstandingGeneration = generationState
-        ? buildOutstandingGenerationState(
-            existing?.outstandingGeneration ?? null,
-            generationState,
-            now,
-          )
-        : null;
       return this.saveRevisit(
         candidate,
         now,
@@ -2001,7 +2016,7 @@ export class HistoryCollector {
           continuation: null,
           continuationRevision: null,
           malformedPage,
-          outstandingGeneration,
+          outstandingGeneration: generationState,
           pagesFetched: detailPagesFetched,
           incrementAttempt: generationState !== null && existing !== null,
         },
@@ -2542,32 +2557,68 @@ function messagePageRevisitIssue(
     : null;
 }
 
-function generationCompletionState(
-  messages: MessageRecord[],
-): GenerationCompletionState | null {
-  let unknown = false;
+function generationScan(messages: MessageRecord[]): GenerationScan {
+  let active: GenerationEvidence | null = null;
+  const terminal: GenerationIdentity[] = [];
   for (const message of messages) {
     if (message.role !== "assistant" && message.role !== "tool") {
       continue;
     }
     const status = (message.status ?? "").trim().toLowerCase();
+    const identity = generationIdentityFor(message);
     if (NONTERMINAL_GENERATION_STATUSES.has(status)) {
-      return "nonterminal";
+      active = preferGenerationEvidence(active, {
+        ...identity,
+        state: "nonterminal",
+        kind: "identified",
+      });
+      continue;
     }
     if (status && TERMINAL_GENERATION_STATUSES.has(status)) {
+      terminal.push(identity);
       continue;
     }
     if (["cancelled", "error", "failed", "interrupted", "rejected"].includes(status)) {
+      terminal.push(identity);
+      continue;
+    }
+    if (!status && message.endTurn === true) {
+      terminal.push(identity);
       continue;
     }
     const hasGenerationIdentity =
-      message.generationId !== null || message.requestId !== null;
-    if (!hasGenerationIdentity) {
+      identity.generationId !== null || identity.requestId !== null;
+    if (hasGenerationIdentity) {
+      active = preferGenerationEvidence(active, {
+        ...identity,
+        state: "unknown",
+        kind: "identified",
+      });
       continue;
     }
-    unknown = true;
+    if (!status && message.endTurn === false) {
+      active = preferGenerationEvidence(active, {
+        ...identity,
+        state: "unknown",
+        kind: "sparse",
+      });
+    }
   }
-  return unknown ? "unknown" : null;
+  return { active, terminal };
+}
+
+function preferGenerationEvidence(
+  current: GenerationEvidence | null,
+  candidate: GenerationEvidence,
+): GenerationEvidence {
+  if (
+    current === null ||
+    current.kind === "sparse" ||
+    (current.state === "unknown" && candidate.state === "nonterminal")
+  ) {
+    return candidate;
+  }
+  return current;
 }
 
 function generationStateFor(
@@ -2575,19 +2626,43 @@ function generationStateFor(
   existing: RevisitEntry | null,
   now: Date,
 ): OutstandingGenerationState | null {
-  const state = generationCompletionState(messages);
-  return state
-    ? buildOutstandingGenerationState(
-        existing?.outstandingGeneration ?? null,
-        state,
-        now,
+  const scan = generationScan(messages);
+  const active =
+    scan.active &&
+    !scan.terminal.some((terminal) =>
+      sameGenerationIdentity(scan.active!, terminal),
+    )
+      ? scan.active
+      : null;
+  const existingState = existing?.outstandingGeneration ?? null;
+
+  if (active?.kind === "sparse") {
+    if (existingState && !terminallyResolves(scan, existingState)) {
+      return refreshOutstandingGenerationTimeout(existingState, now);
+    }
+    return null;
+  }
+  if (active) {
+    return buildOutstandingGenerationState(
+      existingState && sameGenerationIdentity(
+        generationIdentityForState(existingState),
+        active,
       )
-    : null;
+        ? existingState
+        : null,
+      active,
+      now,
+    );
+  }
+  if (existingState && !terminallyResolves(scan, existingState)) {
+    return refreshOutstandingGenerationTimeout(existingState, now);
+  }
+  return null;
 }
 
 function buildOutstandingGenerationState(
   existing: OutstandingGenerationState | null,
-  state: GenerationCompletionState,
+  evidence: GenerationEvidence,
   now: Date,
 ): OutstandingGenerationState {
   const since = existing?.since ?? now.toISOString();
@@ -2597,10 +2672,83 @@ function buildOutstandingGenerationState(
     (Number.isFinite(sinceMs) &&
       now.getTime() - sinceMs >= OUTSTANDING_GENERATION_TIMEOUT_MS);
   return {
-    state: existing?.state === "unknown" || timedOut ? "unknown" : state,
+    state:
+      existing?.state === "unknown" || timedOut ? "unknown" : evidence.state,
     since,
     timedOut,
+    messageId: evidence.messageId ?? existing?.messageId ?? null,
+    generationId: evidence.generationId ?? existing?.generationId ?? null,
+    requestId: evidence.requestId ?? existing?.requestId ?? null,
   };
+}
+
+function refreshOutstandingGenerationTimeout(
+  state: OutstandingGenerationState,
+  now: Date,
+): OutstandingGenerationState {
+  const sinceMs = new Date(state.since).getTime();
+  const timedOut =
+    state.timedOut ||
+    (Number.isFinite(sinceMs) &&
+      now.getTime() - sinceMs >= OUTSTANDING_GENERATION_TIMEOUT_MS);
+  return {
+    ...state,
+    state: timedOut ? "unknown" : state.state,
+    timedOut,
+  };
+}
+
+function generationIdentityFor(message: MessageRecord): GenerationIdentity {
+  return {
+    messageId: message.messageId.trim() || null,
+    generationId: message.generationId,
+    requestId: message.requestId,
+  };
+}
+
+function generationIdentityForState(
+  state: OutstandingGenerationState,
+): GenerationIdentity {
+  return {
+    messageId: state.messageId,
+    generationId: state.generationId,
+    requestId: state.requestId,
+  };
+}
+
+function sameGenerationIdentity(
+  left: GenerationIdentity,
+  right: GenerationIdentity,
+): boolean {
+  const leftStrong = [left.generationId, left.requestId].filter(
+    (value): value is string => value !== null,
+  );
+  const rightStrong = [right.generationId, right.requestId].filter(
+    (value): value is string => value !== null,
+  );
+  if (leftStrong.length > 0 && rightStrong.length > 0) {
+    return leftStrong.some((value) => rightStrong.includes(value));
+  }
+  if (left.messageId !== null && right.messageId !== null) {
+    return left.messageId === right.messageId;
+  }
+  return leftStrong.length === 0 && rightStrong.length === 0;
+}
+
+function terminallyResolves(
+  scan: GenerationScan,
+  existing: OutstandingGenerationState,
+): boolean {
+  const identity = generationIdentityForState(existing);
+  if (scan.terminal.some((terminal) => sameGenerationIdentity(identity, terminal))) {
+    return true;
+  }
+  return (
+    identity.messageId === null &&
+    identity.generationId === null &&
+    identity.requestId === null &&
+    scan.terminal.length > 0
+  );
 }
 
 function nextOutstandingGenerationAt(
