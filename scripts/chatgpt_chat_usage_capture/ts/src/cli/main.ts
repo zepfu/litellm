@@ -1,10 +1,10 @@
 /**
- * Stage-1 CLI entry point.
+ * TypeScript Stage-2B CLI entry point.
  *
- * Implemented commands: init, bootstrap, inspect-capabilities. All other
- * Stage-2+ commands fail closed with an explicit "not implemented in Stage 1"
- * error. No command submits prompts, exports credentials, or bypasses the
- * GET-only route allowlist.
+ * Browser commands remain read-only. Ledger commands operate only on retained
+ * local evidence; deferred browser traversal, scheduling, reset accounting,
+ * API, and UI commands fail closed. No command submits prompts, exports
+ * credentials, or bypasses the GET-only route allowlist.
  */
 
 import { existsSync } from "node:fs";
@@ -17,7 +17,10 @@ import {
   inspectCapabilities,
   inspectFixtureCapabilities,
 } from "../browser/bootstrap.js";
+import { buildRawModelReport } from "../accounting/raw-model.js";
+import { reaggregate } from "../accounting/reaggregate.js";
 import { ADAPTER_VERSION } from "../contracts/records.js";
+import { Ledger } from "../ledger/store.js";
 import type { BootstrapResult, InspectCapabilitiesResult } from "../browser/bootstrap.js";
 
 interface CliArgs {
@@ -27,6 +30,10 @@ interface CliArgs {
   interactiveLogin: boolean;
   stateDirectory: string | null;
   fixtureRoot: string | null;
+  databasePath: string | null;
+  lastHours: number | null;
+  mappingVersion: string | null;
+  apply: boolean;
 }
 
 const STAGE1_COMMANDS = new Set(["init", "bootstrap", "inspect-capabilities"]);
@@ -55,10 +62,18 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   if (!STAGE1_COMMANDS.has(args.command)) {
+    if (["report", "rebuild", "models"].includes(args.command)) {
+      try {
+        return await execute(args);
+      } catch (error) {
+        console.error(`usage-capture: ${(error as Error).message}`);
+        return 1;
+      }
+    }
     if (STAGE2_PLUS_COMMANDS.has(args.command)) {
       console.error(
-        `usage-capture: '${args.command}' is not implemented in Stage 1. ` +
-          "Stage 1 covers bootstrap, inspect-capabilities, and init only.",
+        `usage-capture: '${args.command}' is deferred beyond Stage 2B. ` +
+          "Browser traversal, scheduling, reset accounting, API, and UI are not implemented.",
       );
       return 2;
     }
@@ -81,7 +96,16 @@ async function execute(args: CliArgs): Promise<number> {
   if (args.command === "bootstrap") {
     return runBootstrap(args);
   }
-  return runInspectCapabilities(args);
+  if (args.command === "inspect-capabilities") {
+    return runInspectCapabilities(args);
+  }
+  if (args.command === "report") {
+    return runReport(args);
+  }
+  if (args.command === "rebuild") {
+    return runRebuild(args);
+  }
+  return runModels(args);
 }
 
 function runInit(args: CliArgs): number {
@@ -168,6 +192,102 @@ async function runInspectCapabilities(args: CliArgs): Promise<number> {
   return result.state === "ready" ? 0 : 1;
 }
 
+function runReport(args: CliArgs): number {
+  const config = loadConfig(args.configPath);
+  const account = selectAccount(config.accounts, args.accountId);
+  if (!account) {
+    console.error(`usage-capture report: account '${args.accountId}' not found`);
+    return 2;
+  }
+  const ledger = new Ledger(
+    resolve(args.databasePath ?? config.application.databasePath),
+  );
+  try {
+    const scope = ledger.accountScope(account.id);
+    console.log(
+      JSON.stringify(
+        buildRawModelReport(ledger, scope, {
+          durationMs: (args.lastHours ?? 24) * 60 * 60 * 1000,
+        }),
+        null,
+        2,
+      ),
+    );
+    return 0;
+  } finally {
+    ledger.close();
+  }
+}
+
+function runRebuild(args: CliArgs): number {
+  const config = loadConfig(args.configPath);
+  const account = selectAccount(config.accounts, args.accountId);
+  if (!account) {
+    console.error(`usage-capture rebuild: account '${args.accountId}' not found`);
+    return 2;
+  }
+  const ledger = new Ledger(
+    resolve(args.databasePath ?? config.application.databasePath),
+  );
+  try {
+    const scope = ledger.accountScope(account.id);
+    const mapping = selectMapping(ledger, args.mappingVersion);
+    const result = reaggregate(ledger, scope, mapping, { apply: args.apply });
+    console.log(
+      JSON.stringify({ mode: args.apply ? "apply" : "preview", ...result }, null, 2),
+    );
+    return 0;
+  } finally {
+    ledger.close();
+  }
+}
+
+function runModels(args: CliArgs): number {
+  const config = loadConfig(args.configPath);
+  const account = selectAccount(config.accounts, args.accountId);
+  if (!account) {
+    console.error(`usage-capture models: account '${args.accountId}' not found`);
+    return 2;
+  }
+  const ledger = new Ledger(
+    resolve(args.databasePath ?? config.application.databasePath),
+  );
+  try {
+    const scope = ledger.accountScope(account.id);
+    const mapping = selectMapping(ledger, args.mappingVersion);
+    console.log(
+      JSON.stringify(
+        {
+          mapping_version: mapping.version,
+          review_status: mapping.reviewStatus,
+          suggestions: ledger.modelMappingSuggestions(scope, mapping),
+        },
+        null,
+        2,
+      ),
+    );
+    return 0;
+  } finally {
+    ledger.close();
+  }
+}
+
+function selectMapping(
+  ledger: Ledger,
+  version: string | null,
+) {
+  if (version) {
+    return ledger.modelMapping(version);
+  }
+  const mapping = ledger.modelMappings().at(-1);
+  if (!mapping) {
+    throw new Error(
+      "no model mapping version is recorded; use --mapping-version after recording one",
+    );
+  }
+  return mapping;
+}
+
 function printBootstrapResult(result: BootstrapResult): void {
   console.log(JSON.stringify(result, null, 2));
 }
@@ -193,6 +313,10 @@ function parseArgs(argv: string[]): CliArgs {
   let interactiveLogin = false;
   let stateDirectory: string | null = null;
   let fixtureRoot: string | null = null;
+  let databasePath: string | null = null;
+  let lastHours: number | null = null;
+  let mappingVersion: string | null = null;
+  let apply = false;
 
   for (let index = 1; index < argv.length; index += 1) {
     const flag = argv[index];
@@ -210,6 +334,21 @@ function parseArgs(argv: string[]): CliArgs {
     } else if (flag === "--fixture-root" && argv[index + 1]) {
       fixtureRoot = argv[index + 1]!;
       index += 1;
+    } else if (flag === "--database" && argv[index + 1]) {
+      databasePath = argv[index + 1]!;
+      index += 1;
+    } else if (flag === "--last-hours" && argv[index + 1]) {
+      const value = Number(argv[index + 1]);
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new Error("--last-hours must be a positive number");
+      }
+      lastHours = value;
+      index += 1;
+    } else if (flag === "--mapping-version" && argv[index + 1]) {
+      mappingVersion = argv[index + 1]!;
+      index += 1;
+    } else if (flag === "--apply") {
+      apply = true;
     } else if (flag === "--help" || flag === "-h") {
       printHelp();
       process.exit(0);
@@ -234,12 +373,16 @@ function parseArgs(argv: string[]): CliArgs {
     interactiveLogin,
     stateDirectory,
     fixtureRoot,
+    databasePath,
+    lastHours,
+    mappingVersion,
+    apply,
   };
 }
 
 function printHelp(): void {
   console.log(
-    `usage-capture (Stage 1, adapter ${ADAPTER_VERSION})
+    `usage-capture (Stage 2B, adapter ${ADAPTER_VERSION})
 
 Stage-1 commands:
   init --config <path>
@@ -256,10 +399,20 @@ Stage-1 commands:
       Use --fixture-root only with a fixture_history account for offline
       acceptance; live inspection requires playwright_persistent_context.
 
-All other commands (backfill, refresh, report, schedule, windows, quota,
-rebuild, export, dashboard, models) are Stage-2+ and fail closed with an
-explicit error. No prompt submission, credential export, or provider mutation
-is supported in Stage 1.`,
+Stage-2B offline ledger commands:
+  report --config <path> [--account <id>] [--database <path>] [--last-hours <n>]
+      Report observed raw-model activity from SQLite over the last N hours.
+
+  models --config <path> [--account <id>] [--database <path>]
+      Show raw-model mapping review suggestions from retained attempts.
+
+  rebuild --config <path> [--account <id>] [--database <path>]
+      [--mapping-version <version>] [--apply]
+      Preview or apply deterministic reaggregation without website requests.
+
+Deferred commands (browser traversal, scheduling, reset accounting, API, and
+UI) fail closed. No prompt submission, credential export, or provider mutation
+is supported.`,
   );
 }
 

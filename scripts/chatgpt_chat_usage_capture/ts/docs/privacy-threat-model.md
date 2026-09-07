@@ -1,4 +1,4 @@
-# Privacy and threat model
+# Stage-2B privacy and threat model
 
 ## Assets
 
@@ -6,18 +6,24 @@
   state inside the dedicated Playwright profile;
 - provider user, workspace, and quota-owner identifiers;
 - conversation and message relationship identifiers;
-- model, mode, reasoning, status, timestamp, and generation metadata;
-- local config and bootstrap state files.
+- model, mode, reasoning, status, timestamp, generation, request, branch, and
+  revision metadata;
+- local config, bootstrap state, SQLite ledger, WAL, and rollback journal files.
 
 ## Controls
 
-### Profile isolation
+### Profile and database isolation
 
 Live collection requires a non-default dedicated profile path. The bootstrap
 flow does not create or touch a missing profile unless interactive login was
 explicitly requested. Profile and state directories are created with mode
 `0700`; the persisted bootstrap file is created with mode `0600` where the
 filesystem permits it.
+
+The Stage-2B ledger uses a configured local SQLite path with WAL mode, foreign
+keys, a busy timeout, and transactional migrations. The database directory is
+created with mode `0700`; database backups must protect the database and its
+`-wal`/`-shm` companions while writers are active.
 
 ### Egress restriction
 
@@ -32,12 +38,18 @@ The account is ready only when all configured provider user, workspace, and
 quota-owner values are observed and equal. Partial or guessed identity is
 blocked.
 
-### Data minimization
+### Data minimization and immutable evidence
 
 Content keys, titles, prompts, answers, credentials, cookies, raw headers,
 storage, and email addresses are excluded from normalized projections.
-Metadata is typed and allowlisted. Persisted identity is checked with
-`assertNoSecrets` immediately before writing.
+Metadata is typed and allowlisted. Persisted observations, messages, mappings,
+coverage details, and reports are checked with `assertNoSecrets` immediately
+before writing. Stable fingerprints make replay idempotent while changed
+evidence appends immutable observation, message, and attempt revisions.
+
+Attempt identity is scoped by collector account, provider, provider user,
+workspace, quota owner, conversation, and validated generation/request/branch
+evidence. Upstream IDs are never merged across accounts.
 
 ### Test isolation
 
@@ -47,15 +59,18 @@ or make network calls.
 
 ## Threats and residual risk
 
-| Threat | Stage-1 response | Residual risk |
+| Threat | Stage-2B response | Residual risk |
 | --- | --- | --- |
 | Accidental mutating provider call | `GET`-only method and exact route allowlist | A future change could weaken the boundary; route tests must remain part of the gate |
 | Wrong account attribution | Required three-field identity match | Provider schema changes can make identity unavailable until the adapter is updated |
-| Credential or content persistence | Allowlist projection and secret scan | Upstream response data still exists in memory during the request |
+| Credential or content persistence | Allowlist projection, typed metadata, and secret scan at every persistence boundary | Upstream response data still exists in memory during the request |
 | Shared/default profile exposure | Dedicated-profile checks and explicit login | Filesystem ownership and OS-level access are outside the package |
 | HTML login or auth challenge treated as data | HTML, `401`, and `403` become auth-required | Live provider behavior can change and require new detection |
-| Provider throttling mistaken for quota | `429` becomes `RateLimitedError` | No retry scheduler or quota accounting exists in Stage 1 |
+| Provider throttling mistaken for quota | `429` becomes `RateLimitedError` | No retry scheduler or provider quota accounting exists in Stage 2B |
 | Schema drift | Coverage and warnings are returned instead of inventing completeness | The current adapter cannot interpret unknown future shapes |
+| Cross-account upstream ID collision | Scope-keyed ledger rows, aliases, and attempts plus coverage-gap records | A provider can expose insufficient identity or linkage evidence |
+| In-progress evidence overwritten | Immutable observation, message, and attempt revisions | Historical evidence is only as complete as the pages observed |
+| Model mapping overclaim | Raw labels remain reportable and mapping versions/history are explicit | A reviewed local family mapping does not prove provider billing semantics |
 
 This is a local privacy boundary, not a security boundary against a
 compromised host, compromised Node process, malicious dependencies, or a user

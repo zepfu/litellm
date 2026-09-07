@@ -1,10 +1,12 @@
-# ChatGPT Chat usage capture: TypeScript Stage 1
+# ChatGPT Chat usage capture: TypeScript Stage 2B
 
-This directory contains the bounded TypeScript Stage-1 implementation for
-read-only ordinary Chat history bootstrap and capability inspection. It is an
-independent collector boundary, not an official ChatGPT quota meter.
+This directory contains the bounded TypeScript Stage-2B implementation for
+read-only ordinary Chat history evidence, a local SQLite ledger, whole-generation
+attempt reconstruction, versioned model mapping, deterministic rebuilds, and
+raw-model activity reporting. It is an independent collector boundary, not an
+official ChatGPT quota meter.
 
-Stage 1 implements:
+Stage 1 browser and adapter behavior remains available:
 
 - `init`: write a starter JSON configuration;
 - `bootstrap`: verify a dedicated persistent browser profile and bind the
@@ -13,9 +15,18 @@ Stage 1 implements:
   report adapter coverage. It supports live Playwright inspection and an
   explicit fixture-backed offline acceptance mode.
 
-Stage 1 does not implement ledger storage, attempt reconstruction, accounting,
-quota windows, scheduling, local API, dashboard UI, exports, or model
-reporting. Those commands fail closed with an explicit Stage-2 error.
+Stage 2B adds:
+
+- transactional SQLite migrations and a sanitized, revisioned evidence ledger;
+- scope-aware message, attempt, alias, provenance, and coverage-gap storage;
+- chained generation reconstruction across analysis, reasoning, tool, and final
+  nodes, including retries, regenerations, and branches;
+- reviewed versioned raw-model mapping and deterministic reaggregation;
+- offline `report`, `models`, and `rebuild` commands.
+
+Stage 2B does not implement browser discovery traversal, scheduling, reset-window
+accounting, provider quota accounting, local API, dashboard UI, or exports.
+Those commands fail closed.
 
 ## Requirements
 
@@ -23,7 +34,7 @@ reporting. Those commands fail closed with an explicit Stage-2 error.
 - npm
 - A dedicated Playwright Chromium profile for live operation
 
-The Stage-1 fixture suite is synthetic and runs offline. No credentials or
+The fixture suite is synthetic and runs offline. No credentials or
 browser profile are required for tests or fixture-backed CLI inspection.
 
 ## Install
@@ -46,13 +57,15 @@ The exact direct dependency versions are pinned in `package.json` and
 
 | Package | Version |
 | --- | --- |
+| `better-sqlite3` | `13.0.3` |
 | `playwright` | `1.63.0` |
 | `typescript` | `5.9.3` |
 | `typescript-eslint` | `8.69.0` |
 | `eslint` | `10.10.0` |
 | `@eslint/js` | `9.39.2` |
 | `@types/node` | `26.4.1` |
-| `vitest` | `3.2.4` |
+| `@types/better-sqlite3` | `9.6.0` |
+| `vitest` | `3.2.7` |
 
 The adapter contract version is `chatgpt-chat-history-v1`.
 
@@ -89,7 +102,8 @@ node bin/usage-capture.mjs bootstrap --config ./config.json
 node bin/usage-capture.mjs inspect-capabilities --config ./config.json
 ```
 
-For offline CLI acceptance, use the committed synthetic config and fixtures:
+For offline Stage-1 CLI acceptance, use the committed synthetic config and
+fixtures:
 
 ```bash
 node bin/usage-capture.mjs inspect-capabilities \
@@ -102,6 +116,31 @@ The fixture command must use an account with
 `browser.adapter: "fixture_history"` and never contacts ChatGPT. Live
 `bootstrap` and live `inspect-capabilities` require
 `browser.adapter: "playwright_persistent_context"` and a dedicated profile.
+
+Stage-2B ledger commands operate only on retained local evidence:
+
+```bash
+node bin/usage-capture.mjs report \
+  --config ./config.json \
+  --account personal-primary \
+  --database ./state/usage.sqlite \
+  --last-hours 24
+
+node bin/usage-capture.mjs models \
+  --config ./config.json \
+  --account personal-primary \
+  --database ./state/usage.sqlite \
+  --mapping-version mapping-v2
+
+node bin/usage-capture.mjs rebuild \
+  --config ./config.json \
+  --account personal-primary \
+  --database ./state/usage.sqlite \
+  --mapping-version mapping-v2
+```
+
+These commands do not issue website requests. `rebuild` previews by default;
+pass `--apply` only after reviewing the deterministic result.
 
 The bootstrap command returns exit code `0` only for a verified `ready`
 identity. Missing authentication, missing expected identity bindings, identity
@@ -117,9 +156,10 @@ node bin/usage-capture.mjs bootstrap \
 ```
 
 `--state-directory <path>` overrides the configured state directory. Persisted
-Stage-1 state is limited to sanitized identity metadata, adapter version,
-state, and timestamp under `bootstrap/<account-id>.json`; browser state stays
-inside the dedicated profile.
+Persisted bootstrap state is limited to sanitized identity metadata, adapter
+version, state, and timestamp under `bootstrap/<account-id>.json`; browser
+state stays inside the dedicated profile. Stage-2B ledger state is stored in
+the configured SQLite database and never contains prompt or answer content.
 
 ## Verify
 
@@ -143,5 +183,7 @@ See:
 - `docs/architecture.md`
 - `docs/endpoint-evidence.md`
 - `docs/privacy-threat-model.md`
+- `docs/counting-semantics.md`
+- `docs/operating-runbook.md`
 - `docs/known-limitations.md`
 - `docs/acceptance-results.md`

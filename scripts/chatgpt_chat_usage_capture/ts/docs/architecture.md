@@ -1,7 +1,9 @@
-# Stage-1 architecture
+# Stage-2B architecture
 
 The TypeScript slice keeps browser access, provider adaptation, identity
-verification, privacy projection, and local bootstrap state separate.
+verification, privacy projection, local bootstrap state, and the evidence ledger
+separate. Stage 2B operates on adapted records and retained local evidence; it
+does not add browser discovery traversal.
 
 ```text
 CLI
@@ -23,6 +25,14 @@ JSON config -> bootstrap state machine
              |
              v
    0600 bootstrap identity state
+             |
+             v
+       SQLite evidence ledger
+       observations/messages
+       attempts/aliases/revisions
+             |
+             v
+      raw-model reports/rebuilds
 ```
 
 ## Boundaries
@@ -81,9 +91,28 @@ browser storage, and email addresses are stripped or rejected at the
 persistence boundary. `assertNoSecrets` checks every persisted identity
 projection before it is written.
 
+### Ledger and accounting
+
+`src/ledger/store.ts` applies ordered SQL migrations to a local SQLite database
+configured with WAL, foreign keys, and a busy timeout. Ingestion is
+transactional: sanitized observations are revisioned by source identity and
+stable evidence fingerprint; messages and attempts retain immutable revisions;
+and aliases are scoped by account/provider/user/workspace/quota owner.
+
+`src/normalize/reconstruct.ts` follows the user-to-descendant graph and groups
+analysis, reasoning, tool, and final nodes by generation, then by request and
+branch evidence. Terminal answers are selected by timestamp, and unresolved or
+ambiguous linkage is retained as an explicit attempt or coverage gap.
+
+`src/normalize/model-mapping.ts` keeps requested, recorded-final, and resolved
+raw labels separate. Reviewed mapping versions are stored independently from
+raw evidence. `src/accounting/reaggregate.ts` rebuilds from local messages and
+`src/accounting/raw-model.ts` reports raw-model activity over a half-open
+last-N interval without interpreting it as official quota.
+
 ### Stage boundary
 
-The TypeScript implementation intentionally stops before ledger/accounting,
-attempt reconstruction, scheduler, local API, dashboard, and exports. The
-Python implementation in the parent directory remains the reference for those
-later stages; it is not imported by this package.
+The TypeScript implementation intentionally stops before browser discovery
+traversal, scheduler, reset-window accounting, provider quota accounting, local
+API, dashboard, and exports. The Python implementation in the parent directory
+remains outside this lane and is not imported or modified by this package.

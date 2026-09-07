@@ -1,7 +1,7 @@
 /**
- * Stage-1 configuration loader. Only the subset of the spec configuration
- * required for bootstrap and inspect-capabilities is modeled here; scheduler,
- * accounting, and ledger configuration belong to later stages.
+ * Configuration loader for the browser boundary and Stage-2B local ledger.
+ * Scheduler, reset-window accounting, provider quota accounting, and API
+ * configuration belong to later stages.
  */
 
 import {
@@ -30,6 +30,7 @@ export interface AccountConfig {
 export interface ApplicationConfig {
   reportTimezone: string;
   stateDirectory: string;
+  databasePath: string;
 }
 
 export interface Stage1Config {
@@ -47,6 +48,7 @@ export class ConfigError extends Error {
 
 const DEFAULT_TIMEZONE = "America/New_York";
 const DEFAULT_STATE_DIRECTORY = "./state";
+const DEFAULT_DATABASE_PATH = "./state/usage.sqlite";
 
 export function loadConfig(path: string): Stage1Config {
   const resolvedPath = resolve(path);
@@ -117,6 +119,7 @@ export function loadConfig(path: string): Stage1Config {
     application: {
       reportTimezone: String(applicationRaw.report_timezone ?? DEFAULT_TIMEZONE),
       stateDirectory: String(applicationRaw.state_directory ?? DEFAULT_STATE_DIRECTORY),
+      databasePath: String(applicationRaw.database_path ?? DEFAULT_DATABASE_PATH),
     },
     accounts,
   };
@@ -128,6 +131,7 @@ export function defaultConfig(): Stage1Config {
     application: {
       reportTimezone: "America/New_York",
       stateDirectory: DEFAULT_STATE_DIRECTORY,
+      databasePath: DEFAULT_DATABASE_PATH,
     },
     accounts: [
       {
@@ -159,6 +163,7 @@ export function saveConfig(config: Stage1Config, path: string): void {
     application: {
       report_timezone: config.application.reportTimezone,
       state_directory: config.application.stateDirectory,
+      database_path: config.application.databasePath,
     },
     accounts: config.accounts.map((account) => ({
       id: account.id,

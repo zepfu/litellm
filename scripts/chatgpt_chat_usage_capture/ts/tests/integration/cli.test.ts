@@ -19,7 +19,7 @@ describe("CLI", () => {
   });
 
   it("rejects Stage-2+ commands with an explicit error", async () => {
-    for (const command of ["backfill", "refresh", "report", "schedule", "rebuild"]) {
+    for (const command of ["backfill", "refresh", "schedule", "windows", "quota"]) {
       const exitCode = await run([command, "--config", "unused.yaml"]);
       expect(exitCode).toBe(2);
     }
