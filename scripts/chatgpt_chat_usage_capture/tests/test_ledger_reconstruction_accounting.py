@@ -30,6 +30,7 @@ def _message(
     children: tuple[str, ...] = (),
     status: str | None = None,
     end_turn: bool | None = None,
+    channel: str | None = None,
     generation_id: str | None = None,
     request_id: str | None = None,
     created_at: datetime = NOW,
@@ -43,7 +44,7 @@ def _message(
         parent_id=None if role == "user" else "user-1",
         children=children,
         role=role,
-        channel=None,
+        channel=channel,
         created_at=created_at,
         status=status,
         end_turn=end_turn,
@@ -225,6 +226,48 @@ def test_nonterminal_assistant_nodes_remain_uncertain(
     assert summary["working"] == {}
     assert summary["unknown_debit"] == 1
     assert working_contribution(asdict(attempt), config) is None
+
+
+def test_finished_analysis_does_not_complete_in_progress_final() -> None:
+    attempts = reconstruct_attempts(
+        [
+            _message(
+                "user-1",
+                "user",
+                children=("analysis-1", "final-1"),
+                status="finished_successfully",
+                end_turn=True,
+            ),
+            _message(
+                "analysis-1",
+                "assistant",
+                status="finished_successfully",
+                end_turn=True,
+                channel="analysis",
+                generation_id="generation-mixed",
+                request_id="request-mixed",
+                created_at=NOW + timedelta(seconds=5),
+            ),
+            _message(
+                "final-1",
+                "assistant",
+                status="in_progress",
+                end_turn=False,
+                generation_id="generation-mixed",
+                request_id="request-mixed",
+                created_at=NOW + timedelta(seconds=6),
+            ),
+        ],
+        mapping_version="mapping-v1",
+        mapping_rules=({"slug": "gpt-test", "family": "astra_pro"},),
+        conversation_id="conv-1",
+    )
+
+    assert len(attempts) == 1
+    attempt = attempts[0]
+    assert attempt.completed_answer is False
+    assert attempt.outcome == "completion_unknown"
+    assert attempt.recorded_final_model_raw is None
 
 
 def test_rebuild_reclassifies_retained_raw_evidence_and_preserves_history(
