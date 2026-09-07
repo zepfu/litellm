@@ -1,5 +1,7 @@
 import {
   AuthenticationRequiredError,
+  CapabilityError,
+  HttpStatusError,
   LegacyFallbackNotApprovedError,
   RateLimitedError,
 } from "../adapters/chatgpt/adapter.js";
@@ -26,6 +28,7 @@ import {
   HISTORY_STATE_VERSION,
 } from "../contracts/history.js";
 import type {
+  AdaptedPage,
   ConversationDetailProjection,
   ConversationSummary,
   IdentityRecord,
@@ -264,6 +267,7 @@ export class HistoryCollector {
     );
     const warnings: string[] = [];
     const summaries: ConversationSummary[] = [];
+    const summaryIds = new Set<string>();
     const seenOffsets = new Set<number>();
     const pageBudget =
       request.maxIndexPagesPerScope ?? this.maxIndexPagesPerScope;
@@ -279,6 +283,7 @@ export class HistoryCollector {
     let continuation: number | null = offset;
     let paginationState: PaginationState = "unknown";
     let completeDiscoveryStartedAt = previous?.lastCompleteDiscoveryStartedAt ?? null;
+    let leadingPage: AdaptedPage<ConversationSummary> | null = null;
 
     this.options.store.saveDiscovery(
       checkpointFor(
@@ -328,12 +333,19 @@ export class HistoryCollector {
       pagesFetched += 1;
       paginationState = page.paginationState;
       warnings.push(...page.warnings);
+      if (offset === 0 && leadingPage === null) {
+        leadingPage = page;
+      }
       for (const summary of page.items) {
         if (summary.updatedAt === null) {
           warnings.push("conversation_missing_update_time");
         }
-        if (isCandidateSummary(summary, candidateCutoff, requestedRange.end)) {
+        if (
+          isCandidateSummary(summary, candidateCutoff, requestedRange.end) &&
+          !summaryIds.has(summary.conversationId)
+        ) {
           summaries.push(summary);
+          summaryIds.add(summary.conversationId);
         }
       }
       if (
@@ -414,6 +426,56 @@ export class HistoryCollector {
         ),
       );
       offset = page.continuation;
+    }
+
+    if (status === "complete") {
+      let reread: AdaptedPage<ConversationSummary>;
+      try {
+        reread = await this.reader.listConversations({
+          archived: scope === "archived",
+          offset: 0,
+          limit: request.indexPageSize ?? this.indexPageSize,
+          order: "updated",
+        });
+        pagesFetched += 1;
+        warnings.push(...reread.warnings);
+        if (
+          leadingPage === null ||
+          indexPagesDiffer(leadingPage, reread)
+        ) {
+          status = "partial";
+          completeDiscoveryStartedAt =
+            previous?.lastCompleteDiscoveryStartedAt ?? null;
+          paginationState = "continuation";
+          continuation = 0;
+          warnings.push(
+            leadingPage === null
+              ? "leading_index_baseline_unavailable"
+              : "leading_index_changed_during_scan",
+          );
+          for (const summary of reread.items) {
+            if (
+              summary.updatedAt === null ||
+              isCandidateSummary(summary, candidateCutoff, requestedRange.end)
+            ) {
+              if (summary.updatedAt === null) {
+                warnings.push("conversation_missing_update_time");
+              }
+              if (!summaryIds.has(summary.conversationId)) {
+                summaries.push(summary);
+                summaryIds.add(summary.conversationId);
+              }
+            }
+          }
+        }
+      } catch (error) {
+        status = "partial";
+        completeDiscoveryStartedAt =
+          previous?.lastCompleteDiscoveryStartedAt ?? null;
+        paginationState = "unknown";
+        continuation = 0;
+        warnings.push(`leading_index_reread_${errorCode(error)}`);
+      }
     }
 
     if (status === "in_progress") {
@@ -729,9 +791,13 @@ export class HistoryCollector {
     const gaps: string[] = [...warnings];
     if (projects === "unknown") {
       gaps.push("project_coverage_unknown");
+    } else {
+      gaps.push("project_visibility_unproven");
     }
     if (branches === "unknown") {
       gaps.push("branch_visibility_unknown");
+    } else {
+      gaps.push("branch_visibility_unproven");
     }
     if (conversations.some((conversation) => conversation.coverage !== "complete")) {
       gaps.push("incomplete_conversation_details");
@@ -810,6 +876,49 @@ function isCandidateSummary(
     return true;
   }
   return updatedAt.getTime() >= start.getTime() && updatedAt.getTime() < end.getTime();
+}
+
+function indexPagesDiffer(
+  left: AdaptedPage<ConversationSummary>,
+  right: AdaptedPage<ConversationSummary>,
+): boolean {
+  return JSON.stringify(indexPageFingerprint(left)) !== JSON.stringify(
+    indexPageFingerprint(right),
+  );
+}
+
+function indexPageFingerprint(
+  page: AdaptedPage<ConversationSummary>,
+): {
+  items: Array<{
+    conversationId: string;
+    updatedAt: string | null;
+    workspaceId: string | null;
+    projectId: string | null;
+    hasVersions: boolean | null;
+    currentNode: string | null;
+    isArchived: boolean;
+    surface: ConversationSummary["surface"];
+  }>;
+  continuation: string | number | null;
+  exhausted: boolean;
+  paginationState: PaginationState;
+} {
+  return {
+    items: page.items.map((item) => ({
+      conversationId: item.conversationId,
+      updatedAt: item.updatedAt,
+      workspaceId: item.workspaceId,
+      projectId: item.projectId,
+      hasVersions: item.hasVersions,
+      currentNode: item.currentNode,
+      isArchived: item.isArchived,
+      surface: item.surface,
+    })),
+    continuation: page.continuation,
+    exhausted: page.exhausted,
+    paginationState: page.paginationState,
+  };
 }
 
 function isMoreRecent(left: string | null, right: string | null): boolean {
@@ -896,6 +1005,12 @@ function errorCode(error: unknown): string {
   }
   if (error instanceof LegacyFallbackNotApprovedError) {
     return "legacy_fallback_not_approved";
+  }
+  if (error instanceof CapabilityError) {
+    return `capability_${error.capability}`;
+  }
+  if (error instanceof HttpStatusError) {
+    return `http_${error.status}`;
   }
   if (error instanceof Error && error.name) {
     return error.name.toLowerCase().replace(/[^a-z0-9]+/g, "_");

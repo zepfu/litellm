@@ -53,6 +53,10 @@ class ScriptedReader implements HistoryReader {
   readonly capabilities = emptyCapabilities();
   readonly requests: Array<{ method: string; path: string }> = [];
   readonly indexPages = new Map<HistoryScope, Map<number, AdaptedPage<ConversationSummary>>>();
+  readonly indexSequences = new Map<
+    HistoryScope,
+    AdaptedPage<ConversationSummary>[]
+  >();
   readonly details = new Map<string, ConversationDetailProjection>();
   readonly messagePages = new Map<
     string,
@@ -83,6 +87,10 @@ class ScriptedReader implements HistoryReader {
       method: "GET",
       path: `/backend-api/conversations?scope=${scope}&offset=${offset}`,
     });
+    const sequence = this.indexSequences.get(scope);
+    if (sequence && sequence.length > 0) {
+      return sequence.shift()!;
+    }
     return (
       this.indexPages.get(scope)?.get(offset) ??
       completePage<ConversationSummary>([])
@@ -282,7 +290,7 @@ describe("Stage-2A history collection", () => {
       range: EXPLICIT_RANGE,
     });
 
-    expect(result.status).toBe("complete");
+    expect(result.status).toBe("partial");
     expect(result.conversations).toHaveLength(2);
     expect(
       result.conversations.find(
@@ -291,7 +299,9 @@ describe("Stage-2A history collection", () => {
     ).toEqual(["active", "archived"]);
     expect(result.coverage.projects).toBe("validated_for_discovered_projects");
     expect(result.coverage.branches).toBe("version_metadata_observed");
-    expect(result.coverage.overall).toBe("complete");
+    expect(result.coverage.overall).toBe("partial");
+    expect(result.coverage.gaps).toContain("project_visibility_unproven");
+    expect(result.coverage.gaps).toContain("branch_visibility_unproven");
     expect(store.loadDiscovery("active")?.lastCompleteDiscoveryStartedAt).toBe(
       NOW.toISOString(),
     );
@@ -438,9 +448,10 @@ describe("Stage-2A history collection", () => {
       );
     }
 
+    const store = new MemoryCheckpointStore();
     const result = await new HistoryCollector(reader, {
       accountId: "fixture-primary",
-      store: new MemoryCheckpointStore(),
+      store,
       clock: { now: () => NOW },
     }).collect({
       mode: "backfill",
@@ -454,8 +465,57 @@ describe("Stage-2A history collection", () => {
     ).toEqual(["conv-first-page", "conv-late-page"]);
     expect(result.scopes.find((scope) => scope.scope === "active")).toMatchObject({
       coverage: "complete",
-      pagesFetched: 2,
+      pagesFetched: 3,
     });
+  });
+
+  it("rereads the leading index page and leaves changing scans partial", async () => {
+    const reader = new ScriptedReader();
+    const firstPage = summary("conv-leading", {
+      updatedAt: "2026-09-02T12:00:00.000Z",
+    });
+    const changedLeadingPage = summary("conv-leading", {
+      updatedAt: "2026-09-03T12:00:00.000Z",
+    });
+    const laterPage = summary("conv-later");
+    reader.indexSequences.set("active", [
+      indexPage([firstPage], 1, false, "continuation"),
+      indexPage([laterPage]),
+      indexPage([changedLeadingPage], 1, false, "continuation"),
+    ]);
+    reader.indexPages.set("archived", new Map([[0, indexPage([])]]));
+    for (const conversation of [firstPage, laterPage, changedLeadingPage]) {
+      reader.details.set(
+        conversation.conversationId,
+        detail(conversation.conversationId),
+      );
+      reader.messagePages.set(
+        conversation.conversationId,
+        new Map([["latest", completePage([])]]),
+      );
+    }
+
+    const store = new MemoryCheckpointStore();
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    }).collect({
+      mode: "backfill",
+      range: EXPLICIT_RANGE,
+    });
+
+    expect(result.status).toBe("partial");
+    expect(result.scopes.find((scope) => scope.scope === "active")).toMatchObject({
+      coverage: "partial",
+      continuation: 0,
+      pagesFetched: 3,
+    });
+    expect(result.warnings).toContain("leading_index_changed_during_scan");
+    expect(store.loadDiscovery("active")?.lastCompleteDiscoveryStartedAt).toBeNull();
+    expect(
+      reader.requests.filter((request) => request.path.includes("scope=active")),
+    ).toHaveLength(3);
   });
 
   it("queues incomplete message revisits and clears them after a later complete pass", async () => {
