@@ -8,7 +8,7 @@ import threading
 from http.client import HTTPConnection
 from http.server import HTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
@@ -297,7 +297,7 @@ def test_api_auth_csrf_and_dashboard_unknown_remaining(tmp_path: Path) -> None:
         server = HTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        host, port = server.server_address[:2]
+        host, port = cast(tuple[str, int], server.server_address)
         try:
             unauth = HTTPConnection(host, port, timeout=5)
             unauth.request("GET", "/api/v1/status")

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -160,7 +160,7 @@ def bucket_usage(bucket: QuotaBucket, working: Counter[str], in_range: list[Mapp
 
 
 def summarize_attempts(
-    attempts: list[Mapping[str, Any]],
+    attempts: Sequence[Mapping[str, Any]],
     config: CollectorConfig,
     *,
     start: Optional[datetime],
@@ -393,7 +393,7 @@ def rebuild_aggregates(
     account = config.account(account_id)
     evaluated_at = ensure_utc(now or datetime.now(timezone.utc))
     preview = build_report(config, ledger, account_id=account.id, now=evaluated_at)
-    payload = {
+    payload: dict[str, Any] = {
         "account_id": account.id,
         "policy_id": account.plan_policy_id,
         "mapping_version": config.model_mapping.version,

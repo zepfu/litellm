@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional, Protocol
+from typing import Any, Mapping, Optional, Protocol, cast
 
 from .models import AdaptedPage, CapabilityRecord, ConversationSummary, MessageRecord
 from .privacy import (
@@ -473,7 +473,10 @@ def _raise_if_rate_limited(payload: Mapping[str, Any], path: str) -> None:
     status = int(payload.get("http_status") or 200)
     if status != 429:
         return
-    headers = payload.get("headers") if isinstance(payload.get("headers"), Mapping) else {}
+    headers = cast(
+        Mapping[str, Any],
+        payload.get("headers") if isinstance(payload.get("headers"), Mapping) else {},
+    )
     retry_after = payload.get("retry_after") or headers.get("Retry-After") or headers.get("retry-after")
     raise RateLimitedError(
         f"rate limited (429) for {path}; no legacy fallback and not quota exhaustion",

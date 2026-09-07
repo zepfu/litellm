@@ -103,7 +103,7 @@ class UsageAPI:
             return False
         return True
 
-    def dispatch(self, method: str, path: str, headers: Any, body: dict[str, Any]) -> tuple[int, dict[str, Any] | str]:
+    def dispatch(self, method: str, path: str, headers: Any, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         parsed = urlparse(path)
         route = parsed.path.rstrip("/") or "/"
         query = _query(path)
@@ -385,16 +385,16 @@ def make_handler(api: UsageAPI):
             route = parsed.path.rstrip("/") or "/"
             if method == "GET" and route in {"/", "/index.html"}:
                 token = api.config.application.local_api_token or "local-dev"
-                body = DASHBOARD_HTML.replace(
+                dashboard_body = DASHBOARD_HTML.replace(
                     "<script>",
                     "<script>window.__USAGE_TOKEN=" + json.dumps(token) + ";",
                     1,
                 ).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Length", str(len(dashboard_body)))
                 self.end_headers()
-                self.wfile.write(body)
+                self.wfile.write(dashboard_body)
                 return
             if not api.authorized(self.headers):
                 self._write(401, {"error": "unauthorized"})
