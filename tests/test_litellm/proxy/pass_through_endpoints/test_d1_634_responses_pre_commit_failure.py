@@ -2846,8 +2846,15 @@ async def test_nonstream_openai_passthrough_responses_hands_off_capacity_coordin
 
 
 @pytest.mark.asyncio
-async def test_nonstream_alpha_openai_sse_precommit_overload_closes_and_propagates(
-    monkeypatch,
+@pytest.mark.parametrize("stream_request", [False, True])
+@pytest.mark.parametrize("error_code", ["server_overloaded", "server_is_overloaded", "capacity_exhausted"])
+@pytest.mark.parametrize("event_type", ["error", "response.failed"])
+@pytest.mark.parametrize(
+    "target",
+    ["https://api.openai.com/v1/responses", "https://chatgpt.com/backend-api/codex/responses"],
+)
+async def test_alpha_openai_sse_precommit_overload_closes_and_propagates(
+    monkeypatch, stream_request, error_code, event_type, target,
 ):
     monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
     from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
@@ -2865,12 +2872,18 @@ async def test_nonstream_alpha_openai_sse_precommit_overload_closes_and_propagat
     mock_request.query_params = {}
     mock_request.state = SimpleNamespace()
     custom_body = {"model": "gpt-5.4"}
-    stream = _ClosableAsyncByteStream(_failed_lifecycle_stream())
+    error = {"code": error_code, "type": "server_error", "message": "Try again."}
+    payload = (
+        {"type": event_type, "response": {"status": "failed", "error": error}}
+        if event_type == "response.failed"
+        else {"type": event_type, "error": error}
+    )
+    stream = _ClosableAsyncByteStream([_sse(event_type, payload)])
     upstream_response = httpx.Response(
         status_code=200,
         headers={"content-type": "text/event-stream"},
         stream=stream,
-        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+        request=httpx.Request("POST", target),
     )
     captured: dict[str, Any] = {}
 
@@ -2915,6 +2928,8 @@ async def test_nonstream_alpha_openai_sse_precommit_overload_closes_and_propagat
     ) as mock_logging_obj:
         mock_client_obj = MagicMock()
         mock_client_obj.client = MagicMock()
+        mock_client_obj.client.send = AsyncMock(return_value=upstream_response)
+        mock_client_obj.client.build_request.return_value = upstream_response.request
         mock_get_client.return_value = mock_client_obj
         mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
         mock_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
@@ -2922,18 +2937,70 @@ async def test_nonstream_alpha_openai_sse_precommit_overload_closes_and_propagat
         with pytest.raises(ProxyException):
             await pass_through_request(
                 request=mock_request,
-                target="https://api.openai.com/v1/responses",
+                target=target,
                 custom_headers={},
                 user_api_key_dict=MagicMock(),
                 custom_body=custom_body,
                 custom_llm_provider="openai",
-                stream=False,
+                stream=stream_request,
             )
 
     assert isinstance(captured["exception"], ResponsesStreamPreCommitFailure)
     assert captured["exception"].error_class == "server_overloaded"
+    assert captured["exception"].retryable is True
+    assert captured["exception"].error_code == error_code
     assert stream.close_calls == 1
     assert upstream_response.is_closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", ["server_is_overloaded", "capacity_exhausted"])
+@pytest.mark.parametrize(
+    ("enabled", "error_type", "message", "substantive"),
+    [
+        (False, "server_error", "Try again.", False),
+        (True, "server_error", "Quota exceeded", False),
+        (True, "insufficient_quota", "Try again.", False),
+        (True, "authentication_error", "Invalid credentials", False),
+        (True, "invalid_request_error", "Invalid request", False),
+        (True, "server_error", "Try again.", True),
+    ],
+)
+async def test_exact_capacity_sse_codes_preserve_peek_exclusions_and_bytes(
+    error_code, enabled, error_type, message, substantive,
+):
+    chunks = []
+    if substantive:
+        chunks.append(_sse(
+            "response.output_text.delta",
+            {"type": "response.output_text.delta", "delta": "hello"},
+        ))
+    chunks.append(_sse(
+        "response.failed",
+        {
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {"code": error_code, "type": error_type, "message": message},
+            },
+        },
+    ))
+    response = httpx.Response(
+        200,
+        stream=_ClosableAsyncByteStream(chunks),
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response, openai_alpha_capacity_retry_enabled=enabled,
+    )
+    if substantive:
+        assert failure is None
+    else:
+        assert failure is not None
+        assert failure.retryable is False
+        assert failure.error_code == error_code
+    assert b"".join([chunk async for chunk in peeked.aiter_bytes()]) == b"".join(chunks)
+    await peeked.aclose()
 
 
 @pytest.mark.asyncio

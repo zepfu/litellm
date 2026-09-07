@@ -5011,7 +5011,11 @@ async def pass_through_request(  # noqa: PLR0915
                         response,
                         pre_commit_failure,
                     ) = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
-                        response
+                        response,
+                        openai_alpha_capacity_retry_enabled=(
+                            capacity_retry_coordinator is not None
+                            and response.status_code == status.HTTP_200_OK
+                        ),
                     )
                     if pre_commit_failure is not None:
                         await response.aclose()
@@ -5221,7 +5225,8 @@ async def pass_through_request(  # noqa: PLR0915
                         response,
                         pre_commit_failure,
                     ) = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
-                        response
+                        response,
+                        openai_alpha_capacity_retry_enabled=True,
                     )
                     if pre_commit_failure is not None:
                         await response.aclose()
