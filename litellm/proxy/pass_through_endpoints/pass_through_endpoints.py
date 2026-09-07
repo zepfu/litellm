@@ -851,33 +851,30 @@ def _get_passthrough_terminal_wire_headers(exc: Exception) -> Dict[str, str]:
     if not getattr(exc, "_aawm_openai_capacity_expired", False):
         return {}
     fallback = {"Retry-After": "10"}
-    headers = getattr(exc, "headers", None)
-    if not hasattr(headers, "items"):
-        response = getattr(exc, "response", None)
-        headers = getattr(response, "headers", None)
-    if not hasattr(headers, "items"):
-        return fallback
-
-    header_items = getattr(headers, "items", None)
-    if not callable(header_items):
-        return fallback
-
-    for header_name, header_value in header_items():
-        if str(header_name).lower() != "retry-after":
+    for headers in (
+        getattr(exc, "headers", None),
+        getattr(exc, "upstream_headers", None),
+        getattr(getattr(exc, "response", None), "headers", None),
+    ):
+        header_items = getattr(headers, "items", None)
+        if not callable(header_items):
             continue
-        try:
-            retry_after_seconds = float(str(header_value).strip())
-        except (TypeError, ValueError):
-            return fallback
-        if not isfinite(retry_after_seconds) or retry_after_seconds < 0:
-            return fallback
-        bounded_retry_after = min(
-            retry_after_seconds,
-            _PASSTHROUGH_TERMINAL_RETRY_AFTER_MAX_SECONDS,
-        )
-        if bounded_retry_after == int(bounded_retry_after):
-            return {"Retry-After": str(int(bounded_retry_after))}
-        return {"Retry-After": str(bounded_retry_after)}
+        for header_name, header_value in header_items():
+            if str(header_name).lower() != "retry-after":
+                continue
+            try:
+                retry_after_seconds = float(str(header_value).strip())
+            except (TypeError, ValueError):
+                continue
+            if not isfinite(retry_after_seconds) or retry_after_seconds < 0:
+                continue
+            bounded_retry_after = min(
+                retry_after_seconds,
+                _PASSTHROUGH_TERMINAL_RETRY_AFTER_MAX_SECONDS,
+            )
+            if bounded_retry_after == int(bounded_retry_after):
+                return {"Retry-After": str(int(bounded_retry_after))}
+            return {"Retry-After": str(bounded_retry_after)}
     return fallback
 
 

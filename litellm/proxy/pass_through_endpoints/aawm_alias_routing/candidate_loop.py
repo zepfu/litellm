@@ -1149,6 +1149,15 @@ async def handle_alias_route(  # noqa: PLR0915
                 ):
                     if hasattr(source_exc, field):
                         setattr(terminal_exc, field, getattr(source_exc, field))
+            if isinstance(terminal_exc.detail, bytes):
+                payload = _passthrough_helpers._coerce_upstream_error_payload(
+                    terminal_exc.detail
+                )
+                terminal_exc.detail = (
+                    payload
+                    if payload is not None
+                    else terminal_exc.detail.decode("utf-8", errors="replace")
+                )
             setattr(terminal_exc, "_aawm_openai_capacity_expired", True)
         elif _is_cursor_session_continuation_failure(exc, candidate=candidate):
             detail = getattr(exc, "detail", None)

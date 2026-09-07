@@ -2500,6 +2500,36 @@ async def test_central_coordinator_expiry_without_prior_failure_returns_504():
     assert response.headers["retry-after"] == "10"
 
 
+@pytest.mark.parametrize(
+    ("expired", "upstream_retry_after", "expected"),
+    [
+        (True, "17", {"Retry-After": "17"}),
+        (True, "999999", {"Retry-After": "7200"}),
+        (True, "invalid", {"Retry-After": "10"}),
+        (True, None, {"Retry-After": "10"}),
+        (False, "17", {}),
+    ],
+)
+def test_terminal_wire_headers_read_preserved_upstream_headers(
+    expired, upstream_retry_after, expected,
+):
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+
+    exc = ProxyException(
+        message="capacity", type="None", param="None", code=503,
+        headers={"x-litellm-call-id": "test"},
+    )
+    exc.upstream_headers = {
+        "content-length": "1",
+        "transfer-encoding": "chunked",
+        "content-encoding": "gzip",
+    }
+    if upstream_retry_after is not None:
+        exc.upstream_headers["rEtRy-AfTeR"] = upstream_retry_after
+    exc._aawm_openai_capacity_expired = expired
+    assert pte._get_passthrough_terminal_wire_headers(exc) == expected
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("exception_kind", "status_code", "error_payload"),
