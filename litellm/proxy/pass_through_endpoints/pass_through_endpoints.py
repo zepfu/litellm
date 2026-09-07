@@ -1938,9 +1938,11 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     error_class=failure_class,
                     status_code=status.HTTP_504_GATEWAY_TIMEOUT,
                 )
-                raise HTTPException(
-                    status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                    detail=str(exc),
+                raise _mark_passthrough_capacity_exception_terminal(
+                    HTTPException(
+                        status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                        detail=str(exc),
+                    )
                 ) from exc
             should_retry = _is_passthrough_pre_first_byte_hidden_retryable(
                 exc,

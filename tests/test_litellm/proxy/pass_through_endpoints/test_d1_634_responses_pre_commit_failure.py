@@ -2388,6 +2388,7 @@ async def test_legacy_budget_timeout_preserves_original_exception(prior_capacity
 @pytest.mark.asyncio
 async def test_central_coordinator_expiry_without_prior_failure_returns_504():
     from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+    from litellm.proxy.proxy_server import openai_exception_handler
 
     coordinator = MagicMock()
     coordinator.deadline_seconds = 7200.0
@@ -2419,6 +2420,18 @@ async def test_central_coordinator_expiry_without_prior_failure_returns_504():
 
     assert raised.value.status_code == 504
     assert "hidden retry budget exhausted" in str(raised.value.detail)
+    proxy_exception = ProxyException(
+        message=raised.value.detail,
+        type="None",
+        param="None",
+        code=raised.value.status_code,
+        headers=pte._get_passthrough_terminal_wire_headers(raised.value),
+    )
+    response = await openai_exception_handler(
+        MagicMock(spec=Request), proxy_exception
+    )
+    assert response.status_code == 504
+    assert response.headers["retry-after"] == "10"
 
 
 @pytest.mark.asyncio
