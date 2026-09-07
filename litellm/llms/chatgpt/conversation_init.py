@@ -2308,7 +2308,8 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
         state = failure if failed and failure is not None else capture
         request_id = capture.get("request_id")
         verified = (
-            capture.get("account_hash") == expected_account_hash
+            isinstance(request_id, str)
+            and capture.get("account_hash") == expected_account_hash
             and extra_hashes.get(request_id) == expected_account_hash
         )
         native: Dict[str, Any] = {
@@ -3696,7 +3697,7 @@ def _retained_bound_envelope_identity(
     if identity_source == CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE:
         if fields != ["native_capture.account_hash"]:
             return None, []
-        if native_capture["account_hash"] != account_hash:
+        if native_capture is None or native_capture["account_hash"] != account_hash:
             return None, []
     elif any(
         field not in _CANONICAL_ACCOUNT_ID_PROVENANCE_FIELDS for field in fields

@@ -14128,7 +14128,11 @@ def _chatgpt_conversation_init_is_throttled(
 ) -> bool:
     status_code = coverage.get("status_code")
     try:
-        if not isinstance(status_code, bool) and int(status_code) == 429:
+        if (
+            status_code is not None
+            and not isinstance(status_code, bool)
+            and int(status_code) == 429
+        ):
             return True
     except (TypeError, ValueError):
         pass
@@ -14220,13 +14224,7 @@ def _chatgpt_conversation_init_session_keys(
         getattr(binding, "oracle_profile_path", None)
     )
     if profile_path:
-        profile_directory = getattr(binding, "oracle_profile_directory", None)
-        if isinstance(profile_directory, str) and profile_directory.strip():
-            profile_path = _chatgpt_conversation_init_canonical_profile_path(
-                Path(profile_path) / profile_directory
-            )
-        if profile_path:
-            keys.append(f"profile:{profile_path}")
+        keys.append(f"profile:{profile_path}")
     cdp_key = _chatgpt_conversation_init_cdp_session_key(
         getattr(binding, "cdp_endpoint", None)
     )
