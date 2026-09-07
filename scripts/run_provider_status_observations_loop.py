@@ -400,6 +400,7 @@ DEFAULT_CHATGPT_ORACLE_STARTUP_TIMEOUT_SECONDS = 45.0
 # for the helper and its owned process group to exit normally.
 DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS = 35.0
 DEFAULT_CHATGPT_ORACLE_FORCE_TERMINATION_TIMEOUT_SECONDS = 5.0
+CHATGPT_ORACLE_TEMP_ROOT_PREFIX = "aawm-chatgpt-oracle-"
 MAX_CHATGPT_ORACLE_STARTUP_LINE_BYTES = 1024
 DEFAULT_GROK_BILLING_POLL_ENABLED = False
 DEFAULT_GROK_BILLING_POLL_INTERVAL_SECONDS = 600.0
@@ -2252,27 +2253,112 @@ def _signal_chatgpt_oracle_process_group(
         pass
 
 
-def _cleanup_chatgpt_oracle_process(process: subprocess.Popen) -> None:
+def _chatgpt_oracle_owned_chrome_pids(temp_root: Path) -> List[int]:
+    if os.name != "posix":
+        return []
+    try:
+        resolved_root = temp_root.resolve()
+    except (OSError, RuntimeError):
+        return []
+    try:
+        proc_entries = os.scandir("/proc")
+    except OSError:
+        return []
+
+    owned_pids: List[int] = []
+    with proc_entries:
+        for entry in proc_entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                command_line = Path(entry.path, "cmdline").read_bytes()
+            except OSError:
+                continue
+            for argument in command_line.split(b"\0"):
+                if not argument.startswith(b"--user-data-dir="):
+                    continue
+                raw_user_data_dir = argument.split(b"=", 1)[1]
+                if not raw_user_data_dir:
+                    continue
+                try:
+                    user_data_dir = Path(
+                        os.fsdecode(raw_user_data_dir)
+                    ).resolve()
+                except (OSError, RuntimeError, UnicodeError):
+                    continue
+                try:
+                    user_data_dir.relative_to(resolved_root)
+                except ValueError:
+                    continue
+                owned_pids.append(int(entry.name))
+                break
+    return owned_pids
+
+
+def _signal_chatgpt_oracle_owned_chrome(
+    temp_root: Path,
+    signal_number: int,
+) -> None:
+    if os.name != "posix":
+        return
+    current_process_group = os.getpgrp()
+    process_groups: Dict[int, List[int]] = {}
+    individual_pids: List[int] = []
+    for pid in _chatgpt_oracle_owned_chrome_pids(temp_root):
+        try:
+            process_group = os.getpgid(pid)
+        except OSError:
+            individual_pids.append(pid)
+            continue
+        if process_group <= 0 or process_group == current_process_group:
+            individual_pids.append(pid)
+            continue
+        process_groups.setdefault(process_group, []).append(pid)
+
+    for process_group, pids in process_groups.items():
+        try:
+            os.killpg(process_group, signal_number)
+        except OSError:
+            individual_pids.extend(pids)
+    for pid in individual_pids:
+        try:
+            os.kill(pid, signal_number)
+        except OSError:
+            pass
+
+
+def _cleanup_chatgpt_oracle_process(
+    process: subprocess.Popen,
+    temp_root: Path,
+) -> None:
     try:
         if process.stdin is not None:
             process.stdin.close()
     except (BrokenPipeError, OSError):
         pass
+    force_cleanup = False
     try:
         process.wait(timeout=DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
+        force_cleanup = True
         _signal_chatgpt_oracle_process_group(process, signal.SIGTERM)
+        _signal_chatgpt_oracle_owned_chrome(temp_root, signal.SIGTERM)
         try:
             process.wait(timeout=DEFAULT_CHATGPT_ORACLE_FORCE_TERMINATION_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
+            pass
+    except OSError:
+        force_cleanup = True
+    finally:
+        if force_cleanup:
             _signal_chatgpt_oracle_process_group(process, signal.SIGKILL)
+            _signal_chatgpt_oracle_owned_chrome(temp_root, signal.SIGKILL)
             try:
                 process.wait(timeout=DEFAULT_CHATGPT_ORACLE_FORCE_TERMINATION_TIMEOUT_SECONDS)
             except (OSError, subprocess.TimeoutExpired):
                 pass
-    except OSError:
-        pass
-    finally:
+        _signal_chatgpt_oracle_owned_chrome(temp_root, signal.SIGKILL)
+        shutil.rmtree(temp_root, ignore_errors=True)
         for stream in (process.stdout, process.stderr):
             if stream is not None:
                 try:
