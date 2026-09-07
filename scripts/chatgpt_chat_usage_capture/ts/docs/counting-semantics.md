@@ -24,7 +24,11 @@ identity and graph linkage support that grouping.
 Distinct generation IDs remain distinct attempts, including regenerations.
 Request IDs are grouping evidence only and are scoped by conversation and
 branch. A collision is recorded as a coverage gap instead of merging two
-attempts.
+attempts. The first persisted alias owner is retained, but the colliding alias
+is marked ambiguous and cannot authorize a later merge or retirement by itself.
+Later evidence must compare every persisted generation identity involved in a
+candidate merge; conflicting or incomplete identity evidence remains unresolved
+with its coverage gap preserved.
 
 Attempt identity includes:
 

@@ -497,6 +497,226 @@ describe("D1-752 Stage 2B ledger", () => {
     ledger.close();
   });
 
+  it("does not transfer persisted generations through a weak alias projection", () => {
+    const directory = mkdtempSync(join(tmpdir(), "stage2b-persisted-generation-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    const account = scope("account-persisted-generation", "provider-user", "workspace", "quota");
+    const conversationId = "conversation-persisted-generation";
+    ledger.upsertAccount(account);
+
+    const makeAttempt = (
+      attemptId: string,
+      generationId: string,
+      branchAlias: string,
+      messageId: string,
+    ) => {
+      const attempt = reconstructAttempts(
+        [
+          message({
+            conversationId,
+            messageId,
+            nodeId: messageId,
+            role: "assistant",
+            createdAt: "2026-09-07T10:00:02.000Z",
+            status: "finished_successfully",
+            endTurn: true,
+            recordedFinalModelRaw: "model-final",
+            generationId,
+            requestId: `request-${generationId}`,
+          }),
+        ],
+        {
+          scope: account,
+          conversationId,
+          mapping: mappingReviewed,
+        },
+      )[0];
+      if (!attempt) {
+        throw new Error(`missing reconstructed attempt for ${generationId}`);
+      }
+      return {
+        ...attempt,
+        attemptId,
+        aliases: [
+          ["generation", `${conversationId}:${generationId}`],
+          ["branch", `${conversationId}:${branchAlias}`],
+        ] as Array<[string, string]>,
+      };
+    };
+
+    const first = makeAttempt(
+      "attempt-generation-a",
+      "generation-a",
+      "branch-a",
+      "message-a",
+    );
+    const second = makeAttempt(
+      "attempt-generation-b",
+      "generation-b",
+      "shared-branch",
+      "message-b",
+    );
+    ledger.upsertAttempt(
+      account,
+      first,
+      context("run-persisted-a", conversationId, "2026-09-07T10:05:00.000Z"),
+    );
+    ledger.upsertAttempt(
+      account,
+      second,
+      context("run-persisted-b", conversationId, "2026-09-07T10:06:00.000Z"),
+    );
+
+    const incompleteProjection = {
+      ...first,
+      identityBasis: "provisional",
+      aliases: [["branch", `${conversationId}:shared-branch`]] as Array<[string, string]>,
+      evidenceMessageIds: ["message-a"],
+    };
+    const result = ledger.upsertAttempt(
+      account,
+      incompleteProjection,
+      context("run-persisted-incomplete", conversationId, "2026-09-07T10:07:00.000Z"),
+    );
+
+    expect(result.attemptId).toBe("attempt-generation-a");
+    expect(ledger.listAttempts(account)).toHaveLength(2);
+    expect(ledger.listAttempts(account, true).filter((attempt) => attempt.tombstone))
+      .toHaveLength(0);
+    expect(
+      ledger.db
+        .prepare(
+          `
+          SELECT alias_value, attempt_id
+          FROM attempt_aliases
+          WHERE scope_key=? AND alias_kind='generation'
+          ORDER BY alias_value
+          `,
+        )
+        .all(scopeKey(account)),
+    ).toEqual([
+      {
+        alias_value: `${conversationId}:generation-a`,
+        attempt_id: "attempt-generation-a",
+      },
+      {
+        alias_value: `${conversationId}:generation-b`,
+        attempt_id: "attempt-generation-b",
+      },
+    ]);
+    expect(ledger.coverageGaps(account).map((gap) => gap.reason)).toContain(
+      "generation_alias_conflict",
+    );
+    ledger.close();
+  });
+
+  it("does not let an ambiguous weak alias authorize a generationless merge", () => {
+    const directory = mkdtempSync(join(tmpdir(), "stage2b-ambiguous-alias-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    const account = scope("account-ambiguous-alias", "provider-user", "workspace", "quota");
+    const conversationId = "conversation-ambiguous-alias";
+    ledger.upsertAccount(account);
+
+    const makeAttempt = (attemptId: string, generationId: string, messageId: string) => {
+      const attempt = reconstructAttempts(
+        [
+          message({
+            conversationId,
+            messageId,
+            nodeId: messageId,
+            role: "assistant",
+            createdAt: "2026-09-07T10:00:02.000Z",
+            status: "finished_successfully",
+            endTurn: true,
+            recordedFinalModelRaw: "model-final",
+            generationId,
+            requestId: `request-${generationId}`,
+          }),
+        ],
+        {
+          scope: account,
+          conversationId,
+          mapping: mappingReviewed,
+        },
+      )[0];
+      if (!attempt) {
+        throw new Error(`missing reconstructed attempt for ${generationId}`);
+      }
+      return {
+        ...attempt,
+        attemptId,
+        aliases: [
+          ["generation", `${conversationId}:${generationId}`],
+          ["branch", `${conversationId}:shared-branch`],
+        ] as Array<[string, string]>,
+      };
+    };
+
+    const first = makeAttempt("attempt-ambiguous-a", "generation-a", "message-a");
+    const second = makeAttempt("attempt-ambiguous-b", "generation-b", "message-b");
+    ledger.upsertAttempt(
+      account,
+      first,
+      context("run-ambiguous-a", conversationId, "2026-09-07T10:05:00.000Z"),
+    );
+    const collision = ledger.upsertAttempt(
+      account,
+      second,
+      context("run-ambiguous-b", conversationId, "2026-09-07T10:06:00.000Z"),
+    );
+
+    expect(collision.aliasConflicts).toBe(1);
+    expect(
+      ledger.db
+        .prepare(
+          `
+          SELECT attempt_id, ambiguous
+          FROM attempt_aliases
+          WHERE scope_key=? AND alias_kind='branch' AND alias_value=?
+          `,
+        )
+        .get(scopeKey(account), `${conversationId}:shared-branch`),
+    ).toEqual({ attempt_id: "attempt-ambiguous-a", ambiguous: 1 });
+
+    const provisional = {
+      ...first,
+      attemptId: "attempt-provisional-ambiguous",
+      identityBasis: "provisional",
+      aliases: [
+        ["branch", `${conversationId}:shared-branch`],
+      ] as Array<[string, string]>,
+      evidenceMessageIds: ["message-provisional"],
+    };
+    const result = ledger.upsertAttempt(
+      account,
+      provisional,
+      context("run-ambiguous-provisional", conversationId, "2026-09-07T10:07:00.000Z"),
+    );
+
+    expect(result.status).toBe("inserted");
+    expect(result.attemptId).toBe("attempt-provisional-ambiguous");
+    expect(ledger.listAttempts(account)).toHaveLength(3);
+    expect(ledger.listAttempts(account, true).filter((attempt) => attempt.tombstone))
+      .toHaveLength(0);
+    expect(
+      ledger.db
+        .prepare(
+          `
+          SELECT COUNT(*) AS count
+          FROM attempt_evidence
+          WHERE scope_key=? AND attempt_id=? AND evidence_id=?
+          `,
+        )
+        .get(scopeKey(account), "attempt-provisional-ambiguous", "message-provisional"),
+    ).toEqual({ count: 1 });
+    expect(ledger.coverageGaps(account).map((gap) => gap.reason)).toContain(
+      "alias_collision",
+    );
+    ledger.close();
+  });
+
   it("does not inherit prompt time or model into a later regeneration", () => {
     const account = scope("account-regeneration", "provider-user", "workspace", "quota");
     const conversationId = "conversation-regeneration";

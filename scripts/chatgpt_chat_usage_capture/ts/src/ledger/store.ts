@@ -59,6 +59,7 @@ type AttemptAliasOwner = {
   identityBasis: string;
   completedAnswer: boolean;
   tombstone: boolean;
+  ambiguous: boolean;
   generationAliases: string[];
 };
 
@@ -1109,36 +1110,66 @@ export class Ledger {
     let effectiveMapping: ModelMappingVersion | undefined;
     const aliases = uniqueAttemptAliases(incomingAttempt.aliases);
     const aliasOwners = this.findAttemptAliasOwners(scope, aliases);
-    const incomingGenerationAliases = new Set(
-      aliases
+    const persistedIncomingGenerationAliases = this.generationAliasesFor(
+      scope,
+      incomingAttempt.attemptId,
+    );
+    const incomingGenerationAliases = new Set([
+      ...persistedIncomingGenerationAliases,
+      ...aliases
         .filter(([aliasKind]) => aliasKind === "generation")
         .map(([, aliasValue]) => aliasValue),
-    );
-    const mergeableOwnerIds = new Set(
-      aliasOwners
-        .filter(
-          (owner) =>
-            owner.attemptId !== incomingAttempt.attemptId &&
-            MERGEABLE_ATTEMPT_ALIAS_KINDS.has(owner.aliasKind) &&
-            !conflictingGenerationAliases(
-              incomingGenerationAliases,
-              owner.generationAliases,
-            ),
+    ]);
+    const mergeableOwnerIds = new Set<string>();
+    for (const owner of aliasOwners) {
+      if (
+        owner.attemptId === incomingAttempt.attemptId ||
+        !MERGEABLE_ATTEMPT_ALIAS_KINDS.has(owner.aliasKind) ||
+        owner.ambiguous
+      ) {
+        continue;
+      }
+      if (
+        conflictingGenerationAliases(
+          incomingGenerationAliases,
+          owner.generationAliases,
         )
-        .map((owner) => owner.attemptId),
-    );
+      ) {
+        this.recordGenerationIdentityConflict(
+          scope,
+          incomingAttempt.attemptId,
+          owner.attemptId,
+          [...incomingGenerationAliases],
+          owner.generationAliases,
+          context.observedAt,
+        );
+        continue;
+      }
+      mergeableOwnerIds.add(owner.attemptId);
+    }
+    const incomingCurrent = this.db
+      .prepare("SELECT * FROM attempts WHERE attempt_id=? AND scope_key=?")
+      .get(incomingAttempt.attemptId, key) as SqlRow | undefined;
     if (incomingGenerationAliases.size === 0) {
       const authoritativeOwnerIdentities = new Set(
-        [...mergeableOwnerIds]
-          .map((attemptId) =>
-            generationIdentityKey(
-              aliasOwners.find((owner) => owner.attemptId === attemptId)
-                ?.generationAliases ?? [],
-            ),
-          )
+        aliasOwners
+          .map((owner) => generationIdentityKey(owner.generationAliases))
           .filter((identity) => identity !== ""),
       );
       if (authoritativeOwnerIdentities.size > 1) {
+        this.recordCoverageGap(
+          scope,
+          {
+            sourceKind: "attempt_merge",
+            sourceId: incomingAttempt.attemptId,
+            reason: "ambiguous_generation_identity",
+            details: {
+              incomingAttemptId: incomingAttempt.attemptId,
+              generationIdentities: [...authoritativeOwnerIdentities].sort(),
+            },
+          },
+          context.observedAt,
+        );
         for (const attemptId of [...mergeableOwnerIds]) {
           const owner = aliasOwners.find((candidate) => candidate.attemptId === attemptId);
           if (owner && owner.generationAliases.length > 0) {
@@ -1152,10 +1183,14 @@ export class Ledger {
       aliases,
       aliasOwners,
       mergeableOwnerIds,
+      persistedIncomingGenerationAliases,
     );
-    const current = this.db
-      .prepare("SELECT * FROM attempts WHERE attempt_id=? AND scope_key=?")
-      .get(canonicalAttemptId, key) as SqlRow | undefined;
+    const current =
+      canonicalAttemptId === incomingAttempt.attemptId
+        ? incomingCurrent
+        : (this.db
+            .prepare("SELECT * FROM attempts WHERE attempt_id=? AND scope_key=?")
+            .get(canonicalAttemptId, key) as SqlRow | undefined);
     const inheritedQuarantine = mergeQuarantines(
       parseQuarantine(current?.quarantine_json),
       quarantineFromWarnings(parseJsonArray(current?.warnings_json)),
@@ -1174,10 +1209,27 @@ export class Ledger {
       },
       context.observedAt,
     );
-    if (canonicalAttemptId !== incomingAttempt.attemptId &&
-        this.db.prepare("SELECT 1 FROM attempts WHERE attempt_id=? AND scope_key=?")
-          .get(incomingAttempt.attemptId, key)) {
+    if (
+      canonicalAttemptId !== incomingAttempt.attemptId &&
+      incomingCurrent &&
+      !cannotRetireGenerationIdentity(
+        persistedIncomingGenerationAliases,
+        this.generationAliasesFor(scope, canonicalAttemptId),
+      )
+    ) {
       mergeableOwnerIds.add(incomingAttempt.attemptId);
+    } else if (
+      canonicalAttemptId !== incomingAttempt.attemptId &&
+      incomingCurrent
+    ) {
+      this.recordGenerationIdentityConflict(
+        scope,
+        incomingAttempt.attemptId,
+        canonicalAttemptId,
+        persistedIncomingGenerationAliases,
+        this.generationAliasesFor(scope, canonicalAttemptId),
+        context.observedAt,
+      );
     }
     if (mapping) {
       validateMappingVersion(mapping);
@@ -1345,7 +1397,7 @@ export class Ledger {
     const statement = this.db.prepare(
       `
       SELECT a.alias_kind, a.alias_value, a.attempt_id,
-             t.identity_basis, t.completed_answer, t.tombstone
+             a.ambiguous, t.identity_basis, t.completed_answer, t.tombstone
       FROM attempt_aliases a
       JOIN attempts t
         ON t.scope_key=a.scope_key AND t.attempt_id=a.attempt_id
@@ -1376,6 +1428,7 @@ export class Ledger {
         identityBasis: String(row.identity_basis),
         completedAnswer: Number(row.completed_answer) === 1,
         tombstone: Number(row.tombstone) === 1,
+        ambiguous: Number(row.ambiguous) === 1,
         generationAliases: generationStatement
           .all(scopeKey(scope), String(row.attempt_id))
           .map((item: unknown) => String((item as SqlRow).alias_value)),
@@ -1384,29 +1437,60 @@ export class Ledger {
     return owners;
   }
 
+  private generationAliasesFor(scope: LedgerScope, attemptId: string): string[] {
+    return this.db
+      .prepare(
+        `
+        SELECT alias_value
+        FROM attempt_aliases
+        WHERE scope_key=? AND attempt_id=? AND alias_kind='generation'
+        ORDER BY alias_value
+        `,
+      )
+      .all(scopeKey(scope), attemptId)
+      .map((row: unknown) => String((row as SqlRow).alias_value));
+  }
+
   private selectCanonicalAttemptId(
     attempt: ReconstructedAttempt,
     aliases: Array<[string, string]>,
     aliasOwners: AttemptAliasOwner[],
     mergeableOwnerIds: Set<string>,
+    persistedIncomingGenerationAliases: ReadonlyArray<string>,
   ): string {
+    const incomingHasPromptAlias = aliases.some(
+      ([aliasKind, aliasValue]) =>
+        aliasKind === "prompt" &&
+        !aliasOwners.some(
+          (owner) =>
+            owner.aliasKind === aliasKind &&
+            owner.aliasValue === aliasValue &&
+            owner.ambiguous,
+        ),
+    );
     const candidates = [
       {
         attemptId: attempt.attemptId,
-        identityBasis: attempt.identityBasis,
+        identityBasis: persistedIncomingGenerationAliases.length > 0
+          ? "generation"
+          : attempt.identityBasis,
         completedAnswer: attempt.completedAnswer,
         tombstone: false,
-        hasPromptAlias: aliases.some(([kind]) => kind === "prompt"),
+        hasPromptAlias: incomingHasPromptAlias,
       },
       ...[...mergeableOwnerIds].map((attemptId) => {
         const owners = aliasOwners.filter((owner) => owner.attemptId === attemptId);
         const first = owners[0];
         return {
           attemptId,
-          identityBasis: first?.identityBasis ?? "unresolved",
+          identityBasis: first && first.generationAliases.length > 0
+            ? "generation"
+            : first?.identityBasis ?? "unresolved",
           completedAnswer: owners.some((owner) => owner.completedAnswer),
           tombstone: owners.every((owner) => owner.tombstone),
-          hasPromptAlias: owners.some((owner) => owner.aliasKind === "prompt"),
+          hasPromptAlias: owners.some(
+            (owner) => !owner.ambiguous && owner.aliasKind === "prompt",
+          ),
         };
       }),
     ];
@@ -1421,12 +1505,61 @@ export class Ledger {
     })[0]?.attemptId ?? attempt.attemptId;
   }
 
+  private recordGenerationIdentityConflict(
+    scope: LedgerScope,
+    leftAttemptId: string,
+    rightAttemptId: string,
+    leftGenerationAliases: ReadonlyArray<string>,
+    rightGenerationAliases: ReadonlyArray<string>,
+    seenAt: string,
+  ): void {
+    this.recordCoverageGap(
+      scope,
+      {
+        sourceKind: "attempt_merge",
+        sourceId: `${leftAttemptId}:${rightAttemptId}`,
+        reason: "generation_alias_conflict",
+        details: {
+          leftAttemptId,
+          leftGenerationAliases: [...new Set(leftGenerationAliases)].sort(),
+          rightAttemptId,
+          rightGenerationAliases: [...new Set(rightGenerationAliases)].sort(),
+        },
+      },
+      seenAt,
+    );
+  }
+
   private retireDuplicateAttempt(
     scope: LedgerScope,
     duplicateAttemptId: string,
     canonicalAttemptId: string,
     updatedAt: string,
   ): void {
+    const duplicateGenerationAliases = this.generationAliasesFor(
+      scope,
+      duplicateAttemptId,
+    );
+    const canonicalGenerationAliases = this.generationAliasesFor(
+      scope,
+      canonicalAttemptId,
+    );
+    if (
+      cannotRetireGenerationIdentity(
+        duplicateGenerationAliases,
+        canonicalGenerationAliases,
+      )
+    ) {
+      this.recordGenerationIdentityConflict(
+        scope,
+        duplicateAttemptId,
+        canonicalAttemptId,
+        duplicateGenerationAliases,
+        canonicalGenerationAliases,
+        updatedAt,
+      );
+      return;
+    }
     const key = scopeKey(scope);
     this.db
       .prepare("UPDATE attempt_aliases SET attempt_id=? WHERE scope_key=? AND attempt_id=?")
@@ -2412,6 +2545,15 @@ export class Ledger {
         .get(key, aliasKind, aliasValue) as SqlRow | undefined;
       if (existing && existing.attempt_id !== attempt.attemptId) {
         aliasConflicts += 1;
+        this.db
+          .prepare(
+            `
+            UPDATE attempt_aliases
+            SET ambiguous=1, last_seen_at=MAX(last_seen_at, ?)
+            WHERE scope_key=? AND alias_kind=? AND alias_value=?
+            `,
+          )
+          .run(seenAt, key, aliasKind, aliasValue);
         this.recordCoverageGap(
           scope,
           {
@@ -2917,6 +3059,19 @@ function conflictingGenerationAliases(
     return false;
   }
   return incoming.size !== stored.size || [...incoming].some((alias) => !stored.has(alias));
+}
+
+function cannotRetireGenerationIdentity(
+  duplicate: ReadonlyArray<string>,
+  canonical: ReadonlyArray<string>,
+): boolean {
+  const duplicateSet = new Set(duplicate);
+  const canonicalSet = new Set(canonical);
+  if (duplicateSet.size === 0) {
+    return false;
+  }
+  return canonicalSet.size === 0 ||
+    conflictingGenerationAliases(duplicateSet, [...canonicalSet]);
 }
 
 function generationIdentityKey(aliases: ReadonlyArray<string>): string {
