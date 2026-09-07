@@ -14216,10 +14216,15 @@ def _chatgpt_conversation_init_session_keys(
     account_label: str,
 ) -> tuple[str, ...]:
     keys: List[str] = []
-    for field_name in ("oracle_profile_path", "oracle_profile_directory"):
-        profile_path = _chatgpt_conversation_init_canonical_profile_path(
-            getattr(binding, field_name, None)
-        )
+    profile_path = _chatgpt_conversation_init_canonical_profile_path(
+        getattr(binding, "oracle_profile_path", None)
+    )
+    if profile_path:
+        profile_directory = getattr(binding, "oracle_profile_directory", None)
+        if isinstance(profile_directory, str) and profile_directory.strip():
+            profile_path = _chatgpt_conversation_init_canonical_profile_path(
+                Path(profile_path) / profile_directory
+            )
         if profile_path:
             keys.append(f"profile:{profile_path}")
     cdp_key = _chatgpt_conversation_init_cdp_session_key(
