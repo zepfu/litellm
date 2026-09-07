@@ -624,4 +624,3 @@ def test_collector_does_not_claim_live_oracle_browser(tmp_path: Path) -> None:
     )
     summary = collect_conversation_init_snapshot(str(source), transport=transport)
     assert summary["live_authenticated_oracle_browser"] is False
-

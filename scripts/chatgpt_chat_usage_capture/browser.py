@@ -26,7 +26,7 @@ class LiveBrowserUnavailable(AdapterError):
 
 def playwright_available() -> bool:
     try:
-        import playwright  # noqa: F401
+        import playwright  # type: ignore[import-not-found]  # noqa: F401
     except Exception:
         return False
     return True
@@ -118,7 +118,7 @@ class PlaywrightTransport:
         if reason is not None:
             raise LiveBrowserUnavailable(f"{LIVE_GATE} ({reason})")
         try:
-            from playwright.sync_api import sync_playwright
+            from playwright.sync_api import sync_playwright  # type: ignore[import-not-found]
 
             self._playwright = sync_playwright().start()
             self._context = self._playwright.chromium.launch_persistent_context(
