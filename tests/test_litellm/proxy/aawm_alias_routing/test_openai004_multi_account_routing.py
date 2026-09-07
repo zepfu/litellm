@@ -2660,16 +2660,19 @@ async def test_candidate_loop_transient_capacity_retries_same_account_before_fai
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("error_code", "expected_class"),
+    ("error_code", "expected_class", "should_retry"),
     [
-        ("server_is_overloaded", "server_overloaded"),
-        ("capacity_exhausted", "capacity_exhausted"),
+        ("server_is_overloaded", "server_overloaded", True),
+        ("capacity_exhausted", "capacity_exhausted", True),
+        ("invalid_api_key", "provider_terminal_error", False),
+        ("insufficient_quota", "usage_limit_reached", False),
     ],
 )
 async def test_candidate_loop_classifies_alpha_openai_exact_capacity_codes(
     monkeypatch: pytest.MonkeyPatch,
     error_code: str,
     expected_class: str,
+    should_retry: bool,
 ) -> None:
     _patch_candidate_loop_host(monkeypatch)
     monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
@@ -2712,7 +2715,7 @@ async def test_candidate_loop_classifies_alpha_openai_exact_capacity_codes(
         performed += 1
         if performed == 1:
             exc = HTTPException(
-                status_code=502,
+                status_code=503,
                 detail={
                     "error": {
                         "code": error_code,
@@ -2725,7 +2728,7 @@ async def test_candidate_loop_classifies_alpha_openai_exact_capacity_codes(
             raise exc
         return Response(content=b"recovered")
 
-    response = await candidate_loop.handle_alias_route(
+    operation = candidate_loop.handle_alias_route(
         _loop_services(
             select_candidate=_select,
             perform_candidate=_perform,
@@ -2742,14 +2745,24 @@ async def test_candidate_loop_classifies_alpha_openai_exact_capacity_codes(
         log_label="Codex",
     )
 
-    assert response.body == b"recovered"
-    assert performed == 2
-    sleep.assert_awaited_once_with(
-        15.0, error_class=expected_class, status_code=502
-    )
+    if should_retry:
+        response = await operation
+        assert response.body == b"recovered"
+        assert performed == 2
+        sleep.assert_awaited_once_with(
+            15.0, error_class=expected_class, status_code=503
+        )
+    else:
+        with pytest.raises((HTTPException, ProxyException)):
+            await operation
+        assert performed == 1
+        sleep.assert_not_awaited()
     request_outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
     captured_attempts = list(request_outcome.get("attempts") or [])
-    assert captured_attempts[0]["pre_commit_retry"]["error_class"] == expected_class
+    if should_retry:
+        assert captured_attempts[0]["pre_commit_retry"]["error_class"] == expected_class
+    else:
+        assert captured_attempts[0]["error_class"] == expected_class
 
 
 @pytest.mark.asyncio

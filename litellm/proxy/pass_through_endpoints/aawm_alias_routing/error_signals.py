@@ -2391,9 +2391,6 @@ def _classify_openai_alpha_capacity_error_code(
         exact_codes = {
             code for code in normalized_capacity_codes if code in text_lower
         }
-    if not exact_codes:
-        return None
-
     if (
         normalized_tokens & _OPENAI_ALPHA_CAPACITY_QUOTA_ERROR_TOKENS
         or any(marker in text_lower for marker in _OPENAI_ALPHA_CAPACITY_QUOTA_TEXT_MARKERS)
@@ -2405,6 +2402,8 @@ def _classify_openai_alpha_capacity_error_code(
         or any(marker in text_lower for marker in _OPENAI_ALPHA_CAPACITY_AUTH_TEXT_MARKERS)
     ):
         return "provider_terminal_error"
+    if not exact_codes:
+        return None
     if "server_is_overloaded" in exact_codes:
         return "server_overloaded"
     return "capacity_exhausted"

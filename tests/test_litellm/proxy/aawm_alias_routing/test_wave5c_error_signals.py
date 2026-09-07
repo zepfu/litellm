@@ -1045,16 +1045,19 @@ class TestClassification:
             == expected
         )
 
-    def test_exact_capacity_codes_require_alpha_openai_alias_scope(self):
+    @pytest.mark.parametrize(
+        "code", ["capacity_exhausted", "invalid_api_key", "insufficient_quota"]
+    )
+    def test_exact_capacity_codes_require_alpha_openai_alias_scope(self, code: str):
         exc = _FakeExc(
             detail={
                 "error": {
-                    "code": "capacity_exhausted",
+                    "code": code,
                     "type": "server_error",
                     "message": "Please try again later.",
                 }
             },
-            status_code=502,
+            status_code=503,
             _aawm_provider_returned=True,
         )
         assert (
