@@ -167,6 +167,7 @@ from .aawm_alias_routing.pre_commit_retry import (
     OpenAIAlphaCapacityRetryCoordinator,
     _build_openai_capacity_target_identity,
 )
+from .aawm_alias_routing.durable import get_aawm_alias_routing_state_namespace
 from .success_handler import PassThroughEndpointLogging
 
 from .provider_failure_classifiers import (  # noqa: F401
@@ -4769,7 +4770,9 @@ async def pass_through_request(  # noqa: PLR0915
                             if isinstance(provider_bound_body, dict)
                             else None
                         ),
-                    )
+                        upstream_url=str(url) if url is not None else None,
+                    ),
+                    namespace=get_aawm_alias_routing_state_namespace(),
                 )
 
             async def _send_stream_pre_first_byte() -> Tuple[
@@ -4964,7 +4967,9 @@ async def pass_through_request(  # noqa: PLR0915
                         if isinstance(provider_bound_body, dict)
                         else None
                     ),
-                )
+                    upstream_url=str(url) if url is not None else None,
+                ),
+                namespace=get_aawm_alias_routing_state_namespace(),
             )
 
         async def _send_non_stream_pre_first_byte() -> httpx.Response:

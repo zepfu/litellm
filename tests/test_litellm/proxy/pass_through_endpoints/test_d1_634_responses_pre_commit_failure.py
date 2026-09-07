@@ -1368,31 +1368,56 @@ class TestOpenAIAlphaCapacityRetrySchedule:
 
 
 class TestTargetIdentity:
-    def test_provider_only(self):
-        assert _build_openai_capacity_target_identity(provider="openai") == "openai"
-
-    def test_provider_with_model(self):
+    def test_identity_preserves_selected_model_and_upstream_route(self):
         assert _build_openai_capacity_target_identity(
-            provider="openai", model="gpt-5.6-astra"
-        ) == "openai:gpt"
+            provider="openai",
+            model="GPT-5.6-Astra",
+            upstream_url="https://api.openai.com/v1/responses/",
+        ) == "openai:gpt-5.6-astra@api.openai.com/v1/responses"
 
-    def test_provider_with_model_slash(self):
-        assert _build_openai_capacity_target_identity(
-            provider="openai", model="openai/gpt-5.6-astra"
-        ) == "openai:openai"
+    def test_different_models_and_upstream_hosts_are_distinct(self):
+        api_target = _build_openai_capacity_target_identity(
+            model="gpt-5.6-astra",
+            upstream_url="https://api.openai.com/v1/responses",
+        )
+        codex_target = _build_openai_capacity_target_identity(
+            model="gpt-5.6-astra",
+            upstream_url="https://chatgpt.com/backend-api/codex/responses",
+        )
+        other_model = _build_openai_capacity_target_identity(
+            model="gpt-5.4",
+            upstream_url="https://api.openai.com/v1/responses",
+        )
+
+        assert api_target != codex_target
+        assert api_target != other_model
+
+    def test_same_target_normalizes_model_and_route(self):
+        first = _build_openai_capacity_target_identity(
+            model=" OpenAI/GPT-5.6-Astra ",
+            upstream_url="https://API.OPENAI.COM/v1/responses/",
+        )
+        second = _build_openai_capacity_target_identity(
+            model="gpt-5.6-astra",
+            upstream_url="https://api.openai.com/v1/responses",
+        )
+
+        assert first == second
 
     def test_identity_and_redis_key_are_credential_free(self):
         target_identity = _build_openai_capacity_target_identity(
-            provider="openai", model="gpt-5.6-astra"
+            provider="openai",
+            model="gpt-5.6-astra",
+            upstream_url="https://api.openai.com/v1/responses",
         )
         redis_key = _build_openai_capacity_success_redis_key(
             target_identity, namespace="aawm-routing-alpha-v1"
         )
 
-        assert target_identity == "openai:gpt"
         assert redis_key == (
             "aawm:openai_capacity_success:"
-            "aawm-routing-alpha-v1:openai:gpt"
+            "aawm-routing-alpha-v1:openai:gpt-5.6-astra@"
+            "api.openai.com/v1/responses"
         )
         assert "account" not in redis_key
         assert "secret" not in redis_key
@@ -1472,6 +1497,7 @@ class TestCoordinatorSleepWakeup:
     @pytest.mark.asyncio
     async def test_sleep_peer_success_via_event(self):
         target_identity = "openai:local-event"
+        namespace = "aawm-routing-test-v2"
 
         with patch(
             "litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry."
@@ -1480,17 +1506,18 @@ class TestCoordinatorSleepWakeup:
         ):
             coordinator = OpenAIAlphaCapacityRetryCoordinator(
                 target_identity=target_identity,
+                namespace=namespace,
             )
             sleep_task = asyncio.create_task(
                 coordinator.sleep_with_wakeup(1.0)
             )
             for _ in range(3):
                 await asyncio.sleep(0)
-                if _LOCAL_CAPACITY_WAKEUP_EVENTS.get(target_identity):
+                if _LOCAL_CAPACITY_WAKEUP_EVENTS.get((namespace, target_identity)):
                     break
-            assert _LOCAL_CAPACITY_WAKEUP_EVENTS.get(target_identity)
+            assert _LOCAL_CAPACITY_WAKEUP_EVENTS.get((namespace, target_identity))
 
-            await _signal_openai_capacity_success(target_identity)
+            await _signal_openai_capacity_success(target_identity, namespace)
             reason = await asyncio.wait_for(sleep_task, timeout=0.2)
 
         assert reason == "peer_success"
@@ -1499,6 +1526,7 @@ class TestCoordinatorSleepWakeup:
     async def test_wakeup_event_returns_event(self):
         coordinator = OpenAIAlphaCapacityRetryCoordinator(
             target_identity="openai:gpt",
+            namespace="aawm-routing-test-v2",
         )
         ev = coordinator.wakeup_event()
         assert not ev.is_set()
@@ -1506,7 +1534,7 @@ class TestCoordinatorSleepWakeup:
         assert ev.is_set()
         coordinator._local_events.discard(ev)
         if not coordinator._local_events:
-            _LOCAL_CAPACITY_WAKEUP_EVENTS.pop("openai:gpt", None)
+            _LOCAL_CAPACITY_WAKEUP_EVENTS.pop(coordinator._local_event_key, None)
 
     def test_redis_resolver_uses_public_manager(self):
         redis_client = SimpleNamespace()
@@ -1545,9 +1573,9 @@ class TestCoordinatorSleepWakeup:
             )
         )
         event = asyncio.Event()
-        _LOCAL_CAPACITY_WAKEUP_EVENTS.setdefault(target_identity, set()).add(
-            event
-        )
+        _LOCAL_CAPACITY_WAKEUP_EVENTS.setdefault(
+            (namespace, target_identity), set()
+        ).add(event)
 
         try:
             with patch(
@@ -1559,11 +1587,13 @@ class TestCoordinatorSleepWakeup:
                     target_identity, namespace
                 )
         finally:
-            _LOCAL_CAPACITY_WAKEUP_EVENTS.get(target_identity, set()).discard(
-                event
-            )
-            if not _LOCAL_CAPACITY_WAKEUP_EVENTS.get(target_identity):
-                _LOCAL_CAPACITY_WAKEUP_EVENTS.pop(target_identity, None)
+            _LOCAL_CAPACITY_WAKEUP_EVENTS.get(
+                (namespace, target_identity), set()
+            ).discard(event)
+            if not _LOCAL_CAPACITY_WAKEUP_EVENTS.get((namespace, target_identity)):
+                _LOCAL_CAPACITY_WAKEUP_EVENTS.pop(
+                    (namespace, target_identity), None
+                )
 
         redis_key = _build_openai_capacity_success_redis_key(
             target_identity, namespace
@@ -1608,6 +1638,66 @@ class TestCoordinatorSleepWakeup:
             call.args == (redis_key,)
             for call in redis_client.get.await_args_list
         )
+
+    @pytest.mark.asyncio
+    async def test_sleep_with_wakeup_does_not_treat_expired_epoch_as_success(self):
+        target_identity = "openai:redis-expiry"
+        namespace = "aawm-routing-alpha-v1"
+        redis_client = SimpleNamespace(
+            get=AsyncMock(side_effect=[b"7", None]),
+        )
+        redis_cache = SimpleNamespace(
+            init_async_client=MagicMock(return_value=redis_client)
+        )
+        manager = SimpleNamespace(
+            get_dual_cache=MagicMock(
+                return_value=SimpleNamespace(redis_cache=redis_cache)
+            )
+        )
+
+        with patch(
+            "litellm.proxy.aawm_alias_routing_redis."
+            "aawm_alias_routing_redis_manager",
+            manager,
+        ):
+            coordinator = OpenAIAlphaCapacityRetryCoordinator(
+                target_identity=target_identity,
+                namespace=namespace,
+            )
+            reason = await coordinator.sleep_with_wakeup(0.01)
+
+        assert reason == "timer"
+        assert redis_client.get.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_sleep_with_wakeup_does_not_treat_redis_recovery_as_success(self):
+        target_identity = "openai:redis-recovery"
+        namespace = "aawm-routing-alpha-v1"
+        redis_client = SimpleNamespace(
+            get=AsyncMock(side_effect=[RuntimeError("redis unavailable"), b"7"]),
+        )
+        redis_cache = SimpleNamespace(
+            init_async_client=MagicMock(return_value=redis_client)
+        )
+        manager = SimpleNamespace(
+            get_dual_cache=MagicMock(
+                return_value=SimpleNamespace(redis_cache=redis_cache)
+            )
+        )
+
+        with patch(
+            "litellm.proxy.aawm_alias_routing_redis."
+            "aawm_alias_routing_redis_manager",
+            manager,
+        ):
+            coordinator = OpenAIAlphaCapacityRetryCoordinator(
+                target_identity=target_identity,
+                namespace=namespace,
+            )
+            reason = await coordinator.sleep_with_wakeup(0.01)
+
+        assert reason == "timer"
+        assert redis_client.get.await_count == 2
 
 
 class TestCoordinatorLogging:
@@ -2149,6 +2239,9 @@ async def test_nonstream_openai_passthrough_responses_hands_off_capacity_coordin
     mock_request.query_params = {}
     mock_request.state = SimpleNamespace()
     custom_body = {"model": "gpt-5.4"}
+    monkeypatch.setenv(
+        "AAWM_ALIAS_ROUTING_STATE_NAMESPACE", "aawm-routing-test-v2"
+    )
     upstream_response = MagicMock()
     upstream_response.status_code = 200
     upstream_response.headers = {"content-type": "application/json"}
@@ -2213,3 +2306,7 @@ async def test_nonstream_openai_passthrough_responses_hands_off_capacity_coordin
     assert captured.get("operation_name") == "non_stream_pre_first_byte"
     assert isinstance(coordinator, OpenAIAlphaCapacityRetryCoordinator)
     assert coordinator.deadline_seconds == 7200.0
+    assert coordinator._namespace == "aawm-routing-test-v2"
+    assert coordinator._target_identity == (
+        "openai:gpt-5.4@api.openai.com/v1/responses"
+    )

@@ -17,7 +17,9 @@ import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
+from .durable import get_aawm_alias_routing_state_namespace
 from .retry import (
     OpenAIAlphaCapacityRetryBudget,
     openai_alpha_capacity_retry_wait_seconds,
@@ -33,31 +35,72 @@ logger = logging.getLogger("LiteLLMProxy")
 _OPENAI_CAPACITY_SUCCESS_KEY_PREFIX = "aawm:openai_capacity_success"
 _OPENAI_CAPACITY_SUCCESS_EPOCH_TTL_SECONDS = 300  # 5 min stale-success expiry
 _OPENAI_CAPACITY_SUCCESS_POLL_SECONDS = 1.0
-_LOCAL_CAPACITY_WAKEUP_EVENTS: dict[str, set[asyncio.Event]] = {}
+_LOCAL_CAPACITY_WAKEUP_EVENTS: dict[tuple[str, str], set[asyncio.Event]] = {}
+
+
+def _resolve_openai_capacity_namespace(namespace: Optional[str]) -> str:
+    if namespace is not None:
+        normalized = str(namespace).strip()
+        if normalized:
+            return normalized
+    return get_aawm_alias_routing_state_namespace()
+
+
+def _normalize_selected_model(model: Optional[str], provider: str) -> str:
+    normalized = " ".join(str(model or "").strip().split()).lower()
+    if not normalized:
+        return "unknown"
+
+    provider_prefix = provider.strip().lower()
+    for prefix in (f"{provider_prefix}/", f"{provider_prefix}:"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :].strip()
+            break
+    return normalized or "unknown"
+
+
+def _normalize_upstream_host_path(upstream_url: Optional[str]) -> str:
+    parsed = urlsplit(str(upstream_url or ""))
+    hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not hostname:
+        hostname = "unknown"
+
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port is not None and not (
+        (parsed.scheme.lower() == "https" and port == 443)
+        or (parsed.scheme.lower() == "http" and port == 80)
+    ):
+        hostname = f"{hostname}:{port}"
+
+    path = "/" + "/".join(part for part in parsed.path.split("/") if part)
+    return f"{hostname}{path.lower()}"
+
+
+def _capacity_wakeup_scope_key(
+    target_identity: str,
+    namespace: str,
+) -> tuple[str, str]:
+    return (namespace, target_identity)
 
 
 def _build_openai_capacity_target_identity(
     *,
     provider: str = "openai",
     model: Optional[str] = None,
+    upstream_url: Optional[str] = None,
 ) -> str:
     """Build a credential-free target identity for capacity wakeup.
 
-    Uses provider + optional model prefix (first segment before '/' or '-').
-    Does not include account labels, hashes, or credentials.
+    The selected model and upstream host/path distinguish compatible targets.
+    URL credentials, query parameters, and request bodies are excluded.
     """
-    model_prefix = ""
-    if model:
-        stripped = model.strip()
-        for sep in ("/", "-"):
-            if sep in stripped:
-                model_prefix = stripped.split(sep)[0]
-                break
-        if not model_prefix:
-            model_prefix = stripped
-    if model_prefix:
-        return f"{provider}:{model_prefix}"
-    return provider
+    normalized_provider = provider.strip().lower() or "openai"
+    normalized_model = _normalize_selected_model(model, normalized_provider)
+    normalized_target = _normalize_upstream_host_path(upstream_url)
+    return f"{normalized_provider}:{normalized_model}@{normalized_target}"
 
 
 def _build_openai_capacity_success_redis_key(
@@ -146,6 +189,7 @@ class _CapacityWakeupState:
 
     event: asyncio.Event = field(default_factory=asyncio.Event)
     starting_epoch: Optional[int] = None
+    epoch_baseline_known: bool = True
     redis_key: Optional[str] = None
     wakeup_reason: str = "timer"
 
@@ -173,15 +217,19 @@ def _resolve_redis_for_capacity_wakeup() -> Optional[Any]:
 
 async def _signal_openai_capacity_success(
     target_identity: str,
-    namespace: str = "default",
+    namespace: Optional[str] = None,
 ) -> None:
     """Increment the capacity-success epoch for cross-worker wakeup."""
-    for event in tuple(_LOCAL_CAPACITY_WAKEUP_EVENTS.get(target_identity, ())):
+    resolved_namespace = _resolve_openai_capacity_namespace(namespace)
+    scope_key = _capacity_wakeup_scope_key(target_identity, resolved_namespace)
+    for event in tuple(_LOCAL_CAPACITY_WAKEUP_EVENTS.get(scope_key, ())):
         event.set()
     redis_cache = _resolve_redis_for_capacity_wakeup()
     if redis_cache is None:
         return
-    key = _build_openai_capacity_success_redis_key(target_identity, namespace)
+    key = _build_openai_capacity_success_redis_key(
+        target_identity, resolved_namespace
+    )
     try:
         client = redis_cache.init_async_client()
         if client is None:
@@ -196,16 +244,14 @@ async def _fetch_capacity_success_epoch(
     redis_cache: Any,
     key: str,
 ) -> Optional[int]:
-    try:
-        client = redis_cache.init_async_client()
-        if client is None:
-            return None
-        value = await client.get(key)
-        if value is None:
-            return 0
-        return int(value)
-    except Exception:
+    client = redis_cache.init_async_client()
+    if client is None:
+        raise RuntimeError("capacity wakeup Redis client unavailable")
+    value = await client.get(key)
+    if value is None:
         return None
+    epoch = int(value)
+    return epoch if epoch > 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -225,12 +271,15 @@ class OpenAIAlphaCapacityRetryCoordinator:
         *,
         target_identity: str,
         budget: Optional[OpenAIAlphaCapacityRetryBudget] = None,
-        namespace: str = "default",
+        namespace: Optional[str] = None,
     ):
         self._target_identity = target_identity
         self._target_hash = _hash_target_identity(target_identity)
         self._budget = budget or OpenAIAlphaCapacityRetryBudget()
-        self._namespace = namespace
+        self._namespace = _resolve_openai_capacity_namespace(namespace)
+        self._local_event_key = _capacity_wakeup_scope_key(
+            target_identity, self._namespace
+        )
         self._start_monotonic = time.monotonic()
         self._retry_count = 0
         self._terminal_reason: str = ""
@@ -241,7 +290,7 @@ class OpenAIAlphaCapacityRetryCoordinator:
             else None
         )
         self._local_events = _LOCAL_CAPACITY_WAKEUP_EVENTS.setdefault(
-            target_identity, set()
+            self._local_event_key, set()
         )
 
     @property
@@ -306,7 +355,8 @@ class OpenAIAlphaCapacityRetryCoordinator:
                         redis_cache, redis_key
                     )
                 except Exception:
-                    wakeup.starting_epoch = 0
+                    wakeup.starting_epoch = None
+                    wakeup.epoch_baseline_known = False
 
             deadline = time.monotonic() + wait_seconds
             while True:
@@ -327,9 +377,17 @@ class OpenAIAlphaCapacityRetryCoordinator:
                         )
                     except Exception:
                         current_epoch = None
+                    if not wakeup.epoch_baseline_known:
+                        if current_epoch is not None:
+                            wakeup.starting_epoch = current_epoch
+                            wakeup.epoch_baseline_known = True
+                        current_epoch = None
                     if (
                         current_epoch is not None
-                        and current_epoch != wakeup.starting_epoch
+                        and (
+                            wakeup.starting_epoch is None
+                            or current_epoch != wakeup.starting_epoch
+                        )
                     ):
                         wakeup.wakeup_reason = "peer_success"
                         break
@@ -341,7 +399,7 @@ class OpenAIAlphaCapacityRetryCoordinator:
         finally:
             self._local_events.discard(wakeup.event)
             if not self._local_events:
-                _LOCAL_CAPACITY_WAKEUP_EVENTS.pop(self._target_identity, None)
+                _LOCAL_CAPACITY_WAKEUP_EVENTS.pop(self._local_event_key, None)
 
         return wakeup.wakeup_reason
 
