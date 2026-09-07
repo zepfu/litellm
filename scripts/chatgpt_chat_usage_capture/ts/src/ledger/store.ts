@@ -16,9 +16,11 @@ import type {
 import { reconstructAttempts } from "../normalize/reconstruct.js";
 import {
   isMappingPublished,
+  ModelMappingError,
   normalizeMappingVersion,
   resolveModelEvidence,
   suggestModelMappings,
+  validateMappingOwnerConsistency,
   validateMappingVersion,
 } from "../normalize/model-mapping.js";
 import {
@@ -39,6 +41,7 @@ import type {
   IngestContext,
   IngestResult,
   LedgerScope,
+  MappingOwnerBinding,
   ModelMappingVersion,
   ReconstructedAttempt,
   StoredMessage,
@@ -351,6 +354,9 @@ export class Ledger {
       profilePath?: string | null;
     } = {},
   ): void {
+    for (const mapping of this.modelMappings()) {
+      this.assertMappingOwnerConsistency(mapping, scope);
+    }
     const now = new Date().toISOString();
     this.db
       .prepare(
@@ -553,6 +559,7 @@ export class Ledger {
     summary?: ConversationSummary,
   ): IngestResult {
     validateMappingVersion(mapping);
+    this.assertMappingOwnerConsistency(mapping, scope);
     return this.transaction(() => {
       const futureMessageIds = new Set(
         detail.messages
@@ -1012,6 +1019,8 @@ export class Ledger {
   } {
     const key = scopeKey(scope);
     const incomingAttempt = sanitizeAttempt(attempt, context.observedAt);
+    let cleanAttempt = incomingAttempt;
+    let effectiveMapping: ModelMappingVersion | undefined;
     const aliases = uniqueAttemptAliases(incomingAttempt.aliases);
     const aliasOwners = this.findAttemptAliasOwners(scope, aliases);
     const mergeableOwnerIds = new Set(
@@ -1029,8 +1038,8 @@ export class Ledger {
       aliasOwners,
       mergeableOwnerIds,
     );
-    const cleanAttempt = {
-      ...incomingAttempt,
+    cleanAttempt = {
+      ...cleanAttempt,
       attemptId: canonicalAttemptId,
       aliases,
     };
@@ -1042,26 +1051,25 @@ export class Ledger {
     const current = this.db
       .prepare("SELECT * FROM attempts WHERE attempt_id=? AND scope_key=?")
       .get(cleanAttempt.attemptId, key) as SqlRow | undefined;
-    if (current && mapping) {
-      const applied = resolveModelEvidence(
-        { slug: null, mode: null, reasoningEffort: null },
-        mapping,
-        scope.collectorAccountId,
-        { at: cleanAttempt.attemptTime },
-      ).applied;
-      if (!applied) {
-        cleanAttempt.requestedFamily = nullableString(current.requested_family);
-        cleanAttempt.recordedFinalFamily = nullableString(current.recorded_final_family);
-        cleanAttempt.resolvedFamily = nullableString(current.resolved_family);
-        cleanAttempt.mappingVersion = String(current.mapping_version);
-      }
-      if (cleanAttempt.mappingVersion === current.mapping_version) {
-        cleanAttempt.warnings = uniqueStrings([
-          ...cleanAttempt.warnings,
-          ...parseJsonArray(current.warnings_json).filter((warning) =>
-            warning.startsWith("mapping_") || mapping.warnings?.includes(warning),
-          ),
-        ]);
+    if (mapping) {
+      validateMappingVersion(mapping);
+      this.assertMappingOwnerConsistency(mapping, scope);
+      const projection = this.projectAttemptMapping(scope, cleanAttempt, mapping);
+      if (
+        current &&
+        rawEvidenceMatchesCurrent(current, cleanAttempt) &&
+        (projection.mapping === null ||
+          projection.mapping.version === String(current.mapping_version))
+      ) {
+        cleanAttempt = preserveCurrentMappingProjection(
+          cleanAttempt,
+          current,
+          mapping,
+        );
+        effectiveMapping = projection.mapping ?? undefined;
+      } else {
+        cleanAttempt = projection.attempt;
+        effectiveMapping = projection.mapping ?? mapping;
       }
     }
     const payload = attemptPayload(cleanAttempt);
@@ -1176,7 +1184,17 @@ export class Ledger {
       status = "updated";
     }
     if (currentChanged) {
-      this.recordMappingHistory(scope, cleanAttempt, context.observedAt, "ingest");
+      this.recordMappingHistory(
+        scope,
+        cleanAttempt,
+        context.observedAt,
+        mappingHistorySource(context.sourceKind),
+        effectiveMapping
+          ? {
+              mapping: effectiveMapping,
+            }
+          : undefined,
+      );
     }
     return { attemptId: cleanAttempt.attemptId, status, aliasConflicts };
   }
@@ -1373,6 +1391,7 @@ export class Ledger {
     const candidate = normalizeMappingVersion(mapping);
     validateMappingVersion(candidate);
     assertNoSecrets(candidate);
+    this.assertMappingOwnerConsistency(candidate);
     const existingRow = this.db
       .prepare("SELECT * FROM model_mapping_versions WHERE version=?")
       .get(candidate.version) as SqlRow | undefined;
@@ -1473,6 +1492,7 @@ export class Ledger {
     scope: LedgerScope,
     mapping: ModelMappingVersion,
   ) {
+    this.assertMappingOwnerConsistency(mapping, scope);
     return suggestModelMappings(
       this.listAttempts(scope).map((attempt) => ({
         requestedModelRaw: nullableString(attempt.requestedModelRaw),
@@ -1489,6 +1509,154 @@ export class Ledger {
     );
   }
 
+  private assertMappingOwnerConsistency(
+    mapping: ModelMappingVersion,
+    extraScope?: LedgerScope,
+  ): void {
+    try {
+      validateMappingOwnerConsistency(mapping, this.mappingOwnerBindings(extraScope));
+    } catch (error) {
+      if (error instanceof ModelMappingError) {
+        throw new LedgerError(error.message);
+      }
+      throw error;
+    }
+  }
+
+  private mappingOwnerBindings(extraScope?: LedgerScope): MappingOwnerBinding[] {
+    const bindings = [
+      ...this.listAccounts(),
+      ...(extraScope ? [extraScope] : []),
+    ];
+    const seen = new Set<string>();
+    return bindings
+      .map((scope) => ({
+        collectorAccountId: scope.collectorAccountId,
+        canonicalOwnerKey: scopeKey(scope),
+      }))
+      .filter((binding) => {
+        const key = `${binding.collectorAccountId}\u0000${binding.canonicalOwnerKey}`;
+        if (seen.has(key)) {
+          return false;
+        }
+        seen.add(key);
+        return true;
+      });
+  }
+
+  private projectAttemptMapping(
+    scope: LedgerScope,
+    attempt: ReconstructedAttempt,
+    requestedMapping: ModelMappingVersion,
+  ): {
+    attempt: ReconstructedAttempt;
+    mapping: ModelMappingVersion | null;
+  } {
+    const applicationTime = attempt.attemptTime;
+    const requestedResolution = resolveModelEvidence(
+      { slug: null, mode: null, reasoningEffort: null },
+      requestedMapping,
+      scope.collectorAccountId,
+      { at: applicationTime },
+    );
+    const effectiveMapping = requestedResolution.applied
+      ? requestedMapping
+      : this.findApplicableStoredMapping(
+          scope,
+          requestedMapping,
+          applicationTime,
+        );
+    if (effectiveMapping === null) {
+      return {
+        attempt: {
+          ...attempt,
+          requestedFamily: null,
+          recordedFinalFamily: null,
+          resolvedFamily: null,
+          mappingVersion: requestedMapping.version,
+          warnings: uniqueStrings([
+            ...attempt.warnings,
+            ...requestedResolution.warnings,
+            `mapping_unresolved:${requestedMapping.version}`,
+          ]),
+        },
+        mapping: null,
+      };
+    }
+
+    const requested = resolveModelEvidence(
+      {
+        slug: attempt.requestedModelRaw,
+        mode: attempt.requestedModeRaw,
+        reasoningEffort: attempt.requestedReasoningEffortRaw,
+      },
+      effectiveMapping,
+      scope.collectorAccountId,
+      { at: applicationTime },
+    );
+    const recordedFinal = resolveModelEvidence(
+      {
+        slug: attempt.recordedFinalModelRaw,
+        mode: null,
+        reasoningEffort: null,
+      },
+      effectiveMapping,
+      scope.collectorAccountId,
+      { at: applicationTime },
+    );
+    const resolved = resolveModelEvidence(
+      {
+        slug: attempt.resolvedModelRaw,
+        mode: null,
+        reasoningEffort: null,
+      },
+      effectiveMapping,
+      scope.collectorAccountId,
+      { at: applicationTime },
+    );
+    const fallbackWarnings =
+      effectiveMapping.version === requestedMapping.version ||
+      effectiveMapping.version === attempt.mappingVersion
+        ? []
+        : [`mapping_fallback:${effectiveMapping.version}`];
+    return {
+      attempt: {
+        ...attempt,
+        requestedFamily: requested.family,
+        recordedFinalFamily: recordedFinal.family,
+        resolvedFamily: resolved.family,
+        mappingVersion: effectiveMapping.version,
+        warnings: uniqueStrings([
+          ...attempt.warnings,
+          ...requested.warnings,
+          ...recordedFinal.warnings,
+          ...resolved.warnings,
+          ...fallbackWarnings,
+        ]),
+      },
+      mapping: effectiveMapping,
+    };
+  }
+
+  private findApplicableStoredMapping(
+    scope: LedgerScope,
+    requestedMapping: ModelMappingVersion,
+    applicationTime: string | null,
+  ): ModelMappingVersion | null {
+    return this.modelMappings()
+      .filter((mapping) => mapping.version !== requestedMapping.version)
+      .filter((mapping) =>
+        resolveModelEvidence(
+          { slug: null, mode: null, reasoningEffort: null },
+          mapping,
+          scope.collectorAccountId,
+          { at: applicationTime },
+        ).applied,
+      )
+      .sort(compareMappingRecency)
+      .at(-1) ?? null;
+  }
+
   reclassifyAttempts(
     scope: LedgerScope,
     mapping: ModelMappingVersion,
@@ -1498,56 +1666,32 @@ export class Ledger {
     const candidate = normalizeMappingVersion(mapping);
     validateMappingVersion(candidate);
     assertNoSecrets(candidate);
+    this.assertMappingOwnerConsistency(candidate, scope);
     if (!isMappingPublished(candidate)) {
       return 0;
     }
     let changed = 0;
     for (const row of this.listAttempts(scope)) {
       const attempt = rowToReconstructedAttempt(row, scope);
-      const applicationTime = attempt.attemptTime;
-      const requested = resolveModelEvidence(
-        {
-          slug: nullableString(row.requestedModelRaw),
-          mode: nullableString(row.requestedModeRaw),
-          reasoningEffort: nullableString(row.requestedReasoningEffortRaw),
-        },
-        candidate,
-        scope.collectorAccountId,
-        { at: applicationTime },
-      );
-      const recordedFinal = resolveModelEvidence(
-        {
-          slug: nullableString(row.recordedFinalModelRaw),
-          mode: null,
-          reasoningEffort: null,
-        },
-        candidate,
-        scope.collectorAccountId,
-        { at: applicationTime },
-      );
-      const resolved = resolveModelEvidence(
-        {
-          slug: nullableString(row.resolvedModelRaw),
-          mode: null,
-          reasoningEffort: null,
-        },
-        candidate,
-        scope.collectorAccountId,
-        { at: applicationTime },
-      );
-      if (!requested.applied || !recordedFinal.applied || !resolved.applied) {
+      const projection = this.projectAttemptMapping(scope, attempt, candidate);
+      if (projection.mapping === null) {
         continue;
       }
-      const requestedFamily = requested.family;
-      const recordedFinalFamily = recordedFinal.family;
-      const resolvedFamily = resolved.family;
+      const effectiveMapping = projection.mapping ?? candidate;
+      const mappedAttempt = projection.attempt;
+      const projectionChanged =
+        mappedAttempt.requestedFamily !== attempt.requestedFamily ||
+        mappedAttempt.recordedFinalFamily !== attempt.recordedFinalFamily ||
+        mappedAttempt.resolvedFamily !== attempt.resolvedFamily ||
+        mappedAttempt.mappingVersion !== attempt.mappingVersion;
+      const reclassificationWarning =
+        projection.mapping?.version === candidate.version || projectionChanged
+          ? [`mapping_reclassified:${effectiveMapping.version}`]
+          : [];
       const nextWarnings = uniqueStrings([
-        ...attempt.warnings,
+        ...mappedAttempt.warnings,
         ...(candidate.warnings ?? []),
-        ...requested.warnings,
-        ...recordedFinal.warnings,
-        ...resolved.warnings,
-        `mapping_reclassified:${candidate.version}`,
+        ...reclassificationWarning,
       ]);
       const current = [
         nullableString(row.requestedFamily),
@@ -1557,21 +1701,17 @@ export class Ledger {
         [...attempt.warnings].sort(),
       ];
       const next = [
-        requestedFamily,
-        recordedFinalFamily,
-        resolvedFamily,
-        candidate.version,
+        mappedAttempt.requestedFamily,
+        mappedAttempt.recordedFinalFamily,
+        mappedAttempt.resolvedFamily,
+        mappedAttempt.mappingVersion,
         [...nextWarnings].sort(),
       ];
       if (JSON.stringify(current) === JSON.stringify(next)) {
         continue;
       }
       const projected = {
-        ...attempt,
-        requestedFamily,
-        recordedFinalFamily,
-        resolvedFamily,
-        mappingVersion: candidate.version,
+        ...mappedAttempt,
         warnings: nextWarnings,
       };
       const payload = attemptPayload(projected);
@@ -1580,13 +1720,16 @@ export class Ledger {
       const projectionFingerprint = fingerprint(payload);
       const provenance = {
         source,
-        mapping_version: candidate.version,
+        mapping_version: effectiveMapping.version,
+        ...(effectiveMapping.version === candidate.version
+          ? {}
+          : { requested_mapping_version: candidate.version }),
         previous_mapping_version: attempt.mappingVersion,
-        change_kind: candidate.changeKind ?? "prospective",
-        valid_from: candidate.validFrom ?? null,
-        valid_until: candidate.validUntil ?? null,
+        change_kind: effectiveMapping.changeKind ?? "prospective",
+        valid_from: effectiveMapping.validFrom ?? null,
+        valid_until: effectiveMapping.validUntil ?? null,
         recorded_at: recordedAt,
-        ...(candidate.provenance ?? {}),
+        ...(effectiveMapping.provenance ?? {}),
       };
       this.recordMappingHistory(scope, attempt, recordedAt, "prior_projection", {
         warnings: attempt.warnings,
@@ -1597,7 +1740,7 @@ export class Ledger {
         },
       });
       this.recordMappingHistory(scope, projected, recordedAt, source, {
-        mapping: candidate,
+        mapping: effectiveMapping,
         warnings: nextWarnings,
         provenance,
       });
@@ -1670,6 +1813,8 @@ export class Ledger {
     mapping: ModelMappingVersion,
     recordedAt: string,
   ): number {
+    validateMappingVersion(mapping);
+    this.assertMappingOwnerConsistency(mapping, scope);
     let changed = 0;
     for (const conversationId of this.conversations(scope)) {
       const attempts = reconstructAttempts(this.reconstructionMessages(scope, conversationId), {
@@ -2340,6 +2485,40 @@ function sanitizeAttempt(
   };
 }
 
+function rawEvidenceMatchesCurrent(
+  current: SqlRow,
+  attempt: ReconstructedAttempt,
+): boolean {
+  return (
+    nullableString(current.requested_model_raw) === attempt.requestedModelRaw &&
+    nullableString(current.requested_mode_raw) === attempt.requestedModeRaw &&
+    nullableString(current.requested_reasoning_effort_raw) ===
+      attempt.requestedReasoningEffortRaw &&
+    nullableString(current.recorded_final_model_raw) === attempt.recordedFinalModelRaw &&
+    nullableString(current.resolved_model_raw) === attempt.resolvedModelRaw
+  );
+}
+
+function preserveCurrentMappingProjection(
+  attempt: ReconstructedAttempt,
+  current: SqlRow,
+  mapping: ModelMappingVersion,
+): ReconstructedAttempt {
+  return {
+    ...attempt,
+    requestedFamily: nullableString(current.requested_family),
+    recordedFinalFamily: nullableString(current.recorded_final_family),
+    resolvedFamily: nullableString(current.resolved_family),
+    mappingVersion: String(current.mapping_version),
+    warnings: uniqueStrings([
+      ...attempt.warnings,
+      ...parseJsonArray(current.warnings_json).filter(
+        (warning) => warning.startsWith("mapping_") || mapping.warnings?.includes(warning),
+      ),
+    ]),
+  };
+}
+
 function futureMessageIdsHasEvidence(
   attempt: ReconstructedAttempt,
   messageIds: ReadonlySet<string>,
@@ -2586,6 +2765,24 @@ function mappingFingerprint(mapping: ModelMappingVersion): string {
     provenance: normalized.provenance ?? {},
     warnings: normalized.warnings ?? [],
   });
+}
+
+function compareMappingRecency(
+  left: ModelMappingVersion,
+  right: ModelMappingVersion,
+): number {
+  return (
+    Number(left.changeKind === "historical_correction") -
+      Number(right.changeKind === "historical_correction") ||
+    (left.validFrom ?? "").localeCompare(right.validFrom ?? "") ||
+    left.createdAt.localeCompare(right.createdAt) ||
+    (left.publishedAt ?? "").localeCompare(right.publishedAt ?? "") ||
+    left.version.localeCompare(right.version)
+  );
+}
+
+function mappingHistorySource(sourceKind: string): string {
+  return sourceKind === "aggregate_rebuild" ? "aggregate_rebuild" : "ingest";
 }
 
 function uniqueStrings(values: ReadonlyArray<string>): string[] {

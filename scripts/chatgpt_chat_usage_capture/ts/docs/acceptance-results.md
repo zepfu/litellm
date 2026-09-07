@@ -43,8 +43,9 @@ closed.
 
 All checks used synthetic data, with no live browser, provider request,
 container, Python, Anthropic, Harness v2, or analysis-queue operation.
-Remaining spec concern: collector-specific mapping overrides can target shared
-owner activity; precedence for conflicting overrides is unspecified. See
+The base acceptance recorded a remaining shared-owner mapping concern.
+Collector-specific overrides for one canonical owner are now validated as one
+owner-scoped result, and conflicting effective overrides are rejected. See
 `known-limitations.md`.
 
 ## Original integration record

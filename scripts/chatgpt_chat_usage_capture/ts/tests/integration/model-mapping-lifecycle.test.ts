@@ -55,6 +55,183 @@ describe("model mapping ledger lifecycle", () => {
     ledger.close();
   });
 
+  it("re-evaluates changed raw evidence with the applicable stored mapping", () => {
+    const ledger = newLedger("mapping-prospective-fallback");
+    const account = scope("account-prospective-fallback");
+    ledger.upsertAccount(account);
+    const initial = mapping("mapping-initial", {
+      rules: [
+        reviewedRule("model-old", "astra_pro"),
+        reviewedRule("model-new", "sol_pro"),
+        reviewedRule("model-final", "astra_pro"),
+        reviewedRule("model-resolved", "astra_pro"),
+      ],
+    });
+    const prospective = mapping("mapping-prospective", {
+      createdAt: "2026-09-07T01:00:00.000Z",
+      validFrom: "2026-09-08T00:00:00.000Z",
+      rules: [
+        reviewedRule("model-new", "astra_pro"),
+        reviewedRule("model-final", "astra_pro"),
+        reviewedRule("model-resolved", "astra_pro"),
+      ],
+    });
+    ledger.saveModelMapping(initial);
+    ledger.saveModelMapping(prospective);
+
+    ledger.ingestConversation(
+      account,
+      detail("conversation-prospective-fallback", "model-old"),
+      initial,
+      context("run-prospective-1"),
+    );
+    ledger.ingestConversation(
+      account,
+      detail("conversation-prospective-fallback", "model-new"),
+      prospective,
+      context("run-prospective-2"),
+    );
+
+    const attempt = ledger.listAttempts(account)[0]!;
+    expect(attempt.requestedModelRaw).toBe("model-new");
+    expect(attempt.requestedFamily).toBe("sol_pro");
+    expect(attempt.mappingVersion).toBe("mapping-initial");
+    expect(attempt.warnings).toContain("mapping_fallback:mapping-initial");
+    ledger.close();
+  });
+
+  it("clears stale families when no applicable stored mapping exists", () => {
+    const ledger = newLedger("mapping-prospective-unresolved");
+    const account = scope("account-prospective-unresolved");
+    ledger.upsertAccount(account);
+    const initial = mapping("mapping-direct", {
+      rules: [
+        reviewedRule("model-old", "astra_pro"),
+        reviewedRule("model-final", "astra_pro"),
+        reviewedRule("model-resolved", "astra_pro"),
+      ],
+    });
+    const prospective = mapping("mapping-future-only", {
+      validFrom: "2026-09-08T00:00:00.000Z",
+      rules: [
+        reviewedRule("model-new", "sol_pro"),
+        reviewedRule("model-final", "sol_pro"),
+        reviewedRule("model-resolved", "sol_pro"),
+      ],
+    });
+
+    ledger.ingestConversation(
+      account,
+      detail("conversation-prospective-unresolved", "model-old"),
+      initial,
+      context("run-unresolved-1"),
+    );
+    ledger.saveModelMapping(prospective);
+    ledger.ingestConversation(
+      account,
+      detail("conversation-prospective-unresolved", "model-new"),
+      prospective,
+      context("run-unresolved-2"),
+    );
+
+    const attempt = ledger.listAttempts(account)[0]!;
+    expect(attempt.requestedModelRaw).toBe("model-new");
+    expect(attempt.requestedFamily).toBeNull();
+    expect(attempt.recordedFinalFamily).toBeNull();
+    expect(attempt.resolvedFamily).toBeNull();
+    expect(attempt.mappingVersion).toBe("mapping-future-only");
+    expect(attempt.warnings).toEqual(
+      expect.arrayContaining([
+        "mapping_outside_validity_interval",
+        "mapping_unresolved:mapping-future-only",
+      ]),
+    );
+    ledger.close();
+  });
+
+  it("rejects conflicting collector overrides for one canonical owner", () => {
+    const ledger = newLedger("mapping-owner-conflict");
+    const first = scope("account-owner-one");
+    const second = scope("account-owner-two");
+    ledger.upsertAccount(first);
+    ledger.upsertAccount(second);
+
+    expect(() =>
+      ledger.saveModelMapping(
+        mapping("mapping-owner-conflict", {
+          rules: [
+            reviewedRule("model-shared", "astra_pro", {
+              collectorAccountId: first.collectorAccountId,
+            }),
+            reviewedRule("model-shared", "sol_pro", {
+              collectorAccountId: second.collectorAccountId,
+            }),
+          ],
+        }),
+      ),
+    ).toThrow(/conflicting collector overrides for canonical owner/);
+    ledger.close();
+  });
+
+  it("records correction lifecycle bounds when a full rebuild creates history", () => {
+    const ledger = newLedger("mapping-rebuild-history");
+    const account = scope("account-rebuild-history");
+    ledger.upsertAccount(account);
+    const correction = mapping("mapping-rebuild-correction", {
+      changeKind: "historical_correction",
+      validFrom: "2026-09-07T10:00:00.000Z",
+      validUntil: "2026-09-07T12:00:00.000Z",
+      rules: allModelRules(),
+    });
+    ledger.saveModelMapping(correction);
+
+    const conversation = detail("conversation-rebuild-history");
+    ledger.upsertConversation(
+      account,
+      {
+        conversationId: conversation.conversationId,
+        createdAt: conversation.createdAt,
+        updatedAt: conversation.updatedAt,
+        isArchived: false,
+        workspaceId: account.workspaceId,
+        projectId: null,
+        surface: "chat",
+        origin: null,
+        hasVersions: null,
+        currentNode: conversation.currentNode,
+        coverage: "validated_page",
+      },
+      "run-rebuild-history",
+      "2026-09-07T11:30:00.000Z",
+    );
+    for (const messageRecord of conversation.messages) {
+      ledger.upsertMessage(
+        account,
+        messageRecord,
+        context("run-rebuild-history", "conversation-rebuild-history"),
+      );
+    }
+
+    expect(
+      ledger.rebuildAttemptsFromMessages(
+        account,
+        correction,
+        "2026-09-07T11:45:00.000Z",
+      ),
+    ).toBe(1);
+    const attempt = ledger.listAttempts(account)[0]!;
+    const history = ledger.attemptMappingHistory(account, String(attempt.attemptId));
+    expect(history).toHaveLength(1);
+    expect(history[0]).toMatchObject({
+      mapping_version: "mapping-rebuild-correction",
+      source: "aggregate_rebuild",
+      change_kind: "historical_correction",
+      valid_from: "2026-09-07T10:00:00.000Z",
+      valid_until: "2026-09-07T12:00:00.000Z",
+    });
+    ledger.close();
+  });
+
   it("separates prospective changes from historical corrections and preserves provenance", () => {
     const ledger = newLedger("mapping-correction");
     const account = scope("account-correction");
@@ -183,12 +360,17 @@ function mapping(
   };
 }
 
-function reviewedRule(slug: string, family: string): MappingRule {
+function reviewedRule(
+  slug: string,
+  family: string,
+  overrides: Partial<MappingRule> = {},
+): MappingRule {
   return {
     slug,
     family,
     reviewed: true,
     source: "integration-test",
+    ...overrides,
   };
 }
 
@@ -211,7 +393,10 @@ function context(runId: string) {
   };
 }
 
-function detail(conversationId: string): ConversationDetailProjection {
+function detail(
+  conversationId: string,
+  requestedModel = "model-requested",
+): ConversationDetailProjection {
   return {
     conversationId,
     createdAt: "2026-09-07T11:00:00.000Z",
@@ -230,7 +415,7 @@ function detail(conversationId: string): ConversationDetailProjection {
         role: "user",
         children: ["node-final"],
         createdAt: "2026-09-07T11:00:00.000Z",
-        requestedModelRaw: "model-requested",
+        requestedModelRaw: requestedModel,
       }),
       message({
         conversationId,

@@ -113,8 +113,12 @@ explicit rather than being guessed.
 Requested, recorded-final, and resolved model labels are independent. The
 initial mapping has canonical families but no slug rules. Published mappings
 are immutable, use event-time validity, and distinguish prospective changes
-from historical corrections. Rebuild preserves mapping warnings, linkage, and
-retired duplicates. Mapping history is separate from raw evidence.
+from historical corrections. Changed raw evidence uses the applicable stored
+mapping when the selected mapping is not yet applicable; without one, family
+fields remain unresolved. Collector-specific overrides are rejected when they
+would produce different results for collectors sharing one canonical owner.
+Rebuild preserves mapping warnings, lifecycle bounds, linkage, and retired
+duplicates. Mapping history is separate from raw evidence.
 `src/accounting/raw-model.ts` reports elapsed half-open intervals with
 mismatches, ambiguous/unknown times, surface/origin exclusions, and open
 coverage gaps. `src/accounting/reaggregate.ts` rebuilds from the same messages

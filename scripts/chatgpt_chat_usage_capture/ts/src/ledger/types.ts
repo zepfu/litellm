@@ -24,6 +24,11 @@ export interface MappingRule {
   source?: string;
 }
 
+export interface MappingOwnerBinding {
+  collectorAccountId: string;
+  canonicalOwnerKey: string;
+}
+
 export type MappingChangeKind = "prospective" | "historical_correction";
 
 export interface ModelMappingVersion {

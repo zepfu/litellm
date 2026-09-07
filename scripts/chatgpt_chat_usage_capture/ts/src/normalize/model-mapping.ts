@@ -1,5 +1,6 @@
 import type {
   MappingEvidence,
+  MappingOwnerBinding,
   MappingResolution,
   MappingRule,
   ModelMappingVersion,
@@ -129,6 +130,54 @@ export function validateMappingVersion(mapping: ModelMappingVersion): void {
   }
 }
 
+export function validateMappingOwnerConsistency(
+  mapping: ModelMappingVersion,
+  bindings: ReadonlyArray<MappingOwnerBinding>,
+): void {
+  const normalized = normalizeMappingVersion(mapping);
+  validateMappingVersion(normalized);
+  if (!isMappingPublished(normalized)) {
+    return;
+  }
+
+  const collectorsByOwner = new Map<string, Set<string>>();
+  for (const binding of bindings) {
+    if (!binding.collectorAccountId.trim() || !binding.canonicalOwnerKey.trim()) {
+      continue;
+    }
+    const collectors = collectorsByOwner.get(binding.canonicalOwnerKey) ?? new Set<string>();
+    collectors.add(binding.collectorAccountId);
+    collectorsByOwner.set(binding.canonicalOwnerKey, collectors);
+  }
+
+  for (const [canonicalOwnerKey, collectors] of collectorsByOwner) {
+    if (collectors.size < 2) {
+      continue;
+    }
+    for (const evidence of mappingEvidenceCases(normalized.rules)) {
+      const signatures = new Set<string>();
+      for (const collectorAccountId of collectors) {
+        const resolution = resolveMappingRules(
+          evidence,
+          normalized,
+          collectorAccountId,
+        );
+        signatures.add(
+          resolution.ambiguous
+            ? "ambiguous"
+            : resolution.family ?? "unmapped",
+        );
+      }
+      if (signatures.size > 1) {
+        throw new ModelMappingError(
+          `conflicting collector overrides for canonical owner ${canonicalOwnerKey}: ` +
+            evidenceSelector(evidence),
+        );
+      }
+    }
+  }
+}
+
 export function resolveModelEvidence(
   evidence: MappingEvidence,
   mapping: ModelMappingVersion,
@@ -160,37 +209,12 @@ export function resolveModelEvidence(
     };
   }
 
-  const candidates = normalized.rules
-    .filter((rule) => rule.reviewed === true)
-    .filter((rule) => {
-      if (
-        rule.collectorAccountId !== undefined &&
-        rule.collectorAccountId !== null &&
-        rule.collectorAccountId !== collectorAccountId
-      ) {
-        return false;
-      }
-      return rule.slug === evidence.slug;
-    })
-    .filter((rule) => matchesOptional(rule.mode, evidence.mode))
-    .filter((rule) => matchesOptional(rule.reasoningEffort, evidence.reasoningEffort))
-    .sort((left, right) => compareRulePrecedence(right, left));
-
-  const best = candidates[0] ?? null;
-  if (best === null) {
-    return {
-      family: null,
-      rule: null,
-      warnings: [],
-      applied: true,
-    };
-  }
-
-  const tied = candidates.filter(
-    (candidate) => compareRulePrecedence(candidate, best) === 0,
+  const resolution = resolveMappingRules(
+    evidence,
+    normalized,
+    collectorAccountId,
   );
-  const tiedFamilies = new Set(tied.map((candidate) => candidate.family));
-  if (tiedFamilies.size > 1) {
+  if (resolution.ambiguous) {
     return {
       family: null,
       rule: null,
@@ -200,8 +224,8 @@ export function resolveModelEvidence(
   }
 
   return {
-    family: best.family,
-    rule: best,
+    family: resolution.family,
+    rule: resolution.rule,
     warnings: [],
     applied: true,
   };
@@ -396,6 +420,81 @@ function mappingSelector(rule: MappingRule): string {
     rule.mode ?? null,
     rule.reasoningEffort ?? null,
   ]);
+}
+
+function evidenceSelector(evidence: MappingEvidence): string {
+  return JSON.stringify([
+    evidence.slug,
+    evidence.mode,
+    evidence.reasoningEffort,
+  ]);
+}
+
+function mappingEvidenceCases(rules: ReadonlyArray<MappingRule>): MappingEvidence[] {
+  const bySlug = new Map<
+    string,
+    { modes: Set<string | null>; reasoningEfforts: Set<string | null> }
+  >();
+  for (const rule of rules) {
+    const values = bySlug.get(rule.slug) ?? {
+      modes: new Set<string | null>([null]),
+      reasoningEfforts: new Set<string | null>([null]),
+    };
+    values.modes.add(rule.mode ?? null);
+    values.reasoningEfforts.add(rule.reasoningEffort ?? null);
+    bySlug.set(rule.slug, values);
+  }
+
+  const cases: MappingEvidence[] = [];
+  for (const [slug, values] of bySlug) {
+    for (const mode of values.modes) {
+      for (const reasoningEffort of values.reasoningEfforts) {
+        cases.push({ slug, mode, reasoningEffort });
+      }
+    }
+  }
+  return cases;
+}
+
+function resolveMappingRules(
+  evidence: MappingEvidence,
+  mapping: ModelMappingVersion,
+  collectorAccountId?: string,
+): {
+  family: string | null;
+  rule: MappingRule | null;
+  ambiguous: boolean;
+} {
+  const candidates = mapping.rules
+    .filter((rule) => rule.reviewed === true)
+    .filter((rule) => {
+      if (
+        rule.collectorAccountId !== undefined &&
+        rule.collectorAccountId !== null &&
+        rule.collectorAccountId !== collectorAccountId
+      ) {
+        return false;
+      }
+      return rule.slug === evidence.slug;
+    })
+    .filter((rule) => matchesOptional(rule.mode, evidence.mode))
+    .filter((rule) => matchesOptional(rule.reasoningEffort, evidence.reasoningEffort))
+    .sort((left, right) => compareRulePrecedence(right, left));
+
+  const best = candidates[0] ?? null;
+  if (best === null) {
+    return { family: null, rule: null, ambiguous: false };
+  }
+
+  const tied = candidates.filter(
+    (candidate) => compareRulePrecedence(candidate, best) === 0,
+  );
+  const tiedFamilies = new Set(tied.map((candidate) => candidate.family));
+  if (tiedFamilies.size > 1) {
+    return { family: null, rule: null, ambiguous: true };
+  }
+
+  return { family: best.family, rule: best, ambiguous: false };
 }
 
 function matchesOptional(

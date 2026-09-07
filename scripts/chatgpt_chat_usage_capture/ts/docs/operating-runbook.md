@@ -96,8 +96,10 @@ Use `--mapping-version <stored-version>` for an explicit selection in
 collection, `models`, or `rebuild`; otherwise the latest stored version is used.
 Published versions are immutable. Event-time validity controls applicability;
 historical corrections require an explicit bounded interval. Inapplicable or
-draft mappings do not erase retained classifications. Keep overrides consistent
-across collectors for one owner; conflicting override precedence is unspecified.
+draft mappings never authorize a stale family to be retained after raw evidence
+changes: the applicable stored mapping is used, or the attempt remains
+explicitly unresolved. Collector-specific overrides are checked at canonical
+owner scope and conflicting overrides are rejected.
 
 ## Rebuild
 
