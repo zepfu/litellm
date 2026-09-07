@@ -13950,15 +13950,26 @@ def _collect_bound_chatgpt_conversation_init_account(
             coverage["verified_account_hash"] = verified_account_hash
 
             if not coverage["collector_written"]:
+                identity_error = collector_summary.get(
+                    "account_identity_verification_error"
+                )
+                if identity_error not in (
+                    "account_identity_mismatch",
+                    "missing_authoritative_account_id",
+                ):
+                    identity_error = None
+                coverage["account_identity_verification_error"] = identity_error
                 _set_chatgpt_account_failure(
                     coverage,
                     stage="capture",
                     error_class=(
                         collector_summary.get("error_class")
+                        or identity_error
                         or "ChatGPTConversationInitCaptureNotWritten"
                     ),
                     error_message=(
                         collector_summary.get("error_message")
+                        or identity_error
                         or "Current conversation-init capture was not written."
                     ),
                     telemetry_class=collector_summary.get("telemetry_class"),
