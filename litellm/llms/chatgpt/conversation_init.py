@@ -31,6 +31,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
@@ -1806,21 +1807,40 @@ class OracleBrowserBoundaryUnavailable(ChatGPTConversationInitError):
 
 
 _ORACLE_BROWSER_FETCH_SCRIPT = """
-async (url) => {
-  const response = await fetch(url, {
-    method: "POST",
-    credentials: "include"
+async (request) => {
+  const controller = new AbortController();
+  const timeoutMs = Math.max(1, Number(request.timeout_ms));
+  let timeoutId = null;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      controller.abort();
+      reject(new Error("conversation-init browser fetch timed out"));
+    }, timeoutMs);
   });
-  let payload = null;
+  const fetchResponse = (async () => {
+    const response = await fetch(request.url, {
+      method: "POST",
+      credentials: "include",
+      signal: controller.signal
+    });
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch (_) {
+      payload = null;
+    }
+    return {
+      status_code: response.status,
+      payload
+    };
+  })();
   try {
-    payload = await response.json();
-  } catch (_) {
-    payload = null;
+    return await Promise.race([fetchResponse, timeout]);
+  } finally {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+    }
   }
-  return {
-    status_code: response.status,
-    payload
-  };
 }
 """
 
@@ -1863,25 +1883,54 @@ class OracleBrowserConversationInitTransport:
 
     def fetch(self, request: urllib_request.Request) -> Mapping[str, Any]:
         _validate_oracle_browser_request(request)
+        deadline = time.monotonic() + self.timeout_seconds
         playwright = None
         browser = None
         try:
             playwright = self._start_playwright()
+            remaining_seconds = _remaining_browser_timeout(deadline)
+            if remaining_seconds <= 0:
+                raise OracleBrowserBoundaryUnavailable(
+                    "Oracle browser conversation-init capture timed out."
+                )
             browser = playwright.chromium.connect_over_cdp(
                 self.cdp_endpoint,
-                timeout=int(self.timeout_seconds * 1000),
+                timeout=_browser_timeout_milliseconds(remaining_seconds),
             )
+            remaining_seconds = _remaining_browser_timeout(deadline)
+            if remaining_seconds <= 0:
+                raise OracleBrowserBoundaryUnavailable(
+                    "Oracle browser conversation-init capture timed out."
+                )
             page = _find_existing_chatgpt_page(
                 browser,
                 self.page_target_id,
                 request.full_url,
+                deadline=deadline,
             )
             if page is None:
                 raise OracleBrowserBoundaryUnavailable(
                     "Oracle browser has no existing ChatGPT CDP target for the "
                     "conversation-init request."
                 )
-            result = page.evaluate(_ORACLE_BROWSER_FETCH_SCRIPT, request.full_url)
+            remaining_seconds = _remaining_browser_timeout(deadline)
+            if remaining_seconds <= 0:
+                raise OracleBrowserBoundaryUnavailable(
+                    "Oracle browser conversation-init capture timed out."
+                )
+            result = page.evaluate(
+                _ORACLE_BROWSER_FETCH_SCRIPT,
+                {
+                    "url": request.full_url,
+                    "timeout_ms": _browser_timeout_milliseconds(
+                        remaining_seconds
+                    ),
+                },
+            )
+            if _remaining_browser_timeout(deadline) <= 0:
+                raise OracleBrowserBoundaryUnavailable(
+                    "Oracle browser conversation-init capture timed out."
+                )
             return _coerce_browser_response(result)
         except OracleBrowserBoundaryUnavailable:
             raise
@@ -1962,16 +2011,30 @@ def _validate_page_target_id(page_target_id: Any) -> str:
     return cleaned
 
 
+def _remaining_browser_timeout(deadline: float) -> float:
+    return deadline - time.monotonic()
+
+
+def _browser_timeout_milliseconds(timeout_seconds: float) -> int:
+    return max(1, int(timeout_seconds * 1000))
+
+
 def _find_existing_chatgpt_page(
     browser: Any,
     page_target_id: str,
     request_url: str,
+    *,
+    deadline: Optional[float] = None,
 ) -> Any:
     target_host = urlsplit(request_url).hostname
     if not target_host:
         return None
     for context in getattr(browser, "contexts", ()):
         for page in getattr(context, "pages", ()):
+            if deadline is not None and _remaining_browser_timeout(deadline) <= 0:
+                raise OracleBrowserBoundaryUnavailable(
+                    "Oracle browser conversation-init capture timed out."
+                )
             page_url = str(getattr(page, "url", "") or "")
             page_host = urlsplit(page_url).hostname
             if page_host == target_host and _page_target_id(context, page) == page_target_id:
