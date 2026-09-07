@@ -1926,6 +1926,7 @@ def _run_oracle_browser_capture_in_worker(
 ) -> Mapping[str, Any]:
     context = _oracle_browser_process_context(playwright_factory)
     receiver, sender = context.Pipe(duplex=False)
+    private_process_group = context.RawValue("q", 0)
     process = context.Process(
         target=_oracle_browser_capture_worker,
         args=(
@@ -1935,6 +1936,7 @@ def _run_oracle_browser_capture_in_worker(
             request_url,
             deadline,
             playwright_factory,
+            private_process_group,
         ),
     )
     try:
@@ -1965,8 +1967,7 @@ def _run_oracle_browser_capture_in_worker(
         return _coerce_browser_response(message.get("result"))
     finally:
         receiver.close()
-        if process.is_alive():
-            _terminate_oracle_browser_worker(process)
+        _terminate_oracle_browser_worker(process, private_process_group.value)
         process.join(timeout=0)
 
 
@@ -1977,8 +1978,9 @@ def _oracle_browser_capture_worker(
     request_url: str,
     deadline: float,
     playwright_factory: Optional[Callable[[], Any]],
+    private_process_group: Any,
 ) -> None:
-    _enter_oracle_browser_worker_process_group()
+    _enter_oracle_browser_worker_process_group(private_process_group)
     playwright = None
     browser = None
     result = None
@@ -2182,22 +2184,29 @@ def _oracle_browser_process_context(
     return multiprocessing.get_context("spawn")
 
 
-def _enter_oracle_browser_worker_process_group() -> None:
+def _enter_oracle_browser_worker_process_group(private_process_group: Any) -> None:
     if os.name == "posix":
-        try:
-            os.setsid()
-        except OSError:
-            pass
+        # Fail before starting the driver unless cleanup owns an isolated group.
+        os.setsid()
+        private_process_group.value = os.getpgrp()
 
 
-def _terminate_oracle_browser_worker(process: Any) -> None:
+def _terminate_oracle_browser_worker(process: Any, private_process_group: int) -> None:
     process_id = getattr(process, "pid", None)
-    if os.name == "posix" and isinstance(process_id, int):
+    if (
+        os.name == "posix"
+        and isinstance(process_id, int)
+        and private_process_group == process_id
+        and private_process_group > 0
+        and private_process_group != os.getpgrp()
+    ):
         try:
-            os.killpg(process_id, signal.SIGKILL)
-            return
+            # The driver can survive its leader; group cleanup is unconditional.
+            os.killpg(private_process_group, signal.SIGKILL)
         except OSError:
             pass
+    if not process.is_alive():
+        return
     kill = getattr(process, "kill", None)
     if callable(kill):
         try:
