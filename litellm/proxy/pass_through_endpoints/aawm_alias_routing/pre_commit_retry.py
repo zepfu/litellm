@@ -154,10 +154,10 @@ def _resolve_redis_for_capacity_wakeup() -> Optional[Any]:
     """Resolve the alias-routing Redis manager if available."""
     try:
         from litellm.proxy.aawm_alias_routing_redis import (
-            _aawm_alias_routing_redis_manager,
+            aawm_alias_routing_redis_manager,
         )
 
-        manager = _aawm_alias_routing_redis_manager
+        manager = aawm_alias_routing_redis_manager
         if manager is None:
             return None
         dual_cache = manager.get_dual_cache()
