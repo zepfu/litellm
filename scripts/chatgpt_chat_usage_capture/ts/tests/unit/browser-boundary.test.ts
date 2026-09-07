@@ -119,6 +119,7 @@ describe("browser boundary", () => {
     expect(get).toHaveBeenCalledWith(`${CHATGPT_ORIGIN}${SESSION_ROUTE}`, {
       timeout: 1000,
       maxRedirects: 0,
+      signal: expect.any(AbortSignal),
     });
     expect(playwrightMocks.launchPersistentContext).toHaveBeenCalledWith(
       profilePath,

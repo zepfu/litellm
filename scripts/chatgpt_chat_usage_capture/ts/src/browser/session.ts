@@ -22,6 +22,7 @@ import { chromium, type BrowserContext, type APIRequestContext } from "playwrigh
 
 import {
   type HistoryTransport,
+  type HistoryTransportRequestOptions,
   AdapterError,
   assertAllowedRequest,
 } from "../adapters/chatgpt/adapter.js";
@@ -142,6 +143,7 @@ export class PlaywrightTransport implements HistoryTransport {
 
   private context: BrowserContext | null = null;
   private requestContext: APIRequestContext | null = null;
+  private activeRequestController: AbortController | null = null;
 
   constructor(private readonly config: BrowserConfig) {}
 
@@ -149,6 +151,7 @@ export class PlaywrightTransport implements HistoryTransport {
     method: string,
     path: string,
     params: Record<string, unknown> = {},
+    options: HistoryTransportRequestOptions = {},
   ): Promise<Record<string, unknown>> {
     assertAllowedRequest(method, path);
     const normalizedMethod = method.toUpperCase();
@@ -163,15 +166,31 @@ export class PlaywrightTransport implements HistoryTransport {
       url.searchParams.set(key, value);
     }
     let response;
+    const requestController = new AbortController();
+    const onAbort = (): void => {
+      requestController.abort();
+    };
+    if (options.signal?.aborted) {
+      requestController.abort();
+    } else {
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+    }
+    this.activeRequestController = requestController;
     try {
       response = await requestContext.get(url.toString(), {
         timeout: this.config.requestTimeoutSeconds * 1000,
         maxRedirects: 0,
+        signal: requestController.signal,
       });
     } catch (error) {
       throw new AdapterError(
         `browser GET failed for ${path}`,
       );
+    } finally {
+      options.signal?.removeEventListener("abort", onAbort);
+      if (this.activeRequestController === requestController) {
+        this.activeRequestController = null;
+      }
     }
     if (response.status() >= 300 && response.status() < 400) {
       throw new AdapterError(`browser redirect rejected for ${path}`);
@@ -180,12 +199,17 @@ export class PlaywrightTransport implements HistoryTransport {
   }
 
   async close(): Promise<void> {
+    await this.cancel();
     this.requestContext = null;
     const context = this.context;
     this.context = null;
     if (context) {
       await context.close().catch(() => undefined);
     }
+  }
+
+  async cancel(): Promise<void> {
+    this.activeRequestController?.abort();
   }
 
   private async ensureRequestContext(): Promise<APIRequestContext> {

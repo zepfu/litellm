@@ -144,12 +144,19 @@ interface TimestampResult {
   warning: "conversation_missing_update_time" | "conversation_invalid_update_time" | null;
 }
 
+export interface HistoryTransportRequestOptions {
+  signal?: AbortSignal;
+}
+
 export interface HistoryTransport {
   request(
     method: string,
     path: string,
     params?: Record<string, unknown>,
+    options?: HistoryTransportRequestOptions,
   ): Promise<Record<string, unknown>>;
+  cancel?: () => Promise<void> | void;
+  close?: () => Promise<void> | void;
 }
 
 export function assertAllowedRequest(method: string, path: string): void {
@@ -302,9 +309,8 @@ export class ChatGPTHistoryAdapter {
   }
 
   async close(): Promise<void> {
-    const closer = (this.transport as { close?: () => Promise<void> | void }).close;
-    if (typeof closer === "function") {
-      await closer.call(this.transport);
+    if (typeof this.transport.close === "function") {
+      await this.transport.close();
     }
   }
 

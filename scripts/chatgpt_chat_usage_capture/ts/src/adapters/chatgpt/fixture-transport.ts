@@ -51,6 +51,10 @@ export class FixtureTransport implements HistoryTransport {
     raiseIfRateLimited(payload, path);
     return payload;
   }
+
+  async cancel(): Promise<void> {}
+
+  async close(): Promise<void> {}
 }
 
 function loadFixture(

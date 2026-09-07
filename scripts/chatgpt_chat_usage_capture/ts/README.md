@@ -157,5 +157,6 @@ git diff --check
 
 See `docs/architecture.md`, `docs/endpoint-evidence.md`,
 `docs/counting-semantics.md`, `docs/operating-runbook.md`,
-`docs/privacy-threat-model.md`, `docs/known-limitations.md`, and
+`docs/request-budgets.md`, `docs/privacy-threat-model.md`,
+`docs/known-limitations.md`, and
 `docs/acceptance-results.md`.
