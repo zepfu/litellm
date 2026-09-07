@@ -2000,3 +2000,86 @@ def test_candidate_loop_planner_calls_pass_live_elapsed_and_deadline():
         assert "same_account_transient_attempts_by_slot" not in elapsed_names
         assert "request_retry_budget" in budget_names
         assert "same_account_transient_attempts_by_slot" not in budget_names
+
+
+@pytest.mark.asyncio
+async def test_nonstream_openai_passthrough_responses_hands_off_capacity_coordinator():
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        pass_through_request,
+    )
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.url = SimpleNamespace(path="/openai_passthrough/v1/responses")
+    mock_request.headers = {"content-type": "application/json"}
+    mock_request.query_params = {}
+    mock_request.state = SimpleNamespace()
+    custom_body = {"model": "gpt-5.4"}
+    upstream_response = MagicMock()
+    upstream_response.status_code = 200
+    upstream_response.headers = {"content-type": "application/json"}
+    upstream_response.aiter_bytes = AsyncMock(return_value=[b'{"ok": true}'])
+    upstream_response.aread = AsyncMock(return_value=b'{"ok": true}')
+    captured: dict[str, Any] = {}
+
+    async def execute_hidden_retries(**kwargs):
+        captured.update(kwargs)
+        return upstream_response
+
+    async def run_with_renewal(_lease, operation):
+        return await operation()
+
+    with patch.object(
+        pte,
+        "_aawm_session_owner_pre_send_guard",
+        new=AsyncMock(),
+    ), patch.object(
+        sa,
+        "get_request_session_owner_lease",
+        return_value=None,
+    ), patch.object(
+        sa,
+        "run_with_session_owner_lease_renewal",
+        new=run_with_renewal,
+    ), patch.object(
+        sa,
+        "finalize_request_session_owner_lease",
+        new=AsyncMock(),
+    ), patch.object(
+        pte,
+        "_execute_passthrough_pre_first_byte_with_hidden_retries",
+        new=execute_hidden_retries,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+    ) as mock_get_client, patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj"
+    ) as mock_logging_obj, patch.object(
+        pte.pass_through_endpoint_logging,
+        "pass_through_async_success_handler",
+        new_callable=AsyncMock,
+    ):
+        mock_client_obj = MagicMock()
+        mock_client_obj.client = MagicMock()
+        mock_get_client.return_value = mock_client_obj
+        mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+        mock_logging_obj.post_call_success_hook = AsyncMock()
+        mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+        await pass_through_request(
+            request=mock_request,
+            target="https://api.openai.com/v1/responses",
+            custom_headers={},
+            user_api_key_dict=MagicMock(),
+            custom_body=custom_body,
+            custom_llm_provider="openai",
+            stream=False,
+        )
+
+    coordinator = captured.get("openai_capacity_coordinator")
+    assert captured.get("operation_name") == "non_stream_pre_first_byte"
+    assert isinstance(coordinator, OpenAIAlphaCapacityRetryCoordinator)
+    assert coordinator.deadline_seconds == 7200.0

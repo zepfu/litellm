@@ -4948,6 +4948,23 @@ async def pass_through_request(  # noqa: PLR0915
         )
         upstream_wait_started_at = datetime.now()
 
+        capacity_retry_coordinator = None
+        if _is_openai_alpha_capacity_retry_target(
+            request=request,
+            url=url,
+            endpoint_type=endpoint_type,
+        ):
+            capacity_retry_coordinator = OpenAIAlphaCapacityRetryCoordinator(
+                target_identity=_build_openai_capacity_target_identity(
+                    provider="openai",
+                    model=(
+                        str(provider_bound_body.get("model") or "")
+                        if isinstance(provider_bound_body, dict)
+                        else None
+                    ),
+                )
+            )
+
         async def _send_non_stream_pre_first_byte() -> httpx.Response:
             non_stream_headers = headers
             if use_json_egress:
@@ -5045,6 +5062,7 @@ async def pass_through_request(  # noqa: PLR0915
                     caller_managed_hidden_retry=caller_managed_hidden_retry,
                     url=url,
                     custom_llm_provider=custom_llm_provider,
+                    openai_capacity_coordinator=capacity_retry_coordinator,
                 ),
             )
         except Exception:
