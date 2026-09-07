@@ -1,4 +1,4 @@
-// Flat ESLint config for Stage 1. Core rules only; the TypeScript parser keeps
+// Flat ESLint config for the TypeScript collector. Core rules only; the TypeScript parser keeps
 // lint syntax-aware while TypeScript checks remain delegated to typecheck.
 import js from "@eslint/js";
 import tseslint from "typescript-eslint";

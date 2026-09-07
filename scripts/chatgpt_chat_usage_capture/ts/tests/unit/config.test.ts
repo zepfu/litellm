@@ -1,12 +1,12 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { defaultConfig, loadConfig, saveConfig } from "../../src/config.js";
+import { defaultConfig, loadConfig, resolveDatabasePath, saveConfig } from "../../src/config.js";
 
-describe("Stage-1 config contract", () => {
+describe("Stage-2 config contract", () => {
   const temporaryDirectories: string[] = [];
 
   afterEach(() => {
@@ -32,5 +32,17 @@ describe("Stage-1 config contract", () => {
     expect(loaded.schemaVersion).toBe(1);
     expect(loaded.accounts[0]?.browser.adapter).toBe("playwright_persistent_context");
     expect(loaded.accounts[0]?.planPolicyId).toBe("pro200-chat-2026-09-05");
+    expect(loaded.application.databasePath).toBe("./state/usage.sqlite");
+  });
+
+  it("uses one database path with consistent command-line override precedence", () => {
+    const config = defaultConfig();
+    config.application.databasePath = "./custom/ledger.sqlite";
+    expect(resolveDatabasePath(config, { databasePath: null, stateDirectory: null }))
+      .toBe(resolve("./custom/ledger.sqlite"));
+    expect(resolveDatabasePath(config, { databasePath: null, stateDirectory: "./isolated" }))
+      .toBe(resolve("./isolated/usage.sqlite"));
+    expect(resolveDatabasePath(config, { databasePath: "./explicit.sqlite", stateDirectory: "./isolated" }))
+      .toBe(resolve("./explicit.sqlite"));
   });
 });

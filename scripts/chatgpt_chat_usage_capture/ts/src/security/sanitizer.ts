@@ -41,6 +41,8 @@ const OBSERVATION_ALLOWLIST = new Set([
   "metadata",
   "model_slug",
   "requested_model",
+  "resolved_model",
+  "resolved_model_slug",
   "requested_mode",
   "reasoning_effort",
   "default_model_slug",
@@ -71,12 +73,18 @@ const OBSERVATION_ALLOWLIST = new Set([
   "copied",
   "error_type",
   "error_code",
+  "detail_route",
+  "pagination_state",
+  "coverage",
+  "warnings",
 ]);
 
 const METADATA_ALLOWLIST = new Set([
   "model_slug",
   "requested_model",
   "requested_model_slug",
+  "resolved_model",
+  "resolved_model_slug",
   "requested_mode",
   "reasoning_effort",
   "default_model_slug",
@@ -114,6 +122,8 @@ const METADATA_IDENTIFIER_KEYS = new Set([
   "requested_model",
   "requested_model_slug",
   "default_model_slug",
+  "resolved_model",
+  "resolved_model_slug",
   "generation_id",
   "request_id",
   "message_request_id",
@@ -229,10 +239,15 @@ export function* iterUnknownFields(value: unknown, prefix = ""): Generator<strin
   if (isPlainObject(value)) {
     for (const [key, child] of Object.entries(value)) {
       const path = prefix ? `${prefix}.${key}` : key;
+      const sensitiveKey = SENSITIVE_KEY_RE.test(key);
+      const safePath = sensitiveKey
+        ? `${prefix ? `${prefix}.` : ""}[redacted-key]`
+        : path;
       if (!OBSERVATION_ALLOWLIST.has(key) && !METADATA_ALLOWLIST.has(key)) {
-        yield `${path}:${typeName(child)}`;
+        yield `${safePath}:${typeName(child)}`;
       }
-      yield* iterUnknownFields(child, path);
+      const childPrefix = sensitiveKey ? safePath : path;
+      yield* iterUnknownFields(child, childPrefix);
     }
   } else if (Array.isArray(value)) {
     const limit = Math.min(value.length, 8);

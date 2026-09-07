@@ -1,5 +1,5 @@
 /**
- * Fixture-backed transport for deterministic, offline Stage-1 verification.
+ * Fixture-backed transport for deterministic, offline verification.
  * Serves reviewed synthetic pages from a directory of JSON fixtures.
  */
 

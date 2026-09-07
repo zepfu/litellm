@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Thin launcher for the TypeScript Stage-1 CLI. Runs the compiled output; falls
+// Thin launcher for the TypeScript collector CLI. Runs the compiled output; falls
 // back to a helpful error when the project has not been built yet.
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";

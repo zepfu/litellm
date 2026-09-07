@@ -1,7 +1,7 @@
 /**
- * Stage-1 configuration loader. Only the subset of the spec configuration
- * required for bootstrap and inspect-capabilities is modeled here; scheduler,
- * accounting, and ledger configuration belong to later stages.
+ * Shared configuration for history collection and the Stage-2 local ledger.
+ * Scheduler, reset-window accounting, provider quota accounting, and API
+ * configuration belong to later stages.
  */
 
 import {
@@ -11,7 +11,7 @@ import {
   readFileSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import type { BrowserConfig } from "./browser/session.js";
 
@@ -30,6 +30,7 @@ export interface AccountConfig {
 export interface ApplicationConfig {
   reportTimezone: string;
   stateDirectory: string;
+  databasePath: string;
 }
 
 export interface Stage1Config {
@@ -47,6 +48,7 @@ export class ConfigError extends Error {
 
 const DEFAULT_TIMEZONE = "America/New_York";
 const DEFAULT_STATE_DIRECTORY = "./state";
+const DEFAULT_DATABASE_PATH = "./state/usage.sqlite";
 
 export function loadConfig(path: string): Stage1Config {
   const resolvedPath = resolve(path);
@@ -117,6 +119,10 @@ export function loadConfig(path: string): Stage1Config {
     application: {
       reportTimezone: String(applicationRaw.report_timezone ?? DEFAULT_TIMEZONE),
       stateDirectory: String(applicationRaw.state_directory ?? DEFAULT_STATE_DIRECTORY),
+      databasePath: String(
+        applicationRaw.database_path ??
+          join(String(applicationRaw.state_directory ?? DEFAULT_STATE_DIRECTORY), "usage.sqlite"),
+      ),
     },
     accounts,
   };
@@ -128,6 +134,7 @@ export function defaultConfig(): Stage1Config {
     application: {
       reportTimezone: "America/New_York",
       stateDirectory: DEFAULT_STATE_DIRECTORY,
+      databasePath: DEFAULT_DATABASE_PATH,
     },
     accounts: [
       {
@@ -151,6 +158,18 @@ export function defaultConfig(): Stage1Config {
   };
 }
 
+export function resolveDatabasePath(
+  config: Stage1Config,
+  overrides: { databasePath: string | null; stateDirectory: string | null },
+): string {
+  return resolve(
+    overrides.databasePath ??
+      (overrides.stateDirectory
+        ? join(overrides.stateDirectory, "usage.sqlite")
+        : config.application.databasePath),
+  );
+}
+
 export function saveConfig(config: Stage1Config, path: string): void {
   const resolvedPath = resolve(path);
   mkdirSync(dirname(resolvedPath), { recursive: true });
@@ -159,6 +178,7 @@ export function saveConfig(config: Stage1Config, path: string): void {
     application: {
       report_timezone: config.application.reportTimezone,
       state_directory: config.application.stateDirectory,
+      database_path: config.application.databasePath,
     },
     accounts: config.accounts.map((account) => ({
       id: account.id,

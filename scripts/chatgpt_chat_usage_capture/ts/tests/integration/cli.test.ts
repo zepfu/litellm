@@ -2,10 +2,12 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { run } from "../../src/cli/main.js";
 import { defaultConfig, loadConfig, saveConfig } from "../../src/config.js";
+import { Ledger } from "../../src/ledger/store.js";
+import { SqliteCheckpointStore } from "../../src/history/checkpoints.js";
 
 describe("CLI", () => {
   let stateDirectory: string;
@@ -15,11 +17,13 @@ describe("CLI", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
     rmSync(stateDirectory, { recursive: true, force: true });
   });
 
-  it("rejects Stage-2+ commands with an explicit error", async () => {
-    for (const command of ["backfill", "refresh", "report", "schedule", "rebuild"]) {
+  it("rejects deferred commands with an explicit error", async () => {
+    for (const command of ["run", "schedule", "windows", "quota"]) {
       const exitCode = await run([command, "--config", "unused.yaml"]);
       expect(exitCode).toBe(2);
     }
@@ -69,5 +73,113 @@ describe("CLI", () => {
     );
     expect(persisted.state).toBe("ready");
     expect(persisted.identity.providerUserId).toBe("user-abc123");
+  });
+
+  it("collects, replays, reports, and rebuilds through one configured SQLite database", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-07T12:00:00.000Z"));
+    const output = vi.spyOn(console, "log").mockImplementation(() => {});
+    const config = defaultConfig();
+    const account = config.accounts[0]!;
+    account.id = "fixture-primary";
+    account.expectedProviderUserId = "user-abc123";
+    account.expectedWorkspaceId = "ws-xyz";
+    account.quotaOwnerId = "user-abc123";
+    account.browser.adapter = "fixture_history";
+    account.browser.profilePath = "";
+    config.application.stateDirectory = stateDirectory;
+    config.application.databasePath = join(stateDirectory, "ledger.sqlite");
+
+    const configPath = join(stateDirectory, "fixture-config.json");
+    saveConfig(config, configPath);
+    const fixtureRoot = new URL("../fixtures/v1/", import.meta.url).pathname;
+
+    const collectArgs = ["--config", configPath, "--fixture-root", fixtureRoot];
+    const localArgs = ["--config", configPath];
+    const end = "2026-09-08T00:00:00.000Z";
+    const lastResult = () => JSON.parse(String(output.mock.calls.at(-1)?.[0]));
+    expect(await run(["backfill", ...collectArgs, "--until", end])).toBe(0);
+    const first = lastResult();
+    expect(first.ledger).toMatchObject({
+      committed: true,
+      databasePath: config.application.databasePath,
+      observationsInserted: 2,
+      messagesInserted: 5,
+      attemptsInserted: 3,
+    });
+    expect(first.range).toEqual({
+      start: "2026-08-25T00:00:00.000Z",
+      end,
+    });
+    expect(first.conversations.map((item: { messageCount: number }) => item.messageCount))
+      .toEqual([3, 2]);
+    expect(await run(["backfill", ...collectArgs, "--until", end])).toBe(0);
+    expect(lastResult().ledger).toMatchObject({
+      observationsInserted: 0,
+      messagesInserted: 0,
+      messagesDeduplicated: 5,
+      attemptsInserted: 0,
+      attemptsUpdated: 0,
+      attemptsDeduplicated: 3,
+    });
+
+    expect(await run(["report", ...localArgs, "--last-hours", "168", "--until", end]))
+      .toBe(0);
+    const report = lastResult();
+    expect(report.includedAttempts).toBe(3);
+    expect(report.observedAttemptsByRequestedModel).toEqual({ "gpt-5.6-astra-pro": 3 });
+    expect(report.completedAnswersByRecordedFinalModel).toEqual({ "gpt-5.6-astra-pro": 2 });
+    expect(report.modelMismatches).toBe(0);
+    expect(report.coverageGaps.some(
+      (gap: { reason: string }) => gap.reason === "incomplete_history_coverage",
+    )).toBe(true);
+
+    // Renamed conversations do not move their old attempts into a recent report.
+    expect(await run(["report", ...localArgs, "--last-hours", "24", "--until", end])).toBe(0);
+    expect(lastResult().includedAttempts).toBe(0);
+    expect(await run(["models", ...localArgs])).toBe(0);
+    expect(lastResult()).toMatchObject({
+      mapping_version: "initial-unmapped",
+      review_status: "draft",
+    });
+    expect(lastResult().suggestions[0]?.suggestedFamily).toBeNull();
+
+    const ledger = new Ledger(config.application.databasePath);
+    try {
+      const scope = ledger.accountScope("fixture-primary");
+      const attempts = ledger.listAttempts(scope);
+      const evidenceCounts = () => Object.fromEntries(
+        ["observations", "message_revisions", "attempt_revisions", "attempt_aliases"]
+          .map((table) => [table, ledger.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()]),
+      );
+      const priorCounts = evidenceCounts();
+      const rebuildArgs = ["rebuild", ...localArgs, "--until", end];
+      expect(await run(rebuildArgs)).toBe(0);
+      const preview = lastResult();
+      expect(preview).toMatchObject({ mode: "preview", rebuiltAttempts: 0 });
+      expect(preview.report.attemptIds).toEqual(report.attemptIds);
+      expect(ledger.aggregateRevisions(scope)).toHaveLength(0);
+      expect(ledger.listAttempts(scope)).toEqual(attempts);
+      expect(evidenceCounts()).toEqual(priorCounts);
+      expect(await run([...rebuildArgs, "--apply"])).toBe(0);
+      expect(lastResult().revisionId).toBe(preview.revisionId);
+      expect(ledger.aggregateRevisions(scope)).toHaveLength(1);
+      expect(ledger.listAttempts(scope)).toEqual(attempts);
+
+      expect(await run(["refresh", ...collectArgs])).toBe(0);
+      expect(lastResult().mode).toBe("incremental");
+      expect(lastResult().scopes[0]?.candidateCutoff).toBe("2026-09-05T12:00:00.000Z");
+      expect(await run([
+        "reconcile", ...collectArgs, "--since", "2026-09-01T00:00:00.000Z", "--until", end,
+      ])).toBe(0);
+      expect(lastResult().conversations).toHaveLength(2);
+      expect(ledger.listAttempts(scope)).toEqual(attempts);
+      expect(evidenceCounts()).toEqual(priorCounts);
+      const store = new SqliteCheckpointStore(ledger, scope);
+      expect(store.loadDiscovery("active")?.status).toBe("complete");
+      expect(store.loadDiscovery("archived")?.status).toBe("complete");
+    } finally {
+      ledger.close();
+    }
   });
 });

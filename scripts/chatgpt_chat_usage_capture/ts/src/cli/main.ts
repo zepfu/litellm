@@ -1,24 +1,51 @@
 /**
- * Stage-1 CLI entry point.
+ * TypeScript Stage-2 collector CLI entry point.
  *
- * Implemented commands: init, bootstrap, inspect-capabilities. All other
- * Stage-2+ commands fail closed with an explicit "not implemented in Stage 1"
- * error. No command submits prompts, exports credentials, or bypasses the
- * GET-only route allowlist.
+ * History collection and offline ledger commands share one config and database.
+ * Scheduling, reset accounting, API, and UI remain deferred. No command submits
+ * prompts, exports credentials, or bypasses the GET-only route allowlist.
  */
 
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { loadConfig, saveConfig, defaultConfig, ConfigError } from "../config.js";
+import {
+  loadConfig, saveConfig, defaultConfig, ConfigError, resolveDatabasePath,
+} from "../config.js";
 import {
   bootstrapAccount,
   inspectCapabilities,
   inspectFixtureCapabilities,
 } from "../browser/bootstrap.js";
+import {
+  ChatGPTHistoryAdapter,
+  type HistoryTransport,
+} from "../adapters/chatgpt/adapter.js";
+import { FixtureTransport } from "../adapters/chatgpt/fixture-transport.js";
+import { PlaywrightTransport } from "../browser/session.js";
+import { buildRawModelReport } from "../accounting/raw-model.js";
+import { reaggregate } from "../accounting/reaggregate.js";
 import { ADAPTER_VERSION } from "../contracts/records.js";
+import { Ledger } from "../ledger/store.js";
 import type { BootstrapResult, InspectCapabilitiesResult } from "../browser/bootstrap.js";
+import type {
+  HistoryCollectionMode,
+  HistoryCollectionResult,
+  HistoryRange,
+} from "../contracts/history.js";
+import {
+  assertAccountBinding,
+  collectIntoLedger,
+  configuredScope,
+  selectMapping,
+} from "../history/ingest.js";
+import {
+  defaultBackfillRange,
+  makeRange,
+  parseDuration,
+  parseInstant,
+} from "../history/range.js";
 
 interface CliArgs {
   command: string;
@@ -27,22 +54,24 @@ interface CliArgs {
   interactiveLogin: boolean;
   stateDirectory: string | null;
   fixtureRoot: string | null;
+  since: string | null;
+  until: string | null;
+  databasePath: string | null;
+  lastHours: number | null;
+  mappingVersion: string | null;
+  apply: boolean;
 }
 
 const STAGE1_COMMANDS = new Set(["init", "bootstrap", "inspect-capabilities"]);
-const STAGE2_PLUS_COMMANDS = new Set([
-  "backfill",
-  "refresh",
+const STAGE2_HISTORY_COMMANDS = new Set(["backfill", "refresh", "reconcile"]);
+const DEFERRED_COMMANDS = new Set([
   "run",
   "status",
-  "report",
   "schedule",
   "windows",
   "quota",
-  "rebuild",
   "export",
   "dashboard",
-  "models",
 ]);
 
 export async function run(argv: string[]): Promise<number> {
@@ -54,11 +83,27 @@ export async function run(argv: string[]): Promise<number> {
     return 2;
   }
 
+  if (STAGE2_HISTORY_COMMANDS.has(args.command)) {
+    try {
+      return await runHistoryCollection(args);
+    } catch (error) {
+      console.error(`usage-capture: ${(error as Error).message}`);
+      return 1;
+    }
+  }
   if (!STAGE1_COMMANDS.has(args.command)) {
-    if (STAGE2_PLUS_COMMANDS.has(args.command)) {
+    if (["report", "rebuild", "models"].includes(args.command)) {
+      try {
+        return await execute(args);
+      } catch (error) {
+        console.error(`usage-capture: ${(error as Error).message}`);
+        return 1;
+      }
+    }
+    if (DEFERRED_COMMANDS.has(args.command)) {
       console.error(
-        `usage-capture: '${args.command}' is not implemented in Stage 1. ` +
-          "Stage 1 covers bootstrap, inspect-capabilities, and init only.",
+        `usage-capture: '${args.command}' is deferred beyond Stage 2. ` +
+          "Scheduling, reset accounting, API, and UI are not implemented.",
       );
       return 2;
     }
@@ -81,7 +126,16 @@ async function execute(args: CliArgs): Promise<number> {
   if (args.command === "bootstrap") {
     return runBootstrap(args);
   }
-  return runInspectCapabilities(args);
+  if (args.command === "inspect-capabilities") {
+    return runInspectCapabilities(args);
+  }
+  if (args.command === "report") {
+    return runReport(args);
+  }
+  if (args.command === "rebuild") {
+    return runRebuild(args);
+  }
+  return runModels(args);
 }
 
 function runInit(args: CliArgs): number {
@@ -168,12 +222,195 @@ async function runInspectCapabilities(args: CliArgs): Promise<number> {
   return result.state === "ready" ? 0 : 1;
 }
 
+async function runHistoryCollection(args: CliArgs): Promise<number> {
+  const config = loadConfig(args.configPath);
+  const account = selectAccount(config.accounts, args.accountId);
+  if (!account) {
+    console.error(`usage-capture ${args.command}: account '${args.accountId}' not found`);
+    return 2;
+  }
+  if (account.browser.adapter === "fixture_history" && !args.fixtureRoot) {
+    console.error(
+      `usage-capture ${args.command}: fixture_history requires --fixture-root`,
+    );
+    return 2;
+  }
+  if (account.browser.adapter === "playwright_persistent_context" && args.fixtureRoot) {
+    console.error(
+      `usage-capture ${args.command}: --fixture-root requires browser.adapter fixture_history`,
+    );
+    return 2;
+  }
+
+  const mode: HistoryCollectionMode =
+    args.command === "backfill"
+      ? "backfill"
+      : args.command === "reconcile"
+        ? "reconciliation"
+        : "incremental";
+  let range: HistoryRange | undefined;
+  try {
+    range = collectionRange(args, mode);
+  } catch (error) {
+    console.error(`usage-capture ${args.command}: ${(error as Error).message}`);
+    return 2;
+  }
+
+  const transport: HistoryTransport =
+    account.browser.adapter === "fixture_history"
+      ? new FixtureTransport(resolve(args.fixtureRoot!))
+      : new PlaywrightTransport(account.browser);
+  const adapter = new ChatGPTHistoryAdapter(transport, {
+    providerUserId: account.expectedProviderUserId,
+    workspaceId: account.expectedWorkspaceId,
+    quotaOwnerId: account.quotaOwnerId,
+  });
+  let ledger: Ledger | undefined;
+  try {
+    ledger = new Ledger(resolveDatabasePath(config, args));
+    const request = range ? { mode, range } : { mode };
+    const result = await collectIntoLedger(adapter, ledger, account, request, args.mappingVersion);
+    printCollectionResult(result);
+    return result.status === "blocked" ? 1 : 0;
+  } finally {
+    try {
+      await adapter.close();
+    } finally {
+      ledger?.close();
+    }
+  }
+}
+
+function collectionRange(
+  args: CliArgs,
+  mode: HistoryCollectionMode,
+): HistoryRange | undefined {
+  if (mode === "incremental" && !args.since && !args.until) {
+    return undefined;
+  }
+  if (mode === "reconciliation" && !args.since) {
+    throw new Error("reconcile requires --since and an explicit range");
+  }
+  const now = new Date();
+  const end = args.until ? parseInstant(args.until) : now;
+  if (!args.since) {
+    return defaultBackfillRange(end);
+  }
+  const sinceIsDuration = /^\d+(?:\.\d+)?[dhm]$/i.test(args.since.trim());
+  if (!sinceIsDuration) {
+    return makeRange(parseInstant(args.since), end);
+  }
+  const duration = parseDuration(args.since);
+  return makeRange(new Date(end.getTime() - duration), end);
+}
+
+function runReport(args: CliArgs): number {
+  const config = loadConfig(args.configPath);
+  const account = selectAccount(config.accounts, args.accountId);
+  if (!account) {
+    console.error(`usage-capture report: account '${args.accountId}' not found`);
+    return 2;
+  }
+  const ledger = new Ledger(resolveDatabasePath(config, args));
+  try {
+    assertAccountBinding(ledger, configuredScope(account));
+    const scope = ledger.accountScope(account.id);
+    console.log(
+      JSON.stringify(
+        buildRawModelReport(ledger, scope, {
+          durationMs: (args.lastHours ?? 24) * 60 * 60 * 1000,
+          ...(args.until ? { now: parseInstant(args.until).toISOString() } : {}),
+        }),
+        null,
+        2,
+      ),
+    );
+    return 0;
+  } finally {
+    ledger.close();
+  }
+}
+
+function runRebuild(args: CliArgs): number {
+  const config = loadConfig(args.configPath);
+  const account = selectAccount(config.accounts, args.accountId);
+  if (!account) {
+    console.error(`usage-capture rebuild: account '${args.accountId}' not found`);
+    return 2;
+  }
+  const ledger = new Ledger(resolveDatabasePath(config, args));
+  try {
+    assertAccountBinding(ledger, configuredScope(account));
+    const scope = ledger.accountScope(account.id);
+    const mapping = selectMapping(ledger, args.mappingVersion);
+    const result = reaggregate(ledger, scope, mapping, {
+      apply: args.apply,
+      ...(args.until ? { evaluatedAt: parseInstant(args.until).toISOString() } : {}),
+    });
+    console.log(
+      JSON.stringify({ mode: args.apply ? "apply" : "preview", ...result }, null, 2),
+    );
+    return 0;
+  } finally {
+    ledger.close();
+  }
+}
+
+function runModels(args: CliArgs): number {
+  const config = loadConfig(args.configPath);
+  const account = selectAccount(config.accounts, args.accountId);
+  if (!account) {
+    console.error(`usage-capture models: account '${args.accountId}' not found`);
+    return 2;
+  }
+  const ledger = new Ledger(resolveDatabasePath(config, args));
+  try {
+    assertAccountBinding(ledger, configuredScope(account));
+    const scope = ledger.accountScope(account.id);
+    const mapping = selectMapping(ledger, args.mappingVersion);
+    console.log(
+      JSON.stringify(
+        {
+          mapping_version: mapping.version,
+          review_status: mapping.reviewStatus,
+          suggestions: ledger.modelMappingSuggestions(scope, mapping),
+        },
+        null,
+        2,
+      ),
+    );
+    return 0;
+  } finally {
+    ledger.close();
+  }
+}
+
 function printBootstrapResult(result: BootstrapResult): void {
   console.log(JSON.stringify(result, null, 2));
 }
 
 function printInspectCapabilitiesResult(result: InspectCapabilitiesResult): void {
   console.log(JSON.stringify(result, null, 2));
+}
+
+function printCollectionResult(result: HistoryCollectionResult): void {
+  console.log(
+    JSON.stringify(
+      {
+        ...result,
+        conversations: result.conversations.map((conversation) => ({
+          summary: conversation.summary,
+          scopes: conversation.scopes,
+          coverage: conversation.coverage,
+          messageCount: conversation.messages.length,
+          revisit: conversation.revisit,
+          warnings: conversation.warnings,
+        })),
+      },
+      null,
+      2,
+    ),
+  );
 }
 
 function selectAccount<T extends { id: string; enabled: boolean }>(
@@ -193,6 +430,12 @@ function parseArgs(argv: string[]): CliArgs {
   let interactiveLogin = false;
   let stateDirectory: string | null = null;
   let fixtureRoot: string | null = null;
+  let since: string | null = null;
+  let until: string | null = null;
+  let databasePath: string | null = null;
+  let lastHours: number | null = null;
+  let mappingVersion: string | null = null;
+  let apply = false;
 
   for (let index = 1; index < argv.length; index += 1) {
     const flag = argv[index];
@@ -210,6 +453,27 @@ function parseArgs(argv: string[]): CliArgs {
     } else if (flag === "--fixture-root" && argv[index + 1]) {
       fixtureRoot = argv[index + 1]!;
       index += 1;
+    } else if (flag === "--since" && argv[index + 1]) {
+      since = argv[index + 1]!;
+      index += 1;
+    } else if (flag === "--until" && argv[index + 1]) {
+      until = argv[index + 1]!;
+      index += 1;
+    } else if (flag === "--database" && argv[index + 1]) {
+      databasePath = argv[index + 1]!;
+      index += 1;
+    } else if (flag === "--last-hours" && argv[index + 1]) {
+      const value = Number(argv[index + 1]);
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new Error("--last-hours must be a positive number");
+      }
+      lastHours = value;
+      index += 1;
+    } else if (flag === "--mapping-version" && argv[index + 1]) {
+      mappingVersion = argv[index + 1]!;
+      index += 1;
+    } else if (flag === "--apply") {
+      apply = true;
     } else if (flag === "--help" || flag === "-h") {
       printHelp();
       process.exit(0);
@@ -224,7 +488,11 @@ function parseArgs(argv: string[]): CliArgs {
   }
 
   if (fixtureRoot && command !== "inspect-capabilities") {
-    throw new Error("--fixture-root is only supported by inspect-capabilities");
+    if (!STAGE2_HISTORY_COMMANDS.has(command)) {
+      throw new Error(
+        "--fixture-root is only supported by inspect-capabilities or history collection",
+      );
+    }
   }
 
   return {
@@ -234,14 +502,20 @@ function parseArgs(argv: string[]): CliArgs {
     interactiveLogin,
     stateDirectory,
     fixtureRoot,
+    since,
+    until,
+    databasePath,
+    lastHours,
+    mappingVersion,
+    apply,
   };
 }
 
 function printHelp(): void {
   console.log(
-    `usage-capture (Stage 1, adapter ${ADAPTER_VERSION})
+    `usage-capture (Stage 2, adapter ${ADAPTER_VERSION})
 
-Stage-1 commands:
+Bootstrap and capability commands:
   init --config <path>
       Write a starter JSON config (schema_version 1) for the dedicated profile.
 
@@ -256,10 +530,38 @@ Stage-1 commands:
       Use --fixture-root only with a fixture_history account for offline
       acceptance; live inspection requires playwright_persistent_context.
 
-All other commands (backfill, refresh, report, schedule, windows, quota,
-rebuild, export, dashboard, models) are Stage-2+ and fail closed with an
-explicit error. No prompt submission, credential export, or provider mutation
-is supported in Stage 1.`,
+Stage-2 history commands:
+  backfill --config <path> [--account <id>] [--fixture-root <path>]
+      [--since <14d|ISO-8601>] [--until <ISO-8601>]
+      Acquire active/archived history into SQLite. The default range is 14 days.
+
+  refresh --config <path> [--account <id>] [--fixture-root <path>]
+      Run incremental discovery with the durable per-scope watermark and a
+      48-hour overlap.
+
+  reconcile --config <path> [--account <id>] [--fixture-root <path>]
+      --since <ISO-8601> [--until <ISO-8601>]
+      Re-read the explicitly requested history range.
+
+Stage-2 offline ledger commands:
+  report --config <path> [--account <id>] [--database <path>] [--last-hours <n>]
+      [--until <ISO-8601>]
+      Report observed raw-model activity from SQLite over the last N hours.
+
+  models --config <path> [--account <id>] [--database <path>]
+      Show raw-model mapping review suggestions from retained attempts.
+
+  rebuild --config <path> [--account <id>] [--database <path>]
+      [--mapping-version <version>] [--until <ISO-8601>] [--apply]
+      Preview or apply deterministic reaggregation without website requests.
+
+All history and ledger commands share application.database_path. --database
+overrides it; --state-directory uses <path>/usage.sqlite unless --database is
+also supplied. Reports and rebuilds never issue website requests.
+
+Scheduling, reset accounting, API, UI, and exports remain deferred. Collection
+is GET-only; no prompt submission, credential export, or provider mutation is
+supported.`,
   );
 }
 

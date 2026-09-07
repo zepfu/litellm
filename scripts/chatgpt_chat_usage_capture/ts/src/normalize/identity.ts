@@ -1,7 +1,7 @@
 /**
  * Fail-closed identity, workspace, and quota-owner verification.
  *
- * Stage 1 never infers an account from an email fragment, page title, first
+ * The collector never infers an account from an email fragment, page title, first
  * returned account, or a hard-coded fallback ID. Every configured identity
  * field must be explicitly bound and every observed value must match before
  * collection is allowed to proceed.

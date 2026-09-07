@@ -1,89 +1,119 @@
-# Stage-1 architecture
-
-The TypeScript slice keeps browser access, provider adaptation, identity
-verification, privacy projection, and local bootstrap state separate.
+# Stage-2 architecture
 
 ```text
-CLI
-  |
-  v
-JSON config -> bootstrap state machine
-                    |
-                    v
-        Playwright persistent context
-                    |
-                    v
-          GET-only request boundary
-                    |
-                    v
-          ChatGPT history adapter
-             |                  |
-             v                  v
-      identity verifier   sanitized page records
-             |
-             v
-   0600 bootstrap identity state
+                    one JSON config
+                           |
+             +-------------+-------------------+
+             |                                 |
+     bootstrap / inspect             backfill / refresh / reconcile
+             |                                 |
+             +----- GET-only history adapter --+
+                   Playwright or fixtures      |
+                   verified Chat identity      v
+                                      history collector
+                                active / archived / revisits
+                                               |
+                                      history/ingest.ts
+                                               |
+                                   one SQLite transaction
+                                   observations / messages
+                                   attempts / aliases / revisions
+                                   coverage / runs / checkpoints
+                                               |
+                                  report / models / rebuild
+                                    local evidence only
 ```
 
-## Boundaries
+## Configuration and identity
 
-### Configuration
+`src/config.ts` loads schema-version-1 JSON and round-trips it through `init`.
+One database-path resolver serves every collection and ledger CLI command.
+Bootstrap's metadata-only identity JSON is separate from history state.
 
-`src/config.ts` reads schema version `1` JSON and maps snake_case file fields
-to typed internal values. `init` writes the same snake_case wire shape, so a
-generated config can be loaded without a manual format conversion.
+`src/normalize/identity.ts` requires configured provider user, workspace, and
+quota-owner bindings to match the observed session. Missing expected values
+are `unconfigured`; absent or unequal observed values are `identity_mismatch`.
+Unauthenticated sessions are `auth_required`. Collection additionally requires
+explicit observed `surface=chat`. No email, title, default account, or first
+returned account is an identity guess. Ledger scope includes the local account,
+provider, user, workspace, quota owner, and surface; the CLI rejects rebinding
+an existing local account.
 
-### Dedicated browser session
+## Browser and adapter
 
-`src/browser/session.ts` owns the Playwright persistent context. A live request
-requires an existing dedicated profile. A missing profile is created only
-after `--interactive-login` is explicitly supplied. Downloads are disabled.
-The browser context and its cookies, storage, and tokens remain in the profile
-directory and are never serialized into Stage-1 state.
+`src/browser/session.ts` owns the dedicated Playwright persistent context.
+Live access requires an existing profile unless interactive login was explicitly
+authorized. Downloads are disabled, and browser storage never leaves the
+profile. Fixture mode uses the same adapter without constructing a browser.
 
-For offline acceptance, the CLI can select `fixture_history` with an explicit
-`--fixture-root`. That path uses the same adapter against synthetic JSON and
-does not construct a Playwright context. Live bootstrap and live capability
-inspection reject the fixture adapter.
+`src/adapters/chatgpt/adapter.ts` and both transports enforce exact GET-only
+route shapes and safe conversation IDs. `401`, `403`, HTML auth pages, and
+`429` are control signals, not history or remaining-quota observations.
+Legacy detail fallback requires an approved capability and a modern `404` or
+`405`; authentication and throttling never trigger fallback.
 
-### Adapter
+The shared `AdaptedPage.paginationState` and detail `detailRoute` /
+`paginationState` contracts retain the Stage-2A route and pagination evidence:
+complete, continuation, contradictory, unknown, repeated cursor, and exhausted
+budget. Project IDs and version metadata qualify coverage, not completeness of
+all Projects or branches.
 
-`src/adapters/chatgpt/adapter.ts` accepts only `GET` and only the exact
-history/session route shapes documented in `endpoint-evidence.md`. It treats
-HTTP `401`, `403`, HTML login pages, and `429` as control signals. A `429` is a
-transport rate limit and is never interpreted as a ChatGPT quota exhaustion
-signal. `assertAllowedRequest` is applied by the adapter and by both the
-Playwright and fixture transports before any request is issued.
+## Acquisition and durability
 
-The adapter exposes active and archived index coverage, modern detail support,
-message-page pagination evidence, and legacy detail fallback behavior. The
-capability record is versioned with `chatgpt-chat-history-v1`.
+`src/history/collector.ts` scans active and archived scopes, deduplicates
+conversation IDs, selects candidates by update time, and fetches detail plus
+message pages. Sparse message pages retain already observed graph links and
+model metadata for the same message ID. Attempt attribution uses message
+evidence, not the conversation update time.
 
-### Identity
+Backfill defaults to 14 elapsed days. Implicit refresh uses each scope's last
+complete discovery start with a 48-hour overlap. Explicit ranges take
+precedence. Incomplete discovery retains its continuation without advancing the
+completed watermark. Incomplete detail/message traversal creates a revisit
+independent of the discovery cutoff.
 
-`src/normalize/identity.ts` requires all three configured bindings:
+`src/history/checkpoints.ts` buffers the checkpoint contract in memory.
+`SqliteCheckpointStore` loads/saves the account's per-scope state and revisits
+in the `history_state` table. There is no JSON history-store CLI path.
+`src/history/ingest.ts` joins collection to the Stage-2B ledger: account binding,
+empty mapping seed, run, evidence, reconstructed attempts, coverage, and
+checkpoint changes commit together after acquisition. No SQLite write lock
+spans browser requests. A failed commit rolls everything back; an interrupted
+acquisition replays from the previous durable state. Commit granularity is one
+bounded collection result, not each network page.
 
-1. provider user ID;
-2. workspace ID;
-3. quota owner ID.
+Index completion and detail completion remain separate. A completed index may
+advance its discovery watermark when an incomplete conversation is safely
+retained in the same committed revisit state.
 
-An authenticated response with a missing expected binding is `unconfigured`.
-An observed value that is absent or different is `identity_mismatch`.
-Unauthenticated responses are `auth_required`. No email, page title, first
-account, or default ID is used as an identity guess.
+## Ledger, reconstruction, and reports
 
-### Privacy
+`src/ledger/store.ts` applies three ordered SQLite migrations with WAL, foreign
+keys, and a busy timeout. Source identity and stable sanitized fingerprints
+deduplicate observations while changed evidence appends revisions. Message,
+attempt, alias, mapping, and aggregate history remains available.
 
-`src/security/sanitizer.ts` projects only allowlisted identifiers, typed
-metadata, status, timestamps, model labels, and relationship IDs. Message
-content, titles, prompt/answer fields, credentials, cookies, raw headers,
-browser storage, and email addresses are stripped or rejected at the
-persistence boundary. `assertNoSecrets` checks every persisted identity
-projection before it is written.
+`src/normalize/reconstruct.ts` groups linked user, analysis, reasoning, tool,
+and final nodes into generations. Distinct generation evidence preserves
+regenerations; request IDs remain scoped grouping evidence. Terminal answers
+are selected by timestamp. Missing linkage and ambiguous collisions remain
+explicit rather than being guessed.
 
-### Stage boundary
+Requested, recorded-final, and resolved model labels are independent. The
+initial mapping has canonical families but no slug rules. Reviewed exact
+mapping versions and their history are separate from raw evidence.
+`src/accounting/raw-model.ts` reports elapsed half-open intervals with
+mismatches, ambiguous/unknown times, surface/origin exclusions, and open
+coverage gaps. `src/accounting/reaggregate.ts` rebuilds from the same messages
+and conversation-origin metadata; preview rolls back, apply commits a report
+revision. Neither needs website access.
 
-The TypeScript implementation intentionally stops before ledger/accounting,
-attempt reconstruction, scheduler, local API, dashboard, and exports. The
-Python implementation in the parent directory remains the reference for those
-later stages; it is not imported by this package.
+## Privacy and stage boundary
+
+Allowlisted identifiers, typed metadata, route/pagination evidence, timestamps,
+and model labels cross persistence boundaries. Message contents, titles,
+credentials, cookies, raw headers, browser storage, and email do not.
+
+Stage 2 has manual collection only. Scheduling, leases, cooldown/catch-up,
+automated reconciliation, reset/quota accounting, API, UI, and exports are
+deferred. The parent Python implementation is neither imported nor modified.
