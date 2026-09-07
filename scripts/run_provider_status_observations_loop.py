@@ -13888,6 +13888,7 @@ def _chatgpt_conversation_init_is_throttled(
             continue
         normalized = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
         if normalized in {
+            "browser_challenge",
             "challenge",
             "captcha",
             "rate_limit",
