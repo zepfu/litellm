@@ -2745,23 +2745,23 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                 if error_class is None:
                     error_class = fresh_codex_auth_error_class
-                    if attempt_record.get(SCHEMA_REJECTION_KEY) is not None:
-                        error_class, _ = resolve_schema_rejection_failure_identity(
-                            failure_class=error_class,
-                            error_code=attempt_record.get("error_code"),
+                if attempt_record.get(SCHEMA_REJECTION_KEY) is not None:
+                    error_class, _ = resolve_schema_rejection_failure_identity(
+                        failure_class=error_class,
+                        error_code=attempt_record.get("error_code"),
+                    )
+                if error_class is None:
+                    expiry_source = _capacity_expiry_source(
+                        failure_exc=failure_exc,
+                        error_class=None,
+                    )
+                    if expiry_source is not None:
+                        _terminate_alias_capacity_retry_expiry(
+                            failure_exc=expiry_source[0],
+                            error_class=expiry_source[1],
+                            kimi_failure_metadata=kimi_failure_metadata,
                         )
-                    if error_class is None:
-                        expiry_source = _capacity_expiry_source(
-                            failure_exc=failure_exc,
-                            error_class=None,
-                        )
-                        if expiry_source is not None:
-                            _terminate_alias_capacity_retry_expiry(
-                                failure_exc=expiry_source[0],
-                                error_class=expiry_source[1],
-                                kimi_failure_metadata=kimi_failure_metadata,
-                            )
-                        raise _proxy_exception_for_unclassified_probe_failure(failure_exc)
+                    raise _proxy_exception_for_unclassified_probe_failure(failure_exc)
                 _remember_capacity_failure(
                     failure_exc=failure_exc,
                     error_class=error_class,
