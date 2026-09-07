@@ -20,6 +20,7 @@ const MAX_PROTOCOL_LINE_BYTES = 1024;
 const SCRATCH_PREFIX = "aawm-oracle-browser-";
 const NOOP_LOGGER = () => {};
 const SIGNALS = ["SIGINT", "SIGTERM", "SIGQUIT"];
+const STARTUP_CANCELLATION_TIMEOUT_MS = 5_000;
 
 class StartupTimeoutError extends Error {
   constructor() {
@@ -285,16 +286,21 @@ async function createSession(args, state) {
   }
   throwIfCleanupRequested(state);
 
-  const connection = await helpers.connectWithNewTab(
-    state.chromePort,
-    NOOP_LOGGER,
-    "about:blank",
-    state.chromeHost,
-    {
-      fallbackToDefault: false,
-      retries: 0,
-    },
-  );
+  const connection = await Promise.race([
+    helpers.connectWithNewTab(
+      state.chromePort,
+      NOOP_LOGGER,
+      "about:blank",
+      state.chromeHost,
+      {
+        fallbackToDefault: false,
+        retries: 0,
+      },
+    ),
+    state.startupCancellation.promise.then(() => {
+      throw new StartupAbortedError();
+    }),
+  ]);
   state.client = connection.client;
   state.pageTargetId = connection.targetId;
   if (typeof state.pageTargetId !== "string" || !state.pageTargetId) {
@@ -379,7 +385,14 @@ async function signalOwnedChromePid(pid, scratchDir, signal) {
   }
 }
 
-async function terminateOwnedStartupChrome(scratchDir) {
+async function terminateOwnedStartupChrome(scratchDir, chrome) {
+  if (chrome && typeof chrome.kill === "function") {
+    try {
+      await Promise.resolve(chrome.kill());
+    } catch {
+      // Cleanup continues with owned PID evidence below.
+    }
+  }
   if (!scratchDir) {
     return;
   }
@@ -421,14 +434,7 @@ async function cleanupOwned(state, helpers) {
     if (client && typeof client.close === "function") {
       await client.close().catch(() => undefined);
     }
-    if (chrome && typeof chrome.kill === "function") {
-      try {
-        await Promise.resolve(chrome.kill());
-      } catch {
-        // Cleanup continues with owned PID evidence below.
-      }
-    }
-    await terminateOwnedStartupChrome(scratchDir);
+    await terminateOwnedStartupChrome(scratchDir, chrome);
     if (scratchDir) {
       await rm(scratchDir, { recursive: true, force: true }).catch(
         () => undefined,
@@ -475,6 +481,24 @@ function waitForSignal() {
   };
 }
 
+function createStartupCancellation() {
+  let cancelled = false;
+  let resolveCancellation;
+  const promise = new Promise((resolve) => {
+    resolveCancellation = resolve;
+  });
+  return {
+    promise,
+    cancel() {
+      if (cancelled) {
+        return;
+      }
+      cancelled = true;
+      resolveCancellation();
+    },
+  };
+}
+
 function watchStdinEof() {
   let settled = false;
   let closed = false;
@@ -505,10 +529,15 @@ function watchStdinEof() {
     isClosed() {
       return closed;
     },
-    remove() {
+    stop() {
       process.stdin.removeListener("end", finish);
       process.stdin.removeListener("close", finish);
       process.stdin.removeListener("error", finish);
+      process.stdin.pause();
+      if (!process.stdin.destroyed) {
+        process.stdin.on("error", () => {});
+        process.stdin.destroy();
+      }
     },
   };
 }
@@ -563,12 +592,53 @@ function reportFailure(stage, error) {
 
 async function settleStartup(state) {
   if (!state.startupPromise) {
+    return true;
+  }
+  let timeout;
+  const settled = await Promise.race([
+    state.startupPromise.then(
+      () => true,
+      () => true,
+    ),
+    new Promise((resolve) => {
+      timeout = setTimeout(
+        () => resolve(false),
+        STARTUP_CANCELLATION_TIMEOUT_MS,
+      );
+    }),
+  ]);
+  clearTimeout(timeout);
+  return settled;
+}
+
+async function requestStartupCancellation(state) {
+  state.cleanupRequested = true;
+  if (!state.startupCancellationRequested) {
+    state.startupCancellationRequested = true;
+    state.startupTerminationPromise = terminateOwnedStartupChrome(
+      state.scratchDir,
+      state.chrome,
+    ).catch(() => undefined);
+    state.startupCancellation.cancel();
+  }
+  await state.startupTerminationPromise;
+}
+
+async function cleanupWithAvailableHelpers(state) {
+  await requestStartupCancellation(state);
+  if (!(await settleStartup(state))) {
     return;
   }
-  try {
-    await state.startupPromise;
-  } catch {
-    // The caller receives only the bounded, sanitized failure below.
+  if (state.helpers) {
+    await cleanupOwned(state, state.helpers);
+    return;
+  }
+  if (state.scratchDir) {
+    const scratchDir = state.scratchDir;
+    state.scratchDir = null;
+    await rm(scratchDir, { recursive: true, force: true }).catch(
+      () => undefined,
+    );
   }
 }
 
@@ -590,6 +660,9 @@ async function run() {
     cleanupRequested: false,
     cleanupPromise: null,
     startupPromise: null,
+    startupCancellation: createStartupCancellation(),
+    startupCancellationRequested: false,
+    startupTerminationPromise: Promise.resolve(),
     helpers: null,
     scratchDir: null,
     chrome: null,
@@ -717,23 +790,8 @@ async function run() {
     reportFailure("startup", error);
     return 1;
   } finally {
-    stdinWait.remove();
+    stdinWait.stop();
     stdoutErrors.remove();
-  }
-}
-
-async function cleanupWithAvailableHelpers(state) {
-  await settleStartup(state);
-  if (state.helpers) {
-    await cleanupOwned(state, state.helpers);
-    return;
-  }
-  if (state.scratchDir) {
-    const scratchDir = state.scratchDir;
-    state.scratchDir = null;
-    await rm(scratchDir, { recursive: true, force: true }).catch(
-      () => undefined,
-    );
   }
 }
 
