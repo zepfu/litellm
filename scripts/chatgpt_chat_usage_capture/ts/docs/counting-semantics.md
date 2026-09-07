@@ -108,8 +108,14 @@ when a completed answer exists, and that assessment is labeled
 the assessment but excluded. The default mode excludes failures after start,
 cancellations, unknown acceptance, post-start rejection, conflicting model
 families, and unresolved duplicate identities from the working count; it still
-reports each as an explicit uncertain-debit category. The opt-in `include`
-mode includes those categories and labels the result accordingly.
+reports each as an explicit uncertain-debit category even when a family is
+missing, ineligible, or outside the supplied window. The opt-in `include` mode
+includes eligible uncertain categories and labels the result accordingly.
+
+Repeated identical records for one attempt identity are deduplicated before
+classification. Conflicting records for one identity are retained as one
+`conflicting_duplicate_identity` uncertainty assessment and never select an
+arbitrary family or contribute to a bucket.
 
 Only verified Chat attempts for the expected quota owner contribute. Work,
 Codex, other surfaces, shared/imported/copied origins, missing ownership, and
@@ -120,8 +126,11 @@ bucket.
 
 Direct server observations remain separate from local projections. A known
 window and complete history coverage are required for a numeric working
-remainder; otherwise the remainder and model headroom are `null`. The
-unclamped remainder preserves negative capacity discrepancies while the
-presentation-safe remainder is clamped to zero. Model headroom is the minimum
-of all compatible known individual/shared remainders and is `null` when any
-required bucket is unknown.
+remainder and model headroom; otherwise those qualified values are `null`.
+When local usage and membership are known but coverage is partial, the
+unclamped remainder and any negative discrepancy remain as
+`diagnostic_only` evidence, while the qualified remainder stays `null`. The
+unclamped remainder preserves negative capacity discrepancies and the
+presentation-safe remainder is clamped to zero when qualified. Model headroom
+is the minimum of all compatible known individual/shared remainders and is
+`null` when any required bucket is unknown.
