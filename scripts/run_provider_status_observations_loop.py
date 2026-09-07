@@ -13956,6 +13956,7 @@ def _collect_bound_chatgpt_conversation_init_account(
                 if identity_error not in (
                     "account_identity_mismatch",
                     "missing_authoritative_account_id",
+                    "conflicting_authoritative_account_id",
                 ):
                     identity_error = None
                 coverage["account_identity_verification_error"] = identity_error
