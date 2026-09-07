@@ -20,7 +20,13 @@ const MAX_PROTOCOL_LINE_BYTES = 1024;
 const SCRATCH_PREFIX = "aawm-oracle-browser-";
 const NOOP_LOGGER = () => {};
 const SIGNALS = ["SIGINT", "SIGTERM", "SIGQUIT"];
-const STARTUP_CANCELLATION_TIMEOUT_MS = 5_000;
+const CHROME_LAUNCHER_READINESS_RETRIES = 50;
+const CHROME_LAUNCHER_READINESS_POLL_INTERVAL_MS = 500;
+const STARTUP_CANCELLATION_MARGIN_MS = 5_000;
+const STARTUP_CANCELLATION_TIMEOUT_MS =
+  CHROME_LAUNCHER_READINESS_RETRIES *
+    CHROME_LAUNCHER_READINESS_POLL_INTERVAL_MS +
+  STARTUP_CANCELLATION_MARGIN_MS;
 
 class StartupTimeoutError extends Error {
   constructor() {
@@ -611,6 +617,18 @@ async function settleStartup(state) {
   return settled;
 }
 
+function scheduleCleanupAfterStartup(state) {
+  if (!state.startupPromise || state.startupCleanupPromise) {
+    return;
+  }
+  state.startupCleanupPromise = state.startupPromise
+    .then(
+      () => cleanupWithAvailableHelpers(state),
+      () => cleanupWithAvailableHelpers(state),
+    )
+    .catch(() => undefined);
+}
+
 async function requestStartupCancellation(state) {
   state.cleanupRequested = true;
   if (!state.startupCancellationRequested) {
@@ -627,6 +645,7 @@ async function requestStartupCancellation(state) {
 async function cleanupWithAvailableHelpers(state) {
   await requestStartupCancellation(state);
   if (!(await settleStartup(state))) {
+    scheduleCleanupAfterStartup(state);
     return;
   }
   if (state.helpers) {
@@ -660,6 +679,7 @@ async function run() {
     cleanupRequested: false,
     cleanupPromise: null,
     startupPromise: null,
+    startupCleanupPromise: null,
     startupCancellation: createStartupCancellation(),
     startupCancellationRequested: false,
     startupTerminationPromise: Promise.resolve(),

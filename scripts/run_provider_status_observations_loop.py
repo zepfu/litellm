@@ -397,7 +397,10 @@ CHATGPT_ORACLE_BROWSER_SESSION_SCRIPT = (
     Path(__file__).resolve().with_name("chatgpt_oracle_browser_session.mjs")
 )
 DEFAULT_CHATGPT_ORACLE_STARTUP_TIMEOUT_SECONDS = 45.0
-DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS = 5.0
+# 30 seconds for the Node helper's bounded launcher settlement plus 5 seconds
+# for the helper and its owned process group to exit normally.
+DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS = 35.0
+DEFAULT_CHATGPT_ORACLE_FORCE_TERMINATION_TIMEOUT_SECONDS = 5.0
 MAX_CHATGPT_ORACLE_STARTUP_LINE_BYTES = 1024
 DEFAULT_GROK_BILLING_POLL_ENABLED = False
 DEFAULT_GROK_BILLING_POLL_INTERVAL_SECONDS = 600.0
@@ -2235,6 +2238,24 @@ def _read_chatgpt_oracle_startup_binding(
         )
 
 
+def _signal_chatgpt_oracle_process_group(
+    process: subprocess.Popen,
+    signal_number: int,
+) -> None:
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal_number)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+    try:
+        process.send_signal(signal_number)
+    except OSError:
+        pass
+
+
 def _cleanup_chatgpt_oracle_process(process: subprocess.Popen) -> None:
     try:
         if process.stdin is not None:
@@ -2244,19 +2265,13 @@ def _cleanup_chatgpt_oracle_process(process: subprocess.Popen) -> None:
     try:
         process.wait(timeout=DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
+        _signal_chatgpt_oracle_process_group(process, signal.SIGTERM)
         try:
-            process.terminate()
-        except OSError:
-            pass
-        try:
-            process.wait(timeout=DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS)
+            process.wait(timeout=DEFAULT_CHATGPT_ORACLE_FORCE_TERMINATION_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
+            _signal_chatgpt_oracle_process_group(process, signal.SIGKILL)
             try:
-                process.kill()
-            except OSError:
-                pass
-            try:
-                process.wait(timeout=DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS)
+                process.wait(timeout=DEFAULT_CHATGPT_ORACLE_FORCE_TERMINATION_TIMEOUT_SECONDS)
             except (OSError, subprocess.TimeoutExpired):
                 pass
     except OSError:
@@ -2293,6 +2308,7 @@ def _chatgpt_oracle_browser_binding(
                 stderr=subprocess.DEVNULL,
                 shell=False,
                 close_fds=True,
+                start_new_session=(os.name == "posix"),
             )
         except OSError as exc:
             raise RuntimeError("Oracle browser helper could not be started.") from exc
