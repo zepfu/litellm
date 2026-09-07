@@ -168,6 +168,22 @@ describe("bootstrap state transitions", () => {
     expect(existsSync(missingProfile)).toBe(false);
   });
 
+  it("keeps bootstrap state filenames inside the state directory", async () => {
+    const account = makeAccount(profilePath);
+    account.id = "../bootstrap-escape";
+
+    await expect(
+      bootstrapAccount(account, {
+        interactiveLogin: false,
+        stateDirectory,
+      }),
+    ).rejects.toThrow("bootstrap state filename must remain within the state directory");
+
+    expect(existsSync(resolve(stateDirectory, "..", "bootstrap-escape.json"))).toBe(
+      false,
+    );
+  });
+
   it("requires the Playwright adapter for live bootstrap", async () => {
     const account = makeAccount(profilePath);
     account.browser.adapter = "fixture_history";

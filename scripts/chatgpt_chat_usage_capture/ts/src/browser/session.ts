@@ -8,8 +8,15 @@
  * copied into persistence, logs, fixtures, or exports.
  */
 
-import { existsSync, mkdirSync, chmodSync, readdirSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { chromium, type BrowserContext, type APIRequestContext } from "playwright";
 
@@ -20,10 +27,46 @@ import {
 } from "../adapters/chatgpt/adapter.js";
 
 export const CHATGPT_ORIGIN = "https://chatgpt.com";
+export const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 
 export const LIVE_GATE =
   "live Playwright collection requires Playwright and an existing dedicated browser profile. " +
   "Tokens and cookies remain in that profile and are never copied into persistence.";
+
+const DISALLOWED_PROFILE_NAMES = new Set([
+  "browser",
+  "chrome",
+  "chromium",
+  "default",
+  "default profile",
+  "edge",
+  "google-chrome",
+  "guest profile",
+  "microsoft-edge",
+  "profile",
+  "system profile",
+  "user data",
+  "user-data",
+]);
+
+const DEFAULT_BROWSER_PROFILE_ROOTS = [
+  resolve(homedir(), ".config", "google-chrome"),
+  resolve(homedir(), ".config", "chromium"),
+  resolve(homedir(), ".config", "microsoft-edge"),
+  resolve(homedir(), ".config", "BraveSoftware", "Brave-Browser"),
+  resolve(homedir(), "Library", "Application Support", "Google", "Chrome"),
+  resolve(homedir(), "Library", "Application Support", "Chromium"),
+  resolve(homedir(), "Library", "Application Support", "Microsoft Edge"),
+  resolve(homedir(), "AppData", "Local", "Google", "Chrome", "User Data"),
+  resolve(homedir(), "AppData", "Local", "Chromium", "User Data"),
+  resolve(homedir(), "AppData", "Local", "Microsoft", "Edge", "User Data"),
+] as const;
+
+const DISALLOWED_PROFILE_PATHS = new Set([
+  resolve("/"),
+  resolve("/tmp"),
+  resolve("/var/tmp"),
+]);
 
 export class LiveBrowserUnavailable extends AdapterError {
   constructor(message: string) {
@@ -40,34 +83,52 @@ export interface BrowserConfig {
   requestTimeoutSeconds: number;
 }
 
-export function dedicatedProfileReady(profilePath: string): boolean {
-  if (!profilePath) {
-    return false;
+export function resolveDedicatedProfilePath(profilePath: string): string | null {
+  if (
+    typeof profilePath !== "string" ||
+    profilePath.length === 0 ||
+    profilePath !== profilePath.trim() ||
+    profilePath.includes("\0")
+  ) {
+    return null;
   }
   let resolved: string;
   try {
     resolved = resolve(profilePath.replace(/^~(?=$|\/)/, homedir()));
   } catch {
+    return null;
+  }
+  const canonical = canonicalizePath(resolved);
+  if (canonical === null || !isDedicatedCanonicalProfilePath(canonical)) {
+    return null;
+  }
+  return canonical;
+}
+
+export function dedicatedProfileReady(profilePath: string): boolean {
+  const resolved = resolveDedicatedProfilePath(profilePath);
+  if (resolved === null) {
     return false;
   }
-  if (resolved === resolve(homedir())) {
+  try {
+    return existsSync(resolved) && statSync(resolved).isDirectory();
+  } catch {
     return false;
   }
-  const name = resolved.split("/").at(-1)?.toLowerCase() ?? "";
-  if (["browser", "default", "chrome", "chromium"].includes(name)) {
-    return false;
-  }
-  return existsSync(resolved) && statSync(resolved).isDirectory();
 }
 
 export function liveBrowserGate(config: BrowserConfig): string | null {
-  if (!dedicatedProfileReady(config.profilePath)) {
-    if (!config.allowInteractiveLogin) {
-      return "interactive_login_disabled";
-    }
-    return "dedicated_profile_missing";
+  const resolved = resolveDedicatedProfilePath(config.profilePath);
+  if (resolved === null) {
+    return "invalid_profile_path";
   }
-  return null;
+  if (dedicatedProfileReady(resolved)) {
+    return null;
+  }
+  if (!config.allowInteractiveLogin) {
+    return "interactive_login_disabled";
+  }
+  return "dedicated_profile_missing";
 }
 
 export class PlaywrightTransport implements HistoryTransport {
@@ -103,11 +164,15 @@ export class PlaywrightTransport implements HistoryTransport {
     try {
       response = await requestContext.get(url.toString(), {
         timeout: this.config.requestTimeoutSeconds * 1000,
+        maxRedirects: 0,
       });
     } catch (error) {
       throw new AdapterError(
         `browser GET failed for ${path}`,
       );
+    }
+    if (response.status() >= 300 && response.status() < 400) {
+      throw new AdapterError(`browser redirect rejected for ${path}`);
     }
     return adaptResponse(response);
   }
@@ -129,12 +194,17 @@ export class PlaywrightTransport implements HistoryTransport {
     if (reason !== null) {
       throw new LiveBrowserUnavailable(`${LIVE_GATE} (${reason})`);
     }
+    const profilePath = resolveDedicatedProfilePath(this.config.profilePath);
+    if (profilePath === null || !dedicatedProfileReady(profilePath)) {
+      throw new LiveBrowserUnavailable(`${LIVE_GATE} (invalid_profile_path)`);
+    }
     try {
       this.context = await chromium.launchPersistentContext(
-        resolve(this.config.profilePath.replace(/^~(?=$|\/)/, homedir())),
+        profilePath,
         {
           headless: this.config.headless,
           acceptDownloads: false,
+          chromiumSandbox: true,
         },
       );
       this.requestContext = this.context.request;
@@ -146,10 +216,10 @@ export class PlaywrightTransport implements HistoryTransport {
   }
 }
 
-async function adaptResponse(response: {
+export async function adaptResponse(response: {
   status(): number;
   headers(): Record<string, string>;
-  json(): Promise<unknown>;
+  body(): Promise<Uint8Array>;
 }): Promise<Record<string, unknown>> {
   const status = response.status();
   const headers = response.headers();
@@ -157,11 +227,22 @@ async function adaptResponse(response: {
   const retryAfter = headers["retry-after"] ?? null;
   let payload: Record<string, unknown> = {};
   try {
-    const parsed = await response.json();
+    const declaredLength = responseByteLength(headers);
+    if (declaredLength !== null && declaredLength > MAX_RESPONSE_BYTES) {
+      throw responseTooLargeError(declaredLength);
+    }
+    const body = await response.body();
+    if (body.byteLength > MAX_RESPONSE_BYTES) {
+      throw responseTooLargeError(body.byteLength);
+    }
+    const parsed = JSON.parse(Buffer.from(body).toString("utf8")) as unknown;
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       payload = parsed as Record<string, unknown>;
     }
-  } catch {
+  } catch (error) {
+    if (error instanceof AdapterError) {
+      throw error;
+    }
     payload = {};
   }
   return {
@@ -173,7 +254,10 @@ async function adaptResponse(response: {
 }
 
 export function createProfileDirectory(profilePath: string): string {
-  const resolved = resolve(profilePath.replace(/^~(?=$|\/)/, homedir()));
+  const resolved = resolveDedicatedProfilePath(profilePath);
+  if (resolved === null) {
+    throw new LiveBrowserUnavailable(`${LIVE_GATE} (invalid_profile_path)`);
+  }
   mkdirSync(resolved, { recursive: true, mode: 0o700 });
   try {
     chmodSync(resolved, 0o700);
@@ -184,8 +268,8 @@ export function createProfileDirectory(profilePath: string): string {
 }
 
 export function ensureRestrictivePermissions(profilePath: string): void {
-  const resolved = resolve(profilePath.replace(/^~(?=$|\/)/, homedir()));
-  if (!existsSync(resolved)) {
+  const resolved = resolveDedicatedProfilePath(profilePath);
+  if (resolved === null || !existsSync(resolved)) {
     return;
   }
   for (const entry of readdirSync(resolved, { withFileTypes: true })) {
@@ -198,4 +282,69 @@ export function ensureRestrictivePermissions(profilePath: string): void {
       }
     }
   }
+}
+
+function canonicalizePath(path: string): string | null {
+  let existingPath = path;
+  const missingParts: string[] = [];
+  try {
+    while (!existsSync(existingPath)) {
+      const parent = dirname(existingPath);
+      if (parent === existingPath) {
+        return null;
+      }
+      missingParts.unshift(basename(existingPath));
+      existingPath = parent;
+    }
+    let canonical = realpathSync(existingPath);
+    for (const part of missingParts) {
+      canonical = resolve(canonical, part);
+    }
+    return canonical;
+  } catch {
+    return null;
+  }
+}
+
+function isDedicatedCanonicalProfilePath(profilePath: string): boolean {
+  const canonical = resolve(profilePath);
+  if (
+    canonical === resolve(homedir()) ||
+    DISALLOWED_PROFILE_PATHS.has(canonical) ||
+    DEFAULT_BROWSER_PROFILE_ROOTS.some((root) => isPathWithin(root, canonical))
+  ) {
+    return false;
+  }
+  const name = basename(canonical).toLowerCase();
+  return (
+    !DISALLOWED_PROFILE_NAMES.has(name) &&
+    !/^profile \d+$/.test(name)
+  );
+}
+
+function isPathWithin(parent: string, candidate: string): boolean {
+  const childPath = relative(resolve(parent), resolve(candidate));
+  return (
+    childPath === "" ||
+    (childPath !== ".." &&
+      !childPath.startsWith(`..${sep}`) &&
+      !isAbsolute(childPath))
+  );
+}
+
+function responseByteLength(headers: Record<string, string>): number | null {
+  const value = Object.entries(headers).find(
+    ([key]) => key.toLowerCase() === "content-length",
+  )?.[1];
+  if (value === undefined || value.trim() === "") {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function responseTooLargeError(actualBytes: number): AdapterError {
+  return new AdapterError(
+    `browser response exceeds ${MAX_RESPONSE_BYTES} byte limit (${actualBytes} bytes)`,
+  );
 }

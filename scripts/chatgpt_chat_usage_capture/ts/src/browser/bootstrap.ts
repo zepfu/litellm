@@ -7,9 +7,8 @@
  * tokens, raw headers, browser storage, or message content are persisted.
  */
 
-import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import type { AccountConfig } from "../config.js";
 import { ADAPTER_VERSION } from "../contracts/records.js";
@@ -23,6 +22,7 @@ import {
   dedicatedProfileReady,
   ensureRestrictivePermissions,
   liveBrowserGate,
+  resolveDedicatedProfilePath,
 } from "./session.js";
 import {
   AuthenticationRequiredError,
@@ -355,13 +355,17 @@ function stateForIdentity(identity: IdentityRecord): BootstrapState {
 }
 
 async function performInteractiveLogin(config: BrowserConfig): Promise<void> {
-  const resolved = resolve(
-    config.profilePath.replace(/^~(?=$|\/)/, process.env.HOME ?? "/"),
-  );
+  const resolved = resolveDedicatedProfilePath(config.profilePath);
+  if (resolved === null) {
+    throw new LiveBrowserUnavailable(
+      "interactive login requires a valid dedicated browser profile path (invalid_profile_path)",
+    );
+  }
   const { chromium } = await import("playwright");
   const context = await chromium.launchPersistentContext(resolved, {
     headless: false,
     acceptDownloads: false,
+    chromiumSandbox: true,
   });
   try {
     const page = await context.newPage();
@@ -393,6 +397,8 @@ function persistBootstrapState(
   stateDirectory: string,
 ): void {
   const dir = resolve(stateDirectory, "bootstrap");
+  const filename = `${accountId}.json`;
+  const target = resolveContainedBootstrapFile(dir, accountId, filename);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const payload = {
     accountId,
@@ -403,10 +409,39 @@ function persistBootstrapState(
   };
   assertNoSecrets(payload);
   writeFileSync(
-    resolve(dir, `${accountId}.json`),
+    target,
     JSON.stringify(payload, null, 2) + "\n",
     { encoding: "utf8", mode: 0o600 },
   );
+}
+
+function resolveContainedBootstrapFile(
+  dir: string,
+  accountId: string,
+  filename: string,
+): string {
+  if (
+    accountId.length === 0 ||
+    accountId === "." ||
+    accountId === ".." ||
+    accountId.includes("/") ||
+    accountId.includes("\\") ||
+    accountId.includes("\0")
+  ) {
+    throw new Error("bootstrap state filename must remain within the state directory");
+  }
+  const target = resolve(dir, filename);
+  const relativeTarget = relative(dir, target);
+  if (
+    relativeTarget !== filename ||
+    relativeTarget === "" ||
+    relativeTarget === ".." ||
+    relativeTarget.startsWith(`..${sep}`) ||
+    isAbsolute(relativeTarget)
+  ) {
+    throw new Error("bootstrap state filename must remain within the state directory");
+  }
+  return target;
 }
 
 function emptyIdentity(authState: IdentityRecord["authState"]): IdentityRecord {
