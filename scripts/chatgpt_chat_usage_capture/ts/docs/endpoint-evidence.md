@@ -2,7 +2,7 @@
 
 Evidence date: September 7, 2026.
 
-The live origin configured by the browser transport is
+The live origin configured by the Playwright transport is
 `https://chatgpt.com`. Stage 1 records the route contract in source and
 exercises it with reviewed synthetic fixtures. This acceptance run does not
 use live credentials, a live browser session, or protected containers.
@@ -23,7 +23,8 @@ detail or historical cursor has been live-validated.
 
 ## Blocked routes and methods
 
-The transport rejects every method other than `GET`. It also rejects:
+`ChatGPTHistoryAdapter` and both transports reject every method other than
+`GET` before issuing a request. They also reject:
 
 - `/backend-api/conversation/init` because Stage 1 does not collect quota
   metadata;
@@ -41,4 +42,6 @@ transport rate limiting, not as a quota result.
 `tests/fixtures/v1/manifest.json` identifies the fixture schema as
 `fixture-manifest-v1`, the adapter as `chatgpt-chat-history-v1`, and the data
 as synthetic. Fixture files contain no real account, credential, title, or
-message content.
+message content. `tests/fixtures/v1/stage1-config.json` is the offline CLI
+acceptance config; it binds the synthetic identity and selects
+`fixture_history`.

@@ -1,0 +1,15 @@
+# Local browser profiles, SQLite state, and diagnostics must never be committed.
+/state/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+/browser/
+
+# Build and tooling output
+dist/
+node_modules/
+*.tsbuildinfo
+
+# Playwright diagnostics (never persisted by default)
+test-results/
+playwright-report/

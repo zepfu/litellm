@@ -88,6 +88,16 @@ export interface HistoryTransport {
   ): Promise<Record<string, unknown>>;
 }
 
+export function assertAllowedRequest(method: string, path: string): void {
+  const normalizedMethod = method.toUpperCase();
+  if (!ALLOWED_METHODS.has(normalizedMethod)) {
+    throw new AdapterError(`method not allowlisted: ${normalizedMethod} ${path}`);
+  }
+  if (!isAllowedPath(path)) {
+    throw new AdapterError(`path not allowlisted: ${path}`);
+  }
+}
+
 export function isAllowedPath(path: string): boolean {
   if (path === MODERN_INDEX || path === SESSION_ROUTE || path === INIT_ROUTE) {
     return path !== INIT_ROUTE;
@@ -131,7 +141,7 @@ export class ChatGPTHistoryAdapter {
   async inspectSessionIdentity() {
     let payload: Record<string, unknown>;
     try {
-      payload = await this.transport.request("GET", SESSION_ROUTE);
+      payload = await this.request("GET", SESSION_ROUTE);
       raiseIfAuthenticationRequired(payload, SESSION_ROUTE);
       raiseIfRateLimited(payload, SESSION_ROUTE);
     } catch (error) {
@@ -159,7 +169,7 @@ export class ChatGPTHistoryAdapter {
     const offset = options.offset ?? 0;
     const limit = options.limit ?? 100;
     const order = options.order ?? "updated";
-    const payload = await this.transport.request("GET", MODERN_INDEX, {
+    const payload = await this.request("GET", MODERN_INDEX, {
       offset,
       limit,
       order,
@@ -178,7 +188,7 @@ export class ChatGPTHistoryAdapter {
     conversationId: string,
   ): Promise<ConversationDetailProjection> {
     const modernPath = conversationPath(MODERN_DETAIL, conversationId);
-    const payload = await this.transport.request("GET", modernPath, {
+    const payload = await this.request("GET", modernPath, {
       include_has_versions: "true",
       num_turns: 100,
     });
@@ -187,7 +197,7 @@ export class ChatGPTHistoryAdapter {
     const status = numberOr(payload.http_status, 200);
     if (status === 404 || status === 405) {
       const legacyPath = conversationPath(LEGACY_DETAIL, conversationId);
-      const legacyPayload = await this.transport.request("GET", legacyPath);
+      const legacyPayload = await this.request("GET", legacyPath);
       raiseIfAuthenticationRequired(legacyPayload, legacyPath);
       raiseIfRateLimited(legacyPayload, legacyPath);
       return adaptConversationDetail(legacyPayload, conversationId);
@@ -207,7 +217,7 @@ export class ChatGPTHistoryAdapter {
       params.before = options.before;
     }
     const path = conversationPath(MODERN_MESSAGES, conversationId);
-    const payload = await this.transport.request("GET", path, params);
+    const payload = await this.request("GET", path, params);
     raiseIfAuthenticationRequired(payload, path);
     raiseIfRateLimited(payload, path);
     return adaptMessagePage(payload, {
@@ -221,6 +231,15 @@ export class ChatGPTHistoryAdapter {
     if (typeof closer === "function") {
       await closer.call(this.transport);
     }
+  }
+
+  private async request(
+    method: string,
+    path: string,
+    params: Record<string, unknown> = {},
+  ): Promise<Record<string, unknown>> {
+    assertAllowedRequest(method, path);
+    return this.transport.request(method.toUpperCase(), path, params);
   }
 }
 

@@ -168,4 +168,20 @@ describe("bootstrap state transitions", () => {
     expect(existsSync(missingProfile)).toBe(false);
   });
 
+  it("requires the Playwright adapter for live bootstrap", async () => {
+    const account = makeAccount(profilePath);
+    account.browser.adapter = "fixture_history";
+
+    const result = await bootstrapAccount(account, {
+      interactiveLogin: false,
+      stateDirectory,
+    });
+
+    expect(result.state).toBe("browser_unavailable");
+    expect(result.liveVerification).toBe("not_attempted");
+    expect(result.notes).toContain(
+      "bootstrap requires the playwright_persistent_context adapter",
+    );
+  });
+
 });

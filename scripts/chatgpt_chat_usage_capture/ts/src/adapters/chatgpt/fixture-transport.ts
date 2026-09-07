@@ -8,8 +8,7 @@ import { resolve } from "node:path";
 
 import {
   AdapterError,
-  isAllowedPath,
-  ALLOWED_METHODS,
+  assertAllowedRequest,
   SESSION_ROUTE,
   raiseIfAuthenticationRequired,
   raiseIfRateLimited,
@@ -41,13 +40,8 @@ export class FixtureTransport implements HistoryTransport {
     path: string,
     params: Record<string, unknown> = {},
   ): Promise<Record<string, unknown>> {
+    assertAllowedRequest(method, path);
     const normalizedMethod = method.toUpperCase();
-    if (!ALLOWED_METHODS.has(normalizedMethod)) {
-      throw new AdapterError(`method not allowlisted: ${normalizedMethod} ${path}`);
-    }
-    if (!isAllowedPath(path)) {
-      throw new AdapterError(`path not allowlisted: ${path}`);
-    }
     this.requests.push({ method: normalizedMethod, path, params: { ...params } });
     const payload = loadFixture(this.root, normalizedMethod, path, params);
     raiseIfAuthenticationRequired(payload, path);

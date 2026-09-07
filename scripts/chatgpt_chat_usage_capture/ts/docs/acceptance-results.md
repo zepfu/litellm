@@ -12,6 +12,8 @@ LiteLLM repository and its runtime services are outside this gate.
 - TypeScript: `5.9.3`
 - TypeScript ESLint: `8.69.0`
 - ESLint: `10.10.0`
+- `@eslint/js`: `9.39.2`
+- `@types/node`: `26.4.1`
 - Vitest: `3.2.4`
 - Adapter version: `chatgpt-chat-history-v1`
 - Fixture manifest version: `fixture-manifest-v1`
@@ -22,10 +24,11 @@ LiteLLM repository and its runtime services are outside this gate.
 | --- | --- |
 | `npm install` | Passed; generated `package-lock.json` |
 | `npm run typecheck` | Passed |
-| `npm test` | Passed; 33 tests across 8 focused unit/integration files |
+| `npm test` | Passed; 38 tests across 8 focused unit/integration files |
 | `npm run lint` | Passed |
 | `npm run build` | Passed |
 | `node bin/usage-capture.mjs init ...` | Passed; generated config round-tripped |
+| Fixture CLI `inspect-capabilities` | Passed offline; exit `0`, `ready`, active `2`, archived `0` |
 | Launcher smoke without a profile | Passed; inspect `browser_unavailable`, bootstrap `auth_required`, both exit `1` |
 | `git diff --check` | Passed |
 

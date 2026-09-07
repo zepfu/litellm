@@ -140,4 +140,16 @@ describe("inspect-capabilities", () => {
     expect(result.identity.authState).toBe("browser_unavailable");
     expect(result.notes).toContain("dedicated browser profile is not available");
   });
+
+  it("requires the Playwright adapter for live inspection", async () => {
+    const account = makeAccount(profilePath);
+    account.browser.adapter = "fixture_history";
+
+    const result = await inspectCapabilities(account, { stateDirectory });
+
+    expect(result.state).toBe("browser_unavailable");
+    expect(result.notes).toContain(
+      "live inspect-capabilities requires the playwright_persistent_context adapter",
+    );
+  });
 });

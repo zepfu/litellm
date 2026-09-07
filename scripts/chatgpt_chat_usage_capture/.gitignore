@@ -1,11 +1,11 @@
 # State artifacts
-state/
+/state/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
 
 # Browser profiles
-browser/
+/browser/
 
 # Python cache
 __pycache__/

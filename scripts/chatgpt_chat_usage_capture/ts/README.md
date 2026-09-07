@@ -10,7 +10,8 @@ Stage 1 implements:
 - `bootstrap`: verify a dedicated persistent browser profile and bind the
   provider user, workspace, and quota owner;
 - `inspect-capabilities`: read the active and archived conversation indexes and
-  report adapter coverage.
+  report adapter coverage. It supports live Playwright inspection and an
+  explicit fixture-backed offline acceptance mode.
 
 Stage 1 does not implement ledger storage, attempt reconstruction, accounting,
 quota windows, scheduling, local API, dashboard UI, exports, or model
@@ -23,7 +24,7 @@ reporting. Those commands fail closed with an explicit Stage-2 error.
 - A dedicated Playwright Chromium profile for live operation
 
 The Stage-1 fixture suite is synthetic and runs offline. No credentials or
-browser profile are required for tests.
+browser profile are required for tests or fixture-backed CLI inspection.
 
 ## Install
 
@@ -88,6 +89,20 @@ node bin/usage-capture.mjs bootstrap --config ./config.json
 node bin/usage-capture.mjs inspect-capabilities --config ./config.json
 ```
 
+For offline CLI acceptance, use the committed synthetic config and fixtures:
+
+```bash
+node bin/usage-capture.mjs inspect-capabilities \
+  --config ./tests/fixtures/v1/stage1-config.json \
+  --fixture-root ./tests/fixtures/v1 \
+  --state-directory /tmp/chatgpt-chat-usage-capture-stage1-state
+```
+
+The fixture command must use an account with
+`browser.adapter: "fixture_history"` and never contacts ChatGPT. Live
+`bootstrap` and live `inspect-capabilities` require
+`browser.adapter: "playwright_persistent_context"` and a dedicated profile.
+
 The bootstrap command returns exit code `0` only for a verified `ready`
 identity. Missing authentication, missing expected identity bindings, identity
 mismatch, and browser unavailability return a non-zero status with a
@@ -118,9 +133,10 @@ npm run build
 git diff --check
 ```
 
-The fixture-backed transport is test-only. It provides deterministic synthetic
-session, conversation-index, detail, and message-page responses without
-network access.
+The fixture-backed transport provides deterministic synthetic session,
+conversation-index, detail, and message-page responses without network access.
+It is available to the offline `inspect-capabilities` CLI path and is not live
+endpoint evidence.
 
 See:
 

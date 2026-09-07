@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "application": {
+    "report_timezone": "America/New_York",
+    "state_directory": "./state"
+  },
+  "accounts": [
+    {
+      "id": "fixture-primary",
+      "enabled": true,
+      "provider": "openai",
+      "expected_provider_user_id": "user-abc123",
+      "expected_workspace_id": "ws-xyz",
+      "quota_owner_id": "user-abc123",
+      "surface": "chat",
+      "plan_policy_id": "pro200-chat-2026-09-05",
+      "browser": {
+        "adapter": "fixture_history",
+        "profile_path": "",
+        "headless": true,
+        "allow_interactive_login": false
+      },
+      "collection": {
+        "request_timeout_seconds": 30
+      }
+    }
+  ]
+}

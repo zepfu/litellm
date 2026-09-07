@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   ChatGPTHistoryAdapter,
   AdapterError,
+  assertAllowedRequest,
   isAllowedPath,
   INIT_ROUTE,
   LEGACY_DETAIL,
@@ -12,6 +13,7 @@ import {
   SESSION_ROUTE,
 } from "../../src/adapters/chatgpt/adapter.js";
 import { FixtureTransport } from "../../src/adapters/chatgpt/fixture-transport.js";
+import { PlaywrightTransport } from "../../src/browser/session.js";
 
 const FIXTURE_ROOT = new URL("../fixtures/v1/", import.meta.url).pathname;
 
@@ -32,6 +34,33 @@ describe("route allowlist", () => {
     expect(isAllowedPath(INIT_ROUTE)).toBe(false);
     expect(isAllowedPath("/backend-api/me")).toBe(false);
     expect(isAllowedPath("/api/auth/session/extra")).toBe(false);
+  });
+
+  it("enforces the shared method and path boundary", () => {
+    expect(() => assertAllowedRequest("POST", MODERN_INDEX)).toThrow(
+      "method not allowlisted",
+    );
+    expect(() => assertAllowedRequest("GET", "/backend-api/me")).toThrow(
+      "path not allowlisted",
+    );
+  });
+
+  it("rejects invalid production Playwright requests before browser access", async () => {
+    const transport = new PlaywrightTransport({
+      adapter: "playwright_persistent_context",
+      profilePath: "/stage1-missing-profile",
+      headless: true,
+      allowInteractiveLogin: false,
+      requestTimeoutSeconds: 1,
+    });
+
+    await expect(transport.request("POST", MODERN_INDEX)).rejects.toThrow(
+      "method not allowlisted",
+    );
+    await expect(transport.request("GET", "/backend-api/me")).rejects.toThrow(
+      "path not allowlisted",
+    );
+    expect(transport.requests).toHaveLength(0);
   });
 
   it("rejects POST and other mutating methods", async () => {

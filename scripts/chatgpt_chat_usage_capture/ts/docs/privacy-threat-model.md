@@ -21,10 +21,10 @@ filesystem permits it.
 
 ### Egress restriction
 
-The transport permits only `GET`. The adapter checks exact route shapes and
-safe conversation ID tokens before issuing a request. It never submits prompts,
-changes conversations, archives or deletes data, calls the init route, or
-exports browser state.
+The adapter and both transports share a boundary that permits only `GET` and
+checks exact route shapes and safe conversation ID tokens before issuing a
+request. They never submit prompts, change conversations, archive or delete
+data, call the init route, or export browser state.
 
 ### Identity binding
 
@@ -41,8 +41,9 @@ Metadata is typed and allowlisted. Persisted identity is checked with
 
 ### Test isolation
 
-The fixture transport and all committed fixtures are synthetic. Tests do not
-read a user browser profile or make network calls.
+The fixture transport, offline CLI path, and all committed fixtures are
+synthetic. Tests and fixture CLI acceptance do not read a user browser profile
+or make network calls.
 
 ## Threats and residual risk
 
