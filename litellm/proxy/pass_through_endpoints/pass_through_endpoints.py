@@ -1439,11 +1439,10 @@ def _classify_passthrough_raw_http_error(
 ) -> Optional[Tuple[str, str, bool]]:
     if not isinstance(exc, (HTTPException, httpx.HTTPStatusError)):
         return None
-    if status_code not in {
-        status.HTTP_429_TOO_MANY_REQUESTS,
-        status.HTTP_502_BAD_GATEWAY,
-        status.HTTP_503_SERVICE_UNAVAILABLE,
-    }:
+    if (
+        status_code != status.HTTP_429_TOO_MANY_REQUESTS
+        and status_code not in PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES
+    ):
         return None
 
     detail: Any = getattr(exc, "detail", None)
@@ -1464,9 +1463,29 @@ def _classify_passthrough_raw_http_error(
 
     if not payload.get("message") and error_text.strip():
         payload = {**payload, "message": error_text}
-    return PassThroughStreamingHandler._classify_responses_pre_commit_error(
+    classified = PassThroughStreamingHandler._classify_responses_pre_commit_error(
         payload
     )
+    code, error_type, message = (
+        PassThroughStreamingHandler._extract_responses_stream_error_fields(payload)
+    )
+    fields = " ".join(value or "" for value in (code, error_type, message)).lower()
+    if any(
+        marker in fields
+        for marker in (
+            "quota", "usage_limit", "usage limit", "weekly limit",
+            "auth", "invalid_api_key", "invalid api key", "credential",
+            "token_invalidated", "invalid_token", "forbidden",
+        )
+    ):
+        return classified if not classified[2] else (
+            "provider_terminal_error", "provider_terminal_error", False
+        )
+    if code in {"capacity_exhausted", "server_is_overloaded"} or error_type in {
+        "capacity_exhausted", "server_is_overloaded"
+    }:
+        return "server_overloaded", "transient_capacity", True
+    return classified
 
 
 def _is_passthrough_pre_first_byte_hidden_retryable(
@@ -1817,9 +1836,10 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 url=url,
                 custom_llm_provider=custom_llm_provider,
             )
-            raw_http_classification = _classify_passthrough_raw_http_error(
-                exc,
-                status_code=status_code,
+            raw_http_classification = (
+                _classify_passthrough_raw_http_error(exc, status_code=status_code)
+                if openai_capacity_coordinator is not None
+                else None
             )
             if raw_http_classification is not None:
                 _, raw_failure_classification, _ = raw_http_classification

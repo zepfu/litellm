@@ -2166,22 +2166,27 @@ async def test_central_coordinator_replaces_legacy_precommit_cap():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("exception_kind", "status_code"),
+    ("exception_kind", "status_code", "error_field", "error_value"),
     [
-        ("http_exception", 429),
-        ("http_status_error", 502),
-        ("http_exception", 503),
+        ("http_exception", 429, "code", "server_overloaded"),
+        ("http_status_error", 502, "type", "server_overloaded"),
+        ("http_exception", 503, "code", "server_overloaded"),
+        ("http_exception", 500, "code", "server_is_overloaded"),
+        ("http_status_error", 529, "type", "server_is_overloaded"),
+        ("http_status_error", 504, "code", "capacity_exhausted"),
+        ("http_exception", 500, "type", "capacity_exhausted"),
     ],
 )
 async def test_central_coordinator_retries_raw_http_overload_then_succeeds(
     exception_kind: str,
     status_code: int,
+    error_field: str,
+    error_value: str,
 ):
     overload_payload = {
         "error": {
-            "type": "server_overloaded",
-            "code": "server_overloaded",
-            "message": "The upstream server is overloaded.",
+            error_field: error_value,
+            "message": "Please try again later.",
         }
     }
     headers = {"Retry-After": "1", "X-Upstream": "capacity"}
@@ -2252,10 +2257,11 @@ async def test_central_coordinator_retries_raw_http_overload_then_succeeds(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("exception_kind", "error_payload"),
+    ("exception_kind", "status_code", "error_payload"),
     [
         (
             "http_exception",
+            429,
             {
                 "error": {
                     "type": "usage_limit_reached",
@@ -2266,6 +2272,7 @@ async def test_central_coordinator_retries_raw_http_overload_then_succeeds(
         ),
         (
             "http_status_error",
+            503,
             {
                 "error": {
                     "type": "invalid_api_key",
@@ -2274,13 +2281,41 @@ async def test_central_coordinator_retries_raw_http_overload_then_succeeds(
                 }
             },
         ),
+        (
+            "http_exception", 500,
+            {"error": {"code": "capacity_exhausted", "message": "Quota exhausted."}},
+        ),
+        (
+            "http_status_error", 529,
+            {"error": {"type": "server_is_overloaded", "code": "invalid_api_key"}},
+        ),
+        (
+            "http_exception", 503,
+            {"error": {"code": "server_is_overloaded", "type": "usage_limit_reached"}},
+        ),
+        (
+            "http_status_error", 500,
+            {"error": {"type": "capacity_exhausted", "code": "token_invalidated"}},
+        ),
+        (
+            "http_exception", 429,
+            {"error": {"code": "rate_limit_exceeded", "message": "Local request limit."}},
+        ),
+        (
+            "http_status_error", 504,
+            {"error": {"code": "upstream_timeout", "message": "Gateway timeout."}},
+        ),
+        (
+            "http_exception", 500,
+            {"error": {"code": "internal_error", "message": "Internal error."}},
+        ),
     ],
 )
 async def test_central_coordinator_exits_raw_http_quota_or_auth_immediately(
     exception_kind: str,
+    status_code: int,
     error_payload: dict[str, Any],
 ):
-    status_code = 429 if exception_kind == "http_exception" else 503
     request = httpx.Request("POST", "https://api.openai.com/v1/responses")
     response = httpx.Response(
         status_code,
