@@ -2256,6 +2256,105 @@ async def test_central_coordinator_retries_raw_http_overload_then_succeeds(
 
 
 @pytest.mark.asyncio
+async def test_central_coordinator_preserves_last_capacity_failure_on_expiry():
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+
+    terminal_payload = {
+        "error": {
+            "type": "server_overloaded",
+            "code": "server_overloaded",
+            "message": "The upstream server is overloaded.",
+        }
+    }
+    terminal_exception = HTTPException(
+        status_code=502,
+        detail=terminal_payload,
+        headers={"Retry-After": "999999"},
+    )
+    coordinator = MagicMock()
+    coordinator.deadline_seconds = 7200.0
+    coordinator.remaining_seconds = 7200.0
+    coordinator.within_deadline.return_value = True
+    coordinator.next_wait_seconds.return_value = 0.0
+    coordinator.sleep_with_wakeup = AsyncMock(return_value="timer")
+    coordinator.record_retry = MagicMock()
+
+    await_calls = 0
+
+    async def operation():
+        nonlocal await_calls
+        await_calls += 1
+        if await_calls == 1:
+            raise terminal_exception
+        return "unreachable"
+
+    async def fake_await(
+        operation,
+        *,
+        timeout_seconds,
+        operation_name,
+    ):
+        if await_calls == 0:
+            return await operation()
+        raise pte._PassthroughHiddenRetryBudgetTimeout("expired")
+
+    with patch.object(
+        pte,
+        "_await_passthrough_pre_first_byte_operation",
+        new=fake_await,
+    ):
+        with pytest.raises(HTTPException) as raised:
+            await _execute_passthrough_pre_first_byte_with_hidden_retries(
+                kwargs={},
+                operation_name="stream_pre_first_byte",
+                operation=operation,
+                caller_managed_hidden_retry=False,
+                openai_capacity_coordinator=coordinator,
+            )
+
+    assert raised.value is terminal_exception
+    assert raised.value.status_code == 502
+    assert raised.value.detail == terminal_payload
+    assert raised.value.headers == {"Retry-After": "999999"}
+
+
+@pytest.mark.asyncio
+async def test_central_coordinator_expiry_without_prior_failure_returns_504():
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+
+    coordinator = MagicMock()
+    coordinator.deadline_seconds = 7200.0
+    coordinator.remaining_seconds = 7200.0
+
+    async def fake_await(
+        operation,
+        *,
+        timeout_seconds,
+        operation_name,
+    ):
+        raise pte._PassthroughHiddenRetryBudgetTimeout(
+            "Pass-through stream_pre_first_byte hidden retry budget exhausted"
+        )
+
+    with patch.object(
+        pte,
+        "_await_passthrough_pre_first_byte_operation",
+        new=fake_await,
+    ):
+        with pytest.raises(HTTPException) as raised:
+            await _execute_passthrough_pre_first_byte_with_hidden_retries(
+                kwargs={},
+                operation=AsyncMock(),
+                operation_name="stream_pre_first_byte",
+                caller_managed_hidden_retry=False,
+                openai_capacity_coordinator=coordinator,
+            )
+
+    assert raised.value.status_code == 504
+    assert "hidden retry budget exhausted" in str(raised.value.detail)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("exception_kind", "status_code", "error_payload"),
     [
@@ -2891,3 +2990,91 @@ async def test_nonstream_alpha_openai_sse_substantive_bytes_survive_precommit_pe
     assert replayed == chunks
     signal_success.assert_awaited_once()
     assert stream.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_capacity_failure_retry_after_reaches_proxy_wire_headers(
+    monkeypatch,
+):
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        pass_through_request,
+    )
+    from litellm.proxy.proxy_server import openai_exception_handler
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.url = SimpleNamespace(path="/openai_passthrough/v1/responses")
+    mock_request.headers = {"content-type": "application/json"}
+    mock_request.query_params = {}
+    mock_request.state = SimpleNamespace()
+    custom_body = {"model": "gpt-5.4", "stream": True}
+    terminal_failure = ResponsesStreamPreCommitFailure(
+        error_class="server_overloaded",
+        classification="transient_capacity",
+        retryable=True,
+        retry_after_seconds=999999.0,
+        pre_commit_retry_exhausted=True,
+        message="The upstream server is overloaded.",
+    )
+
+    async def execute_hidden_retries(**kwargs):
+        raise terminal_failure
+
+    async def run_with_renewal(_lease, operation):
+        return await operation()
+
+    with patch.object(
+        pte,
+        "_aawm_session_owner_pre_send_guard",
+        new=AsyncMock(),
+    ), patch.object(
+        sa,
+        "get_request_session_owner_lease",
+        return_value=None,
+    ), patch.object(
+        sa,
+        "run_with_session_owner_lease_renewal",
+        new=run_with_renewal,
+    ), patch.object(
+        sa,
+        "finalize_request_session_owner_lease",
+        new=AsyncMock(),
+    ), patch.object(
+        pte,
+        "_execute_passthrough_pre_first_byte_with_hidden_retries",
+        new=execute_hidden_retries,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+    ) as mock_get_client, patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj"
+    ) as mock_logging_obj:
+        mock_client_obj = MagicMock()
+        mock_client_obj.client = MagicMock()
+        mock_get_client.return_value = mock_client_obj
+        mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+        mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+        with pytest.raises(ProxyException) as raised:
+            await pass_through_request(
+                request=mock_request,
+                target="https://api.openai.com/v1/responses",
+                custom_headers={},
+                user_api_key_dict=MagicMock(),
+                custom_body=custom_body,
+                custom_llm_provider="openai",
+                stream=True,
+            )
+
+    assert raised.value.code == "503"
+    assert raised.value.detail == terminal_failure.detail
+    assert raised.value.headers["Retry-After"] == "7200"
+
+    response = await openai_exception_handler(mock_request, raised.value)
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "7200"
+    assert terminal_failure.message in response.body.decode("utf-8")

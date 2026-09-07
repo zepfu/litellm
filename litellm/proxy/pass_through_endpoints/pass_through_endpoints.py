@@ -140,6 +140,9 @@ class _PassthroughHiddenRetryBudgetTimeout(httpx.ReadTimeout):
     """The shared pre-first-byte retry budget canceled an in-flight attempt."""
 
 
+_PASSTHROUGH_TERMINAL_RETRY_AFTER_MAX_SECONDS = 7200.0
+
+
 from .aawm_adapter_runtime.repetitive_output import (
     bind_output_guard_to_streaming_response,
     maybe_reject_passthrough_responses_body,
@@ -838,6 +841,53 @@ def _build_http_exception_from_upstream_status_error(
     )
     setattr(http_exception, "_aawm_provider_returned", True)
     return http_exception
+
+
+def _get_passthrough_terminal_wire_headers(exc: Exception) -> Dict[str, str]:
+    """Expose only a bounded upstream Retry-After on the proxy response."""
+    headers = getattr(exc, "headers", None)
+    if not hasattr(headers, "items"):
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None)
+    if not hasattr(headers, "items"):
+        return {}
+
+    for header_name, header_value in headers.items():
+        if str(header_name).lower() != "retry-after":
+            continue
+        try:
+            retry_after_seconds = float(str(header_value).strip())
+        except (TypeError, ValueError):
+            return {}
+        if not isfinite(retry_after_seconds) or retry_after_seconds < 0:
+            return {}
+        bounded_retry_after = min(
+            retry_after_seconds,
+            _PASSTHROUGH_TERMINAL_RETRY_AFTER_MAX_SECONDS,
+        )
+        if bounded_retry_after == int(bounded_retry_after):
+            return {"Retry-After": str(int(bounded_retry_after))}
+        return {"Retry-After": str(bounded_retry_after)}
+    return {}
+
+
+def _mark_passthrough_capacity_exception_terminal(
+    exc: Exception,
+) -> None:
+    if not isinstance(exc, ResponsesStreamPreCommitFailure):
+        return
+
+    exc.pre_commit_retry_exhausted = True
+    try:
+        retry_after_seconds = float(exc.retry_after_seconds)
+    except (TypeError, ValueError):
+        retry_after_seconds = 10.0
+    if not isfinite(retry_after_seconds) or retry_after_seconds <= 0:
+        retry_after_seconds = 10.0
+    exc.retry_after_seconds = min(
+        retry_after_seconds,
+        _PASSTHROUGH_TERMINAL_RETRY_AFTER_MAX_SECONDS,
+    )
 
 
 def _extract_exception_status_code(exc: Exception) -> Optional[int]:
@@ -1755,6 +1805,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
     )
     start_monotonic = time.monotonic()
     attempt_number = 0
+    last_capacity_exception: Optional[Exception] = None
     while True:
         attempt_number += 1
         try:
@@ -1828,7 +1879,15 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     budget_seconds,
                     elapsed_seconds,
                 )
-                raise
+                if last_capacity_exception is not None:
+                    _mark_passthrough_capacity_exception_terminal(
+                        last_capacity_exception
+                    )
+                    raise last_capacity_exception from exc
+                raise HTTPException(
+                    status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                    detail=str(exc),
+                ) from exc
             should_retry = _is_passthrough_pre_first_byte_hidden_retryable(
                 exc,
                 status_code=status_code,
@@ -1850,17 +1909,20 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
                 and raw_http_classification[2]
             )
+            capacity_failure = bool(
+                (
+                    isinstance(exc, ResponsesStreamPreCommitFailure)
+                    and exc.error_class
+                    in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
+                    and exc.retryable
+                )
+                or raw_http_capacity_overload
+            )
+            if capacity_failure:
+                last_capacity_exception = exc
             if (
                 openai_capacity_coordinator is not None
-                and (
-                    (
-                        isinstance(exc, ResponsesStreamPreCommitFailure)
-                        and exc.error_class
-                        in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
-                        and exc.retryable
-                    )
-                    or raw_http_capacity_overload
-                )
+                and capacity_failure
             ):
                 if not openai_capacity_coordinator.within_deadline():
                     if isinstance(exc, ResponsesStreamPreCommitFailure):
@@ -5813,7 +5875,10 @@ async def pass_through_request(  # noqa: PLR0915
                 code=status_code
                 if status_code is not None
                 else getattr(e, "status_code", status.HTTP_400_BAD_REQUEST),
-                headers=custom_headers,
+                headers={
+                    **(custom_headers or {}),
+                    **_get_passthrough_terminal_wire_headers(e),
+                },
             )
             setattr(proxy_exc, "detail", getattr(e, "detail", None))
             upstream_headers = getattr(e, "headers", None)
@@ -5838,7 +5903,10 @@ async def pass_through_request(  # noqa: PLR0915
                 code=status_code
                 if status_code is not None
                 else getattr(e, "status_code", 500),
-                headers=custom_headers,
+                headers={
+                    **(custom_headers or {}),
+                    **_get_passthrough_terminal_wire_headers(e),
+                },
             )
             if getattr(e, "_aawm_provider_returned", False):
                 setattr(proxy_exc, "_aawm_provider_returned", True)
