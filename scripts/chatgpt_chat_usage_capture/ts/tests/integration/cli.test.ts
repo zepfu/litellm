@@ -34,6 +34,37 @@ describe("CLI", () => {
     expect(exitCode).toBe(2);
   });
 
+  it("supports top-level help without requiring a config or command", async () => {
+    const output = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    expect(await run(["--help"])).toBe(0);
+    expect(output.mock.calls.flat().join("\n")).toContain("usage-capture");
+  });
+
+  it("refuses collection when no account is enabled", async () => {
+    const config = defaultConfig();
+    const account = config.accounts[0]!;
+    account.enabled = false;
+    account.browser.adapter = "fixture_history";
+    account.browser.profilePath = "";
+    config.application.stateDirectory = stateDirectory;
+    const configPath = join(stateDirectory, "disabled-config.json");
+    saveConfig(config, configPath);
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const fixtureRoot = new URL("../fixtures/v1/", import.meta.url).pathname;
+
+    expect(await run([
+      "backfill",
+      "--config",
+      configPath,
+      "--fixture-root",
+      fixtureRoot,
+    ])).toBe(2);
+    expect(error).toHaveBeenCalledWith(
+      "usage-capture backfill: no enabled account is configured",
+    );
+  });
+
   it("init writes a starter config", async () => {
     const configPath = join(stateDirectory, "config.json");
     const exitCode = await run(["init", "--config", configPath]);
@@ -133,6 +164,14 @@ describe("CLI", () => {
     expect(report.coverageGaps.some(
       (gap: { reason: string }) => gap.reason === "incomplete_history_coverage",
     )).toBe(true);
+
+    expect(await run(["report", ...localArgs, "--since", "24h", "--until", end]))
+      .toBe(0);
+    expect(lastResult()).toMatchObject({
+      durationMs: 24 * 60 * 60 * 1000,
+      start: "2026-09-07T00:00:00.000Z",
+      end,
+    });
 
     // Renamed conversations do not move their old attempts into a recent report.
     expect(await run(["report", ...localArgs, "--last-hours", "24", "--until", end])).toBe(0);
