@@ -168,7 +168,7 @@ describe("CLI", () => {
 
       expect(await run(["refresh", ...collectArgs])).toBe(0);
       expect(lastResult().mode).toBe("incremental");
-      expect(lastResult().scopes[0]?.candidateCutoff).toBe("2026-09-05T12:00:00.000Z");
+      expect(lastResult().scopes[0]?.candidateCutoff).toBe("2026-08-24T12:00:00.000Z");
       expect(await run([
         "reconcile", ...collectArgs, "--since", "2026-09-01T00:00:00.000Z", "--until", end,
       ])).toBe(0);

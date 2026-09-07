@@ -34,12 +34,15 @@ describe("Stage-2A history ranges", () => {
     });
   });
 
-  it("requires reconciliation to carry an explicit range", () => {
-    expect(() =>
+  it("defaults reconciliation to the same fourteen-day range", () => {
+    expect(
       resolveRequestedRange({
         mode: "reconciliation",
         now: new Date("2026-09-07T12:00:00.000Z"),
       }),
-    ).toThrow("reconciliation requires an explicit range");
+    ).toEqual({
+      start: "2026-08-24T12:00:00.000Z",
+      end: "2026-09-07T12:00:00.000Z",
+    });
   });
 });

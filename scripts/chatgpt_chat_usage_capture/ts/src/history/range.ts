@@ -83,9 +83,6 @@ export function resolveRequestedRange(options: {
   if (options.range) {
     return validateRange(options.range);
   }
-  if (options.mode === "reconciliation") {
-    throw new Error("reconciliation requires an explicit range");
-  }
   return defaultBackfillRange(
     options.now,
     options.defaultBackfillDays ?? DEFAULT_BACKFILL_DAYS,

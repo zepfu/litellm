@@ -186,6 +186,7 @@ export class HistoryCollector {
         candidate,
         now,
         request,
+        requestedRange,
       );
       detailPagesFetched += acquisition.detailPagesFetched;
       conversations.push({
@@ -210,6 +211,14 @@ export class HistoryCollector {
       coverage.overall === "complete" && revisits.length === 0
         ? "complete"
         : "partial";
+    this.advanceWatermarksIfEligible(
+      request,
+      scanStartedAt,
+      now,
+      scopeResults,
+      conversations,
+      revisits,
+    );
 
     return {
       accountId: this.options.accountId,
@@ -268,17 +277,20 @@ export class HistoryCollector {
     const pageBudget =
       request.maxIndexPagesPerScope ?? this.maxIndexPagesPerScope;
     const shouldResume =
-      request.mode === "incremental" &&
-      !explicitRange &&
       previous?.continuation !== null &&
       previous?.continuation !== undefined &&
-      previous.status !== "complete";
+      previous.status !== "complete" &&
+      checkpointMatches(
+        previous,
+        request.mode,
+        requestedRange,
+        candidateCutoff,
+      );
     let offset = shouldResume ? previous!.continuation! : 0;
     let pagesFetched = 0;
     let status: ScopeDiscoveryResult["coverage"]["status"] = "in_progress";
     let continuation: number | null = offset;
     let paginationState: PaginationState = "unknown";
-    let completeDiscoveryStartedAt = previous?.lastCompleteDiscoveryStartedAt ?? null;
 
     this.options.store.saveDiscovery(
       checkpointFor(
@@ -328,11 +340,22 @@ export class HistoryCollector {
       pagesFetched += 1;
       paginationState = page.paginationState;
       warnings.push(...page.warnings);
+      if (page.coverage === "unrecognized") {
+        warnings.push("index_unrecognized_page");
+      }
       for (const summary of page.items) {
         if (summary.updatedAt === null) {
           warnings.push("conversation_missing_update_time");
+        } else if (!isValidInstant(summary.updatedAt)) {
+          warnings.push("conversation_invalid_update_time");
         }
-        if (isCandidateSummary(summary, candidateCutoff, requestedRange.end)) {
+        if (
+          isCandidateSummary(
+            summary,
+            candidateCutoff,
+            request.mode === "incremental" ? requestedRange.end : null,
+          )
+        ) {
           summaries.push(summary);
         }
       }
@@ -348,9 +371,11 @@ export class HistoryCollector {
         break;
       }
       if (page.exhausted && page.paginationState === "complete") {
+        if (page.coverage !== "validated_page") {
+          warnings.push("index_unvalidated_terminal_page");
+        }
         status = "complete";
         continuation = null;
-        completeDiscoveryStartedAt = scanStartedAt;
         this.options.store.saveDiscovery(
           checkpointFor(
             this.options.accountId,
@@ -362,7 +387,7 @@ export class HistoryCollector {
             null,
             pagesFetched,
             pageBudget,
-            completeDiscoveryStartedAt,
+            previous?.lastCompleteDiscoveryStartedAt ?? null,
             status,
             paginationState,
             warnings,
@@ -480,19 +505,18 @@ export class HistoryCollector {
     if (!previousWatermark) {
       return requestedRange.start;
     }
-    const overlapStart = new Date(
-      new Date(previousWatermark).getTime() - overlapMs,
-    );
-    const requestedStart = new Date(requestedRange.start);
-    const end = new Date(requestedRange.end);
-    const selected = new Date(Math.max(overlapStart.getTime(), requestedStart.getTime()));
-    return new Date(Math.min(selected.getTime(), end.getTime())).toISOString();
+    const watermark = new Date(previousWatermark);
+    if (!Number.isFinite(watermark.getTime())) {
+      return requestedRange.start;
+    }
+    return new Date(watermark.getTime() - overlapMs).toISOString();
   }
 
   private async acquireConversation(
     candidate: Candidate,
     now: Date,
     request: HistoryCollectionRequest,
+    requestedRange: HistoryRange,
   ): Promise<DetailAcquisition> {
     const existingRevisit =
       this.options.store
@@ -531,13 +555,17 @@ export class HistoryCollector {
 
     const messages = dedupeMessages(detail.messages);
     if (detail.detailRoute === "legacy") {
+      const boundedMessages = messagesBeforeExclusiveEnd(
+        messages,
+        requestedRange.end,
+      );
       this.options.store.completeRevisit(
         this.options.accountId,
         candidate.summary.conversationId,
       );
       return {
-        detail,
-        messages,
+        detail: { ...detail, messages: boundedMessages },
+        messages: boundedMessages,
         revisit: null,
         coverage: detail.coverage === "validated_page" ? "complete" : "partial",
         warnings: detail.warnings,
@@ -553,9 +581,10 @@ export class HistoryCollector {
       existingRevisit,
       request.maxMessagePagesPerConversation ??
         this.maxMessagePagesPerConversation,
+      requestedRange.end,
     );
     return {
-      detail,
+      detail: { ...detail, messages: pageResult.messages },
       messages: pageResult.messages,
       revisit: pageResult.revisit,
       coverage:
@@ -574,6 +603,7 @@ export class HistoryCollector {
     now: Date,
     existingRevisit: RevisitEntry | null,
     pageBudget: number,
+    rangeEnd: string,
   ): Promise<{
     messages: MessageRecord[];
     revisit: RevisitEntry | null;
@@ -610,8 +640,12 @@ export class HistoryCollector {
           this.options.accountId,
           candidate.summary.conversationId,
         );
+        const boundedMessages = messagesBeforeExclusiveEnd(
+          dedupeMessages(messages),
+          rangeEnd,
+        );
         return {
-          messages: dedupeMessages(messages),
+          messages: boundedMessages,
           revisit: null,
           warnings,
           detailPagesFetched,
@@ -659,12 +693,72 @@ export class HistoryCollector {
       null,
       existingRevisit,
     );
+    const boundedMessages = messagesBeforeExclusiveEnd(
+      dedupeMessages(messages),
+      rangeEnd,
+    );
     return {
-      messages: dedupeMessages(messages),
+      messages: boundedMessages,
       revisit,
       warnings,
       detailPagesFetched,
     };
+  }
+
+  private advanceWatermarksIfEligible(
+    request: HistoryCollectionRequest,
+    scanStartedAt: string,
+    now: Date,
+    scopes: ScopeCoverageResult[],
+    conversations: AcquiredConversation[],
+    revisits: RevisitEntry[],
+  ): void {
+    if (
+      request.mode !== "incremental" ||
+      request.range !== undefined
+    ) {
+      return;
+    }
+    const updatedAt = now.toISOString();
+    for (const scope of ["active", "archived"] as const) {
+      // Optional project/branch gaps do not invalidate a complete scope scan.
+      const coverage = scopes.find((item) => item.scope === scope);
+      if (
+        !coverage ||
+        coverage.status !== "complete" ||
+        coverage.coverage !== "complete" ||
+        coverage.warnings.length > 0
+      ) {
+        continue;
+      }
+      if (
+        conversations.some(
+          (conversation) =>
+            conversation.scopes.includes(scope) &&
+            (conversation.coverage !== "complete" ||
+              conversation.warnings.length > 0),
+        )
+      ) {
+        continue;
+      }
+      if (revisits.some((revisit) => revisit.scopes.includes(scope))) {
+        continue;
+      }
+      const checkpoint = this.options.store.loadDiscovery(scope);
+      if (
+        !checkpoint ||
+        checkpoint.status !== "complete" ||
+        checkpoint.warnings.length > 0
+      ) {
+        continue;
+      }
+      this.options.store.saveDiscovery({
+        ...checkpoint,
+        lastCompleteDiscoveryStartedAt: scanStartedAt,
+        updatedAt,
+        lastPageAt: updatedAt,
+      });
+    }
   }
 
   private saveRevisit(
@@ -791,25 +885,68 @@ function checkpointFor(
   };
 }
 
+function checkpointMatches(
+  checkpoint: DiscoveryCheckpoint,
+  mode: HistoryCollectionRequest["mode"],
+  range: HistoryRange,
+  candidateCutoff: string,
+): boolean {
+  return (
+    checkpoint.mode === mode &&
+    checkpoint.candidateCutoff === candidateCutoff &&
+    checkpoint.range.start === range.start &&
+    checkpoint.range.end === range.end
+  );
+}
+
 function isCandidateSummary(
   summary: ConversationSummary,
   candidateCutoff: string,
-  rangeEnd: string,
+  rangeEnd: string | null,
 ): boolean {
   if (summary.updatedAt === null) {
     return true;
   }
   const updatedAt = new Date(summary.updatedAt);
   const start = new Date(candidateCutoff);
-  const end = new Date(rangeEnd);
-  if (
-    !Number.isFinite(updatedAt.getTime()) ||
-    !Number.isFinite(start.getTime()) ||
-    !Number.isFinite(end.getTime())
-  ) {
+  if (!Number.isFinite(updatedAt.getTime()) || !Number.isFinite(start.getTime())) {
     return true;
   }
-  return updatedAt.getTime() >= start.getTime() && updatedAt.getTime() < end.getTime();
+  if (rangeEnd === null) {
+    return updatedAt.getTime() >= start.getTime();
+  }
+  const end = new Date(rangeEnd);
+  if (!Number.isFinite(end.getTime())) {
+    return true;
+  }
+  return (
+    updatedAt.getTime() >= start.getTime() &&
+    updatedAt.getTime() < end.getTime()
+  );
+}
+
+function messagesBeforeExclusiveEnd(
+  messages: MessageRecord[],
+  rangeEnd: string,
+): MessageRecord[] {
+  const end = new Date(rangeEnd);
+  if (!Number.isFinite(end.getTime())) {
+    return messages;
+  }
+  return messages.filter((message) => {
+    if (message.createdAt === null) {
+      return true;
+    }
+    const createdAt = new Date(message.createdAt);
+    return (
+      !Number.isFinite(createdAt.getTime()) ||
+      createdAt.getTime() < end.getTime()
+    );
+  });
+}
+
+function isValidInstant(value: string): boolean {
+  return Number.isFinite(new Date(value).getTime());
 }
 
 function isMoreRecent(left: string | null, right: string | null): boolean {

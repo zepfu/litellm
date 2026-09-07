@@ -292,12 +292,8 @@ describe("Stage-2A history collection", () => {
     expect(result.coverage.projects).toBe("validated_for_discovered_projects");
     expect(result.coverage.branches).toBe("version_metadata_observed");
     expect(result.coverage.overall).toBe("complete");
-    expect(store.loadDiscovery("active")?.lastCompleteDiscoveryStartedAt).toBe(
-      NOW.toISOString(),
-    );
-    expect(store.loadDiscovery("archived")?.lastCompleteDiscoveryStartedAt).toBe(
-      NOW.toISOString(),
-    );
+    expect(store.loadDiscovery("active")?.lastCompleteDiscoveryStartedAt).toBeNull();
+    expect(store.loadDiscovery("archived")?.lastCompleteDiscoveryStartedAt).toBeNull();
   });
 
   it("does not advance an incomplete index checkpoint after a page budget", async () => {
@@ -458,6 +454,52 @@ describe("Stage-2A history collection", () => {
     });
   });
 
+  it("discovers historical summaries beyond the range end and bounds message evidence at that end", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-historical", {
+      updatedAt: "2026-09-10T12:00:00.000Z",
+    });
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set("conv-historical", {
+      ...detail("conv-historical"),
+      messages: [
+        {
+          ...message("conv-historical", "msg-before-end"),
+          createdAt: "2026-09-07T23:59:59.000Z",
+        },
+        {
+          ...message("conv-historical", "msg-at-end"),
+          createdAt: EXPLICIT_RANGE.end,
+        },
+        {
+          ...message("conv-historical", "msg-after-end"),
+          createdAt: "2026-09-08T00:00:01.000Z",
+        },
+      ],
+    });
+    reader.messagePages.set(
+      "conv-historical",
+      new Map([["latest", completePage([])]]),
+    );
+
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store: new MemoryCheckpointStore(),
+      clock: { now: () => NOW },
+    }).collect({
+      mode: "backfill",
+      range: EXPLICIT_RANGE,
+    });
+
+    expect(result.conversations).toHaveLength(1);
+    expect(result.conversations[0]?.messages.map((item) => item.messageId)).toEqual([
+      "msg-before-end",
+    ]);
+    expect(
+      result.conversations[0]?.detail?.messages.map((item) => item.messageId),
+    ).toEqual(["msg-before-end"]);
+  });
+
   it("queues incomplete message revisits and clears them after a later complete pass", async () => {
     const reader = new ScriptedReader();
     const candidate = summary("conv-incomplete");
@@ -560,10 +602,210 @@ describe("Stage-2A history collection", () => {
       },
     });
     expect(explicit.range.start).toBe("2026-09-03T00:00:00.000Z");
-    expect(explicit.conversations).toHaveLength(1);
-    expect(explicit.conversations[0]?.summary.conversationId).toBe(
+    expect(explicit.conversations).toHaveLength(2);
+    expect(explicit.conversations.map((item) => item.summary.conversationId)).toEqual([
+      "conv-in-overlap",
       "conv-outside-overlap",
+    ]);
+  });
+
+  it("refreshes from an old watermark minus overlap without the default-range clamp", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-old-watermark", {
+      updatedAt: "2026-08-15T12:00:00.000Z",
+      hasVersions: false,
+    });
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set("conv-old-watermark", detail("conv-old-watermark"));
+    reader.messagePages.set(
+      "conv-old-watermark",
+      new Map([["latest", completePage([])]]),
     );
+
+    const oldWatermark = "2026-08-01T12:00:00.000Z";
+    const store = new MemoryCheckpointStore();
+    store.saveDiscovery(
+      testCheckpoint("active", {
+        lastCompleteDiscoveryStartedAt: oldWatermark,
+      }),
+    );
+    store.saveDiscovery(
+      testCheckpoint("archived", {
+        lastCompleteDiscoveryStartedAt: oldWatermark,
+      }),
+    );
+
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    }).collect({ mode: "incremental" });
+
+    expect(result.scopes.find((scope) => scope.scope === "active")).toMatchObject({
+      candidateCutoff: "2026-07-30T12:00:00.000Z",
+      coverage: "complete",
+    });
+    expect(result.conversations.map((item) => item.summary.conversationId)).toEqual([
+      "conv-old-watermark",
+    ]);
+    expect(store.loadDiscovery("active")?.lastCompleteDiscoveryStartedAt).toBe(
+      NOW.toISOString(),
+    );
+    expect(store.loadDiscovery("archived")?.lastCompleteDiscoveryStartedAt).toBe(
+      NOW.toISOString(),
+    );
+  });
+
+  it("resumes only when the frozen mode, range, and cutoff all match", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-resume");
+    reader.indexPages.set(
+      "active",
+      new Map([
+        [0, indexPage([candidate], 1, false, "continuation")],
+        [1, indexPage([candidate])],
+      ]),
+    );
+    reader.indexPages.set("archived", new Map([[0, indexPage([])]]));
+    reader.details.set("conv-resume", detail("conv-resume"));
+    reader.messagePages.set(
+      "conv-resume",
+      new Map([["latest", completePage([])]]),
+    );
+
+    const store = new MemoryCheckpointStore();
+    const partial = testCheckpoint("active", {
+      status: "partial",
+      mode: "backfill",
+      range: EXPLICIT_RANGE,
+      candidateCutoff: EXPLICIT_RANGE.start,
+      continuation: 1,
+      paginationState: "budget_exhausted",
+      lastCompleteDiscoveryStartedAt: null,
+    });
+
+    store.saveDiscovery(partial);
+    await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    }).collect({ mode: "backfill", range: EXPLICIT_RANGE });
+    expect(
+      reader.requests.find((request) => request.path.includes("scope=active"))?.path,
+    ).toContain("offset=1");
+
+    reader.requests.length = 0;
+    for (const mismatch of [
+      { mode: "reconciliation" as const },
+      {
+        range: {
+          start: "2026-09-02T00:00:00.000Z",
+          end: EXPLICIT_RANGE.end,
+        },
+      },
+      { candidateCutoff: "2026-08-31T00:00:00.000Z" },
+    ]) {
+      store.saveDiscovery({ ...partial, ...mismatch });
+      await new HistoryCollector(reader, {
+        accountId: "fixture-primary",
+        store,
+        clock: { now: () => NOW },
+      }).collect({ mode: "backfill", range: EXPLICIT_RANGE });
+      expect(
+        reader.requests.find((request) => request.path.includes("scope=active"))?.path,
+      ).toContain("offset=0");
+      reader.requests.length = 0;
+    }
+  });
+
+  it("does not advance a prior watermark after an unrecognized terminal page", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-malformed-index");
+    reader.indexPages.set(
+      "active",
+      new Map([
+        [
+          0,
+          {
+            ...indexPage([candidate]),
+            coverage: "unrecognized",
+          },
+        ],
+      ]),
+    );
+    reader.indexPages.set("archived", new Map([[0, indexPage([])]]));
+    reader.details.set("conv-malformed-index", detail("conv-malformed-index"));
+    reader.messagePages.set(
+      "conv-malformed-index",
+      new Map([["latest", completePage([])]]),
+    );
+
+    const priorWatermark = "2026-09-06T12:00:00.000Z";
+    const store = new MemoryCheckpointStore();
+    store.saveDiscovery(
+      testCheckpoint("active", {
+        lastCompleteDiscoveryStartedAt: priorWatermark,
+      }),
+    );
+    store.saveDiscovery(
+      testCheckpoint("archived", {
+        lastCompleteDiscoveryStartedAt: priorWatermark,
+      }),
+    );
+
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    }).collect({ mode: "incremental" });
+
+    expect(result.scopes.find((scope) => scope.scope === "active")).toMatchObject({
+      coverage: "partial",
+      warnings: ["index_unrecognized_page", "index_unvalidated_terminal_page"],
+    });
+    expect(store.loadDiscovery("active")?.lastCompleteDiscoveryStartedAt).toBe(
+      priorWatermark,
+    );
+  });
+
+  it("uses the fourteen-day reconciliation range while acquiring outstanding work", async () => {
+    const reader = new ScriptedReader();
+    addCompleteIndex(reader, [], []);
+    reader.details.set("conv-outstanding", detail("conv-outstanding"));
+    reader.messagePages.set(
+      "conv-outstanding",
+      new Map([["latest", completePage([])]]),
+    );
+    const store = new MemoryCheckpointStore();
+    store.upsertRevisit({
+      stateVersion: 1,
+      accountId: "fixture-primary",
+      conversationId: "conv-outstanding",
+      scopes: ["active"],
+      status: "pending",
+      reason: "incomplete_detail",
+      firstSeenAt: "2026-08-01T00:00:00.000Z",
+      lastSeenAt: "2026-09-06T12:00:00.000Z",
+      attempts: 1,
+      nextEligibleAt: NOW.toISOString(),
+      lastError: "adapter_error",
+      detailPagesFetched: 1,
+    });
+
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    }).collect({ mode: "reconciliation" });
+
+    expect(result.range).toEqual({
+      start: "2026-08-24T12:00:00.000Z",
+      end: NOW.toISOString(),
+    });
+    expect(result.conversations.map((item) => item.summary.conversationId)).toEqual([
+      "conv-outstanding",
+    ]);
+    expect(result.revisits).toEqual([]);
   });
 
   it("persists per-scope checkpoints and revisits across store instances", () => {
@@ -700,6 +942,31 @@ describe("Stage-2A history collection", () => {
     }
   });
 });
+
+function testCheckpoint(
+  scope: HistoryScope,
+  overrides: Partial<DiscoveryCheckpoint> = {},
+): DiscoveryCheckpoint {
+  return {
+    stateVersion: 1,
+    accountId: "fixture-primary",
+    scope,
+    status: "complete",
+    mode: "incremental",
+    range: EXPLICIT_RANGE,
+    candidateCutoff: EXPLICIT_RANGE.start,
+    scanStartedAt: NOW.toISOString(),
+    continuation: null,
+    pagesFetched: 1,
+    pageBudget: 500,
+    lastCompleteDiscoveryStartedAt: null,
+    lastPageAt: NOW.toISOString(),
+    paginationState: "complete",
+    warnings: [],
+    updatedAt: NOW.toISOString(),
+    ...overrides,
+  };
+}
 
 class RecordingFixtureTransport implements HistoryTransport {
   constructor(

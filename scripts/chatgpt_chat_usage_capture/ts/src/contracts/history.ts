@@ -47,13 +47,16 @@ export interface DiscoveryCheckpoint {
   accountId: string;
   scope: HistoryScope;
   status: CheckpointStatus;
+  /** Frozen identity for the discovery acquisition being resumed. */
   mode: HistoryCollectionMode;
   range: HistoryRange;
+  /** Lower-bound discovery cutoff frozen with mode and range. */
   candidateCutoff: string;
   scanStartedAt: string | null;
   continuation: number | null;
   pagesFetched: number;
   pageBudget: number;
+  /** Clean implicit-refresh watermark; historical scans never advance it. */
   lastCompleteDiscoveryStartedAt: string | null;
   lastPageAt: string | null;
   paginationState: PaginationState;
@@ -155,6 +158,7 @@ export interface AcquiredConversation {
   summary: ConversationSummary;
   scopes: HistoryScope[];
   detail: ConversationDetailProjection | null;
+  /** Evidence is bounded by the collection range's exclusive end. */
   messages: MessageRecord[];
   coverage: "complete" | "partial" | "unknown";
   revisit: RevisitEntry | null;
