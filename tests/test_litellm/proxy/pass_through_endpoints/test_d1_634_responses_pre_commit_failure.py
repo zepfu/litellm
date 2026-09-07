@@ -1799,6 +1799,73 @@ class TestCoordinatorSleepWakeup:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("wait_seconds", "request_deadline_seconds"),
+        [(0.05, 7200.0), (0.2, 0.05)],
+    )
+    async def test_sleep_with_wakeup_bounds_hanging_redis_and_joins_cancellation(
+        self,
+        wait_seconds,
+        request_deadline_seconds,
+    ):
+        target_identity = "openai:redis-timeout"
+        namespace = "aawm-routing-alpha-v1"
+        redis_started = asyncio.Event()
+        redis_cancelled = asyncio.Event()
+        redis_tasks = []
+
+        async def hanging_get(_key):
+            task = asyncio.current_task()
+            assert task is not None
+            redis_tasks.append(task)
+            redis_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                redis_cancelled.set()
+
+        redis_client = SimpleNamespace(get=hanging_get)
+        redis_cache = SimpleNamespace(
+            init_async_client=MagicMock(return_value=redis_client)
+        )
+        manager = SimpleNamespace(
+            get_dual_cache=MagicMock(
+                return_value=SimpleNamespace(redis_cache=redis_cache)
+            )
+        )
+
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        with patch(
+            "litellm.proxy.aawm_alias_routing_redis."
+            "aawm_alias_routing_redis_manager",
+            manager,
+        ):
+            coordinator = OpenAIAlphaCapacityRetryCoordinator(
+                target_identity=target_identity,
+                namespace=namespace,
+                budget=OpenAIAlphaCapacityRetryBudget(
+                    deadline_seconds=request_deadline_seconds
+                ),
+            )
+            reason = await asyncio.wait_for(
+                coordinator.sleep_with_wakeup(wait_seconds),
+                timeout=0.5,
+            )
+        elapsed = loop.time() - started_at
+
+        assert reason == "timer"
+        assert redis_started.is_set()
+        assert redis_cancelled.is_set()
+        assert redis_tasks
+        assert redis_tasks[0].done()
+        assert redis_tasks[0].cancelled()
+        assert elapsed < 0.2
+        assert not _LOCAL_CAPACITY_WAKEUP_EVENTS.get(
+            (namespace, target_identity)
+        )
+
+    @pytest.mark.asyncio
     async def test_sleep_with_wakeup_does_not_treat_expired_epoch_as_success(self):
         target_identity = "openai:redis-expiry"
         namespace = "aawm-routing-alpha-v1"

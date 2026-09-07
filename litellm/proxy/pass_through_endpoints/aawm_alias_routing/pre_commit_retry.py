@@ -389,6 +389,48 @@ async def _fetch_capacity_success_epoch(
     return epoch if epoch > 0 else None
 
 
+async def _fetch_capacity_success_epoch_with_deadline(
+    redis_cache: Any,
+    key: str,
+    *,
+    deadline: float,
+) -> Optional[int]:
+    """Read the wakeup epoch without exceeding the remaining wait budget."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise asyncio.TimeoutError
+
+    fetch_task = asyncio.create_task(
+        _fetch_capacity_success_epoch(redis_cache, key)
+    )
+    try:
+        return await asyncio.wait_for(fetch_task, timeout=remaining)
+    finally:
+        if not fetch_task.done():
+            fetch_task.cancel()
+        await asyncio.gather(fetch_task, return_exceptions=True)
+
+
+async def _read_capacity_success_epoch_for_wait(
+    redis_cache: Any,
+    key: str,
+    *,
+    deadline: float,
+) -> tuple[Optional[int], bool]:
+    """Return an epoch and whether the bounded Redis read completed."""
+    try:
+        return (
+            await _fetch_capacity_success_epoch_with_deadline(
+                redis_cache,
+                key,
+                deadline=deadline,
+            ),
+            True,
+        )
+    except Exception:
+        return None, False
+
+
 # ---------------------------------------------------------------------------
 # Coordinator
 # ---------------------------------------------------------------------------
@@ -541,6 +583,9 @@ class OpenAIAlphaCapacityRetryCoordinator:
         if wait_seconds <= 0:
             return "timer"
 
+        wait_deadline = time.monotonic() + wait_seconds
+        request_deadline = self._start_monotonic + self.deadline_seconds
+        deadline = min(wait_deadline, request_deadline)
         self.record_pre_wait(
             wait_seconds,
             error_class=error_class,
@@ -558,15 +603,15 @@ class OpenAIAlphaCapacityRetryCoordinator:
 
         try:
             if redis_cache is not None and redis_key is not None:
-                try:
-                    wakeup.starting_epoch = await _fetch_capacity_success_epoch(
-                        redis_cache, redis_key
-                    )
-                except Exception:
-                    wakeup.starting_epoch = None
-                    wakeup.epoch_baseline_known = False
+                (
+                    wakeup.starting_epoch,
+                    wakeup.epoch_baseline_known,
+                ) = await _read_capacity_success_epoch_for_wait(
+                    redis_cache,
+                    redis_key,
+                    deadline=deadline,
+                )
 
-            deadline = time.monotonic() + wait_seconds
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -577,14 +622,16 @@ class OpenAIAlphaCapacityRetryCoordinator:
                     wakeup.wakeup_reason = "peer_success"
                     break
 
-                poll_seconds = min(_OPENAI_CAPACITY_SUCCESS_POLL_SECONDS, remaining)
                 if redis_cache is not None and redis_key is not None:
-                    try:
-                        current_epoch = await _fetch_capacity_success_epoch(
-                            redis_cache, redis_key
-                        )
-                    except Exception:
-                        current_epoch = None
+                    current_epoch, _ = await _read_capacity_success_epoch_for_wait(
+                        redis_cache,
+                        redis_key,
+                        deadline=deadline,
+                    )
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        wakeup.wakeup_reason = "timer"
+                        break
                     if not wakeup.epoch_baseline_known:
                         if current_epoch is not None:
                             wakeup.starting_epoch = current_epoch
@@ -596,7 +643,11 @@ class OpenAIAlphaCapacityRetryCoordinator:
                     ):
                         wakeup.wakeup_reason = "peer_success"
                         break
+                    if wakeup.event.is_set():
+                        wakeup.wakeup_reason = "peer_success"
+                        break
 
+                poll_seconds = min(_OPENAI_CAPACITY_SUCCESS_POLL_SECONDS, remaining)
                 try:
                     await asyncio.wait_for(wakeup.event.wait(), timeout=poll_seconds)
                 except asyncio.TimeoutError:
