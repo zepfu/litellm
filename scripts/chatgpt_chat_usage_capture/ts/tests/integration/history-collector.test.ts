@@ -12,6 +12,7 @@ import {
 } from "../../src/adapters/chatgpt/adapter.js";
 import { FixtureTransport } from "../../src/adapters/chatgpt/fixture-transport.js";
 import { HistoryCollector } from "../../src/history/collector.js";
+import { adaptResponse } from "../../src/browser/session.js";
 import {
   SqliteCheckpointStore,
   MemoryCheckpointStore,
@@ -446,6 +447,64 @@ describe("Stage-2A history collection", () => {
       ).toBe(false);
     },
   );
+
+  it.each([
+    ["120", "2026-09-07T12:12:00.000Z"],
+    ["Mon, 07 Sep 2026 13:00:00 GMT", "2026-09-07T13:00:00.000Z"],
+  ])("preserves header receipt time through delayed body processing: %s", async (retryAfter, deadline) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-07T12:10:00.000Z"));
+    try {
+      const adapter = new ChatGPTHistoryAdapter({
+        request: async () => adaptResponse({
+          status: () => 429,
+          headers: () => ({ "retry-after": retryAfter }),
+          body: async () => {
+            vi.setSystemTime(new Date("2026-09-07T12:11:00.000Z"));
+            return Buffer.from("{}");
+          },
+        }),
+      });
+      const result = await new HistoryCollector(adapter, {
+        accountId: "fixture-primary",
+        store: new MemoryCheckpointStore(),
+      }).collect({ mode: "incremental", now: NOW });
+      expect(result.scanStartedAt).toBe(NOW.toISOString());
+      expect(result.accountState.pausedAt).toBe("2026-09-07T12:10:00.000Z");
+      expect(result.accountState.cooldownUntil).toBe(deadline);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("atomically persists paused account status after discovery has started", async () => {
+    const ledger = new Ledger(":memory:");
+    const account = defaultConfig().accounts[0]!;
+    Object.assign(account, {
+      id: LEDGER_SCOPE.collectorAccountId,
+      expectedProviderUserId: LEDGER_SCOPE.providerUserId,
+      expectedWorkspaceId: LEDGER_SCOPE.workspaceId,
+      quotaOwnerId: LEDGER_SCOPE.quotaOwnerId,
+    });
+    const reader = new ScriptedReader();
+    reader.indexPages.set("active", new Map([[0,
+      indexPage([summary("conv-auth")], 1, false, "continuation"),
+    ]]));
+    reader.indexErrors.set("active:1", new AuthenticationRequiredError(
+      "challenge", { status: 403, path: "/backend-api/conversations" },
+    ));
+    try {
+      const result = await collectIntoLedger(reader, ledger, account, {
+        mode: "incremental", now: NOW,
+      });
+      expect(result.ledger.runId).not.toBeNull();
+      expect(ledger.listAccounts()[0]?.authState).toBe("paused");
+      expect(new SqliteCheckpointStore(ledger, LEDGER_SCOPE).loadAccountState())
+        .toMatchObject({ status: "paused", reason: "authentication" });
+    } finally {
+      ledger.close();
+    }
+  });
 
   it("does not shorten numeric Retry-After when the receipt clock fails", async () => {
     const receivedAt = new Date("2026-09-07T12:10:00.000Z");

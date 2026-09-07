@@ -16,9 +16,10 @@ at a normal browser profile or copy authentication state.
 Run `bootstrap`, then `inspect-capabilities`, then `backfill`.
 Interactive login requires `bootstrap --interactive-login`. If collection
 pauses for authentication, rerun that command with `--interactive-login`; only
-an interactive login followed by verified ready Chat identity clears the
+explicit recovery followed by verified bound ready Chat identity clears the
 persisted authentication pause. Read-only inspection and ordinary collection
-never clear it. Inspection covers the first index pages only; backfill
+never clear it. Recovery does not require opening login UI when the session
+is already ready. Inspection covers the first index pages only; backfill
 performs traversal. Fixture acceptance uses `fixture_history` plus
 `--fixture-root`, without live authentication.
 

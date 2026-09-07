@@ -195,7 +195,7 @@ async function runBootstrap(args: CliArgs): Promise<number> {
   if (
     args.interactiveLogin &&
     result.state === "ready" &&
-    result.interactiveLoginUsed
+    result.liveVerification === "passed"
   ) {
     const databasePath = resolveDatabasePath(config, args);
     if (existsSync(databasePath)) {

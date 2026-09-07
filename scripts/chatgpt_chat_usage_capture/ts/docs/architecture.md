@@ -49,8 +49,14 @@ authorized. Downloads are disabled, and browser storage never leaves the
 profile. Fixture mode uses the same adapter without constructing a browser.
 When an account is paused for authentication, only `bootstrap
 --interactive-login` can clear the persisted pause, and only after the
-interactive session verifies the configured ready Chat identity. Read-only
+explicit recovery verifies the configured ready Chat identity, whether or not
+the login UI is needed. Read-only
 capability inspection cannot reset account state.
+
+The browser transport stamps `response_received_at` before awaiting the body;
+adapters validate and carry it as `HttpStatusError.receivedAt`. Wrappers must
+preserve this metadata. Relative Retry-After uses receipt time, not body
+processing or frozen acquisition time; HTTP-date deadlines remain absolute.
 
 `src/adapters/chatgpt/adapter.ts` and both transports enforce exact GET-only
 route shapes and safe conversation IDs. `401`, `403`, HTML auth pages, and

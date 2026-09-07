@@ -471,7 +471,9 @@ export class HistoryCollector {
     // run captured 10 minutes before the 429 must not shorten the deadline.
     const receivedAt =
       error instanceof HttpStatusError && error.retryAfter !== null
-        ? this.responseReceivedAt(now)
+        ? error.receivedAt !== null
+          ? new Date(error.receivedAt)
+          : this.responseReceivedAt(now)
         : now;
     const accountState: HistoryAccountState = {
       status: "paused",

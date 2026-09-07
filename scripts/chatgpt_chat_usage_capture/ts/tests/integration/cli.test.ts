@@ -161,7 +161,7 @@ describe("CLI", () => {
         identityErrors: [],
       },
       capabilities: emptyCapabilities(),
-      interactiveLoginUsed: true,
+      interactiveLoginUsed: false,
       liveVerification: "passed",
       notes: [],
     });

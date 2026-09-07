@@ -56,6 +56,7 @@ export class HttpStatusError extends AdapterError {
   readonly status: number;
   readonly path: string | null;
   readonly retryAfter: string | null;
+  readonly receivedAt: string | null;
 
   constructor(
     message: string,
@@ -63,6 +64,7 @@ export class HttpStatusError extends AdapterError {
       status: number;
       path?: string | null;
       retryAfter?: string | null;
+      receivedAt?: string | null;
     },
   ) {
     super(message);
@@ -70,6 +72,10 @@ export class HttpStatusError extends AdapterError {
     this.status = options.status;
     this.path = options.path ?? null;
     this.retryAfter = options.retryAfter ?? null;
+    this.receivedAt = typeof options.receivedAt === "string" &&
+      Number.isFinite(Date.parse(options.receivedAt))
+      ? new Date(options.receivedAt).toISOString()
+      : null;
   }
 }
 
@@ -104,10 +110,11 @@ export class AuthenticationRequiredError extends HttpStatusError {
 export class RateLimitedError extends HttpStatusError {
   constructor(
     message: string,
-    options: { status?: number; retryAfter?: string | null; path?: string | null } = {},
+    options: { status?: number; retryAfter?: string | null; path?: string | null; receivedAt?: string | null } = {},
   ) {
     super(message, {
       status: options.status ?? 429,
+      receivedAt: options.receivedAt ?? null,
       ...(options.retryAfter !== undefined
         ? { retryAfter: options.retryAfter }
         : {}),
@@ -795,6 +802,8 @@ export function raiseIfRateLimited(
     {
       status: 429,
       retryAfter: retryAfterValue(payload),
+      receivedAt: typeof payload.response_received_at === "string"
+        ? payload.response_received_at : null,
       path,
     },
   );

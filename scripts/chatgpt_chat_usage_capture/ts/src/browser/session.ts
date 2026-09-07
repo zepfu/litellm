@@ -223,6 +223,7 @@ export async function adaptResponse(response: {
   headers(): Record<string, string>;
   body(): Promise<Uint8Array>;
 }, maxResponseBytes = MAX_RESPONSE_BYTES): Promise<Record<string, unknown>> {
+  const receivedAt = new Date().toISOString();
   const status = response.status();
   const headers = response.headers();
   const contentType = String(headers["content-type"] ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
@@ -252,6 +253,7 @@ export async function adaptResponse(response: {
     http_status: status,
     content_type: contentType,
     retry_after: retryAfter,
+    response_received_at: receivedAt,
   };
 }
 

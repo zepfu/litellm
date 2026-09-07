@@ -101,7 +101,8 @@ node bin/usage-capture.mjs rebuild --config ./config.json
 
 Interactive login is opt-in: `bootstrap --interactive-login`. When collection
 is paused for authentication, that command is the explicit recovery entry:
-only a verified interactive ready Chat identity clears the persisted pause.
+explicit recovery with a verified bound ready Chat identity clears the pause,
+even when the login UI is unnecessary.
 Read-only inspection cannot clear it. Missing or mismatched identity blocks
 collection. A stored collector account cannot be rebound to a different
 identity/workspace/quota owner; use a distinct account ID instead. No command

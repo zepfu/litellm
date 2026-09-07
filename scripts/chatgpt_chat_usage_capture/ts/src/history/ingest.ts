@@ -329,6 +329,11 @@ export async function collectIntoLedger(
 
   ledger.transaction(() => {
     ensureRunStarted(result.identity, result.mode, result.scanStartedAt);
+    ledger.upsertAccount(scope, {
+      authState: result.identity.authState,
+      planPolicyId: account.planPolicyId || null,
+      enabled: account.enabled,
+    });
     for (const conversation of result.conversations) {
       if (persistedConversations.has(conversation.summary.conversationId)) {
         continue;
