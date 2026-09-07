@@ -27,7 +27,8 @@ import {
 } from "../adapters/chatgpt/adapter.js";
 
 export const CHATGPT_ORIGIN = "https://chatgpt.com";
-export const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+export const DEFAULT_MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
+export const MAX_RESPONSE_BYTES = DEFAULT_MAX_RESPONSE_BYTES;
 
 export const LIVE_GATE =
   "live Playwright collection requires Playwright and an existing dedicated browser profile. " +
@@ -81,6 +82,7 @@ export interface BrowserConfig {
   headless: boolean;
   allowInteractiveLogin: boolean;
   requestTimeoutSeconds: number;
+  maxResponseBytes?: number;
 }
 
 export function resolveDedicatedProfilePath(profilePath: string): string | null {
@@ -174,7 +176,7 @@ export class PlaywrightTransport implements HistoryTransport {
     if (response.status() >= 300 && response.status() < 400) {
       throw new AdapterError(`browser redirect rejected for ${path}`);
     }
-    return adaptResponse(response);
+    return adaptResponse(response, this.config.maxResponseBytes);
   }
 
   async close(): Promise<void> {
@@ -220,7 +222,7 @@ export async function adaptResponse(response: {
   status(): number;
   headers(): Record<string, string>;
   body(): Promise<Uint8Array>;
-}): Promise<Record<string, unknown>> {
+}, maxResponseBytes = MAX_RESPONSE_BYTES): Promise<Record<string, unknown>> {
   const status = response.status();
   const headers = response.headers();
   const contentType = String(headers["content-type"] ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
@@ -228,12 +230,12 @@ export async function adaptResponse(response: {
   let payload: Record<string, unknown> = {};
   try {
     const declaredLength = responseByteLength(headers);
-    if (declaredLength !== null && declaredLength > MAX_RESPONSE_BYTES) {
-      throw responseTooLargeError(declaredLength);
+    if (declaredLength !== null && declaredLength > maxResponseBytes) {
+      throw responseTooLargeError(declaredLength, maxResponseBytes);
     }
     const body = await response.body();
-    if (body.byteLength > MAX_RESPONSE_BYTES) {
-      throw responseTooLargeError(body.byteLength);
+    if (body.byteLength > maxResponseBytes) {
+      throw responseTooLargeError(body.byteLength, maxResponseBytes);
     }
     const parsed = JSON.parse(Buffer.from(body).toString("utf8")) as unknown;
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
@@ -343,8 +345,11 @@ function responseByteLength(headers: Record<string, string>): number | null {
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
-function responseTooLargeError(actualBytes: number): AdapterError {
+function responseTooLargeError(
+  actualBytes: number,
+  maxResponseBytes: number,
+): AdapterError {
   return new AdapterError(
-    `browser response exceeds ${MAX_RESPONSE_BYTES} byte limit (${actualBytes} bytes)`,
+    `browser response exceeds ${maxResponseBytes} byte limit (${actualBytes} bytes)`,
   );
 }

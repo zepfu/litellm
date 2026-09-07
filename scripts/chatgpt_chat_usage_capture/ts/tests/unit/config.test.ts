@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { MAX_RESPONSE_BYTES } from "../../src/browser/session.js";
 import { defaultConfig, loadConfig, resolveDatabasePath, saveConfig } from "../../src/config.js";
 
 describe("Stage-2 config contract", () => {
@@ -40,7 +41,9 @@ describe("Stage-2 config contract", () => {
       indexPageSize: 100,
       maxIndexPagesPerScope: 500,
       maxPagesPerConversationPerRun: 100,
+      maxResponseBytes: MAX_RESPONSE_BYTES,
     });
+    expect(loaded.accounts[0]?.browser.maxResponseBytes).toBe(MAX_RESPONSE_BYTES);
   });
 
   it("preserves supported collection bounds and rejects unsupported controls", () => {
@@ -55,6 +58,7 @@ describe("Stage-2 config contract", () => {
       indexPageSize: 50,
       maxIndexPagesPerScope: 9,
       maxPagesPerConversationPerRun: 8,
+      maxResponseBytes: 16 * 1024 * 1024,
     };
 
     saveConfig(config, path);
@@ -68,21 +72,22 @@ describe("Stage-2 config contract", () => {
       index_page_size: 50,
       max_index_pages_per_scope: 9,
       max_pages_per_conversation_per_run: 8,
+      max_response_bytes: 16 * 1024 * 1024,
     });
     expect(loadConfig(path).accounts[0]?.collection).toMatchObject(
       config.accounts[0]!.collection,
     );
 
-    written.accounts[0]!.collection = { max_response_bytes: 1024 };
+    written.accounts[0]!.collection = { unsupported_control: 1024 };
     writeFileSync(path, JSON.stringify(written), "utf8");
     expect(() => loadConfig(path)).toThrow(
-      "accounts[0].collection.max_response_bytes is an unsupported Stage-2 collection control",
+      "accounts[0].collection.unsupported_control is an unsupported Stage-2 collection control",
     );
 
-    written.accounts[0]!.collection = { max_pages_per_conversation_per_run: 0 };
+    written.accounts[0]!.collection = { max_response_bytes: 0 };
     writeFileSync(path, JSON.stringify(written), "utf8");
     expect(() => loadConfig(path)).toThrow(
-      "accounts[0].collection.max_pages_per_conversation_per_run must be a positive integer",
+      "accounts[0].collection.max_response_bytes must be a positive integer",
     );
   });
 
