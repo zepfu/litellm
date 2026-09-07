@@ -1110,92 +1110,13 @@ async def handle_alias_route(  # noqa: PLR0915
         )
         terminal_exc: Optional[HTTPException] = None
         if preserve_upstream_failure:
-            source_exc: Exception = exc
-            mark_terminal_fn = getattr(
-                _passthrough_helpers,
-                "_mark_passthrough_capacity_exception_terminal",
-                None,
+            source_exc = exc
+            wire_headers = _passthrough_helpers._get_passthrough_terminal_wire_headers(
+                source_exc
             )
-            if callable(mark_terminal_fn) and not getattr(
-                source_exc,
-                "_aawm_openai_capacity_expired",
-                False,
-            ):
-                try:
-                    converted_exc = mark_terminal_fn(source_exc)
-                except Exception:
-                    converted_exc = source_exc
-                if isinstance(converted_exc, Exception):
-                    source_exc = converted_exc
-
-            if source_exc is exc and not getattr(
-                source_exc,
-                "_aawm_openai_capacity_expired",
-                False,
-            ):
-                if isinstance(source_exc, httpx.HTTPStatusError):
-                    build_http_exception_fn = getattr(
-                        _passthrough_helpers,
-                        "_build_http_exception_from_upstream_status_error",
-                        None,
-                    )
-                    if callable(build_http_exception_fn):
-                        try:
-                            response_content = source_exc.response.content
-                        except Exception:
-                            response_content = str(source_exc)
-                        try:
-                            converted_exc = build_http_exception_fn(
-                                source_exc,
-                                response_content,
-                            )
-                        except Exception:
-                            converted_exc = source_exc
-                        if isinstance(converted_exc, Exception):
-                            source_exc = converted_exc
-            if source_exc is exc and not getattr(
-                source_exc,
-                "_aawm_openai_capacity_expired",
-                False,
-            ):
-                try:
-                    from litellm.proxy.pass_through_endpoints.streaming_handler import (
-                        ResponsesStreamPreCommitFailure,
-                    )
-                except Exception:
-                    ResponsesStreamPreCommitFailure = ()  # type: ignore[assignment]
-                if isinstance(source_exc, ResponsesStreamPreCommitFailure):
-                    source_exc = source_exc.as_http_exception()
-
-            raw_headers = getattr(source_exc, "headers", None)
-            upstream_headers = getattr(source_exc, "upstream_headers", None)
-            source_headers: dict[str, Any] = {}
-            if isinstance(upstream_headers, Mapping):
-                source_headers.update(dict(upstream_headers))
-            if isinstance(raw_headers, Mapping):
-                if isinstance(source_exc, HTTPException):
-                    source_headers.update(dict(raw_headers))
-                else:
-                    source_headers.update(
-                        {
-                            str(header_name): header_value
-                            for header_name, header_value in raw_headers.items()
-                            if str(header_name).lower() == "retry-after"
-                        }
-                    )
-            response = getattr(source_exc, "response", None)
-            response_headers = getattr(response, "headers", None)
-            if isinstance(response_headers, Mapping):
-                source_headers.update(dict(response_headers))
-
             if isinstance(source_exc, HTTPException):
                 terminal_exc = source_exc
-                if source_headers:
-                    merged_source_headers = dict(
-                        getattr(source_exc, "headers", None) or {}
-                    )
-                    merged_source_headers.update(source_headers)
-                    terminal_exc.headers = merged_source_headers
+                terminal_exc.headers = wire_headers
             else:
                 source_detail = getattr(source_exc, "detail", None)
                 if source_detail is None:
@@ -1204,23 +1125,13 @@ async def handle_alias_route(  # noqa: PLR0915
                     source_detail = getattr(source_exc, "message", None) or str(
                         source_exc
                     )
-                source_status_code = _extract_adapter_exception_status_code(source_exc)
-                if source_status_code is None:
-                    try:
-                        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
-                            _PassthroughHiddenRetryBudgetTimeout,
-                        )
-                    except Exception:
-                        _PassthroughHiddenRetryBudgetTimeout = ()  # type: ignore[assignment]
-                    source_status_code = (
-                        status.HTTP_504_GATEWAY_TIMEOUT
-                        if isinstance(source_exc, _PassthroughHiddenRetryBudgetTimeout)
-                        else status.HTTP_502_BAD_GATEWAY
-                    )
                 terminal_exc = HTTPException(
-                    status_code=int(source_status_code),
+                    status_code=(
+                        _passthrough_helpers._extract_exception_status_code(source_exc)
+                        or status.HTTP_502_BAD_GATEWAY
+                    ),
                     detail=copy.deepcopy(source_detail),
-                    headers=source_headers or None,
+                    headers=wire_headers,
                 )
                 for field in (
                     "attempted_provider_call",
@@ -1238,20 +1149,6 @@ async def handle_alias_route(  # noqa: PLR0915
                     if hasattr(source_exc, field):
                         setattr(terminal_exc, field, getattr(source_exc, field))
             setattr(terminal_exc, "_aawm_openai_capacity_expired", True)
-            wire_headers_fn = getattr(
-                _passthrough_helpers,
-                "_get_passthrough_terminal_wire_headers",
-                None,
-            )
-            if callable(wire_headers_fn):
-                try:
-                    wire_headers = wire_headers_fn(terminal_exc)
-                except Exception:
-                    wire_headers = None
-                if isinstance(wire_headers, Mapping) and wire_headers:
-                    merged_headers = dict(getattr(terminal_exc, "headers", None) or {})
-                    merged_headers.update(dict(wire_headers))
-                    terminal_exc.headers = merged_headers
         elif _is_cursor_session_continuation_failure(exc, candidate=candidate):
             detail = getattr(exc, "detail", None)
             if not isinstance(detail, dict):
@@ -1410,39 +1307,6 @@ async def handle_alias_route(  # noqa: PLR0915
         )
         raise terminal_exc from None
 
-    def _record_capacity_retry_terminal(
-        coordinator: OpenAIAlphaCapacityRetryCoordinator,
-        *,
-        reason: str,
-        error_class: Optional[str],
-        status_code: Optional[int],
-    ) -> None:
-        """Record expiry across old and metadata-aware coordinator contracts."""
-        if getattr(coordinator, "terminal_reason", "") == reason:
-            return
-        record_terminal = getattr(coordinator, "record_terminal", None)
-        if not callable(record_terminal):
-            return
-        try:
-            parameters = inspect.signature(record_terminal).parameters.values()
-        except (TypeError, ValueError):
-            parameters = ()
-        accepts_metadata = any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            or parameter.name in {"error_class", "status_code"}
-            for parameter in parameters
-        )
-        if accepts_metadata:
-            record_terminal(
-                reason,
-                error_class=error_class or "unknown",
-                status_code=status_code,
-            )
-        else:
-            # The base driver predates structured terminal metadata. The
-            # logging-schema owner supplies the keyword-aware implementation.
-            record_terminal(reason)
-
     def _remember_capacity_failure(
         *,
         failure_exc: Exception,
@@ -1460,11 +1324,7 @@ async def handle_alias_route(  # noqa: PLR0915
             return
         last_capacity_failure_exc = failure_exc
         last_capacity_failure_class = str(error_class)
-        last_capacity_failure_target_identity = getattr(
-            capacity_retry_coordinator,
-            "target_identity",
-            None,
-        )
+        last_capacity_failure_target_identity = capacity_retry_coordinator.target_identity
 
     def _capacity_expiry_source(
         *,
@@ -1473,7 +1333,7 @@ async def handle_alias_route(  # noqa: PLR0915
     ) -> Optional[tuple[Exception, str]]:
         if capacity_retry_coordinator is None:
             return None
-        target_identity = getattr(capacity_retry_coordinator, "target_identity", None)
+        target_identity = capacity_retry_coordinator.target_identity
         same_target_prior_failure = (
             last_capacity_failure_exc is not None
             and last_capacity_failure_target_identity == target_identity
@@ -1483,24 +1343,22 @@ async def handle_alias_route(  # noqa: PLR0915
                 failure_exc,
                 str(error_class or last_capacity_failure_class or "upstream_timeout"),
             )
-        if getattr(capacity_retry_coordinator, "terminal_reason", "") == (
-            "deadline_exhausted"
-        ):
-            if same_target_prior_failure:
+        if capacity_retry_coordinator.terminal_reason == "deadline_exhausted":
+            if same_target_prior_failure and last_capacity_failure_exc is not None:
                 return (
                     last_capacity_failure_exc,
                     last_capacity_failure_class or "capacity_exhausted",
                 )
             return failure_exc, str(error_class or "upstream_timeout")
         if (
-            getattr(capacity_retry_coordinator, "remaining_seconds", 0.0) <= 0
+            capacity_retry_coordinator.remaining_seconds <= 0
             and (
                 error_class == "upstream_timeout"
                 or _extract_adapter_exception_status_code(failure_exc) == 504
                 or isinstance(failure_exc, httpx.TimeoutException)
             )
         ):
-            if same_target_prior_failure:
+            if same_target_prior_failure and last_capacity_failure_exc is not None:
                 return (
                     last_capacity_failure_exc,
                     last_capacity_failure_class or "capacity_exhausted",
@@ -1508,7 +1366,7 @@ async def handle_alias_route(  # noqa: PLR0915
             return failure_exc, "upstream_timeout"
         return None
 
-    def _new_capacity_deadline_timeout() -> HTTPException:
+    def _new_capacity_deadline_timeout() -> Exception:
         return HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={
@@ -1533,32 +1391,22 @@ async def handle_alias_route(  # noqa: PLR0915
         terminal_error_class = str(error_class or "upstream_timeout")
         terminal_exc = failure_exc
         if not getattr(terminal_exc, "_aawm_openai_capacity_expired", False):
-            mark_terminal_fn = getattr(
-                _passthrough_helpers,
-                "_mark_passthrough_capacity_exception_terminal",
-                None,
+            terminal_exc = (
+                _passthrough_helpers._mark_passthrough_capacity_exception_terminal(
+                    terminal_exc
+                )
             )
-            if callable(mark_terminal_fn):
-                try:
-                    converted_exc = mark_terminal_fn(terminal_exc)
-                except Exception:
-                    converted_exc = terminal_exc
-                if isinstance(converted_exc, Exception):
-                    terminal_exc = converted_exc
-            if (
-                not getattr(terminal_exc, "_aawm_openai_capacity_expired", False)
-                and isinstance(terminal_exc, HTTPException)
-            ):
-                setattr(terminal_exc, "_aawm_openai_capacity_expired", True)
-        terminal_status_code = _extract_adapter_exception_status_code(terminal_exc)
+        terminal_status_code = _passthrough_helpers._extract_exception_status_code(
+            terminal_exc
+        )
         if terminal_status_code is None and terminal_error_class == "upstream_timeout":
             terminal_status_code = status.HTTP_504_GATEWAY_TIMEOUT
-        _record_capacity_retry_terminal(
-            capacity_retry_coordinator,
-            reason="deadline_exhausted",
-            error_class=terminal_error_class,
-            status_code=terminal_status_code,
-        )
+        if capacity_retry_coordinator.terminal_reason != "deadline_exhausted":
+            capacity_retry_coordinator.record_terminal(
+                "deadline_exhausted",
+                error_class=terminal_error_class,
+                status_code=terminal_status_code,
+            )
         attempt_record.pop("cooldown_seconds", None)
         attempt_record["cooldown_scope"] = "none"
         _update_codex_auto_agent_retryable_attempt_record(
@@ -1710,10 +1558,8 @@ async def handle_alias_route(  # noqa: PLR0915
         if (
             capacity_retry_coordinator is not None
             and (
-                getattr(capacity_retry_coordinator, "terminal_reason", "")
-                == "deadline_exhausted"
-                or getattr(capacity_retry_coordinator, "remaining_seconds", 0.0)
-                <= 0
+                capacity_retry_coordinator.terminal_reason == "deadline_exhausted"
+                or capacity_retry_coordinator.remaining_seconds <= 0
             )
         ):
             deadline_failure = (
@@ -2750,18 +2596,6 @@ async def handle_alias_route(  # noqa: PLR0915
                         failure_class=error_class,
                         error_code=attempt_record.get("error_code"),
                     )
-                if error_class is None:
-                    expiry_source = _capacity_expiry_source(
-                        failure_exc=failure_exc,
-                        error_class=None,
-                    )
-                    if expiry_source is not None:
-                        _terminate_alias_capacity_retry_expiry(
-                            failure_exc=expiry_source[0],
-                            error_class=expiry_source[1],
-                            kimi_failure_metadata=kimi_failure_metadata,
-                        )
-                    raise _proxy_exception_for_unclassified_probe_failure(failure_exc)
                 _remember_capacity_failure(
                     failure_exc=failure_exc,
                     error_class=error_class,

@@ -34,9 +34,6 @@ from starlette.requests import Request
 
 from litellm.proxy.pass_through_endpoints import aawm_alias_routing as package
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
-from litellm.proxy.pass_through_endpoints import (
-    pass_through_endpoints as passthrough_endpoints,
-)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import candidate_loop
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     pre_commit_retry as pre_commit_retry_module,
@@ -2808,10 +2805,14 @@ async def test_candidate_loop_capacity_retries_use_one_request_coordinator(  # n
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("expiry_mode", ["planner_deadline", "in_flight"])
+@pytest.mark.parametrize("failure_kind", ["sse", "raw_http"])
 async def test_candidate_loop_capacity_expiry_preserves_upstream_failure(  # noqa: PLR0915
     expiry_mode: str,
+    failure_kind: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import httpx
+
     from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
         _PassthroughHiddenRetryBudgetTimeout,
     )
@@ -2829,6 +2830,11 @@ async def test_candidate_loop_capacity_expiry_preserves_upstream_failure(  # noq
         state=SimpleNamespace(),
         url=SimpleNamespace(path="/openai_passthrough/v1/responses"),
     )
+
+    async def _is_disconnected() -> bool:
+        return False
+
+    request.is_disconnected = _is_disconnected
     candidate = {
         "provider": "openai",
         "model": "gpt-5.4-codex",
@@ -2846,7 +2852,16 @@ async def test_candidate_loop_capacity_expiry_preserves_upstream_failure(  # noq
     failover_calls: list[dict[str, Any]] = []
     redispatch_calls: list[dict[str, Any]] = []
     failure_records: list[dict[str, Any]] = []
-    terminal_records: list[str] = []
+    terminal_records: list[tuple[str, Optional[str], Optional[int]]] = []
+    upstream_detail = {
+        "error": {
+            "message": "upstream overloaded body",
+            "type": "server_error",
+            "code": "server_overloaded",
+            "retryable": True,
+        }
+    }
+    raw_body = json.dumps(upstream_detail)
 
     class _Coordinator:
         def __init__(self) -> None:
@@ -2862,15 +2877,23 @@ async def test_candidate_loop_capacity_expiry_preserves_upstream_failure(  # noq
         async def signal_success(self) -> None:
             return None
 
-        async def sleep_with_wakeup(self, wait_seconds: float) -> str:
+        async def sleep_with_wakeup(
+            self, wait_seconds: float, **_metadata: Any
+        ) -> str:
             waits.append(wait_seconds)
             return "timer"
 
-        def record_retry(self, _wakeup_reason: str) -> None:
+        def record_retry(self, _wakeup_reason: str, **_metadata: Any) -> None:
             self.retry_count += 1
 
-        def record_terminal(self, reason: str) -> None:
-            terminal_records.append(reason)
+        def record_terminal(
+            self,
+            reason: str,
+            *,
+            error_class: Optional[str] = None,
+            status_code: Optional[int] = None,
+        ) -> None:
+            terminal_records.append((reason, error_class, status_code))
             self.terminal_reason = reason
 
     coordinator = _Coordinator()
@@ -2897,6 +2920,29 @@ async def test_candidate_loop_capacity_expiry_preserves_upstream_failure(  # noq
             raise _PassthroughHiddenRetryBudgetTimeout(
                 "upstream request timed out"
             )
+        if failure_kind == "raw_http":
+            upstream_request = httpx.Request("POST", target_url)
+            upstream_response = httpx.Response(
+                529,
+                request=upstream_request,
+                text=raw_body,
+            )
+            upstream_response.headers.update(
+                {
+                    "Retry-After": "999999",
+                    "Content-Length": "1",
+                    "Transfer-Encoding": "chunked",
+                    "Content-Encoding": "gzip",
+                    "X-Upstream-Trace": "capacity-123",
+                }
+            )
+            raw_failure = httpx.HTTPStatusError(
+                "server_overloaded",
+                request=upstream_request,
+                response=upstream_response,
+            )
+            setattr(raw_failure, "error_class", "server_overloaded")
+            raise raw_failure
         raise ResponsesStreamPreCommitFailure(
             error_class="server_overloaded",
             classification="transient_capacity",
@@ -2943,27 +2989,6 @@ async def test_candidate_loop_capacity_expiry_preserves_upstream_failure(  # noq
         finalize_session_owner_lease_on_failure=_noop_async,
     )
 
-    def _mark_capacity_terminal(exc: Exception) -> Exception:
-        converted = exc.as_http_exception()
-        converted.headers = {
-            "Retry-After": "23",
-            "X-Upstream-Trace": "capacity-123",
-        }
-        converted._aawm_openai_capacity_expired = True
-        return converted
-
-    monkeypatch.setattr(
-        passthrough_endpoints,
-        "_mark_passthrough_capacity_exception_terminal",
-        _mark_capacity_terminal,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        passthrough_endpoints,
-        "_get_passthrough_terminal_wire_headers",
-        lambda _exc: {"Retry-After": "23"},
-        raising=False,
-    )
     monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
     monkeypatch.setattr(
         candidate_loop,
@@ -3052,19 +3077,13 @@ async def test_candidate_loop_capacity_expiry_preserves_upstream_failure(  # noq
     assert failover_calls == []
     assert redispatch_calls == []
     assert len(failure_records) == len(provider_calls)
-    assert terminal_records == ["deadline_exhausted"]
+    assert terminal_records == [("deadline_exhausted", "server_overloaded", 529)]
     assert exc_info.value.status_code == 529
-    assert exc_info.value.detail == {
-        "error": {
-            "message": "upstream overloaded body",
-            "type": "server_error",
-            "code": "server_overloaded",
-            "retryable": True,
-        }
-    }
+    assert exc_info.value.detail == (
+        raw_body if failure_kind == "raw_http" else upstream_detail
+    )
     assert exc_info.value.headers == {
-        "Retry-After": "23",
-        "X-Upstream-Trace": "capacity-123",
+        "Retry-After": "7200" if failure_kind == "raw_http" else "23",
     }
     assert getattr(exc_info.value, "_aawm_openai_capacity_expired", False) is True
 
@@ -3093,7 +3112,7 @@ async def test_candidate_loop_capacity_expiry_without_prior_failure_returns_504(
     provider_calls: list[None] = []
     publication_calls: list[None] = []
     redispatch_calls: list[dict[str, Any]] = []
-    terminal_records: list[str] = []
+    terminal_records: list[tuple[str, Optional[str], Optional[int]]] = []
 
     class _Coordinator:
         target_identity = "openai:gpt-5.4-codex@chatgpt.com/backend-api/codex/responses"
@@ -3103,8 +3122,15 @@ async def test_candidate_loop_capacity_expiry_without_prior_failure_returns_504(
         budget = SimpleNamespace(deadline_seconds=7200.0)
         terminal_reason = ""
 
-        def record_terminal(self, reason: str) -> None:
-            terminal_records.append(reason)
+        def record_terminal(
+            self,
+            reason: str,
+            *,
+            error_class: Optional[str] = None,
+            status_code: Optional[int] = None,
+        ) -> None:
+            terminal_records.append((reason, error_class, status_code))
+            self.terminal_reason = reason
 
     coordinator = _Coordinator()
 
@@ -3218,8 +3244,9 @@ async def test_candidate_loop_capacity_expiry_without_prior_failure_returns_504(
     assert provider_calls == []
     assert publication_calls == []
     assert redispatch_calls == []
-    assert terminal_records == ["deadline_exhausted"]
+    assert terminal_records == [("deadline_exhausted", "upstream_timeout", 504)]
     assert exc_info.value.status_code == 504
+    assert exc_info.value.headers == {"Retry-After": "10"}
     assert "all_candidates_unavailable" not in str(exc_info.value.detail)
 
 
