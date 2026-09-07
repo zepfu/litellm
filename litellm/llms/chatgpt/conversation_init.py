@@ -1308,7 +1308,7 @@ def _parse_blocked_features(
         if identity is None:
             malformed += 1
             continue
-        if blocked_state is not True:
+        if blocked_state is None:
             continue
         rows.append(
             {
