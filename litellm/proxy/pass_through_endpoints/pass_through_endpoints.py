@@ -1708,7 +1708,10 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     if openai_capacity_coordinator is not None
                     else budget_seconds
                 )
-                if attempt_number > 1:
+                if (
+                    openai_capacity_coordinator is None
+                    and attempt_number > 1
+                ):
                     timeout_seconds = max(
                         0.0,
                         timeout_seconds - (time.monotonic() - start_monotonic),
@@ -1805,6 +1808,11 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     raise
                 wait_seconds = openai_capacity_coordinator.next_wait_seconds()
                 should_retry = True
+            elif openai_capacity_coordinator is not None:
+                # The coordinator owns only OpenAI/Codex capacity retries. Do
+                # not let generic retryable errors enter a zero-second loop.
+                should_retry = False
+                wait_seconds = 0.0
             else:
                 wait_seconds = 0.0
             if (
