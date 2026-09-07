@@ -113,6 +113,75 @@ class IncompleteDetailTransport:
 
 
 # ---------------------------------------------------------------------------
+# Synthetic lifecycle transport
+# ---------------------------------------------------------------------------
+
+
+class RevisitedConversationTransport:
+    def __init__(self) -> None:
+        self.active_index_calls = 0
+        self.detail_calls = 0
+        self.requests: list[dict[str, Any]] = []
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        assert method == "GET"
+        query = dict(params or {})
+        self.requests.append({"method": method, "path": path, "params": query})
+        if path == "/api/auth/session":
+            return {
+                "user": {"id": "user-abc123"},
+                "workspace_id": "ws-xyz",
+                "quota_owner_id": "user-abc123",
+                "surface": "chat",
+            }
+        if path == "/backend-api/conversations":
+            if query.get("is_archived") == "true":
+                return {"items": [], "total": 0, "offset": 0}
+            self.active_index_calls += 1
+            if self.active_index_calls < 3:
+                return {
+                    "items": [
+                        {
+                            "id": "conv-revisited",
+                            "create_time": "2026-09-05T10:00:00Z",
+                            "update_time": "2026-09-05T12:00:00Z",
+                            "surface": "chat",
+                            "workspace_id": "ws-xyz",
+                        }
+                    ],
+                    "total": 1,
+                    "offset": 0,
+                }
+            return {"items": [], "total": 0, "offset": 0}
+        if path == "/backend-api/conversations/conv-revisited":
+            self.detail_calls += 1
+            return {
+                "conversation_id": "conv-revisited",
+                "surface": "chat",
+                "messages": [
+                    {
+                        "id": "msg-revisited",
+                        "author": {"role": "assistant"},
+                        "create_time": "2026-09-05T12:00:00Z",
+                        "metadata": {
+                            "model_slug": "gpt-5.6-astra-pro",
+                            "generation_id": "gen-revisited",
+                        },
+                        "status": "finished_successfully",
+                        "end_turn": True,
+                    }
+                ],
+                "page_info": {"has_previous_page": self.detail_calls == 2},
+            }
+        raise AssertionError(f"unexpected request: {method} {path} {query}")
+
+
+# ---------------------------------------------------------------------------
 # Config parsing
 # ---------------------------------------------------------------------------
 
@@ -687,6 +756,63 @@ class TestCollectorIntegration:
             ("test-account", "conv-incomplete"),
         ).fetchone()
         assert pending["pending"] == 1
+
+    def test_incomplete_revisit_remains_pending_when_next_index_omits_conversation(
+        self,
+        config_and_ledger,
+    ):
+        config, ledger = config_and_ledger
+        transport = RevisitedConversationTransport()
+        adapter = ChatGPTHistoryAdapter(
+            transport,
+            expected_identity={
+                "provider_user_id": "user-abc123",
+                "workspace_id": "ws-xyz",
+                "quota_owner_id": "user-abc123",
+            },
+        )
+        now = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)
+        collector = Collector(config, ledger, adapter=adapter, clock=lambda: now)
+
+        first = collector.collect(mode="refresh")
+        first_state = ledger.get_discovery_state("test-account", "active")
+
+        second = collector.collect(mode="refresh")
+        second_state = ledger.get_discovery_state("test-account", "active")
+        pending_after_incomplete = ledger.conn.execute(
+            """
+            SELECT pending, page_coverage
+            FROM conversation_state
+            WHERE collector_account_id=? AND conversation_id=?
+            """,
+            ("test-account", "conv-revisited"),
+        ).fetchone()
+
+        third = collector.collect(mode="refresh")
+        pending_after_retry = ledger.conn.execute(
+            """
+            SELECT pending, page_coverage
+            FROM conversation_state
+            WHERE collector_account_id=? AND conversation_id=?
+            """,
+            ("test-account", "conv-revisited"),
+        ).fetchone()
+
+        assert first.result == "complete"
+        assert first_state is not None
+        assert first_state["watermark_at"] == isoformat_utc(now)
+        assert second.result == "partial"
+        assert "detail_coverage:unrecognized" in second.warnings
+        assert second_state is not None
+        assert second_state["watermark_at"] == first_state["watermark_at"]
+        assert pending_after_incomplete["pending"] == 1
+        assert pending_after_incomplete["page_coverage"] == "partial"
+        assert third.result == "complete"
+        assert third.conversations_seen == 1
+        assert transport.active_index_calls == 3
+        assert transport.detail_calls == 3
+        assert pending_after_retry["pending"] == 0
+        assert all(request["method"] == "GET" for request in transport.requests)
 
     def test_report_after_collect(self, config_and_ledger):
         config, ledger = config_and_ledger
