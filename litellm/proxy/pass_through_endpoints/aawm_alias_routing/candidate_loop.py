@@ -74,9 +74,11 @@ from .interfaces import (
 )
 from .durable import get_aawm_alias_routing_state_namespace
 from .pre_commit_retry import (
+    ClientDisconnectedCancellation,
     OpenAIAlphaCapacityRetryBudget,
     OpenAIAlphaCapacityRetryCoordinator,
     _build_openai_capacity_target_identity,
+    await_with_client_disconnect,
     get_or_create_openai_alpha_capacity_retry_coordinator,
 )
 from .schema_rejections import (
@@ -1704,20 +1706,45 @@ async def handle_alias_route(  # noqa: PLR0915
                                     attempted_provider_call = False
                                 raise
 
-                        run_with_lease_renewal = getattr(
-                            sa,
-                            "run_with_session_owner_lease_renewal",
-                            None,
-                        )
-                        if callable(run_with_lease_renewal):
-                            response = await run_with_lease_renewal(
-                                session_owner_lease,
-                                _perform_candidate_request,
+                        async def _run_candidate_operation() -> Response:
+                            run_with_lease_renewal = getattr(
+                                sa,
+                                "run_with_session_owner_lease_renewal",
+                                None,
                             )
-                        else:
+                            if callable(run_with_lease_renewal):
+                                return await run_with_lease_renewal(
+                                    session_owner_lease,
+                                    _perform_candidate_request,
+                                )
                             # Keep older extracted-host test seams usable while
                             # the runtime host rolls out the renewal helper.
-                            response = await _perform_candidate_request()
+                            return await _perform_candidate_request()
+
+                        try:
+                            if capacity_retry_coordinator is not None:
+                                response = await await_with_client_disconnect(
+                                    _run_candidate_operation,
+                                    request=request,
+                                )
+                            else:
+                                response = await _run_candidate_operation()
+                        except ClientDisconnectedCancellation:
+                            if capacity_retry_coordinator is not None:
+                                capacity_retry_coordinator.record_terminal(
+                                    "client_disconnected",
+                                    error_class="client_disconnected",
+                                    status_code=None,
+                                )
+                            raise
+                        except asyncio.CancelledError:
+                            if capacity_retry_coordinator is not None:
+                                capacity_retry_coordinator.record_terminal(
+                                    "cancelled",
+                                    error_class="cancelled",
+                                    status_code=None,
+                                )
+                            raise
                         is_auto_review = (
                             alias_model in {"codex-auto-review", "auto-review"}
                             or sa.get_request_codex_auto_review_parent_session_identity(
@@ -2492,13 +2519,29 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                     if wait_seconds > 0:
                         if capacity_retry_coordinator is not None:
-                            wakeup_reason = (
-                                await capacity_retry_coordinator.sleep_with_wakeup(
-                                    wait_seconds,
-                                    error_class=error_class,
+                            try:
+                                wakeup_reason = await await_with_client_disconnect(
+                                    lambda: capacity_retry_coordinator.sleep_with_wakeup(
+                                        wait_seconds,
+                                        error_class=error_class,
+                                        status_code=capacity_error_status_code,
+                                    ),
+                                    request=request,
+                                )
+                            except ClientDisconnectedCancellation:
+                                capacity_retry_coordinator.record_terminal(
+                                    "client_disconnected",
+                                    error_class=error_class or "client_disconnected",
                                     status_code=capacity_error_status_code,
                                 )
-                            )
+                                raise
+                            except asyncio.CancelledError:
+                                capacity_retry_coordinator.record_terminal(
+                                    "cancelled",
+                                    error_class=error_class or "cancelled",
+                                    status_code=capacity_error_status_code,
+                                )
+                                raise
                             capacity_retry_coordinator.record_retry(
                                 wakeup_reason,
                                 error_class=error_class,

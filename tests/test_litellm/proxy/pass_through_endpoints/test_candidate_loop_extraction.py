@@ -2579,6 +2579,12 @@ async def test_candidate_loop_capacity_retries_use_one_request_coordinator(  # n
         state=SimpleNamespace(),
         url=SimpleNamespace(path="/openai_passthrough/v1/responses"),
     )
+
+    async def _is_disconnected() -> bool:
+        return False
+
+    request.is_disconnected = _is_disconnected
+
     candidate = {
         "provider": "openai",
         "model": "gpt-5.4-codex",
@@ -2795,6 +2801,268 @@ async def test_candidate_loop_capacity_retries_use_one_request_coordinator(  # n
     assert all(snapshot[0] for snapshot in reentry_snapshots)
     assert len({snapshot[1] for snapshot in reentry_snapshots}) == 1
     assert {snapshot[2] for snapshot in reentry_snapshots} == {7200.0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase",
+    ("io_disconnect", "wait_disconnect", "wait_cancel"),
+)
+async def test_candidate_loop_alpha_disconnect_cancels_io_or_wait(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    namespace = "openai-054-alias-disconnect-test"
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_STATE_NAMESPACE", namespace)
+    target_url = "https://chatgpt.com/backend-api/codex/responses"
+    monkeypatch.setattr(lpe, "_codex_oauth_responses_target_url", lambda: target_url)
+    monkeypatch.setattr(
+        pre_commit_retry_module,
+        "_resolve_redis_for_capacity_wakeup",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        pre_commit_retry_module,
+        "_CLIENT_DISCONNECT_POLL_SECONDS",
+        0.001,
+    )
+
+    disconnect_requested = False
+    disconnect_polls = 0
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        url=SimpleNamespace(path="/openai_passthrough/v1/responses"),
+    )
+
+    async def _is_disconnected() -> bool:
+        nonlocal disconnect_polls
+        disconnect_polls += 1
+        return disconnect_requested
+
+    request.is_disconnected = _is_disconnected
+    candidate = {
+        "provider": "openai",
+        "model": "gpt-5.4-codex",
+        "route_family": "codex_responses",
+    }
+    selection_calls: list[dict[str, Any]] = []
+    provider_calls: list[str] = []
+    failure_records: list[dict[str, Any]] = []
+    terminal_logs: list[dict[str, Any]] = []
+    cooldown_calls: list[dict[str, Any]] = []
+    wait_calls: list[dict[str, Any]] = []
+    provider_started = asyncio.Event()
+    provider_cancelled = asyncio.Event()
+    wait_started = asyncio.Event()
+    wait_cancelled = asyncio.Event()
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        selection_calls.append(kwargs)
+        return {
+            "candidate": dict(candidate),
+            "lane_key": "codex-oauth:test",
+            "cooldown_key": "openai:gpt-5.4-codex",
+            "selection_reason": "first_available",
+            "skipped": [],
+        }
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> object:
+        del candidate_body
+        provider_calls.append(candidate["model"])
+        if phase == "io_disconnect":
+            provider_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                provider_cancelled.set()
+                raise
+        if len(provider_calls) == 1:
+            raise ResponsesStreamPreCommitFailure(
+                error_class="server_overloaded",
+                classification="transient_capacity",
+                retryable=True,
+                message="overloaded",
+                status_code=502,
+            )
+        raise AssertionError("disconnect/cancellation must prevent another call")
+
+    async def _no_active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _owner_guard(**_kwargs: Any) -> object:
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    async def _sleep_with_wakeup(
+        _coordinator: object,
+        wait_seconds: float,
+        **metadata: Any,
+    ) -> str:
+        wait_calls.append(
+            {
+                "wait_seconds": wait_seconds,
+                "metadata": metadata,
+            }
+        )
+        wait_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            wait_cancelled.set()
+            raise
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(self, _lease: object) -> None:
+            return None
+
+    session_affinity_seam = SimpleNamespace(
+        is_replay_safe_session_owner_redispatch_body=lambda _body: True,
+        resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
+        get_request_codex_auto_review_parent_session_identity=lambda _request: None,
+        build_session_owner_attributes=lambda **_kwargs: {},
+        ensure_session_owner_guard_for_request=_owner_guard,
+        get_request_session_owner_lease=lambda _request: None,
+        finalize_session_owner_lease_on_success=_noop_async,
+        finalize_session_owner_lease_on_failure=_noop_async,
+    )
+
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: session_affinity_seam,
+    )
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        pre_commit_retry_module.OpenAIAlphaCapacityRetryCoordinator,
+        "sleep_with_wakeup",
+        _sleep_with_wakeup,
+    )
+    monkeypatch.setattr(
+        pre_commit_retry_module,
+        "_emit_openai_capacity_terminal_log",
+        lambda **kwargs: terminal_logs.append(kwargs),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_no_candidate_event",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_started",
+        lambda **kwargs: kwargs["prepared_request_body"],
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_failure",
+        lambda **kwargs: failure_records.append(kwargs),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_success",
+        lambda **kwargs: kwargs["attempt_record"],
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_codex_failure_evidence",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        lambda exc, **_kwargs: getattr(exc, "error_class", None),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_plan_codex_oauth_account_failover",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "execute_cooldown_publication_transaction",
+        lambda **kwargs: cooldown_calls.append(kwargs),
+    )
+
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=lpe._resolve_auto_agent_cooldown_publication_plan,
+        publish_cooldown_memory_fn=lambda **_kwargs: None,
+        persist_cooldown_fn=_noop_async,
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=lambda body, **_kwargs: body,
+        raise_redispatch_fn=None,
+    )
+    route_task = asyncio.create_task(
+        candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="work",
+            request=request,
+            prepared_request_body={"model": "work", "input": "dispatch basic"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_no_active_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+    )
+
+    if phase == "io_disconnect":
+        await asyncio.wait_for(provider_started.wait(), timeout=1.0)
+        disconnect_requested = True
+    else:
+        await asyncio.wait_for(wait_started.wait(), timeout=1.0)
+        if phase == "wait_disconnect":
+            disconnect_requested = True
+        else:
+            route_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(route_task, timeout=1.0)
+
+    assert provider_calls == ["gpt-5.4-codex"]
+    assert len(selection_calls) == 1
+    assert (
+        provider_cancelled.is_set()
+        if phase == "io_disconnect"
+        else wait_cancelled.is_set()
+    )
+    assert len(terminal_logs) == 1
+    assert terminal_logs[0]["terminal_reason"] == (
+        "cancelled" if phase == "wait_cancel" else "client_disconnected"
+    )
+    assert terminal_logs[0]["error_class"] == (
+        "client_disconnected" if phase == "io_disconnect" else "server_overloaded"
+    )
+    assert terminal_logs[0]["status_code"] == (
+        None if phase == "io_disconnect" else 502
+    )
+    assert len(wait_calls) == (0 if phase == "io_disconnect" else 1)
+    assert len(failure_records) == (0 if phase == "io_disconnect" else 1)
+    assert cooldown_calls == []
+    assert request.state.aawm_openai_capacity_retry.retry_count == 0
+
+    polls_after_exit = disconnect_polls
+    await asyncio.sleep(0.02)
+    assert disconnect_polls == polls_after_exit
 
 
 @pytest.mark.asyncio
