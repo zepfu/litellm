@@ -2492,11 +2492,7 @@ async def test_central_coordinator_exits_raw_http_quota_or_auth_immediately(
     coordinator.record_retry.assert_not_called()
     coordinator.record_terminal.assert_called_once_with(
         "non_capacity_error",
-        error_class=(
-            "http_status_429"
-            if exception_kind == "http_exception"
-            else f"http_status_{status_code}"
-        ),
+        error_class=f"http_status_{status_code}",
         status_code=status_code,
     )
 
