@@ -2,6 +2,8 @@ import type {
   DiscoveryCheckpoint,
   HistoryCheckpointStore,
   HistoryScope,
+  OutstandingGenerationState,
+  RevisitPageIssue,
   RevisitEntry,
 } from "../contracts/history.js";
 import { HISTORY_STATE_VERSION } from "../contracts/history.js";
@@ -119,15 +121,60 @@ function clone<T>(value: T): T {
 }
 
 function normalizeRevisit(entry: RevisitEntry): RevisitEntry {
+  const continuation =
+    typeof entry.continuation === "string" && entry.continuation.trim()
+      ? entry.continuation.trim()
+      : null;
   return {
     ...entry,
-    continuation:
-      typeof entry.continuation === "string" && entry.continuation.trim()
-        ? entry.continuation.trim()
+    continuation,
+    continuationRevision:
+      continuation !== null &&
+      typeof entry.continuationRevision === "string" &&
+      entry.continuationRevision.trim()
+        ? entry.continuationRevision.trim()
         : null,
     detailPagesFetched:
       Number.isInteger(entry.detailPagesFetched) && entry.detailPagesFetched >= 0
         ? entry.detailPagesFetched
         : 0,
+    malformedPage: normalizePageIssue(entry.malformedPage),
+    outstandingGeneration: normalizeOutstandingGeneration(
+      entry.outstandingGeneration,
+    ),
+  };
+}
+
+function normalizePageIssue(
+  issue: RevisitPageIssue | null | undefined,
+): RevisitPageIssue | null {
+  if (!issue || typeof issue.reason !== "string") {
+    return null;
+  }
+  return {
+    reason: issue.reason as RevisitPageIssue["reason"],
+    warnings: Array.isArray(issue.warnings)
+      ? issue.warnings.filter(
+          (warning): warning is string => typeof warning === "string",
+        )
+      : [],
+  };
+}
+
+function normalizeOutstandingGeneration(
+  state: OutstandingGenerationState | null | undefined,
+): OutstandingGenerationState | null {
+  if (
+    !state ||
+    (state.state !== "nonterminal" && state.state !== "unknown") ||
+    typeof state.since !== "string" ||
+    !state.since.trim()
+  ) {
+    return null;
+  }
+  return {
+    state: state.timedOut ? "unknown" : state.state,
+    since: state.since,
+    timedOut: state.timedOut === true,
   };
 }

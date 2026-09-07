@@ -15,6 +15,9 @@ export const DEFAULT_INDEX_PAGE_SIZE = 100;
 export const DEFAULT_MAX_INDEX_PAGES = 500;
 export const DEFAULT_MAX_MESSAGE_PAGES_PER_CONVERSATION = 100;
 export const DEFAULT_MAX_OLDER_HISTORY_AUDIT_PAGES = 1;
+export const OUTSTANDING_GENERATION_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+export const OUTSTANDING_GENERATION_REVISIT_BASE_DELAY_MS = 15 * 60 * 1000;
+export const OUTSTANDING_GENERATION_REVISIT_MAX_DELAY_MS = 6 * 60 * 60 * 1000;
 
 export type HistoryScope = "active" | "archived";
 export type HistoryCollectionMode =
@@ -45,6 +48,19 @@ export type OlderHistoryAuditStatus =
   | "in_progress"
   | "partial"
   | "complete";
+
+export type GenerationCompletionState = "nonterminal" | "unknown";
+
+export interface RevisitPageIssue {
+  reason: RevisitReason;
+  warnings: string[];
+}
+
+export interface OutstandingGenerationState {
+  state: GenerationCompletionState;
+  since: string;
+  timedOut: boolean;
+}
 
 export interface OlderHistoryAuditRequest {
   enabled: boolean;
@@ -108,6 +124,12 @@ export interface RevisitEntry {
   lastError: string | null;
   detailPagesFetched: number;
   continuation: string | null;
+  /** Revision of the conversation when the saved continuation was issued. */
+  continuationRevision: string | null;
+  /** A page-shape/pagination issue that remains unresolved independently of budget. */
+  malformedPage: RevisitPageIssue | null;
+  /** Nonterminal or unproven generation completion remains unknown. */
+  outstandingGeneration: OutstandingGenerationState | null;
 }
 
 export interface HistoryCheckpointStore {

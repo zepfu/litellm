@@ -34,6 +34,11 @@ import type {
   HistoryScope,
   RevisitEntry,
 } from "../../src/contracts/history.js";
+import {
+  OUTSTANDING_GENERATION_REVISIT_BASE_DELAY_MS,
+  OUTSTANDING_GENERATION_REVISIT_MAX_DELAY_MS,
+  OUTSTANDING_GENERATION_TIMEOUT_MS,
+} from "../../src/contracts/history.js";
 
 const NOW = new Date("2026-09-07T12:00:00.000Z");
 const EXPLICIT_RANGE: HistoryRange = {
@@ -768,6 +773,9 @@ describe("Stage-2A history collection", () => {
       lastError: null,
       detailPagesFetched: 1,
       continuation: "stale-cursor",
+      continuationRevision: null,
+      malformedPage: null,
+      outstandingGeneration: null,
     });
 
     const result = await new HistoryCollector(reader, {
@@ -787,6 +795,338 @@ describe("Stage-2A history collection", () => {
     expect(result.revisits).toHaveLength(0);
     expect(result.conversations[0]?.warnings).toContain(
       "messages_bad_continuation_restarting",
+    );
+  });
+
+  it("preserves a saved continuation when detail exposes a newer first cursor", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-saved-continuation");
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set("conv-saved-continuation", {
+      ...detail("conv-saved-continuation"),
+      continuation: "detail-first-cursor",
+      paginationState: "continuation",
+    });
+    reader.messagePages.set(
+      "conv-saved-continuation",
+      new Map([
+        [
+          "saved-cursor",
+          completePage([message("conv-saved-continuation", "msg-saved")]),
+        ],
+      ]),
+    );
+    const store = new MemoryCheckpointStore();
+    store.upsertRevisit({
+      stateVersion: 1,
+      accountId: "fixture-primary",
+      conversationId: "conv-saved-continuation",
+      scopes: ["active"],
+      status: "pending",
+      reason: "page_budget",
+      firstSeenAt: NOW.toISOString(),
+      lastSeenAt: NOW.toISOString(),
+      attempts: 1,
+      nextEligibleAt: NOW.toISOString(),
+      lastError: null,
+      detailPagesFetched: 1,
+      continuation: "saved-cursor",
+      continuationRevision: "2026-09-06T12:00:00.000Z|",
+      malformedPage: null,
+      outstandingGeneration: null,
+    });
+
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    }).collect({ mode: "incremental" });
+
+    expect(
+      reader.requests
+        .filter((request) =>
+          request.path.includes("conv-saved-continuation/messages"),
+        )
+        .map((request) => request.path),
+    ).toEqual([
+      "/backend-api/conversations/conv-saved-continuation/messages?before=saved-cursor",
+    ]);
+    expect(result.revisits[0]).toMatchObject({
+      reason: "incomplete_detail",
+      malformedPage: {
+        reason: "incomplete_detail",
+      },
+    });
+    expect(result.conversations[0]?.messages.map((item) => item.messageId)).toEqual([
+      "msg-saved",
+    ]);
+  });
+
+  it("restarts exactly once from newest when a saved continuation revision expires", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-expired-continuation");
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set("conv-expired-continuation", {
+      ...detail("conv-expired-continuation"),
+      updatedAt: "2026-09-07T11:00:00.000Z",
+      currentNode: "node-new",
+    });
+    reader.messagePages.set(
+      "conv-expired-continuation",
+      new Map([
+        [
+          "latest",
+          completePage([
+            message("conv-expired-continuation", "msg-newest"),
+          ]),
+        ],
+      ]),
+    );
+    const store = new MemoryCheckpointStore();
+    store.upsertRevisit({
+      stateVersion: 1,
+      accountId: "fixture-primary",
+      conversationId: "conv-expired-continuation",
+      scopes: ["active"],
+      status: "pending",
+      reason: "page_budget",
+      firstSeenAt: NOW.toISOString(),
+      lastSeenAt: NOW.toISOString(),
+      attempts: 1,
+      nextEligibleAt: NOW.toISOString(),
+      lastError: null,
+      detailPagesFetched: 1,
+      continuation: "saved-cursor",
+      continuationRevision: "2026-09-06T12:00:00.000Z|node-old",
+      malformedPage: null,
+      outstandingGeneration: null,
+    });
+
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    }).collect({ mode: "incremental" });
+
+    expect(
+      reader.requests
+        .filter((request) =>
+          request.path.includes("conv-expired-continuation/messages"),
+        )
+        .map((request) => request.path),
+    ).toEqual([
+      "/backend-api/conversations/conv-expired-continuation/messages?before=latest",
+    ]);
+    expect(result.revisits).toEqual([]);
+    expect(result.conversations[0]?.warnings).toContain(
+      "messages_saved_continuation_expired_restarting",
+    );
+  });
+
+  it("keeps malformed-page state separate from page-budget continuation progress", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-malformed-progress");
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set("conv-malformed-progress", detail("conv-malformed-progress"));
+    reader.messagePages.set(
+      "conv-malformed-progress",
+      new Map([
+        [
+          "latest",
+          {
+            ...continuationPage([], "cursor-1"),
+            coverage: "partial",
+            warnings: ["message_shape_warning"],
+          },
+        ],
+        ["cursor-1", continuationPage([], "cursor-2")],
+      ]),
+    );
+
+    const store = new MemoryCheckpointStore();
+    const collector = new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+      maxMessagePagesPerConversation: 1,
+    });
+    const first = await collector.collect({
+      mode: "backfill",
+      range: EXPLICIT_RANGE,
+    });
+    expect(first.revisits[0]).toMatchObject({
+      reason: "page_budget",
+      continuation: "cursor-1",
+      malformedPage: {
+        reason: "partial_detail",
+        warnings: ["message_shape_warning"],
+      },
+    });
+
+    const second = await collector.collect({
+      mode: "incremental",
+      now: new Date("2026-09-07T13:00:00.000Z"),
+    });
+    expect(second.revisits[0]).toMatchObject({
+      reason: "page_budget",
+      continuation: "cursor-2",
+      malformedPage: {
+        reason: "partial_detail",
+        warnings: ["message_shape_warning"],
+      },
+    });
+  });
+
+  it("clears malformed traversal state only after a validated terminal page", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-malformed-cleanup");
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set("conv-malformed-cleanup", detail("conv-malformed-cleanup"));
+    reader.messagePages.set(
+      "conv-malformed-cleanup",
+      new Map([
+        [
+          "latest",
+          {
+            ...completePage([]),
+            coverage: "partial",
+            warnings: ["message_shape_warning"],
+          },
+        ],
+      ]),
+    );
+
+    const store = new MemoryCheckpointStore();
+    const collector = new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    });
+    const first = await collector.collect({
+      mode: "backfill",
+      range: EXPLICIT_RANGE,
+    });
+    expect(first.revisits[0]).toMatchObject({
+      reason: "partial_detail",
+      continuation: null,
+      malformedPage: {
+        reason: "partial_detail",
+        warnings: ["message_shape_warning"],
+      },
+    });
+
+    reader.messagePages.set(
+      "conv-malformed-cleanup",
+      new Map([["latest", completePage([])]]),
+    );
+    const second = await collector.collect({
+      mode: "incremental",
+      now: new Date("2026-09-07T13:00:00.000Z"),
+    });
+    expect(second.revisits).toEqual([]);
+    expect(second.conversations[0]?.coverage).toBe("complete");
+  });
+
+  it("times out outstanding generations, backs off revisits, and preserves unknown completion", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-generation-timeout");
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set("conv-generation-timeout", detail("conv-generation-timeout"));
+    reader.messagePages.set(
+      "conv-generation-timeout",
+      new Map([
+        [
+          "latest",
+          completePage([
+            {
+              ...message("conv-generation-timeout", "msg-pending"),
+              status: "in_progress",
+              endTurn: false,
+            },
+          ]),
+        ],
+      ]),
+    );
+
+    const store = new MemoryCheckpointStore();
+    const collector = new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    });
+    const first = await collector.collect({
+      mode: "backfill",
+      range: EXPLICIT_RANGE,
+    });
+    const firstRevisit = first.revisits[0]!;
+    expect(firstRevisit.outstandingGeneration).toEqual({
+      state: "nonterminal",
+      since: NOW.toISOString(),
+      timedOut: false,
+    });
+    expect(
+      new Date(firstRevisit.nextEligibleAt).getTime() - NOW.getTime(),
+    ).toBe(OUTSTANDING_GENERATION_REVISIT_BASE_DELAY_MS);
+
+    const requestsBeforeEarlyPass = reader.requests.length;
+    const early = await collector.collect({
+      mode: "incremental",
+      now: new Date(
+        NOW.getTime() + OUTSTANDING_GENERATION_REVISIT_BASE_DELAY_MS / 2,
+      ),
+    });
+    expect(early.conversations).toEqual([]);
+    expect(reader.requests.length).toBeGreaterThan(requestsBeforeEarlyPass);
+    expect(
+      reader.requests
+        .slice(requestsBeforeEarlyPass)
+        .some((request) =>
+          request.path.includes("conv-generation-timeout/messages"),
+        ),
+    ).toBe(false);
+
+    reader.messagePages.set(
+      "conv-generation-timeout",
+      new Map([
+        [
+          "latest",
+          completePage([
+            {
+              ...message("conv-generation-timeout", "msg-pending"),
+              status: null,
+              endTurn: false,
+              generationId: "generation-1",
+              requestId: "request-1",
+            },
+          ]),
+        ],
+      ]),
+    );
+    const timedOutAt = new Date(
+      NOW.getTime() + OUTSTANDING_GENERATION_TIMEOUT_MS + 60_000,
+    );
+    const timedOut = await collector.collect({
+      mode: "incremental",
+      now: timedOutAt,
+    });
+    const timedOutRevisit = timedOut.revisits[0]!;
+    expect(timedOutRevisit.outstandingGeneration).toEqual({
+      state: "unknown",
+      since: NOW.toISOString(),
+      timedOut: true,
+    });
+    expect(
+      new Date(timedOutRevisit.nextEligibleAt).getTime() -
+        timedOutAt.getTime(),
+    ).toBe(OUTSTANDING_GENERATION_REVISIT_MAX_DELAY_MS);
+    expect(timedOut.conversations[0]?.messages[0]?.generationId).toBe(
+      "generation-1",
+    );
+    expect(timedOut.conversations[0]?.warnings).toContain(
+      "generation_completion_unknown",
+    );
+    expect(timedOut.conversations[0]?.warnings).toContain(
+      "nonterminal_generation_timeout",
     );
   });
 
@@ -1099,6 +1439,10 @@ describe("Stage-2A history collection", () => {
       nextEligibleAt: NOW.toISOString(),
       lastError: "adapter_error",
       detailPagesFetched: 1,
+      continuation: null,
+      continuationRevision: null,
+      malformedPage: null,
+      outstandingGeneration: null,
     });
 
     const result = await new HistoryCollector(reader, {
@@ -1156,6 +1500,16 @@ describe("Stage-2A history collection", () => {
       lastError: "adapter_error",
       detailPagesFetched: 1,
       continuation: "cursor-1",
+      continuationRevision: "revision-1",
+      malformedPage: {
+        reason: "partial_detail",
+        warnings: ["message_shape_warning"],
+      },
+      outstandingGeneration: {
+        state: "unknown",
+        since: "2026-09-06T12:00:00.000Z",
+        timedOut: true,
+      },
     };
     first.saveDiscovery(checkpoint);
     first.upsertRevisit(revisit);
