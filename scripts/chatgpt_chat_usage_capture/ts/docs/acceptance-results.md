@@ -22,7 +22,7 @@ LiteLLM repository and its runtime services are outside this gate.
 
 | Command | Result |
 | --- | --- |
-| `npm install` | Passed; generated `package-lock.json` |
+| `npm install` | Passed; installed 147 packages from the committed lockfile |
 | `npm run typecheck` | Passed |
 | `npm test` | Passed; 38 tests across 8 focused unit/integration files |
 | `npm run lint` | Passed |
