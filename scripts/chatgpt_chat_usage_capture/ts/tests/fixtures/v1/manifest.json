@@ -1,0 +1,67 @@
+{
+  "schemaVersion": "fixture-manifest-v1",
+  "adapterVersion": "chatgpt-chat-history-v1",
+  "createdOn": "2026-09-07",
+  "description": "Synthetic Stage-1 fixtures for identity, pagination, and privacy tests. No real user data.",
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/api/auth/session",
+      "params": { "fixture": "session-authpause.json" },
+      "fixture": "session-authpause.json"
+    },
+    {
+      "method": "GET",
+      "path": "/api/auth/session",
+      "fixture": "session-valid.json"
+    },
+    {
+      "method": "GET",
+      "path": "/api/auth/session",
+      "params": { "fixture": "session-invalid.json" },
+      "fixture": "session-invalid.json"
+    },
+    {
+      "method": "GET",
+      "path": "/api/auth/session",
+      "params": { "fixture": "session-missing-identity.json" },
+      "fixture": "session-missing-identity.json"
+    },
+    {
+      "method": "GET",
+      "path": "/backend-api/conversations",
+      "params": { "offset": "0", "limit": "100", "order": "updated", "is_archived": "false" },
+      "fixture": "conversations-active-offset-0.json"
+    },
+    {
+      "method": "GET",
+      "path": "/backend-api/conversations",
+      "params": { "offset": "0", "limit": "100", "order": "updated", "is_archived": "true" },
+      "fixture": "conversations-archived-offset-0.json"
+    },
+    {
+      "method": "GET",
+      "path": "/backend-api/conversations/conv-001",
+      "params": { "include_has_versions": "true", "num_turns": "100" },
+      "fixture": "conversation-conv-001.json"
+    },
+    {
+      "method": "GET",
+      "path": "/backend-api/conversations/conv-002",
+      "params": { "include_has_versions": "true", "num_turns": "100" },
+      "fixture": "conversation-conv-002.json"
+    },
+    {
+      "method": "GET",
+      "path": "/backend-api/conversations/conv-001/messages",
+      "params": { "include_has_versions": "true", "num_turns": "100" },
+      "fixture": "messages-conv-001-latest.json"
+    },
+    {
+      "method": "GET",
+      "path": "/backend-api/conversations/conv-002/messages",
+      "params": { "include_has_versions": "true", "num_turns": "100" },
+      "fixture": "messages-conv-002-latest.json"
+    }
+  ]
+}

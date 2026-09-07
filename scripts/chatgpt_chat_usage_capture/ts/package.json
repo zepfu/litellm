@@ -1,0 +1,33 @@
+{
+  "name": "chatgpt-chat-usage-capture",
+  "version": "0.1.0",
+  "description": "Independent read-only ChatGPT ordinary Chat usage collector (D1-752 Stage 1: evidence contract and fixture-backed adapter)",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "bin": {
+    "usage-capture": "./bin/usage-capture.mjs"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration"
+  },
+  "dependencies": {
+    "playwright": "1.63.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.2",
+    "@types/node": "26.4.1",
+    "eslint": "10.10.0",
+    "typescript-eslint": "8.69.0",
+    "typescript": "5.9.3",
+    "vitest": "3.2.4"
+  }
+}
