@@ -759,31 +759,35 @@ Dashboard polling uses `urllib` with those stdlib helpers.
 
 ## ChatGPT conversation-init observations
 
-The current ChatGPT frontend issues `POST /backend-api/conversation/init` with
-no body. GET is invalid: a browser GET returned HTTP 400
-`{"detail":"Invalid conversation init"}`, and a headless GET returned HTTP 403.
-The collector must not submit a model message or conversation content.
+The collector observes the ChatGPT frontend's native
+`POST /backend-api/conversation/init` request and response on an owned page.
+It does not fabricate a fetch or submit model messages or conversation content.
+Whether the native request actually omitted its body is recorded as evidence,
+not imposed as a universal no-body contract. Account-pin provenance comes from
+the matching native request and its CDP `ExtraInfo` events, not from assumed
+account fields in the conversation-init response.
 
 This path has two cooperating pieces:
 
 - Browser-boundary collector: `litellm/llms/chatgpt/conversation_init.py`
-  accepts an injected transport, issues the no-body POST contract, redacts
+  accepts an injected transport, observes the native exchange, redacts
   cookies, tokens, headers, raw storage, and personal fields, then atomically
   writes a credential-safe JSON snapshot. It refuses symlink destinations.
-  Fixture transports make this unit-testable without live auth. The public
+  The public
   `collect_conversation_init_snapshot_from_oracle_browser(...)` entry point
-  attaches to an existing Oracle browser over CDP and evaluates only the
-  authenticated no-body POST from an existing ChatGPT page. It does not launch
-  Chrome, create a persistent context, read browser cookies or storage, export
-  credentials, or return response headers.
+  attaches to a bound Oracle browser over CDP and observes the native exchange
+  on an owned page. The attach path does not launch Chrome or open a persistent
+  profile. It does not export cookies, storage, credentials, or raw headers.
 - Sidecar task: `scripts/run_provider_status_observations_loop.py` retains a
   legacy regular-file consumer and optionally runs bound live capture through
   the public collector. The sidecar never directly HTTP-calls `chatgpt.com`,
   never reads Oracle cookies, and never ships `authenticator.py`,
   `common_utils.py`, or `httpx`.
 
-The sidecar image copies only `conversation_init.py` and touches
-`litellm/llms/chatgpt/__init__.py`. Persist uses the existing
+The sidecar image packages `conversation_init.py`, the owned
+`scripts/chatgpt_oracle_browser_session.mjs` helper, and pinned Playwright with
+Chromium shared libraries/Xvfb, `rsync`, and `xauth`; it does not download another
+browser. Persist uses the existing
 `rate_limit_observations` insert path. Conversation-init writes use
 `AAWM_CODEX_QUOTA_DSN` through the same DSN resolver as Codex quota writes,
 falling back to the general provider-status DSN. Account identifiers and
@@ -817,13 +821,16 @@ object keyed by the `LITELLM_CODEX_OAUTH_INVENTORY` label:
     "page_target_id": "target-id-for-account1"
   },
   "account2": {
-    "cdp_endpoint": "http://127.0.0.1:9223",
-    "page_target_id": "target-id-for-account2"
+    "oracle_profile_path": "/run/aawm/oracle/account2",
+    "oracle_profile_directory": "Default"
   }
 }
 ```
 
-The value is supplied through
+Each label selects either an existing `cdp_endpoint` plus `page_target_id`
+binding or an `oracle_profile_path` binding with optional
+`oracle_profile_directory`. The example illustrates configuration, not verified
+account2 coverage. The value is supplied through
 `AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS` (or the matching CLI
 option). Bound mode iterates
 `_require_codex_oauth_inventory(config).ordered_records(enabled_only=True)`
@@ -832,9 +839,8 @@ binding. Each account is captured to a separate fresh sanitized temporary
 path. The sidecar parses and persists only when the current capture was
 written, the collector returned `account_identity_verified=true`, and its
 canonical-12 `account_hash` matches the inventory pin. A source-path hash is
-never accepted for bound persistence. Missing bindings, missing or invalid
-OAuth credentials, unavailable browser dependencies, unreachable CDP targets,
-and identity mismatches are isolated in explicit per-account coverage and do
+never accepted for bound persistence. Binding, browser-session, dependency,
+and identity failures are isolated in explicit per-account coverage and do
 not cause another account's current capture to be persisted incorrectly. A
 retained old snapshot is never counted as a fresh bound capture.
 Bound telemetry reports `capture_coverage_status` separately from
@@ -844,7 +850,7 @@ identity-verified bound captures, so legacy file rereads leave it at zero.
 Relevant environment variables:
 
 - `AAWM_CHATGPT_CONVERSATION_INIT_POLL_ENABLED`: enables the sidecar file
-  consumer. Defaults to disabled.
+  consumer or bound capture. Defaults to disabled.
 - `AAWM_CHATGPT_CONVERSATION_INIT_POLL_INTERVAL_SECONDS`: minimum seconds
   between attempts; default `600`.
 - `AAWM_CHATGPT_CONVERSATION_INIT_SOURCE_PATH`: regular-file JSON snapshot;
@@ -852,36 +858,34 @@ Relevant environment variables:
 - `AAWM_CHATGPT_CONVERSATION_INIT_URL`: documented POST URL. The sidecar does
   not fetch this URL.
 - `AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS`: optional nonsecret JSON
-  object mapping inventory labels to `cdp_endpoint` and `page_target_id`;
+  object mapping inventory labels to a CDP or Oracle profile binding;
   enables bound per-account live capture.
 - `AAWM_CHATGPT_CONVERSATION_INIT_BROWSER_CDP_ENDPOINT`: optional CDP endpoint
   used by direct attach-only collector calls; bound sidecar mode uses the
   endpoint from each account binding.
 - `ORACLE_BROWSER_CDP_ENDPOINT`: fallback CDP endpoint for the established
   Oracle browser boundary. The default is `http://127.0.0.1:9222`.
+- `AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE`: mounted Oracle Node executable.
+- `AAWM_CHATGPT_ORACLE_PACKAGE_DIR`: mounted installed Oracle package/module tree.
+- `AAWM_CHATGPT_ORACLE_CHROME_EXECUTABLE`: mounted Chrome executable.
 
-Bound live mode requires all of the following at runtime: an already-running
-authenticated Oracle browser with an existing ChatGPT page for each configured
-target, a reachable per-account CDP endpoint and target id, and Playwright
-installed in the process that invokes the public entry point. The default
-Oracle profile
-`/home/zepfu/.oracle/browser-profile` is a locked shared profile and must not
-be opened by a competing persistent browser context; CDP attachment is the
-only supported collection path here. As of September 7, 2026, the existing
-provider-status image installs `psycopg` but does not install Playwright, and
-the inspected deployment has no browser mounts or listeners on ports 9222,
-9223, or 9333. Those are integration prerequisites, not source-level
-acceptance evidence. Until they are supplied, bound capture fails closed per
-account without inserting a row; no deployment change is implied by this
-source wiring.
+The profile alternative uses existing Oracle code through the owned helper,
+copies the read-only base profile into a private working profile, and cleans up
+only its private processes and files. It must not open the shared base profile
+as a competing persistent browser context. It runs headed Chrome with an Xvfb
+fallback when `DISPLAY` is absent; it is not a standalone service.
 
-The current native conversation-init response lacks canonical account fields.
-Even ready CDP and an authenticated page are insufficient until an authoritative
-same-context identity source is established. The missing identity read is an
-implementation gap, not merely session or dependency configuration. Bound
-capture fails closed and per-account coverage preserves the collector's
-`account_identity_verification_error`: `missing_authoritative_account_id` or
-`account_identity_mismatch`.
+The actual sidecar is owned by
+`aawm-infrastructure/docker-compose.thoth-litellm.yml` and runs as UID 1000.
+Chrome, the installed Oracle Node/module tree, and base profiles are supplied
+through read-only runtime mounts. The copied-profile lifecycle remains pending
+review, and infrastructure integration requires separate approval; these
+contracts do not claim deployed acceptance.
+
+Polling uses a 600-second default cadence. `Retry-After` and backoff apply to
+the shared browser session, preserving other sessions and prior observation
+rows. A deferred or failed capture is not fresh evidence and does not replace
+prior rows or establish account coverage.
 
 ## Alibaba Token Plan quota polling
 
