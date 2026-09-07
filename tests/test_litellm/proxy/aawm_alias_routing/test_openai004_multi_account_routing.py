@@ -2678,6 +2678,11 @@ async def test_candidate_loop_classifies_alpha_openai_exact_capacity_codes(
         "_classify_codex_auto_agent_retryable_exhaustion",
         error_signals._classify_codex_auto_agent_retryable_exhaustion,
     )
+    monkeypatch.setattr(
+        lpe,
+        "_extract_adapter_exception_status_code",
+        lambda exc: getattr(exc, "status_code", None),
+    )
     sleep = AsyncMock(return_value="timer")
     monkeypatch.setattr(
         candidate_loop.OpenAIAlphaCapacityRetryCoordinator,
@@ -2687,6 +2692,7 @@ async def test_candidate_loop_classifies_alpha_openai_exact_capacity_codes(
     request = _request()
     request.scope["path"] = "/openai_passthrough/v1/responses"
     request.scope["raw_path"] = b"/openai_passthrough/v1/responses"
+    monkeypatch.setattr(request, "is_disconnected", AsyncMock(return_value=False))
     performed = 0
 
     async def _select(**_kwargs: Any) -> dict[str, Any]:
