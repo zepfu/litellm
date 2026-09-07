@@ -4,6 +4,7 @@ import type { AccountConfig } from "../config.js";
 import type {
   HistoryCollectionRequest,
   HistoryCollectionResult,
+  HistoryDiscoveryPageCommit,
   HistoryPageCommit,
   HistoryReader,
 } from "../contracts/history.js";
@@ -233,9 +234,22 @@ export async function collectIntoLedger(
     ledger.transaction(() => {
       ensureRunStarted(page.identity, page.mode, page.scanStartedAt);
       persistConversation(page, new Date().toISOString());
+      store.acknowledgeCandidates(page.summary.conversationId, page.scopes);
       store.persist();
     });
     persistedConversations.add(page.summary.conversationId);
+  };
+
+  const onDiscoveryPageCommit = (page: HistoryDiscoveryPageCommit): void => {
+    assertCollectedIdentity(page.identity, scope);
+    ledger.transaction(() => {
+      ensureRunStarted(
+        page.identity,
+        page.checkpoint.mode,
+        page.scanStartedAt,
+      );
+      store.persist();
+    });
   };
 
   let result: HistoryCollectionResult;
@@ -243,6 +257,7 @@ export async function collectIntoLedger(
     result = await new HistoryCollector(reader, {
       accountId: account.id,
       store,
+      onDiscoveryPageCommit,
       onPageCommit,
     }).collect(request);
   } catch (error) {
@@ -282,6 +297,10 @@ export async function collectIntoLedger(
           revisit: conversation.revisit,
         },
         new Date().toISOString(),
+      );
+      store.acknowledgeCandidates(
+        conversation.summary.conversationId,
+        conversation.scopes,
       );
     }
     const observedAt = new Date().toISOString();

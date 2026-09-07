@@ -30,6 +30,25 @@ export class MemoryCheckpointStore implements HistoryCheckpointStore {
     this.checkpoints.set(checkpoint.scope, clone(checkpoint));
   }
 
+  acknowledgeCandidates(
+    conversationId: string,
+    scopes: readonly HistoryScope[],
+  ): void {
+    const acknowledgedScopes = new Set(scopes);
+    for (const scope of acknowledgedScopes) {
+      const checkpoint = this.checkpoints.get(scope);
+      if (!checkpoint?.candidateQueue) {
+        continue;
+      }
+      this.saveDiscovery({
+        ...checkpoint,
+        candidateQueue: checkpoint.candidateQueue.filter(
+          (candidate) => candidate.summary.conversationId !== conversationId,
+        ),
+      });
+    }
+  }
+
   listRevisits(): RevisitEntry[] {
     return [...this.revisits.values()]
       .filter((entry) => entry.status === "pending")

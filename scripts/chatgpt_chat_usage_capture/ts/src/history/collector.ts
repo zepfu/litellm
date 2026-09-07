@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import {
   AuthenticationRequiredError,
   CapabilityError,
@@ -7,12 +9,15 @@ import {
 } from "../adapters/chatgpt/adapter.js";
 import type {
   AcquiredConversation,
+  DiscoveryCandidate,
   DiscoveryCheckpoint,
   HistoryCollectionOptions,
   HistoryCollectionRequest,
   HistoryCollectionResult,
   HistoryCoverageResult,
   HistoryRange,
+  HistoryDiscoveryPageCommit,
+  HistoryCheckpointStore,
   HistoryPageCommit,
   HistoryReader,
   HistoryScope,
@@ -122,7 +127,7 @@ export class HistoryCollector {
     request: HistoryCollectionRequest,
   ): Promise<HistoryCollectionResult> {
     const now = request.now ?? this.options.clock?.now() ?? new Date();
-    const scanStartedAt = now.toISOString();
+    const initialScanStartedAt = now.toISOString();
     const rangeOptions: {
       mode: HistoryCollectionRequest["mode"];
       now: Date;
@@ -136,7 +141,7 @@ export class HistoryCollector {
     if (request.range) {
       rangeOptions.range = request.range;
     }
-    const requestedRange = resolveRequestedRange(rangeOptions);
+    let requestedRange = resolveRequestedRange(rangeOptions);
     validatePositiveInteger(
       request.indexPageSize ?? this.indexPageSize,
       "index page size",
@@ -156,6 +161,16 @@ export class HistoryCollector {
         "older-history audit page budget",
       );
     }
+    const frozenAcquisition = frozenImplicitAcquisition(
+      this.options.store,
+      request,
+    );
+    const scanStartedAt =
+      frozenAcquisition?.scanStartedAt ?? initialScanStartedAt;
+    if (frozenAcquisition) {
+      requestedRange = frozenAcquisition.range;
+    }
+
     const identity = await this.readIdentity();
 
     if (identity.authState !== "ready" || identity.surface !== "chat") {
@@ -175,12 +190,13 @@ export class HistoryCollector {
     let pagesFetched = 0;
 
     for (const scope of ["active", "archived"] as const) {
-      const discovery = await this.discoverScope(
+      const discovery = await this.discoverScopeDurable(
         scope,
         request,
         requestedRange,
         now,
         scanStartedAt,
+        identity,
       );
       scopeResults.push(discovery.coverage);
       pagesFetched += discovery.coverage.pagesFetched;
@@ -256,14 +272,6 @@ export class HistoryCollector {
       coverage.overall === "complete" && revisits.length === 0
         ? "complete"
         : "partial";
-    this.advanceWatermarksIfEligible(
-      request,
-      scanStartedAt,
-      now,
-      scopeResults,
-      conversations,
-      revisits,
-    );
 
     return {
       accountId: this.options.accountId,
@@ -300,91 +308,245 @@ export class HistoryCollector {
     }
   }
 
-  private async discoverScope(
+  private async discoverScopeDurable(
     scope: HistoryScope,
     request: HistoryCollectionRequest,
     requestedRange: HistoryRange,
     now: Date,
     scanStartedAt: string,
+    identity: IdentityRecord,
   ): Promise<ScopeDiscoveryResult> {
     const previous = this.options.store.loadDiscovery(scope);
     const explicitRange = request.range !== undefined;
-    const candidateCutoff = this.candidateCutoff(
+    const calculatedCandidateCutoff = this.candidateCutoff(
       request.mode,
       requestedRange,
       previous,
       explicitRange,
       request.overlapMs ?? this.overlapMs,
     );
+    const reuseFrozen = shouldReuseFrozenAcquisition(
+      previous,
+      request,
+      requestedRange,
+      calculatedCandidateCutoff,
+    );
+    const acquisitionRange = reuseFrozen ? previous!.range : requestedRange;
+    const candidateCutoff = reuseFrozen
+      ? previous!.candidateCutoff
+      : calculatedCandidateCutoff;
+    const acquisitionStartAt =
+      reuseFrozen && previous?.scanStartedAt
+        ? previous.scanStartedAt
+        : scanStartedAt;
     const warnings: string[] = [];
-    const summaries: ConversationSummary[] = [];
-    const summaryIds = new Set<string>();
+    const candidateQueue = normalizeCandidateQueue(previous?.candidateQueue);
+    const candidateById = new Map<string, DiscoveryCandidate>();
+    for (const candidate of candidateQueue) {
+      candidateById.set(candidate.summary.conversationId, candidate);
+    }
     const seenOffsets = new Set<number>();
     const priorAudit = normalizeOlderHistoryAudit(previous?.olderHistoryAudit);
     const pageBudget =
       request.maxIndexPagesPerScope ?? this.maxIndexPagesPerScope;
     const pageSize = request.indexPageSize ?? this.indexPageSize;
-    const shouldResume =
+    const canResumeContinuation =
+      reuseFrozen &&
       previous?.continuation !== null &&
       previous?.continuation !== undefined &&
-      previous.status !== "complete" &&
-      checkpointMatches(
-        previous,
-        request.mode,
-        requestedRange,
-        candidateCutoff,
-      );
-    let offset = shouldResume ? previous!.continuation! : 0;
+      Number.isInteger(previous.continuation) &&
+      previous.continuation >= 0 &&
+      previous.candidateQueue !== undefined &&
+      previous.headFingerprint !== undefined;
+    let offset = canResumeContinuation ? previous!.continuation! : 0;
     let pagesFetched = 0;
     let status: ScopeDiscoveryResult["coverage"]["status"] = "in_progress";
     let continuation: number | null = offset;
     let paginationState: PaginationState = "unknown";
     let leadingPage: AdaptedPage<ConversationSummary> | null = null;
+    let headFingerprint =
+      canResumeContinuation ? previous?.headFingerprint ?? null : null;
+    let restartUsed = false;
+    let pendingPage: {
+      offset: number;
+      page: AdaptedPage<ConversationSummary>;
+    } | null = null;
+    let stopIndexScan = false;
+    const restartAtZero = (): void => {
+      restartUsed = true;
+      offset = 0;
+      continuation = null;
+      paginationState = "unknown";
+      leadingPage = null;
+      headFingerprint = null;
+      pendingPage = null;
+      seenOffsets.clear();
+    };
 
-    this.options.store.saveDiscovery(
-      checkpointFor(
+    const enqueueCandidate = (summary: ConversationSummary): void => {
+      const existing = candidateById.get(summary.conversationId);
+      if (existing) {
+        if (isMoreRecent(summary.updatedAt, existing.summary.updatedAt)) {
+          existing.summary = summary;
+        }
+        existing.missingUpdateTime ||= summary.updatedAt === null;
+        return;
+      }
+      const candidate: DiscoveryCandidate = {
+        summary,
+        missingUpdateTime: summary.updatedAt === null,
+      };
+      candidateQueue.push(candidate);
+      candidateById.set(summary.conversationId, candidate);
+    };
+
+    const enqueuePageCandidates = (
+      items: ConversationSummary[],
+      force = false,
+    ): void => {
+      for (const summary of items) {
+        if (summary.updatedAt === null) {
+          warnings.push("conversation_missing_update_time");
+        } else if (!isValidInstant(summary.updatedAt)) {
+          warnings.push("conversation_invalid_update_time");
+        }
+        if (
+          force ||
+          isCandidateSummary(
+            summary,
+            candidateCutoff,
+            request.mode === "incremental" ? acquisitionRange.end : null,
+          )
+        ) {
+          enqueueCandidate(summary);
+        }
+      }
+    };
+
+    const saveCheckpoint = async (
+      checkpointStatus: DiscoveryCheckpoint["status"],
+      checkpointPaginationState: PaginationState,
+      checkpointContinuation: number | null,
+      watermark = previous?.lastCompleteDiscoveryStartedAt ?? null,
+      auditState = priorAudit,
+    ): Promise<void> => {
+      const checkpoint = checkpointFor(
         this.options.accountId,
         scope,
         request.mode,
-        requestedRange,
+        acquisitionRange,
         candidateCutoff,
-        scanStartedAt,
-        offset,
+        acquisitionStartAt,
+        checkpointContinuation,
         pagesFetched,
         pageBudget,
-        previous?.lastCompleteDiscoveryStartedAt ?? null,
-        "in_progress",
-        "unknown",
+        watermark,
+        checkpointStatus,
+        checkpointPaginationState,
         warnings,
         now.toISOString(),
-        priorAudit,
-      ),
-    );
+        auditState,
+        candidateQueue,
+        headFingerprint,
+      );
+      this.options.store.saveDiscovery(checkpoint);
+      await this.commitDiscoveryCheckpoint(
+        checkpoint,
+        identity,
+        acquisitionStartAt,
+      );
+    };
 
-    while (pagesFetched < pageBudget) {
-      if (seenOffsets.has(offset)) {
-        warnings.push("repeated_index_offset");
-        status = "partial";
-        paginationState = "repeated_cursor";
-        continuation = offset;
-        break;
-      }
-      seenOffsets.add(offset);
+    await saveCheckpoint("in_progress", "unknown", offset);
 
-      let page;
+    if (canResumeContinuation && offset > 0) {
       try {
-        page = await this.reader.listConversations({
+        const headPage = await this.reader.listConversations({
           archived: scope === "archived",
-          offset,
+          offset: 0,
           limit: pageSize,
           order: "updated",
         });
+        pagesFetched += 1;
+        const currentHeadFingerprint = fingerprintIndexPage(headPage);
+        const resumeHeadIsValid =
+          currentHeadFingerprint === previous!.headFingerprint &&
+          headPage.coverage !== "unrecognized" &&
+          headPage.warnings.length === 0 &&
+          headPage.paginationState === "continuation" &&
+          headPage.continuation === previous!.continuation;
+        if (resumeHeadIsValid) {
+          leadingPage = headPage;
+          headFingerprint = currentHeadFingerprint;
+          enqueuePageCandidates(headPage.items);
+          seenOffsets.add(0);
+          continuation = previous!.continuation;
+          paginationState = "continuation";
+          if (pagesFetched >= pageBudget) {
+            warnings.push("index_page_budget_exhausted");
+            status = "partial";
+            paginationState = "budget_exhausted";
+            await saveCheckpoint(status, paginationState, continuation);
+            stopIndexScan = true;
+          } else {
+            offset = previous!.continuation!;
+          }
+        } else {
+          warnings.push(
+            currentHeadFingerprint === previous!.headFingerprint
+              ? "saved_head_not_validated_for_resume"
+              : "discovery_head_changed_restart",
+          );
+          restartAtZero();
+          pendingPage = { offset: 0, page: headPage };
+        }
       } catch (error) {
-        warnings.push(`index_${errorCode(error)}`);
+        warnings.push(`index_head_${errorCode(error)}`);
         status = "partial";
         paginationState = "unknown";
-        continuation = offset;
+        continuation = null;
+        await saveCheckpoint(status, paginationState, continuation);
+        stopIndexScan = true;
+      }
+    }
+
+    while (!stopIndexScan && pagesFetched < pageBudget) {
+      const pageOffset = pendingPage?.offset ?? offset;
+      if (seenOffsets.has(pageOffset)) {
+        warnings.push("repeated_index_offset");
+        status = "partial";
+        paginationState = "repeated_cursor";
+        continuation = null;
+        await saveCheckpoint(status, paginationState, continuation);
+        if (!restartUsed && pageOffset > 0) {
+          restartAtZero();
+          status = "in_progress";
+          continue;
+        }
         break;
+      }
+      seenOffsets.add(pageOffset);
+
+      let page: AdaptedPage<ConversationSummary>;
+      if (pendingPage) {
+        page = pendingPage.page;
+        pendingPage = null;
+      } else {
+        try {
+          page = await this.reader.listConversations({
+            archived: scope === "archived",
+            offset: pageOffset,
+            limit: pageSize,
+            order: "updated",
+          });
+        } catch (error) {
+          warnings.push(`index_${errorCode(error)}`);
+          status = "partial";
+          paginationState = "unknown";
+          continuation = null;
+          await saveCheckpoint(status, paginationState, continuation);
+          break;
+        }
       }
 
       pagesFetched += 1;
@@ -393,78 +555,62 @@ export class HistoryCollector {
       if (page.coverage === "unrecognized") {
         warnings.push("index_unrecognized_page");
       }
-      if (offset === 0 && leadingPage === null) {
+      if (pageOffset === 0 && leadingPage === null) {
         leadingPage = page;
+        headFingerprint = fingerprintIndexPage(page);
       }
-      for (const summary of page.items) {
-        if (summary.updatedAt === null) {
-          warnings.push("conversation_missing_update_time");
-        } else if (!isValidInstant(summary.updatedAt)) {
-          warnings.push("conversation_invalid_update_time");
-        }
-        if (
-          isCandidateSummary(
-            summary,
-            candidateCutoff,
-            request.mode === "incremental" ? requestedRange.end : null,
-          ) &&
-          !summaryIds.has(summary.conversationId)
-        ) {
-          summaries.push(summary);
-          summaryIds.add(summary.conversationId);
-        }
-      }
+      enqueuePageCandidates(page.items);
+
       if (
         page.paginationState === "unknown" ||
         page.paginationState === "contradictory" ||
         page.paginationState === "repeated_cursor"
       ) {
         status = "partial";
-        continuation =
-          typeof page.continuation === "number" ? page.continuation : offset;
+        continuation = null;
         warnings.push(`index_${page.paginationState}`);
+        await saveCheckpoint(status, paginationState, continuation);
+        if (
+          !restartUsed &&
+          pageOffset > 0 &&
+          (page.paginationState === "contradictory" ||
+            page.paginationState === "repeated_cursor")
+        ) {
+          restartAtZero();
+          status = "in_progress";
+          continue;
+        }
         break;
       }
+
       if (page.exhausted && page.paginationState === "complete") {
         if (page.coverage !== "validated_page") {
           warnings.push("index_unvalidated_terminal_page");
         }
         status = "complete";
         continuation = null;
-        this.options.store.saveDiscovery(
-          checkpointFor(
-            this.options.accountId,
-            scope,
-            request.mode,
-            requestedRange,
-            candidateCutoff,
-            scanStartedAt,
-            null,
-            pagesFetched,
-            pageBudget,
-            previous?.lastCompleteDiscoveryStartedAt ?? null,
-            status,
-            paginationState,
-            warnings,
-            now.toISOString(),
-            priorAudit,
-          ),
-        );
+        await saveCheckpoint(status, paginationState, continuation);
         break;
       }
+
       if (
         page.paginationState !== "continuation" ||
         typeof page.continuation !== "number" ||
-        page.continuation <= offset
+        page.continuation <= pageOffset
       ) {
         status = "partial";
-        continuation =
-          typeof page.continuation === "number" ? page.continuation : offset;
+        continuation = null;
         paginationState =
           page.paginationState === "continuation"
             ? "repeated_cursor"
             : "unknown";
         warnings.push("nonadvancing_index_continuation");
+        await saveCheckpoint(status, paginationState, continuation);
+        if (!restartUsed && pageOffset > 0) {
+          restartAtZero();
+          status = "in_progress";
+          continue;
+        }
         break;
       }
 
@@ -473,29 +619,12 @@ export class HistoryCollector {
         status = "partial";
         paginationState = "budget_exhausted";
         warnings.push("index_page_budget_exhausted");
+        await saveCheckpoint(status, paginationState, continuation);
         break;
       }
 
-      this.options.store.saveDiscovery(
-        checkpointFor(
-          this.options.accountId,
-          scope,
-          request.mode,
-          requestedRange,
-          candidateCutoff,
-          scanStartedAt,
-          continuation,
-          pagesFetched,
-          pageBudget,
-          previous?.lastCompleteDiscoveryStartedAt ?? null,
-          "in_progress",
-          paginationState,
-          warnings,
-          now.toISOString(),
-          priorAudit,
-        ),
-      );
       offset = page.continuation;
+      await saveCheckpoint("in_progress", paginationState, continuation);
     }
 
     if (status === "complete") {
@@ -504,47 +633,33 @@ export class HistoryCollector {
         reread = await this.reader.listConversations({
           archived: scope === "archived",
           offset: 0,
-          limit: request.indexPageSize ?? this.indexPageSize,
+          limit: pageSize,
           order: "updated",
         });
         pagesFetched += 1;
         warnings.push(...reread.warnings);
-        if (
-          leadingPage === null ||
-          indexPagesDiffer(leadingPage, reread)
-        ) {
+        if (reread.coverage === "unrecognized") {
+          warnings.push("index_unrecognized_page");
+        }
+        if (leadingPage === null || indexPagesDiffer(leadingPage, reread)) {
           status = "partial";
           paginationState = "continuation";
-          continuation = 0;
+          continuation = null;
           warnings.push(
             leadingPage === null
               ? "leading_index_baseline_unavailable"
               : "leading_index_changed_during_scan",
           );
-          for (const summary of reread.items) {
-            if (
-              summary.updatedAt === null ||
-              isCandidateSummary(
-                summary,
-                candidateCutoff,
-                request.mode === "incremental" ? requestedRange.end : null,
-              )
-            ) {
-              if (summary.updatedAt === null) {
-                warnings.push("conversation_missing_update_time");
-              }
-              if (!summaryIds.has(summary.conversationId)) {
-                summaries.push(summary);
-                summaryIds.add(summary.conversationId);
-              }
-            }
-          }
+          headFingerprint = fingerprintIndexPage(reread);
+          enqueuePageCandidates(reread.items);
+          await saveCheckpoint(status, paginationState, continuation);
         }
       } catch (error) {
         status = "partial";
         paginationState = "unknown";
-        continuation = 0;
+        continuation = null;
         warnings.push(`leading_index_reread_${errorCode(error)}`);
+        await saveCheckpoint(status, paginationState, continuation);
       }
     }
 
@@ -552,27 +667,7 @@ export class HistoryCollector {
       status = "partial";
       paginationState = "budget_exhausted";
       warnings.push("index_page_budget_exhausted");
-    }
-    if (status !== "complete") {
-      this.options.store.saveDiscovery(
-        checkpointFor(
-          this.options.accountId,
-          scope,
-          request.mode,
-          requestedRange,
-          candidateCutoff,
-          scanStartedAt,
-          continuation,
-          pagesFetched,
-          pageBudget,
-          previous?.lastCompleteDiscoveryStartedAt ?? null,
-          status,
-          paginationState,
-          warnings,
-          now.toISOString(),
-          priorAudit,
-        ),
-      );
+      await saveCheckpoint(status, paginationState, continuation);
     }
 
     let auditState = priorAudit;
@@ -580,14 +675,14 @@ export class HistoryCollector {
       const audit = await this.auditOlderHistory(
         scope,
         request,
-        requestedRange,
+        acquisitionRange,
         now,
-        scanStartedAt,
+        acquisitionStartAt,
         priorAudit,
       );
       auditState = audit.state;
-      summaries.push(...audit.summaries);
       warnings.push(...audit.warnings);
+      enqueuePageCandidates(audit.summaries, true);
     } else {
       auditState = {
         ...priorAudit,
@@ -596,24 +691,19 @@ export class HistoryCollector {
       };
     }
 
-    this.options.store.saveDiscovery(
-      checkpointFor(
-        this.options.accountId,
-        scope,
-        request.mode,
-        requestedRange,
-        candidateCutoff,
-        scanStartedAt,
-        continuation,
-        pagesFetched,
-        pageBudget,
-        previous?.lastCompleteDiscoveryStartedAt ?? null,
-        status,
-        paginationState,
-        warnings,
-        now.toISOString(),
-        auditState,
-      ),
+    const cleanImplicitDiscovery =
+      request.mode === "incremental" &&
+      !explicitRange &&
+      status === "complete" &&
+      warnings.length === 0;
+    await saveCheckpoint(
+      status,
+      paginationState,
+      continuation,
+      cleanImplicitDiscovery
+        ? acquisitionStartAt
+        : previous?.lastCompleteDiscoveryStartedAt ?? null,
+      auditState,
     );
 
     const coverage =
@@ -624,13 +714,13 @@ export class HistoryCollector {
           : "partial";
     return {
       scope,
-      summaries,
+      summaries: candidateQueue.map((candidate) => candidate.summary),
       coverage: {
         scope,
         status,
         coverage,
         pagesFetched,
-        candidates: summaries.length,
+        candidates: candidateQueue.length,
         continuation,
         paginationState,
         candidateCutoff,
@@ -1390,62 +1480,6 @@ export class HistoryCollector {
     };
   }
 
-  private advanceWatermarksIfEligible(
-    request: HistoryCollectionRequest,
-    scanStartedAt: string,
-    now: Date,
-    scopes: ScopeCoverageResult[],
-    conversations: AcquiredConversation[],
-    revisits: RevisitEntry[],
-  ): void {
-    if (
-      request.mode !== "incremental" ||
-      request.range !== undefined
-    ) {
-      return;
-    }
-    const updatedAt = now.toISOString();
-    for (const scope of ["active", "archived"] as const) {
-      // Optional project/branch gaps do not invalidate a complete scope scan.
-      const coverage = scopes.find((item) => item.scope === scope);
-      if (
-        !coverage ||
-        coverage.status !== "complete" ||
-        coverage.coverage !== "complete" ||
-        coverage.warnings.length > 0
-      ) {
-        continue;
-      }
-      if (
-        conversations.some(
-          (conversation) =>
-            conversation.scopes.includes(scope) &&
-            (conversation.coverage !== "complete" ||
-              conversation.warnings.length > 0),
-        )
-      ) {
-        continue;
-      }
-      if (revisits.some((revisit) => revisit.scopes.includes(scope))) {
-        continue;
-      }
-      const checkpoint = this.options.store.loadDiscovery(scope);
-      if (
-        !checkpoint ||
-        checkpoint.status !== "complete" ||
-        checkpoint.warnings.length > 0
-      ) {
-        continue;
-      }
-      this.options.store.saveDiscovery({
-        ...checkpoint,
-        lastCompleteDiscoveryStartedAt: scanStartedAt,
-        updatedAt,
-        lastPageAt: updatedAt,
-      });
-    }
-  }
-
   private saveRevisit(
     candidate: Candidate,
     now: Date,
@@ -1520,10 +1554,30 @@ export class HistoryCollector {
     return null;
   }
 
+  private async commitDiscoveryCheckpoint(
+    checkpoint: DiscoveryCheckpoint,
+    identity: IdentityRecord,
+    scanStartedAt: string,
+  ): Promise<void> {
+    if (this.options.onDiscoveryPageCommit) {
+      const page: HistoryDiscoveryPageCommit = {
+        checkpoint,
+        identity,
+        scanStartedAt,
+      };
+      await this.options.onDiscoveryPageCommit(page);
+    }
+  }
+
   private async commitPage(page: HistoryPageCommit): Promise<void> {
     if (this.options.onPageCommit) {
       await this.options.onPageCommit(page);
+      return;
     }
+    this.options.store.acknowledgeCandidates(
+      page.summary.conversationId,
+      page.scopes,
+    );
   }
 
   private buildCoverage(
@@ -1627,6 +1681,8 @@ function checkpointFor(
   warnings: string[],
   updatedAt: string,
   olderHistoryAudit: OlderHistoryAuditState,
+  candidateQueue: DiscoveryCandidate[] = [],
+  headFingerprint: string | null = null,
 ): DiscoveryCheckpoint {
   return {
     stateVersion: HISTORY_STATE_VERSION,
@@ -1645,6 +1701,11 @@ function checkpointFor(
     paginationState,
     warnings: [...new Set(warnings)],
     updatedAt,
+    candidateQueue: candidateQueue.map((candidate) => ({
+      summary: { ...candidate.summary },
+      missingUpdateTime: candidate.missingUpdateTime,
+    })),
+    headFingerprint,
     olderHistoryAudit,
   };
 }
@@ -1692,6 +1753,107 @@ function auditCoverage(
   return { ...normalizeOlderHistoryAudit(state) };
 }
 
+function frozenImplicitAcquisition(
+  store: HistoryCheckpointStore,
+  request: HistoryCollectionRequest,
+): { range: HistoryRange; scanStartedAt: string } | null {
+  if (request.mode !== "incremental" || request.range !== undefined) {
+    return null;
+  }
+  const unfinished = (["active", "archived"] as const)
+    .map((scope) => store.loadDiscovery(scope))
+    .filter(
+      (checkpoint): checkpoint is DiscoveryCheckpoint =>
+        checkpoint !== null &&
+        checkpoint.mode === "incremental" &&
+        (checkpoint.status !== "complete" || checkpoint.continuation !== null) &&
+        checkpoint.scanStartedAt !== null &&
+        isValidInstant(checkpoint.scanStartedAt) &&
+        validHistoryRange(checkpoint.range),
+    );
+  const first = unfinished[0];
+  if (!first || first.scanStartedAt === null) {
+    return null;
+  }
+  if (
+    unfinished.some(
+      (checkpoint) =>
+        checkpoint.scanStartedAt !== first.scanStartedAt ||
+        checkpoint.range.start !== first.range.start ||
+        checkpoint.range.end !== first.range.end,
+    )
+  ) {
+    return null;
+  }
+  return {
+    range: { ...first.range },
+    scanStartedAt: first.scanStartedAt,
+  };
+}
+
+function shouldReuseFrozenAcquisition(
+  previous: DiscoveryCheckpoint | null,
+  request: HistoryCollectionRequest,
+  requestedRange: HistoryRange,
+  candidateCutoff: string,
+): boolean {
+  if (
+    !previous ||
+    previous.mode !== request.mode ||
+    (previous.status === "complete" && previous.continuation === null) ||
+    previous.scanStartedAt === null ||
+    !isValidInstant(previous.scanStartedAt) ||
+    !validHistoryRange(previous.range)
+  ) {
+    return false;
+  }
+  return (
+    previous.range.start === requestedRange.start &&
+    previous.range.end === requestedRange.end &&
+    previous.candidateCutoff === candidateCutoff
+  );
+}
+
+function normalizeCandidateQueue(
+  queue: DiscoveryCandidate[] | undefined,
+): DiscoveryCandidate[] {
+  const normalized = new Map<string, DiscoveryCandidate>();
+  for (const candidate of queue ?? []) {
+    const summary = candidate?.summary;
+    const conversationId = summary?.conversationId;
+    if (typeof conversationId !== "string" || conversationId.trim() === "") {
+      continue;
+    }
+    const existing = normalized.get(conversationId);
+    const next: DiscoveryCandidate = {
+      summary: { ...summary },
+      missingUpdateTime:
+        candidate.missingUpdateTime === true || summary.updatedAt === null,
+    };
+    if (!existing) {
+      normalized.set(conversationId, next);
+      continue;
+    }
+    if (isMoreRecent(next.summary.updatedAt, existing.summary.updatedAt)) {
+      existing.summary = next.summary;
+    }
+    existing.missingUpdateTime ||= next.missingUpdateTime;
+  }
+  return [...normalized.values()];
+}
+
+function fingerprintIndexPage(page: AdaptedPage<ConversationSummary>): string {
+  return createHash("sha256")
+    .update(JSON.stringify(indexPageFingerprint(page)))
+    .digest("hex");
+}
+
+function validHistoryRange(range: HistoryRange): boolean {
+  const start = new Date(range.start).getTime();
+  const end = new Date(range.end).getTime();
+  return Number.isFinite(start) && Number.isFinite(end) && start < end;
+}
+
 function isOlderHistoryAuditCandidate(
   summary: ConversationSummary,
   cutoff: string,
@@ -1704,20 +1866,6 @@ function isOlderHistoryAuditCandidate(
   return !Number.isFinite(updatedAt) ||
     !Number.isFinite(cutoffTime) ||
     updatedAt < cutoffTime;
-}
-
-function checkpointMatches(
-  checkpoint: DiscoveryCheckpoint,
-  mode: HistoryCollectionRequest["mode"],
-  range: HistoryRange,
-  candidateCutoff: string,
-): boolean {
-  return (
-    checkpoint.mode === mode &&
-    checkpoint.candidateCutoff === candidateCutoff &&
-    checkpoint.range.start === range.start &&
-    checkpoint.range.end === range.end
-  );
 }
 
 function isCandidateSummary(

@@ -71,6 +71,11 @@ export interface HistoryRange {
   end: string;
 }
 
+export interface DiscoveryCandidate {
+  summary: ConversationSummary;
+  missingUpdateTime: boolean;
+}
+
 export interface DiscoveryCheckpoint {
   stateVersion: typeof HISTORY_STATE_VERSION;
   accountId: string;
@@ -91,6 +96,10 @@ export interface DiscoveryCheckpoint {
   paginationState: PaginationState;
   warnings: string[];
   updatedAt: string;
+  /** SHA-256 fingerprint of the frozen offset-zero index page. */
+  headFingerprint?: string | null;
+  /** Candidates discovered by this scope and not yet durably acknowledged. */
+  candidateQueue?: DiscoveryCandidate[];
   olderHistoryAudit?: OlderHistoryAuditState;
 }
 
@@ -113,9 +122,19 @@ export interface RevisitEntry {
 export interface HistoryCheckpointStore {
   loadDiscovery(scope: HistoryScope): DiscoveryCheckpoint | null;
   saveDiscovery(checkpoint: DiscoveryCheckpoint): void;
+  acknowledgeCandidates(
+    conversationId: string,
+    scopes: readonly HistoryScope[],
+  ): void;
   listRevisits(): RevisitEntry[];
   upsertRevisit(entry: RevisitEntry): void;
   completeRevisit(accountId: string, conversationId: string): void;
+}
+
+export interface HistoryDiscoveryPageCommit {
+  checkpoint: DiscoveryCheckpoint;
+  identity: IdentityRecord;
+  scanStartedAt: string;
 }
 
 export interface HistoryPageCommit {
@@ -180,6 +199,9 @@ export interface HistoryCollectionOptions {
   maxIndexPagesPerScope?: number;
   maxMessagePagesPerConversation?: number;
   legacyFallbackApproved?: boolean;
+  onDiscoveryPageCommit?: (
+    page: HistoryDiscoveryPageCommit,
+  ) => Promise<void> | void;
   onPageCommit?: (
     page: HistoryPageCommit,
   ) => Promise<void> | void;

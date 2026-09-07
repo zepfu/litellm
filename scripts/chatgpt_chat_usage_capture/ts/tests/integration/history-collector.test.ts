@@ -432,11 +432,70 @@ describe("Stage-2A history collection", () => {
     expect(result.scopes.find((scope) => scope.scope === "active")).toMatchObject({
       coverage: "partial",
       paginationState: "repeated_cursor",
-      continuation: 0,
+      continuation: null,
     });
     expect(
       reader.requests.filter((request) => request.path.includes("scope=active")),
     ).toHaveLength(1);
+  });
+
+  it("invalidates a nonadvancing continuation and restarts at zero once", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-nonadvancing-discovery");
+    const firstPage = indexPage([candidate], 1, false, "continuation");
+    const badPage = indexPage([candidate], 1, false, "continuation");
+    reader.indexPages.set(
+      "active",
+      new Map([
+        [0, firstPage],
+        [1, badPage],
+      ]),
+    );
+    reader.indexPages.set("archived", new Map([[0, indexPage([])]]));
+    reader.details.set(candidate.conversationId, detail(candidate.conversationId));
+    reader.messagePages.set(
+      candidate.conversationId,
+      new Map([["latest", completePage([])]]),
+    );
+
+    const store = new MemoryCheckpointStore();
+    await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+      maxIndexPagesPerScope: 1,
+    }).collect({ mode: "incremental" });
+
+    reader.requests.length = 0;
+    reader.indexSequences.set("active", [
+      firstPage,
+      badPage,
+      indexPage([candidate]),
+      indexPage([candidate]),
+    ]);
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => new Date("2026-09-07T13:00:00.000Z") },
+    }).collect({
+      mode: "incremental",
+      now: new Date("2026-09-07T13:00:00.000Z"),
+    });
+    expect(
+      reader.requests
+        .filter((request) => request.path.includes("scope=active"))
+        .map((request) => request.path),
+    ).toEqual([
+      "/backend-api/conversations?scope=active&offset=0",
+      "/backend-api/conversations?scope=active&offset=1",
+      "/backend-api/conversations?scope=active&offset=0",
+      "/backend-api/conversations?scope=active&offset=0",
+    ]);
+    expect(result.scopes.find((scope) => scope.scope === "active")).toMatchObject({
+      continuation: null,
+    });
+    expect(result.warnings).toContain("nonadvancing_index_continuation");
+    expect(store.loadDiscovery("active")?.continuation).toBeNull();
   });
 
   it("acquires a conversation that becomes visible on a later index page", async () => {
@@ -578,7 +637,7 @@ describe("Stage-2A history collection", () => {
     expect(result.status).toBe("partial");
     expect(result.scopes.find((scope) => scope.scope === "active")).toMatchObject({
       coverage: "partial",
-      continuation: 0,
+      continuation: null,
       pagesFetched: 3,
     });
     expect(result.warnings).toContain("leading_index_changed_during_scan");
@@ -844,7 +903,7 @@ describe("Stage-2A history collection", () => {
       "conv-older-audit",
     );
     expect(store.loadDiscovery("active")?.olderHistoryAudit?.lastCompletedAt).toBe(
-      "2026-09-07T13:00:00.000Z",
+      NOW.toISOString(),
     );
   });
 
@@ -965,7 +1024,7 @@ describe("Stage-2A history collection", () => {
     );
   });
 
-  it("resumes only when the frozen mode, range, and cutoff all match", async () => {
+  it("resumes only when frozen discovery metadata matches", async () => {
     const reader = new ScriptedReader();
     const candidate = summary("conv-resume");
     reader.indexPages.set(
@@ -983,25 +1042,31 @@ describe("Stage-2A history collection", () => {
     );
 
     const store = new MemoryCheckpointStore();
-    const partial = testCheckpoint("active", {
-      status: "partial",
-      mode: "backfill",
-      range: EXPLICIT_RANGE,
-      candidateCutoff: EXPLICIT_RANGE.start,
-      continuation: 1,
-      paginationState: "budget_exhausted",
-      lastCompleteDiscoveryStartedAt: null,
-    });
+    await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+      maxIndexPagesPerScope: 1,
+    }).collect({ mode: "backfill", range: EXPLICIT_RANGE });
+    const partial = store.loadDiscovery("active")!;
+    expect(partial.continuation).toBe(1);
+    expect(partial.headFingerprint).toBeTruthy();
 
-    store.saveDiscovery(partial);
+    reader.requests.length = 0;
     await new HistoryCollector(reader, {
       accountId: "fixture-primary",
       store,
       clock: { now: () => NOW },
     }).collect({ mode: "backfill", range: EXPLICIT_RANGE });
     expect(
-      reader.requests.find((request) => request.path.includes("scope=active"))?.path,
-    ).toContain("offset=1");
+      reader.requests
+        .filter((request) => request.path.includes("scope=active"))
+        .map((request) => request.path),
+    ).toEqual([
+      "/backend-api/conversations?scope=active&offset=0",
+      "/backend-api/conversations?scope=active&offset=1",
+      "/backend-api/conversations?scope=active&offset=0",
+    ]);
 
     reader.requests.length = 0;
     for (const mismatch of [
@@ -1075,6 +1140,85 @@ describe("Stage-2A history collection", () => {
     expect(store.loadDiscovery("active")?.lastCompleteDiscoveryStartedAt).toBe(
       priorWatermark,
     );
+  });
+
+  it("freezes an implicit range and scan start while resuming discovery", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-frozen-discovery");
+    reader.indexPages.set(
+      "active",
+      new Map([
+        [0, indexPage([candidate], 1, false, "continuation")],
+        [1, indexPage([candidate])],
+      ]),
+    );
+    reader.indexPages.set("archived", new Map([[0, indexPage([])]]));
+    reader.details.set(candidate.conversationId, detail(candidate.conversationId));
+    reader.messagePages.set(
+      candidate.conversationId,
+      new Map([["latest", completePage([])]]),
+    );
+
+    const store = new MemoryCheckpointStore();
+    const first = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+      maxIndexPagesPerScope: 1,
+    }).collect({ mode: "incremental" });
+    const firstCheckpoint = store.loadDiscovery("active")!;
+    expect(firstCheckpoint).toMatchObject({
+      continuation: 1,
+      scanStartedAt: NOW.toISOString(),
+      range: first.range,
+    });
+    expect(firstCheckpoint.headFingerprint).toBeTruthy();
+
+    reader.requests.length = 0;
+    const later = new Date("2026-09-07T13:00:00.000Z");
+    const second = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => later },
+    }).collect({ mode: "incremental", now: later });
+
+    expect(second.range).toEqual(first.range);
+    expect(second.scanStartedAt).toBe(first.scanStartedAt);
+    expect(
+      reader.requests
+        .filter((request) => request.path.includes("scope=active"))
+        .map((request) => request.path),
+    ).toEqual([
+      "/backend-api/conversations?scope=active&offset=0",
+      "/backend-api/conversations?scope=active&offset=1",
+      "/backend-api/conversations?scope=active&offset=0",
+    ]);
+    expect(store.loadDiscovery("active")?.headFingerprint).toBe(
+      firstCheckpoint.headFingerprint,
+    );
+  });
+
+  it("advances a clean discovery watermark while detail work remains outstanding", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-detail-outstanding");
+    addCompleteIndex(reader, [candidate], []);
+    const store = new MemoryCheckpointStore();
+
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    }).collect({ mode: "incremental" });
+
+    expect(result.revisits).toMatchObject([
+      { conversationId: candidate.conversationId, reason: "incomplete_detail" },
+    ]);
+    expect(store.loadDiscovery("active")).toMatchObject({
+      status: "complete",
+      continuation: null,
+      lastCompleteDiscoveryStartedAt: NOW.toISOString(),
+      candidateQueue: [],
+    });
   });
 
   it("uses the fourteen-day reconciliation range while acquiring outstanding work", async () => {
@@ -1267,7 +1411,60 @@ describe("Stage-2A history collection", () => {
     }
   });
 
-  it("does not persist a failed page's mutated continuation", async () => {
+  it("atomically persists an index-page candidate queue before a later page fails", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "usage-capture-discovery-atomicity-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    ledger.upsertAccount(LEDGER_SCOPE);
+    const store = new SqliteCheckpointStore(ledger, LEDGER_SCOPE);
+    const reader = new ScriptedReader();
+    const first = summary("conv-discovery-queued");
+    const second = summary("conv-discovery-later");
+    reader.indexPages.set(
+      "active",
+      new Map([
+        [0, indexPage([first], 1, false, "continuation")],
+        [1, indexPage([second])],
+      ]),
+    );
+    reader.indexPages.set("archived", new Map([[0, indexPage([])]]));
+
+    let commits = 0;
+    try {
+      await expect(
+        new HistoryCollector(reader, {
+          accountId: "fixture-primary",
+          store,
+          clock: { now: () => NOW },
+          onDiscoveryPageCommit: () => {
+            commits += 1;
+            ledger.transaction(() => {
+              store.persist();
+              if (commits === 3) {
+                throw new Error("injected discovery checkpoint failure");
+              }
+            });
+          },
+        }).collect({ mode: "backfill", range: EXPLICIT_RANGE }),
+      ).rejects.toThrow("injected discovery checkpoint failure");
+
+      const durable = new SqliteCheckpointStore(ledger, LEDGER_SCOPE)
+        .loadDiscovery("active");
+      expect(commits).toBe(3);
+      expect(durable).toMatchObject({
+        status: "in_progress",
+        continuation: 1,
+        pagesFetched: 1,
+      });
+      expect(durable?.candidateQueue?.map((item) => item.summary.conversationId))
+        .toEqual([first.conversationId]);
+      expect(durable?.headFingerprint).toBeTruthy();
+    } finally {
+      ledger.close();
+    }
+  });
+
+  it("persists discovery state while rolling back failed detail evidence", async () => {
     const directory = mkdtempSync(join(tmpdir(), "usage-capture-page-atomicity-"));
     temporaryDirectories.push(directory);
     const ledger = new Ledger(join(directory, "usage.sqlite"));
@@ -1326,13 +1523,32 @@ describe("Stage-2A history collection", () => {
           now: new Date("2026-09-07T13:00:00.000Z"),
         }),
       ).rejects.toThrow("injected failed page");
-      expect(
+      const persistedAfterFailure = JSON.parse(
         (
           ledger.db
             .prepare("SELECT state_json FROM history_state")
             .get() as { state_json: string }
         ).state_json,
-      ).toBe(persistedBeforeFailure);
+      ) as {
+        checkpoints: Record<string, Record<string, unknown>>;
+        revisits: unknown[];
+      };
+      const priorState = JSON.parse(persistedBeforeFailure) as {
+        revisits: unknown[];
+      };
+      expect(persistedAfterFailure.checkpoints.active).toMatchObject({
+        mode: "incremental",
+        continuation: null,
+        lastCompleteDiscoveryStartedAt: "2026-09-07T13:00:00.000Z",
+        candidateQueue: [
+          {
+            summary: {
+              conversationId: candidate.conversationId,
+            },
+          },
+        ],
+      });
+      expect(persistedAfterFailure.revisits).toEqual(priorState.revisits);
     } finally {
       ledger.close();
     }
