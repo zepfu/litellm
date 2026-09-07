@@ -286,6 +286,51 @@ describe("sanitizer boundary", () => {
     expect(nodeLimited.coverage).toBe("partial");
   });
 
+  it("should validate full and partial 100-message pages with generated provenance", () => {
+    const payload = {
+      conversation_id: "conversation-1",
+      surface: "chat",
+      messages: Array.from({ length: 100 }, (_, index) => ({
+        conversationId: "conversation-1",
+        messageId: `message-${index}`,
+        nodeId: `node-${index}`,
+        parentId: null,
+        children: [],
+        role: index % 2 === 0 ? "user" : "assistant",
+        channel: "final",
+        createdAt: "2026-09-07T00:00:00Z",
+        status: "finished_successfully",
+        endTurn: true,
+        requestedModelRaw: "gpt-5.6-astra-pro",
+        requestedModeRaw: "standard",
+        requestedReasoningEffortRaw: "high",
+        recordedFinalModelRaw: "gpt-5.6-astra-pro",
+        generationId: `generation-${index}`,
+        requestId: `request-${index}`,
+        surface: "chat",
+        origin: null,
+        metadata: {
+          model_slug: "gpt-5.6-astra-pro",
+          requested_model: "gpt-5.6-astra-pro",
+          surface: "chat",
+        },
+      })),
+    };
+    const provenance = {
+      sourceKind: "conversation_detail",
+      runId: "run-1",
+      evidenceId: "evidence-1",
+    };
+
+    const projected = observationProjection(payload, provenance);
+    const partial = observationProjection(payload, provenance, { maxNodes: 1024 });
+
+    expect(projected.messages).toHaveLength(100);
+    expect(() => assertNoSecrets(projected)).not.toThrow();
+    expect(partial.coverage).toBe("partial");
+    expect(() => assertNoSecrets(partial)).not.toThrow();
+  });
+
   it("should fail closed with an explicit error for cyclic input", () => {
     const cyclic: Record<string, unknown> = {
       conversation_id: "conversation-1",
