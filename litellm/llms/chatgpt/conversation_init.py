@@ -2192,6 +2192,7 @@ def _native_init_retry_after(headers: Mapping[str, Any]) -> Optional[float]:
 def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture lifetime
     page: Any,
     *,
+    session: Any,
     request_url: str,
     expected_account_hash: str,
     deadline: float,
@@ -2201,7 +2202,6 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
 
     target = urlsplit(request_url)
     origin = f"https://{target.netloc}"
-    session = page.context.new_cdp_session(page)
     capture: Dict[str, Any] = {}
     page_response: Dict[str, Any] = {}
     extra_hashes: Dict[str, Optional[str]] = {}
@@ -2465,7 +2465,9 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
                 return envelope(None, failed=True)
             page.wait_for_timeout(50)
     finally:
-        session.detach()
+        # Keep Fetch interception installed until the caller closes the target.
+        # Closing that target tears down the session; do not detach it here.
+        boundary_error = True
 
 
 class OracleBrowserConversationInitTransport:
@@ -2669,6 +2671,7 @@ def _oracle_browser_capture_worker(
         )
         result = _observe_native_oracle_init(
             owned_page,
+            session=owned_page.context.new_cdp_session(owned_page),
             request_url=request_url,
             expected_account_hash=expected_account_hash,
             deadline=deadline,
@@ -2733,6 +2736,7 @@ def _create_owned_oracle_page(
         create_options["browserContextId"] = anchor["browserContextId"]
     # Publish ownership before waiting for Playwright's Page or starting capture.
     with source_page.context.expect_page(
+        predicate=lambda page: page.url == creation_url,
         timeout=_browser_timeout_milliseconds(_remaining_browser_timeout(deadline))
     ) as page_event:
         creation_state.value = 1
