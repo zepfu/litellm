@@ -1991,7 +1991,7 @@ def _env_int(name: str, default: int) -> int:
 def _parse_chatgpt_conversation_init_account_bindings(
     raw_value: Optional[str],
 ) -> Optional[Dict[str, ChatGPTConversationInitAccountBinding]]:
-    if raw_value is None or not str(raw_value).strip():
+    if raw_value is None:
         return None
     try:
         parsed = json.loads(str(raw_value))
@@ -14214,6 +14214,7 @@ def _run_chatgpt_conversation_init_poll_task(  # noqa: PLR0915
                 "legacy_file_snapshot" if payloads else "no_current_snapshot"
             )
             if config.apply and payloads:
+                summary["persistence_coverage_status"] = "attempted"
                 summary["inserted_count"] = (
                     _persist_chatgpt_conversation_init_observations(
                         config,
@@ -14249,12 +14250,17 @@ def _run_chatgpt_conversation_init_poll_task(  # noqa: PLR0915
             summary["error_class"] = exc.__class__.__name__
             summary["error_message"] = _redacted_failure_message(str(exc))
             summary["last_good_state_retained"] = True
-            summary["coverage_status"] = "no_current_snapshot"
-            if isinstance(exc, ChatGPTConversationInitError):
-                summary["status_code"] = exc.status_code
-                summary["telemetry_class"] = exc.telemetry_class
+            if summary["persistence_coverage_status"] == "attempted":
+                summary["coverage_status"] = "database_write_failed"
+                summary["persistence_coverage_status"] = "database_write_failed"
+                summary["telemetry_class"] = "database_write_failed"
             else:
-                summary["telemetry_class"] = "malformed_telemetry"
+                summary["coverage_status"] = "no_current_snapshot"
+                if isinstance(exc, ChatGPTConversationInitError):
+                    summary["status_code"] = exc.status_code
+                    summary["telemetry_class"] = exc.telemetry_class
+                else:
+                    summary["telemetry_class"] = "malformed_telemetry"
 
     return {
         "event": "chatgpt_conversation_init_poll",

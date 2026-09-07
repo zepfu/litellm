@@ -802,6 +802,10 @@ When `AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS` is absent, the sidecar
 preserves legacy file-only mode. That mode covers only the one
 configured snapshot path and must not be described as live all-account
 coverage. The existing last-good file behavior applies only to this mode.
+Explicit empty or whitespace values are invalid JSON; `{}` enables bound mode
+with missing-binding coverage. A legacy database write failure preserves
+`capture_coverage_status=legacy_file_snapshot` and reports
+`persistence_coverage_status=database_write_failed`.
 
 When the binding variable is present, its exact nonsecret interface is a JSON
 object keyed by the `LITELLM_CODEX_OAUTH_INVENTORY` label:
