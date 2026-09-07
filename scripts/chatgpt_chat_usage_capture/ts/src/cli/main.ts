@@ -15,6 +15,7 @@ import { loadConfig, saveConfig, defaultConfig, ConfigError } from "../config.js
 import {
   bootstrapAccount,
   inspectCapabilities,
+  inspectFixtureCapabilities,
 } from "../browser/bootstrap.js";
 import { ADAPTER_VERSION } from "../contracts/records.js";
 import type { BootstrapResult, InspectCapabilitiesResult } from "../browser/bootstrap.js";
@@ -25,6 +26,7 @@ interface CliArgs {
   accountId: string | null;
   interactiveLogin: boolean;
   stateDirectory: string | null;
+  fixtureRoot: string | null;
 }
 
 const STAGE1_COMMANDS = new Set(["init", "bootstrap", "inspect-capabilities"]);
@@ -126,6 +128,32 @@ async function runInspectCapabilities(args: CliArgs): Promise<number> {
     console.error(`usage-capture inspect-capabilities: account '${args.accountId}' not found`);
     return 2;
   }
+  const stateDirectory = resolve(
+    args.stateDirectory ?? config.application.stateDirectory,
+  );
+
+  if (account.browser.adapter === "fixture_history") {
+    if (!args.fixtureRoot) {
+      console.error(
+        "usage-capture inspect-capabilities: fixture_history requires --fixture-root",
+      );
+      return 2;
+    }
+    const result = await inspectFixtureCapabilities(account, {
+      fixtureRoot: resolve(args.fixtureRoot),
+      stateDirectory,
+    });
+    printInspectCapabilitiesResult(result);
+    return result.state === "ready" ? 0 : 1;
+  }
+
+  if (args.fixtureRoot) {
+    console.error(
+      "usage-capture inspect-capabilities: --fixture-root requires browser.adapter fixture_history",
+    );
+    return 2;
+  }
+
   if (account.browser.adapter !== "playwright_persistent_context") {
     console.error(
       "usage-capture inspect-capabilities: browser adapter is not playwright_persistent_context",
@@ -134,7 +162,7 @@ async function runInspectCapabilities(args: CliArgs): Promise<number> {
   }
 
   const result = await inspectCapabilities(account, {
-    stateDirectory: resolve(args.stateDirectory ?? config.application.stateDirectory),
+    stateDirectory,
   });
   printInspectCapabilitiesResult(result);
   return result.state === "ready" ? 0 : 1;
@@ -164,6 +192,7 @@ function parseArgs(argv: string[]): CliArgs {
   let accountId: string | null = null;
   let interactiveLogin = false;
   let stateDirectory: string | null = null;
+  let fixtureRoot: string | null = null;
 
   for (let index = 1; index < argv.length; index += 1) {
     const flag = argv[index];
@@ -178,6 +207,9 @@ function parseArgs(argv: string[]): CliArgs {
     } else if (flag === "--state-directory" && argv[index + 1]) {
       stateDirectory = argv[index + 1]!;
       index += 1;
+    } else if (flag === "--fixture-root" && argv[index + 1]) {
+      fixtureRoot = argv[index + 1]!;
+      index += 1;
     } else if (flag === "--help" || flag === "-h") {
       printHelp();
       process.exit(0);
@@ -191,7 +223,18 @@ function parseArgs(argv: string[]): CliArgs {
     process.exit(2);
   }
 
-  return { command, configPath, accountId, interactiveLogin, stateDirectory };
+  if (fixtureRoot && command !== "inspect-capabilities") {
+    throw new Error("--fixture-root is only supported by inspect-capabilities");
+  }
+
+  return {
+    command,
+    configPath,
+    accountId,
+    interactiveLogin,
+    stateDirectory,
+    fixtureRoot,
+  };
 }
 
 function printHelp(): void {
@@ -208,7 +251,10 @@ Stage-1 commands:
       quota owner. Interactive login is explicit and opt-in only.
 
   inspect-capabilities --config <path> [--account <id>] [--state-directory <path>]
+      [--fixture-root <path>]
       Read-only capability inspection of active and archived history indexes.
+      Use --fixture-root only with a fixture_history account for offline
+      acceptance; live inspection requires playwright_persistent_context.
 
 All other commands (backfill, refresh, report, schedule, windows, quota,
 rebuild, export, dashboard, models) are Stage-2+ and fail closed with an

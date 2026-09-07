@@ -12,6 +12,9 @@
 - Live operation requires a dedicated persistent Playwright profile and a
   locally installed Chromium browser. Automated credential acquisition is not
   supported.
+- Fixture-backed `inspect-capabilities` is offline contract acceptance only; it
+  does not prove live endpoint availability, authentication, or provider schema
+  compatibility.
 - Interactive login is intentionally opt-in and human-driven. The package
   never accepts credentials on the command line or writes them to config,
   logs, fixtures, or state.
@@ -19,8 +22,8 @@
   `unrecognized` or `partial`; the adapter does not invent complete coverage.
 - Project coverage and quota metadata are reported as unknown or not collected
   in Stage 1. No official remaining-quota value is inferred.
-- The fixture transport is deterministic test support, not a provider emulator
-  and not a live endpoint proof.
+- The fixture transport is deterministic synthetic support, not a provider
+  emulator and not a live endpoint proof.
 - The Python implementation remains the reference for later accounting and
   scheduling behavior. This TypeScript package does not duplicate those
   stages.

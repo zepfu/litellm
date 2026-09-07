@@ -13,7 +13,7 @@ JSON config -> bootstrap state machine
         Playwright persistent context
                     |
                     v
-          GET-only route transport
+          GET-only request boundary
                     |
                     v
           ChatGPT history adapter
@@ -41,13 +41,19 @@ after `--interactive-login` is explicitly supplied. Downloads are disabled.
 The browser context and its cookies, storage, and tokens remain in the profile
 directory and are never serialized into Stage-1 state.
 
+For offline acceptance, the CLI can select `fixture_history` with an explicit
+`--fixture-root`. That path uses the same adapter against synthetic JSON and
+does not construct a Playwright context. Live bootstrap and live capability
+inspection reject the fixture adapter.
+
 ### Adapter
 
 `src/adapters/chatgpt/adapter.ts` accepts only `GET` and only the exact
 history/session route shapes documented in `endpoint-evidence.md`. It treats
 HTTP `401`, `403`, HTML login pages, and `429` as control signals. A `429` is a
 transport rate limit and is never interpreted as a ChatGPT quota exhaustion
-signal.
+signal. `assertAllowedRequest` is applied by the adapter and by both the
+Playwright and fixture transports before any request is issued.
 
 The adapter exposes active and archived index coverage, modern detail support,
 message-page pagination evidence, and legacy detail fallback behavior. The

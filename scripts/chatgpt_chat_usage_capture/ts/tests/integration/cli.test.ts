@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { run } from "../../src/cli/main.js";
-import { loadConfig } from "../../src/config.js";
+import { defaultConfig, loadConfig, saveConfig } from "../../src/config.js";
 
 describe("CLI", () => {
   let stateDirectory: string;
@@ -36,5 +36,38 @@ describe("CLI", () => {
     expect(exitCode).toBe(0);
     expect(JSON.parse(readFileSync(configPath, "utf8")).schema_version).toBe(1);
     expect(loadConfig(configPath).accounts).toHaveLength(1);
+  });
+
+  it("runs fixture-backed inspect-capabilities offline", async () => {
+    const config = defaultConfig();
+    const account = config.accounts[0]!;
+    account.id = "fixture-primary";
+    account.expectedProviderUserId = "user-abc123";
+    account.expectedWorkspaceId = "ws-xyz";
+    account.quotaOwnerId = "user-abc123";
+    account.browser.adapter = "fixture_history";
+    account.browser.profilePath = "";
+    config.application.stateDirectory = stateDirectory;
+
+    const configPath = join(stateDirectory, "fixture-config.json");
+    saveConfig(config, configPath);
+    const fixtureRoot = new URL("../fixtures/v1/", import.meta.url).pathname;
+
+    const exitCode = await run([
+      "inspect-capabilities",
+      "--config",
+      configPath,
+      "--fixture-root",
+      fixtureRoot,
+      "--state-directory",
+      stateDirectory,
+    ]);
+
+    expect(exitCode).toBe(0);
+    const persisted = JSON.parse(
+      readFileSync(join(stateDirectory, "bootstrap", "fixture-primary.json"), "utf8"),
+    );
+    expect(persisted.state).toBe("ready");
+    expect(persisted.identity.providerUserId).toBe("user-abc123");
   });
 });
