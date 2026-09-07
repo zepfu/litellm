@@ -6,8 +6,8 @@ import asyncio
 import json
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import Any, Optional
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import httpx
 import pytest
@@ -1649,3 +1649,147 @@ async def test_central_coordinator_replaces_legacy_precommit_cap():
         "timer",
         "timer",
     ]
+
+
+@pytest.mark.asyncio
+async def test_central_coordinator_uses_remaining_deadline_once_per_attempt():
+    coordinator = OpenAIAlphaCapacityRetryCoordinator(
+        target_identity="openai:gpt",
+    )
+    coordinator.within_deadline = MagicMock(return_value=True)
+    coordinator.next_wait_seconds = MagicMock(return_value=15.0)
+    coordinator.sleep_with_wakeup = AsyncMock(return_value="timer")
+    coordinator.record_retry = MagicMock()
+    coordinator.signal_success = AsyncMock()
+
+    attempts = 0
+    timeout_values: list[Optional[float]] = []
+
+    async def operation():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ResponsesStreamPreCommitFailure(
+                error_class="server_overloaded",
+                classification="transient_capacity",
+                retryable=True,
+                message="overloaded",
+            )
+        return "committed"
+
+    async def fake_await(
+        operation,
+        *,
+        timeout_seconds,
+        operation_name,
+    ):
+        timeout_values.append(timeout_seconds)
+        return await operation()
+
+    with (
+        patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
+            "_await_passthrough_pre_first_byte_operation",
+            new=fake_await,
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.time.monotonic",
+            side_effect=[0.0, 15.0, 15.0],
+        ),
+        patch.object(
+            type(coordinator),
+            "remaining_seconds",
+            new_callable=PropertyMock,
+        ) as remaining_seconds,
+    ):
+        remaining_seconds.side_effect = [7200.0, 7185.0]
+        result = await _execute_passthrough_pre_first_byte_with_hidden_retries(
+            kwargs={},
+            operation_name="stream_pre_first_byte",
+            operation=operation,
+            caller_managed_hidden_retry=False,
+            openai_capacity_coordinator=coordinator,
+        )
+
+    assert result == "committed"
+    assert timeout_values == [7200.0, 7185.0]
+
+
+@pytest.mark.asyncio
+async def test_central_coordinator_uses_repeating_capacity_schedule():
+    coordinator = MagicMock()
+    coordinator.deadline_seconds = 7200.0
+    coordinator.remaining_seconds = 7200.0
+    coordinator.within_deadline.return_value = True
+    coordinator.next_wait_seconds.side_effect = [
+        15.0,
+        30.0,
+        60.0,
+        120.0,
+        240.0,
+        240.0,
+    ]
+    coordinator.sleep_with_wakeup = AsyncMock(return_value="timer")
+    coordinator.record_retry = MagicMock()
+    coordinator.signal_success = AsyncMock()
+
+    attempts = 0
+
+    async def operation():
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 6:
+            raise ResponsesStreamPreCommitFailure(
+                error_class="server_overloaded",
+                classification="transient_capacity",
+                retryable=True,
+                message="overloaded",
+            )
+        return "committed"
+
+    result = await _execute_passthrough_pre_first_byte_with_hidden_retries(
+        kwargs={},
+        operation_name="stream_pre_first_byte",
+        operation=operation,
+        caller_managed_hidden_retry=False,
+        openai_capacity_coordinator=coordinator,
+    )
+
+    assert result == "committed"
+    assert attempts == 7
+    assert [
+        call.args[0]
+        for call in coordinator.sleep_with_wakeup.call_args_list
+    ] == [15.0, 30.0, 60.0, 120.0, 240.0, 240.0]
+    assert coordinator.record_retry.call_count == 6
+
+
+@pytest.mark.asyncio
+async def test_central_coordinator_does_not_tight_loop_non_capacity_retryable():
+    coordinator = MagicMock()
+    coordinator.deadline_seconds = 7200.0
+    coordinator.remaining_seconds = 7200.0
+    coordinator.sleep_with_wakeup = AsyncMock(
+        side_effect=AssertionError("non-capacity retry must not sleep")
+    )
+    coordinator.record_retry = MagicMock()
+
+    attempts = 0
+
+    async def operation():
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ReadError("connection reset")
+
+    with pytest.raises(httpx.ReadError):
+        await _execute_passthrough_pre_first_byte_with_hidden_retries(
+            kwargs={},
+            operation_name="stream_pre_first_byte",
+            operation=operation,
+            caller_managed_hidden_retry=False,
+            openai_capacity_coordinator=coordinator,
+        )
+
+    assert attempts == 1
+    coordinator.sleep_with_wakeup.assert_not_awaited()
+    coordinator.record_retry.assert_not_called()
