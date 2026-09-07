@@ -14009,12 +14009,12 @@ def _set_chatgpt_conversation_init_cooldown(
     )
     for session_key in session_keys:
         prior_cooldown_until = (
-            state.chatgpt_conversation_init_cooldown_until_by_session.get(
+            state.chatgpt_conversation_init_cooldown_until_monotonic_by_session.get(
                 session_key
             )
         )
         if prior_cooldown_until is None or cooldown_until > prior_cooldown_until:
-            state.chatgpt_conversation_init_cooldown_until_by_session[
+            state.chatgpt_conversation_init_cooldown_until_monotonic_by_session[
                 session_key
             ] = cooldown_until
 
