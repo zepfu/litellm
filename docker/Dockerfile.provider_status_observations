@@ -26,7 +26,9 @@ RUN apt-get update \
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir "psycopg[binary]==3.3.4"
+RUN pip install --no-cache-dir \
+    "psycopg[binary]==3.3.4" \
+    "playwright==1.62.0"
 
 COPY scripts/record_provider_status_observations.py /app/scripts/record_provider_status_observations.py
 COPY scripts/grok_oidc_refresh.py /app/scripts/grok_oidc_refresh.py
