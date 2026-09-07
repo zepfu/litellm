@@ -483,7 +483,9 @@ export function estimateQuota(input: QuotaEstimatorInput): QuotaEstimate {
   for (const attemptId of attemptIds) {
     let assessment: QuotaAttemptAssessment;
     if (normalized.conflictingIds.has(attemptId)) {
-      assessment = conflictingDuplicateAssessment(attemptId);
+      assessment = conflictingDuplicateAssessment(
+        attemptId, normalized.variants.get(attemptId) ?? [], input.ownership,
+      );
     } else {
       const attempt = normalized.byId.get(attemptId);
       if (attempt === undefined) {
@@ -635,13 +637,14 @@ function buildBucketEstimate(
     : null;
   const unclampedRemainderKnown =
     state.window?.status === "known" &&
-    state.membershipComplete &&
+    (state.membershipComplete ||
+      (workingUsageEstimate !== null && workingUsageEstimate > state.policy.capacity)) &&
     workingUsageEstimate !== null;
   const workingRemainingUnclamped = unclampedRemainderKnown
     ? state.policy.capacity - (workingUsageEstimate ?? 0)
     : null;
   const remainderQualified =
-    unclampedRemainderKnown && coverage === "complete";
+    unclampedRemainderKnown && state.membershipComplete && coverage === "complete";
   const workingRemainingEstimate =
     !remainderQualified || workingRemainingUnclamped === null
     ? null
@@ -652,7 +655,7 @@ function buildBucketEstimate(
           kind: "local_usage_exceeds_capacity" as const,
           excess: Math.abs(workingRemainingUnclamped),
           qualification:
-            coverage === "complete" ? ("qualified" as const) : ("diagnostic_only" as const),
+            remainderQualified ? ("qualified" as const) : ("diagnostic_only" as const),
         }
       : null;
 
@@ -933,6 +936,7 @@ function validateOwnership(ownership: QuotaOwnershipExpectation): void {
 interface NormalizedAttempts {
   byId: Map<string, ReconstructedAttempt>;
   conflictingIds: Set<string>;
+  variants: Map<string, ReconstructedAttempt[]>;
 }
 
 function normalizeAttempts(
@@ -962,12 +966,24 @@ function normalizeAttempts(
       conflictingIds.add(attemptId);
     }
   }
-  return { byId, conflictingIds };
+  return { byId, conflictingIds, variants: grouped };
 }
 
 function conflictingDuplicateAssessment(
   attemptId: string,
+  variants: ReadonlyArray<ReconstructedAttempt>,
+  ownership: QuotaOwnershipExpectation,
 ): QuotaAttemptAssessment {
+  const categories = new Set<UncertainDebitCategory>(["conflicting_duplicate_identity"]);
+  for (const variant of variants) {
+    if (scopeReasonFor(variant, ownership) !== null ||
+        variant.outcome === "rejected_before_start") {
+      continue;
+    }
+    for (const category of uncertainDebitCategoriesFor(variant)) {
+      categories.add(category);
+    }
+  }
   return {
     attemptId,
     disposition: "unclassified",
@@ -976,7 +992,9 @@ function conflictingDuplicateAssessment(
     applicableBucketIds: [],
     contributedBucketIds: [],
     membershipByBucket: {},
-    uncertainDebitCategories: ["conflicting_duplicate_identity"],
+    uncertainDebitCategories: UNCERTAIN_DEBIT_CATEGORIES.filter(
+      (category) => categories.has(category),
+    ),
     unclassifiedReasons: ["conflicting_duplicate_identity"],
   };
 }

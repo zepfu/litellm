@@ -345,6 +345,32 @@ describe("pure quota estimator", () => {
     });
   });
 
+  it("should union independent uncertainty across conflicting revisions without counting them", () => {
+    const failed = makeAttempt({
+      outcome: "failed_after_start", completedAnswer: false,
+    });
+    const variants = [failed, { ...failed, revision: 2 }];
+    const input = {
+      attempts: variants,
+      windows: [windowFor("astra_weekly", { attempt: "in" })],
+      coverage: "complete" as const,
+      ownership,
+      uncertainAttemptMode: "include" as const,
+    };
+    const result = estimateQuota(input);
+    expect(result.unknownDebitAttempts).toBe(1);
+    expect(result.uncertainDebitCategories.failed_after_start).toEqual(["attempt"]);
+    expect(result.uncertainDebitCategories.conflicting_duplicate_identity).toEqual(["attempt"]);
+    expect(result.countedAttemptIds).toEqual([]);
+    expect(estimateQuota({ ...input, attempts: [...variants].reverse() })).toEqual(result);
+
+    const cancelled = { ...failed, outcome: "cancelled_after_start", revision: 3 };
+    const union = estimateQuota({ ...input, attempts: [...variants, cancelled] });
+    expect(union.uncertainDebitCategories.failed_after_start).toEqual(["attempt"]);
+    expect(union.uncertainDebitCategories.cancelled_after_start).toEqual(["attempt"]);
+    expect(union.countedAttemptIds).toEqual([]);
+  });
+
   it("should exclude non-Chat, unattributed, unknown-owner, and other-owner attempts", () => {
     const attempts = [
       makeAttempt({
@@ -521,6 +547,32 @@ describe("pure quota estimator", () => {
     });
     expect(diagnostic.workingHeadroomByFamily.fixture_family).toBeNull();
 
+    const ambiguousExtra = estimateQuota({
+      policy: diagnosticPolicy,
+      attempts: [...diagnosticAttempts, makeAttempt({
+        attemptId: "fourth",
+        requestedFamily: "fixture_family",
+        recordedFinalFamily: "fixture_family",
+      })],
+      windows: [windowFor("diagnostic", {
+        one: "in", two: "in", three: "in", fourth: "ambiguous",
+      })],
+      coverage: "complete",
+      ownership,
+    });
+    expect(ambiguousExtra.buckets.diagnostic).toMatchObject({
+      workingUsageEstimate: 3,
+      workingRemainingEstimate: null,
+      workingRemainingUnclamped: -2,
+      unknownMembershipAttemptIds: ["fourth"],
+      discrepancy: {
+        kind: "local_usage_exceeds_capacity",
+        excess: 2,
+        qualification: "diagnostic_only",
+      },
+    });
+    expect(ambiguousExtra.workingHeadroomByFamily.fixture_family).toBeNull();
+
     const completeWithUnknownMembership = estimateQuota({
       attempts: [attempt],
       windows,
@@ -550,41 +602,54 @@ describe("pure quota estimator", () => {
       [170, 20],
     ] as const;
     const firstTotals = { sol: 0, astra: 0, combined: 0 };
+    const firstHistory: ReconstructedAttempt[] = [];
 
     for (const [dayIndex, [solCount, astraCount]] of firstSchedule.entries()) {
       const day = arithmeticDay("first", dayIndex + 1, solCount, astraCount);
-      const result = estimateArithmeticDay(day);
+      firstHistory.push(...day.attempts);
+      const result = estimateArithmeticDay(day, firstHistory, `first-day-${dayIndex + 1}`);
       const sol = result.buckets.sol_daily?.workingUsageEstimate ?? null;
       const astra = result.buckets.astra_weekly?.workingUsageEstimate ?? null;
       const combined =
         result.buckets.pro_combined_daily?.workingUsageEstimate ?? null;
 
       expect(sol).toBe(solCount);
-      expect(astra).toBe(astraCount);
+      firstTotals.astra += astraCount;
+      expect(astra).toBe(firstTotals.astra);
+      expect(astra ?? Infinity).toBeLessThanOrEqual(200);
+      expect(result.buckets.astra_weekly?.workingRemainingEstimate).toBe(200 - firstTotals.astra);
       expect(combined).toBe(solCount + astraCount);
       expect(sol ?? Infinity).toBeLessThanOrEqual(170);
       expect(combined ?? Infinity).toBeLessThanOrEqual(200);
       firstTotals.sol += sol ?? 0;
-      firstTotals.astra += astra ?? 0;
       firstTotals.combined += combined ?? 0;
     }
 
     expect(firstTotals).toEqual({ sol: 1190, astra: 200, combined: 1390 });
 
     let secondCombinedTotal = 0;
+    const secondHistory: ReconstructedAttempt[] = [];
     for (let day = 1; day <= 7; day += 1) {
       const dayFixture =
         day === 1
           ? arithmeticDay("second", day, 0, 200)
           : arithmeticDay("second", day, 170, 0);
-      const result = estimateArithmeticDay(dayFixture);
+      secondHistory.push(...dayFixture.attempts);
+      const result = estimateArithmeticDay(dayFixture, secondHistory, `second-day-${day}`);
       const sol = result.buckets.sol_daily?.workingUsageEstimate ?? null;
       const combined =
         result.buckets.pro_combined_daily?.workingUsageEstimate ?? null;
+      expect(result.buckets.astra_weekly).toMatchObject({
+        workingUsageEstimate: 200,
+        workingRemainingEstimate: 0,
+      });
+      expect(sol ?? Infinity).toBeLessThanOrEqual(170);
+      expect(combined ?? Infinity).toBeLessThanOrEqual(200);
 
       if (day === 1) {
         expect(sol).toBe(0);
         expect(combined).toBe(200);
+        expect(result.workingHeadroomByFamily.sol_pro).toBe(0);
       } else {
         expect(sol).toBe(170);
         expect(combined).toBe(170);
@@ -684,14 +749,17 @@ function estimateArithmeticDay(day: {
   attempts: ReconstructedAttempt[];
   solIds: string[];
   astraIds: string[];
-}) {
-  const combinedIds = [...day.solIds, ...day.astraIds];
+}, retainedAttempts: ReconstructedAttempt[], dailyWindowId: string) {
+  const combinedIds = new Set([...day.solIds, ...day.astraIds]);
+  const dailyMembership = Object.fromEntries(retainedAttempts.map((attempt) => [
+    attempt.attemptId, combinedIds.has(attempt.attemptId) ? "in" as const : "out" as const,
+  ]));
   return estimateQuota({
-    attempts: day.attempts,
+    attempts: retainedAttempts,
     windows: [
-      windowFor("astra_weekly", membershipFor(day.astraIds)),
-      windowFor("sol_daily", membershipFor(day.solIds)),
-      windowFor("pro_combined_daily", membershipFor(combinedIds)),
+      windowFor("astra_weekly", membershipFor(retainedAttempts.map((attempt) => attempt.attemptId))),
+      windowFor("sol_daily", dailyMembership, dailyWindowId),
+      windowFor("pro_combined_daily", dailyMembership, dailyWindowId),
     ],
     coverage: "complete",
     ownership,

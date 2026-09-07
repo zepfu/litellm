@@ -112,6 +112,8 @@ Repeated identical records for one attempt identity are deduplicated before
 classification. Conflicting records for one identity are retained as one
 `conflicting_duplicate_identity` uncertainty assessment and never select an
 arbitrary family or contribute to a bucket.
+Independent uncertainty categories from owned Chat variants are unioned, so a
+conflicting revision does not hide a known failure or cancellation.
 
 Only verified Chat attempts for the expected quota owner contribute. Work,
 Codex, other surfaces, shared/imported/copied origins, missing ownership, and
@@ -130,3 +132,10 @@ unclamped remainder preserves negative capacity discrepancies and the
 presentation-safe remainder is clamped to zero when qualified. Model headroom
 is the minimum of all compatible known individual/shared remainders and is
 `null` when any required bucket is unknown.
+
+Definite in-window usage exceeding capacity preserves the negative diagnostic
+even when additional attempts have ambiguous membership. That discrepancy is
+`diagnostic_only`; unresolved membership still makes qualified remainder and
+headroom unknown. Arithmetic fixtures retain weekly history while supplying
+distinct daily memberships, so daily rollover does not replenish the weekly
+Astra allocation.
