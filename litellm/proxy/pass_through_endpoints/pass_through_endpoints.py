@@ -2025,7 +2025,9 @@ def _is_openai_alpha_capacity_retry_target(
     url: httpx.URL,
     endpoint_type: EndpointType,
 ) -> bool:
-    """Limit the long capacity retry budget to the central OpenAI Responses route."""
+    """Limit the long capacity retry budget to alpha OpenAI Responses traffic."""
+    if os.getenv("AAWM_LITELLM_ENVIRONMENT", "").strip() != "litellm-alpha":
+        return False
     if endpoint_type != EndpointType.OPENAI:
         return False
     incoming_path = str(getattr(getattr(request, "url", None), "path", "") or "")

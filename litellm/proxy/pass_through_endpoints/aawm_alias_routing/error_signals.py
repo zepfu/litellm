@@ -20,7 +20,7 @@ import os
 import random
 import re
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 import httpx
 
@@ -2447,12 +2447,33 @@ _RESPONSES_PRE_COMMIT_ACCOUNT_EXHAUSTION_CLASSES = frozenset(
         "usage_limit_reached",
     }
 )
-# Legacy alias preserved for existing callers that reference the old constant.
-# The progressive schedule in retry.py is authoritative for wait durations.
+# Legacy policy constants remain authoritative unless the caller explicitly
+# enables the alpha OpenAI capacity extension.
 RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS = 10.0
-# No longer bounded by a fixed attempt count; the schedule and deadline define
-# the retry envelope.  Kept as a sentinel only for non-OpenAI callers.
 RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS = 2
+
+
+def _is_openai_alpha_capacity_retry_enabled(
+    *,
+    request: Any,
+    candidate: Any,
+    is_codex_alias: bool,
+) -> bool:
+    """Return whether the alpha OpenAI capacity extension is explicitly eligible."""
+    if os.getenv("AAWM_LITELLM_ENVIRONMENT", "").strip() != "litellm-alpha":
+        return False
+    if not is_codex_alias or not isinstance(candidate, Mapping):
+        return False
+    if (
+        candidate.get("provider") != "openai"
+        or candidate.get("route_family") != "codex_responses"
+    ):
+        return False
+    incoming_path = str(getattr(getattr(request, "url", None), "path", "") or "")
+    return incoming_path.rstrip("/") in {
+        "/openai_passthrough/responses",
+        "/openai_passthrough/v1/responses",
+    }
 
 
 def plan_responses_pre_commit_retry(
@@ -2461,13 +2482,15 @@ def plan_responses_pre_commit_retry(
     same_account_transient_attempts: int,
     elapsed_seconds: float = 0.0,
     budget: Optional[OpenAIAlphaCapacityRetryBudget] = None,
+    openai_alpha_capacity_retry_enabled: bool = False,
 ) -> dict[str, Any]:
     """Decide same-account retry vs account rotation before SSE commit.
 
-    OpenAI alpha capacity errors use the progressive schedule
-    ``15, 30, 60, 120, 240, 240, ...`` and a two-hour request-wide deadline.
-    Non-capacity errors (usage exhaustion, terminal, etc.) are excluded
-    immediately.
+    The legacy policy remains the default: one 10-second same-account retry,
+    followed by ``pre_stream_unavailable``.  Alpha OpenAI capacity errors may
+    explicitly opt into the progressive schedule ``15, 30, 60, 120, 240,
+    240, ...`` and its two-hour request-wide deadline.  Non-capacity errors
+    (usage exhaustion, terminal, etc.) are excluded immediately.
     """
     normalized = str(error_class or "")
     if normalized in _RESPONSES_PRE_COMMIT_ACCOUNT_EXHAUSTION_CLASSES:
@@ -2481,6 +2504,29 @@ def plan_responses_pre_commit_retry(
             "error_class": normalized,
         }
     if normalized in _RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES:
+        if not openai_alpha_capacity_retry_enabled:
+            if (
+                same_account_transient_attempts
+                < RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS
+            ):
+                return {
+                    "action": "retry_same_account",
+                    "retry_same_account": True,
+                    "apply_account_exhaustion_cooldown": False,
+                    "wait_seconds": RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
+                    "http_status": 503,
+                    "retryable": True,
+                    "error_class": normalized,
+                }
+            return {
+                "action": "pre_stream_unavailable",
+                "retry_same_account": False,
+                "apply_account_exhaustion_cooldown": False,
+                "wait_seconds": RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
+                "http_status": 503,
+                "retryable": True,
+                "error_class": normalized,
+            }
         next_wait = openai_alpha_capacity_retry_wait_seconds(
             same_account_transient_attempts
         )

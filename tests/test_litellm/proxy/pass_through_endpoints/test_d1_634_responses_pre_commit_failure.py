@@ -18,6 +18,7 @@ from starlette.responses import Response
 from litellm.proxy._types import ProxyException
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals import (
     _RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES,
+    _is_openai_alpha_capacity_retry_enabled,
     plan_responses_pre_commit_retry,
 )
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
@@ -689,6 +690,7 @@ def test_plan_retries_same_account_for_transient_capacity():
     first = plan_responses_pre_commit_retry(
         error_class="server_overloaded",
         same_account_transient_attempts=0,
+        openai_alpha_capacity_retry_enabled=True,
     )
     assert first["action"] == "retry_same_account"
     assert first["retry_same_account"] is True
@@ -717,6 +719,7 @@ def test_plan_returns_pre_stream_503_after_two_transient_failures():
         same_account_transient_attempts=0,
         elapsed_seconds=7195.0,
         budget=OpenAIAlphaCapacityRetryBudget(deadline_seconds=7200.0),
+        openai_alpha_capacity_retry_enabled=True,
     )
     assert plan["action"] == "deadline_exhausted"
     assert plan["retry_same_account"] is False
@@ -1085,6 +1088,7 @@ def test_plan_progressive_schedule_first_retry_15s():
     plan = plan_responses_pre_commit_retry(
         error_class="server_overloaded",
         same_account_transient_attempts=0,
+        openai_alpha_capacity_retry_enabled=True,
     )
     assert plan["action"] == "retry_same_account"
     assert plan["retry_same_account"] is True
@@ -1096,6 +1100,7 @@ def test_plan_progressive_schedule_second_retry_30s():
     plan = plan_responses_pre_commit_retry(
         error_class="server_overloaded",
         same_account_transient_attempts=1,
+        openai_alpha_capacity_retry_enabled=True,
     )
     assert plan["action"] == "retry_same_account"
     assert plan["wait_seconds"] == 30.0
@@ -1105,6 +1110,7 @@ def test_plan_progressive_schedule_third_retry_60s():
     plan = plan_responses_pre_commit_retry(
         error_class="server_overloaded",
         same_account_transient_attempts=2,
+        openai_alpha_capacity_retry_enabled=True,
     )
     assert plan["action"] == "retry_same_account"
     assert plan["wait_seconds"] == 60.0
@@ -1114,6 +1120,7 @@ def test_plan_progressive_schedule_fourth_retry_120s():
     plan = plan_responses_pre_commit_retry(
         error_class="server_overloaded",
         same_account_transient_attempts=3,
+        openai_alpha_capacity_retry_enabled=True,
     )
     assert plan["action"] == "retry_same_account"
     assert plan["wait_seconds"] == 120.0
@@ -1123,6 +1130,7 @@ def test_plan_progressive_schedule_fifth_retry_240s():
     plan = plan_responses_pre_commit_retry(
         error_class="server_overloaded",
         same_account_transient_attempts=4,
+        openai_alpha_capacity_retry_enabled=True,
     )
     assert plan["action"] == "retry_same_account"
     assert plan["wait_seconds"] == 240.0
@@ -1132,6 +1140,7 @@ def test_plan_progressive_schedule_sixth_retry_repeats_240s():
     plan = plan_responses_pre_commit_retry(
         error_class="server_overloaded",
         same_account_transient_attempts=5,
+        openai_alpha_capacity_retry_enabled=True,
     )
     assert plan["action"] == "retry_same_account"
     assert plan["wait_seconds"] == 240.0
@@ -1143,6 +1152,7 @@ def test_plan_deadline_exhausted_when_projected_exceeds():
         same_account_transient_attempts=0,
         elapsed_seconds=7190.0,
         budget=OpenAIAlphaCapacityRetryBudget(deadline_seconds=7200.0),
+        openai_alpha_capacity_retry_enabled=True,
     )
     assert plan["action"] == "deadline_exhausted"
     assert plan["retry_same_account"] is False
@@ -1155,6 +1165,7 @@ def test_plan_no_deadline_when_already_exceeded():
         same_account_transient_attempts=4,
         elapsed_seconds=7205.0,
         budget=OpenAIAlphaCapacityRetryBudget(deadline_seconds=7200.0),
+        openai_alpha_capacity_retry_enabled=True,
     )
     assert plan["action"] == "deadline_exhausted"
 
@@ -1192,6 +1203,7 @@ def test_plan_capacity_exhausted_uses_progressive_schedule():
     plan = plan_responses_pre_commit_retry(
         error_class="capacity_exhausted",
         same_account_transient_attempts=0,
+        openai_alpha_capacity_retry_enabled=True,
     )
     assert plan["action"] == "retry_same_account"
     assert plan["wait_seconds"] == 15.0
@@ -1201,6 +1213,7 @@ def test_plan_upstream_transient_internal_uses_progressive_schedule():
     plan = plan_responses_pre_commit_retry(
         error_class="upstream_transient_internal",
         same_account_transient_attempts=1,
+        openai_alpha_capacity_retry_enabled=True,
     )
     assert plan["action"] == "retry_same_account"
     assert plan["wait_seconds"] == 30.0
@@ -1212,6 +1225,7 @@ def test_plan_default_deadline_is_7200():
         error_class="server_overloaded",
         same_account_transient_attempts=0,
         elapsed_seconds=8000.0,
+        openai_alpha_capacity_retry_enabled=True,
     )
     assert plan["action"] == "deadline_exhausted"
 
@@ -1222,6 +1236,7 @@ def test_plan_custom_budget_short_deadline():
         same_account_transient_attempts=0,
         elapsed_seconds=30.0,
         budget=OpenAIAlphaCapacityRetryBudget(deadline_seconds=40.0),
+        openai_alpha_capacity_retry_enabled=True,
     )
     # 30 + 15 = 45 > 40, so deadline exhausted
     assert plan["action"] == "deadline_exhausted"
@@ -1233,17 +1248,19 @@ def test_plan_custom_budget_still_retries():
         same_account_transient_attempts=0,
         elapsed_seconds=10.0,
         budget=OpenAIAlphaCapacityRetryBudget(deadline_seconds=40.0),
+        openai_alpha_capacity_retry_enabled=True,
     )
     # 10 + 15 = 25 <= 40
     assert plan["action"] == "retry_same_account"
     assert plan["wait_seconds"] == 15.0
 
 
-def test_plan_existing_legacy_caller_still_works():
-    """Callers that don't pass elapsed_seconds or budget still get valid results."""
+def test_plan_existing_alpha_extension_caller_still_works():
+    """The explicit alpha extension still accepts the request-wide budget."""
     first = plan_responses_pre_commit_retry(
         error_class="server_overloaded",
         same_account_transient_attempts=1,
+        openai_alpha_capacity_retry_enabled=True,
     )
     assert first["action"] == "retry_same_account"
     assert first["wait_seconds"] == 30.0
@@ -1251,9 +1268,30 @@ def test_plan_existing_legacy_caller_still_works():
     second = plan_responses_pre_commit_retry(
         error_class="server_overloaded",
         same_account_transient_attempts=2,
+        openai_alpha_capacity_retry_enabled=True,
     )
     assert second["action"] == "retry_same_account"
     assert second["wait_seconds"] == 60.0
+
+
+def test_plan_preserves_legacy_policy_without_alpha_extension():
+    first = plan_responses_pre_commit_retry(
+        error_class="server_overloaded",
+        same_account_transient_attempts=0,
+        elapsed_seconds=7195.0,
+        budget=OpenAIAlphaCapacityRetryBudget(deadline_seconds=7200.0),
+    )
+    assert first["action"] == "retry_same_account"
+    assert first["wait_seconds"] == 10.0
+
+    exhausted = plan_responses_pre_commit_retry(
+        error_class="server_overloaded",
+        same_account_transient_attempts=2,
+        elapsed_seconds=0.0,
+        budget=OpenAIAlphaCapacityRetryBudget(deadline_seconds=7200.0),
+    )
+    assert exhausted["action"] == "pre_stream_unavailable"
+    assert exhausted["wait_seconds"] == 10.0
 
 
 def test_openai_alpha_capacity_budget_defaults():
@@ -1642,6 +1680,7 @@ class TestPlanIntegrationWithCoordinator:
             same_account_transient_attempts=0,
             elapsed_seconds=30.0,  # 30 + 15 = 45 > 40
             budget=budget,
+            openai_alpha_capacity_retry_enabled=True,
         )
         assert plan["action"] == "deadline_exhausted"
 
@@ -1652,6 +1691,7 @@ class TestPlanIntegrationWithCoordinator:
             same_account_transient_attempts=0,
             elapsed_seconds=10.0,  # 10 + 15 = 25 <= 40
             budget=budget,
+            openai_alpha_capacity_retry_enabled=True,
         )
         assert plan["action"] == "retry_same_account"
         assert plan["wait_seconds"] == 15.0
@@ -1684,6 +1724,7 @@ class TestPlanIntegrationWithCoordinator:
             same_account_transient_attempts=5,  # 6th attempt
             elapsed_seconds=100.0,
             budget=budget,
+            openai_alpha_capacity_retry_enabled=True,
         )
         assert plan["action"] == "retry_same_account"
         assert plan["wait_seconds"] == 240.0
@@ -1695,6 +1736,7 @@ class TestPlanIntegrationWithCoordinator:
             same_account_transient_attempts=0,
             elapsed_seconds=5.0,  # 5 + 15 = 20 > 10
             budget=budget,
+            openai_alpha_capacity_retry_enabled=True,
         )
         assert plan["action"] == "deadline_exhausted"
         assert plan["retryable"] is True
@@ -1715,8 +1757,18 @@ class TestCoordinatorNoReplayBoundary:
         assert coordinator.retry_count == 0
 
 
-def test_central_capacity_retry_target_is_scoped_to_openai_responses():
+def test_central_capacity_retry_target_is_scoped_to_alpha_openai_responses(
+    monkeypatch,
+):
     request = _responses_request({"model": "gpt-5.4"})
+    monkeypatch.delenv("AAWM_LITELLM_ENVIRONMENT", raising=False)
+    assert not _is_openai_alpha_capacity_retry_target(
+        request=request,
+        url=httpx.URL("https://api.openai.com/v1/responses"),
+        endpoint_type=EndpointType.OPENAI,
+    )
+
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
     assert _is_openai_alpha_capacity_retry_target(
         request=request,
         url=httpx.URL("https://api.openai.com/v1/responses"),
@@ -1727,6 +1779,77 @@ def test_central_capacity_retry_target_is_scoped_to_openai_responses():
         url=httpx.URL("https://chatgpt.com/backend-api/codex/responses"),
         endpoint_type=EndpointType.OPENAI,
     )
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-dev")
+    assert not _is_openai_alpha_capacity_retry_target(
+        request=request,
+        url=httpx.URL("https://api.openai.com/v1/responses"),
+        endpoint_type=EndpointType.OPENAI,
+    )
+
+
+def test_alpha_capacity_planner_gate_requires_codex_openai_route(monkeypatch):
+    request = _responses_request({"model": "gpt-5.4"})
+    candidate = {
+        "provider": "openai",
+        "route_family": "codex_responses",
+    }
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    assert _is_openai_alpha_capacity_retry_enabled(
+        request=request,
+        candidate=candidate,
+        is_codex_alias=True,
+    )
+    assert not _is_openai_alpha_capacity_retry_enabled(
+        request=request,
+        candidate={**candidate, "provider": "openrouter"},
+        is_codex_alias=True,
+    )
+    assert not _is_openai_alpha_capacity_retry_enabled(
+        request=request,
+        candidate={**candidate, "route_family": "anthropic_openai_responses_adapter"},
+        is_codex_alias=True,
+    )
+    assert not _is_openai_alpha_capacity_retry_enabled(
+        request=request,
+        candidate=candidate,
+        is_codex_alias=False,
+    )
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-dev")
+    assert not _is_openai_alpha_capacity_retry_enabled(
+        request=request,
+        candidate=candidate,
+        is_codex_alias=True,
+    )
+
+
+def test_alpha_capacity_planner_gate_rejects_non_responses_route(monkeypatch):
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/openai_passthrough/chat/completions",
+            "raw_path": b"/openai_passthrough/chat/completions",
+            "query_string": b"",
+            "headers": [],
+        }
+    )
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+    assert not _is_openai_alpha_capacity_retry_enabled(
+        request=request,
+        candidate={
+            "provider": "openai",
+            "route_family": "codex_responses",
+        },
+        is_codex_alias=True,
+    )
+
+
+def test_central_capacity_retry_target_rejects_non_openai_upstream_in_alpha(
+    monkeypatch,
+):
+    request = _responses_request({"model": "gpt-5.4"})
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
     assert not _is_openai_alpha_capacity_retry_target(
         request=request,
         url=httpx.URL("https://api.anthropic.com/v1/messages"),
@@ -1991,19 +2114,26 @@ def test_candidate_loop_planner_calls_pass_live_elapsed_and_deadline():
             "same_account_transient_attempts",
             "elapsed_seconds",
             "budget",
+            "openai_alpha_capacity_retry_enabled",
         }
         elapsed_names = _name_ids(keywords["elapsed_seconds"])
         elapsed_attrs = _attr_names(keywords["elapsed_seconds"])
         budget_names = _name_ids(keywords["budget"])
         assert "request_retry_started_at" in elapsed_names
         assert "monotonic" in elapsed_attrs
+        assert "_is_openai_alpha_capacity_retry_enabled" in _attr_names(
+            keywords["openai_alpha_capacity_retry_enabled"]
+        )
         assert "same_account_transient_attempts_by_slot" not in elapsed_names
         assert "request_retry_budget" in budget_names
         assert "same_account_transient_attempts_by_slot" not in budget_names
 
 
 @pytest.mark.asyncio
-async def test_nonstream_openai_passthrough_responses_hands_off_capacity_coordinator():
+async def test_nonstream_openai_passthrough_responses_hands_off_capacity_coordinator(
+    monkeypatch,
+):
+    monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
     from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         session_affinity as sa,

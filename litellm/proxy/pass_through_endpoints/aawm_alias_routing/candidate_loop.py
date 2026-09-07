@@ -1928,6 +1928,13 @@ async def handle_alias_route(  # noqa: PLR0915
                                 time.monotonic() - request_retry_started_at
                             ),
                             budget=request_retry_budget,
+                            openai_alpha_capacity_retry_enabled=(
+                                _error_signals._is_openai_alpha_capacity_retry_enabled(
+                                    request=request,
+                                    candidate=candidate,
+                                    is_codex_alias=is_codex_alias,
+                                )
+                            ),
                         )
                     )
                     prefer_account_failover = (
@@ -2335,6 +2342,13 @@ async def handle_alias_route(  # noqa: PLR0915
                         time.monotonic() - request_retry_started_at
                     ),
                     budget=request_retry_budget,
+                    openai_alpha_capacity_retry_enabled=(
+                        _error_signals._is_openai_alpha_capacity_retry_enabled(
+                            request=request,
+                            candidate=candidate,
+                            is_codex_alias=is_codex_alias,
+                        )
+                    ),
                 )
                 prefer_account_failover = _prefer_codex_oauth_account_failover(
                     candidate=candidate,
