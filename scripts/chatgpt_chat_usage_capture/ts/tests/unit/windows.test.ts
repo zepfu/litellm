@@ -65,6 +65,41 @@ describe("reset-window engine", () => {
     expect(resolved.known).toBe(true);
   });
 
+  it("does not let an expired provider window override a current recurring rule", () => {
+    const providerEvidence = {
+      source: "provider_explicit" as const,
+      provenance: "historical provider window",
+      validated: true,
+      rule: {
+        type: "provider_explicit" as const,
+        start: "2026-09-07T04:00:00.000Z",
+        end: "2026-09-08T04:00:00.000Z",
+        windowId: "expired-provider-window",
+      },
+    };
+    const recurringEvidence = {
+      source: "reviewed_rule" as const,
+      provenance: "reviewed daily observations",
+      reviewed: true,
+      supportedByObservations: true,
+      rule: {
+        type: "calendar" as const,
+        timezone: "America/New_York",
+        period: "day" as const,
+      },
+    };
+    const resolved = resolveResetWindow({
+      asOf: "2026-09-08T04:00:00.000Z",
+      evidence: [providerEvidence, recurringEvidence],
+    });
+
+    expect(resolved.evidenceSource).toBe("reviewed_rule");
+    expect(resolved.selectedEvidence).toEqual(recurringEvidence);
+    expect(resolved.start).toBe("2026-09-08T04:00:00.000Z");
+    expect(resolved.end).toBe("2026-09-09T04:00:00.000Z");
+    expect(resolved.evidence).toEqual([providerEvidence, recurringEvidence]);
+  });
+
   it("preserves a null previous boundary when only the provider next reset is known", () => {
     const resolved = resolveResetWindow({
       asOf: "2026-09-07T12:00:00.000Z",
@@ -170,12 +205,66 @@ describe("reset-window engine", () => {
         type: "calendar",
         timezone: "America/New_York",
         period: "week",
+        weekStartsOn: 1,
       },
       asOf: "2026-09-09T16:00:00.000Z",
     });
     expect(evaluated.start).toBe("2026-09-07T04:00:00.000Z");
     expect(evaluated.end).toBe("2026-09-14T04:00:00.000Z");
     expect(evaluated.weekStartsOn).toBe(1);
+  });
+
+  it("does not infer calendar recurrence from a period hint or Monday default", () => {
+    const fromHint = resolveResetWindow({
+      asOf: "2026-09-09T16:00:00.000Z",
+      evidence: [
+        {
+          source: "reviewed_rule",
+          provenance: "documented policy hint only",
+          reviewed: true,
+          supportedByObservations: true,
+          rule: {
+            type: "calendar",
+            timezone: "America/New_York",
+            documentedPeriodHint: "week",
+          },
+        },
+      ],
+    });
+    expect(fromHint.type).toBe("unknown");
+    expect(fromHint.selectedEvidence).toBeNull();
+
+    const withoutWeekday = resolveResetWindow({
+      asOf: "2026-09-09T16:00:00.000Z",
+      evidence: [
+        {
+          source: "reviewed_rule",
+          provenance: "weekly observations without weekday",
+          reviewed: true,
+          supportedByObservations: true,
+          rule: {
+            type: "calendar",
+            timezone: "America/New_York",
+            period: "week",
+          },
+        },
+      ],
+    });
+    expect(withoutWeekday.type).toBe("unknown");
+    expect(withoutWeekday.selectedEvidence).toBeNull();
+  });
+
+  it("resolves a Sao Paulo day whose local midnight is in a DST gap", () => {
+    const evaluated = evaluateResetWindow({
+      rule: {
+        type: "calendar",
+        timezone: "America/Sao_Paulo",
+        period: "day",
+      },
+      asOf: "2018-11-04T12:00:00.000Z",
+    });
+    expect(evaluated.start).toBe("2018-11-04T03:00:00.000Z");
+    expect(evaluated.end).toBe("2018-11-05T02:00:00.000Z");
   });
 
   it("returns event-specific rolling expiry rather than one shared reset", () => {

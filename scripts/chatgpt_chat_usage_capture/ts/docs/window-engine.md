@@ -54,9 +54,12 @@ a rolling rule, or a timezone from that timestamp.
   The evaluated period containing `asOf` is selected; an exact boundary starts
   the next period.
 - `calendar` requires an IANA `timezone` and supports `day` and `week`.
-  Weeks start on Monday by default and can use `weekStartsOn` with JavaScript
-  weekday numbering. Local midnights are converted through Node's ICU-backed
-  `Intl.DateTimeFormat`, so DST days can be 23 or 25 elapsed hours.
+  The period must be explicit; a `documentedPeriodHint` is context only. Weekly
+  rules must also provide an explicit `weekStartsOn` with JavaScript weekday
+  numbering. Local-date boundaries are resolved through Node's ICU-backed
+  `Intl.DateTimeFormat`; when midnight is in a gap, the first valid instant on
+  that local date is used, and overlaps retain the first occurrence. DST days
+  can therefore be 23 or 25 elapsed hours.
 - `rolling_elapsed` evaluates `[asOf - duration, asOf)` and derives
   `nextExpiryAt` from individual event timestamps.
 - `unknown` has no justified boundaries.

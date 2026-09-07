@@ -41,7 +41,7 @@ export interface ResetWindowRule {
   /** Alias accepted for JavaScript callers; `timezone` is canonical. */
   readonly timeZone?: string | null;
   readonly period?: CalendarPeriod | null;
-  /** Compatibility alias for policy documents that call this a period hint. */
+  /** Context-only policy hint; it never establishes recurrence. */
   readonly documentedPeriodHint?: string | null;
   /** JavaScript weekday numbering: Sunday=0, Monday=1, ... Saturday=6. */
   readonly weekStartsOn?: Weekday;
@@ -169,10 +169,11 @@ const formatterCache = new Map<string, Intl.DateTimeFormat>();
 export function resolveResetWindow(
   input: ResolveResetWindowInput,
 ): ResolvedResetWindow {
+  const asOf = parseInstant(input.asOf, "asOf");
   const evidence = [...(input.evidence ?? [])];
   const candidates = evidence
     .map((item, index) => ({ item, index }))
-    .filter(({ item }) => isEligibleEvidence(item))
+    .filter(({ item }) => isEligibleEvidence(item, asOf))
     .sort((left, right) => {
       const priority =
         EVIDENCE_PRIORITY[right.item.source] -
@@ -190,7 +191,7 @@ export function resolveResetWindow(
   const selected = candidates[0]?.item ?? null;
   const evaluated = evaluateResetWindow({
     rule: selected?.rule ?? { type: "unknown" },
-    asOf: input.asOf,
+    asOf,
     ...(input.eventTimes === undefined
       ? {}
       : { eventTimes: input.eventTimes }),
@@ -274,8 +275,8 @@ export function evaluateResetWindow(
             )
           : asOfDateOnly;
       const endDate = addLocalDays(startDate, period === "week" ? 7 : 1);
-      start = localMidnightUtc(startDate, timezone);
-      end = localMidnightUtc(endDate, timezone);
+      start = localDateBoundaryUtc(startDate, timezone);
+      end = localDateBoundaryUtc(endDate, timezone);
       validateBounds(start, end);
       break;
     }
@@ -418,7 +419,10 @@ export function nextRollingExpiry(input: RollingExpiryInput): string | null {
   return nextExpiry === null ? null : new Date(nextExpiry).toISOString();
 }
 
-function isEligibleEvidence(evidence: ResetWindowEvidence): boolean {
+function isEligibleEvidence(
+  evidence: ResetWindowEvidence,
+  asOf: Date,
+): boolean {
   const rule = evidence.rule;
   if (evidence.current === false || !isNonEmptyString(evidence.provenance)) {
     return false;
@@ -430,31 +434,62 @@ function isEligibleEvidence(evidence: ResetWindowEvidence): boolean {
         rule.type === "provider_explicit" &&
         (rule.start != null ||
           rule.end != null ||
-          isNonEmptyString(rule.windowId))
+          isNonEmptyString(rule.windowId)) &&
+        explicitRuleIsCurrent(rule, asOf)
       );
     case "operator_explicit":
       return (
         evidence.validated !== false &&
         rule.type === "operator_explicit" &&
         rule.start != null &&
-        rule.end != null
+        rule.end != null &&
+        explicitRuleIsCurrent(rule, asOf)
       );
     case "reviewed_rule":
       return (
         evidence.validated !== false &&
         evidence.reviewed === true &&
         evidence.supportedByObservations === true &&
-        RECURRING_WINDOW_TYPES.has(rule.type)
+        RECURRING_WINDOW_TYPES.has(rule.type) &&
+        recurringRuleIsJustified(rule)
       );
     case "provisional_assumption":
       return (
         evidence.validated !== false &&
         evidence.provisional !== false &&
-        RECURRING_WINDOW_TYPES.has(rule.type)
+        RECURRING_WINDOW_TYPES.has(rule.type) &&
+        recurringRuleIsJustified(rule)
       );
     case "unknown":
       return rule.type === "unknown";
   }
+}
+
+function explicitRuleIsCurrent(rule: ResetWindowRule, asOf: Date): boolean {
+  try {
+    const start = optionalInstant(rule.start, "window start");
+    const end = optionalInstant(rule.end, "window end");
+    validateBounds(start, end);
+    if (start !== null && asOf.getTime() < start.getTime()) {
+      return false;
+    }
+    if (end !== null && asOf.getTime() >= end.getTime()) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function recurringRuleIsJustified(rule: ResetWindowRule): boolean {
+  if (rule.type !== "calendar") {
+    return true;
+  }
+  if (rule.period !== "day" && rule.period !== "week") {
+    return false;
+  }
+  return rule.period !== "week" || rule.weekStartsOn !== undefined;
 }
 
 function observedAtMs(evidence: ResetWindowEvidence): number {
@@ -563,7 +598,12 @@ function requiredTimezone(rule: ResetWindowRule): string {
 }
 
 function calendarPeriod(rule: ResetWindowRule): CalendarPeriod {
-  const raw = rule.period ?? rule.documentedPeriodHint ?? "day";
+  const raw = rule.period;
+  if (raw === null || raw === undefined) {
+    throw new Error(
+      "calendar windows require an explicit period; documentedPeriodHint is not sufficient",
+    );
+  }
   const normalized = String(raw).toLowerCase();
   if (normalized === "day" || normalized === "daily") {
     return "day";
@@ -575,7 +615,10 @@ function calendarPeriod(rule: ResetWindowRule): CalendarPeriod {
 }
 
 function weekStart(rule: ResetWindowRule): Weekday {
-  const value = rule.weekStartsOn ?? 1;
+  const value = rule.weekStartsOn;
+  if (value === undefined) {
+    throw new Error("calendar week windows require an explicit weekStartsOn");
+  }
   if (!Number.isInteger(value) || value < 0 || value > 6) {
     throw new Error("weekStartsOn must be an integer from 0 through 6");
   }
@@ -646,34 +689,56 @@ function localDateToUtcMilliseconds(
   return date.getTime();
 }
 
-function localMidnightUtc(value: LocalDate, timezone: string): Date {
-  const wallClock = localDateToUtcMilliseconds({
+/**
+ * Find the first instant whose local calendar date is `value`. This is local
+ * midnight when representable, and the first valid instant after a midnight
+ * gap. Searching the ICU-derived local date also preserves the first
+ * occurrence when a boundary is repeated during an overlap.
+ */
+function localDateBoundaryUtc(value: LocalDate, timezone: string): Date {
+  const targetDateKey = localDateToUtcMilliseconds({
     ...value,
     hour: 0,
     minute: 0,
     second: 0,
   });
-  let candidate = wallClock;
+  const searchSpan = 7 * 24 * 60 * 60 * 1000;
+  let low = targetDateKey - searchSpan;
+  let high = targetDateKey + searchSpan;
   for (let attempt = 0; attempt < 8; attempt += 1) {
-    const offset = timezoneOffsetMs(new Date(candidate), timezone);
-    const next = wallClock - offset;
-    if (next === candidate) {
+    if (localDateKey(new Date(low), timezone) < targetDateKey) {
       break;
     }
-    candidate = next;
+    low -= searchSpan;
   }
-  const resolved = new Date(candidate);
-  const actual = localDateTime(resolved, timezone);
-  if (
-    actual.year !== value.year ||
-    actual.month !== value.month ||
-    actual.day !== value.day ||
-    actual.hour !== 0 ||
-    actual.minute !== 0 ||
-    actual.second !== 0
-  ) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    if (localDateKey(new Date(high), timezone) >= targetDateKey) {
+      break;
+    }
+    high += searchSpan;
+  }
+  if (localDateKey(new Date(low), timezone) >= targetDateKey) {
     throw new Error(
-      `timezone '${timezone}' has no representable local midnight for ` +
+      `unable to find a preceding local date for timezone '${timezone}'`,
+    );
+  }
+  if (localDateKey(new Date(high), timezone) < targetDateKey) {
+    throw new Error(
+      `unable to find local date boundary for timezone '${timezone}'`,
+    );
+  }
+  while (high - low > 1) {
+    const middle = low + Math.floor((high - low) / 2);
+    if (localDateKey(new Date(middle), timezone) >= targetDateKey) {
+      high = middle;
+    } else {
+      low = middle;
+    }
+  }
+  const resolved = new Date(high);
+  if (localDateKey(resolved, timezone) !== targetDateKey) {
+    throw new Error(
+      `timezone '${timezone}' has no representable instant for local date ` +
         `${String(value.year).padStart(4, "0")}-${String(value.month).padStart(
           2,
           "0",
@@ -683,10 +748,14 @@ function localMidnightUtc(value: LocalDate, timezone: string): Date {
   return resolved;
 }
 
-function timezoneOffsetMs(date: Date, timezone: string): number {
-  const parts = localDateTime(date, timezone);
-  const localAsUtc = localDateToUtcMilliseconds(parts) + date.getUTCMilliseconds();
-  return localAsUtc - date.getTime();
+function localDateKey(date: Date, timezone: string): number {
+  const local = localDateTime(date, timezone);
+  return localDateToUtcMilliseconds({
+    ...local,
+    hour: 0,
+    minute: 0,
+    second: 0,
+  });
 }
 
 function addLocalDays(value: LocalDate, days: number): LocalDate {
