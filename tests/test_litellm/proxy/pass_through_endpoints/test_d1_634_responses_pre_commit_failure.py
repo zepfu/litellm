@@ -1278,11 +1278,15 @@ def test_openai_alpha_capacity_budget_custom():
 import time as _time_module
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry import (
+    _LOCAL_CAPACITY_WAKEUP_EVENTS,
     OpenAIAlphaCapacityRetryCoordinator,
+    _build_openai_capacity_success_redis_key,
     _build_openai_capacity_target_identity,
     _hash_target_identity,
     _emit_capacity_retry_log,
     _emit_openai_capacity_terminal_log,
+    _resolve_redis_for_capacity_wakeup,
+    _signal_openai_capacity_success,
     CapacityRetryLogEntry,
 )
 
@@ -1338,6 +1342,22 @@ class TestTargetIdentity:
         assert _build_openai_capacity_target_identity(
             provider="openai", model="openai/gpt-5.6-astra"
         ) == "openai:openai"
+
+    def test_identity_and_redis_key_are_credential_free(self):
+        target_identity = _build_openai_capacity_target_identity(
+            provider="openai", model="gpt-5.6-astra"
+        )
+        redis_key = _build_openai_capacity_success_redis_key(
+            target_identity, namespace="aawm-routing-alpha-v1"
+        )
+
+        assert target_identity == "openai:gpt"
+        assert redis_key == (
+            "aawm:openai_capacity_success:"
+            "aawm-routing-alpha-v1:openai:gpt"
+        )
+        assert "account" not in redis_key
+        assert "secret" not in redis_key
 
     def test_hash_is_stable(self):
         h1 = _hash_target_identity("openai:gpt")
@@ -1400,36 +1420,42 @@ class TestCoordinatorSleepWakeup:
 
     @pytest.mark.asyncio
     async def test_sleep_timer(self):
-        coordinator = OpenAIAlphaCapacityRetryCoordinator(
-            target_identity="openai:gpt",
-        )
-        reason = await coordinator.sleep_with_wakeup(0.05)
+        with patch(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry."
+            "_resolve_redis_for_capacity_wakeup",
+            return_value=None,
+        ):
+            coordinator = OpenAIAlphaCapacityRetryCoordinator(
+                target_identity="openai:gpt",
+            )
+            reason = await coordinator.sleep_with_wakeup(0.05)
         assert reason == "timer"
 
     @pytest.mark.asyncio
     async def test_sleep_peer_success_via_event(self):
-        coordinator = OpenAIAlphaCapacityRetryCoordinator(
-            target_identity="openai:gpt",
-        )
-        import asyncio as _asyncio
+        target_identity = "openai:local-event"
 
-        async def _waker():
-            await _asyncio.sleep(0.02)
-            # Access internal event to signal peer success
-            # We use a local event approach via wakeup_event
-            coordinator._redis_cache = None  # force timer fallback, use event
+        with patch(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.pre_commit_retry."
+            "_resolve_redis_for_capacity_wakeup",
+            return_value=None,
+        ):
+            coordinator = OpenAIAlphaCapacityRetryCoordinator(
+                target_identity=target_identity,
+            )
+            sleep_task = asyncio.create_task(
+                coordinator.sleep_with_wakeup(1.0)
+            )
+            for _ in range(3):
+                await asyncio.sleep(0)
+                if _LOCAL_CAPACITY_WAKEUP_EVENTS.get(target_identity):
+                    break
+            assert _LOCAL_CAPACITY_WAKEUP_EVENTS.get(target_identity)
 
-        # Simulate peer success by setting the event early
-        async def _sleep_then_check():
-            # We need to inject a local event. The coordinator creates a new
-            # _CapacityWakeupState internally. We can't easily inject. Instead,
-            # test by using a short sleep that should be "timer" by default,
-            # confirming the event path is not triggered spuriously.
-            reason = await coordinator.sleep_with_wakeup(0.05)
-            return reason
+            await _signal_openai_capacity_success(target_identity)
+            reason = await asyncio.wait_for(sleep_task, timeout=0.2)
 
-        reason = await _sleep_then_check()
-        assert reason == "timer"
+        assert reason == "peer_success"
 
     @pytest.mark.asyncio
     async def test_wakeup_event_returns_event(self):
@@ -1440,6 +1466,110 @@ class TestCoordinatorSleepWakeup:
         assert not ev.is_set()
         ev.set()
         assert ev.is_set()
+        coordinator._local_events.discard(ev)
+        if not coordinator._local_events:
+            _LOCAL_CAPACITY_WAKEUP_EVENTS.pop("openai:gpt", None)
+
+    def test_redis_resolver_uses_public_manager(self):
+        redis_client = SimpleNamespace()
+        redis_cache = SimpleNamespace(
+            init_async_client=MagicMock(return_value=redis_client)
+        )
+        manager = SimpleNamespace(
+            get_dual_cache=MagicMock(
+                return_value=SimpleNamespace(redis_cache=redis_cache)
+            )
+        )
+
+        with patch(
+            "litellm.proxy.aawm_alias_routing_redis."
+            "aawm_alias_routing_redis_manager",
+            manager,
+        ):
+            assert _resolve_redis_for_capacity_wakeup() is redis_cache
+
+        manager.get_dual_cache.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_signal_success_increments_redis_epoch_and_refreshes_ttl(self):
+        target_identity = "openai:redis-signal"
+        namespace = "aawm-routing-alpha-v1"
+        redis_client = SimpleNamespace(
+            incr=AsyncMock(return_value=4),
+            expire=AsyncMock(return_value=True),
+        )
+        redis_cache = SimpleNamespace(
+            init_async_client=MagicMock(return_value=redis_client)
+        )
+        manager = SimpleNamespace(
+            get_dual_cache=MagicMock(
+                return_value=SimpleNamespace(redis_cache=redis_cache)
+            )
+        )
+        event = asyncio.Event()
+        _LOCAL_CAPACITY_WAKEUP_EVENTS.setdefault(target_identity, set()).add(
+            event
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.aawm_alias_routing_redis."
+                "aawm_alias_routing_redis_manager",
+                manager,
+            ):
+                await _signal_openai_capacity_success(
+                    target_identity, namespace
+                )
+        finally:
+            _LOCAL_CAPACITY_WAKEUP_EVENTS.get(target_identity, set()).discard(
+                event
+            )
+            if not _LOCAL_CAPACITY_WAKEUP_EVENTS.get(target_identity):
+                _LOCAL_CAPACITY_WAKEUP_EVENTS.pop(target_identity, None)
+
+        redis_key = _build_openai_capacity_success_redis_key(
+            target_identity, namespace
+        )
+        assert event.is_set()
+        redis_client.incr.assert_awaited_once_with(redis_key)
+        redis_client.expire.assert_awaited_once_with(redis_key, 300)
+
+    @pytest.mark.asyncio
+    async def test_sleep_with_wakeup_reads_redis_epoch_change(self):
+        target_identity = "openai:redis-read"
+        namespace = "aawm-routing-alpha-v1"
+        redis_client = SimpleNamespace(
+            get=AsyncMock(side_effect=[b"7", b"8"]),
+        )
+        redis_cache = SimpleNamespace(
+            init_async_client=MagicMock(return_value=redis_client)
+        )
+        manager = SimpleNamespace(
+            get_dual_cache=MagicMock(
+                return_value=SimpleNamespace(redis_cache=redis_cache)
+            )
+        )
+
+        with patch(
+            "litellm.proxy.aawm_alias_routing_redis."
+            "aawm_alias_routing_redis_manager",
+            manager,
+        ):
+            coordinator = OpenAIAlphaCapacityRetryCoordinator(
+                target_identity=target_identity,
+                namespace=namespace,
+            )
+            reason = await coordinator.sleep_with_wakeup(1.0)
+
+        redis_key = _build_openai_capacity_success_redis_key(
+            target_identity, namespace
+        )
+        assert reason == "peer_success"
+        assert redis_client.get.await_count == 2
+        assert all(
+            call.args == (redis_key,)
+            for call in redis_client.get.await_args_list
+        )
 
 
 class TestCoordinatorLogging:
