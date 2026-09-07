@@ -117,19 +117,20 @@ class Collector:
         adapter = self._adapter_for(account)
         now = ensure_utc(self.clock())
         run_id = str(uuid4())
-        self.ledger.upsert_account(
-            {
-                "collector_account_id": account.id,
-                "provider_user_id": account.expected_provider_user_id,
-                "workspace_id": account.expected_workspace_id,
-                "quota_owner_id": account.quota_owner_id,
-                "surface": SURFACE_CHAT,
-                "auth_state": "unconfigured",
-                "plan_policy_id": account.plan_policy_id,
-                "enabled": account.enabled,
-                "profile_path": str(account.browser.profile_path),
-            }
-        )
+        with self.ledger.transaction():
+            self.ledger.upsert_account(
+                {
+                    "collector_account_id": account.id,
+                    "provider_user_id": account.expected_provider_user_id,
+                    "workspace_id": account.expected_workspace_id,
+                    "quota_owner_id": account.quota_owner_id,
+                    "surface": SURFACE_CHAT,
+                    "auth_state": "unconfigured",
+                    "plan_policy_id": account.plan_policy_id,
+                    "enabled": account.enabled,
+                    "profile_path": str(account.browser.profile_path),
+                }
+            )
         with self.ledger.transaction():
             self.ledger.record_run_start(
                 run_id=run_id,
@@ -212,19 +213,20 @@ class Collector:
                 "auth_state": identity.get("auth_state") or "unknown",
             }
         )
-        self.ledger.upsert_account(
-            {
-                "collector_account_id": account.id,
-                "provider_user_id": safe.get("provider_user_id"),
-                "workspace_id": safe.get("workspace_id"),
-                "quota_owner_id": safe.get("quota_owner_id") or account.quota_owner_id,
-                "surface": SURFACE_CHAT,
-                "auth_state": safe.get("auth_state") or "unknown",
-                "plan_policy_id": account.plan_policy_id,
-                "enabled": account.enabled,
-                "profile_path": str(account.browser.profile_path),
-            }
-        )
+        with self.ledger.transaction():
+            self.ledger.upsert_account(
+                {
+                    "collector_account_id": account.id,
+                    "provider_user_id": safe.get("provider_user_id"),
+                    "workspace_id": safe.get("workspace_id"),
+                    "quota_owner_id": safe.get("quota_owner_id") or account.quota_owner_id,
+                    "surface": SURFACE_CHAT,
+                    "auth_state": safe.get("auth_state") or "unknown",
+                    "plan_policy_id": account.plan_policy_id,
+                    "enabled": account.enabled,
+                    "profile_path": str(account.browser.profile_path),
+                }
+            )
         return safe
 
     def _finish_paused_run(
@@ -508,10 +510,16 @@ class Collector:
         pages += 1
         from .adapter import adapt_message_page
 
+        # Chat history is collected from the Chat surface. Preserve an
+        # explicit non-Chat value from a payload, but default missing summary
+        # evidence to Chat so accounting does not discard ordinary attempts.
+        effective_surface = (
+            summary.surface if summary.surface == SURFACE_CHAT else SURFACE_CHAT
+        )
         page = adapt_message_page(
             payload,
             conversation_id=summary.conversation_id,
-            conversation_surface=summary.surface,
+            conversation_surface=effective_surface,
         )
         records.extend(page.items)
         warnings.extend(page.warnings)
@@ -525,7 +533,7 @@ class Collector:
             next_page = adapter.fetch_messages(
                 summary.conversation_id,
                 before=str(cursor),
-                conversation_surface=summary.surface,
+                conversation_surface=effective_surface,
             )
             pages += 1
             records.extend(next_page.items)
@@ -539,28 +547,29 @@ class Collector:
                 break
             cursor = next_page.continuation
         coverage = "partial" if warnings else "validated_page"
-        self.ledger.mark_conversation_fetched(account.id, summary.conversation_id, coverage)
-        self.ledger.insert_observation(
-            account_id=account.id,
-            source_kind="conversation",
-            source_id=summary.conversation_id,
-            revision=isoformat_utc(summary.updated_at) or run_id,
-            surface=summary.surface,
-            conversation_id=summary.conversation_id,
-            payload=observation_projection(
-                {
-                    "id": summary.conversation_id,
-                    "update_time": isoformat_utc(summary.updated_at),
-                    "surface": summary.surface,
-                    "message_count": len(records),
-                },
+        with self.ledger.transaction():
+            self.ledger.mark_conversation_fetched(account.id, summary.conversation_id, coverage)
+            self.ledger.insert_observation(
+                account_id=account.id,
                 source_kind="conversation",
+                source_id=summary.conversation_id,
+                revision=isoformat_utc(summary.updated_at) or run_id,
+                surface=summary.surface,
+                conversation_id=summary.conversation_id,
+                payload=observation_projection(
+                    {
+                        "id": summary.conversation_id,
+                        "update_time": isoformat_utc(summary.updated_at),
+                        "surface": summary.surface,
+                        "message_count": len(records),
+                    },
+                    source_kind="conversation",
+                    run_id=run_id,
+                    evidence_id=summary.conversation_id,
+                ),
+                observed_at=now,
                 run_id=run_id,
-                evidence_id=summary.conversation_id,
-            ),
-            observed_at=now,
-            run_id=run_id,
-        )
+            )
         return records, pages, warnings
 
     def _ingest_messages(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -55,6 +55,7 @@ class SchedulerConfig:
     overlap_duration: timedelta
     initial_backfill_duration: timedelta
     reconciliation_lookback: timedelta
+    schedule_anchor: Optional[datetime] = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,28 @@ class AccountConfig:
 
 
 @dataclass(frozen=True)
+class RetentionConfig:
+    sanitized_observation_days: int
+    normalized_attempt_days: int
+    daily_aggregate_days: int
+    preserve_active_window_evidence: bool
+    raw_payload_storage: str = "disabled"
+
+
+@dataclass(frozen=True)
+class AlertsConfig:
+    threshold_percentages: tuple[int, ...]
+    unknown_mapping: bool
+    model_mismatch: bool
+    auth_required: bool
+    incomplete_history: bool
+    stale_soft_multiplier: int
+    stale_hard_multiplier: int
+    stale_grace_minutes: int
+    deduplicate_per_window_and_threshold: bool
+
+
+@dataclass(frozen=True)
 class ApplicationConfig:
     name: str
     report_timezone: str
@@ -141,6 +164,9 @@ class ApplicationConfig:
     persist_message_content: bool
     bind_host: str
     bind_port: int
+    local_api_auth: str = "required"
+    local_api_token: Optional[str] = None
+    outbound_notifications_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -153,6 +179,10 @@ class CollectorConfig:
     quota_policies: tuple[QuotaPolicy, ...]
     default_lookback: timedelta
     source_path: Path
+    retention: RetentionConfig = field(default_factory=lambda: RetentionConfig(45, 180, 400, True))
+    alerts: AlertsConfig = field(
+        default_factory=lambda: AlertsConfig((75, 90, 100), True, True, True, True, 2, 6, 5, True)
+    )
 
     def account(self, account_id: Optional[str] = None) -> AccountConfig:
         if account_id is None:
@@ -196,7 +226,8 @@ def parse_config(payload: Mapping[str, Any], *, source_path: Path) -> CollectorC
     policies = tuple(_parse_policy(item) for item in (payload.get("quota_policies") or []))
     reporting = payload.get("reporting") or {}
     lookback = parse_iso_duration(str(reporting.get("default_lookback") or DEFAULT_LOOKBACK))
-    _validate_retention(payload.get("retention") or {}, accounts)
+    retention = _parse_retention(payload.get("retention") or {}, accounts)
+    alerts = _parse_alerts(payload.get("alerts") or {})
     return CollectorConfig(
         schema_version=schema_version,
         application=application,
@@ -206,6 +237,8 @@ def parse_config(payload: Mapping[str, Any], *, source_path: Path) -> CollectorC
         quota_policies=policies,
         default_lookback=lookback,
         source_path=source_path,
+        retention=retention,
+        alerts=alerts,
     )
 
 
@@ -216,6 +249,9 @@ def _parse_application(raw: Mapping[str, Any], source_path: Path) -> Application
     persist = bool(raw.get("persist_message_content") or False)
     if persist:
         raise ConfigError("persist_message_content must remain false")
+    auth_mode = str(raw.get("local_api_auth") or "required")
+    if auth_mode not in {"required", "disabled"}:
+        raise ConfigError("application.local_api_auth must be required or disabled")
     return ApplicationConfig(
         name=str(raw.get("name") or "chatgpt-chat-usage-capture"),
         report_timezone=str(raw.get("report_timezone") or DEFAULT_TIMEZONE),
@@ -223,6 +259,9 @@ def _parse_application(raw: Mapping[str, Any], source_path: Path) -> Application
         persist_message_content=False,
         bind_host=str(raw.get("bind_host") or "127.0.0.1"),
         bind_port=int(raw.get("bind_port") or 8765),
+        local_api_auth=auth_mode,
+        local_api_token=_optional_str(raw.get("local_api_token")),
+        outbound_notifications_enabled=bool(raw.get("outbound_notifications_enabled") or False),
     )
 
 
@@ -287,15 +326,19 @@ def _parse_scheduler(raw: Mapping[str, Any]) -> SchedulerConfig:
     catch_up = str(raw.get("catch_up") or "coalesce")
     if catch_up != "coalesce":
         raise ConfigError("scheduler.catch_up must be coalesce")
+    jitter = int(raw.get("jitter_seconds") or 60)
+    if jitter < 0:
+        raise ConfigError("scheduler.jitter_seconds must be >= 0")
     return SchedulerConfig(
         refresh_interval=refresh,
         reconciliation_interval=recon,
-        jitter_seconds=int(raw.get("jitter_seconds") or 60),
+        jitter_seconds=jitter,
         catch_up=catch_up,
         refresh_on_startup=str(raw.get("refresh_on_startup") or "if_due"),
         overlap_duration=overlap,
         initial_backfill_duration=backfill,
         reconciliation_lookback=recon_lookback,
+        schedule_anchor=_optional_datetime(raw.get("schedule_anchor")),
     )
 
 
@@ -378,14 +421,43 @@ def _parse_bucket(raw: Mapping[str, Any]) -> QuotaBucket:
     )
 
 
-def _validate_retention(raw: Mapping[str, Any], accounts: tuple[AccountConfig, ...]) -> None:
+def _parse_retention(raw: Mapping[str, Any], accounts: tuple[AccountConfig, ...]) -> RetentionConfig:
     observation_days = int(raw.get("sanitized_observation_days") or 45)
     attempt_days = int(raw.get("normalized_attempt_days") or 180)
-    if observation_days < 45 or attempt_days < 180:
+    daily_aggregate_days = int(raw.get("daily_aggregate_days") or 400)
+    if observation_days < 45 or attempt_days < 180 or daily_aggregate_days < 400:
         raise ConfigError("retention is shorter than the collector defaults")
     max_backfill = max(item.scheduler.initial_backfill_duration for item in accounts)
     if timedelta(days=observation_days) < max_backfill:
         raise ConfigError("observation retention is shorter than the configured backfill")
+    max_window = timedelta(0)
+    for account in accounts:
+        # Window durations live on policies; keep retention at least as long as backfill/overlap.
+        max_window = max(max_window, account.scheduler.overlap_duration)
+    if timedelta(days=observation_days) < max_window:
+        raise ConfigError("observation retention is shorter than reconciliation overlap")
+    return RetentionConfig(
+        sanitized_observation_days=observation_days,
+        normalized_attempt_days=attempt_days,
+        daily_aggregate_days=daily_aggregate_days,
+        preserve_active_window_evidence=bool(raw.get("preserve_active_window_evidence", True)),
+        raw_payload_storage=str(raw.get("raw_payload_storage") or "disabled"),
+    )
+
+
+def _parse_alerts(raw: Mapping[str, Any]) -> AlertsConfig:
+    thresholds = tuple(int(item) for item in (raw.get("threshold_percentages") or [75, 90, 100]))
+    return AlertsConfig(
+        threshold_percentages=thresholds,
+        unknown_mapping=bool(raw.get("unknown_mapping", True)),
+        model_mismatch=bool(raw.get("model_mismatch", True)),
+        auth_required=bool(raw.get("auth_required", True)),
+        incomplete_history=bool(raw.get("incomplete_history", True)),
+        stale_soft_multiplier=int(raw.get("stale_soft_multiplier") or 2),
+        stale_hard_multiplier=int(raw.get("stale_hard_multiplier") or 6),
+        stale_grace_minutes=int(raw.get("stale_grace_minutes") or 5),
+        deduplicate_per_window_and_threshold=bool(raw.get("deduplicate_per_window_and_threshold", True)),
+    )
 
 
 def _optional_str(value: Any) -> Optional[str]:
