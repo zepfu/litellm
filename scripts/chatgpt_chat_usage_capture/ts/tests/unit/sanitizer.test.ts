@@ -3,9 +3,12 @@ import { describe, expect, it } from "vitest";
 import {
   assertNoSecrets,
   classifySurface,
+  iterUnknownFields,
+  observationProjection,
   sanitizeIdentity,
   sanitizeMapping,
   sanitizeMetadata,
+  sanitizeDiagnosticKey,
   sanitizeToken,
 } from "../../src/security/sanitizer.js";
 
@@ -90,6 +93,7 @@ describe("sanitizer boundary", () => {
     const metadata = {
       model_slug: "gpt-5.6-astra-pro",
       requested_model: "gpt-5.6-astra-pro",
+      resolved_model: "gpt-5.6-astra-pro",
       requested_mode: "standard",
       reasoning_effort: "high",
       generation_id: "gen-123",
@@ -100,6 +104,7 @@ describe("sanitizer boundary", () => {
     const sanitized = sanitizeMetadata(metadata);
     expect(sanitized.model_slug).toBe("gpt-5.6-astra-pro");
     expect(sanitized.requested_model).toBe("gpt-5.6-astra-pro");
+    expect(sanitized.resolved_model).toBe("gpt-5.6-astra-pro");
     expect(sanitized.unknown_field).toBeUndefined();
     expect(sanitized.content).toBeUndefined();
   });
@@ -128,5 +133,181 @@ describe("sanitizer boundary", () => {
     expect(sanitizeToken("   ")).toBeNull();
     expect(sanitizeToken("a b")).toBeNull();
     expect(sanitizeToken("a@b")).toBeNull();
+  });
+
+  it("should recursively project typed metadata and drop nested content, tools, and credentials", () => {
+    const projected = observationProjection(
+      {
+        conversation_id: "conversation-1",
+        messages: [
+          {
+            messageId: "message-1",
+            role: "assistant",
+            metadata: {
+              model_slug: "gpt-5.6-astra-pro",
+              content: "private prompt",
+              nested: {
+                authorization: "Bearer secret",
+              },
+            },
+            content: "private answer",
+            tool_calls: [
+              {
+                arguments: {
+                  secret: "private tool input",
+                },
+              },
+            ],
+            toolCalls: [{ arguments: { privateValue: "private tool input" } }],
+            credentials: { accessToken: "eyJsecret" },
+          },
+        ],
+        nested: {
+          content: "private nested content",
+        },
+      },
+      {
+        sourceKind: "conversation_detail",
+        runId: "run-1",
+        evidenceId: "evidence-1",
+      },
+    );
+
+    expect(projected.messages).toEqual([
+      {
+        messageId: "message-1",
+        role: "assistant",
+        metadata: {
+          model_slug: "gpt-5.6-astra-pro",
+        },
+      },
+    ]);
+    expect(JSON.stringify(projected)).not.toContain("private");
+    expect(JSON.stringify(projected)).not.toContain("Bearer");
+    expect(JSON.stringify(projected)).not.toContain("eyJ");
+  });
+
+  it("should stop unknown-field diagnostics beneath excluded subtrees", () => {
+    const fields = [
+      ...iterUnknownFields({
+        authorization: {
+          nested_private_field: {
+            email: "user@example.com",
+          },
+        },
+        unknown_field: {
+          safe_child: true,
+        },
+      }),
+    ];
+
+    expect(fields.some((field) => field.includes("nested_private_field"))).toBe(false);
+    expect(fields.some((field) => field.includes("user@example.com"))).toBe(false);
+    expect(fields).toContain("[excluded]:object");
+    expect(fields).toContain("unknown_field:object");
+  });
+
+  it("should hash unsafe diagnostic keys and keep them bounded", () => {
+    const privateKey = "private prompt with user@example.com and " + "x".repeat(300);
+    const sanitizedKey = sanitizeDiagnosticKey(privateKey, 32);
+    const projected = observationProjection(
+      {
+        [privateKey]: {
+          child: true,
+        },
+      },
+      {
+        sourceKind: "conversation_detail",
+        runId: "run-1",
+        evidenceId: "evidence-1",
+      },
+    );
+    const provenance = projected.provenance as {
+      unknown_fields: string[];
+    };
+
+    expect(sanitizedKey).toMatch(/^key_[a-f0-9]+$/);
+    expect(sanitizedKey.length).toBeLessThanOrEqual(32);
+    expect(provenance.unknown_fields.join("\n")).not.toContain(privateKey);
+    expect(provenance.unknown_fields.every((field) => field.length <= 96)).toBe(true);
+  });
+
+  it("should report incomplete projection and omit unfinished data at depth and node budgets", () => {
+    const deepPayload: Record<string, unknown> = {
+      safe: "root",
+    };
+    let cursor = deepPayload;
+    for (let index = 0; index < 20; index += 1) {
+      const child: Record<string, unknown> = {
+        safe: `level-${index}`,
+      };
+      cursor.child = child;
+      cursor = child;
+    }
+
+    const depthLimited = observationProjection(
+      deepPayload,
+      {
+        sourceKind: "conversation_detail",
+        runId: "run-1",
+        evidenceId: "evidence-1",
+      },
+      { maxDepth: 3, maxNodes: 1000 },
+    );
+    const depthSanitization = (
+      depthLimited.provenance as {
+        sanitization: { status: string };
+      }
+    ).sanitization;
+
+    const nodeLimited = observationProjection(
+      {
+        messages: [
+          { messageId: "message-1", role: "assistant" },
+          { messageId: "message-2", role: "assistant" },
+        ],
+      },
+      {
+        sourceKind: "conversation_detail",
+        runId: "run-1",
+        evidenceId: "evidence-1",
+      },
+      { maxDepth: 16, maxNodes: 3 },
+    );
+    const nodeSanitization = (
+      nodeLimited.provenance as {
+        sanitization: { status: string };
+      }
+    ).sanitization;
+
+    expect(depthSanitization.status).toBe("incomplete");
+    expect(depthLimited.coverage).toBe("partial");
+    expect(nodeSanitization.status).toBe("incomplete");
+    expect(nodeLimited.coverage).toBe("partial");
+  });
+
+  it("should fail closed with an explicit error for cyclic input", () => {
+    const cyclic: Record<string, unknown> = {
+      conversation_id: "conversation-1",
+    };
+    cyclic.self = cyclic;
+
+    const projected = observationProjection(
+      cyclic,
+      {
+        sourceKind: "conversation_detail",
+        runId: "run-1",
+        evidenceId: "evidence-1",
+      },
+    );
+    const provenance = projected.provenance as {
+      projection_status: string;
+      projection_error: string | null;
+    };
+
+    expect(provenance.projection_status).toBe("error");
+    expect(provenance.projection_error).toBe("cycle_detected");
+    expect(projected.coverage).toBe("unrecognized");
+    expect(JSON.stringify(projected)).not.toContain("[object Object]");
   });
 });

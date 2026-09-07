@@ -13,13 +13,12 @@
   timestamps, and provider failures retain explicit partial/unknown coverage.
   Capabilities are adapter declarations plus observations, not provider
   guarantees.
-- Checkpoint/evidence commits are per bounded collection result, not per
-  network page. A crash before commit replays that run. Stage-2A JSON history
-  checkpoints are not automatically imported; rerun backfill into SQLite.
-- Completed index discovery can advance its watermark while incomplete detail
-  remains in the same committed revisit state. There is no automatic
-  long-running-generation timeout/follow-up policy beyond incomplete traversal
-  revisits in this stage.
+- Checkpoint/evidence commits are per acquired page. A failed page replays from
+  the last durable continuation. Stage-2A JSON history checkpoints are not
+  automatically imported; rerun backfill into SQLite.
+- Incomplete details and nonterminal generations retain revisits and prevent
+  the affected refresh watermark from advancing. These revisits and opt-in
+  older-history audits still require manual collection; there is no scheduler.
 - Changing indexes can skip records despite deduplication. Explicit
   reconciliation and overlapping manual refresh reduce this risk but do not
   provide a snapshot guarantee. Run collectors sequentially until Stage-3
@@ -35,6 +34,10 @@
   review/suggestion view; recording approvals uses the TypeScript ledger API,
   not a CLI approval editor. Latest stored mapping is the default unless an
   explicit stored version is selected.
+- Activity is shared by verified owner, but mapping rules can override by local
+  collector account. Conflicting overrides can reclassify the same shared
+  projection; cross-collector override precedence remains unspecified. Use
+  consistent reviewed mappings for collectors sharing one owner.
 - Bootstrap metadata JSON remains separate from SQLite; browser authentication
   remains only in its dedicated profile. No content or credential migration is
   performed.

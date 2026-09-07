@@ -14,6 +14,13 @@ import {
 import { dirname, join, resolve } from "node:path";
 
 import type { BrowserConfig } from "./browser/session.js";
+import {
+  DEFAULT_BACKFILL_DAYS,
+  DEFAULT_INDEX_PAGE_SIZE,
+  DEFAULT_MAX_INDEX_PAGES,
+  DEFAULT_MAX_MESSAGE_PAGES_PER_CONVERSATION,
+  DEFAULT_OVERLAP_MS,
+} from "./contracts/history.js";
 
 export interface AccountConfig {
   id: string;
@@ -25,6 +32,16 @@ export interface AccountConfig {
   surface: string;
   planPolicyId: string;
   browser: BrowserConfig;
+  collection?: CollectionConfig;
+}
+
+export interface CollectionConfig {
+  requestTimeoutSeconds: number;
+  initialBackfillDays: number;
+  overlapMs: number;
+  indexPageSize: number;
+  maxIndexPagesPerScope: number;
+  maxPagesPerConversationPerRun: number;
 }
 
 export interface ApplicationConfig {
@@ -49,6 +66,17 @@ export class ConfigError extends Error {
 const DEFAULT_TIMEZONE = "America/New_York";
 const DEFAULT_STATE_DIRECTORY = "./state";
 const DEFAULT_DATABASE_PATH = "./state/usage.sqlite";
+const DEFAULT_REQUEST_TIMEOUT_SECONDS = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const COLLECTION_KEYS = new Set([
+  "request_timeout_seconds",
+  "initial_backfill_duration",
+  "overlap_duration",
+  "index_page_size",
+  "max_index_pages_per_scope",
+  "max_pages_per_conversation_per_run",
+  "max_message_pages_per_conversation",
+]);
 
 export function loadConfig(path: string): Stage1Config {
   const resolvedPath = resolve(path);
@@ -73,14 +101,21 @@ export function loadConfig(path: string): Stage1Config {
   if (raw.schema_version !== 1) {
     throw new ConfigError(`unsupported schema_version: ${raw.schema_version}`);
   }
-  const applicationRaw = (raw.application as Record<string, unknown> | undefined) ?? {};
+  const applicationRaw = recordOrEmpty(raw.application, "application");
+  if (raw.accounts !== undefined && !Array.isArray(raw.accounts)) {
+    throw new ConfigError("accounts must be an array");
+  }
   const accountsRaw = Array.isArray(raw.accounts) ? raw.accounts : [];
   const accounts: AccountConfig[] = accountsRaw.map((entry, index) => {
     if (!isRecord(entry)) {
       throw new ConfigError(`accounts[${index}] must be an object`);
     }
     const account = entry;
-    const browserRaw = (account.browser as Record<string, unknown> | undefined) ?? {};
+    const browserRaw = recordOrEmpty(account.browser, `accounts[${index}].browser`);
+    const collectionRaw = recordOrEmpty(
+      account.collection,
+      `accounts[${index}].collection`,
+    );
     if (
       browserRaw.adapter !== "playwright_persistent_context" &&
       browserRaw.adapter !== "fixture_history"
@@ -93,6 +128,10 @@ export function loadConfig(path: string): Stage1Config {
     if (id === null) {
       throw new ConfigError(`accounts[${index}].id must be a non-empty string`);
     }
+    const collection = parseCollectionConfig(
+      collectionRaw,
+      `accounts[${index}].collection`,
+    );
     return {
       id,
       enabled: account.enabled !== false,
@@ -107,11 +146,9 @@ export function loadConfig(path: string): Stage1Config {
         profilePath: String(browserRaw.profile_path ?? ""),
         headless: browserRaw.headless === true,
         allowInteractiveLogin: browserRaw.allow_interactive_login === true,
-        requestTimeoutSeconds: positiveNumber(
-          (account.collection as Record<string, unknown> | undefined)
-            ?.request_timeout_seconds,
-        ),
+        requestTimeoutSeconds: collection.requestTimeoutSeconds,
       },
+      collection,
     };
   });
   return {
@@ -153,8 +190,22 @@ export function defaultConfig(): Stage1Config {
           allowInteractiveLogin: true,
           requestTimeoutSeconds: 30,
         },
+        collection: defaultCollectionConfig(),
       },
     ],
+  };
+}
+
+export function defaultCollectionConfig(
+  requestTimeoutSeconds = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+): CollectionConfig {
+  return {
+    requestTimeoutSeconds,
+    initialBackfillDays: DEFAULT_BACKFILL_DAYS,
+    overlapMs: DEFAULT_OVERLAP_MS,
+    indexPageSize: DEFAULT_INDEX_PAGE_SIZE,
+    maxIndexPagesPerScope: DEFAULT_MAX_INDEX_PAGES,
+    maxPagesPerConversationPerRun: DEFAULT_MAX_MESSAGE_PAGES_PER_CONVERSATION,
   };
 }
 
@@ -180,25 +231,35 @@ export function saveConfig(config: Stage1Config, path: string): void {
       state_directory: config.application.stateDirectory,
       database_path: config.application.databasePath,
     },
-    accounts: config.accounts.map((account) => ({
-      id: account.id,
-      enabled: account.enabled,
-      provider: account.provider,
-      expected_provider_user_id: account.expectedProviderUserId,
-      expected_workspace_id: account.expectedWorkspaceId,
-      quota_owner_id: account.quotaOwnerId,
-      surface: account.surface,
-      plan_policy_id: account.planPolicyId,
-      browser: {
-        adapter: account.browser.adapter,
-        profile_path: account.browser.profilePath,
-        headless: account.browser.headless,
-        allow_interactive_login: account.browser.allowInteractiveLogin,
-      },
-      collection: {
-        request_timeout_seconds: account.browser.requestTimeoutSeconds,
-      },
-    })),
+    accounts: config.accounts.map((account) => {
+      const collection =
+        account.collection ?? defaultCollectionConfig(account.browser.requestTimeoutSeconds);
+      return {
+        id: account.id,
+        enabled: account.enabled,
+        provider: account.provider,
+        expected_provider_user_id: account.expectedProviderUserId,
+        expected_workspace_id: account.expectedWorkspaceId,
+        quota_owner_id: account.quotaOwnerId,
+        surface: account.surface,
+        plan_policy_id: account.planPolicyId,
+        browser: {
+          adapter: account.browser.adapter,
+          profile_path: account.browser.profilePath,
+          headless: account.browser.headless,
+          allow_interactive_login: account.browser.allowInteractiveLogin,
+        },
+        collection: {
+          request_timeout_seconds: collection.requestTimeoutSeconds,
+          initial_backfill_duration: formatDuration(collection.initialBackfillDays * DAY_MS),
+          overlap_duration: formatDuration(collection.overlapMs),
+          index_page_size: collection.indexPageSize,
+          max_index_pages_per_scope: collection.maxIndexPagesPerScope,
+          max_pages_per_conversation_per_run:
+            collection.maxPagesPerConversationPerRun,
+        },
+      };
+    }),
   };
   writeFileSync(resolvedPath, JSON.stringify(raw, null, 2) + "\n", {
     encoding: "utf8",
@@ -221,9 +282,164 @@ function optionalString(value: unknown): string | null {
   return String(value);
 }
 
-function positiveNumber(value: unknown): number {
-  const number = Number(value ?? 30);
-  return Number.isFinite(number) && number > 0 ? number : 30;
+function parseCollectionConfig(
+  raw: Record<string, unknown>,
+  path: string,
+): CollectionConfig {
+  for (const key of Object.keys(raw)) {
+    if (!COLLECTION_KEYS.has(key)) {
+      throw new ConfigError(
+        `${path}.${key} is an unsupported Stage-2 collection control`,
+      );
+    }
+  }
+
+  const maxPagesPerConversation = resolveAliasedValue(
+    raw,
+    "max_pages_per_conversation_per_run",
+    "max_message_pages_per_conversation",
+    path,
+  );
+  const requestTimeoutSeconds = positiveNumber(
+    raw.request_timeout_seconds,
+    `${path}.request_timeout_seconds`,
+    DEFAULT_REQUEST_TIMEOUT_SECONDS,
+  );
+  const initialBackfillMs = parseDurationMilliseconds(
+    raw.initial_backfill_duration,
+    `${path}.initial_backfill_duration`,
+    DEFAULT_BACKFILL_DAYS * DAY_MS,
+  );
+  const overlapMs = parseDurationMilliseconds(
+    raw.overlap_duration,
+    `${path}.overlap_duration`,
+    DEFAULT_OVERLAP_MS,
+  );
+
+  return {
+    requestTimeoutSeconds,
+    initialBackfillDays: initialBackfillMs / DAY_MS,
+    overlapMs,
+    indexPageSize: positiveInteger(
+      raw.index_page_size,
+      `${path}.index_page_size`,
+      DEFAULT_INDEX_PAGE_SIZE,
+    ),
+    maxIndexPagesPerScope: positiveInteger(
+      raw.max_index_pages_per_scope,
+      `${path}.max_index_pages_per_scope`,
+      DEFAULT_MAX_INDEX_PAGES,
+    ),
+    maxPagesPerConversationPerRun: positiveInteger(
+      maxPagesPerConversation,
+      `${path}.max_pages_per_conversation_per_run`,
+      DEFAULT_MAX_MESSAGE_PAGES_PER_CONVERSATION,
+    ),
+  };
+}
+
+function resolveAliasedValue(
+  raw: Record<string, unknown>,
+  primary: string,
+  alias: string,
+  path: string,
+): unknown {
+  if (raw[primary] !== undefined && raw[alias] !== undefined) {
+    throw new ConfigError(`${path} cannot set both ${primary} and ${alias}`);
+  }
+  return raw[primary] ?? raw[alias];
+}
+
+function positiveNumber(value: unknown, path: string, fallback: number): number {
+  if (value === undefined) {
+    return fallback;
+  }
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new ConfigError(`${path} must be a positive finite number`);
+  }
+  return value;
+}
+
+function positiveInteger(value: unknown, path: string, fallback: number): number {
+  if (value === undefined) {
+    return fallback;
+  }
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value <= 0
+  ) {
+    throw new ConfigError(`${path} must be a positive integer`);
+  }
+  return value;
+}
+
+function parseDurationMilliseconds(
+  value: unknown,
+  path: string,
+  fallback: number,
+): number {
+  if (value === undefined) {
+    return fallback;
+  }
+  if (typeof value !== "string") {
+    throw new ConfigError(`${path} must be an ISO-8601 duration`);
+  }
+  const text = value.trim();
+  const shortMatch = /^(\d+(?:\.\d+)?)([dhm])$/i.exec(text);
+  if (shortMatch) {
+    const amount = Number(shortMatch[1]);
+    const unit = shortMatch[2]!.toLowerCase();
+    const multiplier =
+      unit === "d" ? DAY_MS : unit === "h" ? 60 * 60 * 1000 : 60 * 1000;
+    const milliseconds = amount * multiplier;
+    if (Number.isFinite(milliseconds) && milliseconds > 0) {
+      return milliseconds;
+    }
+  }
+
+  const match =
+    /^P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/i.exec(
+      text,
+    );
+  if (!match || !match.slice(1).some((part) => part !== undefined)) {
+    throw new ConfigError(`${path} must be a positive ISO-8601 duration`);
+  }
+  const milliseconds =
+    Number(match[1] ?? 0) * DAY_MS +
+    Number(match[2] ?? 0) * 60 * 60 * 1000 +
+    Number(match[3] ?? 0) * 60 * 1000 +
+    Number(match[4] ?? 0) * 1000;
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
+    throw new ConfigError(`${path} must be a positive ISO-8601 duration`);
+  }
+  return milliseconds;
+}
+
+function formatDuration(milliseconds: number): string {
+  if (milliseconds % DAY_MS === 0) {
+    return `P${milliseconds / DAY_MS}D`;
+  }
+  if (milliseconds % (60 * 60 * 1000) === 0) {
+    return `PT${milliseconds / (60 * 60 * 1000)}H`;
+  }
+  if (milliseconds % (60 * 1000) === 0) {
+    return `PT${milliseconds / (60 * 1000)}M`;
+  }
+  return `PT${milliseconds / 1000}S`;
+}
+
+function recordOrEmpty(
+  value: unknown,
+  path: string,
+): Record<string, unknown> {
+  if (value === undefined) {
+    return {};
+  }
+  if (!isRecord(value)) {
+    throw new ConfigError(`${path} must be an object`);
+  }
+  return value;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

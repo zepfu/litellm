@@ -11,7 +11,12 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import {
-  loadConfig, saveConfig, defaultConfig, ConfigError, resolveDatabasePath,
+  defaultCollectionConfig,
+  defaultConfig,
+  loadConfig,
+  saveConfig,
+  ConfigError,
+  resolveDatabasePath,
 } from "../config.js";
 import {
   bootstrapAccount,
@@ -31,6 +36,7 @@ import { Ledger } from "../ledger/store.js";
 import type { BootstrapResult, InspectCapabilitiesResult } from "../browser/bootstrap.js";
 import type {
   HistoryCollectionMode,
+  HistoryCollectionRequest,
   HistoryCollectionResult,
   HistoryRange,
 } from "../contracts/history.js";
@@ -49,6 +55,7 @@ import {
 
 interface CliArgs {
   command: string;
+  help: boolean;
   configPath: string;
   accountId: string | null;
   interactiveLogin: boolean;
@@ -75,12 +82,25 @@ const DEFERRED_COMMANDS = new Set([
 ]);
 
 export async function run(argv: string[]): Promise<number> {
+  if (argv.length === 0) {
+    printHelp();
+    return 2;
+  }
+  if (argv[0] === "--help" || argv[0] === "-h") {
+    printHelp();
+    return 0;
+  }
+
   let args: CliArgs;
   try {
     args = parseArgs(argv);
   } catch (error) {
     console.error((error as Error).message);
     return 2;
+  }
+  if (args.help) {
+    printHelp();
+    return 0;
   }
 
   if (STAGE2_HISTORY_COMMANDS.has(args.command)) {
@@ -224,9 +244,17 @@ async function runInspectCapabilities(args: CliArgs): Promise<number> {
 
 async function runHistoryCollection(args: CliArgs): Promise<number> {
   const config = loadConfig(args.configPath);
-  const account = selectAccount(config.accounts, args.accountId);
+  const account = selectEnabledAccount(config.accounts, args.accountId);
   if (!account) {
-    console.error(`usage-capture ${args.command}: account '${args.accountId}' not found`);
+    const configured = args.accountId
+      ? config.accounts.find((candidate) => candidate.id === args.accountId)
+      : null;
+    const message = args.accountId
+      ? configured
+        ? `account '${args.accountId}' is disabled`
+        : `account '${args.accountId}' not found`
+      : "no enabled account is configured";
+    console.error(`usage-capture ${args.command}: ${message}`);
     return 2;
   }
   if (account.browser.adapter === "fixture_history" && !args.fixtureRoot) {
@@ -249,8 +277,11 @@ async function runHistoryCollection(args: CliArgs): Promise<number> {
         ? "reconciliation"
         : "incremental";
   let range: HistoryRange | undefined;
+  const collection = account.collection ?? defaultCollectionConfig(
+    account.browser.requestTimeoutSeconds,
+  );
   try {
-    range = collectionRange(args, mode);
+    range = collectionRange(args, mode, collection.initialBackfillDays);
   } catch (error) {
     console.error(`usage-capture ${args.command}: ${(error as Error).message}`);
     return 2;
@@ -268,7 +299,15 @@ async function runHistoryCollection(args: CliArgs): Promise<number> {
   let ledger: Ledger | undefined;
   try {
     ledger = new Ledger(resolveDatabasePath(config, args));
-    const request = range ? { mode, range } : { mode };
+    const request: HistoryCollectionRequest = {
+      mode,
+      ...(range ? { range } : {}),
+      overlapMs: collection.overlapMs,
+      indexPageSize: collection.indexPageSize,
+      maxIndexPagesPerScope: collection.maxIndexPagesPerScope,
+      maxMessagePagesPerConversation:
+        collection.maxPagesPerConversationPerRun,
+    };
     const result = await collectIntoLedger(adapter, ledger, account, request, args.mappingVersion);
     printCollectionResult(result);
     return result.status === "blocked" ? 1 : 0;
@@ -284,6 +323,7 @@ async function runHistoryCollection(args: CliArgs): Promise<number> {
 function collectionRange(
   args: CliArgs,
   mode: HistoryCollectionMode,
+  defaultBackfillDays: number,
 ): HistoryRange | undefined {
   if (mode === "incremental" && !args.since && !args.until) {
     return undefined;
@@ -294,7 +334,7 @@ function collectionRange(
   const now = new Date();
   const end = args.until ? parseInstant(args.until) : now;
   if (!args.since) {
-    return defaultBackfillRange(end);
+    return defaultBackfillRange(end, defaultBackfillDays);
   }
   const sinceIsDuration = /^\d+(?:\.\d+)?[dhm]$/i.test(args.since.trim());
   if (!sinceIsDuration) {
@@ -315,11 +355,12 @@ function runReport(args: CliArgs): number {
   try {
     assertAccountBinding(ledger, configuredScope(account));
     const scope = ledger.accountScope(account.id);
+    const window = reportWindow(args);
     console.log(
       JSON.stringify(
         buildRawModelReport(ledger, scope, {
-          durationMs: (args.lastHours ?? 24) * 60 * 60 * 1000,
-          ...(args.until ? { now: parseInstant(args.until).toISOString() } : {}),
+          durationMs: window.durationMs,
+          ...(window.now ? { now: window.now } : {}),
         }),
         null,
         2,
@@ -423,8 +464,51 @@ function selectAccount<T extends { id: string; enabled: boolean }>(
   return accounts.find((account) => account.enabled) ?? accounts[0] ?? null;
 }
 
+function selectEnabledAccount<T extends { id: string; enabled: boolean }>(
+  accounts: T[],
+  accountId: string | null,
+): T | null {
+  if (accountId) {
+    const account = accounts.find((candidate) => candidate.id === accountId);
+    return account?.enabled ? account : null;
+  }
+  return accounts.find((account) => account.enabled) ?? null;
+}
+
+function reportWindow(args: CliArgs): { durationMs: number; now?: string } {
+  if (args.since === null) {
+    return {
+      durationMs: (args.lastHours ?? 24) * 60 * 60 * 1000,
+      ...(args.until ? { now: parseInstant(args.until).toISOString() } : {}),
+    };
+  }
+  if (args.lastHours !== null) {
+    throw new Error("report accepts either --since or --last-hours, not both");
+  }
+
+  const end = args.until ? parseInstant(args.until) : new Date();
+  const sinceIsDuration = /^\d+(?:\.\d+)?[dhm]$/i.test(args.since.trim());
+  if (sinceIsDuration) {
+    return {
+      durationMs: parseDuration(args.since),
+      ...(args.until ? { now: end.toISOString() } : {}),
+    };
+  }
+
+  const start = parseInstant(args.since);
+  const durationMs = end.getTime() - start.getTime();
+  if (!Number.isFinite(durationMs) || durationMs <= 0) {
+    throw new Error("report --since must be before its exclusive end");
+  }
+  return {
+    durationMs,
+    now: end.toISOString(),
+  };
+}
+
 function parseArgs(argv: string[]): CliArgs {
   const command = argv[0] ?? "";
+  let help = false;
   let configPath = "./config.json";
   let accountId: string | null = null;
   let interactiveLogin = false;
@@ -475,16 +559,14 @@ function parseArgs(argv: string[]): CliArgs {
     } else if (flag === "--apply") {
       apply = true;
     } else if (flag === "--help" || flag === "-h") {
-      printHelp();
-      process.exit(0);
+      help = true;
     } else {
       throw new Error(`unknown flag: ${flag}`);
     }
   }
 
   if (!command) {
-    printHelp();
-    process.exit(2);
+    throw new Error("missing command; use --help for usage");
   }
 
   if (fixtureRoot && command !== "inspect-capabilities") {
@@ -497,6 +579,7 @@ function parseArgs(argv: string[]): CliArgs {
 
   return {
     command,
+    help,
     configPath,
     accountId,
     interactiveLogin,
@@ -545,8 +628,9 @@ Stage-2 history commands:
 
 Stage-2 offline ledger commands:
   report --config <path> [--account <id>] [--database <path>] [--last-hours <n>]
-      [--until <ISO-8601>]
-      Report observed raw-model activity from SQLite over the last N hours.
+      [--since <duration|ISO-8601>] [--until <ISO-8601>]
+      Report observed raw-model activity from SQLite over a bounded lookback.
+      Use either --last-hours or --since, not both.
 
   models --config <path> [--account <id>] [--database <path>]
       Show raw-model mapping review suggestions from retained attempts.
@@ -558,6 +642,11 @@ Stage-2 offline ledger commands:
 All history and ledger commands share application.database_path. --database
 overrides it; --state-directory uses <path>/usage.sqlite unless --database is
 also supplied. Reports and rebuilds never issue website requests.
+
+Stage-2 collection config supports request timeout, initial backfill duration,
+overlap duration, index page size, index-page budget, and per-conversation
+message-page budget. Unsupported scheduler, retry, run-duration, and
+response-size controls are rejected instead of ignored.
 
 Scheduling, reset accounting, API, UI, and exports remain deferred. Collection
 is GET-only; no prompt submission, credential export, or provider mutation is

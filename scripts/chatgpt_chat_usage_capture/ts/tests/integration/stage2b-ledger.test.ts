@@ -12,7 +12,7 @@ import type {
   ConversationSummary,
   MessageRecord,
 } from "../../src/contracts/records.js";
-import { scopeKey } from "../../src/ledger/identity.js";
+import { collectorScopeKey, scopeKey } from "../../src/ledger/identity.js";
 import { Ledger } from "../../src/ledger/store.js";
 import type {
   LedgerScope,
@@ -59,11 +59,11 @@ afterEach(() => {
 });
 
 describe("D1-752 Stage 2B ledger", () => {
-  it("runs migrations and scopes identical upstream generation IDs by account identity", () => {
+  it("runs migrations and converges identical upstream activity for one verified owner", () => {
     const directory = mkdtempSync(join(tmpdir(), "stage2b-ledger-"));
     temporaryDirectories.push(directory);
     const ledger = new Ledger(join(directory, "usage.sqlite"));
-    expect(ledger.schemaVersion).toBe(3);
+    expect(ledger.schemaVersion).toBe(5);
 
     const first = scope("account-one", "provider-user-one", "workspace-one", "quota-one");
     const second = scope("account-two", "provider-user-one", "workspace-one", "quota-one");
@@ -78,13 +78,28 @@ describe("D1-752 Stage 2B ledger", () => {
     const secondAttempts = ledger.listAttempts(second);
     expect(firstAttempts).toHaveLength(1);
     expect(secondAttempts).toHaveLength(1);
-    expect(firstAttempts[0]?.attemptId).not.toBe(secondAttempts[0]?.attemptId);
-    expect(scopeKey(first)).not.toBe(scopeKey(second));
+    expect(firstAttempts[0]?.attemptId).toBe(secondAttempts[0]?.attemptId);
+    expect(scopeKey(first)).toBe(scopeKey(second));
+    expect(collectorScopeKey(first)).not.toBe(collectorScopeKey(second));
     expect(
       ledger.db
         .prepare("SELECT COUNT(*) AS count FROM attempt_aliases")
         .get() as { count: number },
-    ).toEqual({ count: 8 });
+    ).toEqual({ count: 5 });
+    expect(
+      ledger.activityProvenance(
+        first,
+        "attempt",
+        String(firstAttempts[0]?.attemptId),
+      ).map((row) => row.collector_account_id),
+    ).toEqual(["account-one", "account-two"]);
+    expect(
+      ledger.db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM observations WHERE scope_key=?",
+        )
+        .get(scopeKey(first)),
+    ).toEqual({ count: 2 });
     ledger.close();
   });
 
@@ -167,6 +182,307 @@ describe("D1-752 Stage 2B ledger", () => {
     expect(attempts[0]?.recordedFinalModelRaw).toBe("model-new");
   });
 
+  it("groups disjoint generations when linkage is only visible in either graph direction", () => {
+    const account = scope("account-bidirectional", "provider-user", "workspace", "quota");
+    const conversationId = "conversation-bidirectional";
+    const messages = [
+      message({
+        conversationId,
+        messageId: "message-user",
+        nodeId: "node-user",
+        role: "user",
+        children: ["node-a-progress", "node-b-progress"],
+        createdAt: "2026-09-07T10:00:00.000Z",
+        requestedModelRaw: "model-requested",
+      }),
+      message({
+        conversationId,
+        messageId: "message-a-progress",
+        nodeId: "node-a-progress",
+        parentId: "node-user",
+        role: "assistant",
+        channel: "analysis",
+        createdAt: "2026-09-07T10:00:01.000Z",
+        status: "finished_successfully",
+        generationId: "generation-a",
+      }),
+      message({
+        conversationId,
+        messageId: "message-a-final",
+        nodeId: "node-a-final",
+        parentId: "node-a-progress",
+        role: "assistant",
+        createdAt: "2026-09-07T10:00:02.000Z",
+        status: "finished_successfully",
+        endTurn: true,
+        recordedFinalModelRaw: "model-final",
+      }),
+      message({
+        conversationId,
+        messageId: "message-b-progress",
+        nodeId: "node-b-progress",
+        parentId: "node-user",
+        role: "assistant",
+        channel: "analysis",
+        createdAt: "2026-09-07T10:01:01.000Z",
+        status: "finished_successfully",
+      }),
+      message({
+        conversationId,
+        messageId: "message-b-final",
+        nodeId: "node-b-final",
+        parentId: "node-b-progress",
+        role: "assistant",
+        createdAt: "2026-09-07T10:01:02.000Z",
+        status: "finished_successfully",
+        endTurn: true,
+        recordedFinalModelRaw: "model-final",
+        generationId: "generation-b",
+      }),
+    ];
+
+    const attempts = reconstructAttempts(messages, {
+      scope: account,
+      conversationId,
+      mapping: mappingReviewed,
+    });
+
+    expect(attempts).toHaveLength(2);
+    expect(attempts.every((attempt) => attempt.completedAnswer)).toBe(true);
+    const nonPromptEvidence = attempts.map(
+      (attempt) =>
+        new Set(attempt.evidenceMessageIds.filter((id) => id !== "message-user")),
+    );
+    expect(nonPromptEvidence[0] && nonPromptEvidence[1]).toBeTruthy();
+    expect(
+      [...(nonPromptEvidence[0] ?? [])].some((id) =>
+        (nonPromptEvidence[1] ?? new Set()).has(id),
+      ),
+    ).toBe(false);
+    expect(
+      new Set(
+        attempts.flatMap((attempt) =>
+          attempt.aliases
+            .filter(([kind]) => kind === "generation")
+            .map(([, value]) => value),
+        ),
+      ),
+    ).toEqual(
+      new Set([
+        `${conversationId}:generation-a`,
+        `${conversationId}:generation-b`,
+      ]),
+    );
+  });
+
+  it("merges later linkage into one active attempt and retires the provisional row", () => {
+    const directory = mkdtempSync(join(tmpdir(), "stage2b-linkage-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    const account = scope("account-linkage", "provider-user", "workspace", "quota");
+    ledger.upsertAccount(account);
+
+    const provisional = progressDetail(
+      "conversation-linkage",
+      "finished_successfully",
+      true,
+      "model-final",
+    );
+    provisional.messages[1] = {
+      ...provisional.messages[1]!,
+      generationId: null,
+      requestId: null,
+    };
+    ledger.ingestConversation(
+      account,
+      provisional,
+      mappingReviewed,
+      context("run-linkage-1", "conversation-linkage", "2026-09-07T12:00:00.000Z"),
+    );
+
+    const linked = ledger.ingestConversation(
+      account,
+      progressDetail("conversation-linkage", "finished_successfully", true, "model-final"),
+      mappingReviewed,
+      context("run-linkage-2", "conversation-linkage", "2026-09-07T12:05:00.000Z"),
+    );
+
+    expect(linked.attemptUpdated).toBe(1);
+    expect(ledger.listAttempts(account)).toHaveLength(1);
+    expect(ledger.listAttempts(account)[0]?.identityBasis).toBe("generation");
+    expect(ledger.listAttempts(account, true)).toHaveLength(2);
+    expect(
+      ledger.listAttempts(account, true).filter((attempt) => attempt.tombstone),
+    ).toHaveLength(1);
+    expect(
+      ledger.db
+        .prepare(
+          "SELECT attempt_id FROM attempt_aliases WHERE scope_key=? AND alias_kind='generation'",
+        )
+        .get(scopeKey(account)),
+    ).toEqual({ attempt_id: ledger.listAttempts(account)[0]?.attemptId });
+    expect(
+      ledger.db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM attempt_evidence WHERE scope_key=? AND evidence_kind='message'",
+        )
+        .get(scopeKey(account)),
+    ).toEqual({ count: 2 });
+    ledger.reclassifyAttempts(account, mappingReviewed, "2026-09-07T12:10:00.000Z");
+    expect(ledger.listAttempts(account)).toHaveLength(1);
+    expect(ledger.listAttempts(account, true).filter((attempt) => attempt.tombstone))
+      .toHaveLength(1);
+    expect(ledger.db.pragma("foreign_key_check")).toEqual([]);
+    ledger.close();
+  });
+
+  it("does not inherit prompt time or model into a later regeneration", () => {
+    const account = scope("account-regeneration", "provider-user", "workspace", "quota");
+    const conversationId = "conversation-regeneration";
+    const attempts = reconstructAttempts(
+      [
+        message({
+          conversationId,
+          messageId: "message-user",
+          nodeId: "node-user",
+          role: "user",
+          children: ["node-original", "node-regenerated"],
+          createdAt: "2026-09-07T10:00:00.000Z",
+          requestedModelRaw: "model-requested",
+        }),
+        message({
+          conversationId,
+          messageId: "message-original",
+          nodeId: "node-original",
+          parentId: "node-user",
+          role: "assistant",
+          createdAt: "2026-09-07T10:00:02.000Z",
+          status: "finished_successfully",
+          endTurn: true,
+          recordedFinalModelRaw: "model-final",
+          generationId: "generation-original",
+        }),
+        message({
+          conversationId,
+          messageId: "message-regenerated",
+          nodeId: "node-regenerated",
+          parentId: "node-user",
+          role: "assistant",
+          createdAt: "2026-09-07T10:10:02.000Z",
+          status: "finished_successfully",
+          endTurn: true,
+          recordedFinalModelRaw: "model-final",
+          generationId: "generation-regenerated",
+        }),
+      ],
+      {
+        scope: account,
+        conversationId,
+        mapping: mappingReviewed,
+      },
+    );
+
+    const original = attempts.find((attempt) =>
+      attempt.aliases.some(
+        ([kind, value]) =>
+          kind === "generation" && value === `${conversationId}:generation-original`,
+      ),
+    );
+    const regenerated = attempts.find((attempt) =>
+      attempt.aliases.some(
+        ([kind, value]) =>
+          kind === "generation" && value === `${conversationId}:generation-regenerated`,
+      ),
+    );
+    expect(original?.requestedModelRaw).toBe("model-requested");
+    expect(original?.attemptTime).toBe("2026-09-07T10:00:00.000Z");
+    expect(regenerated?.requestedModelRaw).toBeNull();
+    expect(regenerated?.attemptTime).toBeNull();
+    expect(regenerated?.earliestPossibleAt).toBeNull();
+    expect(regenerated?.latestPossibleAt).toBeNull();
+  });
+
+  it("does not fabricate request bounds from a final-only response", () => {
+    const account = scope("account-final-only", "provider-user", "workspace", "quota");
+    const conversationId = "conversation-final-only";
+    const attempts = reconstructAttempts(
+      [
+        message({
+          conversationId,
+          messageId: "message-final-only",
+          nodeId: "node-final-only",
+          role: "assistant",
+          createdAt: "2026-09-07T10:00:02.000Z",
+          status: "finished_successfully",
+          endTurn: true,
+          recordedFinalModelRaw: "model-final",
+        }),
+      ],
+      {
+        scope: account,
+        conversationId,
+        mapping: mappingReviewed,
+      },
+    );
+
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]?.timeBasis).toBe("unknown");
+    expect(attempts[0]?.attemptTime).toBeNull();
+    expect(attempts[0]?.earliestPossibleAt).toBeNull();
+    expect(attempts[0]?.latestPossibleAt).toBeNull();
+  });
+
+  it("classifies rejection after observed generation start separately", () => {
+    const account = scope("account-rejection", "provider-user", "workspace", "quota");
+    const conversationId = "conversation-rejection";
+    const attempts = reconstructAttempts(
+      [
+        message({
+          conversationId,
+          messageId: "message-user",
+          nodeId: "node-user",
+          role: "user",
+          children: ["node-progress"],
+          createdAt: "2026-09-07T10:00:00.000Z",
+        }),
+        message({
+          conversationId,
+          messageId: "message-progress",
+          nodeId: "node-progress",
+          parentId: "node-user",
+          children: ["node-rejected"],
+          role: "assistant",
+          channel: "analysis",
+          createdAt: "2026-09-07T10:00:01.000Z",
+          status: "in_progress",
+          generationId: "generation-rejected",
+          requestId: "request-rejected",
+        }),
+        message({
+          conversationId,
+          messageId: "message-rejected",
+          nodeId: "node-rejected",
+          parentId: "node-progress",
+          role: "assistant",
+          createdAt: "2026-09-07T10:00:02.000Z",
+          status: "moderation_blocked",
+          endTurn: true,
+          generationId: "generation-rejected",
+          requestId: "request-rejected",
+        }),
+      ],
+      {
+        scope: account,
+        conversationId,
+        mapping: mappingReviewed,
+      },
+    );
+
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]?.generationStarted).toBe(true);
+    expect(attempts[0]?.outcome).toBe("rejected_after_start");
+  });
+
   it("deduplicates replay and preserves in-progress to completed revisions", () => {
     const directory = mkdtempSync(join(tmpdir(), "stage2b-revision-"));
     temporaryDirectories.push(directory);
@@ -221,6 +537,158 @@ describe("D1-752 Stage 2B ledger", () => {
         )
         .get(scopeKey(account), "conversation_detail", "conversation-revision"),
     ).toEqual({ count: 2 });
+    ledger.close();
+  });
+
+  it("preserves A-B-A observation, message, and attempt revision occurrences", () => {
+    const directory = mkdtempSync(join(tmpdir(), "stage2b-aba-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    const account = scope("account-aba", "provider-user", "workspace", "quota");
+    ledger.upsertAccount(account);
+
+    for (const [index, finalModel] of ["model-a", "model-b", "model-a"].entries()) {
+      ledger.ingestConversation(
+        account,
+        progressDetail(
+          "conversation-aba",
+          "finished_successfully",
+          true,
+          finalModel,
+          `2026-09-07T10:0${index + 1}:00.000Z`,
+        ),
+        mappingReviewed,
+        context(
+          `run-aba-${index + 1}`,
+          "conversation-aba",
+          `2026-09-07T10:0${index + 1}:30.000Z`,
+        ),
+      );
+    }
+
+    const attempt = ledger.listAttempts(account)[0]!;
+    expect(attempt.recordedFinalModelRaw).toBe("model-a");
+    expect(
+      ledger.attemptRevisions(account, String(attempt.attemptId)).map((item) =>
+        String((item.payload as Record<string, unknown>).recordedFinalModelRaw),
+      ),
+    ).toEqual(["model-a", "model-b", "model-a"]);
+    expect(
+      ledger.messageRevisions(account, "conversation-aba", "message-final").map((item) =>
+        String((item.payload as Record<string, unknown>).recordedFinalModelRaw),
+      ),
+    ).toEqual(["model-a", "model-b", "model-a"]);
+    expect(
+      ledger.db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM observations WHERE scope_key=? AND source_kind=? AND source_id=?",
+        )
+        .get(scopeKey(account), "conversation_detail", "conversation-aba"),
+    ).toEqual({ count: 3 });
+    ledger.close();
+  });
+
+  it("does not let older evidence replace the current projection", () => {
+    const directory = mkdtempSync(join(tmpdir(), "stage2b-stale-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    const account = scope("account-stale", "provider-user", "workspace", "quota");
+    ledger.upsertAccount(account);
+
+    ledger.ingestConversation(
+      account,
+      progressDetail(
+        "conversation-stale",
+        "finished_successfully",
+        true,
+        "model-new",
+        "2026-09-07T10:02:00.000Z",
+      ),
+      mappingReviewed,
+      context("run-stale-new", "conversation-stale", "2026-09-07T12:00:00.000Z"),
+    );
+    ledger.ingestConversation(
+      account,
+      progressDetail(
+        "conversation-stale",
+        "finished_successfully",
+        true,
+        "model-old",
+        "2026-09-07T10:01:00.000Z",
+      ),
+      mappingReviewed,
+      context("run-stale-old", "conversation-stale", "2026-09-07T11:00:00.000Z"),
+    );
+
+    const attempt = ledger.listAttempts(account)[0]!;
+    expect(attempt.recordedFinalModelRaw).toBe("model-new");
+    expect(
+      ledger.messagesFor(account, "conversation-stale").find(
+        (message) => message.messageId === "message-final",
+      )?.recordedFinalModelRaw,
+    ).toBe("model-new");
+    expect(ledger.attemptRevisions(account, String(attempt.attemptId))).toHaveLength(1);
+    expect(ledger.messageRevisions(account, "conversation-stale", "message-final")).toHaveLength(2);
+    ledger.close();
+  });
+
+  it("allowlists persisted context provenance and quarantines future timestamps", () => {
+    const directory = mkdtempSync(join(tmpdir(), "stage2b-provenance-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    const account = scope("account-provenance", "provider-user", "workspace", "quota");
+    ledger.upsertAccount(account);
+
+    ledger.ingestConversation(
+      account,
+      progressDetail(
+        "conversation-provenance",
+        "finished_successfully",
+        true,
+        "model-final",
+        "2026-09-07T13:00:00.000Z",
+      ),
+      mappingReviewed,
+      {
+        ...context(
+          "run-provenance",
+          "conversation-provenance",
+          "2026-09-07T12:00:00.000Z",
+        ),
+        provenance: {
+          adapter_version: "chatgpt-chat-history-v1",
+          detail_route: "modern",
+          pagination_state: "complete",
+          scopes: ["active"],
+          fixture: "stage2b-synthetic",
+          authorization: "Bearer should-not-persist",
+          nested: { prompt: "should-not-persist" },
+        },
+      },
+    );
+
+    const observation = ledger.db
+      .prepare("SELECT provenance_json FROM observations")
+      .get() as { provenance_json: string };
+    const provenance = JSON.parse(observation.provenance_json) as Record<string, unknown>;
+    expect(provenance).toMatchObject({
+      adapter_version: "chatgpt-chat-history-v1",
+      detail_route: "modern",
+      pagination_state: "complete",
+      scopes: ["active"],
+      fixture: "stage2b-synthetic",
+      collector_account_id: "account-provenance",
+    });
+    expect(provenance.authorization).toBeUndefined();
+    expect(provenance.nested).toBeUndefined();
+
+    const finalMessage = ledger.messagesFor(account, "conversation-provenance").find(
+      (message) => message.messageId === "message-final",
+    );
+    expect(finalMessage?.createdAt).toBeNull();
+    const attempt = ledger.listAttempts(account)[0]!;
+    expect(attempt.latestPossibleAt).toBe("2026-09-07T11:00:00.000Z");
+    expect(attempt.warnings).toContain("future_timestamp_quarantined");
     ledger.close();
   });
 
@@ -311,6 +779,14 @@ describe("D1-752 Stage 2B ledger", () => {
         String(ledger.listAttempts(account)[0]?.attemptId),
       ).map((item) => item.mapping_version),
     ).toEqual(["mapping-v1", "mapping-v2"]);
+    const revisedAttempt = ledger.listAttempts(account)[0]!;
+    const revisedPayload = ledger.attemptRevisions(
+      account,
+      String(revisedAttempt.attemptId),
+    ).at(-1)?.payload as Record<string, unknown>;
+    expect(revisedPayload.aliases).toEqual(revisedAttempt.aliases);
+    expect(revisedPayload.evidenceMessageIds).toEqual(revisedAttempt.evidenceMessageIds);
+    expect(revisedPayload.warnings).toEqual(revisedAttempt.warnings);
     expect(ledger.aggregateRevisions(account)).toHaveLength(1);
     ledger.close();
   });
@@ -347,7 +823,8 @@ describe("D1-752 Stage 2B ledger", () => {
     expect(report.observedAttemptsByResolvedModel).toEqual({
       "model-resolved": 1,
     });
-    expect(report.modelMismatches).toBe(1);
+    expect(report.modelMismatches).toBe(0);
+    expect(report.rawSlugDifferences).toBe(1);
     ledger.close();
   });
 
@@ -449,6 +926,7 @@ function progressDetail(
     currentNode: "node-final",
     surface: "chat",
     detailRoute: "modern",
+    continuation: null,
     paginationState: "complete",
     coverage: "validated_page",
     warnings: [],
@@ -491,6 +969,7 @@ function chainedDetail(): ConversationDetailProjection {
     currentNode: "node-final-2",
     surface: "chat",
     detailRoute: "modern",
+    continuation: null,
     paginationState: "complete",
     coverage: "validated_page",
     warnings: [],

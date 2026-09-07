@@ -51,6 +51,8 @@ SQLite `history_state` retains independent active/archived continuations,
 budgets, pagination states, ranges, warnings, completed discovery starts, and
 incomplete-detail revisits. It commits with the corresponding evidence and
 attempts. No separate JSON history checkpoint needs copying.
+Each acquired page commits with its corresponding continuation. Checkpoints
+remain local to the collector account even when activity is shared by owner.
 
 - Partial index/detail: rerun `refresh` to use committed continuations and
   revisits. An interrupted uncommitted run is replayed.
@@ -62,6 +64,11 @@ attempts. No separate JSON history checkpoint needs copying.
   retry/cooldown scheduler in Stage 2.
 - Schema drift, repeated cursors, or exhausted budgets: retain the database
   and review explicit pagination/coverage warnings.
+
+Historical backfill/reconciliation does not advance refresh watermarks.
+Refresh advances a scope only after clean discovery and detail acquisition with
+no pending revisits. A continuation from a different mode, range, or cutoff is
+not reused.
 
 `complete` applies only to the declared available index/detail paths.
 `partial` retains known gaps; `unknown` means controls or scope could not be
@@ -87,6 +94,10 @@ reviewed mappings in this same database; the CLI does not yet author approval
 records. Never treat a suggestion as a billing or entitlement classification.
 Use `--mapping-version <stored-version>` for an explicit selection in
 collection, `models`, or `rebuild`; otherwise the latest stored version is used.
+Published versions are immutable. Event-time validity controls applicability;
+historical corrections require an explicit bounded interval. Inapplicable or
+draft mappings do not erase retained classifications. Keep overrides consistent
+across collectors for one owner; conflicting override precedence is unspecified.
 
 ## Rebuild
 

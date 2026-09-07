@@ -13,9 +13,16 @@ export interface RawModelReport {
   completedAnswersByRecordedFinalModel: Record<string, number>;
   observedAttemptsByResolvedModel: Record<string, number>;
   modelMismatches: number;
+  rawSlugDifferences: number;
   includedAttempts: number;
+  possibleAttemptIds: string[];
+  possibleAttemptsByRequestedModel: Record<string, number>;
+  possibleCompletedAnswersByRecordedFinalModel: Record<string, number>;
+  possibleAttemptsByResolvedModel: Record<string, number>;
   ambiguousTimeAttempts: number;
   unknownTimeAttempts: number;
+  unresolvedAttempts: number;
+  unknownModelAttempts: number;
   excludedSurfaceAttempts: number;
   excludedOriginAttempts: number;
   unclassifiedAttempts: number;
@@ -42,61 +49,107 @@ export function buildRawModelReport(
   const requested = new Map<string, number>();
   const recorded = new Map<string, number>();
   const resolved = new Map<string, number>();
+  const possibleRequested = new Map<string, number>();
+  const possibleRecorded = new Map<string, number>();
+  const possibleResolved = new Map<string, number>();
   const attemptIds: string[] = [];
+  const possibleAttemptIds: string[] = [];
+  const unclassifiedAttemptIds = new Set<string>();
   let modelMismatches = 0;
+  let rawSlugDifferences = 0;
   let ambiguousTimeAttempts = 0;
   let unknownTimeAttempts = 0;
+  let unresolvedAttempts = 0;
+  let unknownModelAttempts = 0;
   let excludedSurfaceAttempts = 0;
   let excludedOriginAttempts = 0;
-  let unclassifiedAttempts = 0;
 
   for (const attempt of ledger.listAttempts(scope)) {
+    const attemptId = String(attempt.attemptId);
     const membership = membershipFor(attempt, startDate, endDate);
     if (membership === "out") {
       continue;
     }
+    attemptIds.push(attemptId);
+
+    const unresolved = isUnresolvedFragment(attempt);
+    const hasRawModelEvidence = hasAnyRawModelEvidence(attempt);
+    const excludedSurface = String(attempt.surface) !== "chat";
+    const excludedOrigin = ["shared", "imported", "copied"].includes(String(attempt.origin));
+    const possibleMembership = membership !== "in" || unresolved;
+
     if (membership === "ambiguous") {
       ambiguousTimeAttempts += 1;
-      unclassifiedAttempts += 1;
+      unclassifiedAttemptIds.add(attemptId);
     }
     if (membership === "unknown") {
       unknownTimeAttempts += 1;
-      unclassifiedAttempts += 1;
+      unclassifiedAttemptIds.add(attemptId);
     }
-    attemptIds.push(String(attempt.attemptId));
-    if (String(attempt.surface) !== "chat") {
+    if (unresolved) {
+      unresolvedAttempts += 1;
+      unclassifiedAttemptIds.add(attemptId);
+    }
+    if (!hasRawModelEvidence) {
+      unknownModelAttempts += 1;
+      unclassifiedAttemptIds.add(attemptId);
+    }
+    if (excludedSurface) {
       excludedSurfaceAttempts += 1;
-      unclassifiedAttempts += 1;
-      continue;
+      unclassifiedAttemptIds.add(attemptId);
     }
-    if (["shared", "imported", "copied"].includes(String(attempt.origin))) {
+    if (excludedOrigin) {
       excludedOriginAttempts += 1;
-      unclassifiedAttempts += 1;
+      unclassifiedAttemptIds.add(attemptId);
+    }
+
+    if (possibleMembership) {
+      possibleAttemptIds.push(attemptId);
+      if (!excludedSurface && !excludedOrigin) {
+        incrementIfPresent(possibleRequested, attempt.requestedModelRaw);
+        if (attempt.completedAnswer) {
+          incrementIfPresent(possibleRecorded, attempt.recordedFinalModelRaw);
+        }
+        incrementIfPresent(possibleResolved, attempt.resolvedModelRaw);
+      }
+    }
+
+    if (
+      membership !== "in" ||
+      unresolved ||
+      excludedSurface ||
+      excludedOrigin ||
+      !hasRawModelEvidence
+    ) {
       continue;
     }
 
-    increment(requested, rawOrUnknown(attempt.requestedModelRaw));
+    incrementIfPresent(requested, attempt.requestedModelRaw);
     if (attempt.completedAnswer) {
-      increment(recorded, rawOrUnknown(attempt.recordedFinalModelRaw));
+      incrementIfPresent(recorded, attempt.recordedFinalModelRaw);
     }
-    increment(resolved, rawOrUnknown(attempt.resolvedModelRaw));
+    incrementIfPresent(resolved, attempt.resolvedModelRaw);
+
+    const requestedFamily = nonEmptyString(attempt.requestedFamily);
+    const recordedFinalFamily = nonEmptyString(attempt.recordedFinalFamily);
     if (
-      attempt.requestedModelRaw !== null &&
-      attempt.recordedFinalModelRaw !== null &&
-      attempt.requestedModelRaw !== attempt.recordedFinalModelRaw
+      requestedFamily !== null &&
+      recordedFinalFamily !== null &&
+      requestedFamily !== recordedFinalFamily
     ) {
       modelMismatches += 1;
     }
     if (
-      attempt.requestedModelRaw === null &&
-      attempt.recordedFinalModelRaw === null &&
-      attempt.resolvedModelRaw === null
+      nonEmptyString(attempt.requestedModelRaw) !== null &&
+      nonEmptyString(attempt.recordedFinalModelRaw) !== null &&
+      attempt.requestedModelRaw !== attempt.recordedFinalModelRaw
     ) {
-      unclassifiedAttempts += 1;
+      rawSlugDifferences += 1;
     }
   }
 
   attemptIds.sort();
+  possibleAttemptIds.sort();
   return {
     accountId: scope.collectorAccountId,
     scopeKey: scopeKey(scope),
@@ -108,12 +161,19 @@ export function buildRawModelReport(
     completedAnswersByRecordedFinalModel: sortedCounts(recorded),
     observedAttemptsByResolvedModel: sortedCounts(resolved),
     modelMismatches,
+    rawSlugDifferences,
     includedAttempts: attemptIds.length,
+    possibleAttemptIds,
+    possibleAttemptsByRequestedModel: sortedCounts(possibleRequested),
+    possibleCompletedAnswersByRecordedFinalModel: sortedCounts(possibleRecorded),
+    possibleAttemptsByResolvedModel: sortedCounts(possibleResolved),
     ambiguousTimeAttempts,
     unknownTimeAttempts,
+    unresolvedAttempts,
+    unknownModelAttempts,
     excludedSurfaceAttempts,
     excludedOriginAttempts,
-    unclassifiedAttempts,
+    unclassifiedAttempts: unclassifiedAttemptIds.size,
     attemptIds,
     coverageGaps: ledger.coverageGaps(scope).filter((gap) => gap.state === "open"),
     label: "Observed raw-model activity; not an official provider quota balance",
@@ -134,7 +194,10 @@ function membershipFor(
   if (!earliest && !latest) {
     return "unknown";
   }
-  if (latest && latest <= start) {
+  if (earliest && latest && earliest.getTime() === latest.getTime()) {
+    return earliest >= start && earliest < end ? "in" : "out";
+  }
+  if (latest && latest < start) {
     return "out";
   }
   if (earliest && earliest >= end) {
@@ -154,8 +217,30 @@ function dateOrNull(value: unknown): Date | null {
   return Number.isFinite(parsed.getTime()) ? parsed : null;
 }
 
-function rawOrUnknown(value: unknown): string {
-  return typeof value === "string" && value.length > 0 ? value : "unknown";
+function isUnresolvedFragment(attempt: Record<string, unknown>): boolean {
+  return (
+    attempt.identityBasis === "unresolved" ||
+    attempt.outcome === "unresolved"
+  );
+}
+
+function hasAnyRawModelEvidence(attempt: Record<string, unknown>): boolean {
+  return (
+    nonEmptyString(attempt.requestedModelRaw) !== null ||
+    nonEmptyString(attempt.recordedFinalModelRaw) !== null ||
+    nonEmptyString(attempt.resolvedModelRaw) !== null
+  );
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function incrementIfPresent(map: Map<string, number>, value: unknown): void {
+  const key = nonEmptyString(value);
+  if (key !== null) {
+    increment(map, key);
+  }
 }
 
 function increment(map: Map<string, number>, key: string): void {

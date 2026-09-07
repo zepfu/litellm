@@ -5,10 +5,11 @@ official provider quota meter and does not infer reset windows or billing.
 
 ## Observations
 
-An observation is a sanitized source projection. Its identity is
-`scope + source_kind + source_id + sanitized_revision_fingerprint`. Replaying
-the same sanitized evidence is idempotent. Changed evidence appends a new
-immutable observation revision and points to the previous revision.
+An observation is a sanitized source projection. Its identity includes activity
+scope, source kind, source ID, occurrence revision, and sanitized fingerprint.
+Consecutive identical evidence from the same collector deduplicates. Changed
+evidence, including an A-B-A reversion or a different collector's observation,
+appends an immutable revision pointing to the previous occurrence.
 
 The collection run ID and observation time are provenance, not evidence
 content. They do not cause an identical replay to count again.
@@ -27,16 +28,21 @@ attempts.
 
 Attempt identity includes:
 
-- local collector account;
 - provider;
 - verified provider user;
 - workspace;
 - quota owner;
+- surface;
 - conversation;
 - validated generation/request/branch identity.
 
-The same upstream generation ID under two accounts therefore produces two
-ledger attempts.
+The same upstream activity collected by two local accounts for one verified
+owner converges on one active attempt with separate collector provenance.
+Different owners remain isolated. Unverified identity is collector-local.
+Later strong linkage can retire a provisional duplicate while retaining its
+revision history and transferring evidence and aliases to the active attempt.
+Regenerations do not inherit prompt model/time without linkage, and a final-only
+response does not invent request-time bounds.
 
 ## Completion
 
@@ -54,13 +60,30 @@ an immutable attempt revision.
 
 Requested, recorded-final, and resolved raw model labels remain separate.
 Canonical families are derived through a versioned, reviewed exact mapping.
-Unmapped raw labels remain reportable. A mapping change reclassifies retained
-attempts and records mapping history; it does not create another attempt.
+Unmapped raw labels remain reportable. Published mappings are immutable;
+prospective versions and bounded historical corrections apply at event time.
+Draft or inapplicable mappings do not erase an existing classification.
+Reclassification preserves warnings and mapping provenance and does not create
+another attempt or reactivate a retired duplicate.
 
 ## Reports
 
-The raw-model report uses a half-open elapsed interval `[start, end)`. It
-reports requested raw-model attempts, completed recorded-final raw-model
-answers, resolved raw-model observations, mismatches, unknown time, ambiguous
-time, excluded surfaces, and shared/imported/copied exclusions independently.
-It does not calculate remaining quota, reset periods, or provider charges.
+The raw-model report uses a half-open elapsed interval `[start, end)`. A point
+exactly at `start` is included and a point exactly at `end` is excluded.
+Definite raw-model totals include only eligible Chat attempts whose time
+membership is definite and whose fragment is not unresolved. Straddling
+intervals, unknown-time attempts, and unresolved fragments remain in
+`possibleAttemptIds` and the possible raw-model maps when their evidence is
+available; possible membership is qualified evidence and must not be added to
+definite totals or treated as a bucket assignment.
+
+Requested and recorded-final family mismatches compare the mapped family
+fields. `rawSlugDifferences` separately preserves cases where the raw
+requested and recorded-final slugs differ even when both map to one family.
+Unclassified attempts are counted by distinct attempt ID. The uncertainty
+category counters can overlap for one attempt and therefore are not additive.
+
+The report also exposes unknown time, ambiguous time, unresolved fragments,
+unknown model evidence, excluded surfaces, and shared/imported/copied
+exclusions independently. It does not calculate remaining quota, reset
+periods, or provider charges.

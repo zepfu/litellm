@@ -24,8 +24,8 @@ ledger consistency, not host-level security.
 
 Provider user, workspace, and quota owner must match before collection.
 Acquisition requires explicit ordinary Chat surface. Account rebinding is
-rejected by the integrated CLI. Attempts and checkpoints are scoped to the
-local account and verified provider identity.
+rejected by the integrated CLI. Attempts share verified-owner activity scope
+with per-collector provenance; checkpoints remain collector-local.
 
 ### Read-only egress
 
@@ -53,9 +53,9 @@ JSON, fixtures, diagnostics, or reports.
 ### Atomic local state
 
 History state is buffered during browser requests and commits with evidence,
-attempts, and run metadata in one SQLite transaction. A failed write cannot
-advance a checkpoint past missing evidence. No write lock is held across
-network requests. Interrupted uncommitted acquisition is replayed.
+attempts, and run metadata in a transaction per acquired page. A failed write
+cannot advance a checkpoint past missing evidence. No write lock is held across
+network requests. Interrupted uncommitted pages are replayed.
 
 ### Fixture isolation
 

@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import {
   ChatGPTHistoryAdapter,
   AdapterError,
+  CapabilityError,
+  HttpStatusError,
   LegacyFallbackNotApprovedError,
   RateLimitedError,
   adaptConversationIndex,
@@ -134,6 +136,74 @@ describe("route allowlist", () => {
     expect(page.warnings).toContain("short_page_before_reported_total");
   });
 
+  it("keeps missing and invalid update timestamps unresolved", () => {
+    const page = adaptConversationIndex(
+      {
+        items: [
+          {
+            id: "conv-missing-update",
+            create_time: "2026-09-07T00:00:00Z",
+          },
+          {
+            id: "conv-invalid-update",
+            create_time: "2026-09-07T00:00:00Z",
+            update_time: "not-a-timestamp",
+          },
+          {
+            id: "conv-numeric-update",
+            update_time: 1788739200,
+          },
+        ],
+      },
+      { archived: false, offset: 0, limit: 100 },
+    );
+
+    expect(page.items[0]?.updatedAt).toBeNull();
+    expect(page.items[1]?.updatedAt).toBeNull();
+    expect(page.items[2]?.updatedAt).toBe("2026-09-07T00:00:00.000Z");
+    expect(page.items[0]?.coverage).toBe("partial");
+    expect(page.items[1]?.coverage).toBe("partial");
+    expect(page.coverage).toBe("partial");
+    expect(page.warnings).toContain("conversation_missing_update_time");
+    expect(page.warnings).toContain("conversation_invalid_update_time");
+  });
+
+  it("honors returned index pagination controls", () => {
+    const page = adaptConversationIndex(
+      {
+        items: [{ id: "conv-001", update_time: "2026-09-07T00:00:00Z" }],
+        offset: 0,
+        total: 101,
+        has_more: true,
+        next_offset: 25,
+      },
+      { archived: false, offset: 0, limit: 100 },
+    );
+
+    expect(page.continuation).toBe(25);
+    expect(page.exhausted).toBe(false);
+    expect(page.paginationState).toBe("continuation");
+    expect(page.coverage).toBe("validated_page");
+  });
+
+  it("marks a returned repeated index offset as contradictory", () => {
+    const page = adaptConversationIndex(
+      {
+        items: [{ id: "conv-001", update_time: "2026-09-07T00:00:00Z" }],
+        offset: 0,
+        has_more: true,
+        next_offset: 0,
+      },
+      { archived: false, offset: 0, limit: 100 },
+    );
+
+    expect(page.continuation).toBe(0);
+    expect(page.exhausted).toBe(false);
+    expect(page.paginationState).toBe("contradictory");
+    expect(page.coverage).toBe("partial");
+    expect(page.warnings).toContain("nonadvancing_next_offset");
+  });
+
   it("requires capability approval before using legacy detail after 404", async () => {
     class StatusTransport implements HistoryTransport {
       readonly requests: string[] = [];
@@ -168,8 +238,12 @@ describe("route allowlist", () => {
       {},
       { legacyFallbackApproved: false },
     );
-    await expect(unapproved.fetchConversation("conv-001")).rejects.toBeInstanceOf(
+    const unapprovedFailure = unapproved.fetchConversation("conv-001");
+    await expect(unapprovedFailure).rejects.toBeInstanceOf(
       LegacyFallbackNotApprovedError,
+    );
+    await expect(unapprovedFailure).rejects.toBeInstanceOf(
+      CapabilityError,
     );
     expect(unapprovedTransport.requests).toEqual([
       "/backend-api/conversations/conv-001",
@@ -187,6 +261,36 @@ describe("route allowlist", () => {
       "/backend-api/conversations/conv-001",
       "/backend-api/conversation/conv-001",
     ]);
+  });
+
+  it("surfaces typed HTTP and response-capability failures", async () => {
+    class StatusTransport implements HistoryTransport {
+      constructor(private readonly payload: Record<string, unknown>) {}
+
+      async request(): Promise<Record<string, unknown>> {
+        return this.payload;
+      }
+    }
+
+    const httpAdapter = new ChatGPTHistoryAdapter(
+      new StatusTransport({ http_status: 503 }),
+    );
+    await expect(httpAdapter.listConversations({ archived: false })).rejects.toMatchObject({
+      name: "HttpStatusError",
+      status: 503,
+      path: MODERN_INDEX,
+    } satisfies Partial<HttpStatusError>);
+
+    const capabilityAdapter = new ChatGPTHistoryAdapter(
+      new StatusTransport({ http_status: "not-a-status" }),
+    );
+    await expect(
+      capabilityAdapter.listConversations({ archived: false }),
+    ).rejects.toMatchObject({
+      name: "CapabilityError",
+      capability: "http_status",
+      path: MODERN_INDEX,
+    } satisfies Partial<CapabilityError>);
   });
 
   it("never falls back to legacy detail for a rate limit", async () => {

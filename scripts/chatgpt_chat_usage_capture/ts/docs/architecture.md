@@ -15,7 +15,7 @@
                                                |
                                       history/ingest.ts
                                                |
-                                   one SQLite transaction
+                                   per-page SQLite transactions
                                    observations / messages
                                    attempts / aliases / revisions
                                    coverage / runs / checkpoints
@@ -35,8 +35,10 @@ quota-owner bindings to match the observed session. Missing expected values
 are `unconfigured`; absent or unequal observed values are `identity_mismatch`.
 Unauthenticated sessions are `auth_required`. Collection additionally requires
 explicit observed `surface=chat`. No email, title, default account, or first
-returned account is an identity guess. Ledger scope includes the local account,
-provider, user, workspace, quota owner, and surface; the CLI rejects rebinding
+returned account is an identity guess. Activity scope includes provider, user,
+workspace, quota owner, and surface. Collectors for the same verified owner
+share activity while retaining collector provenance. Unverified scopes and
+discovery/checkpoint state remain collector-local. The CLI rejects rebinding
 an existing local account.
 
 ## Browser and adapter
@@ -67,31 +69,40 @@ model metadata for the same message ID. Attempt attribution uses message
 evidence, not the conversation update time.
 
 Backfill defaults to 14 elapsed days. Implicit refresh uses each scope's last
-complete discovery start with a 48-hour overlap. Explicit ranges take
-precedence. Incomplete discovery retains its continuation without advancing the
-completed watermark. Incomplete detail/message traversal creates a revisit
-independent of the discovery cutoff.
+clean implicit-refresh discovery start with a 48-hour overlap, without clamping
+an old watermark to the default range. Explicit ranges take precedence;
+historical scans do not advance refresh watermarks. Continuations resume only
+when mode, range, and cutoff match. Historical discovery includes conversations
+updated beyond the range end, but all page evidence respects its exclusive end.
+Leading-page rereads leave changing indexes partial. Incomplete detail/message
+traversal and nonterminal generations retain revisits independently of cutoff.
 
 `src/history/checkpoints.ts` buffers the checkpoint contract in memory.
 `SqliteCheckpointStore` loads/saves the account's per-scope state and revisits
 in the `history_state` table. There is no JSON history-store CLI path.
 `src/history/ingest.ts` joins collection to the Stage-2B ledger: account binding,
 empty mapping seed, run, evidence, reconstructed attempts, coverage, and
-checkpoint changes commit together after acquisition. No SQLite write lock
-spans browser requests. A failed commit rolls everything back; an interrupted
-acquisition replays from the previous durable state. Commit granularity is one
-bounded collection result, not each network page.
+checkpoint changes commit together for each acquired page. No SQLite write
+lock spans browser requests. A failed page commit rolls back that page; prior
+successful pages and their continuations remain durable. Bad saved message
+continuations allow one bounded restart.
 
-Index completion and detail completion remain separate. A completed index may
-advance its discovery watermark when an incomplete conversation is safely
-retained in the same committed revisit state.
+Index completion and detail completion remain separate. Only clean implicit
+refresh scopes without incomplete details, warnings, or pending revisits
+advance their watermark. Observed Project and branch metadata still leave
+global visibility unproven. Older-history audit rotation is opt-in through the
+collector request API.
 
 ## Ledger, reconstruction, and reports
 
-`src/ledger/store.ts` applies three ordered SQLite migrations with WAL, foreign
-keys, and a busy timeout. Source identity and stable sanitized fingerprints
-deduplicate observations while changed evidence appends revisions. Message,
-attempt, alias, mapping, and aggregate history remains available.
+`src/ledger/store.ts` applies five ordered SQLite migrations with WAL, foreign
+keys, and a busy timeout, checking applied migration names and checksums.
+Migration 4 enables occurrence revisions and provenance; migration 5 adds
+mapping lifecycle columns and transactionally migrates legacy activity scopes.
+Legacy evidence IDs and revision occurrences remain available; duplicate owner
+activity converges, and checkpoints remain collector-local. Consecutive
+identical evidence from one collector deduplicates; A-B-A changes retain all
+three occurrences. Older evidence does not replace newer current projections.
 
 `src/normalize/reconstruct.ts` groups linked user, analysis, reasoning, tool,
 and final nodes into generations. Distinct generation evidence preserves
@@ -100,8 +111,10 @@ are selected by timestamp. Missing linkage and ambiguous collisions remain
 explicit rather than being guessed.
 
 Requested, recorded-final, and resolved model labels are independent. The
-initial mapping has canonical families but no slug rules. Reviewed exact
-mapping versions and their history are separate from raw evidence.
+initial mapping has canonical families but no slug rules. Published mappings
+are immutable, use event-time validity, and distinguish prospective changes
+from historical corrections. Rebuild preserves mapping warnings, linkage, and
+retired duplicates. Mapping history is separate from raw evidence.
 `src/accounting/raw-model.ts` reports elapsed half-open intervals with
 mismatches, ambiguous/unknown times, surface/origin exclusions, and open
 coverage gaps. `src/accounting/reaggregate.ts` rebuilds from the same messages

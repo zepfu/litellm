@@ -20,10 +20,11 @@ protected containers.
 
 `inspect-capabilities` currently requests the session route and the first
 active and archived index pages. Stage-2A collection paginates each scope,
-persists a checkpoint after each page, acquires modern detail/messages, and
-retains incomplete conversations for later revisit. Index and message pages
-expose explicit `complete`, `continuation`, `contradictory`, `unknown`,
-`repeated_cursor`, or `budget_exhausted` states.
+acquires modern detail/messages, and retains incomplete conversations for later
+revisit. Index and message pages expose explicit `complete`, `continuation`,
+`contradictory`, `unknown`, `repeated_cursor`, or `budget_exhausted` states.
+Collection bounds are explicit and finite: the index page size, per-scope index
+page budget, and per-conversation message-page budget are validated from config.
 
 ## Blocked routes and methods
 
@@ -52,10 +53,14 @@ remains `unknown`. `has_versions` is exposed as version metadata or
 active-branch-only evidence; it is not treated as proof that every branch was
 returned.
 
-The checkpoint store is local JSON state under the configured state directory.
-It contains no response body or browser state. Explicit backfill and
-reconciliation ranges are stored and used as requested; the incremental
-watermark is only consulted by an implicit refresh.
+The checkpoint store is the `history_state` table in the configured SQLite
+database; it contains no response body or browser state. Browser acquisition
+does not commit after each network page. Instead, sanitized observations,
+normalized evidence, coverage, revisits, and checkpoints commit together once
+per bounded collection result. A failed transaction leaves the previous result
+intact, and an interrupted acquisition replays from that prior durable state.
+Explicit backfill and reconciliation ranges are stored and used as requested;
+the incremental watermark is only consulted by an implicit refresh.
 
 ## Fixture provenance
 

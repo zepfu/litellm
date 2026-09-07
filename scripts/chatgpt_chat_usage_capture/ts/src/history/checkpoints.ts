@@ -5,7 +5,7 @@ import type {
   RevisitEntry,
 } from "../contracts/history.js";
 import { HISTORY_STATE_VERSION } from "../contracts/history.js";
-import { scopeKey } from "../ledger/identity.js";
+import { collectorScopeKey } from "../ledger/identity.js";
 import type { Ledger } from "../ledger/store.js";
 import type { LedgerScope } from "../ledger/types.js";
 import { assertNoSecrets } from "../security/sanitizer.js";
@@ -33,7 +33,7 @@ export class MemoryCheckpointStore implements HistoryCheckpointStore {
   listRevisits(): RevisitEntry[] {
     return [...this.revisits.values()]
       .filter((entry) => entry.status === "pending")
-      .map(clone)
+      .map((entry) => clone(normalizeRevisit(entry)))
       .sort((left, right) =>
         left.nextEligibleAt.localeCompare(right.nextEligibleAt) ||
         left.conversationId.localeCompare(right.conversationId),
@@ -41,7 +41,7 @@ export class MemoryCheckpointStore implements HistoryCheckpointStore {
   }
 
   upsertRevisit(entry: RevisitEntry): void {
-    this.revisits.set(entry.conversationId, clone(entry));
+    this.revisits.set(entry.conversationId, clone(normalizeRevisit(entry)));
   }
 
   completeRevisit(accountId: string, conversationId: string): void {
@@ -64,7 +64,7 @@ export class SqliteCheckpointStore extends MemoryCheckpointStore {
     super();
     const row = ledger.db
       .prepare("SELECT state_json FROM history_state WHERE scope_key=?")
-      .get(scopeKey(scope)) as { state_json: string } | undefined;
+      .get(collectorScopeKey(scope)) as { state_json: string } | undefined;
     if (!row) {
       return;
     }
@@ -78,7 +78,9 @@ export class SqliteCheckpointStore extends MemoryCheckpointStore {
       throw new Error("history checkpoint state is invalid");
     }
     for (const checkpoint of Object.values(state.checkpoints)) {
-      this.saveDiscovery(checkpoint);
+      if (checkpoint) {
+        this.saveDiscovery(checkpoint);
+      }
     }
     for (const revisit of state.revisits) {
       this.upsertRevisit(revisit);
@@ -108,10 +110,24 @@ export class SqliteCheckpointStore extends MemoryCheckpointStore {
         VALUES (?, ?, ?)
         ON CONFLICT(scope_key) DO UPDATE SET state_json=excluded.state_json
       `)
-      .run(scopeKey(this.scope), this.scope.collectorAccountId, JSON.stringify(state));
+      .run(collectorScopeKey(this.scope), this.scope.collectorAccountId, JSON.stringify(state));
   }
 }
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function normalizeRevisit(entry: RevisitEntry): RevisitEntry {
+  return {
+    ...entry,
+    continuation:
+      typeof entry.continuation === "string" && entry.continuation.trim()
+        ? entry.continuation.trim()
+        : null,
+    detailPagesFetched:
+      Number.isInteger(entry.detailPagesFetched) && entry.detailPagesFetched >= 0
+        ? entry.detailPagesFetched
+        : 0,
+  };
 }

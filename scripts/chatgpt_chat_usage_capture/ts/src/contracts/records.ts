@@ -80,6 +80,7 @@ export interface ConversationDetailProjection {
   surface: Surface;
   detailRoute: "modern" | "legacy";
   messages: MessageRecord[];
+  continuation: string | null;
   paginationState: PaginationState;
   coverage: Coverage;
   warnings: string[];

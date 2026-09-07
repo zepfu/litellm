@@ -56,7 +56,7 @@ Exact direct dependency pins in `package.json` and `package-lock.json`:
 | `@types/better-sqlite3` | `9.6.0` |
 | `vitest` | `3.2.7` |
 
-Adapter contract: `chatgpt-chat-history-v1`. SQLite schema: `3`. History state
+Adapter contract: `chatgpt-chat-history-v1`. SQLite schema: `5`. History state
 contract: `1`.
 
 ## Configuration

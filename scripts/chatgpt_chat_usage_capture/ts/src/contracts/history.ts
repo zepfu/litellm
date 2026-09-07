@@ -14,6 +14,7 @@ export const DEFAULT_OVERLAP_MS = 48 * 60 * 60 * 1000;
 export const DEFAULT_INDEX_PAGE_SIZE = 100;
 export const DEFAULT_MAX_INDEX_PAGES = 500;
 export const DEFAULT_MAX_MESSAGE_PAGES_PER_CONVERSATION = 100;
+export const DEFAULT_MAX_OLDER_HISTORY_AUDIT_PAGES = 1;
 
 export type HistoryScope = "active" | "archived";
 export type HistoryCollectionMode =
@@ -28,12 +29,40 @@ export type CheckpointStatus =
 export type RevisitStatus = "pending" | "complete";
 export type RevisitReason =
   | "incomplete_detail"
+  | "partial_detail"
+  | "unrecognized_detail"
   | "repeated_cursor"
+  | "bad_continuation"
   | "page_budget"
   | "unknown_pagination"
   | "contradictory_pagination"
   | "detail_unavailable"
-  | "missing_update_time";
+  | "missing_update_time"
+  | "nonterminal_generation";
+
+export type OlderHistoryAuditStatus =
+  | "disabled"
+  | "in_progress"
+  | "partial"
+  | "complete";
+
+export interface OlderHistoryAuditRequest {
+  enabled: boolean;
+  maxPages?: number;
+}
+
+export interface OlderHistoryAuditState {
+  enabled: boolean;
+  status: OlderHistoryAuditStatus;
+  continuation: number | null;
+  pagesFetched: number;
+  conversationsAudited: number;
+  lastStartedAt: string | null;
+  lastPageAt: string | null;
+  lastCompletedAt: string | null;
+}
+
+export interface OlderHistoryAuditCoverage extends OlderHistoryAuditState {}
 
 export interface HistoryRange {
   /** Inclusive UTC instant. */
@@ -47,18 +76,22 @@ export interface DiscoveryCheckpoint {
   accountId: string;
   scope: HistoryScope;
   status: CheckpointStatus;
+  /** Frozen identity for the discovery acquisition being resumed. */
   mode: HistoryCollectionMode;
   range: HistoryRange;
+  /** Lower-bound discovery cutoff frozen with mode and range. */
   candidateCutoff: string;
   scanStartedAt: string | null;
   continuation: number | null;
   pagesFetched: number;
   pageBudget: number;
+  /** Clean implicit-refresh watermark; historical scans never advance it. */
   lastCompleteDiscoveryStartedAt: string | null;
   lastPageAt: string | null;
   paginationState: PaginationState;
   warnings: string[];
   updatedAt: string;
+  olderHistoryAudit?: OlderHistoryAuditState;
 }
 
 export interface RevisitEntry {
@@ -74,6 +107,7 @@ export interface RevisitEntry {
   nextEligibleAt: string;
   lastError: string | null;
   detailPagesFetched: number;
+  continuation: string | null;
 }
 
 export interface HistoryCheckpointStore {
@@ -82,6 +116,23 @@ export interface HistoryCheckpointStore {
   listRevisits(): RevisitEntry[];
   upsertRevisit(entry: RevisitEntry): void;
   completeRevisit(accountId: string, conversationId: string): void;
+}
+
+export interface HistoryPageCommit {
+  accountId: string;
+  mode: HistoryCollectionMode;
+  scanStartedAt: string;
+  identity: IdentityRecord;
+  summary: ConversationSummary;
+  scopes: HistoryScope[];
+  detail: ConversationDetailProjection | null;
+  messages: MessageRecord[];
+  coverage: AcquiredConversation["coverage"];
+  warnings: string[];
+  pageKind: "detail" | "messages";
+  pageNumber: number;
+  nextContinuation: string | null;
+  revisit: RevisitEntry | null;
 }
 
 export interface HistoryReader {
@@ -116,6 +167,7 @@ export interface HistoryCollectionRequest {
   maxIndexPagesPerScope?: number;
   maxMessagePagesPerConversation?: number;
   legacyFallbackApproved?: boolean;
+  olderHistoryAudit?: OlderHistoryAuditRequest;
 }
 
 export interface HistoryCollectionOptions {
@@ -128,6 +180,9 @@ export interface HistoryCollectionOptions {
   maxIndexPagesPerScope?: number;
   maxMessagePagesPerConversation?: number;
   legacyFallbackApproved?: boolean;
+  onPageCommit?: (
+    page: HistoryPageCommit,
+  ) => Promise<void> | void;
 }
 
 export interface ScopeCoverageResult {
@@ -140,6 +195,7 @@ export interface ScopeCoverageResult {
   paginationState: PaginationState;
   candidateCutoff: string;
   warnings: string[];
+  olderHistoryAudit: OlderHistoryAuditCoverage;
 }
 
 export interface HistoryCoverageResult {
@@ -147,6 +203,12 @@ export interface HistoryCoverageResult {
   archived: ScopeCoverageResult;
   projects: "validated_for_discovered_projects" | "unknown";
   branches: "version_metadata_observed" | "active_branch_only" | "unknown";
+  olderHistoryAudit: {
+    enabled: boolean;
+    status: OlderHistoryAuditStatus;
+    active: OlderHistoryAuditCoverage;
+    archived: OlderHistoryAuditCoverage;
+  };
   overall: "complete" | "partial" | "unknown";
   gaps: string[];
 }
@@ -155,6 +217,7 @@ export interface AcquiredConversation {
   summary: ConversationSummary;
   scopes: HistoryScope[];
   detail: ConversationDetailProjection | null;
+  /** Evidence is bounded by the collection range's exclusive end. */
   messages: MessageRecord[];
   coverage: "complete" | "partial" | "unknown";
   revisit: RevisitEntry | null;
