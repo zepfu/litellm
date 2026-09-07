@@ -5,6 +5,8 @@ import {
   access,
   chmod,
   mkdtemp,
+  readdir,
+  readFile,
   rm,
   stat,
 } from "node:fs/promises";
@@ -329,49 +331,113 @@ function boundedProtocolLine(session) {
   return `${line}\n`;
 }
 
+async function listOwnedChromePids(scratchDir) {
+  if (process.platform !== "linux") {
+    return [];
+  }
+  let entries;
+  try {
+    entries = await readdir("/proc");
+  } catch {
+    return [];
+  }
+  const marker = `--user-data-dir=${scratchDir}`;
+  const pids = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) {
+      continue;
+    }
+    let commandLine;
+    try {
+      commandLine = await readFile(path.join("/proc", entry, "cmdline"));
+    } catch {
+      continue;
+    }
+    if (commandLine.toString("utf8").split("\0").includes(marker)) {
+      pids.push(Number(entry));
+    }
+  }
+  return pids;
+}
+
+async function signalOwnedChromePid(pid, scratchDir, signal) {
+  if (process.platform !== "linux" || !Number.isInteger(pid)) {
+    return;
+  }
+  const ownedPids = await listOwnedChromePids(scratchDir);
+  if (!ownedPids.includes(pid)) {
+    return;
+  }
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // The owned process may have exited between the evidence check and signal.
+    }
+  }
+}
+
+async function terminateOwnedStartupChrome(scratchDir) {
+  if (!scratchDir) {
+    return;
+  }
+  const ownedPids = await listOwnedChromePids(scratchDir);
+  for (const pid of ownedPids) {
+    await signalOwnedChromePid(pid, scratchDir, "SIGTERM");
+  }
+  if (ownedPids.length === 0) {
+    return;
+  }
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const remainingPids = await listOwnedChromePids(scratchDir);
+  for (const pid of remainingPids) {
+    await signalOwnedChromePid(pid, scratchDir, "SIGKILL");
+  }
+}
+
 async function cleanupOwned(state, helpers) {
   if (state.cleanupPromise) {
     return state.cleanupPromise;
   }
 
   state.cleanupPromise = (async () => {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const targetId = state.pageTargetId;
-      const client = state.client;
-      const chrome = state.chrome;
-      const scratchDir = state.scratchDir;
-      state.pageTargetId = null;
-      state.client = null;
-      state.chrome = null;
-      state.scratchDir = null;
+    const targetId = state.pageTargetId;
+    const client = state.client;
+    const chrome = state.chrome;
+    const scratchDir = state.scratchDir;
 
-      if (targetId && chrome && Number.isInteger(chrome.port)) {
-        await helpers.closeTab(
+    if (targetId && chrome && Number.isInteger(chrome.port)) {
+      await helpers
+        .closeTab(
           chrome.port,
           targetId,
           NOOP_LOGGER,
           chrome.host ?? "127.0.0.1",
-        ).catch(() => undefined);
-      }
-      if (client && typeof client.close === "function") {
-        await client.close().catch(() => undefined);
-      }
-      if (chrome && typeof chrome.kill === "function") {
-        await chrome.kill().catch(() => undefined);
-      }
-      if (scratchDir) {
-        await rm(scratchDir, { recursive: true, force: true }).catch(
-          () => undefined,
-        );
-      }
-
-      await Promise.resolve();
-      if (!state.pageTargetId && !state.client && !state.chrome) {
-        if (!state.scratchDir) {
-          break;
-        }
+        )
+        .catch(() => undefined);
+    }
+    if (client && typeof client.close === "function") {
+      await client.close().catch(() => undefined);
+    }
+    if (chrome && typeof chrome.kill === "function") {
+      try {
+        await Promise.resolve(chrome.kill());
+      } catch {
+        // Cleanup continues with owned PID evidence below.
       }
     }
+    await terminateOwnedStartupChrome(scratchDir);
+    if (scratchDir) {
+      await rm(scratchDir, { recursive: true, force: true }).catch(
+        () => undefined,
+      );
+    }
+    state.pageTargetId = null;
+    state.client = null;
+    state.chrome = null;
+    state.scratchDir = null;
   })();
 
   try {
@@ -409,29 +475,78 @@ function waitForSignal() {
   };
 }
 
-function waitForStdinEof() {
+function watchStdinEof() {
+  let settled = false;
+  let closed = false;
+  let resolveEof;
+  const promise = new Promise((resolve) => {
+    resolveEof = resolve;
+  });
+  const finish = () => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    closed = true;
+    process.stdin.removeListener("end", finish);
+    process.stdin.removeListener("close", finish);
+    process.stdin.removeListener("error", finish);
+    resolveEof();
+  };
+  process.stdin.once("end", finish);
+  process.stdin.once("close", finish);
+  process.stdin.once("error", finish);
+  process.stdin.resume();
   if (process.stdin.readableEnded) {
-    return Promise.resolve();
+    finish();
   }
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = () => {
-      if (settled) {
-        return;
-      }
-      settled = true;
+  return {
+    promise,
+    isClosed() {
+      return closed;
+    },
+    remove() {
       process.stdin.removeListener("end", finish);
       process.stdin.removeListener("close", finish);
       process.stdin.removeListener("error", finish);
-      resolve();
-    };
-    process.stdin.once("end", finish);
-    process.stdin.once("close", finish);
-    process.stdin.once("error", finish);
-    process.stdin.resume();
-    if (process.stdin.readableEnded) {
-      finish();
+    },
+  };
+}
+
+function watchStdoutErrors() {
+  let errorSeen = false;
+  let resolveError;
+  const promise = new Promise((resolve) => {
+    resolveError = resolve;
+  });
+  const handleError = () => {
+    if (errorSeen) {
+      return;
     }
+    errorSeen = true;
+    resolveError();
+  };
+  process.stdout.on("error", handleError);
+  return {
+    promise,
+    hasError() {
+      return errorSeen;
+    },
+    remove() {
+      process.stdout.removeListener("error", handleError);
+    },
+  };
+}
+
+function writeProtocolLine(line) {
+  return new Promise((resolve, reject) => {
+    process.stdout.write(line, "utf8", (error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
   });
 }
 
@@ -444,6 +559,17 @@ function reportFailure(stage, error) {
   process.stderr.write(
     `oracle browser session ${stage} failed (${sanitizedErrorName(error)})\n`,
   );
+}
+
+async function settleStartup(state) {
+  if (!state.startupPromise) {
+    return;
+  }
+  try {
+    await state.startupPromise;
+  } catch {
+    // The caller receives only the bounded, sanitized failure below.
+  }
 }
 
 async function run() {
@@ -463,6 +589,7 @@ async function run() {
   const state = {
     cleanupRequested: false,
     cleanupPromise: null,
+    startupPromise: null,
     helpers: null,
     scratchDir: null,
     chrome: null,
@@ -472,20 +599,24 @@ async function run() {
     pageTargetId: null,
   };
   const signalWait = waitForSignal();
-  let startupPromise;
+  const stdinWait = watchStdinEof();
+  const stdoutErrors = watchStdoutErrors();
+  let removeTerminationHooks = null;
 
   try {
     const validated = await validateInputs(args);
     args = { ...args, ...validated };
 
-    startupPromise = createSession(args, state);
+    state.startupPromise = createSession(args, state);
     let startupTimer;
     const startupResult = await Promise.race([
-      startupPromise.then(
+      state.startupPromise.then(
         (session) => ({ kind: "ready", session }),
         (error) => ({ kind: "error", error }),
       ),
       signalWait.promise.then((signal) => ({ kind: "signal", signal })),
+      stdinWait.promise.then(() => ({ kind: "stdin-eof" })),
+      stdoutErrors.promise.then(() => ({ kind: "stdout-error" })),
       new Promise((resolve) => {
         startupTimer = setTimeout(
           () => resolve({ kind: "timeout" }),
@@ -498,35 +629,31 @@ async function run() {
     if (startupResult.kind === "signal") {
       signalWait.remove();
       state.cleanupRequested = true;
-      if (state.helpers) {
-        await cleanupOwned(state, state.helpers);
-      }
+      await cleanupWithAvailableHelpers(state);
       process.exitCode = startupResult.signal === "SIGINT" ? 130 : 143;
-      void startupPromise.then(
-        () => cleanupWithAvailableHelpers(state),
-        () => cleanupWithAvailableHelpers(state),
-      );
       return process.exitCode;
     }
     if (startupResult.kind === "timeout") {
       signalWait.remove();
       state.cleanupRequested = true;
-      if (state.helpers) {
-        await cleanupOwned(state, state.helpers);
-      }
+      await cleanupWithAvailableHelpers(state);
       reportFailure("startup", new StartupTimeoutError());
-      void startupPromise.then(
-        () => cleanupWithAvailableHelpers(state),
-        () => cleanupWithAvailableHelpers(state),
-      );
+      return 1;
+    }
+    if (
+      startupResult.kind === "stdin-eof" ||
+      startupResult.kind === "stdout-error"
+    ) {
+      signalWait.remove();
+      state.cleanupRequested = true;
+      await cleanupWithAvailableHelpers(state);
+      reportFailure("startup", new StartupAbortedError());
       return 1;
     }
     if (startupResult.kind === "error") {
       signalWait.remove();
       state.cleanupRequested = true;
-      if (state.helpers) {
-        await cleanupOwned(state, state.helpers);
-      }
+      await cleanupWithAvailableHelpers(state);
       reportFailure("startup", startupResult.error);
       return 1;
     }
@@ -535,7 +662,7 @@ async function run() {
     if (!helpers) {
       throw new Error("Oracle browser helpers are unavailable");
     }
-    const removeTerminationHooks = helpers.registerTerminationHooks(
+    removeTerminationHooks = helpers.registerTerminationHooks(
       state.chrome,
       state.scratchDir,
       false,
@@ -547,23 +674,56 @@ async function run() {
     );
     signalWait.remove();
 
-    process.stdout.write(boundedProtocolLine(startupResult.session));
-    await waitForStdinEof();
+    if (stdinWait.isClosed() || stdoutErrors.hasError()) {
+      removeTerminationHooks();
+      removeTerminationHooks = null;
+      state.cleanupRequested = true;
+      await cleanupWithAvailableHelpers(state);
+      reportFailure("startup", new StartupAbortedError());
+      return 1;
+    }
+    try {
+      await writeProtocolLine(boundedProtocolLine(startupResult.session));
+    } catch {
+      removeTerminationHooks();
+      removeTerminationHooks = null;
+      state.cleanupRequested = true;
+      await cleanupWithAvailableHelpers(state);
+      reportFailure("protocol", new StartupAbortedError());
+      return 1;
+    }
 
+    const captureResult = await Promise.race([
+      stdinWait.promise.then(() => "stdin-eof"),
+      stdoutErrors.promise.then(() => "stdout-error"),
+    ]);
     removeTerminationHooks();
+    removeTerminationHooks = null;
     state.cleanupRequested = true;
-    await cleanupOwned(state, helpers);
+    await cleanupWithAvailableHelpers(state);
+    if (captureResult === "stdout-error") {
+      reportFailure("protocol", new StartupAbortedError());
+      return 1;
+    }
     return 0;
   } catch (error) {
     signalWait.remove();
+    if (removeTerminationHooks) {
+      removeTerminationHooks();
+      removeTerminationHooks = null;
+    }
     state.cleanupRequested = true;
     await cleanupWithAvailableHelpers(state);
     reportFailure("startup", error);
     return 1;
+  } finally {
+    stdinWait.remove();
+    stdoutErrors.remove();
   }
 }
 
 async function cleanupWithAvailableHelpers(state) {
+  await settleStartup(state);
   if (state.helpers) {
     await cleanupOwned(state, state.helpers);
     return;
