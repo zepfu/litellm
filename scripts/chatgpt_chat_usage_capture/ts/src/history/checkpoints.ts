@@ -33,7 +33,7 @@ export class MemoryCheckpointStore implements HistoryCheckpointStore {
   listRevisits(): RevisitEntry[] {
     return [...this.revisits.values()]
       .filter((entry) => entry.status === "pending")
-      .map(clone)
+      .map((entry) => clone(normalizeRevisit(entry)))
       .sort((left, right) =>
         left.nextEligibleAt.localeCompare(right.nextEligibleAt) ||
         left.conversationId.localeCompare(right.conversationId),
@@ -41,7 +41,7 @@ export class MemoryCheckpointStore implements HistoryCheckpointStore {
   }
 
   upsertRevisit(entry: RevisitEntry): void {
-    this.revisits.set(entry.conversationId, clone(entry));
+    this.revisits.set(entry.conversationId, clone(normalizeRevisit(entry)));
   }
 
   completeRevisit(accountId: string, conversationId: string): void {
@@ -78,7 +78,9 @@ export class SqliteCheckpointStore extends MemoryCheckpointStore {
       throw new Error("history checkpoint state is invalid");
     }
     for (const checkpoint of Object.values(state.checkpoints)) {
-      this.saveDiscovery(checkpoint);
+      if (checkpoint) {
+        this.saveDiscovery(checkpoint);
+      }
     }
     for (const revisit of state.revisits) {
       this.upsertRevisit(revisit);
@@ -114,4 +116,18 @@ export class SqliteCheckpointStore extends MemoryCheckpointStore {
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function normalizeRevisit(entry: RevisitEntry): RevisitEntry {
+  return {
+    ...entry,
+    continuation:
+      typeof entry.continuation === "string" && entry.continuation.trim()
+        ? entry.continuation.trim()
+        : null,
+    detailPagesFetched:
+      Number.isInteger(entry.detailPagesFetched) && entry.detailPagesFetched >= 0
+        ? entry.detailPagesFetched
+        : 0,
+  };
 }

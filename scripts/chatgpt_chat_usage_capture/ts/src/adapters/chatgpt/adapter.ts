@@ -413,6 +413,8 @@ export function adaptConversationDetail(
     surface,
     detailRoute: options.detailRoute ?? "modern",
     messages: page.items,
+    continuation:
+      typeof page.continuation === "string" ? page.continuation : null,
     paginationState: page.paginationState,
     coverage: page.coverage,
     warnings: page.warnings,

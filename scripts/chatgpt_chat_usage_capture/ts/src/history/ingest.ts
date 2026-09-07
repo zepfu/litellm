@@ -4,6 +4,7 @@ import type { AccountConfig } from "../config.js";
 import type {
   HistoryCollectionRequest,
   HistoryCollectionResult,
+  HistoryPageCommit,
   HistoryReader,
 } from "../contracts/history.js";
 import { ADAPTER_VERSION } from "../contracts/records.js";
@@ -78,10 +79,6 @@ export async function collectIntoLedger(
   assertAccountBinding(ledger, scope);
   const mapping = selectMapping(ledger, mappingVersion);
   const store = new SqliteCheckpointStore(ledger, scope);
-  const result = await new HistoryCollector(reader, {
-    accountId: account.id,
-    store,
-  }).collect(request);
   const summary: PersistedHistoryResult["ledger"] = {
     databasePath: ledger.path,
     runId: null,
@@ -94,23 +91,21 @@ export async function collectIntoLedger(
     attemptsDeduplicated: 0,
     aliasConflicts: 0,
   };
-  if (result.status === "blocked") {
-    return { ...result, ledger: summary };
-  }
-  if (
-    result.identity.providerUserId !== scope.providerUserId ||
-    result.identity.workspaceId !== scope.workspaceId ||
-    result.identity.quotaOwnerId !== scope.quotaOwnerId
-  ) {
-    throw new LedgerError("collected identity differs from the configured ledger binding");
-  }
-
   const runId = randomUUID();
-  const observedAt = new Date().toISOString();
-  ledger.transaction(() => {
+  let runStarted = false;
+  const persistedConversations = new Set<string>();
+
+  const ensureRunStarted = (
+    identity: HistoryPageCommit["identity"],
+    mode: HistoryCollectionRequest["mode"],
+    scanStartedAt: string,
+  ): void => {
+    if (runStarted) {
+      return;
+    }
     assertAccountBinding(ledger, scope);
     ledger.upsertAccount(scope, {
-      authState: result.identity.authState,
+      authState: identity.authState,
       planPolicyId: account.planPolicyId || null,
       enabled: account.enabled,
     });
@@ -119,65 +114,191 @@ export async function collectIntoLedger(
     }
     ledger.startRun(scope, {
       runId,
-      mode: result.mode,
-      startedAt: result.scanStartedAt,
+      mode,
+      startedAt: scanStartedAt,
     });
-    for (const conversation of result.conversations) {
-      const sourceKind = "history_conversation";
-      const sourceId = conversation.summary.conversationId;
-      ledger.resolveCoverageGaps(scope, sourceKind, sourceId, observedAt);
-      ledger.upsertConversation(scope, conversation.summary, runId);
-      if (!conversation.detail) {
-        ledger.recordCoverageGap(scope, {
+    runStarted = true;
+  };
+
+  const persistConversation = (
+    page: Pick<
+      HistoryPageCommit,
+      | "summary"
+      | "scopes"
+      | "detail"
+      | "messages"
+      | "coverage"
+      | "warnings"
+      | "pageKind"
+      | "pageNumber"
+      | "nextContinuation"
+      | "revisit"
+    >,
+    observedAt: string,
+  ): void => {
+    const sourceKind = "history_conversation";
+    const sourceId = page.summary.conversationId;
+    const warnings = [...new Set([...page.detail?.warnings ?? [], ...page.warnings])];
+    ledger.resolveCoverageGaps(scope, sourceKind, sourceId, observedAt);
+    ledger.upsertConversation(scope, page.summary, runId);
+    if (!page.detail) {
+      ledger.recordCoverageGap(
+        scope,
+        {
           sourceKind,
           sourceId,
           reason: "detail_unavailable",
-          details: { warnings: conversation.warnings },
-        }, observedAt);
-        continue;
-      }
-      const ingested = ledger.ingestConversation(
-        scope,
-        {
-          ...conversation.detail,
-          messages: conversation.messages,
-          coverage: conversation.detail.coverage === "unrecognized"
-            ? "unrecognized"
-            : conversation.coverage === "complete" ? "validated_page" : "partial",
-          warnings: conversation.warnings,
-        },
-        mapping,
-        {
-          runId,
-          observedAt,
-          sourceKind,
-          sourceId,
-          schemaVersion: ADAPTER_VERSION,
-          provenance: {
-            adapter_version: ADAPTER_VERSION,
-            detail_route: conversation.detail.detailRoute,
-            pagination_state: conversation.detail.paginationState,
-            scopes: conversation.scopes,
-            coverage: conversation.coverage,
+          details: {
+            warnings,
+            revisit_reason: page.revisit?.reason ?? null,
+            continuation: page.revisit?.continuation ?? null,
           },
         },
-        conversation.summary,
+        observedAt,
       );
-      summary.observationsInserted += Number(ingested.observationInserted);
-      summary.messagesInserted += ingested.messageInserted;
-      summary.messagesDeduplicated += ingested.messageDeduplicated;
-      summary.attemptsInserted += ingested.attemptInserted;
-      summary.attemptsUpdated += ingested.attemptUpdated;
-      summary.attemptsDeduplicated += ingested.attemptDeduplicated;
-      summary.aliasConflicts += ingested.aliasConflicts;
+      return;
     }
-    ledger.recordCoverageGap(scope, {
-      sourceKind: "history_collection",
-      sourceId: account.id,
-      reason: "incomplete_history_coverage",
-      state: result.status === "complete" ? "resolved" : "open",
-      details: { coverage: result.coverage, pending_revisits: result.revisits.length },
-    }, observedAt);
+
+    const ingested = ledger.ingestConversation(
+      scope,
+      {
+        ...page.detail,
+        messages: page.messages,
+        coverage:
+          page.detail.coverage === "unrecognized"
+            ? "unrecognized"
+            : page.detail.coverage === "partial"
+              ? "partial"
+            : page.coverage === "complete"
+              ? "validated_page"
+              : "partial",
+        warnings,
+      },
+      mapping,
+      {
+        runId,
+        observedAt,
+        sourceKind,
+        sourceId,
+        schemaVersion: ADAPTER_VERSION,
+        provenance: {
+          adapter_version: ADAPTER_VERSION,
+          detail_route: page.detail.detailRoute,
+          pagination_state: page.detail.paginationState,
+          scopes: page.scopes,
+          coverage: page.coverage,
+          page_kind: page.pageKind,
+          page_number: page.pageNumber,
+          next_continuation: page.nextContinuation,
+          revisit_reason: page.revisit?.reason ?? null,
+        },
+      },
+      page.summary,
+    );
+    summary.observationsInserted += Number(ingested.observationInserted);
+    summary.messagesInserted += ingested.messageInserted;
+    summary.messagesDeduplicated += ingested.messageDeduplicated;
+    summary.attemptsInserted += ingested.attemptInserted;
+    summary.attemptsUpdated += ingested.attemptUpdated;
+    summary.attemptsDeduplicated += ingested.attemptDeduplicated;
+    summary.aliasConflicts += ingested.aliasConflicts;
+
+    if (page.revisit) {
+      ledger.recordCoverageGap(
+        scope,
+        {
+          sourceKind: "history_revisit",
+          sourceId,
+          reason: page.revisit.reason,
+          details: {
+            continuation: page.revisit.continuation,
+            detail_pages_fetched: page.revisit.detailPagesFetched,
+            attempts: page.revisit.attempts,
+          },
+        },
+        observedAt,
+      );
+    } else {
+      ledger.resolveCoverageGaps(
+        scope,
+        "history_revisit",
+        sourceId,
+        observedAt,
+      );
+    }
+  };
+
+  const onPageCommit = (page: HistoryPageCommit): void => {
+    assertCollectedIdentity(page.identity, scope);
+    ledger.transaction(() => {
+      ensureRunStarted(page.identity, page.mode, page.scanStartedAt);
+      persistConversation(page, new Date().toISOString());
+      store.persist();
+    });
+    persistedConversations.add(page.summary.conversationId);
+  };
+
+  let result: HistoryCollectionResult;
+  try {
+    result = await new HistoryCollector(reader, {
+      accountId: account.id,
+      store,
+      onPageCommit,
+    }).collect(request);
+  } catch (error) {
+    if (runStarted) {
+      ledger.transaction(() => {
+        ledger.finishRun(runId, "failed", new Date().toISOString(), {
+          error: error instanceof Error ? error.name : "collection_error",
+          ...summary,
+        });
+      });
+    }
+    throw error;
+  }
+
+  if (result.status === "blocked") {
+    return { ...result, ledger: summary };
+  }
+  assertCollectedIdentity(result.identity, scope);
+
+  ledger.transaction(() => {
+    ensureRunStarted(result.identity, result.mode, result.scanStartedAt);
+    for (const conversation of result.conversations) {
+      if (persistedConversations.has(conversation.summary.conversationId)) {
+        continue;
+      }
+      persistConversation(
+        {
+          summary: conversation.summary,
+          scopes: conversation.scopes,
+          detail: conversation.detail,
+          messages: conversation.messages,
+          coverage: conversation.coverage,
+          warnings: conversation.warnings,
+          pageKind: "detail",
+          pageNumber: conversation.revisit?.detailPagesFetched ?? 0,
+          nextContinuation: conversation.revisit?.continuation ?? null,
+          revisit: conversation.revisit,
+        },
+        new Date().toISOString(),
+      );
+    }
+    const observedAt = new Date().toISOString();
+    ledger.recordCoverageGap(
+      scope,
+      {
+        sourceKind: "history_collection",
+        sourceId: account.id,
+        reason: "incomplete_history_coverage",
+        state: result.status === "complete" ? "resolved" : "open",
+        details: {
+          coverage: result.coverage,
+          pending_revisits: result.revisits.length,
+        },
+      },
+      observedAt,
+    );
     store.persist();
     summary.runId = runId;
     summary.committed = true;
@@ -190,4 +311,19 @@ export async function collectIntoLedger(
     });
   });
   return { ...result, ledger: summary };
+}
+
+function assertCollectedIdentity(
+  identity: HistoryPageCommit["identity"],
+  scope: LedgerScope,
+): void {
+  if (
+    identity.providerUserId !== scope.providerUserId ||
+    identity.workspaceId !== scope.workspaceId ||
+    identity.quotaOwnerId !== scope.quotaOwnerId
+  ) {
+    throw new LedgerError(
+      "collected identity differs from the configured ledger binding",
+    );
+  }
 }

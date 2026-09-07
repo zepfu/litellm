@@ -58,6 +58,7 @@ class ScriptedReader implements HistoryReader {
     string,
     Map<string, AdaptedPage<MessageRecord>>
   >();
+  readonly messageErrors = new Map<string, Error>();
   identity: IdentityRecord = {
     providerUserId: "user-abc123",
     workspaceId: "ws-xyz",
@@ -112,6 +113,10 @@ class ScriptedReader implements HistoryReader {
       method: "GET",
       path: `/backend-api/conversations/${conversationId}/messages?before=${before}`,
     });
+    const error = this.messageErrors.get(`${conversationId}:${before}`);
+    if (error) {
+      throw error;
+    }
     return (
       this.messagePages.get(conversationId)?.get(before) ??
       completePage<MessageRecord>([])
@@ -177,6 +182,7 @@ function detail(
     surface: "chat",
     detailRoute,
     messages: [],
+    continuation: null,
     paginationState: "complete",
     coverage: "validated_page",
     warnings: [],
@@ -356,11 +362,23 @@ describe("Stage-2A history collection", () => {
     );
 
     const store = new MemoryCheckpointStore();
+    const commits: Array<{
+      pageKind: string;
+      warnings: string[];
+      nextContinuation: string | null;
+    }> = [];
     const result = await new HistoryCollector(reader, {
       accountId: "fixture-primary",
       store,
       clock: { now: () => NOW },
       maxMessagePagesPerConversation: 1,
+      onPageCommit: (page) => {
+        commits.push({
+          pageKind: page.pageKind,
+          warnings: page.warnings,
+          nextContinuation: page.nextContinuation,
+        });
+      },
     }).collect({
       mode: "backfill",
       range: EXPLICIT_RANGE,
@@ -374,6 +392,11 @@ describe("Stage-2A history collection", () => {
         request.path.includes("conv-message-budget/messages"),
       ),
     ).toHaveLength(1);
+    expect(commits).toContainEqual({
+      pageKind: "messages",
+      warnings: ["message_page_budget_exhausted"],
+      nextContinuation: "cursor-1",
+    });
   });
 
   it("records a repeated index offset as partial without looping", async () => {
@@ -467,7 +490,7 @@ describe("Stage-2A history collection", () => {
       "conv-incomplete",
       new Map([
         ["latest", continuationPage([message("conv-incomplete", "msg-1")], "cursor-1")],
-        ["cursor-1", continuationPage([message("conv-incomplete", "msg-2")], "cursor-1")],
+        ["cursor-1", completePage([message("conv-incomplete", "msg-2")])],
       ]),
     );
 
@@ -476,25 +499,246 @@ describe("Stage-2A history collection", () => {
       accountId: "fixture-primary",
       store,
       clock: { now: () => NOW },
+      maxMessagePagesPerConversation: 1,
     });
     const first = await collector.collect({
       mode: "backfill",
       range: EXPLICIT_RANGE,
     });
     expect(first.revisits).toHaveLength(1);
-    expect(first.revisits[0]?.reason).toBe("repeated_cursor");
+    expect(first.revisits[0]?.reason).toBe("page_budget");
     expect(first.conversations[0]?.coverage).toBe("partial");
 
     reader.messagePages.set(
       "conv-incomplete",
-      new Map([["latest", completePage([message("conv-incomplete", "msg-3")])]]),
+      new Map([["cursor-1", completePage([message("conv-incomplete", "msg-3")])]]),
     );
+    const requestsBeforeSecondPass = reader.requests.length;
     const second = await collector.collect({
       mode: "incremental",
       now: new Date("2026-09-07T13:00:00.000Z"),
     });
     expect(second.revisits).toHaveLength(0);
     expect(second.conversations[0]?.coverage).toBe("complete");
+    expect(
+      reader.requests
+        .slice(requestsBeforeSecondPass)
+        .filter((request) => request.path.includes("conv-incomplete/messages")),
+    ).toEqual([
+      {
+        method: "GET",
+        path: "/backend-api/conversations/conv-incomplete/messages?before=cursor-1",
+      },
+    ]);
+  });
+
+  it("retains a revisit when detail is partial or unrecognized even if messages finish", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-unrecognized-detail");
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set("conv-unrecognized-detail", {
+      ...detail("conv-unrecognized-detail"),
+      coverage: "unrecognized",
+      paginationState: "unknown",
+      warnings: ["unrecognized_detail_shape"],
+    });
+    reader.messagePages.set(
+      "conv-unrecognized-detail",
+      new Map([["latest", completePage([])]]),
+    );
+
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store: new MemoryCheckpointStore(),
+      clock: { now: () => NOW },
+    }).collect({ mode: "backfill", range: EXPLICIT_RANGE });
+
+    expect(result.conversations[0]?.coverage).toBe("partial");
+    expect(result.revisits).toHaveLength(1);
+    expect(result.revisits[0]).toMatchObject({
+      conversationId: "conv-unrecognized-detail",
+      reason: "unrecognized_detail",
+      continuation: null,
+    });
+  });
+
+  it("retains a revisit when any message page is only partially recognized", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-partial-message-page");
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set("conv-partial-message-page", detail("conv-partial-message-page"));
+    reader.messagePages.set(
+      "conv-partial-message-page",
+      new Map([
+        [
+          "latest",
+          {
+            ...continuationPage([], "cursor-1"),
+            warnings: ["message_shape_warning"],
+          },
+        ],
+        ["cursor-1", completePage([])],
+      ]),
+    );
+
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store: new MemoryCheckpointStore(),
+      clock: { now: () => NOW },
+    }).collect({ mode: "backfill", range: EXPLICIT_RANGE });
+
+    expect(result.revisits).toHaveLength(1);
+    expect(result.revisits[0]).toMatchObject({
+      conversationId: "conv-partial-message-page",
+      reason: "partial_detail",
+      continuation: null,
+    });
+    expect(result.conversations[0]?.coverage).toBe("partial");
+  });
+
+  it("retains a revisit for an outstanding nonterminal generation after pagination completes", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-outstanding-generation");
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set("conv-outstanding-generation", detail("conv-outstanding-generation"));
+    reader.messagePages.set(
+      "conv-outstanding-generation",
+      new Map([
+        [
+          "latest",
+          completePage([
+            {
+              ...message("conv-outstanding-generation", "msg-pending"),
+              status: "in_progress",
+              endTurn: false,
+            },
+          ]),
+        ],
+      ]),
+    );
+
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store: new MemoryCheckpointStore(),
+      clock: { now: () => NOW },
+    }).collect({ mode: "backfill", range: EXPLICIT_RANGE });
+
+    expect(result.revisits).toHaveLength(1);
+    expect(result.revisits[0]?.reason).toBe("nonterminal_generation");
+    expect(result.conversations[0]?.coverage).toBe("partial");
+  });
+
+  it("invalidates one bad saved continuation and performs only one bounded restart", async () => {
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-bad-continuation");
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set("conv-bad-continuation", detail("conv-bad-continuation"));
+    reader.messagePages.set(
+      "conv-bad-continuation",
+      new Map([
+        [
+          "stale-cursor",
+          continuationPage(
+            [message("conv-bad-continuation", "msg-stale")],
+            "stale-cursor",
+          ),
+        ],
+        ["latest", completePage([message("conv-bad-continuation", "msg-fresh")])],
+      ]),
+    );
+    const store = new MemoryCheckpointStore();
+    store.upsertRevisit({
+      stateVersion: 1,
+      accountId: "fixture-primary",
+      conversationId: "conv-bad-continuation",
+      scopes: ["active"],
+      status: "pending",
+      reason: "page_budget",
+      firstSeenAt: NOW.toISOString(),
+      lastSeenAt: NOW.toISOString(),
+      attempts: 1,
+      nextEligibleAt: NOW.toISOString(),
+      lastError: null,
+      detailPagesFetched: 1,
+      continuation: "stale-cursor",
+    });
+
+    const result = await new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+    }).collect({ mode: "incremental" });
+
+    expect(
+      reader.requests
+        .filter((request) => request.path.includes("conv-bad-continuation/messages"))
+        .map((request) => request.path),
+    ).toEqual([
+      "/backend-api/conversations/conv-bad-continuation/messages?before=stale-cursor",
+      "/backend-api/conversations/conv-bad-continuation/messages?before=latest",
+    ]);
+    expect(result.revisits).toHaveLength(0);
+    expect(result.conversations[0]?.warnings).toContain(
+      "messages_bad_continuation_restarting",
+    );
+  });
+
+  it("rotates opt-in older-history audit progress and reports its coverage", async () => {
+    const reader = new ScriptedReader();
+    const recent = summary("conv-recent-audit", {
+      updatedAt: "2026-09-05T12:00:00.000Z",
+    });
+    const older = summary("conv-older-audit", {
+      updatedAt: "2026-08-01T12:00:00.000Z",
+    });
+    reader.indexPages.set(
+      "active",
+      new Map([
+        [0, indexPage([recent], 1, false, "continuation")],
+        [1, indexPage([older])],
+      ]),
+    );
+    reader.indexPages.set("archived", new Map([[0, indexPage([])]]));
+    for (const conversation of [recent, older]) {
+      reader.details.set(
+        conversation.conversationId,
+        detail(conversation.conversationId),
+      );
+      reader.messagePages.set(
+        conversation.conversationId,
+        new Map([["latest", completePage([])]]),
+      );
+    }
+    const store = new MemoryCheckpointStore();
+    const collector = new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+      maxIndexPagesPerScope: 1,
+    });
+
+    const first = await collector.collect({
+      mode: "incremental",
+      olderHistoryAudit: { enabled: true, maxPages: 1 },
+    });
+    expect(first.coverage.active.olderHistoryAudit).toMatchObject({
+      enabled: true,
+      status: "partial",
+      continuation: 1,
+    });
+
+    const second = await collector.collect({
+      mode: "incremental",
+      now: new Date("2026-09-07T13:00:00.000Z"),
+      olderHistoryAudit: { enabled: true, maxPages: 1 },
+    });
+    expect(second.coverage.olderHistoryAudit.active.status).toBe("complete");
+    expect(second.conversations.map((item) => item.summary.conversationId)).toContain(
+      "conv-older-audit",
+    );
+    expect(store.loadDiscovery("active")?.olderHistoryAudit?.lastCompletedAt).toBe(
+      "2026-09-07T13:00:00.000Z",
+    );
   });
 
   it("uses the 48-hour overlap for incremental discovery but honors explicit ranges over newer watermarks", async () => {
@@ -604,6 +848,7 @@ describe("Stage-2A history collection", () => {
       nextEligibleAt: NOW.toISOString(),
       lastError: "adapter_error",
       detailPagesFetched: 1,
+      continuation: "cursor-1",
     };
     first.saveDiscovery(checkpoint);
     first.upsertRevisit(revisit);
@@ -656,7 +901,7 @@ describe("Stage-2A history collection", () => {
       .toBe("node-002");
   });
 
-  it("rolls back evidence and discovery together when integrated ingestion fails", async () => {
+  it("commits each successful page with its checkpoint when a later page fails", async () => {
     const directory = mkdtempSync(join(tmpdir(), "usage-capture-rollback-"));
     temporaryDirectories.push(directory);
     const ledger = new Ledger(join(directory, "usage.sqlite"));
@@ -684,19 +929,96 @@ describe("Stage-2A history collection", () => {
       await expect(collectIntoLedger(adapter, ledger, account, {
         mode: "backfill", range: EXPLICIT_RANGE, now: NOW,
       })).rejects.toThrow("injected ingestion failure");
-      for (const table of ["accounts", "observations", "message_records", "attempts", "history_state", "collector_runs"]) {
-        expect(ledger.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()).toEqual({ n: 0 });
-      }
+      expect(ledger.db.prepare("SELECT COUNT(*) AS n FROM accounts").get()).toEqual({ n: 1 });
+      expect(ledger.db.prepare("SELECT COUNT(*) AS n FROM observations").get()).toEqual({ n: 1 });
+      expect(ledger.db.prepare("SELECT COUNT(*) AS n FROM message_records").get()).toEqual({ n: 3 });
+      expect(ledger.db.prepare("SELECT COUNT(*) AS n FROM attempts").get()).toEqual({ n: 2 });
+      expect(ledger.db.prepare("SELECT COUNT(*) AS n FROM history_state").get()).toEqual({ n: 1 });
+      expect(ledger.db.prepare("SELECT COUNT(*) AS n FROM collector_runs").get()).toEqual({ n: 1 });
+      expect(
+        (ledger.db.prepare("SELECT result FROM collector_runs").get() as { result: string }).result,
+      ).toBe("failed");
       ledger.db.exec("DROP TRIGGER fail_second_conversation");
       const replay = await collectIntoLedger(adapter, ledger, account, {
         mode: "backfill", range: EXPLICIT_RANGE, now: NOW,
       });
-      expect(replay.ledger).toMatchObject({ attemptsInserted: 3, committed: true });
+      expect(replay.ledger).toMatchObject({ attemptsInserted: 1, committed: true });
       expect(new SqliteCheckpointStore(ledger, LEDGER_SCOPE).loadDiscovery("active")?.status)
         .toBe("complete");
     } finally {
       ledger.close();
       await adapter.close();
+    }
+  });
+
+  it("does not persist a failed page's mutated continuation", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "usage-capture-page-atomicity-"));
+    temporaryDirectories.push(directory);
+    const ledger = new Ledger(join(directory, "usage.sqlite"));
+    const account = defaultConfig().accounts[0]!;
+    Object.assign(account, {
+      id: LEDGER_SCOPE.collectorAccountId,
+      expectedProviderUserId: LEDGER_SCOPE.providerUserId,
+      expectedWorkspaceId: LEDGER_SCOPE.workspaceId,
+      quotaOwnerId: LEDGER_SCOPE.quotaOwnerId,
+    });
+    const reader = new ScriptedReader();
+    const candidate = summary("conv-page-atomicity");
+    addCompleteIndex(reader, [candidate], []);
+    reader.details.set(candidate.conversationId, detail(candidate.conversationId));
+    reader.messagePages.set(
+      candidate.conversationId,
+      new Map([
+        [
+          "latest",
+          continuationPage([message(candidate.conversationId, "msg-page-1")], "cursor-1"),
+        ],
+        [
+          "cursor-1",
+          completePage([message(candidate.conversationId, "msg-page-2")]),
+        ],
+      ]),
+    );
+
+    try {
+      const first = await collectIntoLedger(reader, ledger, account, {
+        mode: "backfill",
+        range: EXPLICIT_RANGE,
+        now: NOW,
+        maxMessagePagesPerConversation: 1,
+      });
+      expect(first.revisits[0]?.continuation).toBe("cursor-1");
+      const persistedBeforeFailure = (
+        ledger.db
+          .prepare("SELECT state_json FROM history_state")
+          .get() as { state_json: string }
+      ).state_json;
+
+      reader.messageErrors.set(
+        `${candidate.conversationId}:cursor-1`,
+        new Error("late_page_error"),
+      );
+      ledger.db.exec(`
+        CREATE TRIGGER fail_history_page BEFORE INSERT ON observations
+        WHEN NEW.source_kind='history_conversation'
+        BEGIN SELECT RAISE(ABORT, 'injected failed page'); END
+      `);
+
+      await expect(
+        collectIntoLedger(reader, ledger, account, {
+          mode: "incremental",
+          now: new Date("2026-09-07T13:00:00.000Z"),
+        }),
+      ).rejects.toThrow("injected failed page");
+      expect(
+        (
+          ledger.db
+            .prepare("SELECT state_json FROM history_state")
+            .get() as { state_json: string }
+        ).state_json,
+      ).toBe(persistedBeforeFailure);
+    } finally {
+      ledger.close();
     }
   });
 });
