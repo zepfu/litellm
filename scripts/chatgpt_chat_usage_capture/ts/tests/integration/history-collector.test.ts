@@ -1524,6 +1524,142 @@ describe("Stage-2A history collection", () => {
     });
   });
 
+  it("retains failed older-history audit candidate coverage across continuation runs", async () => {
+    const reader = new ScriptedReader();
+    const failed = summary("conv-older-audit-still-fails", {
+      updatedAt: "2026-08-01T12:00:00.000Z",
+    });
+    const succeeding = summary("conv-older-audit-succeeds", {
+      updatedAt: "2026-07-01T12:00:00.000Z",
+    });
+    reader.indexPages.set(
+      "active",
+      new Map([
+        [0, indexPage([failed], 1, false, "continuation")],
+        [1, indexPage([succeeding])],
+      ]),
+    );
+    reader.indexPages.set("archived", new Map([[0, indexPage([])]]));
+    reader.detailErrors.set(
+      failed.conversationId,
+      new Error("audit_candidate_still_fails"),
+    );
+    reader.details.set(
+      succeeding.conversationId,
+      detail(succeeding.conversationId),
+    );
+    reader.messagePages.set(
+      succeeding.conversationId,
+      new Map([["latest", completePage([])]]),
+    );
+
+    const store = new MemoryCheckpointStore();
+    const collector = new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+      maxIndexPagesPerScope: 1,
+    });
+
+    const first = await collector.collect({
+      mode: "incremental",
+      olderHistoryAudit: { enabled: true, maxPages: 1 },
+    });
+    expect(first.coverage.active.olderHistoryAudit.status).toBe("partial");
+    expect(
+      store
+        .loadDiscovery("active")
+        ?.olderHistoryAudit?.candidateOutcomes,
+    ).toEqual([
+      expect.objectContaining({
+        conversationId: failed.conversationId,
+        coverage: "partial",
+      }),
+    ]);
+
+    const second = await collector.collect({
+      mode: "incremental",
+      now: new Date("2026-09-07T13:00:00.000Z"),
+      olderHistoryAudit: { enabled: true, maxPages: 1 },
+    });
+    const audit = second.coverage.active.olderHistoryAudit;
+    expect(audit.status).toBe("partial");
+    expect(audit.conversationsAudited).toBe(1);
+    expect(audit.lastCompletedAt).toBeNull();
+    expect(audit.candidateOutcomes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          conversationId: failed.conversationId,
+          coverage: "partial",
+        }),
+        expect.objectContaining({
+          conversationId: succeeding.conversationId,
+          coverage: "complete",
+        }),
+      ]),
+    );
+  });
+
+  it("retains prior older-history audit page warnings after a clean terminal page", async () => {
+    const reader = new ScriptedReader();
+    const warned = summary("conv-older-audit-warned", {
+      updatedAt: "2026-08-01T12:00:00.000Z",
+    });
+    const terminal = summary("conv-older-audit-terminal", {
+      updatedAt: "2026-07-01T12:00:00.000Z",
+    });
+    const warnedPage: AdaptedPage<ConversationSummary> = {
+      ...indexPage([warned], 1, false, "continuation"),
+      coverage: "partial",
+      warnings: ["pagination_signal_warning"],
+    };
+    reader.indexPages.set(
+      "active",
+      new Map([
+        [0, warnedPage],
+        [1, indexPage([terminal])],
+      ]),
+    );
+    reader.indexPages.set("archived", new Map([[0, indexPage([])]]));
+    for (const conversation of [warned, terminal]) {
+      reader.details.set(
+        conversation.conversationId,
+        detail(conversation.conversationId),
+      );
+      reader.messagePages.set(
+        conversation.conversationId,
+        new Map([["latest", completePage([])]]),
+      );
+    }
+
+    const store = new MemoryCheckpointStore();
+    const collector = new HistoryCollector(reader, {
+      accountId: "fixture-primary",
+      store,
+      clock: { now: () => NOW },
+      maxIndexPagesPerScope: 1,
+    });
+
+    await collector.collect({
+      mode: "incremental",
+      olderHistoryAudit: { enabled: true, maxPages: 1 },
+    });
+    expect(
+      store.loadDiscovery("active")?.olderHistoryAudit?.warnings,
+    ).toContain("older_audit_pagination_signal_warning");
+
+    const second = await collector.collect({
+      mode: "incremental",
+      now: new Date("2026-09-07T13:00:00.000Z"),
+      olderHistoryAudit: { enabled: true, maxPages: 1 },
+    });
+    expect(second.coverage.active.olderHistoryAudit.status).toBe("partial");
+    expect(second.coverage.active.olderHistoryAudit.lastCompletedAt).toBeNull();
+    expect(second.coverage.active.olderHistoryAudit.warnings).toContain(
+      "older_audit_pagination_signal_warning",
+    );
+  });
+
   it("uses the 48-hour overlap for incremental discovery but honors explicit ranges over newer watermarks", async () => {
     const reader = new ScriptedReader();
     const inOverlap = summary("conv-in-overlap", {

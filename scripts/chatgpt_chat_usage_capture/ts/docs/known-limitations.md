@@ -13,12 +13,17 @@
   timestamps, and provider failures retain explicit partial/unknown coverage.
   Capabilities are adapter declarations plus observations, not provider
   guarantees.
+- An exact-limit index page without `total`, `has_more`, or `next_offset` is
+  not evidence of either exhaustion or a validated continuation. Conflicting
+  control values remain partial.
 - Checkpoint/evidence commits are per acquired page. A failed page replays from
   the last durable continuation. Stage-2A JSON history checkpoints are not
   automatically imported; rerun backfill into SQLite.
 - Incomplete details and nonterminal generations retain revisits independently
-  of the durable discovery watermark. These revisits and opt-in
-  older-history audits still require manual collection; there is no scheduler.
+  of the durable discovery watermark. Opt-in older-history audit checkpoints
+  retain page warnings and candidate acquisition coverage across continuation
+  runs; a clean terminal page does not erase earlier partial evidence. These
+  revisits and audits still require manual collection; there is no scheduler.
 - Changing indexes can skip records despite deduplication. Explicit
   reconciliation and overlapping manual refresh reduce this risk but do not
   provide a snapshot guarantee. Run collectors sequentially until Stage-3

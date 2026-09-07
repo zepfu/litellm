@@ -58,7 +58,9 @@ The shared `AdaptedPage.paginationState` and detail `detailRoute` /
 `paginationState` contracts retain the Stage-2A route and pagination evidence:
 complete, continuation, contradictory, unknown, repeated cursor, and exhausted
 budget. Project IDs and version metadata qualify coverage, not completeness of
-all Projects or branches.
+all Projects or branches. An exact-limit index page without an explicit
+pagination signal remains unknown/partial; conflicting control values remain
+contradictory/partial and never become validated exhaustion.
 
 ## Acquisition and durability
 
@@ -93,7 +95,11 @@ discovery advances its watermark once candidates are durably queued, even when
 detail work remains. Failed evidence commits retain candidates for restart.
 Observed Project and branch metadata still leave
 global visibility unproven. Older-history audit rotation is opt-in through the
-collector request API; audit completion requires successful candidate acquisition.
+collector request API. Its checkpoint retains page warnings and the latest
+acquisition coverage for every candidate in the current audit cycle, so a later
+clean terminal page cannot erase an earlier gap. Audit completion requires a
+validated terminal page, no retained page warnings, and complete acquisition
+coverage for every retained candidate.
 
 ## Ledger, reconstruction, and reports
 

@@ -49,8 +49,10 @@ and `revisits`. A blocked identity returns exit `1` without ingesting evidence.
 
 SQLite `history_state` retains independent active/archived continuations,
 budgets, pagination states, ranges, warnings, completed discovery starts, and
-incomplete-detail revisits. It commits with the corresponding evidence and
-attempts. No separate JSON history checkpoint needs copying.
+incomplete-detail revisits. Older-history audit state additionally retains
+page-level warnings and per-conversation acquisition coverage across
+continuation runs. It commits with the corresponding evidence and attempts. No
+separate JSON history checkpoint needs copying.
 Each acquired page commits with its corresponding continuation. Checkpoints
 remain local to the collector account even when activity is shared by owner.
 
@@ -65,6 +67,9 @@ remain local to the collector account even when activity is shared by owner.
   Retry-After cooldown blocks subsequent manual collection until eligible.
 - Schema drift, repeated cursors, or exhausted budgets: retain the database
   and review explicit pagination/coverage warnings.
+- A clean terminal older-history page does not clear an earlier audit warning
+  or failed candidate. Resolve the warning and reacquire the incomplete
+  candidate before treating the audit as complete.
 
 Historical backfill/reconciliation does not advance refresh watermarks.
 Refresh advances a scope after clean discovery durably queues its candidates;

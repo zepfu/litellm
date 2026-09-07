@@ -57,6 +57,15 @@ export type OlderHistoryAuditStatus =
   | "partial"
   | "complete";
 
+export type OlderHistoryAuditCandidateCoverage = "complete" | "partial" | "unknown";
+
+export interface OlderHistoryAuditCandidateOutcome {
+  conversationId: string;
+  coverage: OlderHistoryAuditCandidateCoverage;
+  lastSeenAt: string | null;
+  warnings: string[];
+}
+
 export type GenerationCompletionState = "nonterminal" | "unknown";
 
 export interface RevisitPageIssue {
@@ -84,6 +93,10 @@ export interface OlderHistoryAuditState {
   lastStartedAt: string | null;
   lastPageAt: string | null;
   lastCompletedAt: string | null;
+  /** Page-level warnings that remain valid across an audit continuation. */
+  warnings: string[];
+  /** Latest acquisition result for each candidate in the current audit cycle. */
+  candidateOutcomes: OlderHistoryAuditCandidateOutcome[];
 }
 
 export interface OlderHistoryAuditCoverage extends OlderHistoryAuditState {}

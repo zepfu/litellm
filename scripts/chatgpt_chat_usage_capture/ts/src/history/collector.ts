@@ -23,6 +23,7 @@ import type {
   HistoryPageCommit,
   HistoryReader,
   HistoryScope,
+  OlderHistoryAuditCandidateOutcome,
   OlderHistoryAuditCoverage,
   OlderHistoryAuditState,
   OutstandingGenerationState,
@@ -89,7 +90,7 @@ interface RevisitOptions {
 }
 
 interface AuditEvidence {
-  committedCandidateIds: Set<string>;
+  outcomes: Map<string, OlderHistoryAuditCandidateOutcome>;
 }
 
 const TERMINAL_GENERATION_STATUSES = new Set([
@@ -329,7 +330,7 @@ export class HistoryCollector {
     const auditEvidence = new Map<HistoryScope, AuditEvidence>(
       discoveries.map((discovery) => [
         discovery.scope,
-        { committedCandidateIds: new Set<string>() },
+        { outcomes: new Map<string, OlderHistoryAuditCandidateOutcome>() },
       ]),
     );
     const conversations: AcquiredConversation[] = [];
@@ -359,17 +360,11 @@ export class HistoryCollector {
       );
       detailPagesFetched += acquisition.detailPagesFetched;
       for (const discovery of discoveries) {
-        if (
-          discovery.auditCandidateIds.includes(
+        if (discovery.auditCandidateIds.includes(candidate.summary.conversationId)) {
+          auditEvidence.get(discovery.scope)?.outcomes.set(
             candidate.summary.conversationId,
-          ) &&
-          acquisition.detail !== null &&
-          acquisition.coverage === "complete" &&
-          acquisition.revisit === null
-        ) {
-          auditEvidence
-            .get(discovery.scope)
-            ?.committedCandidateIds.add(candidate.summary.conversationId);
+            auditCandidateOutcome(candidate.summary.conversationId, acquisition, now),
+          );
         }
       }
       conversations.push({
@@ -943,7 +938,8 @@ export class HistoryCollector {
     let pagesFetched = 0;
     const summaries: ConversationSummary[] = [];
     const selectedConversationIds = new Set<string>();
-    const warnings: string[] = [];
+    const persistedWarnings = rotate ? [] : [...previous.warnings];
+    const warnings: string[] = [...persistedWarnings];
     const seenOffsets = new Set<number>();
     let scanComplete = false;
     let state: OlderHistoryAuditState = {
@@ -953,6 +949,8 @@ export class HistoryCollector {
       continuation: offset,
       lastStartedAt: scanStartedAt,
       lastPageAt: previous.lastPageAt,
+      warnings: persistedWarnings,
+      candidateOutcomes: rotate ? [] : previous.candidateOutcomes,
     };
 
     while (pagesFetched < pageBudget) {
@@ -961,11 +959,13 @@ export class HistoryCollector {
         break;
       }
       if (seenOffsets.has(offset)) {
-        warnings.push("older_history_audit_repeated_offset");
+        const repeatedWarning = "older_history_audit_repeated_offset";
+        warnings.push(repeatedWarning);
         state = {
           ...state,
           status: "partial",
           continuation: offset,
+          warnings: uniqueWarnings([...state.warnings, repeatedWarning]),
         };
         break;
       }
@@ -980,15 +980,18 @@ export class HistoryCollector {
           order: "updated",
         });
       } catch (error) {
-        warnings.push(`older_history_audit_${errorCode(error)}`);
+        const errorWarnings = [`older_history_audit_${errorCode(error)}`];
+        warnings.push(...errorWarnings);
         if (isAccountStopError(error)) {
           const accountState = this.pauseForError(error, now);
+          errorWarnings.push(accountPauseWarning(accountState));
           warnings.push(accountPauseWarning(accountState));
         }
         state = {
           ...state,
           status: "partial",
           continuation: offset,
+          warnings: uniqueWarnings([...state.warnings, ...errorWarnings]),
         };
         break;
       }
@@ -999,7 +1002,14 @@ export class HistoryCollector {
         pagesFetched: state.pagesFetched + 1,
         lastPageAt: now.toISOString(),
       };
-      warnings.push(...page.warnings.map((warning) => `older_audit_${warning}`));
+      const pageWarnings = page.warnings.map(
+        (warning) => `older_audit_${warning}`,
+      );
+      warnings.push(...pageWarnings);
+      state = {
+        ...state,
+        warnings: uniqueWarnings([...state.warnings, ...pageWarnings]),
+      };
       for (const summary of page.items) {
         if (isOlderHistoryAuditCandidate(summary, requestedRange.start)) {
           summaries.push(summary);
@@ -1012,18 +1022,29 @@ export class HistoryCollector {
         page.paginationState === "contradictory" ||
         page.paginationState === "repeated_cursor"
       ) {
-        warnings.push(`older_history_audit_${page.paginationState}`);
+        const paginationWarning = `older_history_audit_${page.paginationState}`;
+        warnings.push(paginationWarning);
         state = {
           ...state,
           status: "partial",
           continuation:
             typeof page.continuation === "number" ? page.continuation : offset,
+          warnings: uniqueWarnings([...state.warnings, paginationWarning]),
         };
         break;
       }
       if (page.exhausted && page.paginationState === "complete") {
+        const validatedTerminalPage = isValidatedPageExhaustion(page);
+        if (!validatedTerminalPage) {
+          const terminalWarning = "older_history_audit_unvalidated_terminal_page";
+          warnings.push(terminalWarning);
+          state = {
+            ...state,
+            warnings: uniqueWarnings([...state.warnings, terminalWarning]),
+          };
+        }
         scanComplete =
-          page.coverage === "validated_page" && page.warnings.length === 0;
+          validatedTerminalPage && state.warnings.length === 0;
         state = {
           ...state,
           status: "partial",
@@ -1037,12 +1058,15 @@ export class HistoryCollector {
         typeof page.continuation !== "number" ||
         page.continuation <= offset
       ) {
-        warnings.push("older_history_audit_nonadvancing_continuation");
+        const continuationWarning =
+          "older_history_audit_nonadvancing_continuation";
+        warnings.push(continuationWarning);
         state = {
           ...state,
           status: "partial",
           continuation:
             typeof page.continuation === "number" ? page.continuation : offset,
+          warnings: uniqueWarnings([...state.warnings, continuationWarning]),
         };
         break;
       }
@@ -1874,19 +1898,43 @@ export class HistoryCollector {
         continue;
       }
       const committedCandidateIds =
-        evidence.get(discovery.scope)?.committedCandidateIds ??
-        new Set<string>();
+        evidence.get(discovery.scope)?.outcomes ??
+        new Map<string, OlderHistoryAuditCandidateOutcome>();
+      const candidateOutcomes = new Map(
+        discovery.auditState.candidateOutcomes.map((outcome) => [
+          outcome.conversationId,
+          outcome,
+        ]),
+      );
+      for (const conversationId of discovery.auditCandidateIds) {
+        const currentOutcome = committedCandidateIds.get(conversationId);
+        if (currentOutcome) {
+          candidateOutcomes.set(conversationId, currentOutcome);
+        } else if (!candidateOutcomes.has(conversationId)) {
+          candidateOutcomes.set(conversationId, {
+            conversationId,
+            coverage: "unknown",
+            lastSeenAt: scanStartedAt,
+            warnings: ["older_history_audit_candidate_not_acquired"],
+          });
+        }
+      }
+      const normalizedCandidateOutcomes = [...candidateOutcomes.values()].sort(
+        (left, right) => left.conversationId.localeCompare(right.conversationId),
+      );
       const complete =
         discovery.auditScanComplete &&
-        discovery.auditCandidateIds.every((conversationId) =>
-          committedCandidateIds.has(conversationId),
+        discovery.auditState.warnings.length === 0 &&
+        normalizedCandidateOutcomes.every(
+          (outcome) => outcome.coverage === "complete",
         );
       const auditState: OlderHistoryAuditState = {
         ...discovery.auditState,
         status: complete ? "complete" : "partial",
-        conversationsAudited:
-          discovery.auditState.conversationsAudited +
-          committedCandidateIds.size,
+        conversationsAudited: normalizedCandidateOutcomes.filter(
+          (outcome) => outcome.coverage === "complete",
+        ).length,
+        candidateOutcomes: normalizedCandidateOutcomes,
         lastCompletedAt: complete
           ? scanStartedAt
           : discovery.auditState.lastCompletedAt,
@@ -2146,6 +2194,19 @@ export class HistoryCollector {
   }
 }
 
+function auditCandidateOutcome(
+  conversationId: string,
+  acquisition: DetailAcquisition,
+  now: Date,
+): OlderHistoryAuditCandidateOutcome {
+  return {
+    conversationId,
+    coverage: acquisition.coverage,
+    lastSeenAt: now.toISOString(),
+    warnings: uniqueWarnings(acquisition.warnings),
+  };
+}
+
 function checkpointFor(
   accountId: string,
   scope: HistoryScope,
@@ -2204,6 +2265,8 @@ function normalizeOlderHistoryAudit(
       lastStartedAt: null,
       lastPageAt: null,
       lastCompletedAt: null,
+      warnings: [],
+      candidateOutcomes: [],
     };
   }
   return {
@@ -2225,7 +2288,58 @@ function normalizeOlderHistoryAudit(
     lastStartedAt: state.lastStartedAt ?? null,
     lastPageAt: state.lastPageAt ?? null,
     lastCompletedAt: state.lastCompletedAt ?? null,
+    warnings: normalizeAuditWarnings(state.warnings),
+    candidateOutcomes: normalizeAuditCandidateOutcomes(state.candidateOutcomes),
   };
+}
+
+function normalizeAuditWarnings(value: unknown): string[] {
+  return Array.isArray(value)
+    ? uniqueWarnings(
+        value.filter(
+          (warning): warning is string =>
+            typeof warning === "string" && warning.trim() !== "",
+        ),
+      )
+    : [];
+}
+
+function normalizeAuditCandidateOutcomes(
+  value: unknown,
+): OlderHistoryAuditCandidateOutcome[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const outcomes = new Map<string, OlderHistoryAuditCandidateOutcome>();
+  for (const raw of value) {
+    if (!isRecord(raw)) {
+      continue;
+    }
+    const conversationId =
+      typeof raw.conversationId === "string" ? raw.conversationId.trim() : "";
+    if (!conversationId) {
+      continue;
+    }
+    const coverage =
+      raw.coverage === "complete" ||
+      raw.coverage === "partial" ||
+      raw.coverage === "unknown"
+        ? raw.coverage
+        : "unknown";
+    const lastSeenAt =
+      typeof raw.lastSeenAt === "string" && raw.lastSeenAt.trim() !== ""
+        ? raw.lastSeenAt
+        : null;
+    outcomes.set(conversationId, {
+      conversationId,
+      coverage,
+      lastSeenAt,
+      warnings: normalizeAuditWarnings(raw.warnings),
+    });
+  }
+  return [...outcomes.values()].sort((left, right) =>
+    left.conversationId.localeCompare(right.conversationId),
+  );
 }
 
 function auditCoverage(
@@ -2884,4 +2998,8 @@ function validatePositiveInteger(value: number, label: string): void {
 
 function uniqueWarnings(warnings: string[]): string[] {
   return [...new Set(warnings)];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

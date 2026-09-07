@@ -152,6 +152,40 @@ describe("route allowlist", () => {
     expect(page.warnings).toContain("missing_pagination_controls");
   });
 
+  it("does not validate an exact-limit page without pagination controls", () => {
+    const page = adaptConversationIndex(
+      {
+        items: [
+          { id: "conv-001", update_time: "2026-09-07T00:00:00Z" },
+          { id: "conv-002", update_time: "2026-09-07T00:01:00Z" },
+        ],
+      },
+      { archived: false, offset: 0, limit: 2 },
+    );
+
+    expect(page.exhausted).toBe(false);
+    expect(page.paginationState).toBe("unknown");
+    expect(page.coverage).toBe("partial");
+    expect(page.warnings).toContain("missing_pagination_controls");
+  });
+
+  it("rejects conflicting top-level and nested has-more controls", () => {
+    const page = adaptConversationIndex(
+      {
+        items: [{ id: "conv-001", update_time: "2026-09-07T00:00:00Z" }],
+        has_more: false,
+        pagination: { has_more: true },
+      },
+      { archived: false, offset: 0, limit: 100 },
+    );
+
+    expect(page.exhausted).toBe(false);
+    expect(page.continuation).toBeNull();
+    expect(page.paginationState).toBe("contradictory");
+    expect(page.coverage).toBe("partial");
+    expect(page.warnings).toContain("conflicting_has_more");
+  });
+
   it("keeps missing and invalid update timestamps unresolved", () => {
     const page = adaptConversationIndex(
       {

@@ -136,6 +136,7 @@ interface IndexPaginationControls {
   returnedOffset: number | null;
   returnedOffsetPresent: boolean;
   invalid: boolean;
+  contradictory: boolean;
   warnings: string[];
 }
 
@@ -395,11 +396,7 @@ export function adaptConversationIndex(
   if (hasMissingConversations) {
     warnings.push("index reported missing conversations");
   }
-  if (controls.returnedOffsetPresent && controls.returnedOffset !== offset) {
-    warnings.push("returned_index_offset_mismatch");
-    paginationState = "contradictory";
-    continuation = controls.returnedOffset ?? offset;
-  } else if (controls.invalid) {
+  if (controls.invalid) {
     paginationState = "unknown";
     continuation =
       controls.nextOffsetPresent && controls.nextOffset !== null
@@ -407,6 +404,19 @@ export function adaptConversationIndex(
         : pageEnd > offset
           ? pageEnd
           : offset;
+  } else if (controls.contradictory) {
+    paginationState = "contradictory";
+    continuation =
+      controls.nextOffsetPresent && controls.nextOffset !== null
+        ? controls.nextOffset
+        : null;
+  } else if (
+    controls.returnedOffsetPresent &&
+    controls.returnedOffset !== offset
+  ) {
+    warnings.push("returned_index_offset_mismatch");
+    paginationState = "contradictory";
+    continuation = controls.returnedOffset ?? offset;
   } else if (total !== null && total < offset) {
     warnings.push("total_before_offset");
     paginationState = "contradictory";
@@ -481,8 +491,9 @@ export function adaptConversationIndex(
     continuation = pageEnd > offset ? pageEnd : offset;
     paginationState = "unknown";
   } else {
+    warnings.push("missing_pagination_controls");
     continuation = pageEnd;
-    paginationState = "continuation";
+    paginationState = "unknown";
   }
 
   let coverage: AdaptedPage<ConversationSummary>["coverage"] = "validated_page";
@@ -912,48 +923,83 @@ function readIndexPaginationControls(
     }
   }
 
-  const nextOffsetRaw = firstControlValue(sources, [
+  const nextOffsetRaw = readControlValues(sources, [
     "next_offset",
     "nextOffset",
     "next",
   ]);
-  const hasMoreRaw = firstControlValue(sources, [
+  const hasMoreRaw = readControlValues(sources, [
     "has_more",
     "hasMore",
     "has_next_page",
     "hasNextPage",
   ]);
-  const returnedOffsetRaw = firstControlValue(sources, [
+  const returnedOffsetRaw = readControlValues(sources, [
     "offset",
     "current_offset",
     "currentOffset",
   ]);
   const warnings: string[] = [];
   let invalid = false;
+  let contradictory = false;
 
   let nextOffset: number | null = null;
-  if (nextOffsetRaw.present && nextOffsetRaw.value !== null) {
-    nextOffset = nonNegativeInteger(nextOffsetRaw.value);
-    if (nextOffset === null) {
+  if (nextOffsetRaw.present) {
+    const parsedValues = nextOffsetRaw.values.map((value) =>
+      value === null || value === undefined ? null : nonNegativeInteger(value),
+    );
+    if (
+      nextOffsetRaw.values.some(
+        (value, index) =>
+          value !== null &&
+          value !== undefined &&
+          parsedValues[index] === null,
+      )
+    ) {
       warnings.push("invalid_next_offset");
       invalid = true;
+    } else if (hasConflictingControlValues(parsedValues)) {
+      warnings.push("conflicting_next_offset");
+      contradictory = true;
+    } else {
+      nextOffset = parsedValues[0] ?? null;
     }
   }
 
   let hasMore: boolean | null = null;
-  if (hasMoreRaw.present && typeof hasMoreRaw.value !== "boolean") {
-    warnings.push("invalid_has_more");
-    invalid = true;
-  } else if (hasMoreRaw.present) {
-    hasMore = hasMoreRaw.value as boolean;
+  if (hasMoreRaw.present) {
+    const values = hasMoreRaw.values;
+    if (values.some((value) => typeof value !== "boolean")) {
+      warnings.push("invalid_has_more");
+      invalid = true;
+    } else if (hasConflictingControlValues(values)) {
+      warnings.push("conflicting_has_more");
+      contradictory = true;
+    } else {
+      hasMore = values[0] as boolean;
+    }
   }
 
   let returnedOffset: number | null = null;
   if (returnedOffsetRaw.present) {
-    returnedOffset = nonNegativeInteger(returnedOffsetRaw.value);
-    if (returnedOffset === null) {
+    const parsedValues = returnedOffsetRaw.values.map((value) =>
+      value === null || value === undefined ? null : nonNegativeInteger(value),
+    );
+    if (
+      returnedOffsetRaw.values.some(
+        (value, index) =>
+          value !== null &&
+          value !== undefined &&
+          parsedValues[index] === null,
+      )
+    ) {
       warnings.push("invalid_returned_index_offset");
       invalid = true;
+    } else if (hasConflictingControlValues(parsedValues)) {
+      warnings.push("conflicting_returned_index_offset");
+      contradictory = true;
+    } else {
+      returnedOffset = parsedValues[0] ?? null;
     }
   }
 
@@ -965,22 +1011,35 @@ function readIndexPaginationControls(
     returnedOffset,
     returnedOffsetPresent: returnedOffsetRaw.present,
     invalid,
+    contradictory,
     warnings,
   };
 }
 
-function firstControlValue(
+function readControlValues(
   sources: Array<Record<string, unknown>>,
   keys: string[],
-): { present: boolean; value: unknown } {
+): { present: boolean; value: unknown; values: unknown[] } {
+  const values: unknown[] = [];
   for (const source of sources) {
     for (const key of keys) {
       if (Object.prototype.hasOwnProperty.call(source, key)) {
-        return { present: true, value: source[key] };
+        values.push(source[key]);
       }
     }
   }
-  return { present: false, value: undefined };
+  return {
+    present: values.length > 0,
+    value: values[0],
+    values,
+  };
+}
+
+function hasConflictingControlValues(values: unknown[]): boolean {
+  if (values.length < 2) {
+    return false;
+  }
+  return values.slice(1).some((value) => !Object.is(value, values[0]));
 }
 
 function httpStatus(payload: Record<string, unknown>, path: string): number {
