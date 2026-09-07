@@ -394,19 +394,35 @@ async def _fetch_capacity_success_epoch_with_deadline(
     key: str,
     *,
     deadline: float,
-) -> Optional[int]:
-    """Read the wakeup epoch without exceeding the remaining wait budget."""
+    wakeup_event: asyncio.Event,
+) -> tuple[Optional[int], bool]:
+    """Read the wakeup epoch or local signal within the remaining wait budget."""
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise asyncio.TimeoutError
 
     fetch_task = asyncio.create_task(_fetch_capacity_success_epoch(redis_cache, key))
+    wakeup_task = asyncio.create_task(wakeup_event.wait())
     try:
-        return await asyncio.wait_for(fetch_task, timeout=remaining)
+        done, _ = await asyncio.wait(
+            {fetch_task, wakeup_task},
+            timeout=remaining,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if wakeup_task in done:
+            return None, True
+        if fetch_task in done:
+            return fetch_task.result(), False
+        raise asyncio.TimeoutError
     finally:
-        if not fetch_task.done():
-            fetch_task.cancel()
-        await asyncio.gather(fetch_task, return_exceptions=True)
+        for task in (fetch_task, wakeup_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(
+            fetch_task,
+            wakeup_task,
+            return_exceptions=True,
+        )
 
 
 async def _read_capacity_success_epoch_for_wait(
@@ -414,19 +430,34 @@ async def _read_capacity_success_epoch_for_wait(
     key: str,
     *,
     deadline: float,
-) -> tuple[Optional[int], bool]:
-    """Return an epoch and whether the bounded Redis read completed."""
+    wakeup_event: asyncio.Event,
+) -> tuple[Optional[int], bool, bool]:
+    """Return an epoch, read status, and whether local wakeup won."""
     try:
-        return (
-            await _fetch_capacity_success_epoch_with_deadline(
-                redis_cache,
-                key,
-                deadline=deadline,
-            ),
-            True,
+        epoch, local_wakeup = await _fetch_capacity_success_epoch_with_deadline(
+            redis_cache,
+            key,
+            deadline=deadline,
+            wakeup_event=wakeup_event,
         )
+        return epoch, True, local_wakeup
     except Exception:
-        return None, False
+        return None, False, False
+
+
+def _apply_capacity_success_epoch_baseline(
+    wakeup: _CapacityWakeupState,
+    current_epoch: Optional[int],
+    *,
+    read_succeeded: bool,
+) -> Optional[int]:
+    """Re-anchor an unknown baseline after any successful Redis read."""
+    if wakeup.epoch_baseline_known:
+        return current_epoch
+    if read_succeeded:
+        wakeup.starting_epoch = current_epoch
+        wakeup.epoch_baseline_known = True
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -605,11 +636,17 @@ class OpenAIAlphaCapacityRetryCoordinator:
                 (
                     wakeup.starting_epoch,
                     wakeup.epoch_baseline_known,
+                    local_wakeup,
                 ) = await _read_capacity_success_epoch_for_wait(
                     redis_cache,
                     redis_key,
                     deadline=deadline,
+                    wakeup_event=wakeup.event,
                 )
+                if local_wakeup:
+                    return (
+                        "peer_success" if deadline - time.monotonic() > 0 else "timer"
+                    )
 
             while True:
                 remaining = deadline - time.monotonic()
@@ -622,20 +659,28 @@ class OpenAIAlphaCapacityRetryCoordinator:
                     break
 
                 if redis_cache is not None and redis_key is not None:
-                    current_epoch, _ = await _read_capacity_success_epoch_for_wait(
+                    (
+                        current_epoch,
+                        read_succeeded,
+                        local_wakeup,
+                    ) = await _read_capacity_success_epoch_for_wait(
                         redis_cache,
                         redis_key,
                         deadline=deadline,
+                        wakeup_event=wakeup.event,
                     )
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         wakeup.wakeup_reason = "timer"
                         break
-                    if not wakeup.epoch_baseline_known:
-                        if current_epoch is not None:
-                            wakeup.starting_epoch = current_epoch
-                            wakeup.epoch_baseline_known = True
-                        current_epoch = None
+                    if local_wakeup:
+                        wakeup.wakeup_reason = "peer_success"
+                        break
+                    current_epoch = _apply_capacity_success_epoch_baseline(
+                        wakeup,
+                        current_epoch,
+                        read_succeeded=read_succeeded,
+                    )
                     if current_epoch is not None and (
                         wakeup.starting_epoch is None
                         or current_epoch != wakeup.starting_epoch

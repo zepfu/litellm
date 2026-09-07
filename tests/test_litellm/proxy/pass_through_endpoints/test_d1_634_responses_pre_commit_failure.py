@@ -1866,6 +1866,89 @@ class TestCoordinatorSleepWakeup:
         )
 
     @pytest.mark.asyncio
+    async def test_local_peer_success_wakes_during_initial_and_subsequent_redis_reads(
+        self,
+    ):
+        target_identity = "openai:redis-local-wakeup"
+        namespace = "aawm-routing-alpha-v1"
+        redis_started = [asyncio.Event(), asyncio.Event()]
+        redis_tasks = []
+        get_count = 0
+
+        async def get_epoch(_key):
+            nonlocal get_count
+            get_count += 1
+            task = asyncio.current_task()
+            assert task is not None
+            redis_tasks.append(task)
+            if get_count == 2:
+                return b"7"
+            redis_started[0 if get_count == 1 else 1].set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                redis_started[0 if get_count == 1 else 1].clear()
+
+        redis_client = SimpleNamespace(
+            get=get_epoch,
+            incr=AsyncMock(return_value=1),
+            expire=AsyncMock(return_value=True),
+        )
+        redis_cache = SimpleNamespace(
+            init_async_client=MagicMock(return_value=redis_client)
+        )
+        manager = SimpleNamespace(
+            get_dual_cache=MagicMock(
+                return_value=SimpleNamespace(redis_cache=redis_cache)
+            )
+        )
+
+        async def wait_for_redis_and_signal(
+            coordinator: OpenAIAlphaCapacityRetryCoordinator,
+            started_event: asyncio.Event,
+        ) -> str:
+            sleep_task = asyncio.create_task(
+                coordinator.sleep_with_wakeup(0.5)
+            )
+            await asyncio.wait_for(started_event.wait(), timeout=0.2)
+            await _signal_openai_capacity_success(target_identity, namespace)
+            return await asyncio.wait_for(sleep_task, timeout=0.2)
+
+        with patch(
+            "litellm.proxy.aawm_alias_routing_redis."
+            "aawm_alias_routing_redis_manager",
+            manager,
+        ):
+            first = OpenAIAlphaCapacityRetryCoordinator(
+                target_identity=target_identity,
+                namespace=namespace,
+            )
+            first_reason = await wait_for_redis_and_signal(
+                first,
+                redis_started[0],
+            )
+
+            second = OpenAIAlphaCapacityRetryCoordinator(
+                target_identity=target_identity,
+                namespace=namespace,
+            )
+            second_reason = await wait_for_redis_and_signal(
+                second,
+                redis_started[1],
+            )
+
+        assert first_reason == "peer_success"
+        assert second_reason == "peer_success"
+        assert get_count == 3
+        assert len(redis_tasks) == 3
+        assert redis_tasks[0].done() and redis_tasks[0].cancelled()
+        assert redis_tasks[1].done() and not redis_tasks[1].cancelled()
+        assert redis_tasks[2].done() and redis_tasks[2].cancelled()
+        assert not _LOCAL_CAPACITY_WAKEUP_EVENTS.get(
+            (namespace, target_identity)
+        )
+
+    @pytest.mark.asyncio
     async def test_sleep_with_wakeup_does_not_treat_expired_epoch_as_success(self):
         target_identity = "openai:redis-expiry"
         namespace = "aawm-routing-alpha-v1"
@@ -1924,6 +2007,46 @@ class TestCoordinatorSleepWakeup:
 
         assert reason == "timer"
         assert redis_client.get.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_sleep_with_wakeup_reanchors_unknown_baseline_on_missing_key(
+        self,
+        monkeypatch,
+    ):
+        target_identity = "openai:redis-reanchor"
+        namespace = "aawm-routing-alpha-v1"
+        monkeypatch.setattr(
+            pre_commit_retry_module,
+            "_OPENAI_CAPACITY_SUCCESS_POLL_SECONDS",
+            0.01,
+        )
+        redis_client = SimpleNamespace(
+            get=AsyncMock(
+                side_effect=[RuntimeError("redis unavailable"), None, b"8"]
+            ),
+        )
+        redis_cache = SimpleNamespace(
+            init_async_client=MagicMock(return_value=redis_client)
+        )
+        manager = SimpleNamespace(
+            get_dual_cache=MagicMock(
+                return_value=SimpleNamespace(redis_cache=redis_cache)
+            )
+        )
+
+        with patch(
+            "litellm.proxy.aawm_alias_routing_redis."
+            "aawm_alias_routing_redis_manager",
+            manager,
+        ):
+            coordinator = OpenAIAlphaCapacityRetryCoordinator(
+                target_identity=target_identity,
+                namespace=namespace,
+            )
+            reason = await coordinator.sleep_with_wakeup(0.2)
+
+        assert reason == "peer_success"
+        assert redis_client.get.await_count == 3
 
 
 class TestCoordinatorLogging:
