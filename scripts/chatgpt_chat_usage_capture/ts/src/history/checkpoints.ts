@@ -89,11 +89,15 @@ export class MemoryCheckpointStore implements HistoryCheckpointStore {
  * SQLite transaction. No database write lock is held across browser requests.
  */
 export class SqliteCheckpointStore extends MemoryCheckpointStore {
+  private readonly beforePersist: (() => void) | undefined;
+
   constructor(
     private readonly ledger: Ledger,
     private readonly scope: LedgerScope,
+    options: SqliteCheckpointStoreOptions = {},
   ) {
     super();
+    this.beforePersist = options.beforePersist;
     const row = ledger.db
       .prepare("SELECT state_json FROM history_state WHERE scope_key=?")
       .get(collectorScopeKey(scope)) as { state_json: string } | undefined;
@@ -138,6 +142,7 @@ export class SqliteCheckpointStore extends MemoryCheckpointStore {
       }
     }
     assertNoSecrets(state);
+    this.beforePersist?.();
     this.ledger.db
       .prepare(`
         INSERT INTO history_state(scope_key, collector_account_id, state_json)
@@ -146,6 +151,14 @@ export class SqliteCheckpointStore extends MemoryCheckpointStore {
       `)
       .run(collectorScopeKey(this.scope), this.scope.collectorAccountId, JSON.stringify(state));
   }
+}
+
+export interface SqliteCheckpointStoreOptions {
+  /**
+   * Called immediately before the checkpoint row is written. The callback is
+   * expected to throw when the owning execution lease is no longer valid.
+   */
+  beforePersist?: () => void;
 }
 
 function clone<T>(value: T): T {

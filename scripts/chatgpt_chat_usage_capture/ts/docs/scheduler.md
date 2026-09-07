@@ -14,6 +14,8 @@ prefixed tables:
 - `chatgpt_scheduler_leases`: one row per `(account_id, profile_id)`.
 - `chatgpt_scheduler_write_lock`: one shared row used to acquire SQLite write
   ownership before scheduler callbacks run.
+- `chatgpt_scheduler_execution`: one durable pending/active execution row per
+  `(account_id, profile_id)`.
 
 The scheduler does not alter the shared ledger migration table or ledger store.
 Times are stored as UTC epoch milliseconds. `account_id` identifies the
@@ -101,3 +103,36 @@ Every scheduler transaction acquires an actual SQLite write lock before its
 callback runs, including a scheduler operation nested inside a caller-owned
 deferred transaction. This keeps live lease time sampling after write
 ownership, rather than treating `db.inTransaction` alone as sufficient.
+
+## Execution service
+
+`SchedulerExecutionService` is the shared one-attempt entry point for later
+manual, backfill, reconciliation, and scheduled wiring:
+
+```ts
+const service = new SchedulerExecutionService({
+  ledger,
+  account,
+  scope: { accountId: account.id, profileId: "profile-primary" },
+  ownerId: "worker-a",
+  readerFactory: async ({ request, signal }) => ({
+    reader: await createReader(request, signal),
+    close: () => closeReader(),
+    cancel: () => cancelReader(),
+  }),
+});
+
+await service.executeManual();
+await service.executeBackfill({ range });
+await service.executeReconciliation();
+await service.executeScheduled();
+```
+
+`execute(request)` is the equivalent mode-discriminated entry point. Each call
+claims the account/profile lease, starts one bounded collector attempt, and
+returns `idle`, `queued`, `complete`, `partial`, or `blocked`. `readerFactory`
+receives the collector request and an abort signal; returned `close` and
+`cancel` hooks are invoked during cleanup or lease-loss cancellation. The
+service does not create browsers, launch a daemon, or duplicate request
+budgets, retries, or throttling. Reconciliation leaves `range` unset so the
+collector applies its frozen 14-day default plus outstanding work.

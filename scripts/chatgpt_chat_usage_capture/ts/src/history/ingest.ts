@@ -17,6 +17,20 @@ import { assertNoSecrets } from "../security/sanitizer.js";
 import { SqliteCheckpointStore } from "./checkpoints.js";
 import { HistoryCollector } from "./collector.js";
 
+export interface CollectionExecutionHooks {
+  /**
+   * Called before every browser-reader method. The callback may throw to stop
+   * acquisition before another request is issued.
+   */
+  beforeRead?: () => void;
+  /**
+   * Called before each logical ledger mutation and immediately before
+   * checkpoint persistence. The callback runs inside the owning SQLite
+   * transaction where the mutation occurs.
+   */
+  beforeWrite?: () => void;
+}
+
 export interface PersistedHistoryResult extends HistoryCollectionResult {
   ledger: {
     databasePath: string;
@@ -75,11 +89,20 @@ export async function collectIntoLedger(
   account: AccountConfig,
   request: HistoryCollectionRequest,
   mappingVersion: string | null = null,
+  hooks: CollectionExecutionHooks = {},
 ): Promise<PersistedHistoryResult> {
   const scope = configuredScope(account);
   assertAccountBinding(ledger, scope);
   const mapping = selectMapping(ledger, mappingVersion);
-  const store = new SqliteCheckpointStore(ledger, scope);
+  const guardWrite = (): void => {
+    hooks.beforeWrite?.();
+  };
+  const store = new SqliteCheckpointStore(ledger, scope, {
+    beforePersist: guardWrite,
+  });
+  const guardedReader = hooks.beforeRead
+    ? withReadGuard(reader, hooks.beforeRead)
+    : reader;
   const summary: PersistedHistoryResult["ledger"] = {
     databasePath: ledger.path,
     runId: null,
@@ -105,14 +128,17 @@ export async function collectIntoLedger(
       return;
     }
     assertAccountBinding(ledger, scope);
+    guardWrite();
     ledger.upsertAccount(scope, {
       authState: identity.authState,
       planPolicyId: account.planPolicyId || null,
       enabled: account.enabled,
     });
     if (ledger.modelMappings().length === 0) {
+      guardWrite();
       ledger.saveModelMapping(mapping);
     }
+    guardWrite();
     ledger.startRun(scope, {
       runId,
       mode,
@@ -140,9 +166,12 @@ export async function collectIntoLedger(
     const sourceKind = "history_conversation";
     const sourceId = page.summary.conversationId;
     const warnings = [...new Set([...page.detail?.warnings ?? [], ...page.warnings])];
+    guardWrite();
     ledger.resolveCoverageGaps(scope, sourceKind, sourceId, observedAt);
+    guardWrite();
     ledger.upsertConversation(scope, page.summary, runId);
     if (!page.detail) {
+      guardWrite();
       ledger.recordCoverageGap(
         scope,
         {
@@ -160,6 +189,7 @@ export async function collectIntoLedger(
       return;
     }
 
+    guardWrite();
     const ingested = ledger.ingestConversation(
       scope,
       {
@@ -205,6 +235,7 @@ export async function collectIntoLedger(
     summary.aliasConflicts += ingested.aliasConflicts;
 
     if (page.revisit) {
+      guardWrite();
       ledger.recordCoverageGap(
         scope,
         {
@@ -220,6 +251,7 @@ export async function collectIntoLedger(
         observedAt,
       );
     } else {
+      guardWrite();
       ledger.resolveCoverageGaps(
         scope,
         "history_revisit",
@@ -232,10 +264,12 @@ export async function collectIntoLedger(
   const onPageCommit = (page: HistoryPageCommit): void => {
     assertCollectedIdentity(page.identity, scope);
     ledger.transaction(() => {
+      guardWrite();
       ensureRunStarted(page.identity, page.mode, page.scanStartedAt);
       persistConversation(page, new Date().toISOString());
       store.acknowledgeCandidates(page.summary.conversationId, page.scopes);
       store.persist();
+      guardWrite();
     });
     persistedConversations.add(page.summary.conversationId);
   };
@@ -243,18 +277,20 @@ export async function collectIntoLedger(
   const onDiscoveryPageCommit = (page: HistoryDiscoveryPageCommit): void => {
     assertCollectedIdentity(page.identity, scope);
     ledger.transaction(() => {
+      guardWrite();
       ensureRunStarted(
         page.identity,
         page.checkpoint.mode,
         page.scanStartedAt,
       );
       store.persist();
+      guardWrite();
     });
   };
 
   let result: HistoryCollectionResult;
   try {
-    result = await new HistoryCollector(reader, {
+    result = await new HistoryCollector(guardedReader, {
       accountId: account.id,
       store,
       onDiscoveryPageCommit,
@@ -263,6 +299,7 @@ export async function collectIntoLedger(
   } catch (error) {
     if (runStarted) {
       ledger.transaction(() => {
+        guardWrite();
         ledger.finishRun(runId, "failed", new Date().toISOString(), {
           error: error instanceof Error ? error.name : "collection_error",
           ...summary,
@@ -275,12 +312,14 @@ export async function collectIntoLedger(
   if (result.status === "blocked") {
     if (result.accountState.status === "paused") {
       ledger.transaction(() => {
+        guardWrite();
         ledger.upsertAccount(scope, {
           authState: result.identity.authState,
           planPolicyId: account.planPolicyId || null,
           enabled: account.enabled,
         });
         store.persist();
+        guardWrite();
       });
     }
     return { ...result, ledger: summary };
@@ -288,6 +327,7 @@ export async function collectIntoLedger(
   assertCollectedIdentity(result.identity, scope);
 
   ledger.transaction(() => {
+    guardWrite();
     ensureRunStarted(result.identity, result.mode, result.scanStartedAt);
     for (const conversation of result.conversations) {
       if (persistedConversations.has(conversation.summary.conversationId)) {
@@ -314,6 +354,7 @@ export async function collectIntoLedger(
       );
     }
     const observedAt = new Date().toISOString();
+    guardWrite();
     ledger.recordCoverageGap(
       scope,
       {
@@ -328,9 +369,11 @@ export async function collectIntoLedger(
       },
       observedAt,
     );
+    guardWrite();
     store.persist();
     summary.runId = runId;
     summary.committed = true;
+    guardWrite();
     ledger.finishRun(runId, result.status, observedAt, {
       range: result.range,
       coverage: result.coverage,
@@ -340,6 +383,31 @@ export async function collectIntoLedger(
     });
   });
   return { ...result, ledger: summary };
+}
+
+function withReadGuard(
+  reader: HistoryReader,
+  beforeRead: () => void,
+): HistoryReader {
+  return {
+    capabilities: reader.capabilities,
+    inspectSessionIdentity: async () => {
+      beforeRead();
+      return reader.inspectSessionIdentity();
+    },
+    listConversations: async (options) => {
+      beforeRead();
+      return reader.listConversations(options);
+    },
+    fetchConversation: async (conversationId, options) => {
+      beforeRead();
+      return reader.fetchConversation(conversationId, options);
+    },
+    fetchMessages: async (conversationId, options) => {
+      beforeRead();
+      return reader.fetchMessages(conversationId, options);
+    },
+  };
 }
 
 function assertCollectedIdentity(
