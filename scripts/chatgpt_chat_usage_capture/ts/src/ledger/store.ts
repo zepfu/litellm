@@ -53,6 +53,7 @@ type AttemptAliasOwner = {
   identityBasis: string;
   completedAnswer: boolean;
   tombstone: boolean;
+  generationAliases: string[];
 };
 
 const MERGEABLE_ATTEMPT_ALIAS_KINDS = new Set([
@@ -1014,15 +1015,44 @@ export class Ledger {
     const incomingAttempt = sanitizeAttempt(attempt, context.observedAt);
     const aliases = uniqueAttemptAliases(incomingAttempt.aliases);
     const aliasOwners = this.findAttemptAliasOwners(scope, aliases);
+    const incomingGenerationAliases = new Set(
+      aliases
+        .filter(([aliasKind]) => aliasKind === "generation")
+        .map(([, aliasValue]) => aliasValue),
+    );
     const mergeableOwnerIds = new Set(
       aliasOwners
         .filter(
           (owner) =>
             owner.attemptId !== incomingAttempt.attemptId &&
-            MERGEABLE_ATTEMPT_ALIAS_KINDS.has(owner.aliasKind),
+            MERGEABLE_ATTEMPT_ALIAS_KINDS.has(owner.aliasKind) &&
+            !conflictingGenerationAliases(
+              incomingGenerationAliases,
+              owner.generationAliases,
+            ),
         )
         .map((owner) => owner.attemptId),
     );
+    if (incomingGenerationAliases.size === 0) {
+      const authoritativeOwnerIdentities = new Set(
+        [...mergeableOwnerIds]
+          .map((attemptId) =>
+            generationIdentityKey(
+              aliasOwners.find((owner) => owner.attemptId === attemptId)
+                ?.generationAliases ?? [],
+            ),
+          )
+          .filter((identity) => identity !== ""),
+      );
+      if (authoritativeOwnerIdentities.size > 1) {
+        for (const attemptId of [...mergeableOwnerIds]) {
+          const owner = aliasOwners.find((candidate) => candidate.attemptId === attemptId);
+          if (owner && owner.generationAliases.length > 0) {
+            mergeableOwnerIds.delete(attemptId);
+          }
+        }
+      }
+    }
     const canonicalAttemptId = this.selectCanonicalAttemptId(
       incomingAttempt,
       aliases,
@@ -1194,6 +1224,14 @@ export class Ledger {
       JOIN attempts t
         ON t.scope_key=a.scope_key AND t.attempt_id=a.attempt_id
       WHERE a.scope_key=? AND a.alias_kind=? AND a.alias_value=?
+        `,
+    );
+    const generationStatement = this.db.prepare(
+      `
+      SELECT alias_value
+      FROM attempt_aliases
+      WHERE scope_key=? AND attempt_id=? AND alias_kind='generation'
+      ORDER BY alias_value
       `,
     );
     for (const [aliasKind, aliasValue] of aliases) {
@@ -1212,6 +1250,9 @@ export class Ledger {
         identityBasis: String(row.identity_basis),
         completedAnswer: Number(row.completed_answer) === 1,
         tombstone: Number(row.tombstone) === 1,
+        generationAliases: generationStatement
+          .all(scopeKey(scope), String(row.attempt_id))
+          .map((item: unknown) => String((item as SqlRow).alias_value)),
       });
     }
     return owners;
@@ -2470,6 +2511,21 @@ function identityRank(identityBasis: string): number {
     default:
       return 0;
   }
+}
+
+function conflictingGenerationAliases(
+  incoming: ReadonlySet<string>,
+  existing: ReadonlyArray<string>,
+): boolean {
+  const stored = new Set(existing);
+  if (incoming.size === 0 || stored.size === 0) {
+    return false;
+  }
+  return incoming.size !== stored.size || [...incoming].some((alias) => !stored.has(alias));
+}
+
+function generationIdentityKey(aliases: ReadonlyArray<string>): string {
+  return [...new Set(aliases)].sort().join("\u0000");
 }
 
 function messageFromRow(row: SqlRow): MessageRecord {
