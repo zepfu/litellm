@@ -2853,6 +2853,16 @@ async def test_candidate_loop_capacity_expiry_preserves_upstream_failure(  # noq
     redispatch_calls: list[dict[str, Any]] = []
     failure_records: list[dict[str, Any]] = []
     terminal_records: list[tuple[str, Optional[str], Optional[int]]] = []
+    emitted: list[dict[str, Any]] = []
+    persisted: list[list[dict[str, Any]]] = []
+    monkeypatch.setattr(
+        lpe, "_emit_auto_agent_alias_route_event",
+        lambda event, **_kwargs: emitted.append(event),
+    )
+    monkeypatch.setattr(
+        lpe, "_persist_auto_agent_alias_audit_only_events_best_effort",
+        lambda events, **_kwargs: persisted.append(events),
+    )
     upstream_detail = {
         "error": {
             "message": "upstream overloaded body",
@@ -3086,10 +3096,23 @@ async def test_candidate_loop_capacity_expiry_preserves_upstream_failure(  # noq
         "Retry-After": "7200" if failure_kind == "raw_http" else "23",
     }
     assert getattr(exc_info.value, "_aawm_openai_capacity_expired", False) is True
+    assert len(emitted) == 1
+    event = emitted[0]
+    assert event["event_type"] == "openai_capacity_retry_deadline_exhausted"
+    assert event["terminal_outcome"] == "retryable_upstream_capacity_exhausted"
+    assert event["fallback_result"] == "capacity_retry_deadline_exhausted"
+    assert event["agent_session_killed"] is False
+    assert event["redispatch_required"] is False
+    assert event["retryable"] is True
+    assert event["attempted_provider_call"] is True
+    assert event["failure_phase"] == "openai_capacity_retry_deadline"
+    assert event["failure_class"] == "server_overloaded"
+    assert event["error_status_code"] == 529
+    assert persisted[-1][-1] == event
 
 
 @pytest.mark.asyncio
-async def test_candidate_loop_capacity_expiry_without_prior_failure_returns_504(
+async def test_candidate_loop_capacity_expiry_without_prior_failure_returns_504(  # noqa: PLR0915
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
@@ -3113,6 +3136,16 @@ async def test_candidate_loop_capacity_expiry_without_prior_failure_returns_504(
     publication_calls: list[None] = []
     redispatch_calls: list[dict[str, Any]] = []
     terminal_records: list[tuple[str, Optional[str], Optional[int]]] = []
+    emitted: list[dict[str, Any]] = []
+    persisted: list[list[dict[str, Any]]] = []
+    monkeypatch.setattr(
+        lpe, "_emit_auto_agent_alias_route_event",
+        lambda event, **_kwargs: emitted.append(event),
+    )
+    monkeypatch.setattr(
+        lpe, "_persist_auto_agent_alias_audit_only_events_best_effort",
+        lambda events, **_kwargs: persisted.append(events),
+    )
 
     class _Coordinator:
         target_identity = "openai:gpt-5.4-codex@chatgpt.com/backend-api/codex/responses"
@@ -3248,6 +3281,15 @@ async def test_candidate_loop_capacity_expiry_without_prior_failure_returns_504(
     assert exc_info.value.status_code == 504
     assert exc_info.value.headers == {"Retry-After": "10"}
     assert "all_candidates_unavailable" not in str(exc_info.value.detail)
+    assert len(emitted) == 1
+    event = emitted[0]
+    assert event["terminal_outcome"] == "retryable_upstream_capacity_exhausted"
+    assert event["fallback_result"] == "capacity_retry_deadline_exhausted"
+    assert event["agent_session_killed"] is False
+    assert event["retryable"] is True
+    assert event["attempted_provider_call"] is False
+    assert event["error_status_code"] == 504
+    assert persisted[-1][-1] == event
 
 
 @pytest.mark.asyncio

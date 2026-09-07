@@ -1087,6 +1087,7 @@ async def handle_alias_route(  # noqa: PLR0915
         *,
         extra_fields: Optional[Mapping[str, Any]] = None,
         preserve_upstream_failure: bool = False,
+        capacity_retry_expired: bool = False,
     ) -> Any:
         last_attempt = attempts[-1] if attempts else {}
         cursor_sanitized_proto_structure = (
@@ -1293,18 +1294,44 @@ async def handle_alias_route(  # noqa: PLR0915
                 request,
                 last_attempt,
             )
-        _emit_auto_agent_alias_no_candidate_event(
-            alias_family=alias_family,
-            alias_model=alias_model,
-            request=request,
-            request_body=prepared_request_body,
-            exc=terminal_exc,
-            attempts=attempts,
-            traversal_budget_exhausted=(
-                provider_candidate_attempts >= max_candidate_attempts
-            ),
-            extra_fields=extra_fields,
-        )
+        if capacity_retry_expired:
+            _emit_auto_agent_alias_pre_attempt_terminal_event(
+                alias_family=alias_family,
+                alias_model=alias_model,
+                request=request,
+                request_body=prepared_request_body,
+                event_type="openai_capacity_retry_deadline_exhausted",
+                candidate_status="terminal_openai_capacity_retry_expired",
+                failure_phase="openai_capacity_retry_deadline",
+                error_status_code=terminal_exc.status_code,
+                failure_class=attempt_record.get("error_class"),
+                candidate=candidate,
+                selection=selection,
+                attempts=attempts,
+                extra_fields={
+                    "attempted_provider_call": bool(
+                        attempt_record.get("attempted_provider_call")
+                    ),
+                    "terminal_outcome": "retryable_upstream_capacity_exhausted",
+                    "fallback_result": "capacity_retry_deadline_exhausted",
+                    "agent_session_killed": False,
+                    "retryable": True,
+                    **dict(extra_fields or {}),
+                },
+            )
+        else:
+            _emit_auto_agent_alias_no_candidate_event(
+                alias_family=alias_family,
+                alias_model=alias_model,
+                request=request,
+                request_body=prepared_request_body,
+                exc=terminal_exc,
+                attempts=attempts,
+                traversal_budget_exhausted=(
+                    provider_candidate_attempts >= max_candidate_attempts
+                ),
+                extra_fields=extra_fields,
+            )
         raise terminal_exc from None
 
     def _remember_capacity_failure(
@@ -1388,6 +1415,9 @@ async def handle_alias_route(  # noqa: PLR0915
         kimi_failure_metadata: Optional[dict[str, Any]] = None,
     ) -> None:
         assert capacity_retry_coordinator is not None
+        expiry_attempted_provider_call = bool(
+            attempt_record.get("attempted_provider_call")
+        )
         terminal_error_class = str(error_class or "upstream_timeout")
         terminal_exc = failure_exc
         if not getattr(terminal_exc, "_aawm_openai_capacity_expired", False):
@@ -1435,6 +1465,10 @@ async def handle_alias_route(  # noqa: PLR0915
         _raise_terminal_alias_failure(
             terminal_exc,
             preserve_upstream_failure=True,
+            capacity_retry_expired=True,
+            extra_fields={
+                "attempted_provider_call": expiry_attempted_provider_call,
+            },
         )
 
     while provider_candidate_attempts < max_candidate_attempts:
