@@ -7,5 +7,8 @@ Initialize the ledger, inspect capabilities, then backfill or refresh through th
 - Interval change: `schedule set --every PT3H` or `3h` recalculates `next_due_at` from the UTC anchor.
 - Rebuild: `rebuild --dry-run` then `rebuild --apply`. Aggregates publish only after the transaction commits.
 - Retention prune keeps attempt aliases/tombstones. If raw observations are gone, rebuild uses retained attempt projections and warns.
+- Configure `expected_provider_user_id`, `expected_workspace_id`, and `quota_owner_id` for every account. Collection pauses as `unconfigured` or `identity_mismatch` until all three values are observed from the authenticated session and match; configured values are never used as observed evidence.
+- Message metadata is projected to a small typed allowlist before observations or the message ledger are written. Unknown fields and unsupported values are discarded; only field names/types remain in schema-drift provenance.
+- Missing or contradictory detail pagination, including an unknown HTTP 200 shape, records an open coverage gap, keeps the conversation pending, and prevents the run watermark from advancing.
 
 Dashboard cards show three policy buckets. Unknown remaining is the string Unknown, never zero.

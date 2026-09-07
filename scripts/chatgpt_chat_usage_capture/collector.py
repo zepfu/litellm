@@ -70,6 +70,7 @@ class Collector:
                 expected_identity={
                     "provider_user_id": account.expected_provider_user_id,
                     "workspace_id": account.expected_workspace_id,
+                    "quota_owner_id": account.quota_owner_id,
                 },
             )
         if adapter_name in {"playwright_persistent_context", "playwright"}:
@@ -121,8 +122,8 @@ class Collector:
             self.ledger.upsert_account(
                 {
                     "collector_account_id": account.id,
-                    "provider_user_id": account.expected_provider_user_id,
-                    "workspace_id": account.expected_workspace_id,
+                    "provider_user_id": None,
+                    "workspace_id": None,
                     "quota_owner_id": account.quota_owner_id,
                     "surface": SURFACE_CHAT,
                     "auth_state": "unconfigured",
@@ -146,7 +147,11 @@ class Collector:
             except AuthenticationRequiredError:
                 identity = {"surface": "unknown", "auth_state": "auth_required"}
             self._persist_account_identity(account, identity)
-            if identity.get("auth_state") in {"auth_required", "identity_mismatch"}:
+            if identity.get("auth_state") in {
+                "auth_required",
+                "identity_mismatch",
+                "unconfigured",
+            }:
                 return self._finish_paused_run(
                     account=account,
                     adapter=adapter,
@@ -205,20 +210,21 @@ class Collector:
     ) -> dict[str, Any]:
         safe = sanitize_identity(
             {
-                "provider_user_id": identity.get("provider_user_id")
-                or account.expected_provider_user_id,
-                "workspace_id": identity.get("workspace_id") or account.expected_workspace_id,
-                "quota_owner_id": account.quota_owner_id,
+                "provider_user_id": identity.get("provider_user_id"),
+                "workspace_id": identity.get("workspace_id"),
+                "quota_owner_id": identity.get("quota_owner_id"),
                 "surface": identity.get("surface"),
                 "auth_state": identity.get("auth_state") or "unknown",
+                "identity_errors": identity.get("identity_errors"),
             }
         )
+        verified = safe.get("auth_state") == "ready"
         with self.ledger.transaction():
             self.ledger.upsert_account(
                 {
                     "collector_account_id": account.id,
-                    "provider_user_id": safe.get("provider_user_id"),
-                    "workspace_id": safe.get("workspace_id"),
+                    "provider_user_id": safe.get("provider_user_id") if verified else None,
+                    "workspace_id": safe.get("workspace_id") if verified else None,
                     "quota_owner_id": safe.get("quota_owner_id") or account.quota_owner_id,
                     "surface": SURFACE_CHAT,
                     "auth_state": safe.get("auth_state") or "unknown",
@@ -241,6 +247,7 @@ class Collector:
         error_class: str | None = None,
     ) -> RunResult:
         auth_state = str(identity.get("auth_state") or "auth_required")
+        safe_identity = sanitize_identity(identity)
         with self.ledger.transaction():
             self.ledger.finish_run(
                 run_id,
@@ -248,7 +255,7 @@ class Collector:
                 result=auth_state,
                 coverage="paused",
                 error_class=error_class or auth_state,
-                details={"identity": dict(identity)},
+                details={"identity": safe_identity},
             )
         return RunResult(
             run_id=run_id,
@@ -343,8 +350,20 @@ class Collector:
             new_attempts += stats["inserted"]
             updated_attempts += stats["updated"]
             deduplicated_attempts += stats["deduplicated"]
+            if any(
+                warning.startswith("detail_coverage:")
+                for warning in conv_warnings
+            ):
+                coverage = "partial"
         result = "complete" if coverage == "validated_page" and not any(
-            warning.startswith("budget") or warning.startswith("repeated_cursor")
+            warning.startswith(
+                (
+                    "budget",
+                    "repeated_cursor",
+                    "conversation_page_budget",
+                    "detail_coverage:",
+                )
+            )
             for warning in warnings
         ) else "partial"
         with self.ledger.transaction():
@@ -368,6 +387,16 @@ class Collector:
                         continuation=None,
                         watermark_at=now,
                         coverage="complete",
+                    )
+            else:
+                incomplete_coverage = "unrecognized" if coverage == "unrecognized" else "partial"
+                for scope in scopes:
+                    state = self.ledger.get_discovery_state(account.id, scope) or {}
+                    self.ledger.upsert_discovery_state(
+                        account_id=account.id,
+                        scope=scope,
+                        continuation=state.get("continuation"),
+                        coverage=incomplete_coverage,
                     )
         return RunResult(
             run_id=run_id,
@@ -523,6 +552,8 @@ class Collector:
         )
         records.extend(page.items)
         warnings.extend(page.warnings)
+        if page.coverage != "validated_page":
+            warnings.append(f"detail_coverage:{page.coverage}")
         cursor = page.continuation
         seen_cursors: set[str] = set()
         while cursor:
@@ -538,6 +569,8 @@ class Collector:
             pages += 1
             records.extend(next_page.items)
             warnings.extend(next_page.warnings)
+            if next_page.coverage != "validated_page":
+                warnings.append(f"detail_coverage:{next_page.coverage}")
             if "repeated_cursor" in next_page.warnings:
                 break
             if next_page.exhausted or next_page.continuation is None:
@@ -548,7 +581,24 @@ class Collector:
             cursor = next_page.continuation
         coverage = "partial" if warnings else "validated_page"
         with self.ledger.transaction():
-            self.ledger.mark_conversation_fetched(account.id, summary.conversation_id, coverage)
+            if coverage != "validated_page":
+                self.ledger.record_gap(
+                    gap_id=evidence_identity(
+                        "detail-pagination",
+                        summary.conversation_id,
+                        "incomplete",
+                    ),
+                    account_id=account.id,
+                    scope=f"conversation:{summary.conversation_id}",
+                    reason="detail_pagination_incomplete",
+                    now=now,
+                )
+            if coverage == "validated_page":
+                self.ledger.mark_conversation_fetched(
+                    account.id,
+                    summary.conversation_id,
+                    coverage,
+                )
             self.ledger.insert_observation(
                 account_id=account.id,
                 source_kind="conversation",
