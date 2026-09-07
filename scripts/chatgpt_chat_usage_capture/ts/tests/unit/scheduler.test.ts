@@ -49,6 +49,91 @@ describe("durable scheduler state", () => {
     db.close();
   });
 
+  it("reads the live clock after acquiring the write lock for lease paths", () => {
+    let now = 0;
+    let armed = false;
+    const clockReads: boolean[] = [];
+    const db = new Database(":memory:");
+    const scheduler = new SchedulerStore(db, {
+      clock: () => {
+        if (armed) {
+          clockReads.push(db.inTransaction);
+        }
+        return now;
+      },
+      random: () => 0,
+    });
+    const account = scope();
+    scheduler.ensureSchedule(account, { anchorAt: 0, interval: "PT1H" });
+    armed = true;
+
+    const expectClockAfterLock = (operation: () => void): void => {
+      clockReads.length = 0;
+      operation();
+      expect(clockReads).toEqual([true]);
+    };
+
+    let lease = scheduler.claimLease(account, "worker-a", {
+      leaseDurationMs: 2 * HOUR_MS,
+    });
+    expectClockAfterLock(() => {
+      lease = scheduler.claimLease(account, "worker-a", {
+        leaseDurationMs: 2 * HOUR_MS,
+      });
+    });
+    expect(lease.acquired).toBe(false);
+
+    now = HOUR_MS + 1;
+    let claim = scheduler.claimTrigger(
+      account,
+      "worker-a",
+      lease.lease.fencingToken,
+    );
+    expect(claim).not.toBeNull();
+    expectClockAfterLock(() => {
+      claim = scheduler.claimTrigger(
+        account,
+        "worker-a",
+        lease.lease.fencingToken,
+      );
+    });
+    expect(claim?.resumed).toBe(true);
+
+    now += 1_000;
+    expectClockAfterLock(() => {
+      expect(
+        scheduler.heartbeatLease(
+          account,
+          "worker-a",
+          lease.lease.fencingToken,
+          { leaseDurationMs: HOUR_MS },
+        ).applied,
+      ).toBe(true);
+    });
+    expectClockAfterLock(() => {
+      expect(scheduler.requestRefresh(account).occupied).toBe(true);
+    });
+    expectClockAfterLock(() => {
+      expect(
+        scheduler.completeTrigger(
+          account,
+          "worker-a",
+          lease.lease.fencingToken,
+        ).applied,
+      ).toBe(true);
+    });
+    expectClockAfterLock(() => {
+      expect(
+        scheduler.releaseLease(
+          account,
+          "worker-a",
+          lease.lease.fencingToken,
+        ).applied,
+      ).toBe(true);
+    });
+    db.close();
+  });
+
   it("coalesces six missed hourly ticks into one durable catch-up", () => {
     let now = 0;
     const db = new Database(":memory:");

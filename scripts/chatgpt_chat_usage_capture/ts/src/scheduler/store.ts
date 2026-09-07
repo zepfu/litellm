@@ -203,9 +203,10 @@ export class SchedulerStore {
     options: AtOptions = {},
   ): RefreshRequest {
     validateScope(scope);
-    const now = resolveNow(this.clock, options.at);
+    const explicitAt = explicitTime(options.at);
 
     return this.transaction(() => {
+      const now = explicitAt ?? normalizeTime(this.clock());
       let state = this.readSchedule(scope);
       if (!state) {
         const interval = parseRefreshInterval(DEFAULT_REFRESH_INTERVAL);
@@ -263,12 +264,13 @@ export class SchedulerStore {
   ): LeaseClaim {
     validateScope(scope);
     validateNonEmpty(ownerId, "ownerId");
-    const now = resolveNow(this.clock, options.at);
+    const explicitAt = explicitTime(options.at);
     const leaseDurationMs = validateLeaseDuration(
       options.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS,
     );
 
     return this.transaction(() => {
+      const now = explicitAt ?? normalizeTime(this.clock());
       const current = this.readLease(scope);
       if (!current) {
         this.db
@@ -338,12 +340,13 @@ export class SchedulerStore {
     validateScope(scope);
     validateNonEmpty(ownerId, "ownerId");
     validateFencingToken(fencingToken);
-    const now = resolveNow(this.clock, options.at);
+    const explicitAt = explicitTime(options.at);
     const leaseDurationMs = validateLeaseDuration(
       options.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS,
     );
 
     return this.transaction(() => {
+      const now = explicitAt ?? normalizeTime(this.clock());
       const result = this.db
         .prepare(`
           UPDATE chatgpt_scheduler_leases
@@ -381,9 +384,10 @@ export class SchedulerStore {
     validateScope(scope);
     validateNonEmpty(ownerId, "ownerId");
     validateFencingToken(fencingToken);
-    const now = resolveNow(this.clock, options.at);
+    const explicitAt = explicitTime(options.at);
 
     return this.transaction(() => {
+      const now = explicitAt ?? normalizeTime(this.clock());
       const result = this.db
         .prepare(`
           UPDATE chatgpt_scheduler_leases
@@ -422,9 +426,10 @@ export class SchedulerStore {
     validateScope(scope);
     validateNonEmpty(ownerId, "ownerId");
     validateFencingToken(fencingToken);
-    const now = resolveNow(this.clock, options.at);
+    const explicitAt = explicitTime(options.at);
 
     return this.transaction(() => {
+      const now = explicitAt ?? normalizeTime(this.clock());
       this.assertLease(scope, ownerId, fencingToken, now);
       let state = this.requireSchedule(scope);
 
@@ -521,9 +526,10 @@ export class SchedulerStore {
     validateScope(scope);
     validateNonEmpty(ownerId, "ownerId");
     validateFencingToken(fencingToken);
-    const now = resolveNow(this.clock, options.at);
+    const explicitAt = explicitTime(options.at);
 
     return this.transaction(() => {
+      const now = explicitAt ?? normalizeTime(this.clock());
       if (!this.hasValidLease(scope, ownerId, fencingToken, now)) {
         return {
           applied: false,
@@ -970,6 +976,10 @@ function validateNonEmpty(value: string, label: string): void {
 
 function resolveNow(clock: () => number, value: SchedulerTime | undefined): number {
   return normalizeTime(value ?? clock());
+}
+
+function explicitTime(value: SchedulerTime | undefined): number | undefined {
+  return value === undefined ? undefined : normalizeTime(value);
 }
 
 function normalizeTime(value: SchedulerTime): number {
