@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import json
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,11 +18,18 @@ from scripts.chatgpt_chat_usage_capture.privacy import (
     ADAPTER_VERSION,
     assert_no_secrets,
     classify_surface,
+    sanitize_metadata,
     sanitize_identity,
     sanitize_mapping,
     observation_projection,
 )
-from scripts.chatgpt_chat_usage_capture.adapter import ChatGPTHistoryAdapter, FixtureTransport, AdapterError
+from scripts.chatgpt_chat_usage_capture.adapter import (
+    AdapterError,
+    ChatGPTHistoryAdapter,
+    FixtureTransport,
+    adapt_message_page,
+    message_from_node,
+)
 from scripts.chatgpt_chat_usage_capture.collector import Collector
 from scripts.chatgpt_chat_usage_capture.reporting import build_report
 from scripts.chatgpt_chat_usage_capture.timeutil import ensure_utc, parse_iso_duration, isoformat_utc
@@ -28,6 +37,79 @@ from scripts.chatgpt_chat_usage_capture.models import ConversationSummary, Attem
 
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures"
+
+
+class SessionTransport:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        assert method == "GET"
+        assert path == "/api/auth/session"
+        return self.payload
+
+
+class IncompleteDetailTransport:
+    def __init__(self) -> None:
+        self.requests: list[dict[str, Any]] = []
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        assert method == "GET"
+        query = dict(params or {})
+        self.requests.append({"method": method, "path": path, "params": query})
+        if path == "/api/auth/session":
+            return {
+                "user": {"id": "user-abc123"},
+                "workspace_id": "ws-xyz",
+                "quota_owner_id": "user-abc123",
+                "surface": "chat",
+            }
+        if path == "/backend-api/conversations":
+            if query.get("is_archived") == "true":
+                return {"items": [], "total": 0, "offset": 0}
+            return {
+                "items": [
+                    {
+                        "id": "conv-incomplete",
+                        "create_time": "2026-09-05T10:00:00Z",
+                        "update_time": "2026-09-05T12:00:00Z",
+                        "surface": "chat",
+                        "workspace_id": "ws-xyz",
+                    }
+                ],
+                "total": 1,
+                "offset": 0,
+            }
+        if path == "/backend-api/conversations/conv-incomplete":
+            return {
+                "conversation_id": "conv-incomplete",
+                "surface": "chat",
+                "messages": [
+                    {
+                        "id": "msg-incomplete",
+                        "author": {"role": "assistant"},
+                        "create_time": "2026-09-05T12:00:00Z",
+                        "metadata": {
+                            "model_slug": "gpt-5.6-astra-pro",
+                            "generation_id": "gen-incomplete",
+                        },
+                        "status": "finished_successfully",
+                        "end_turn": True,
+                    }
+                ],
+                "page_info": {"has_previous_page": True},
+            }
+        raise AssertionError(f"unexpected request: {method} {path} {query}")
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +126,9 @@ MINIMAL_CONFIG: dict[str, Any] = {
             "id": "test-account",
             "enabled": True,
             "surface": "chat",
+            "expected_provider_user_id": "user-abc123",
+            "expected_workspace_id": "ws-xyz",
+            "quota_owner_id": "user-abc123",
             "plan_policy_id": "pro200-chat-2026-09-05",
             "browser": {
                 "adapter": "fixture_history",
@@ -154,6 +239,61 @@ class TestPrivacy:
         assert result["provenance"]["adapter_version"] == ADAPTER_VERSION
         assert result["provenance"]["source_kind"] == "test"
 
+    def test_metadata_projection_drops_content_and_unknown_values(self):
+        raw_metadata = {
+            "requested_model": "gpt-5.6-astra-pro",
+            "generation_id": "gen-001",
+            "request_id": "req-001",
+            "surface": "chat",
+            "prompt": "PRIVATE_PROMPT_9f7c",
+            "citations": [
+                {
+                    "title": "PRIVATE_CITATION_TITLE_9f7c",
+                    "url": "https://private.example/9f7c",
+                }
+            ],
+            "private_note": "PRIVATE_METADATA_9f7c",
+            "finish_details": {"reason": "PRIVATE_FINISH_DETAIL_9f7c"},
+            "model_slug": {"content": "PRIVATE_NESTED_CONTENT_9f7c"},
+        }
+
+        result = observation_projection(
+            {"id": "msg-001", "metadata": raw_metadata, "surface": "chat"},
+            source_kind="message",
+            run_id="run-1",
+            evidence_id="msg-001",
+        )
+        projected = result["metadata"]
+
+        assert projected == {
+            "requested_model": "gpt-5.6-astra-pro",
+            "generation_id": "gen-001",
+            "request_id": "req-001",
+            "surface": "chat",
+        }
+        serialized = json.dumps(result)
+        for private_value in (
+            "PRIVATE_PROMPT_9f7c",
+            "PRIVATE_CITATION_TITLE_9f7c",
+            "PRIVATE_METADATA_9f7c",
+            "PRIVATE_FINISH_DETAIL_9f7c",
+            "PRIVATE_NESTED_CONTENT_9f7c",
+        ):
+            assert private_value not in serialized
+        assert "metadata.prompt:string" in result["provenance"]["unknown_fields"]
+
+    def test_metadata_projection_is_closed_for_non_scalar_allowlisted_fields(self):
+        projected = sanitize_metadata(
+            {
+                "generation_id": "gen-002",
+                "request_id": ["PRIVATE_LIST_VALUE_9f7c"],
+                "status": {"detail": "PRIVATE_STATUS_9f7c"},
+                "is_complete": True,
+            }
+        )
+
+        assert projected == {"generation_id": "gen-002", "is_complete": True}
+
 
 # ---------------------------------------------------------------------------
 # Adapter
@@ -172,17 +312,69 @@ class TestAdapter:
 
     def test_adapter_inspect_session(self):
         transport = FixtureTransport(FIXTURE_ROOT)
-        adapter = ChatGPTHistoryAdapter(transport, expected_identity={"provider_user_id": "user-abc123"})
+        adapter = ChatGPTHistoryAdapter(
+            transport,
+            expected_identity={
+                "provider_user_id": "user-abc123",
+                "workspace_id": "ws-xyz",
+                "quota_owner_id": "user-abc123",
+            },
+        )
         identity = adapter.inspect_session()
         assert identity["auth_state"] == "ready"
         assert identity["surface"] == SURFACE_CHAT
         assert identity["provider_user_id"] == "user-abc123"
 
-    def test_adapter_identity_mismatch(self):
+    @pytest.mark.parametrize(
+        "field",
+        ("provider_user_id", "workspace_id", "quota_owner_id"),
+    )
+    def test_adapter_identity_mismatch(self, field):
         transport = FixtureTransport(FIXTURE_ROOT)
-        adapter = ChatGPTHistoryAdapter(transport, expected_identity={"provider_user_id": "wrong-user"})
+        expected = {
+            "provider_user_id": "user-abc123",
+            "workspace_id": "ws-xyz",
+            "quota_owner_id": "user-abc123",
+        }
+        expected[field] = "wrong-value"
+        adapter = ChatGPTHistoryAdapter(transport, expected_identity=expected)
         identity = adapter.inspect_session()
         assert identity["auth_state"] == "identity_mismatch"
+        assert f"{field}_mismatch" in identity["identity_errors"]
+
+    @pytest.mark.parametrize(
+        "field",
+        ("provider_user_id", "workspace_id", "quota_owner_id"),
+    )
+    def test_adapter_requires_all_expected_identity_fields(self, field):
+        transport = FixtureTransport(FIXTURE_ROOT)
+        expected = {
+            "provider_user_id": "user-abc123",
+            "workspace_id": "ws-xyz",
+            "quota_owner_id": "user-abc123",
+        }
+        expected.pop(field)
+        adapter = ChatGPTHistoryAdapter(transport, expected_identity=expected)
+        identity = adapter.inspect_session()
+        assert identity["auth_state"] == "unconfigured"
+        assert f"missing_expected_{field}" in identity["identity_errors"]
+
+    def test_adapter_requires_observed_quota_owner(self):
+        session = json.loads((FIXTURE_ROOT / "session.json").read_text())
+        session.pop("quota_owner_id")
+        adapter = ChatGPTHistoryAdapter(
+            SessionTransport(session),
+            expected_identity={
+                "provider_user_id": "user-abc123",
+                "workspace_id": "ws-xyz",
+                "quota_owner_id": "user-abc123",
+            },
+        )
+
+        identity = adapter.inspect_session()
+
+        assert identity["auth_state"] == "identity_mismatch"
+        assert "missing_observed_quota_owner_id" in identity["identity_errors"]
 
     def test_list_conversations_active(self):
         transport = FixtureTransport(FIXTURE_ROOT)
@@ -199,6 +391,38 @@ class TestAdapter:
         payload = adapter.fetch_conversation("conv-001")
         assert isinstance(payload["mapping"], dict)
         assert len(payload["mapping"]) == 4
+
+    def test_missing_detail_cursor_is_incomplete(self):
+        page = adapt_message_page(
+            {
+                "messages": [
+                    {
+                        "id": "msg-001",
+                        "author": {"role": "assistant"},
+                        "metadata": {"generation_id": "gen-001"},
+                    }
+                ],
+                "page_info": {"has_previous_page": True},
+            },
+            conversation_id="conv-001",
+            conversation_surface=SURFACE_CHAT,
+        )
+
+        assert page.coverage == "unrecognized"
+        assert page.exhausted is False
+        assert page.continuation is None
+        assert "has_previous_page_without_start_cursor" in page.warnings
+
+    def test_unknown_200_detail_shape_is_incomplete(self):
+        page = adapt_message_page(
+            {"status": "ok", "future_shape": {"items": []}},
+            conversation_id="conv-001",
+            conversation_surface=SURFACE_CHAT,
+        )
+
+        assert page.coverage == "unrecognized"
+        assert page.exhausted is False
+        assert "unrecognized_detail_shape" in page.warnings
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +450,54 @@ class TestLedger:
             "plan_policy_id": "pro200",
         })
         # Should not raise
+
+    def test_message_ledger_receives_only_projected_metadata(self, ledger):
+        ledger.upsert_account(
+            {
+                "collector_account_id": "test-metadata",
+                "quota_owner_id": "user-123",
+                "surface": SURFACE_CHAT,
+                "auth_state": "ready",
+            }
+        )
+        warnings: list[str] = []
+        record = message_from_node(
+            {
+                "id": "node-001",
+                "message": {
+                    "id": "msg-001",
+                    "author": {"role": "assistant"},
+                    "metadata": {
+                        "generation_id": {
+                            "prompt": "PRIVATE_GENERATION_PROMPT_ledger_9f7c"
+                        },
+                        "request_id": "req-001",
+                        "prompt": "PRIVATE_PROMPT_ledger_9f7c",
+                        "citations": [
+                            {"title": "PRIVATE_CITATION_ledger_9f7c"}
+                        ],
+                        "private_note": "PRIVATE_METADATA_ledger_9f7c",
+                    },
+                },
+            },
+            conversation_id="conv-001",
+            warnings=warnings,
+            conversation_surface=SURFACE_CHAT,
+        )
+
+        assert record is not None
+        ledger.upsert_message("test-metadata", record)
+        stored = ledger.messages_for("test-metadata", "conv-001")
+
+        assert stored[0].metadata == {
+            "request_id": "req-001",
+        }
+        assert stored[0].generation_id is None
+        assert "PRIVATE_GENERATION_PROMPT_ledger_9f7c" not in json.dumps(
+            stored[0].metadata
+        )
+        assert "PRIVATE_PROMPT_ledger_9f7c" not in json.dumps(stored[0].metadata)
+        assert "PRIVATE_CITATION_ledger_9f7c" not in json.dumps(stored[0].metadata)
 
     def test_rejects_non_chat_surface(self, ledger):
         with pytest.raises(ValueError, match="surface=chat"):
@@ -349,6 +621,72 @@ class TestCollectorIntegration:
         assert result["surface"] == SURFACE_CHAT
         assert result["identity"]["auth_state"] == "ready"
         assert "capabilities" in result
+
+    def test_identity_mismatch_does_not_persist_configured_identity_as_observed(self):
+        payload = copy.deepcopy(MINIMAL_CONFIG)
+        payload["accounts"][0]["expected_provider_user_id"] = "wrong-user"
+        config = parse_config(payload, source_path=Path("/tmp/test-config.yaml"))
+        with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+            path = f.name
+        ledger = Ledger(path)
+        try:
+            result = Collector(
+                config,
+                ledger,
+                fixture_root=str(FIXTURE_ROOT),
+            ).collect(mode="refresh")
+
+            assert result.result == "identity_mismatch"
+            row = ledger.conn.execute(
+                """
+                SELECT provider_user_id, workspace_id, auth_state
+                FROM accounts
+                WHERE collector_account_id=?
+                """,
+                ("test-account",),
+            ).fetchone()
+            assert row["provider_user_id"] is None
+            assert row["workspace_id"] is None
+            assert row["auth_state"] == "identity_mismatch"
+            assert ledger.conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 0
+        finally:
+            ledger.close()
+            Path(path).unlink(missing_ok=True)
+
+    def test_incomplete_detail_does_not_advance_watermark(self, config_and_ledger):
+        config, ledger = config_and_ledger
+        transport = IncompleteDetailTransport()
+        adapter = ChatGPTHistoryAdapter(
+            transport,
+            expected_identity={
+                "provider_user_id": "user-abc123",
+                "workspace_id": "ws-xyz",
+                "quota_owner_id": "user-abc123",
+            },
+        )
+
+        result = Collector(config, ledger, adapter=adapter).collect(mode="refresh")
+
+        assert result.result == "partial"
+        assert "detail_coverage:unrecognized" in result.warnings
+        state = ledger.get_discovery_state("test-account", "active")
+        assert state is not None
+        assert state["coverage"] == "partial"
+        assert state["last_complete_discovery_started_at"] is None
+        assert state["watermark_at"] is None
+        assert any(
+            gap["reason"] == "detail_pagination_incomplete"
+            for gap in ledger.list_coverage_gaps("test-account")
+        )
+        pending = ledger.conn.execute(
+            """
+            SELECT pending, page_coverage
+            FROM conversation_state
+            WHERE collector_account_id=? AND conversation_id=?
+            """,
+            ("test-account", "conv-incomplete"),
+        ).fetchone()
+        assert pending["pending"] == 1
 
     def test_report_after_collect(self, config_and_ledger):
         config, ledger = config_and_ledger

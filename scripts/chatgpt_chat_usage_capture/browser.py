@@ -67,6 +67,7 @@ def build_playwright_adapter(account: AccountConfig) -> ChatGPTHistoryAdapter:
         expected_identity={
             "provider_user_id": account.expected_provider_user_id,
             "workspace_id": account.expected_workspace_id,
+            "quota_owner_id": account.quota_owner_id,
         },
     )
 

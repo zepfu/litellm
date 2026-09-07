@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from typing import Any, Iterable, Mapping, Optional
 
@@ -96,27 +97,18 @@ METADATA_ALLOWLIST = {
     "request_id",
     "message_request_id",
     "parent_id",
-    "finish_details",
     "is_complete",
     "is_visually_hidden_from_conversation",
-    "pad",
     "timestamp_",
-    "citations",
-    "command",
     "status",
-    "invoke_path",
-    "model_switcher_deny",
     "gizmo_id",
     "conversation_id",
     "surface",
     "origin",
-    "shared_conversation_id",
     "from_shared",
     "from_copy",
     "imported",
     "workspace_id",
-    "account_user_id",
-    "quota_owner_id",
 }
 
 IDENTITY_ALLOWLIST = {
@@ -127,6 +119,7 @@ IDENTITY_ALLOWLIST = {
     "surface",
     "auth_state",
     "plan_label",
+    "identity_errors",
 }
 
 UNKNOWN_TYPE_NAMES = {
@@ -139,6 +132,37 @@ UNKNOWN_TYPE_NAMES = {
     bool: "boolean",
     type(None): "null",
 }
+
+_METADATA_IDENTIFIER_KEYS = {
+    "model_slug",
+    "requested_model",
+    "requested_model_slug",
+    "default_model_slug",
+    "generation_id",
+    "request_id",
+    "message_request_id",
+    "parent_id",
+    "gizmo_id",
+    "conversation_id",
+    "workspace_id",
+}
+_METADATA_TOKEN_KEYS = {
+    "requested_mode",
+    "reasoning_effort",
+    "status",
+    "surface",
+    "origin",
+}
+_METADATA_BOOLEAN_KEYS = {
+    "is_complete",
+    "is_visually_hidden_from_conversation",
+    "from_shared",
+    "from_copy",
+    "imported",
+}
+_METADATA_NUMBER_KEYS = {"timestamp_"}
+_SAFE_METADATA_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+_DROP = object()
 
 
 class PrivacyError(ValueError):
@@ -230,7 +254,6 @@ def sanitize_mapping(payload: Mapping[str, Any], *, allow_content: bool = False)
     for raw_key, raw_value in payload.items():
         key = str(raw_key)
         if SENSITIVE_KEY_RE.search(key):
-            out[key] = REDACTED
             continue
         if not allow_content and CONTENT_KEY_RE.fullmatch(key):
             continue
@@ -249,15 +272,44 @@ def sanitize_mapping(payload: Mapping[str, Any], *, allow_content: bool = False)
 
 
 def sanitize_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Project message metadata to typed, non-content provenance fields."""
     out: dict[str, Any] = {}
     for raw_key, raw_value in metadata.items():
         key = str(raw_key)
-        if SENSITIVE_KEY_RE.search(key) or CONTENT_KEY_RE.fullmatch(key):
-            continue
         if key not in METADATA_ALLOWLIST:
             continue
-        out[key] = sanitize_value(raw_value, key=key, allow_content=False)
+        projected = _project_metadata_value(key, raw_value)
+        if projected is _DROP:
+            continue
+        out[key] = projected
     return out
+
+
+def _project_metadata_value(key: str, value: Any) -> Any:
+    if key in _METADATA_BOOLEAN_KEYS:
+        return value if isinstance(value, bool) else _DROP
+    if key in _METADATA_NUMBER_KEYS:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return _DROP
+        return value if math.isfinite(float(value)) else _DROP
+    if key not in _METADATA_IDENTIFIER_KEYS and key not in _METADATA_TOKEN_KEYS:
+        return _DROP
+    if not isinstance(value, str):
+        return _DROP
+    normalized = sanitize_token(value)
+    if normalized is None:
+        return _DROP
+    return normalized
+
+
+def sanitize_token(value: Any) -> Optional[str]:
+    """Return a compact identifier/token or None for unsupported input."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized or not _SAFE_METADATA_TOKEN_RE.fullmatch(normalized):
+        return None
+    return normalized
 
 
 def sanitize_identity(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -266,11 +318,20 @@ def sanitize_identity(payload: Mapping[str, Any]) -> dict[str, Any]:
         if key in payload:
             value = payload[key]
             if SENSITIVE_KEY_RE.search(key):
-                out[key] = REDACTED
+                continue
+            elif key == "identity_errors":
+                if isinstance(value, (list, tuple)):
+                    out[key] = [
+                        str(item)
+                        for item in value
+                        if sanitize_token(item) is not None
+                    ][:16]
             elif isinstance(value, str):
-                out[key] = redact_text(value)
+                normalized = sanitize_token(value)
+                if normalized is not None:
+                    out[key] = normalized
             else:
-                out[key] = value
+                continue
     out.setdefault("surface", classify_surface(payload, default=None))
     return out
 
@@ -285,7 +346,7 @@ def observation_projection(
     sanitized = sanitize_mapping(payload)
     keep: dict[str, Any] = {}
     for key, value in sanitized.items():
-        if key in OBSERVATION_ALLOWLIST or key in METADATA_ALLOWLIST:
+        if key in OBSERVATION_ALLOWLIST:
             keep[key] = value
     keep["surface"] = classify_surface(payload, default=None)
     keep["provenance"] = {

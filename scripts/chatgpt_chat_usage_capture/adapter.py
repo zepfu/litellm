@@ -12,7 +12,8 @@ from .privacy import (
     ADAPTER_VERSION,
     classify_surface,
     sanitize_identity,
-    sanitize_mapping,
+    sanitize_metadata,
+    sanitize_token,
 )
 from .timeutil import parse_datetime
 
@@ -23,6 +24,11 @@ LEGACY_DETAIL = "/backend-api/conversation/{conversation_id}"
 SESSION_ROUTE = "/api/auth/session"
 INIT_ROUTE = "/backend-api/conversation/init"
 ALLOWED_METHODS = {"GET"}
+REQUIRED_IDENTITY_FIELDS = (
+    "provider_user_id",
+    "workspace_id",
+    "quota_owner_id",
+)
 ALLOWED_PATH_PREFIXES = (
     "/backend-api/conversations",
     "/backend-api/conversation/",
@@ -126,28 +132,47 @@ class ChatGPTHistoryAdapter:
             _raise_if_rate_limited(payload, SESSION_ROUTE)
         except AuthenticationRequiredError:
             return {"surface": "unknown", "auth_state": "auth_required"}
-        identity = sanitize_identity(
-            {
-                "provider_user_id": payload.get("user", {}).get("id")
-                if isinstance(payload.get("user"), Mapping)
-                else payload.get("user_id") or payload.get("id"),
-                "workspace_id": payload.get("workspace_id") or payload.get("account", {}).get("id")
-                if isinstance(payload.get("account"), Mapping)
-                else payload.get("workspace_id"),
-                "quota_owner_id": payload.get("quota_owner_id")
-                or payload.get("account", {}).get("id")
-                if isinstance(payload.get("account"), Mapping)
-                else payload.get("quota_owner_id"),
-                "surface": classify_surface(payload, default=None),
-                "auth_state": "ready" if payload.get("accessToken") or payload.get("user") else "auth_required",
-            }
+        user = payload.get("user")
+        user_mapping = user if isinstance(user, Mapping) else {}
+        account = payload.get("account")
+        account_mapping = account if isinstance(account, Mapping) else {}
+        observed = {
+            "provider_user_id": user_mapping.get("id")
+            or payload.get("user_id")
+            or payload.get("id"),
+            "workspace_id": payload.get("workspace_id")
+            or account_mapping.get("workspace_id"),
+            "quota_owner_id": payload.get("quota_owner_id")
+            or account_mapping.get("quota_owner_id"),
+            "surface": classify_surface(payload, default=None),
+        }
+        identity = sanitize_identity(observed)
+        authenticated = bool(
+            user_mapping
+            or payload.get("user_id")
+            or payload.get("id")
         )
-        expected_user = self.expected_identity.get("provider_user_id")
-        expected_workspace = self.expected_identity.get("workspace_id")
-        if expected_user and identity.get("provider_user_id") not in {expected_user, None}:
+        if not authenticated:
+            identity["auth_state"] = "auth_required"
+            return identity
+
+        errors: list[str] = []
+        for field in REQUIRED_IDENTITY_FIELDS:
+            expected = _optional_str(self.expected_identity.get(field))
+            actual = identity.get(field)
+            if expected is None:
+                errors.append(f"missing_expected_{field}")
+            elif actual is None:
+                errors.append(f"missing_observed_{field}")
+            elif actual != expected:
+                errors.append(f"{field}_mismatch")
+        identity["identity_errors"] = errors
+        if any(error.startswith("missing_expected_") for error in errors):
+            identity["auth_state"] = "unconfigured"
+        elif errors:
             identity["auth_state"] = "identity_mismatch"
-        if expected_workspace and identity.get("workspace_id") not in {expected_workspace, None}:
-            identity["auth_state"] = "identity_mismatch"
+        else:
+            identity["auth_state"] = "ready"
         return identity
 
     def list_conversations(
@@ -348,10 +373,18 @@ def adapt_conversation_index(
     )
 
 
-def adapt_message_page(payload: Mapping[str, Any], *, conversation_id: str, conversation_surface: str = "unknown") -> AdaptedPage:
+def adapt_message_page(
+    payload: Mapping[str, Any],
+    *,
+    conversation_id: str,
+    conversation_surface: str = "unknown",
+) -> AdaptedPage:
     warnings: list[str] = []
     records: list[MessageRecord] = []
-    if isinstance(payload.get("mapping"), Mapping):
+    has_mapping = isinstance(payload.get("mapping"), Mapping)
+    has_messages = "messages" in payload
+    messages_raw = payload.get("messages")
+    if has_mapping:
         records.extend(
             iter_mapping_messages(
                 payload["mapping"],
@@ -360,34 +393,85 @@ def adapt_message_page(payload: Mapping[str, Any], *, conversation_id: str, conv
                 conversation_surface=classify_surface(payload, default=conversation_surface),
             )
         )
-    messages = payload.get("messages")
-    if isinstance(messages, list):
-        for item in messages:
+    elif has_messages and isinstance(messages_raw, list):
+        for item in messages_raw:
             if isinstance(item, Mapping):
                 record = message_from_node(item, conversation_id=conversation_id, warnings=warnings, conversation_surface=conversation_surface)
                 if record is not None:
                     records.append(record)
-    page_info_raw = payload.get("page_info")
-    page_info: Mapping[str, Any] = page_info_raw if isinstance(page_info_raw, Mapping) else {}
-    cursor = page_info.get("start_cursor")
-    has_previous = page_info.get("has_previous_page")
-    exhausted = has_previous is False
-    continuation = cursor if has_previous else None
-    if has_previous is True and not cursor:
-        warnings.append("has_previous_page without start_cursor")
-        coverage = "unrecognized"
-        exhausted = False
-        continuation = None
-    elif has_previous is None and not records and not payload.get("mapping"):
-        coverage = "unrecognized"
-        exhausted = False
+                else:
+                    warnings.append("message item missing id")
+            else:
+                warnings.append("non-object message item")
     else:
-        coverage = "partial" if warnings else "validated_page"
+        warnings.append("unrecognized_detail_shape")
+        if has_messages:
+            warnings.append("messages_not_array")
+        if "mapping" in payload:
+            warnings.append("mapping_not_object")
+        return AdaptedPage(
+            items=records,
+            continuation=None,
+            exhausted=False,
+            schema_version=ADAPTER_VERSION,
+            coverage="unrecognized",
+            warnings=warnings,
+        )
+
+    # The legacy endpoint returns a complete mapping and has no modern cursor.
+    # A modern messages response must prove whether older pages remain.
+    if has_mapping and not has_messages and "page_info" not in payload:
+        return AdaptedPage(
+            items=records,
+            continuation=None,
+            exhausted=True,
+            schema_version=ADAPTER_VERSION,
+            coverage="partial" if warnings else "validated_page",
+            warnings=warnings,
+        )
+
+    page_info_raw = payload.get("page_info")
+    if not isinstance(page_info_raw, Mapping):
+        warnings.append("missing_pagination_controls")
+        return AdaptedPage(
+            items=records,
+            continuation=None,
+            exhausted=False,
+            schema_version=ADAPTER_VERSION,
+            coverage="unrecognized",
+            warnings=warnings,
+        )
+
+    cursor = page_info_raw.get("start_cursor")
+    has_previous = page_info_raw.get("has_previous_page")
+    exhausted = False
+    continuation: str | int | None = None
+    invalid_pagination = False
+    if not isinstance(has_previous, bool):
+        warnings.append("non_boolean_has_previous_page")
+        invalid_pagination = True
+    elif has_previous:
+        if not isinstance(cursor, str) or not cursor.strip():
+            warnings.append("has_previous_page_without_start_cursor")
+            invalid_pagination = True
+        else:
+            continuation = cursor.strip()
+    elif cursor not in (None, ""):
+        warnings.append("terminal_page_has_cursor")
+        invalid_pagination = True
+    else:
+        exhausted = True
     if payload.get("repeated_cursor"):
         warnings.append("repeated_cursor")
-        coverage = "partial"
         exhausted = False
         continuation = None
+    coverage = (
+        "unrecognized"
+        if invalid_pagination
+        else "partial"
+        if warnings
+        else "validated_page"
+    )
     return AdaptedPage(
         items=records,
         continuation=continuation,
@@ -426,46 +510,79 @@ def message_from_node(
 ) -> MessageRecord | None:
     message_raw: Any = node.get("message")
     message: Mapping[str, Any] = message_raw if isinstance(message_raw, Mapping) else node
-    message_id = str(message.get("id") or node.get("id") or node_id or "").strip()
+    message_id = (
+        sanitize_token(message.get("id"))
+        or sanitize_token(node.get("id"))
+        or sanitize_token(node_id)
+    )
     if not message_id:
         warnings.append("message missing id")
         return None
     author_raw = message.get("author")
     author: Mapping[str, Any] = author_raw if isinstance(author_raw, Mapping) else {}
+    author_role = sanitize_token(author.get("role"))
     metadata_raw = message.get("metadata")
-    metadata: Mapping[str, Any] = metadata_raw if isinstance(metadata_raw, Mapping) else {}
+    metadata = sanitize_metadata(
+        metadata_raw if isinstance(metadata_raw, Mapping) else {}
+    )
     children_raw = node.get("children") if isinstance(node.get("children"), list) else message.get("children")
-    children = tuple(str(item) for item in (children_raw or []) if item)
+    children = tuple(
+        safe_child
+        for item in (children_raw or [])
+        if (safe_child := sanitize_token(item)) is not None
+    )
     requested = (
         metadata.get("requested_model")
         or metadata.get("requested_model_slug")
         or metadata.get("model_slug")
-        if author.get("role") == "user"
+        if author_role == "user"
         else metadata.get("requested_model")
     )
     recorded = None
-    if author.get("role") == "assistant":
-        recorded = metadata.get("model_slug") or message.get("model_slug")
+    if author_role == "assistant":
+        recorded = metadata.get("model_slug") or sanitize_metadata(
+            {"model_slug": message.get("model_slug")}
+        ).get("model_slug")
     return MessageRecord(
         conversation_id=conversation_id,
         message_id=message_id,
-        node_id=str(node.get("id") or node_id or message_id),
-        parent_id=_optional_str(node.get("parent") or message.get("parent") or metadata.get("parent_id")),
+        node_id=(
+            sanitize_token(node.get("id"))
+            or sanitize_token(node_id)
+            or message_id
+        ),
+        parent_id=(
+            sanitize_token(node.get("parent"))
+            or sanitize_token(message.get("parent"))
+            or sanitize_token(metadata.get("parent_id"))
+        ),
         children=children,
-        role=_optional_str(author.get("role")),
-        channel=_optional_str(message.get("channel") or metadata.get("channel")),
+        role=author_role,
+        channel=(
+            sanitize_token(message.get("channel"))
+            or sanitize_token(metadata.get("channel"))
+        ),
         created_at=parse_datetime(message.get("create_time") or node.get("create_time")),
-        status=_optional_str(message.get("status") or metadata.get("status")),
+        status=(
+            sanitize_token(message.get("status"))
+            or sanitize_token(metadata.get("status"))
+        ),
         end_turn=message.get("end_turn") if isinstance(message.get("end_turn"), bool) else None,
-        requested_model_raw=_optional_str(requested) if author.get("role") == "user" else _optional_str(metadata.get("requested_model")),
-        requested_mode_raw=_optional_str(metadata.get("requested_mode")),
-        requested_reasoning_effort_raw=_optional_str(metadata.get("reasoning_effort")),
-        recorded_final_model_raw=_optional_str(recorded),
-        generation_id=_optional_str(metadata.get("generation_id") or metadata.get("message_request_id")),
-        request_id=_optional_str(metadata.get("request_id")),
+        requested_model_raw=sanitize_token(requested) if author_role == "user" else sanitize_token(metadata.get("requested_model")),
+        requested_mode_raw=sanitize_token(metadata.get("requested_mode")),
+        requested_reasoning_effort_raw=sanitize_token(metadata.get("reasoning_effort")),
+        recorded_final_model_raw=sanitize_token(recorded),
+        generation_id=(
+            sanitize_token(metadata.get("generation_id"))
+            or sanitize_token(metadata.get("message_request_id"))
+        ),
+        request_id=sanitize_token(metadata.get("request_id")),
         surface=classify_surface(message, default=classify_surface(metadata, default=conversation_surface)),
-        origin=_optional_str(metadata.get("origin") or metadata.get("from_shared") and "shared"),
-        metadata=sanitize_mapping(metadata),
+        origin=(
+            sanitize_token(metadata.get("origin"))
+            or ("shared" if metadata.get("from_shared") is True else None)
+        ),
+        metadata=metadata,
     )
 
 
