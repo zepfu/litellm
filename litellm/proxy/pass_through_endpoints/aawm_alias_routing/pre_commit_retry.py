@@ -188,10 +188,7 @@ def _hash_target_identity(target_identity: str) -> str:
 
 
 _LOG_SAFE_CHARACTERS = frozenset(
-    "abcdefghijklmnopqrstuvwxyz"
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    "0123456789"
-    "._:/@-"
+    "abcdefghijklmnopqrstuvwxyz" "ABCDEFGHIJKLMNOPQRSTUVWXYZ" "0123456789" "._:/@-"
 )
 _LOG_VALUE_MAX_LENGTH = 160
 
@@ -212,8 +209,7 @@ def _sanitize_log_value(
     if not text:
         return fallback
     sanitized = "".join(
-        character if character in _LOG_SAFE_CHARACTERS else "_"
-        for character in text
+        character if character in _LOG_SAFE_CHARACTERS else "_" for character in text
     )
     return sanitized[:max_length] or fallback
 
@@ -365,9 +361,7 @@ async def _signal_openai_capacity_success(
     redis_cache = _resolve_redis_for_capacity_wakeup()
     if redis_cache is None:
         return
-    key = _build_openai_capacity_success_redis_key(
-        target_identity, resolved_namespace
-    )
+    key = _build_openai_capacity_success_redis_key(target_identity, resolved_namespace)
     try:
         client = redis_cache.init_async_client()
         if client is None:
@@ -427,9 +421,7 @@ class OpenAIAlphaCapacityRetryCoordinator:
         self._pending_wait_seconds: Optional[float] = None
         self._redis_cache = _resolve_redis_for_capacity_wakeup()
         self._redis_key = (
-            _build_openai_capacity_success_redis_key(
-                target_identity, self._namespace
-            )
+            _build_openai_capacity_success_redis_key(target_identity, self._namespace)
             if self._redis_cache is not None
             else None
         )
@@ -529,9 +521,7 @@ class OpenAIAlphaCapacityRetryCoordinator:
 
     async def signal_success(self) -> None:
         """Signal a successful connection to wake waiting requests."""
-        await _signal_openai_capacity_success(
-            self._target_identity, self._namespace
-        )
+        await _signal_openai_capacity_success(self._target_identity, self._namespace)
 
     async def sleep_with_wakeup(
         self,
@@ -594,12 +584,9 @@ class OpenAIAlphaCapacityRetryCoordinator:
                             wakeup.starting_epoch = current_epoch
                             wakeup.epoch_baseline_known = True
                         current_epoch = None
-                    if (
-                        current_epoch is not None
-                        and (
-                            wakeup.starting_epoch is None
-                            or current_epoch != wakeup.starting_epoch
-                        )
+                    if current_epoch is not None and (
+                        wakeup.starting_epoch is None
+                        or current_epoch != wakeup.starting_epoch
                     ):
                         wakeup.wakeup_reason = "peer_success"
                         break
