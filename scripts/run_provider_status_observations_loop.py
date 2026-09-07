@@ -13,9 +13,12 @@ import json
 import math
 import os
 import re
+import select
 import signal
+import shutil
 import socket
 import ssl
+import subprocess
 import sys
 import tempfile
 import time
@@ -23,11 +26,23 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import contextmanager
 from concurrent.futures import Future, ThreadPoolExecutor, wait as futures_wait
 from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Union
+from typing import (
+    Any,
+    Callable,
+    Collection,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Union,
+)
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -374,6 +389,15 @@ DEFAULT_CHATGPT_CONVERSATION_INIT_BROWSER_TIMEOUT_SECONDS = 30.0
 CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV = (
     "AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS"
 )
+CHATGPT_ORACLE_NODE_EXECUTABLE_ENV = "AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE"
+CHATGPT_ORACLE_PACKAGE_DIR_ENV = "AAWM_CHATGPT_ORACLE_PACKAGE_DIR"
+CHATGPT_ORACLE_CHROME_EXECUTABLE_ENV = "AAWM_CHATGPT_ORACLE_CHROME_EXECUTABLE"
+CHATGPT_ORACLE_BROWSER_SESSION_SCRIPT = (
+    Path(__file__).resolve().with_name("chatgpt_oracle_browser_session.mjs")
+)
+DEFAULT_CHATGPT_ORACLE_STARTUP_TIMEOUT_SECONDS = 45.0
+DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS = 5.0
+MAX_CHATGPT_ORACLE_STARTUP_LINE_BYTES = 1024
 DEFAULT_GROK_BILLING_POLL_ENABLED = False
 DEFAULT_GROK_BILLING_POLL_INTERVAL_SECONDS = 600.0
 DEFAULT_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS = 30.0
@@ -1394,7 +1418,17 @@ FROM ranked
 
 @dataclass(frozen=True)
 class ChatGPTConversationInitAccountBinding:
-    """Nonsecret CDP target binding for one Codex OAuth inventory label."""
+    """Nonsecret browser binding for one Codex OAuth inventory label."""
+
+    cdp_endpoint: Optional[str] = None
+    page_target_id: Optional[str] = None
+    oracle_profile_path: Optional[str] = None
+    oracle_profile_directory: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ChatGPTConversationInitResolvedBinding:
+    """Runtime CDP target binding used by the existing collector."""
 
     cdp_endpoint: str
     page_target_id: str
@@ -2006,7 +2040,12 @@ def _parse_chatgpt_conversation_init_account_bindings(
         )
 
     bindings: Dict[str, ChatGPTConversationInitAccountBinding] = {}
-    allowed_fields = {"cdp_endpoint", "page_target_id"}
+    allowed_fields = {
+        "cdp_endpoint",
+        "page_target_id",
+        "oracle_profile_path",
+        "oracle_profile_directory",
+    }
     for raw_label, raw_binding in parsed.items():
         if not isinstance(raw_label, str) or not raw_label.strip():
             raise SystemExit(
@@ -2027,21 +2066,236 @@ def _parse_chatgpt_conversation_init_account_bindings(
             )
         cdp_endpoint = raw_binding.get("cdp_endpoint")
         page_target_id = raw_binding.get("page_target_id")
+        oracle_profile_path = raw_binding.get("oracle_profile_path")
+        oracle_profile_directory = raw_binding.get("oracle_profile_directory")
+        has_cdp_binding = cdp_endpoint is not None or page_target_id is not None
+        has_oracle_binding = (
+            oracle_profile_path is not None or oracle_profile_directory is not None
+        )
+        if has_cdp_binding and has_oracle_binding:
+            raise SystemExit(
+                f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} entry "
+                f"'{label}' must use either CDP fields or Oracle profile fields, "
+                "not both."
+            )
+        if has_cdp_binding:
+            if (
+                not isinstance(cdp_endpoint, str)
+                or not cdp_endpoint.strip()
+                or not isinstance(page_target_id, str)
+                or not page_target_id.strip()
+            ):
+                raise SystemExit(
+                    f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} entry "
+                    f"'{label}' requires non-empty cdp_endpoint and page_target_id."
+                )
+            bindings[label] = ChatGPTConversationInitAccountBinding(
+                cdp_endpoint=cdp_endpoint.strip(),
+                page_target_id=page_target_id.strip(),
+            )
+            continue
+        if (
+            not isinstance(oracle_profile_path, str)
+            or not oracle_profile_path.strip()
+            or (
+                oracle_profile_directory is not None
+                and (
+                    not isinstance(oracle_profile_directory, str)
+                    or not oracle_profile_directory.strip()
+                )
+            )
+        ):
+            raise SystemExit(
+                f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} entry "
+                f"'{label}' requires non-empty oracle_profile_path and an optional "
+                "non-empty oracle_profile_directory."
+            )
+        bindings[label] = ChatGPTConversationInitAccountBinding(
+            oracle_profile_path=oracle_profile_path.strip(),
+            oracle_profile_directory=(
+                oracle_profile_directory.strip()
+                if oracle_profile_directory is not None
+                else None
+            ),
+        )
+    return bindings
+
+
+def _chatgpt_oracle_required_env_path(name: str) -> str:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        raise RuntimeError(f"{name} is required for an Oracle profile binding.")
+    return value.strip()
+
+
+def _chatgpt_oracle_startup_argv(
+    binding: ChatGPTConversationInitAccountBinding,
+) -> List[str]:
+    if binding.oracle_profile_path is None:
+        raise RuntimeError("Oracle profile binding is missing its profile path.")
+    argv = [
+        _chatgpt_oracle_required_env_path(CHATGPT_ORACLE_NODE_EXECUTABLE_ENV),
+        str(CHATGPT_ORACLE_BROWSER_SESSION_SCRIPT),
+        "--oracle-package-dir",
+        _chatgpt_oracle_required_env_path(CHATGPT_ORACLE_PACKAGE_DIR_ENV),
+        "--chrome-executable",
+        _chatgpt_oracle_required_env_path(CHATGPT_ORACLE_CHROME_EXECUTABLE_ENV),
+        "--base-profile",
+        binding.oracle_profile_path,
+    ]
+    if binding.oracle_profile_directory is not None:
+        argv.extend(
+            ["--profile-directory", binding.oracle_profile_directory]
+        )
+    if not os.getenv("DISPLAY"):
+        xvfb_run = shutil.which("xvfb-run")
+        if xvfb_run is None:
+            raise RuntimeError(
+                "xvfb-run is required for Oracle profile bindings when DISPLAY "
+                "is absent."
+            )
+        argv = [xvfb_run, "-a", *argv]
+    return argv
+
+
+def _read_chatgpt_oracle_startup_binding(
+    process: subprocess.Popen,
+) -> ChatGPTConversationInitResolvedBinding:
+    stdout = process.stdout
+    if stdout is None:
+        raise RuntimeError("Oracle browser helper did not provide a startup stream.")
+    deadline = time.monotonic() + DEFAULT_CHATGPT_ORACLE_STARTUP_TIMEOUT_SECONDS
+    buffer = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("Oracle browser helper startup timed out.")
+        try:
+            readable, _, _ = select.select([stdout], [], [], remaining)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                "Oracle browser helper startup stream failed."
+            ) from exc
+        if not readable:
+            raise RuntimeError("Oracle browser helper startup timed out.")
+        try:
+            chunk = os.read(
+                stdout.fileno(),
+                min(256, MAX_CHATGPT_ORACLE_STARTUP_LINE_BYTES + 1 - len(buffer)),
+            )
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                "Oracle browser helper startup stream failed."
+            ) from exc
+        if not chunk:
+            raise RuntimeError(
+                "Oracle browser helper closed its startup stream before readiness."
+            )
+        buffer.extend(chunk)
+        newline_index = buffer.find(b"\n")
+        if newline_index < 0:
+            if len(buffer) > MAX_CHATGPT_ORACLE_STARTUP_LINE_BYTES:
+                raise RuntimeError(
+                    "Oracle browser helper startup protocol line is too large."
+                )
+            continue
+        if newline_index > MAX_CHATGPT_ORACLE_STARTUP_LINE_BYTES:
+            raise RuntimeError(
+                "Oracle browser helper startup protocol line is too large."
+            )
+        try:
+            line = bytes(buffer[:newline_index]).decode("utf-8")
+            payload = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "Oracle browser helper returned invalid startup protocol."
+            ) from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                "Oracle browser helper returned invalid startup protocol."
+            )
+        cdp_endpoint = payload.get("cdp_endpoint")
+        page_target_id = payload.get("page_target_id")
         if (
             not isinstance(cdp_endpoint, str)
             or not cdp_endpoint.strip()
             or not isinstance(page_target_id, str)
             or not page_target_id.strip()
         ):
-            raise SystemExit(
-                f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} entry "
-                f"'{label}' requires non-empty cdp_endpoint and page_target_id."
+            raise RuntimeError(
+                "Oracle browser helper returned an incomplete startup binding."
             )
-        bindings[label] = ChatGPTConversationInitAccountBinding(
+        return ChatGPTConversationInitResolvedBinding(
             cdp_endpoint=cdp_endpoint.strip(),
             page_target_id=page_target_id.strip(),
         )
-    return bindings
+
+
+def _cleanup_chatgpt_oracle_process(process: subprocess.Popen) -> None:
+    try:
+        if process.stdin is not None:
+            process.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
+    try:
+        process.wait(timeout=DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    except OSError:
+        pass
+    finally:
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+
+@contextmanager
+def _chatgpt_oracle_browser_binding(
+    binding: ChatGPTConversationInitAccountBinding,
+) -> Iterator[ChatGPTConversationInitResolvedBinding]:
+    if binding.oracle_profile_path is None:
+        if binding.cdp_endpoint is None or binding.page_target_id is None:
+            raise RuntimeError("ChatGPT browser binding is incomplete.")
+        yield ChatGPTConversationInitResolvedBinding(
+            cdp_endpoint=binding.cdp_endpoint,
+            page_target_id=binding.page_target_id,
+        )
+        return
+
+    process: Optional[subprocess.Popen] = None
+    try:
+        try:
+            process = subprocess.Popen(
+                _chatgpt_oracle_startup_argv(binding),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                shell=False,
+                close_fds=True,
+            )
+        except OSError as exc:
+            raise RuntimeError("Oracle browser helper could not be started.") from exc
+        yield _read_chatgpt_oracle_startup_binding(process)
+    finally:
+        if process is not None:
+            _cleanup_chatgpt_oracle_process(process)
 
 
 def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
@@ -3212,8 +3466,10 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         default=os.getenv(CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV),
         help=(
             "Optional nonsecret JSON object mapping Codex OAuth inventory labels "
-            "to {cdp_endpoint,page_target_id}. When absent, retain legacy "
-            "file-only conversation-init polling."
+            "to either {cdp_endpoint,page_target_id} or "
+            "{oracle_profile_path,oracle_profile_directory}. Profile bindings "
+            "launch a private owned Oracle browser session. When absent, retain "
+            "legacy file-only conversation-init polling."
         ),
     )
 
@@ -13926,18 +14182,19 @@ def _collect_bound_chatgpt_conversation_init_account(
             dir=str(source_parent),
         ) as snapshot_dir:
             snapshot_path = str(Path(snapshot_dir) / "snapshot.json")
-            collector_summary = (
-                collect_conversation_init_snapshot_from_oracle_browser(
-                    snapshot_path,
-                    cdp_endpoint=binding.cdp_endpoint,
-                    page_target_id=binding.page_target_id,
-                    expected_account_hash=record.expected_account_hash,
-                    timeout_seconds=(
-                        DEFAULT_CHATGPT_CONVERSATION_INIT_BROWSER_TIMEOUT_SECONDS
-                    ),
-                    request_url=config.chatgpt_conversation_init_url,
+            with _chatgpt_oracle_browser_binding(binding) as resolved_binding:
+                collector_summary = (
+                    collect_conversation_init_snapshot_from_oracle_browser(
+                        snapshot_path,
+                        cdp_endpoint=resolved_binding.cdp_endpoint,
+                        page_target_id=resolved_binding.page_target_id,
+                        expected_account_hash=record.expected_account_hash,
+                        timeout_seconds=(
+                            DEFAULT_CHATGPT_CONVERSATION_INIT_BROWSER_TIMEOUT_SECONDS
+                        ),
+                        request_url=config.chatgpt_conversation_init_url,
+                    )
                 )
-            )
             coverage["collector_written"] = bool(
                 collector_summary.get("written")
             )
