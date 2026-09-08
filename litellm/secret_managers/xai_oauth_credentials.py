@@ -20,6 +20,7 @@ from typing import Any, Callable, Optional, Sequence, Tuple
 
 DEFAULT_XAI_OAUTH_AUTH_FILE = "~/.litellm/xai/oauth-auth.json"
 DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS = 300
+DEFAULT_XAI_OAUTH_LOCK_FILE = "~/.litellm/xai/oauth-auth.json.lock"
 DEFAULT_XAI_OAUTH_SCOPE = (
     "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
 )
@@ -209,6 +210,60 @@ def resolve_xai_oauth_credentials(
         scope_source=scope_resolution.source,
         credential_identity=credential_identity,
     )
+
+
+def default_xai_oauth_lock_path(auth_file: AuthPathValue) -> Path:
+    """Return the canonical sibling lock path for one managed auth file."""
+
+    path = _expand_path(_clean_string(auth_file) or DEFAULT_XAI_OAUTH_AUTH_FILE)
+    canonical_path = path.resolve(strict=False)
+    return canonical_path.with_name(f"{canonical_path.name}.lock")
+
+
+def resolve_xai_oauth_lock_path(
+    auth_file: AuthPathValue,
+    explicit_lock_file: Optional[AuthPathValue] = None,
+) -> Path:
+    """Resolve one lock identity without weakening auth-file safety checks.
+
+    The default lock is derived from the canonical auth-file target, so
+    relative paths and existing symlink aliases coordinate on one lock. The
+    portable default lock is also remapped to that sibling for custom auth
+    files, preventing a legacy fixed default from creating a second lock
+    identity. Explicit lock values are accepted only when they resolve to that
+    same canonical sibling; lock symlinks and auth-file collisions are rejected.
+    """
+
+    if explicit_lock_file is None:
+        return default_xai_oauth_lock_path(auth_file)
+    raw_lock = _clean_string(explicit_lock_file)
+    if raw_lock is None:
+        return default_xai_oauth_lock_path(auth_file)
+
+    lock_path = _expand_path(raw_lock)
+    if lock_path.is_symlink():
+        raise ValueError("xAI OAuth lock path must not be a symlink.")
+    canonical_lock = lock_path.resolve(strict=False)
+    canonical_auth = _expand_path(
+        _clean_string(auth_file) or DEFAULT_XAI_OAUTH_AUTH_FILE
+    ).resolve(strict=False)
+    if canonical_lock == canonical_auth:
+        raise ValueError("xAI OAuth lock path must differ from the auth file.")
+    canonical_default_lock = _expand_path(
+        DEFAULT_XAI_OAUTH_LOCK_FILE
+    ).resolve(strict=False)
+    if (
+        canonical_lock == canonical_default_lock
+        and canonical_auth != canonical_default_lock
+    ):
+        canonical_lock = default_xai_oauth_lock_path(auth_file)
+    canonical_sibling = default_xai_oauth_lock_path(auth_file)
+    if canonical_lock != canonical_sibling:
+        raise ValueError(
+            "xAI OAuth lock path must resolve to the canonical auth-file "
+            "sibling lock."
+        )
+    return canonical_sibling
 
 
 def _credential_identity(canonical_path: Path, scope: str) -> str:
@@ -495,7 +550,7 @@ def evaluate_xai_oauth_credential_lifecycle(
         refresh_threshold_metadata(record, min_seconds=refresh_min)
     )
     expired = bool(expiry_available and expires_at <= observed_at)
-    refresh_due = not expiry_available or (
+    refresh_due = not access_available or not expiry_available or (
         observed_at >= expires_at - timedelta(seconds=threshold_seconds)
     )
     route_unusable = (

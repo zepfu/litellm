@@ -151,6 +151,19 @@ observability, routing, authentication, and session metadata remain in the
 separate `litellm_metadata` structure and are never merged into caller
 top-level `metadata`.
 
+## Rate-limit handling
+
+For an xAI provider `429`, LiteLLM uses a valid `Retry-After` value first.
+Otherwise it uses the request or token reset header for the exhausted
+dimension. If the response does not identify the exhausted dimension and both
+dimension-specific values are valid, LiteLLM waits for the later reset.
+Bounded generic reset headers are used only when no dimension-specific reset
+is available.
+
+Reset values may be bounded durations, epoch timestamps, ISO timestamps, or
+HTTP-date values. Malformed, expired, non-finite, and unreasonably future
+values are ignored instead of creating a durable cooldown.
+
 ## OAuth Credential Scope Selection
 
 Managed xAI OAuth and native Grok OIDC credential files must contain the exact
@@ -179,6 +192,19 @@ and the configured minimum. A credential can therefore be `refresh_due` while
 remaining `route_usable`, and refresh-only, access-only, malformed-expiry, and
 expired records receive distinct lifecycle states. Missing or malformed expiry
 never becomes permanently fresh.
+
+`AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS` controls writer-side proactive refresh.
+`LITELLM_XAI_OAUTH_REFRESH_BUFFER_SECONDS` controls the route-safety deadline
+used by request handling and sidecar health/eligibility. These settings are
+independent; an omitted writer buffer retains the compatibility fallback to
+the consumer setting and then the 300-second default.
+
+Managed xAI refreshes derive their default advisory lock from the canonical
+resolved auth file, using the file's `.lock` sibling. Different custom auth
+files use independent locks, while aliases for one file coordinate on one
+lock. Set `AAWM_XAI_OAUTH_LOCK_FILE` or `--xai-oauth-lock-file` only to an
+alias of that canonical sibling; arbitrary paths, lock symlinks, and auth-file
+lock collisions fail closed.
 
 ## Proxy Retry and Quota Behavior
 

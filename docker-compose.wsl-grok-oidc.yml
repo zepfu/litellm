@@ -73,7 +73,10 @@ services:
         grok_timeout = float(env_str("AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS", "30"))
 
         xai_auth_file = env_str("AAWM_XAI_OAUTH_AUTH_FILE", "/home/zepfu/.litellm/xai/oauth-auth.json")
-        xai_lock_file = env_str("AAWM_XAI_OAUTH_LOCK_FILE", str(Path(xai_auth_file).with_name(Path(xai_auth_file).name + ".lock")))
+        xai_lock_file = str(xai.resolve_xai_oauth_lock_path(
+            xai_auth_file,
+            os.getenv("AAWM_XAI_OAUTH_LOCK_FILE"),
+        ))
         xai_interval = env_int("AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS", 300)
         xai_buffer_seconds = env_int("AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS", 300)
         xai_force = env_bool("AAWM_XAI_OAUTH_FORCE_REFRESH", False)

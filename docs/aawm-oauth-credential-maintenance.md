@@ -157,6 +157,20 @@ Refresh-only records cannot serve requests, access-only records become terminal
 when due, and missing or malformed expiry remains degraded and eligible for
 safe refresh rather than being treated as permanently fresh.
 
+`AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS` is the writer's proactive refresh
+minimum. `LITELLM_XAI_OAUTH_REFRESH_BUFFER_SECONDS` is the consumer
+route-safety buffer shared by request readiness and sidecar health/eligibility.
+They are intentionally independent; helper calls without an explicit writer
+buffer retain the compatibility fallback from the writer setting to the
+consumer setting and then the 300-second default.
+
+Managed xAI refresh writers derive the default lock from that same canonical
+auth-file target, using its `.lock` sibling. This lets unrelated custom auth
+files refresh concurrently while all aliases for one file share one advisory
+lock. `AAWM_XAI_OAUTH_LOCK_FILE` and `--xai-oauth-lock-file` may be supplied
+only as aliases of that canonical sibling; arbitrary lock paths, lock
+symlinks, and auth-file collisions fail closed.
+
 ## Managed xAI egress headers
 
 Managed `oa_xai/*` requests send the selected access token only as

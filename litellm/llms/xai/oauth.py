@@ -34,6 +34,7 @@ from litellm.secret_managers.xai_oauth_credentials import (
     DEFAULT_XAI_OAUTH_AUTH_FILE,
     DEFAULT_XAI_OAUTH_SCOPE,
     XaiOAuthCredentialResolution,
+    credential_access_token,
     evaluate_xai_oauth_credential_lifecycle,
     resolve_xai_oauth_credentials,
     select_xai_oauth_credential_record,
@@ -694,10 +695,7 @@ def _select_credential_record(
 
 
 def _credential_access_token(credential: Mapping[str, Any]) -> Optional[str]:
-    token = credential.get("access_token") or credential.get("key")
-    if isinstance(token, str) and token.strip():
-        return token.strip()
-    return None
+    return credential_access_token(credential)
 
 
 def _credential_needs_refresh(credential: Mapping[str, Any]) -> bool:

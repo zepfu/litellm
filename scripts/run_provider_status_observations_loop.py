@@ -118,10 +118,13 @@ from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
 )
 from litellm.secret_managers.xai_oauth_credentials import (
+    DEFAULT_XAI_OAUTH_LOCK_FILE as FOUNDATION_DEFAULT_XAI_OAUTH_LOCK_FILE,
     XAI_OAUTH_AUTH_FILE_ENV_VARS,
     XAI_OAUTH_SCOPE_ENV_VARS,
+    default_xai_oauth_lock_path,
     resolve_xai_oauth_auth_path,
     resolve_xai_oauth_credentials,
+    resolve_xai_oauth_lock_path,
     resolve_xai_oauth_scope,
 )
 from litellm.llms.cursor_agent.constants import CURSOR_AGENT_DASHBOARD_HOST
@@ -181,7 +184,7 @@ CODEX_SIDECAR_DEFAULT_AUTH_PATHS = (
 DEFAULT_CODEX_OAUTH_REFRESH_INTERVAL_SECONDS = 300.0
 DEFAULT_CODEX_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_XAI_OAUTH_AUTH_FILE = xai_oauth_refresh.DEFAULT_XAI_OAUTH_AUTH_FILE
-DEFAULT_XAI_OAUTH_LOCK_FILE = xai_oauth_refresh.DEFAULT_XAI_OAUTH_LOCK_FILE
+DEFAULT_XAI_OAUTH_LOCK_FILE = FOUNDATION_DEFAULT_XAI_OAUTH_LOCK_FILE
 XAI_OAUTH_SIDECAR_AUTH_FILE_ENV_VARS = XAI_OAUTH_AUTH_FILE_ENV_VARS
 DEFAULT_XAI_OAUTH_REFRESH_INTERVAL_SECONDS = 300.0
 DEFAULT_XAI_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
@@ -1881,6 +1884,40 @@ def _resolve_xai_oauth_sidecar_scope(
     return resolution.scope, resolution.source
 
 
+def _resolve_xai_oauth_sidecar_lock_file(
+    explicit_lock_file: Optional[str],
+    auth_file: str,
+) -> str:
+    """Derive one default lock identity for each canonical auth file."""
+
+    explicit_value = (
+        explicit_lock_file.strip()
+        if isinstance(explicit_lock_file, str) and explicit_lock_file.strip()
+        else None
+    )
+    if explicit_value is None:
+        configured_lock_file = os.getenv("AAWM_XAI_OAUTH_LOCK_FILE")
+        if isinstance(configured_lock_file, str) and configured_lock_file.strip():
+            explicit_value = configured_lock_file.strip()
+    if explicit_value is not None:
+        explicit_path = Path(explicit_value).expanduser()
+        resolved_explicit_path = resolve_xai_oauth_lock_path(
+            auth_file,
+            explicit_path,
+        )
+        canonical_path = default_xai_oauth_lock_path(auth_file)
+        default_lock_path = Path(DEFAULT_XAI_OAUTH_LOCK_FILE).expanduser().resolve(
+            strict=False
+        )
+        if (
+            resolved_explicit_path == default_lock_path
+            and canonical_path != default_lock_path
+        ):
+            return str(canonical_path)
+        return str(resolved_explicit_path)
+    return str(resolve_xai_oauth_lock_path(auth_file))
+
+
 def _resolve_kimi_oauth_sidecar_auth_file(
     explicit_auth_file: Optional[str],
 ) -> tuple[str, str]:
@@ -2749,10 +2786,12 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     )
     parser.add_argument(
         "--xai-oauth-lock-file",
-        default=os.getenv("AAWM_XAI_OAUTH_LOCK_FILE", DEFAULT_XAI_OAUTH_LOCK_FILE),
+        default=None,
         help=(
-            "Lock file for sidecar managed xAI OAuth refresh writes. Defaults "
-            "to AAWM_XAI_OAUTH_LOCK_FILE or ~/.litellm/xai/oauth-auth.json.lock."
+            "Lock file for sidecar managed xAI OAuth refresh writes. When "
+            "omitted, the shared resolver derives a canonical sibling of the "
+            "resolved auth file; AAWM_XAI_OAUTH_LOCK_FILE must resolve to that "
+            "same sibling when supplied."
         ),
     )
     parser.add_argument(
@@ -4167,6 +4206,10 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
     _maybe_reject_default_auth_source(xai_oauth_resolution.auth_file_source)
     resolved_xai_oauth_auth_file = str(xai_oauth_resolution.auth_file)
     resolved_xai_oauth_auth_file_source = xai_oauth_resolution.auth_file_source
+    resolved_xai_oauth_lock_file = _resolve_xai_oauth_sidecar_lock_file(
+        args.xai_oauth_lock_file,
+        resolved_xai_oauth_auth_file,
+    )
     resolved_xai_oauth_scope = xai_oauth_resolution.scope
     resolved_xai_oauth_scope_source = xai_oauth_resolution.scope_source
     (
@@ -4218,7 +4261,7 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         xai_oauth_refresh_enabled=args.xai_oauth_refresh_enabled,
         xai_oauth_auth_file=resolved_xai_oauth_auth_file,
         xai_oauth_auth_file_source=resolved_xai_oauth_auth_file_source,
-        xai_oauth_lock_file=args.xai_oauth_lock_file,
+        xai_oauth_lock_file=resolved_xai_oauth_lock_file,
         xai_oauth_scope=resolved_xai_oauth_scope,
         xai_oauth_scope_source=resolved_xai_oauth_scope_source,
         xai_oauth_refresh_interval_seconds=args.xai_oauth_refresh_interval_seconds,
@@ -12870,9 +12913,11 @@ def _oauth_refresh_schedule_evidence(
         "lifecycle_state": final.get("lifecycle_state")
         if final.get("lifecycle_state") is not None
         else pre.get("lifecycle_state"),
-        "route_unusable_reason": final.get("route_unusable_reason")
-        if final.get("route_unusable_reason") is not None
-        else pre.get("route_unusable_reason"),
+        "route_unusable_reason": (
+            final.get("route_unusable_reason")
+            if "route_unusable_reason" in final
+            else pre.get("route_unusable_reason")
+        ),
         "route_unusable_at": final.get("route_unusable_at")
         if final.get("route_unusable_at") is not None
         else pre.get("route_unusable_at"),
@@ -13457,7 +13502,10 @@ def _run_xai_oauth_refresh_task(
             scope=config.xai_oauth_scope,
             buffer_seconds=config.xai_oauth_refresh_buffer_seconds,
             force=config.xai_oauth_force_refresh,
-            lock_file=config.xai_oauth_lock_file,
+            lock_file=_resolve_xai_oauth_sidecar_lock_file(
+                config.xai_oauth_lock_file,
+                config.xai_oauth_auth_file,
+            ),
             http_timeout_seconds=config.xai_oauth_http_timeout_seconds,
             on_token_endpoint_attempt=callback,
         ),
