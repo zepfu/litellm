@@ -2265,9 +2265,13 @@ def _advertised_spawn_agent_tool_definition(
         if isinstance(name, str) and name.casefold() == _SPAWN_AGENT_TOOL_NAME:
             matches.append(definition)
     if len(matches) > 1:
-        raise CursorConnectProtocolError(
+        error = CursorConnectProtocolError(
             "Cursor Agent advertised multiple spawn_agent tools."
         )
+        # This validation runs before auth resolution and any upstream I/O.
+        setattr(error, "attempted_provider_call", False)
+        setattr(error, "failure_phase", "candidate_preflight")
+        raise error
     if not matches:
         return None
     return matches[0]

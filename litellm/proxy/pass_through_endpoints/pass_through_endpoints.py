@@ -164,6 +164,10 @@ from .aawm_alias_routing.output_guard_config import (
     output_guard_context_from_passthrough,
 )
 from .aawm_alias_routing.audit_persist import _emit_aawm_terminal_error
+from .aawm_adapter_runtime.deferred_success import (
+    DeferredPassthroughSuccess,
+    bind_deferred_success_holder,
+)
 from .streaming_handler import (
     RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS,
     PassThroughStreamingHandler,
@@ -4464,6 +4468,7 @@ async def _aawm_session_owner_pre_send_guard(
     expected_target_family: Optional[str],
     url: Optional[httpx.URL],
     provider_bound_body: Optional[dict] = None,
+    defer_session_owner_promotion: bool = False,
 ) -> None:
     """Ensure tokenized session-owner reservation before upstream send.
 
@@ -4500,6 +4505,16 @@ async def _aawm_session_owner_pre_send_guard(
         # Renew held reservation before potentially long upstream I/O.
         lease = sa.get_request_session_owner_lease(request)
         if lease is not None and lease.held_reservation and not lease.promoted:
+            if (
+                (egress_credential_family or "").casefold() == "xai"
+                and not defer_session_owner_promotion
+            ):
+                sa.raise_session_owner_redispatch_required(
+                    session_identity=lease.session_identity,
+                    candidate=lease.attributes,
+                    failure_phase="session_owner_unpromoted_lease_managed_xai",
+                    request=request,
+                )
             await sa.ensure_session_owner_guard_for_request(
                 request=request,
                 request_body=parsed_body if isinstance(parsed_body, dict) else {},
@@ -4578,7 +4593,10 @@ async def _aawm_session_owner_on_upstream_result(
     *,
     request: Request,
     success: bool,
+    defer_session_owner_promotion: bool = False,
 ) -> None:
+    if defer_session_owner_promotion:
+        return
     sa = _session_affinity_mod()
     if success:
         await sa.finalize_request_session_owner_lease(
@@ -4641,6 +4659,7 @@ async def pass_through_request(  # noqa: PLR0915
     blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
     retryable_upstream_status_codes: Optional[list[int]] = None,
     caller_managed_hidden_retry: bool = False,
+    defer_session_owner_promotion: bool = False,
     raw_body_passthrough: bool = False,
     passthrough_logging_metadata: Optional[dict[str, Any]] = None,
 ):
@@ -4667,6 +4686,8 @@ async def pass_through_request(  # noqa: PLR0915
             caller, so generic passthrough failure logging should be deferred to the adapter layer
         caller_managed_hidden_retry: When true, disables shared pre-first-byte hidden retries so
             adapter/candidate-rotation callers do not double-retry upstream failures
+        defer_session_owner_promotion: When true, the caller owns lease
+            promotion after validating the complete candidate response.
         raw_body_passthrough: Forward the original request body as bytes while
             using a small synthetic body for logging. This is intended for
             native binary/protobuf side-channel endpoints.
@@ -4697,6 +4718,11 @@ async def pass_through_request(  # noqa: PLR0915
     raw_body: Optional[bytes] = None
     responses_function_name_rewrite: Optional[ResponsesFunctionNameRewrite] = None
     _transfer_identity: Optional[dict[str, Any]] = None
+    deferred_success_holder = (
+        DeferredPassthroughSuccess()
+        if defer_session_owner_promotion
+        else None
+    )
     route_custom_headers = dict(custom_headers or {})
     headers: Dict[str, Any] = dict(route_custom_headers)
     retryable_status_codes = {
@@ -5162,6 +5188,7 @@ async def pass_through_request(  # noqa: PLR0915
                     if isinstance(provider_bound_body, dict)
                     else None
                 ),
+                defer_session_owner_promotion=defer_session_owner_promotion,
             )
             upstream_wait_started_at = datetime.now()
             try:
@@ -5312,12 +5339,16 @@ async def pass_through_request(  # noqa: PLR0915
                 )
             except ResponsesStreamPreCommitFailure as pre_commit_exc:
                 await _aawm_session_owner_on_upstream_result(
-                    request=request, success=False
+                    request=request,
+                    success=False,
+                    defer_session_owner_promotion=defer_session_owner_promotion,
                 )
                 raise pre_commit_exc.as_http_exception() from pre_commit_exc
             except Exception:
                 await _aawm_session_owner_on_upstream_result(
-                    request=request, success=False
+                    request=request,
+                    success=False,
+                    defer_session_owner_promotion=defer_session_owner_promotion,
                 )
                 raise
             # First upstream byte path succeeded enough to return a response object.
@@ -5325,7 +5356,9 @@ async def pass_through_request(  # noqa: PLR0915
                 getattr(response, "status_code", 500) < 300
             )
             await _aawm_session_owner_on_upstream_result(
-                request=request, success=status_ok
+                request=request,
+                success=status_ok,
+                defer_session_owner_promotion=defer_session_owner_promotion,
             )
             if not status_ok:
                 # Keep existing error handling below.
@@ -5355,6 +5388,7 @@ async def pass_through_request(  # noqa: PLR0915
                 upstream_wait_completed_at=upstream_wait_completed_at,
                 local_prepare_ms=local_prepare_ms,
                 error_log_context=error_log_context,
+                deferred_success_holder=deferred_success_holder,
             )
             if (
                 responses_function_name_rewrite is not None
@@ -5386,7 +5420,10 @@ async def pass_through_request(  # noqa: PLR0915
                 status_code=response.status_code,
             )
             return bind_output_guard_to_streaming_response(
-                stream_response,
+                bind_deferred_success_holder(
+                    stream_response,
+                    deferred_success_holder,
+                ),
                 request_context=output_guard_request_context,
             )
 
@@ -5402,6 +5439,7 @@ async def pass_through_request(  # noqa: PLR0915
                 if isinstance(provider_bound_body, dict)
                 else None
             ),
+            defer_session_owner_promotion=defer_session_owner_promotion,
         )
         upstream_wait_started_at = datetime.now()
 
@@ -5558,12 +5596,16 @@ async def pass_through_request(  # noqa: PLR0915
             )
         except Exception:
             await _aawm_session_owner_on_upstream_result(
-                request=request, success=False
+                request=request,
+                success=False,
+                defer_session_owner_promotion=defer_session_owner_promotion,
             )
             raise
         status_ok = bool(getattr(response, "status_code", 500) < 300)
         await _aawm_session_owner_on_upstream_result(
-            request=request, success=status_ok
+            request=request,
+            success=status_ok,
+            defer_session_owner_promotion=defer_session_owner_promotion,
         )
         upstream_wait_completed_at = datetime.now()
         _record_passthrough_duration(
@@ -5592,6 +5634,7 @@ async def pass_through_request(  # noqa: PLR0915
                 upstream_wait_completed_at=upstream_wait_completed_at,
                 local_prepare_ms=local_prepare_ms,
                 error_log_context=error_log_context,
+                deferred_success_holder=deferred_success_holder,
             )
             if (
                 responses_function_name_rewrite is not None
@@ -5623,7 +5666,10 @@ async def pass_through_request(  # noqa: PLR0915
                 status_code=response.status_code,
             )
             return bind_output_guard_to_streaming_response(
-                stream_response,
+                bind_deferred_success_holder(
+                    stream_response,
+                    deferred_success_holder,
+                ),
                 request_context=output_guard_request_context,
             )
 
@@ -5736,21 +5782,55 @@ async def pass_through_request(  # noqa: PLR0915
             extra_metadata={"stream": False},
         )
         end_time = datetime.now()
-        asyncio.create_task(
-            pass_through_endpoint_logging.pass_through_async_success_handler(
-                httpx_response=response,
-                response_body=response_body,
-                url_route=str(url),
-                result="",
-                start_time=start_time,
-                end_time=end_time,
-                logging_obj=logging_obj,
-                cache_hit=False,
-                request_body=_parsed_body,
-                custom_llm_provider=custom_llm_provider,
-                **kwargs,
+
+        async def _finalize_deferred_success() -> None:
+            asyncio.create_task(
+                pass_through_endpoint_logging.pass_through_async_success_handler(
+                    httpx_response=response,
+                    response_body=response_body,
+                    url_route=str(url),
+                    result="",
+                    start_time=start_time,
+                    end_time=end_time,
+                    logging_obj=logging_obj,
+                    cache_hit=False,
+                    request_body=_parsed_body,
+                    custom_llm_provider=custom_llm_provider,
+                    **kwargs,
+                )
             )
-        )
+            try:
+                from litellm.proxy.aawm_session_transfer.hooks import (
+                    publish_transfer_terminal,
+                )
+
+                if _transfer_identity:
+                    await publish_transfer_terminal(
+                        _transfer_identity,
+                        "completed",
+                    )
+            except Exception:
+                verbose_proxy_logger.debug(
+                    "Failed to publish session-transfer completed phase",
+                    exc_info=True,
+                )
+
+        if not defer_session_owner_promotion:
+            asyncio.create_task(
+                pass_through_endpoint_logging.pass_through_async_success_handler(
+                    httpx_response=response,
+                    response_body=response_body,
+                    url_route=str(url),
+                    result="",
+                    start_time=start_time,
+                    end_time=end_time,
+                    logging_obj=logging_obj,
+                    cache_hit=False,
+                    request_body=_parsed_body,
+                    custom_llm_provider=custom_llm_provider,
+                    **kwargs,
+                )
+            )
         local_finalize_ms = _record_passthrough_duration(
             kwargs,
             metric_key="aawm_local_finalize_ms",
@@ -5789,17 +5869,27 @@ async def pass_through_request(  # noqa: PLR0915
                 publish_transfer_terminal,
             )
 
-            if not stream and _transfer_identity:
+            if (
+                not defer_session_owner_promotion
+                and not stream
+                and _transfer_identity
+            ):
                 await publish_transfer_terminal(_transfer_identity, "completed")
         except Exception:
             verbose_proxy_logger.debug(
                 "Failed to publish session-transfer completed phase",
                 exc_info=True,
             )
-        return Response(
+        response_to_return = Response(
             content=content,
             status_code=response.status_code,
             headers=response_headers,
+        )
+        if deferred_success_holder is not None:
+            deferred_success_holder.set_finalizer(_finalize_deferred_success)
+        return bind_deferred_success_holder(
+            response_to_return,
+            deferred_success_holder,
         )
     except Exception as e:
         custom_headers = ProxyBaseLLMRequestProcessing.get_custom_headers(
