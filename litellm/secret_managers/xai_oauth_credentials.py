@@ -637,6 +637,14 @@ def credential_identity(
     return f"sha256:{digest}"
 
 
+def _account_identity_value(value: Any) -> Optional[str | int]:
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
 def credential_account_identity(
     record: Optional[Mapping[str, Any]] = None,
     *,
@@ -649,24 +657,30 @@ def credential_account_identity(
     an account rollover. Raw account fields are hashed and never returned.
     """
 
-    safe_record: dict[str, Any] = {}
+    account_evidence: dict[str, Any] = {}
     if isinstance(record, Mapping):
         for field_name in (
             "account_id",
-            "client_id",
-            "oidc_client_id",
             "source_account_id",
             "subject",
         ):
-            value = record.get(field_name)
-            if isinstance(value, (str, int, float, bool)) or value is None:
-                safe_record[field_name] = value
-    resolved_scope = _clean_string(scope)
-    if resolved_scope is None and not safe_record:
+            value = _account_identity_value(record.get(field_name))
+            if value is not None:
+                account_evidence[field_name] = value
+    if not account_evidence:
         return None
+
+    context: dict[str, Any] = {}
+    if isinstance(record, Mapping):
+        for field_name in ("client_id", "oidc_client_id"):
+            value = _account_identity_value(record.get(field_name))
+            if value is not None:
+                context[field_name] = value
+    resolved_scope = _clean_string(scope)
     payload = {
+        "account": account_evidence,
+        "context": context,
         "scope": resolved_scope,
-        "record": safe_record,
     }
     digest = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")

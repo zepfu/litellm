@@ -253,12 +253,13 @@ failures retain the generic proxy retry policy.
 ### Managed OAuth Credential Rotation
 
 For a provider-returned managed `oa_xai/*` HTTP `401` before response bytes are
-committed, LiteLLM can reread the configured credential and make one retry.
-The reread must produce a new credential generation with the same derived
-non-secret account identity; it does not change accounts or write credentials.
-An unchanged, expired, malformed, or different-account credential is not
-retried, and native `xai/*` Grok OIDC traffic does not use this managed OAuth
-recovery path.
+committed, LiteLLM can reread the configured credential and make one retry on
+alias routes, direct async SDK routes, and OpenAI passthrough. The reread must
+produce a new credential generation with the same derived non-secret account
+identity. Client IDs and OAuth scope are not account proof by themselves.
+An unchanged, expired, malformed, unproven-account, or different-account
+credential is not retried, and native `xai/*` Grok OIDC traffic does not use
+this managed OAuth recovery.
 
 ## Sample Usage - Vision
 

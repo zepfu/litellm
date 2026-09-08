@@ -1,3 +1,4 @@
+import inspect
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 from fastapi import HTTPException, status
@@ -251,11 +252,47 @@ async def route_request(  # noqa: PLR0915 - Complex routing function, refactorin
         if "generationConfig" in data and "config" not in data:
             data["config"] = data.pop("generationConfig")
 
-    from litellm.llms.xai.oauth import prepare_oa_xai_request
+    from litellm.llms.xai.oauth import (
+        prepare_oa_xai_request,
+        reread_xai_oauth_snapshot_after_provider_401,
+    )
 
-    prepared_oa_xai_request = await prepare_oa_xai_request(data)
+    snapshot_out: dict[str, Any] = {}
+    prepared_oa_xai_request = await prepare_oa_xai_request(
+        data,
+        snapshot_out=snapshot_out,
+    )
     if prepared_oa_xai_request:
-        return getattr(litellm, f"{route_type}")(**data)
+        route_fn = getattr(litellm, f"{route_type}")
+        initial_invocation = route_fn(**data)
+        if not inspect.isawaitable(initial_invocation):
+            return initial_invocation
+
+        snapshot = snapshot_out.get("snapshot")
+        api_base = data.get("api_base")
+
+        async def _await_managed_xai_invocation():
+            try:
+                return await initial_invocation
+            except Exception as exc:
+                if snapshot is None:
+                    raise
+                refreshed_snapshot = (
+                    await reread_xai_oauth_snapshot_after_provider_401(
+                        snapshot,
+                        exc,
+                        api_base=api_base if isinstance(api_base, str) else None,
+                    )
+                )
+                if refreshed_snapshot is None:
+                    raise
+                data["api_key"] = refreshed_snapshot.access_token
+                retry_invocation = route_fn(**data)
+                if inspect.isawaitable(retry_invocation):
+                    return await retry_invocation
+                return retry_invocation
+
+        return _await_managed_xai_invocation()
 
     if "api_key" in data or "api_base" in data:
         if llm_router is not None:

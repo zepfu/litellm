@@ -96,6 +96,23 @@ rejections preserve the managed/native family distinction in sanitized
 telemetry; authorization values, access tokens, and full inbound headers are
 never recorded.
 
+### Read-only xAI request snapshots
+
+Managed xAI OAuth request preparation uses immutable process-local snapshots
+keyed by credential family, resolved file, and scope. File metadata checks and
+reads run off the request event loop. A fingerprint change or route-safety
+deadline evicts the cached snapshot before a later request rebuilds it.
+
+For a provider-returned managed `401` before response bytes are committed,
+alias routing, direct LiteLLM async routes, and OpenAI passthrough can make one
+recovery attempt. The retry uses the exact same request body and the reread
+must produce a changed generation with the same derived non-secret account
+identity. An account identity requires explicit account-specific credential
+evidence such as `account_id`, `source_account_id`, or `subject`; client IDs
+and scope alone are not sufficient. Missing, malformed, expired,
+unchanged-generation, unproven-account, or different-account material is not
+retried. Native Grok OIDC does not use this managed OAuth retry.
+
 ## OAuth refresh deadline contract
 
 Scheduled Grok OIDC, Codex OAuth, managed xAI OAuth, Kimi OAuth, and Nous
