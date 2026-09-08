@@ -2755,17 +2755,24 @@ def _cursor_replay_provider_neutral_tools(
             validation_tool.setdefault("parameters", {})
             validation_tool.setdefault("strict", None)
         if validation_tool.get("type") == "namespace":
-            canonical_tool = _cursor_replay_canonicalize_stock_namespace(
-                validation_tool,
-                tool_adapter=tool_adapter,
-            )
-            if canonical_tool is None:
-                return _cursor_replay_rejected(
-                    "provider_neutral_tools",
-                    "tool_validation",
-                    tool_index=tool_index,
-                    tool=original_tool,
+            try:
+                validated_tool = tool_adapter.validate_python(
+                    validation_tool,
+                    strict=True,
                 )
+                canonical_tool = json.loads(tool_adapter.dump_json(validated_tool))
+            except Exception:  # noqa: BLE001
+                canonical_tool = _cursor_replay_canonicalize_stock_namespace(
+                    validation_tool,
+                    tool_adapter=tool_adapter,
+                )
+                if canonical_tool is None:
+                    return _cursor_replay_rejected(
+                        "provider_neutral_tools",
+                        "tool_validation",
+                        tool_index=tool_index,
+                        tool=original_tool,
+                    )
         elif validation_tool.get("type") == "tool_search":
             canonical_tool = _cursor_replay_canonicalize_stock_tool_search(
                 validation_tool
