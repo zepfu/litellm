@@ -1865,8 +1865,8 @@ def _resolve_xai_oauth_sidecar_auth_file(
         explicit_auth_file,
         value_getter=os.getenv,
     )
-    _maybe_reject_default_auth_source(resolution.auth_file_source)
-    return str(resolution.auth_file), resolution.auth_file_source
+    _maybe_reject_default_auth_source(resolution.source)
+    return str(resolution.path), resolution.source
 
 
 def _resolve_xai_oauth_sidecar_scope(
@@ -13413,7 +13413,7 @@ def _run_xai_oauth_refresh_task(
         ),
         "auth_file": config.xai_oauth_auth_file,
         "scope": summary.get("scope") or config.xai_oauth_scope,
-        "credential_identity": summary.get("credential_identity"),
+        "credential_identity": final.get("credential_identity"),
         "auth_file_source": summary.get("auth_file_source")
         or config.xai_oauth_auth_file_source,
         "scope_source": summary.get("scope_source")
