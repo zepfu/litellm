@@ -65,6 +65,7 @@ _grok_native_client_version_cache: dict[
     _GrokNativeClientVersionSnapshot,
 ] = {}
 _grok_native_client_version_locks: dict[str, asyncio.Lock] = {}
+_GROK_NATIVE_CLIENT_VERSION_READ_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -750,18 +751,22 @@ def _resolve_grok_native_client_version_snapshot_sync(
         resolve_grok_native_version,
     )
 
-    before = _stat_grok_native_client_version_file(path)
-    record, _metadata = resolve_grok_native_version(cache_path=path)
-    after = _stat_grok_native_client_version_file(path)
-    if _grok_native_version_stat_fingerprint(
-        before
-    ) != _grok_native_version_stat_fingerprint(after):
-        raise GrokNativeVersionError("version cache changed while it was read")
-    return _GrokNativeClientVersionSnapshot(
-        version=record.version,
-        generation=_grok_native_version_stat_fingerprint(after),
-        observed_at_epoch=record.observed_at_epoch,
-    )
+    # The shared contract owns secure descriptor reads, while this layer owns
+    # generation-aware caching. Retry a bounded number of times if an atomic
+    # replacement lands between the contract read and the surrounding stats.
+    for _attempt in range(_GROK_NATIVE_CLIENT_VERSION_READ_ATTEMPTS):
+        before = _stat_grok_native_client_version_file(path)
+        record, _metadata = resolve_grok_native_version(cache_path=path)
+        after = _stat_grok_native_client_version_file(path)
+        if _grok_native_version_stat_fingerprint(
+            before
+        ) == _grok_native_version_stat_fingerprint(after):
+            return _GrokNativeClientVersionSnapshot(
+                version=record.version,
+                generation=_grok_native_version_stat_fingerprint(after),
+                observed_at_epoch=record.observed_at_epoch,
+            )
+    raise GrokNativeVersionError("version cache changed while it was read")
 
 
 def _grok_native_client_version_snapshot_is_fresh(

@@ -94,6 +94,10 @@ _grok_native_snapshot_cache: Dict[
     GrokNativeOAuthCredentialSnapshot,
 ] = {}
 _grok_native_snapshot_locks: Dict[str, asyncio.Lock] = {}
+_grok_native_snapshot_flights: Dict[
+    Tuple[str, str],
+    "asyncio.Task[GrokNativeOAuthCredentialSnapshot]",
+] = {}
 _refresh_locks: Dict[str, asyncio.Lock] = {}
 
 
@@ -380,16 +384,25 @@ async def get_grok_native_oauth_access_token() -> str:
 async def get_grok_native_oauth_snapshot() -> GrokNativeOAuthCredentialSnapshot:
     """Return one validated native OIDC snapshot without blocking the loop."""
 
+    credential_path, scope = await asyncio.to_thread(
+        _resolve_grok_native_snapshot_inputs_sync
+    )
+    return await _get_grok_native_oauth_snapshot_for_path(
+        credential_path=credential_path,
+        scope=scope,
+    )
+
+
+def _resolve_grok_native_snapshot_inputs_sync() -> Tuple[Path, str]:
     credential_path = default_grok_xai_oauth_auth_path()
     scope = (
         get_secret_str("LITELLM_XAI_GROK_OAUTH_SCOPE")
         or get_secret_str("LITELLM_XAI_OAUTH_SCOPE")
         or _DEFAULT_XAI_OAUTH_SCOPE
     )
-    return await _get_grok_native_oauth_snapshot_for_path(
-        credential_path=credential_path,
-        scope=scope,
-    )
+    # Keep path normalization, including getcwd() for relative overrides, off
+    # the request event loop.
+    return Path(os.path.abspath(os.fspath(credential_path))), scope
 
 
 def _grok_native_stat_fingerprint(
@@ -506,9 +519,10 @@ def _grok_native_snapshot_key(
     credential_path: Path,
     scope: str,
 ) -> Tuple[str, str]:
-    # Do not resolve through the filesystem on the event loop. The descriptor
-    # read below rejects a final symlink and fstat binds the opened file.
-    return (os.path.abspath(os.fspath(credential_path)), scope)
+    # The path is normalized by _resolve_grok_native_snapshot_inputs_sync().
+    # Do not resolve through the filesystem: the descriptor read below rejects
+    # a final symlink and fstat binds the opened file.
+    return (os.fspath(credential_path), scope)
 
 
 def _grok_native_snapshot_is_usable(
@@ -580,45 +594,81 @@ async def _get_grok_native_oauth_snapshot_for_path(
 
     lock = _grok_native_snapshot_locks.setdefault(lock_key, asyncio.Lock())
     async with lock:
-        try:
-            observed_stat = await asyncio.to_thread(
-                _stat_grok_native_credential_file,
-                credential_path,
+        flight = _grok_native_snapshot_flights.get(cache_key)
+        if flight is None:
+            try:
+                observed_stat = await asyncio.to_thread(
+                    _stat_grok_native_credential_file,
+                    credential_path,
+                )
+            except FileNotFoundError as exc:
+                raise ValueError(
+                    f"Grok OIDC credential file not found at {credential_path}. "
+                    "Run the health/provider-status sidecar Grok OIDC refresh or "
+                    "relogin with the Grok CLI before Grok native traffic can proceed."
+                ) from exc
+            observed_fingerprint = _grok_native_stat_fingerprint(observed_stat)
+            cached = _grok_native_snapshot_cache.get(cache_key)
+            if (
+                cached is not None
+                and cached.file_fingerprint == observed_fingerprint
+                and _grok_native_snapshot_is_usable(cached)
+            ):
+                return cached
+            if cached is not None:
+                _grok_native_snapshot_cache.pop(cache_key, None)
+            flight = asyncio.create_task(
+                _run_grok_native_snapshot_flight(
+                    cache_key=cache_key,
+                    credential_path=credential_path,
+                    scope=scope,
+                )
             )
-        except FileNotFoundError as exc:
-            raise ValueError(
-                f"Grok OIDC credential file not found at {credential_path}. "
-                "Run the health/provider-status sidecar Grok OIDC refresh or "
-                "relogin with the Grok CLI before Grok native traffic can proceed."
-            ) from exc
-        observed_fingerprint = _grok_native_stat_fingerprint(observed_stat)
-        cached = _grok_native_snapshot_cache.get(cache_key)
-        if (
-            cached is not None
-            and cached.file_fingerprint == observed_fingerprint
-            and _grok_native_snapshot_is_usable(cached)
-        ):
-            return cached
-        if cached is not None:
-            _grok_native_snapshot_cache.pop(cache_key, None)
-        try:
-            snapshot = await asyncio.to_thread(
-                _load_grok_native_snapshot_sync,
-                credential_path=credential_path,
-                scope=scope,
+            _grok_native_snapshot_flights[cache_key] = flight
+            flight.add_done_callback(
+                lambda completed: _finish_grok_native_snapshot_flight(
+                    cache_key,
+                    completed,
+                )
             )
-        except FileNotFoundError as exc:
-            _grok_native_snapshot_cache.pop(cache_key, None)
-            raise ValueError(
-                f"Grok OIDC credential file not found at {credential_path}. "
-                "Run the health/provider-status sidecar Grok OIDC refresh or "
-                "relogin with the Grok CLI before Grok native traffic can proceed."
-            ) from exc
-        except Exception:
-            _grok_native_snapshot_cache.pop(cache_key, None)
-            raise
-        _grok_native_snapshot_cache[cache_key] = snapshot
-        return snapshot
+
+    try:
+        return await asyncio.shield(flight)
+    except FileNotFoundError as exc:
+        raise ValueError(
+            f"Grok OIDC credential file not found at {credential_path}. "
+            "Run the health/provider-status sidecar Grok OIDC refresh or "
+            "relogin with the Grok CLI before Grok native traffic can proceed."
+        ) from exc
+
+
+async def _run_grok_native_snapshot_flight(
+    *,
+    cache_key: Tuple[str, str],
+    credential_path: Path,
+    scope: str,
+) -> GrokNativeOAuthCredentialSnapshot:
+    try:
+        snapshot = await asyncio.to_thread(
+            _load_grok_native_snapshot_sync,
+            credential_path=credential_path,
+            scope=scope,
+        )
+    except BaseException:
+        _grok_native_snapshot_cache.pop(cache_key, None)
+        raise
+    _grok_native_snapshot_cache[cache_key] = snapshot
+    return snapshot
+
+
+def _finish_grok_native_snapshot_flight(
+    cache_key: Tuple[str, str],
+    flight: "asyncio.Task[GrokNativeOAuthCredentialSnapshot]",
+) -> None:
+    if _grok_native_snapshot_flights.get(cache_key) is flight:
+        _grok_native_snapshot_flights.pop(cache_key, None)
+    if not flight.cancelled():
+        flight.exception()
 
 
 def _grok_native_oauth_refresh_required_error(*, missing_token: bool) -> ValueError:
