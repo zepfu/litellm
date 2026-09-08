@@ -174,6 +174,10 @@ def install(
     production facade.
     """
     _mod = globals()
+    host_globals.setdefault(
+        "normalize_codex_collaboration_dispatch_body",
+        normalize_codex_collaboration_dispatch_body,
+    )
     for _name in _HOST_FUNCTION_NAMES:
         _obj = _mod[_name]
         if not isinstance(_obj, FunctionType):
