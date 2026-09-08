@@ -2423,7 +2423,9 @@ _ANTHROPIC_XAI_PROVIDER_RUNTIME = _anthropic_xai_provider.Runtime(
     normalize_endpoint=lambda **kwargs: (BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(**kwargs)),
     join_url=lambda *args: BaseOpenAIPassThroughHandler._join_url_paths(*args),
     url_factory=httpx.URL,
-    assemble_headers=lambda **kwargs: (BaseOpenAIPassThroughHandler._assemble_headers(**kwargs)),
+    assemble_headers=lambda **kwargs: (
+        BaseOpenAIPassThroughHandler._assemble_xai_oauth_headers(**kwargs)
+    ),
     prepare_completion_body=lambda body, **kwargs: (_prepare_anthropic_completion_adapter_request_body(body, **kwargs)),
     validate_egress=lambda **kwargs: (HttpPassThroughEndpointHelpers.validate_outgoing_egress(**kwargs)),
     provider=litellm.LlmProviders.XAI.value,

@@ -24,6 +24,7 @@ from litellm.llms.xai.route_descriptors import (
     get_grok_native_route_descriptor,
     get_oa_xai_route_descriptor,
     resolve_oa_xai_route_descriptor,
+    validate_xai_oauth_api_base,
 )
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.secret_managers.grok_oidc_auth_path import (
@@ -162,7 +163,9 @@ async def prepare_oa_xai_request(data: Dict[str, Any]) -> bool:
 
     upstream_model = resolve_oa_xai_upstream_model(public_model)
     data["model"] = upstream_model
-    data["api_base"] = get_secret_str("LITELLM_XAI_OAUTH_API_BASE") or XAI_API_BASE
+    api_base = get_secret_str("LITELLM_XAI_OAUTH_API_BASE") or XAI_API_BASE
+    validate_xai_oauth_api_base(api_base)
+    data["api_base"] = api_base
     data["api_key"] = await get_xai_oauth_access_token()
     data["custom_llm_provider"] = "xai"
     decoded_previous_response_id = _decode_previous_response_id_in_place(data)

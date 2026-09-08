@@ -33,6 +33,9 @@ from typing import (
 import httpx
 
 import litellm
+from litellm.llms.xai.route_descriptors import (
+    XAI_OAUTH_CREDENTIAL_FAMILY,
+)
 from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
     load_text_watermark_config,
 )
@@ -275,6 +278,30 @@ class BaseOpenAIPassThroughHandler:
             }
         if extra_headers is not None:
             base_headers.update(extra_headers)
+        return BaseOpenAIPassThroughHandler._append_openai_beta_header(
+            headers=base_headers,
+            request=request,
+        )
+
+    @staticmethod
+    def _assemble_xai_oauth_headers(
+        api_key: Optional[str],
+        request: "Request",
+        extra_headers: Optional[dict] = None,
+    ) -> dict:
+        """Build managed xAI headers with bearer auth only."""
+        base_headers: dict[str, str] = {}
+        if api_key is not None:
+            base_headers["authorization"] = f"Bearer {api_key}"
+        if extra_headers is not None:
+            for key, value in extra_headers.items():
+                if str(key).lower() in {
+                    "authorization",
+                    "api-key",
+                    "x-api-key",
+                }:
+                    continue
+                base_headers[key] = value
         return BaseOpenAIPassThroughHandler._append_openai_beta_header(
             headers=base_headers,
             request=request,
@@ -582,7 +609,7 @@ class BaseOpenAIPassThroughHandler:
                 ) = oa_xai_context
                 custom_llm_provider = litellm.LlmProviders.XAI
                 forward_headers = False
-                egress_credential_family = "xai"
+                egress_credential_family = XAI_OAUTH_CREDENTIAL_FAMILY
                 expected_target_family = "xai"
             elif rt.is_openai_responses_endpoint_fn(endpoint):
                 grok_native_context = await BaseOpenAIPassThroughHandler._prepare_openai_grok_native_oauth_context(
@@ -652,10 +679,15 @@ class BaseOpenAIPassThroughHandler:
         )
 
         ## CREATE PASS-THROUGH
+        assemble_headers = (
+            BaseOpenAIPassThroughHandler._assemble_xai_oauth_headers
+            if egress_credential_family == XAI_OAUTH_CREDENTIAL_FAMILY
+            else BaseOpenAIPassThroughHandler._assemble_headers
+        )
         endpoint_func = rt.create_pass_through_route_fn(
             endpoint=endpoint,
             target=str(updated_url),
-            custom_headers=BaseOpenAIPassThroughHandler._assemble_headers(
+            custom_headers=assemble_headers(
                 api_key=api_key, request=request, extra_headers=extra_headers
             ),
             _forward_headers=forward_headers,
