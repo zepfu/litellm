@@ -2097,7 +2097,9 @@ async def handle_alias_route(  # noqa: PLR0915
                                     attempt_record[
                                         "transport_connection_failures"
                                     ] = request_ledger.transport_connection_failures
-                                if ordinals or perform_exc is None:
+                                if request_ledger is not None:
+                                    attempted_provider_call = bool(ordinals)
+                                elif perform_exc is None:
                                     attempted_provider_call = True
                                 else:
                                     explicit_attempted_provider_call = getattr(
@@ -2118,10 +2120,6 @@ async def handle_alias_route(  # noqa: PLR0915
                                                 perform_exc,
                                                 "_aawm_provider_returned",
                                                 False,
-                                            )
-                                            or isinstance(
-                                                perform_exc,
-                                                ProxyException,
                                             )
                                         )
                                 attempt_record["attempted_provider_call"] = (
