@@ -4493,48 +4493,6 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             request=request,
         )
 
-    if provider_owned_continuation and (
-        not isinstance(session_owner_record, dict)
-        or sa._record_state(session_owner_record) != "owned"
-    ):
-        owner_state = (
-            sa._record_state(session_owner_record)
-            if isinstance(session_owner_record, dict)
-            else None
-        )
-        owner_id = (
-            session_owner_record.get("owner")
-            if isinstance(session_owner_record, dict)
-            else None
-        )
-        mismatch_reason = (
-            "session_owner: provider-owned continuation requires an "
-            f"owned durable owner record (state={owner_state or 'missing'})"
-        )
-        sa.raise_session_owner_redispatch_required(
-            session_identity=session_owner_identity,
-            alias_model=alias_model,
-            candidate=None,
-            failure_phase="session_owner_continuation_no_owner_affinity",
-            guard=sa.SessionOwnerGuardResult(
-                decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
-                session_identity=session_owner_identity,
-                cache_key=_cache_key,
-                owner_record=session_owner_record,
-                owner_id=owner_id,
-                mismatch_reason=mismatch_reason,
-                provenance=sa.build_session_owner_provenance(
-                    session_identity=session_owner_identity,
-                    decision="redispatch_required",
-                    owner_record=session_owner_record,
-                    owner_id=owner_id,
-                    mismatch_reason=mismatch_reason,
-                    cache_key=_cache_key,
-                ),
-            ),
-            request=request,
-        )
-
     affinity = None
     affinity_bypassed = False
     session_owner_guard_meta = {
@@ -4899,6 +4857,46 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         if existing_affinity is not None:
             affinity_bypassed = True
 
+    if provider_owned_continuation and affinity is None:
+        owner_state = (
+            sa._record_state(session_owner_record)
+            if isinstance(session_owner_record, dict)
+            else None
+        )
+        owner_id = (
+            session_owner_record.get("owner")
+            if isinstance(session_owner_record, dict)
+            else None
+        )
+        mismatch_reason = (
+            "session_owner: provider-owned continuation requires an "
+            "owned durable owner record or compatible affinity "
+            f"(state={owner_state or 'missing'})"
+        )
+        sa.raise_session_owner_redispatch_required(
+            session_identity=session_owner_identity,
+            alias_model=alias_model,
+            candidate=None,
+            failure_phase="session_owner_continuation_no_owner_affinity",
+            guard=sa.SessionOwnerGuardResult(
+                decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                session_identity=session_owner_identity,
+                cache_key=_cache_key,
+                owner_record=session_owner_record,
+                owner_id=owner_id,
+                mismatch_reason=mismatch_reason,
+                provenance=sa.build_session_owner_provenance(
+                    session_identity=session_owner_identity,
+                    decision="redispatch_required",
+                    owner_record=session_owner_record,
+                    owner_id=owner_id,
+                    mismatch_reason=mismatch_reason,
+                    cache_key=_cache_key,
+                ),
+            ),
+            request=request,
+        )
+
     account_identity_pinned = has_account_bound_state
     account_failover_context = (
         _get_codex_oauth_request_local_failover_context(
@@ -5076,9 +5074,13 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             isinstance(session_owner_record, dict)
             and sa._record_state(session_owner_record) == "owned"
         ):
-            if account_identity_pinned and _candidate_matches_affinity(
-                affinity_state["candidate"],
-                affinity,
+            if (
+                account_identity_pinned
+                and _affinity_pins_account_identity(affinity)
+                and _candidate_matches_affinity(
+                    affinity_state["candidate"],
+                    affinity,
+                )
             ):
                 _raise_codex_auto_agent_redispatch_required(
                     candidate=dict(affinity_state.get("candidate") or {}),
