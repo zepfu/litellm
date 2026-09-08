@@ -8,6 +8,11 @@ The later integration step configures host-owned helpers through
 from __future__ import annotations
 
 import hashlib
+import asyncio
+import inspect
+import os
+import stat
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, cast
 from uuid import uuid4 as _uuid4
@@ -19,7 +24,16 @@ from litellm.llms.xai.oauth import (
     build_grok_native_oauth_metadata as _build_grok_native_oauth_metadata,
 )
 from litellm.llms.xai.oauth import (
+    bind_xai_oauth_snapshot_to_request as _bind_xai_oauth_snapshot_to_request,
+)
+from litellm.llms.xai.oauth import (
     get_grok_native_oauth_access_token as _get_grok_native_oauth_access_token,
+)
+from litellm.llms.xai.oauth import (
+    get_grok_native_oauth_snapshot as _get_grok_native_oauth_snapshot,
+)
+from litellm.llms.xai.oauth import (
+    get_xai_oauth_snapshot as _get_xai_oauth_snapshot,
 )
 from litellm.llms.xai.oauth import (
     is_grok_native_oauth_model as _is_grok_native_oauth_model,
@@ -46,6 +60,20 @@ if TYPE_CHECKING:
 
 Payload = dict[str, Any]
 DropRequestFields = Callable[[Payload], tuple[Payload, list[Payload]]]
+
+
+@dataclass(frozen=True)
+class _GrokNativeClientVersionSnapshot:
+    version: str
+    generation: tuple[int, int, int, int, int]
+    observed_at_epoch: float
+
+
+_grok_native_client_version_cache: dict[
+    str,
+    _GrokNativeClientVersionSnapshot,
+] = {}
+_grok_native_client_version_locks: dict[str, asyncio.Lock] = {}
 
 
 @dataclass(frozen=True)
@@ -79,6 +107,11 @@ class XAIRequestPrepRuntime:
     _sanitize_xai_responses_request_body_in_place: Callable[
         [Payload], tuple[list[str], list[dict[str, Any]]]
     ]
+    get_xai_oauth_snapshot: Optional[Callable[[], Awaitable[Any]]] = None
+    get_grok_native_oauth_snapshot: Optional[
+        Callable[[], Awaitable[Any]]
+    ] = None
+    bind_xai_oauth_snapshot: Optional[Callable[[Any, Any], None]] = None
 
 
 XAI_REQUEST_PREP_SEAM_DISPOSITION = {
@@ -125,6 +158,11 @@ XAI_REQUEST_PREP_SEAM_DISPOSITION = {
     "_sanitize_xai_responses_request_body_in_place": (
         "runtime._sanitize_xai_responses_request_body_in_place"
     ),
+    "get_xai_oauth_snapshot": "runtime.get_xai_oauth_snapshot",
+    "get_grok_native_oauth_snapshot": (
+        "runtime.get_grok_native_oauth_snapshot"
+    ),
+    "bind_xai_oauth_snapshot": "runtime.bind_xai_oauth_snapshot",
 }
 
 
@@ -180,6 +218,11 @@ def build_default_xai_request_prep_runtime(
     get_grok_native_oauth_access_token: Optional[
         Callable[[], Awaitable[str]]
     ] = None,
+    get_xai_oauth_snapshot: Optional[Callable[[], Awaitable[Any]]] = None,
+    get_grok_native_oauth_snapshot: Optional[
+        Callable[[], Awaitable[Any]]
+    ] = None,
+    bind_xai_oauth_snapshot: Optional[Callable[[Any, Any], None]] = None,
 ) -> XAIRequestPrepRuntime:
     """Build production defaults while keeping every host callback explicit."""
 
@@ -192,6 +235,12 @@ def build_default_xai_request_prep_runtime(
         get_grok_native_oauth_access_token = (
             _get_grok_native_oauth_access_token
         )
+    if get_xai_oauth_snapshot is None:
+        get_xai_oauth_snapshot = _get_xai_oauth_snapshot
+    if get_grok_native_oauth_snapshot is None:
+        get_grok_native_oauth_snapshot = _get_grok_native_oauth_snapshot
+    if bind_xai_oauth_snapshot is None:
+        bind_xai_oauth_snapshot = _bind_xai_oauth_snapshot_to_request
 
     return XAIRequestPrepRuntime(
         is_oa_xai_model=_is_oa_xai_model,
@@ -233,6 +282,9 @@ def build_default_xai_request_prep_runtime(
         _sanitize_xai_responses_request_body_in_place=(
             sanitize_xai_responses_request_body_in_place
         ),
+        get_xai_oauth_snapshot=get_xai_oauth_snapshot,
+        get_grok_native_oauth_snapshot=get_grok_native_oauth_snapshot,
+        bind_xai_oauth_snapshot=bind_xai_oauth_snapshot,
     )
 
 
@@ -563,6 +615,7 @@ def _sanitize_xai_responses_request_body_in_place(
 async def _prepare_oa_xai_passthrough_request(
     request_body: dict[str, Any],
     *,
+    request: Optional[Request] = None,
     sanitize_responses_request: bool = False,
 ) -> tuple[bool, Optional[str], Optional[str]]:
     runtime = _require_runtime()
@@ -570,9 +623,38 @@ async def _prepare_oa_xai_passthrough_request(
         request_body.get("litellm_metadata"), dict
     ):
         request_body["litellm_metadata"] = {}
-    prepared = await runtime.prepare_oa_xai_request(request_body)
+    snapshot_out: dict[str, Any] = {}
+    prepare_fn = runtime.prepare_oa_xai_request
+    try:
+        prepare_signature = inspect.signature(prepare_fn)
+    except (TypeError, ValueError):
+        prepare_signature = None
+    accepts_snapshot_out = bool(
+        prepare_signature is not None
+        and (
+            "snapshot_out" in prepare_signature.parameters
+            or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in prepare_signature.parameters.values()
+            )
+        )
+    )
+    if accepts_snapshot_out:
+        prepared = await prepare_fn(
+            request_body,
+            snapshot_out=snapshot_out,
+        )
+    else:
+        prepared = await prepare_fn(request_body)
     if not prepared:
         return False, None, None
+    snapshot = snapshot_out.get("snapshot")
+    if (
+        request is not None
+        and snapshot is not None
+        and callable(runtime.bind_xai_oauth_snapshot)
+    ):
+        runtime.bind_xai_oauth_snapshot(request, snapshot)
 
     if sanitize_responses_request:
         (
@@ -663,6 +745,163 @@ def _get_grok_native_oauth_client_version() -> str:
     )
 
 
+def _grok_native_version_stat_fingerprint(
+    stat_result: os.stat_result,
+) -> tuple[int, int, int, int, int]:
+    return (
+        int(stat_result.st_dev),
+        int(stat_result.st_ino),
+        int(stat_result.st_mtime_ns),
+        int(stat_result.st_ctime_ns),
+        int(stat_result.st_size),
+    )
+
+
+def _stat_grok_native_client_version_file(path: str) -> os.stat_result:
+    from litellm.secret_managers.grok_native_version_contract import (
+        GrokNativeVersionError,
+    )
+
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise GrokNativeVersionError(
+            "secure version cache open is unsupported on this platform"
+        )
+    flags = os.O_RDONLY | nofollow
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    if cloexec is not None:
+        flags |= cloexec
+    try:
+        file_descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno == getattr(os, "ENOENT", 2):
+            raise GrokNativeVersionError("version cache file is missing") from None
+        if exc.errno in (getattr(os, "ELOOP", 40), getattr(os, "EMLINK", 31)):
+            raise GrokNativeVersionError(
+                "version cache file is a symlink or unsafe path"
+            ) from None
+        raise GrokNativeVersionError("version cache file is unreadable") from None
+    try:
+        try:
+            result = os.fstat(file_descriptor)
+        except OSError:
+            raise GrokNativeVersionError(
+                "version cache file metadata is unreadable"
+            ) from None
+    finally:
+        try:
+            os.close(file_descriptor)
+        except OSError:
+            pass
+    if not stat.S_ISREG(result.st_mode):
+        raise GrokNativeVersionError("version cache path is not a regular file")
+    return result
+
+
+def _resolve_grok_native_client_version_snapshot_sync(
+    path: str,
+) -> _GrokNativeClientVersionSnapshot:
+    from litellm.secret_managers.grok_native_version_contract import (
+        resolve_grok_native_version,
+    )
+
+    before = _stat_grok_native_client_version_file(path)
+    record, _metadata = resolve_grok_native_version(cache_path=path)
+    after = _stat_grok_native_client_version_file(path)
+    if _grok_native_version_stat_fingerprint(
+        before
+    ) != _grok_native_version_stat_fingerprint(after):
+        from litellm.secret_managers.grok_native_version_contract import (
+            GrokNativeVersionError,
+        )
+
+        raise GrokNativeVersionError(
+            "version cache changed while it was read"
+        )
+    return _GrokNativeClientVersionSnapshot(
+        version=record.version,
+        generation=_grok_native_version_stat_fingerprint(after),
+        observed_at_epoch=record.observed_at_epoch,
+    )
+
+
+def _grok_native_client_version_snapshot_is_fresh(
+    snapshot: _GrokNativeClientVersionSnapshot,
+) -> bool:
+    from litellm.secret_managers.grok_native_version_contract import (
+        _resolve_max_age,
+    )
+
+    try:
+        max_age = _resolve_max_age()
+    except Exception:
+        return False
+    age = time.time() - snapshot.observed_at_epoch
+    return 0 <= age <= max_age
+
+
+async def _get_grok_native_oauth_client_version_async() -> str:
+    """Resolve a cached, generation-aware client version off the event loop."""
+
+    from litellm.secret_managers.grok_native_version_contract import (
+        _resolve_cache_path,
+        _validate_version_string,
+    )
+
+    runtime = _require_runtime()
+    explicit = runtime.get_secret_str("LITELLM_XAI_GROK_CLIENT_VERSION")
+    if explicit is not None:
+        _validate_version_string(explicit)
+        return explicit
+    legacy = runtime.get_secret_str("GROK_CLIENT_VERSION")
+    if legacy is not None:
+        _validate_version_string(legacy)
+        return legacy
+
+    cache_path = _resolve_cache_path()
+    observed = await asyncio.to_thread(
+        _stat_grok_native_client_version_file,
+        cache_path,
+    )
+    generation = _grok_native_version_stat_fingerprint(observed)
+    cached = _grok_native_client_version_cache.get(cache_path)
+    if (
+        cached is not None
+        and cached.generation == generation
+        and _grok_native_client_version_snapshot_is_fresh(cached)
+    ):
+        return cached.version
+
+    lock = _grok_native_client_version_locks.setdefault(
+        cache_path,
+        asyncio.Lock(),
+    )
+    async with lock:
+        observed = await asyncio.to_thread(
+            _stat_grok_native_client_version_file,
+            cache_path,
+        )
+        generation = _grok_native_version_stat_fingerprint(observed)
+        cached = _grok_native_client_version_cache.get(cache_path)
+        if (
+            cached is not None
+            and cached.generation == generation
+            and _grok_native_client_version_snapshot_is_fresh(cached)
+        ):
+            return cached.version
+        _grok_native_client_version_cache.pop(cache_path, None)
+        try:
+            snapshot = await asyncio.to_thread(
+                _resolve_grok_native_client_version_snapshot_sync,
+                cache_path,
+            )
+        except Exception:
+            _grok_native_client_version_cache.pop(cache_path, None)
+            raise
+        _grok_native_client_version_cache[cache_path] = snapshot
+        return snapshot.version
+
+
 def _get_grok_native_oauth_session_id(
     *,
     request: Request,
@@ -750,9 +989,14 @@ def _build_grok_native_oauth_headers(
     model: str,
     request: Request,
     request_body: dict[str, Any],
+    client_version: Optional[str] = None,
 ) -> dict[str, Any]:
     runtime = _require_runtime()
-    client_version = _get_grok_native_oauth_client_version()
+    resolved_client_version = (
+        client_version
+        if isinstance(client_version, str) and client_version
+        else _get_grok_native_oauth_client_version()
+    )
     request_id = _get_grok_native_oauth_request_id(request)
     headers: dict[str, Any] = {
         "accept": "application/json",
@@ -760,13 +1004,13 @@ def _build_grok_native_oauth_headers(
         "content-type": "application/json",
         "user-agent": (
             runtime.get_secret_str("LITELLM_XAI_GROK_USER_AGENT")
-            or f"grok/{client_version}"
+            or f"grok/{resolved_client_version}"
         ),
         "x-grok-client-identifier": (
             runtime.get_secret_str("LITELLM_XAI_GROK_CLIENT_IDENTIFIER")
             or "grok-cli"
         ),
-        "x-grok-client-version": client_version,
+        "x-grok-client-version": resolved_client_version,
         "x-grok-model-override": model,
         "x-grok-req-id": request_id,
         "x-request-id": request_id,
@@ -782,6 +1026,25 @@ def _build_grok_native_oauth_headers(
     if session_id:
         headers["x-grok-session-id"] = session_id
     return headers
+
+
+async def _build_grok_native_oauth_headers_async(
+    *,
+    access_token: str,
+    model: str,
+    request: Request,
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    """Build production headers without synchronously reading the version file."""
+
+    client_version = await _get_grok_native_oauth_client_version_async()
+    return _build_grok_native_oauth_headers(
+        access_token=access_token,
+        model=model,
+        request=request,
+        request_body=request_body,
+        client_version=client_version,
+    )
 
 
 def _add_grok_native_oauth_metadata(
@@ -878,8 +1141,19 @@ async def _prepare_grok_native_oauth_passthrough_request(
         prepared_body,
         _removed_tool_choice,
     ) = runtime._drop_tool_choice_without_tools_from_request_body(prepared_body)
-    access_token = await runtime.get_grok_native_oauth_access_token()
-    headers = _build_grok_native_oauth_headers(
+    snapshot = None
+    if callable(runtime.get_grok_native_oauth_snapshot):
+        snapshot = await runtime.get_grok_native_oauth_snapshot()
+        access_token = getattr(snapshot, "access_token", None)
+        if not isinstance(access_token, str) or not access_token:
+            raise ValueError(
+                "Grok OIDC credential snapshot does not contain an access token."
+            )
+        if callable(runtime.bind_xai_oauth_snapshot):
+            runtime.bind_xai_oauth_snapshot(request, snapshot)
+    else:
+        access_token = await runtime.get_grok_native_oauth_access_token()
+    headers = await _build_grok_native_oauth_headers_async(
         access_token=access_token,
         model=model,
         request=request,

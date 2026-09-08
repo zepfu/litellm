@@ -585,6 +585,7 @@ def credential_identity(
     record: Optional[Mapping[str, Any]] = None,
     *,
     scope: Optional[str] = None,
+    stat_result: Optional[os.stat_result] = None,
 ) -> Optional[str]:
     """Return a stable nonsecret generation identity.
 
@@ -593,17 +594,20 @@ def credential_identity(
     generations while remaining safe for scheduler state and telemetry.
     """
 
-    stat_parts: dict[str, Any] = {}
-    if auth_path is not None:
+    if stat_result is None and auth_path is not None:
         try:
             stat_result = Path(auth_path).expanduser().stat()
         except OSError:
             stat_result = None
-        if stat_result is not None:
-            stat_parts = {
-                "mtime_ns": stat_result.st_mtime_ns,
-                "size": stat_result.st_size,
-            }
+    stat_parts: dict[str, Any] = {}
+    if stat_result is not None:
+        stat_parts = {
+            "st_dev": stat_result.st_dev,
+            "st_ino": stat_result.st_ino,
+            "st_mtime_ns": stat_result.st_mtime_ns,
+            "st_ctime_ns": stat_result.st_ctime_ns,
+            "st_size": stat_result.st_size,
+        }
     safe_record: dict[str, Any] = {}
     if isinstance(record, Mapping):
         for field_name in (
@@ -625,6 +629,43 @@ def credential_identity(
     payload = {
         "scope": _clean_string(scope),
         "stat": stat_parts,
+        "record": safe_record,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"sha256:{digest}"
+
+
+def credential_account_identity(
+    record: Optional[Mapping[str, Any]] = None,
+    *,
+    scope: Optional[str] = None,
+) -> Optional[str]:
+    """Return a stable nonsecret identity for the logical credential account.
+
+    Unlike :func:`credential_identity`, this identity deliberately excludes
+    filesystem generation metadata so refresh publication does not look like
+    an account rollover. Raw account fields are hashed and never returned.
+    """
+
+    safe_record: dict[str, Any] = {}
+    if isinstance(record, Mapping):
+        for field_name in (
+            "account_id",
+            "client_id",
+            "oidc_client_id",
+            "source_account_id",
+            "subject",
+        ):
+            value = record.get(field_name)
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                safe_record[field_name] = value
+    resolved_scope = _clean_string(scope)
+    if resolved_scope is None and not safe_record:
+        return None
+    payload = {
+        "scope": resolved_scope,
         "record": safe_record,
     }
     digest = hashlib.sha256(
