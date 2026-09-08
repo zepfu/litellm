@@ -393,6 +393,9 @@ from litellm.proxy.vector_store_endpoints.utils import (
     is_allowed_to_call_vector_store_endpoint,
 )
 from litellm.secret_managers.main import get_secret_str
+from litellm.secret_managers.xai_oauth_inventory import (
+    XaiOAuthIdentityMismatchError,
+)
 from litellm.llms.alibaba_token_plan.adapters import (
     adapter as _alibaba_token_plan_adapters,
 )
@@ -6369,9 +6372,28 @@ async def openai_proxy_route(  # noqa: PLR0915
                     selection=direct_codex_selection_state,
                 )
             return response
-        except (HTTPException, ProxyException) as exc:
-            provider_returned = isinstance(exc, ProxyException) or bool(
-                getattr(exc, "_aawm_provider_returned", False)
+        except (
+            HTTPException,
+            ProxyException,
+            XaiOAuthIdentityMismatchError,
+        ) as exc:
+            if isinstance(exc, XaiOAuthIdentityMismatchError):
+                normalized_exc = (
+                    _aawm_alias_candidate_loop._proxy_exception_for_unclassified_probe_failure(
+                        exc
+                    )
+                )
+                normalized_exc.__cause__ = exc
+                exc = normalized_exc
+            identity_readiness = (
+                getattr(exc, "_aawm_xai_identity_readiness", False) is True
+            )
+            provider_returned = (
+                not identity_readiness
+                and (
+                    isinstance(exc, ProxyException)
+                    or bool(getattr(exc, "_aawm_provider_returned", False))
+                )
             )
             attempted_provider_call = provider_returned
             provider_status_code = (
