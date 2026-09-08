@@ -487,7 +487,8 @@ def _item_has_encrypted_function_output(item: Any) -> bool:
 
 def _function_call_output_part_is_plaintext(value: Any) -> bool:
     if isinstance(value, str):
-        return bool(value.strip())
+        # Responses text is valid even when it is empty or whitespace-only.
+        return True
     if isinstance(value, Mapping):
         if str(value.get("type") or "").strip() == _NESTED_ENCRYPTED_CONTENT_PART_TYPE:
             return False
@@ -507,6 +508,31 @@ def _function_call_output_part_is_plaintext(value: Any) -> bool:
 
 def _function_call_output_has_plaintext(item: Mapping[str, Any]) -> bool:
     return _function_call_output_part_is_plaintext(item.get("output"))
+
+
+def _function_call_output_has_supported_output_part(value: Any) -> bool:
+    """True when a non-ciphertext Responses output part remains.
+
+    ``function_call_output.output`` normally holds plaintext text, but Codex
+    clients can serialize structured result parts such as images and files.
+    Those parts are supported tool data and must survive ciphertext removal.
+    """
+    if isinstance(value, Mapping):
+        if str(value.get("type") or "").strip() in {
+            "input_image",
+            "input_file",
+        }:
+            return True
+        return any(
+            _function_call_output_has_supported_output_part(nested)
+            for nested in value.values()
+        )
+    if isinstance(value, list):
+        return any(
+            _function_call_output_has_supported_output_part(nested)
+            for nested in value
+        )
+    return False
 
 
 def _strip_nested_encrypted_function_output(value: Any) -> tuple[Any, bool]:
@@ -1335,11 +1361,17 @@ def prepare_encrypted_function_output_items_for_openai_egress(
                 item.pop("encrypted_content", None)
                 stripped_count += 1
                 changed = True
-            if not _function_call_output_has_plaintext(clean_item):
-                if "output" not in clean_item or clean_item.get("output") is None:
-                    clean_item["output"] = ""
-                    item["output"] = ""
-                    changed = True
+            if not _function_call_output_has_plaintext(clean_item) and not (
+                _function_call_output_has_supported_output_part(
+                    clean_item.get("output")
+                )
+            ):
+                # No supported plaintext or structured output remains after
+                # sanitization. Preserve the call ID with the same harmless
+                # placeholder.
+                clean_item["output"] = ""
+                item["output"] = ""
+                changed = True
             normalized_input.append(clean_item)
             continue
 
