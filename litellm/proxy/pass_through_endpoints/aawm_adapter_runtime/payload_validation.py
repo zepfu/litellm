@@ -1613,6 +1613,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
         is_repetitive_output_loop_failure,
     )
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.deferred_success import (
+        finalize_deferred_failure,
         inherit_deferred_success_holder,
     )
 
@@ -1693,6 +1694,16 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             )
 
             disposition = OpenAIResponsesWireDisposition.FAILED
+        try:
+            await finalize_deferred_failure(
+                peeked_response,
+                phase=str(getattr(disposition, "value", disposition)),
+            )
+        except BaseException:
+            verbose_proxy_logger.debug(
+                "Failed to finish deferred Responses failure bookkeeping",
+                exc_info=True,
+            )
         try:
             await owner(disposition)
         except BaseException:
