@@ -817,7 +817,8 @@ falling back to the general provider-status DSN. Account identifiers and
 collector source paths are hashed; titles, names, usernames, workspace fields,
 feature notes, emails, cookies, token values, and unknown string fields are
 redacted. Strings are retained only for explicit telemetry fields such as
-model/feature identity, status, state, mode, window, and reset timestamps.
+model/feature identity (including native limits-progress `feature_name`),
+status, state, mode, window, and reset timestamps.
 Finite numeric token usage counters such as `input_tokens`, `output_tokens`,
 and `token_limit` remain available in sanitized projections. Snapshot
 `raw_provider_fields` omit `observed_at` so repeated identical polls do not
