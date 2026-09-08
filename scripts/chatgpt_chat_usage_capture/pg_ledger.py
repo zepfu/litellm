@@ -17,9 +17,7 @@ from .privacy import (
     assert_no_secrets,
     classify_surface,
     sanitize_metadata,
-    sanitize_mapping,
     sanitize_token,
-    sanitize_value,
 )
 from .timeutil import ensure_utc, isoformat_utc, parse_datetime
 
@@ -70,12 +68,15 @@ _ALLOWED_SURFACES = frozenset(
 )
 _ALLOWED_ORIGINS = frozenset({"shared", "imported", "copied", "local", "user", "unknown"})
 _ALLOWED_IDENTITY_BASES = frozenset({"generation", "request", "provisional", "unresolved", "unknown"})
-_ALLOWED_TIME_BASES = frozenset({"provider", "dispatch", "user_message", "bounded_interval", "unknown"})
+_ALLOWED_TIME_BASES = frozenset(
+    {"provider", "dispatch", "user_message", "response_observed", "bounded_interval", "unknown"}
+)
 _ALLOWED_OUTCOMES = frozenset(
     {
         "completed",
         "failed_after_start",
         "cancelled_after_start",
+        "rejected_after_start",
         "completion_unknown",
         "rejected_before_start",
         "unresolved",
@@ -88,15 +89,26 @@ _ALLOWED_GAP_STATES = frozenset({"open", "resolved", "unknown"})
 _ALLOWED_QUARANTINE_STATES = frozenset({"clear", "quarantined", "unknown"})
 _OBSERVATION_KEY_ALIASES = {
     "conversationId": "conversation_id",
+    "continuation": "continuation",
+    "schemaVersion": "schema_version",
+    "paginationState": "pagination_state",
+    "detailRoute": "detail_route",
+    "coverage": "coverage",
+    "exhausted": "exhausted",
     "messageId": "message_id",
     "nodeId": "node_id",
     "parentId": "parent_id",
     "currentNode": "current_node",
     "modelSlug": "model_slug",
     "requestedModel": "requested_model",
+    "requestedModelRaw": "requested_model_raw",
     "requestedMode": "requested_mode",
+    "requestedModeRaw": "requested_mode_raw",
     "reasoningEffort": "reasoning_effort",
+    "requestedReasoningEffortRaw": "requested_reasoning_effort_raw",
     "defaultModelSlug": "default_model_slug",
+    "recordedFinalModelRaw": "recorded_final_model_raw",
+    "endTurn": "end_turn",
     "generationId": "generation_id",
     "requestId": "request_id",
     "messageRequestId": "message_request_id",
@@ -109,7 +121,10 @@ _OBSERVATION_KEY_ALIASES = {
     "hasNextPage": "has_next_page",
     "startCursor": "start_cursor",
     "endCursor": "end_cursor",
-    "schemaVersion": "schema_version",
+    "nextCursor": "next_cursor",
+    "previousCursor": "previous_cursor",
+    "projectId": "project_id",
+    "workspaceId": "workspace_id",
     "schemaFingerprint": "schema_fingerprint",
     "errorType": "error_type",
     "errorCode": "error_code",
@@ -119,8 +134,7 @@ _OBSERVATION_KEY_ALIASES = {
     "transfer_schema_version": "transfer_version",
     "resolvedModel": "resolved_model",
     "resolvedModelRaw": "resolved_model_raw",
-    "requestedModelRaw": "requested_model_raw",
-    "recordedFinalModelRaw": "recorded_final_model_raw",
+    "resolvedModelSlug": "resolved_model_slug",
     "futureTimestampQuarantined": "future_timestamp_quarantined",
     "quarantineTimestamp": "quarantine_timestamp",
     "quarantineAt": "quarantine_at",
@@ -135,6 +149,8 @@ _OBSERVATION_FIELDS = frozenset(
     {
         "id",
         "conversation_id",
+        "continuation",
+        "exhausted",
         "message_id",
         "node_id",
         "parent",
@@ -146,11 +162,14 @@ _OBSERVATION_FIELDS = frozenset(
         "requested_model_raw",
         "requested_model_slug",
         "requested_mode",
+        "requested_mode_raw",
         "reasoning_effort",
+        "requested_reasoning_effort_raw",
         "default_model_slug",
         "recorded_final_model_raw",
         "resolved_model",
         "resolved_model_raw",
+        "resolved_model_slug",
         "generation_id",
         "request_id",
         "message_request_id",
@@ -172,6 +191,8 @@ _OBSERVATION_FIELDS = frozenset(
         "has_next_page",
         "start_cursor",
         "end_cursor",
+        "next_cursor",
+        "previous_cursor",
         "offset",
         "limit",
         "total",
@@ -182,6 +203,7 @@ _OBSERVATION_FIELDS = frozenset(
         "metadata",
         "author",
         "workspace_id",
+        "project_id",
         "gizmo_id",
         "surface",
         "origin",
@@ -189,6 +211,8 @@ _OBSERVATION_FIELDS = frozenset(
         "imported",
         "copied",
         "coverage",
+        "pagination_state",
+        "detail_route",
         "schema_version",
         "error_type",
         "error_code",
@@ -206,8 +230,13 @@ _OBSERVATION_FIELDS = frozenset(
         "unknown_fields",
         "evidence_id",
         "provenance",
+        "message",
         "transfer_version",
         "transfer_schema_version",
+        "projection_status",
+        "projection_error",
+        "projection_truncated",
+        "projection_truncations",
     }
 )
 _OBSERVATION_TOKEN_FIELDS = frozenset(
@@ -215,6 +244,7 @@ _OBSERVATION_TOKEN_FIELDS = frozenset(
         "id",
         "conversation_id",
         "message_id",
+        "continuation",
         "node_id",
         "parent",
         "parent_id",
@@ -225,11 +255,14 @@ _OBSERVATION_TOKEN_FIELDS = frozenset(
         "requested_model_raw",
         "requested_model_slug",
         "requested_mode",
+        "requested_mode_raw",
         "reasoning_effort",
+        "requested_reasoning_effort_raw",
         "default_model_slug",
         "recorded_final_model_raw",
         "resolved_model",
         "resolved_model_raw",
+        "resolved_model_slug",
         "generation_id",
         "request_id",
         "message_request_id",
@@ -242,9 +275,15 @@ _OBSERVATION_TOKEN_FIELDS = frozenset(
         "channel",
         "recipient",
         "start_cursor",
+        "end_cursor",
+        "next_cursor",
+        "previous_cursor",
         "workspace_id",
+        "project_id",
         "gizmo_id",
         "coverage",
+        "pagination_state",
+        "detail_route",
         "schema_version",
         "error_type",
         "error_code",
@@ -254,6 +293,8 @@ _OBSERVATION_TOKEN_FIELDS = frozenset(
         "schema_fingerprint",
         "evidence_id",
         "transfer_version",
+        "projection_status",
+        "projection_error",
     }
 )
 _OBSERVATION_TIMESTAMP_FIELDS = frozenset(
@@ -269,6 +310,7 @@ _OBSERVATION_TIMESTAMP_FIELDS = frozenset(
 )
 _OBSERVATION_BOOLEAN_FIELDS = frozenset(
     {
+        "exhausted",
         "end_turn",
         "is_archived",
         "is_starred",
@@ -288,6 +330,160 @@ _OBSERVATION_WARNING_FIELDS = frozenset({"warnings", "quarantine_warnings"})
 _OBSERVATION_MAX_DEPTH = 8
 _OBSERVATION_MAX_FIELDS = 128
 _OBSERVATION_MAX_ITEMS = 800
+_OBSERVATION_NULLABLE_BOOLEAN_FIELDS = frozenset({"end_turn", "is_archived", "is_starred", "has_versions"})
+_QUARANTINE_TIMESTAMP_FIELDS = frozenset(
+    {"createdAt", "updatedAt", "attemptTime", "earliestPossibleAt", "latestPossibleAt"}
+)
+
+_SUMMARY_FIELDS = frozenset(
+    {
+        "id",
+        "conversation_id",
+        "created_at",
+        "updated_at",
+        "create_time",
+        "update_time",
+        "is_archived",
+        "workspace_id",
+        "project_id",
+        "gizmo_id",
+        "surface",
+        "origin",
+        "has_versions",
+        "current_node",
+        "coverage",
+    }
+)
+_MESSAGE_FIELDS = frozenset(
+    {
+        "id",
+        "conversation_id",
+        "message_id",
+        "node_id",
+        "parent",
+        "parent_id",
+        "children",
+        "author",
+        "role",
+        "channel",
+        "created_at",
+        "updated_at",
+        "create_time",
+        "update_time",
+        "status",
+        "end_turn",
+        "requested_model",
+        "requested_model_raw",
+        "requested_model_slug",
+        "requested_mode",
+        "requested_mode_raw",
+        "reasoning_effort",
+        "requested_reasoning_effort_raw",
+        "recorded_final_model_raw",
+        "model_slug",
+        "resolved_model",
+        "resolved_model_raw",
+        "resolved_model_slug",
+        "generation_id",
+        "request_id",
+        "message_request_id",
+        "surface",
+        "origin",
+        "metadata",
+        "coverage",
+        "quarantine",
+        "quarantine_state",
+        "warnings",
+    }
+)
+_MAPPING_NODE_FIELDS = _MESSAGE_FIELDS | frozenset({"message"})
+_PAGE_INFO_FIELDS = frozenset(
+    {
+        "has_previous_page",
+        "has_next_page",
+        "start_cursor",
+        "end_cursor",
+        "next_cursor",
+        "previous_cursor",
+        "offset",
+        "limit",
+        "total",
+    }
+)
+_PAGE_FIELDS = frozenset(
+    {
+        "items",
+        "messages",
+        "mapping",
+        "page_info",
+        "continuation",
+        "exhausted",
+        "schema_version",
+        "pagination_state",
+        "coverage",
+        "warnings",
+        "surface",
+        "origin",
+        "detail_route",
+        "conversation_id",
+        "current_node",
+        "workspace_id",
+        "project_id",
+        "gizmo_id",
+        "created_at",
+        "updated_at",
+        "create_time",
+        "update_time",
+        "quarantine",
+        "quarantine_state",
+        "transfer_version",
+        "transfer_schema_version",
+        "schema_fingerprint",
+        "unknown_fields",
+        "evidence_id",
+        "provenance",
+        "projection_status",
+        "projection_error",
+        "projection_truncated",
+        "projection_truncations",
+    }
+)
+
+
+@dataclass
+class _ObservationProjectionState:
+    """Bounded state shared by all shape-specific observation projectors."""
+
+    truncations: list[dict[str, Any]] = field(default_factory=list)
+    invalid: bool = False
+    incomplete: bool = False
+
+    def mark_invalid(self) -> None:
+        self.invalid = True
+
+    def mark_incomplete(self) -> None:
+        self.incomplete = True
+
+    def mark_truncated(
+        self,
+        *,
+        path: str,
+        reason: str,
+        retained_count: Optional[int] = None,
+        source_count: Optional[int] = None,
+        source_count_lower_bound: bool = False,
+    ) -> None:
+        record: dict[str, Any] = {
+            "path": path or "$",
+            "reason": reason,
+        }
+        if retained_count is not None:
+            record["retained_count"] = retained_count
+        if source_count is not None:
+            record["source_count"] = source_count
+        if source_count_lower_bound:
+            record["source_count_lower_bound"] = True
+        self.truncations.append(record)
 
 
 @dataclass(frozen=True)
@@ -702,6 +898,7 @@ class PgLedger:
                       AND outcome IN (
                           'failed_after_start',
                           'cancelled_after_start',
+                          'rejected_after_start',
                           'completion_unknown',
                           'unresolved',
                           'unknown'
@@ -1040,20 +1237,27 @@ class PgLedgerPage:
     ) -> tuple[str, bool]:
         safe_scope = _normalize_scope(scope)
         safe_context = _normalize_context(context)
-        binding = self.bind_scope(safe_scope, seen_at=safe_context.observed_at)
         sanitized = _observation_envelope(payload)
-        self.ledger.assert_safe_record(sanitized)
         provenance = sanitize_provenance(safe_context.provenance)
         provenance.update(
             {
                 "collector_account_id": safe_scope.collector_account_id,
+                "run_id": safe_context.run_id,
                 "schema_version": safe_context.schema_version,
                 "source_id": safe_context.source_id,
                 "source_kind": safe_context.source_kind,
             }
         )
         provenance.setdefault("transfer_schema_version", TRANSFER_SCHEMA_VERSION)
-        self.ledger.assert_safe_record(provenance)
+        self.ledger.assert_safe_record(
+            _prepared_observation_record(
+                safe_scope,
+                safe_context,
+                sanitized,
+                provenance,
+            )
+        )
+        binding = self.bind_scope(safe_scope, seen_at=safe_context.observed_at)
         stable_payload = _without_keys(sanitized, "provenance", "run_id")
         revision_fingerprint = fingerprint_value({"payload": stable_payload, "provenance": provenance})
         observed_at = safe_context.observed_at
@@ -1202,6 +1406,15 @@ class PgLedgerPage:
         safe_context = _normalize_context(context)
         aliases = _unique_aliases(attempt.aliases)
         safe_attempt = _normalize_attempt(attempt, aliases)
+        initial_payload = _attempt_payload(safe_attempt, aliases)
+        self.ledger.assert_safe_record(
+            _prepared_attempt_record(
+                safe_scope,
+                safe_context,
+                initial_payload,
+                aliases,
+            )
+        )
         binding = self.bind_scope(safe_scope, seen_at=safe_context.observed_at)
         observed_at = safe_context.observed_at
         with self.conn.cursor() as cur:
@@ -1226,7 +1439,14 @@ class PgLedgerPage:
                 attempt_id=effective_id,
                 quarantine_reason=quarantine_reason,
             )
-            self.ledger.assert_safe_record(attempt_payload)
+            self.ledger.assert_safe_record(
+                _prepared_attempt_record(
+                    safe_scope,
+                    safe_context,
+                    attempt_payload,
+                    aliases,
+                )
+            )
             projection_fingerprint = fingerprint_value(attempt_payload)
             current = _attempt(cur, binding.scope_key, effective_id)
             if current is not None and current["tombstone"]:
@@ -1245,7 +1465,7 @@ class PgLedgerPage:
                     "quarantined",
                     identity_conflicts + 1,
                 )
-            quarantine_state = "quarantined" if quarantine_reason is not None else "clear"
+            quarantine_state = str(attempt_payload["quarantine"]["state"])
             if quarantine_reason is not None and current is not None:
                 cur.execute(
                     """
@@ -1393,6 +1613,7 @@ class PgLedgerPage:
                         binding.scope_key,
                         effective_id,
                         quarantine_state,
+                        attempt_payload["warnings"],
                     ),
                 )
                 status = "updated"
@@ -2162,6 +2383,7 @@ def _attempt_projection_params(
     scope_key_value: str,
     attempt_id: str,
     quarantine_state: str,
+    warnings: Sequence[str],
 ) -> tuple[Any, ...]:
     return (
         scope.collector_account_id,
@@ -2187,7 +2409,7 @@ def _attempt_projection_params(
         attempt.origin,
         revision,
         projection_fingerprint,
-        json.dumps(attempt.warnings, separators=(",", ":"), default=str),
+        json.dumps(list(warnings), separators=(",", ":"), default=str),
         observed_at,
         observed_at,
         observed_at,
@@ -2405,6 +2627,10 @@ def _attempt_payload(
     quarantine_reason: Optional[str] = None,
 ) -> dict[str, Any]:
     warnings = list(_safe_tokens(attempt.warnings))
+    normalized_quarantine = _normalize_quarantine(attempt.quarantine)
+    for warning in normalized_quarantine["warnings"]:
+        if warning not in warnings:
+            warnings.append(warning)
     if quarantine_reason is not None:
         quarantine_warning = f"quarantine:{quarantine_reason}"
         if quarantine_warning not in warnings:
@@ -2432,10 +2658,10 @@ def _attempt_payload(
         "generationStarted": attempt.generation_started,
         "surface": attempt.surface,
         "origin": attempt.origin,
-        "aliases": sorted(aliases),
+        "aliases": [list(alias) for alias in sorted(aliases)],
         "evidenceMessageIds": sorted(attempt.evidence_message_ids),
         "warnings": sorted(warnings),
-        "quarantine": _quarantine_envelope(warnings),
+        "quarantine": _quarantine_envelope(warnings, normalized_quarantine),
     }
 
 
@@ -2448,6 +2674,47 @@ def _scope_payload(scope: LedgerScope) -> dict[str, Any]:
         "quota_owner_id": scope.quota_owner_id,
         "surface": scope.surface,
         "identity_state": _scope_identity_state(scope),
+    }
+
+
+def _context_payload(context: IngestContext) -> dict[str, Any]:
+    return {
+        "run_id": context.run_id,
+        "observed_at": isoformat_utc(context.observed_at),
+        "source_kind": context.source_kind,
+        "source_id": context.source_id,
+        "schema_version": context.schema_version,
+        "provenance": sanitize_provenance(context.provenance),
+    }
+
+
+def _prepared_observation_record(
+    scope: LedgerScope,
+    context: IngestContext,
+    payload: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "scope": _scope_payload(scope),
+        "context": _context_payload(context),
+        "payload": dict(payload),
+        "provenance": dict(provenance),
+    }
+
+
+def _prepared_attempt_record(
+    scope: LedgerScope,
+    context: IngestContext,
+    payload: Mapping[str, Any],
+    aliases: Sequence[tuple[str, str]],
+) -> dict[str, Any]:
+    return {
+        "scope": _scope_payload(scope),
+        "context": _context_payload(context),
+        "payload": dict(payload),
+        "aliases": [list(alias) for alias in aliases],
+        "warnings": list(payload.get("warnings", [])),
+        "provenance": sanitize_provenance(context.provenance),
     }
 
 
@@ -2519,6 +2786,7 @@ def _normalize_attempt(
         ),
         revision=revision,
         warnings=tuple(_safe_tokens(attempt.warnings)),
+        quarantine=_normalize_quarantine(attempt.quarantine),
     )
 
 
@@ -2594,24 +2862,87 @@ def _sanitize_aliases(
     return out
 
 
+def _looks_like_page(payload: Mapping[str, Any]) -> bool:
+    page_markers = {"items", "messages", "mapping", "page_info", "continuation", "exhausted"}
+    for index, raw_key in enumerate(payload):
+        if index >= _OBSERVATION_MAX_FIELDS:
+            break
+        key = _OBSERVATION_KEY_ALIASES.get(str(raw_key), str(raw_key))
+        if key in page_markers:
+            return True
+    return False
+
+
 def _observation_envelope(payload: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise LedgerError("observation payload must be a mapping")
-    projected: dict[str, Any] = {
-        "transfer_schema_version": TRANSFER_SCHEMA_VERSION,
-    }
+    state = _ObservationProjectionState()
+    projected, unknown_field_count, source_count = _project_observation_root(payload, state)
+    _finish_observation_projection(
+        payload,
+        projected,
+        state,
+        unknown_field_count=unknown_field_count,
+        source_count=source_count,
+    )
+    return projected
+
+
+def _project_observation_root(
+    payload: Mapping[str, Any],
+    state: _ObservationProjectionState,
+) -> tuple[dict[str, Any], int, Optional[int]]:
+    projected: dict[str, Any] = {"transfer_schema_version": TRANSFER_SCHEMA_VERSION}
     unknown_field_count = 0
-    for raw_key, raw_value in payload.items():
+    source_count = _safe_len(payload)
+    root_fields = _PAGE_FIELDS if _looks_like_page(payload) else _OBSERVATION_FIELDS
+    for index, (raw_key, raw_value) in enumerate(payload.items()):
+        if index >= _OBSERVATION_MAX_FIELDS:
+            state.mark_truncated(
+                path="$",
+                reason="max_fields",
+                retained_count=len(projected),
+                source_count=source_count,
+                source_count_lower_bound=source_count is None,
+            )
+            break
         key = _OBSERVATION_KEY_ALIASES.get(str(raw_key), str(raw_key))
-        if key not in _OBSERVATION_FIELDS:
+        if key not in root_fields:
             unknown_field_count += 1
             continue
-        value = _project_observation_field(key, raw_value)
+        value = _project_observation_field(
+            key,
+            raw_value,
+            state=state,
+            path=f"$.{key}",
+            shape="root",
+            depth=0,
+        )
         if value is not _DROP:
             projected[key] = value
+    return projected, unknown_field_count, source_count
+
+
+def _finish_observation_projection(
+    payload: Mapping[str, Any],
+    projected: dict[str, Any],
+    state: _ObservationProjectionState,
+    *,
+    unknown_field_count: int,
+    source_count: Optional[int],
+) -> None:
     surface = classify_surface(payload, default=None)
     projected["surface"] = _surface_token(projected.get("surface", surface))
-    projected["unknown_field_count"] = min(unknown_field_count, 128)
+    projected["unknown_field_count"] = min(unknown_field_count, _OBSERVATION_MAX_FIELDS)
+    if source_count is not None and source_count > _OBSERVATION_MAX_FIELDS:
+        projected["unknown_field_count_lower_bound"] = True
+    _record_observation_collection_counts(projected)
+    _apply_observation_quarantine(projected)
+    _apply_transfer_version_status(projected)
+    _apply_projection_status(projected, state)
+
+
+def _record_observation_collection_counts(projected: dict[str, Any]) -> None:
     for collection_key, count_key in (
         ("items", "item_count"),
         ("messages", "message_count"),
@@ -2619,163 +2950,655 @@ def _observation_envelope(payload: Mapping[str, Any]) -> dict[str, Any]:
     ):
         value = projected.get(collection_key)
         if isinstance(value, (Mapping, Sequence)) and not isinstance(value, (str, bytes, bytearray)):
-            projected[count_key] = min(len(value), _OBSERVATION_MAX_ITEMS)
-    future_timestamp_quarantined = projected.get("future_timestamp_quarantined") is True
-    if future_timestamp_quarantined:
+            projected[count_key] = len(value)
+
+
+def _apply_observation_quarantine(projected: dict[str, Any]) -> None:
+    if projected.get("future_timestamp_quarantined") is True:
         projected["quarantine_state"] = "quarantined"
-        quarantine = projected.get("quarantine")
-        if isinstance(quarantine, Mapping):
-            reasons = _safe_tokens(quarantine.get("reasons", []), limit=32)
-            if "future_timestamp_quarantined" not in reasons:
-                reasons.append("future_timestamp_quarantined")
-            projected["quarantine"] = {
-                **quarantine,
-                "state": "quarantined",
-                "reasons": reasons[:32],
-            }
-        else:
-            projected["quarantine"] = {
-                "state": "quarantined",
-                "reasons": ["future_timestamp_quarantined"],
-            }
-    return projected
+        projected["quarantine"] = _quarantine_envelope(
+            ["future_timestamp_quarantined"],
+            projected.get("quarantine") if isinstance(projected.get("quarantine"), Mapping) else None,
+        )
+        return
+    quarantine = projected.get("quarantine")
+    if isinstance(quarantine, Mapping) and quarantine.get("state") in {"quarantined", "unknown"}:
+        projected["quarantine_state"] = quarantine["state"]
 
 
-def _project_observation_field(key: str, value: Any) -> Any:
+def _apply_transfer_version_status(projected: dict[str, Any]) -> None:
+    source_transfer_version = projected.get("transfer_version")
+    if source_transfer_version is None or source_transfer_version == TRANSFER_SCHEMA_VERSION:
+        return
+    projected["projection_status"] = "unsupported_transfer_version"
+    projected["projection_error"] = f"unsupported_transfer_version:{source_transfer_version}"
+    projected["coverage"] = "unrecognized"
+
+
+def _apply_projection_status(
+    projected: dict[str, Any],
+    state: _ObservationProjectionState,
+) -> None:
+    if state.truncations:
+        projected["projection_truncated"] = True
+        projected["projection_truncations"] = state.truncations[:_OBSERVATION_MAX_FIELDS]
+        if projected.get("coverage") != "unrecognized":
+            projected["coverage"] = "partial"
+        if projected.get("exhausted") is True:
+            projected["exhausted"] = False
+        projected.setdefault("projection_status", "partial")
+    else:
+        projected["projection_truncated"] = False
+        projected["projection_truncations"] = []
+    if state.invalid:
+        projected["coverage"] = "unrecognized"
+        projected["projection_status"] = "unrecognized"
+    elif state.incomplete and projected.get("coverage") != "unrecognized":
+        projected["coverage"] = "partial"
+        projected.setdefault("projection_status", "partial")
+    elif state.truncations and projected.get("projection_status") != "unsupported_transfer_version":
+        projected["projection_status"] = "partial"
+
+
+def _project_observation_field(
+    key: str,
+    value: Any,
+    *,
+    state: Optional[_ObservationProjectionState] = None,
+    path: str = "$",
+    shape: str = "root",
+    depth: int = 0,
+) -> Any:
+    projection_state = state or _ObservationProjectionState()
+    if depth > _OBSERVATION_MAX_DEPTH:
+        projection_state.mark_truncated(path=path, reason="max_depth", source_count_lower_bound=True)
+        return _DROP
     if key in {"surface", "origin"}:
         return _surface_token(value) if key == "surface" else _origin_token(value)
+    if key == "continuation":
+        projected = _continuation_token(value)
+        if projected is _DROP:
+            projection_state.mark_incomplete()
+        return projected
     if key in _OBSERVATION_TIMESTAMP_FIELDS:
-        return _safe_timestamp(value)
+        projected = _safe_timestamp(value)
+        if projected is _DROP:
+            projection_state.mark_incomplete()
+        return projected
     if key in _OBSERVATION_BOOLEAN_FIELDS:
-        return value if isinstance(value, bool) else _DROP
-    if key in _OBSERVATION_NUMBER_FIELDS:
-        return _safe_number(value)
-    if key in _OBSERVATION_COLLECTION_FIELDS:
-        return _observation_collection_envelope(value)
-    if key in _OBSERVATION_WARNING_FIELDS:
-        if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        if value is None and key in _OBSERVATION_NULLABLE_BOOLEAN_FIELDS:
+            return None
+        if not isinstance(value, bool):
+            projection_state.mark_incomplete()
             return _DROP
-        return _safe_tokens(value, limit=64)
+        return value
+    if key in _OBSERVATION_NUMBER_FIELDS:
+        projected = _safe_number(value)
+        if projected is _DROP:
+            projection_state.mark_incomplete()
+        return projected
+    if key in _OBSERVATION_COLLECTION_FIELDS:
+        return _observation_collection_envelope(
+            key,
+            value,
+            state=projection_state,
+            path=path,
+            depth=depth + 1,
+        )
+    if key in _OBSERVATION_WARNING_FIELDS:
+        return _bounded_token_sequence(
+            value,
+            state=projection_state,
+            path=path,
+            limit=64,
+        )
     if key == "provenance":
-        return sanitize_provenance(value) if isinstance(value, Mapping) else _DROP
+        if not isinstance(value, Mapping):
+            projection_state.mark_incomplete()
+            return _DROP
+        return sanitize_provenance(value)
     if key == "quarantine_state":
         return _quarantine_state_token(value)
     if key == "transfer_version":
-        return _transfer_version_token(value)
+        projected = _transfer_version_token(value)
+        if projected is _DROP:
+            projection_state.mark_incomplete()
+        return projected
     if key in _OBSERVATION_LIST_FIELDS:
-        if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-            return _DROP
-        return _safe_tokens(value, limit=800)
-    if key in _OBSERVATION_TOKEN_FIELDS:
-        return _optional_token(value)
+        return _bounded_token_sequence(
+            value,
+            state=projection_state,
+            path=path,
+            limit=_OBSERVATION_MAX_ITEMS,
+        )
     if key == "metadata":
-        return sanitize_metadata(value) if isinstance(value, Mapping) else _DROP
+        return _bounded_metadata_projection(value, state=projection_state, path=path)
     if key == "author":
-        if not isinstance(value, Mapping):
-            return _DROP
-        role = _optional_token(value.get("role"))
-        return {"role": role} if role is not None else {}
+        return _project_author(value, state=projection_state, path=path, depth=depth + 1)
     if key == "page_info":
-        return _page_info_envelope(value)
+        return _project_shape_object(
+            value,
+            _PAGE_INFO_FIELDS,
+            state=projection_state,
+            path=path,
+            shape="page_info",
+            depth=depth + 1,
+        )
+    if key == "message":
+        return _project_message(
+            value,
+            state=projection_state,
+            path=path,
+            depth=depth + 1,
+        )
     if key == "quarantine":
         return _quarantine_value(value)
     if key == "transfer_schema_version":
         return TRANSFER_SCHEMA_VERSION
+    if key == "projection_truncated":
+        return value if isinstance(value, bool) else _DROP
+    if key == "projection_truncations":
+        return _bounded_projection_truncations(value, state=projection_state, path=path)
+    if key in _OBSERVATION_TOKEN_FIELDS:
+        projected = _optional_token(value)
+        if value is not None and projected is None:
+            projection_state.mark_incomplete()
+        return projected
     return _DROP
 
 
-def _observation_collection_envelope(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        sanitized: Any = sanitize_mapping(value)
-    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        sanitized = [sanitize_value(item) for item in value]
-    else:
+def _observation_collection_envelope(
+    key: str,
+    value: Any,
+    *,
+    state: _ObservationProjectionState,
+    path: str,
+    depth: int,
+) -> Any:
+    if key == "items":
+        return _bounded_object_sequence(
+            value,
+            projector=lambda item, item_path: _project_collection_item(
+                item,
+                state=state,
+                path=item_path,
+                depth=depth,
+            ),
+            state=state,
+            path=path,
+            collection_name=key,
+        )
+    if key == "messages":
+        return _bounded_object_sequence(
+            value,
+            projector=lambda item, item_path: _project_message(
+                item,
+                state=state,
+                path=item_path,
+                depth=depth,
+            ),
+            state=state,
+            path=path,
+            collection_name=key,
+        )
+    if key == "mapping":
+        return _bounded_mapping(
+            value,
+            projector=lambda item, item_path: _project_mapping_node(
+                item,
+                state=state,
+                path=item_path,
+                depth=depth,
+            ),
+            state=state,
+            path=path,
+            collection_name=key,
+        )
+    return _DROP
+
+
+def _project_collection_item(
+    value: Any,
+    *,
+    state: _ObservationProjectionState,
+    path: str,
+    depth: int,
+) -> Any:
+    if not isinstance(value, Mapping):
+        state.mark_incomplete()
         return _DROP
-    return _bound_observation_value(sanitized)
+    normalized_keys: set[str] = set()
+    source_count = _safe_len(value)
+    for index, raw_key in enumerate(value):
+        if index >= _OBSERVATION_MAX_FIELDS:
+            state.mark_truncated(
+                path=path,
+                reason="max_fields",
+                retained_count=len(normalized_keys),
+                source_count=source_count,
+                source_count_lower_bound=source_count is None,
+            )
+            break
+        normalized_keys.add(_OBSERVATION_KEY_ALIASES.get(str(raw_key), str(raw_key)))
+    if "message" in normalized_keys or "children" in normalized_keys:
+        return _project_mapping_node(value, state=state, path=path, depth=depth)
+    if normalized_keys.intersection(
+        {
+            "message_id",
+            "node_id",
+            "role",
+            "author",
+            "end_turn",
+            "requested_mode_raw",
+            "requested_reasoning_effort_raw",
+        }
+    ):
+        return _project_message(value, state=state, path=path, depth=depth)
+    return _project_summary(value, state=state, path=path, depth=depth)
 
 
-def _bound_observation_value(value: Any, *, depth: int = 0) -> Any:
+def _project_summary(
+    value: Any,
+    *,
+    state: _ObservationProjectionState,
+    path: str,
+    depth: int,
+) -> Any:
+    return _project_shape_object(
+        value,
+        _SUMMARY_FIELDS,
+        state=state,
+        path=path,
+        shape="summary",
+        depth=depth,
+    )
+
+
+def _project_message(
+    value: Any,
+    *,
+    state: _ObservationProjectionState,
+    path: str,
+    depth: int,
+) -> Any:
+    return _project_shape_object(
+        value,
+        _MESSAGE_FIELDS,
+        state=state,
+        path=path,
+        shape="message",
+        depth=depth,
+    )
+
+
+def _project_mapping_node(
+    value: Any,
+    *,
+    state: _ObservationProjectionState,
+    path: str,
+    depth: int,
+) -> Any:
+    return _project_shape_object(
+        value,
+        _MAPPING_NODE_FIELDS,
+        state=state,
+        path=path,
+        shape="mapping_node",
+        depth=depth,
+    )
+
+
+def _project_shape_object(
+    value: Any,
+    fields: frozenset[str],
+    *,
+    state: _ObservationProjectionState,
+    path: str,
+    shape: str,
+    depth: int,
+) -> Any:
     if depth > _OBSERVATION_MAX_DEPTH:
+        state.mark_truncated(path=path, reason="max_depth", source_count_lower_bound=True)
         return _DROP
-    if isinstance(value, Mapping):
-        out: dict[str, Any] = {}
-        for raw_key, raw_value in list(value.items())[:_OBSERVATION_MAX_FIELDS]:
-            child = _bound_observation_value(raw_value, depth=depth + 1)
-            if child is not _DROP:
-                out[str(raw_key)] = child
-        return out
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        out_list: list[Any] = []
-        for raw_value in list(value)[:_OBSERVATION_MAX_ITEMS]:
-            child = _bound_observation_value(raw_value, depth=depth + 1)
-            if child is not _DROP:
-                out_list.append(child)
-        return out_list
-    if isinstance(value, bool) or value is None or isinstance(value, str):
-        return value
-    if isinstance(value, (int, float)):
-        return _safe_number(value)
-    return _DROP
+    if not isinstance(value, Mapping):
+        state.mark_incomplete()
+        return _DROP
+    source_count = _safe_len(value)
+    projected: dict[str, Any] = {}
+    for index, (raw_key, raw_value) in enumerate(value.items()):
+        if index >= _OBSERVATION_MAX_FIELDS:
+            state.mark_truncated(
+                path=path,
+                reason="max_fields",
+                retained_count=len(projected),
+                source_count=source_count,
+                source_count_lower_bound=source_count is None,
+            )
+            break
+        key = _OBSERVATION_KEY_ALIASES.get(str(raw_key), str(raw_key))
+        if key not in fields:
+            continue
+        child = _project_observation_field(
+            key,
+            raw_value,
+            state=state,
+            path=f"{path}.{key}",
+            shape=shape,
+            depth=depth + 1,
+        )
+        if child is not _DROP:
+            projected[key] = child
+    return projected
+
+
+def _project_author(
+    value: Any,
+    *,
+    state: _ObservationProjectionState,
+    path: str,
+    depth: int,
+) -> Any:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        state.mark_incomplete()
+        return _DROP
+    role = _optional_token(value.get("role"))
+    if value.get("role") is not None and role is None:
+        state.mark_incomplete()
+    return {"role": role}
 
 
 def _page_info_envelope(value: Any) -> Any:
-    if not isinstance(value, Mapping):
+    state = _ObservationProjectionState()
+    return _project_shape_object(
+        value,
+        _PAGE_INFO_FIELDS,
+        state=state,
+        path="$.page_info",
+        shape="page_info",
+        depth=0,
+    )
+
+
+def _bounded_object_sequence(
+    value: Any,
+    *,
+    projector: Any,
+    state: _ObservationProjectionState,
+    path: str,
+    collection_name: str,
+) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+        state.mark_incomplete()
         return _DROP
-    out: dict[str, Any] = {}
-    for key in ("has_previous_page", "has_next_page"):
-        if isinstance(value.get(key), bool):
-            out[key] = value[key]
-    for key in ("start_cursor", "end_cursor"):
-        token = _optional_token(value.get(key))
-        if token is not None:
-            out[key] = token
-    for key in ("offset", "limit", "total"):
-        number = _safe_number(value.get(key))
-        if number is not _DROP:
-            out[key] = number
+    source_count = _safe_len(value)
+    out: list[Any] = []
+    for index, item in enumerate(value):
+        if index >= _OBSERVATION_MAX_ITEMS:
+            state.mark_truncated(
+                path=path,
+                reason="max_items",
+                retained_count=len(out),
+                source_count=source_count,
+                source_count_lower_bound=source_count is None,
+            )
+            break
+        projected = projector(item, f"{path}[{index}]")
+        if projected is not _DROP:
+            out.append(projected)
     return out
+
+
+def _bounded_mapping(
+    value: Any,
+    *,
+    projector: Any,
+    state: _ObservationProjectionState,
+    path: str,
+    collection_name: str,
+) -> Any:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        state.mark_incomplete()
+        return _DROP
+    source_count = _safe_len(value)
+    out: dict[str, Any] = {}
+    for index, (raw_key, item) in enumerate(value.items()):
+        if index >= _OBSERVATION_MAX_ITEMS:
+            state.mark_truncated(
+                path=path,
+                reason="max_items",
+                retained_count=len(out),
+                source_count=source_count,
+                source_count_lower_bound=source_count is None,
+            )
+            break
+        safe_key = _optional_token(str(raw_key))
+        if safe_key is None:
+            state.mark_incomplete()
+            continue
+        projected = projector(item, f"{path}.{safe_key}")
+        if projected is not _DROP:
+            out[safe_key] = projected
+    return out
+
+
+def _bounded_token_sequence(
+    value: Any,
+    *,
+    state: _ObservationProjectionState,
+    path: str,
+    limit: int,
+) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+        state.mark_incomplete()
+        return _DROP
+    source_count = _safe_len(value)
+    out: list[str] = []
+    for index, item in enumerate(value):
+        if index >= limit:
+            state.mark_truncated(
+                path=path,
+                reason="max_items",
+                retained_count=len(out),
+                source_count=source_count,
+                source_count_lower_bound=source_count is None,
+            )
+            break
+        token = _optional_token(item)
+        if token is not None:
+            out.append(token)
+        elif item is not None:
+            state.mark_incomplete()
+    return out
+
+
+def _bounded_metadata_projection(
+    value: Any,
+    *,
+    state: _ObservationProjectionState,
+    path: str,
+) -> Any:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        state.mark_incomplete()
+        return _DROP
+    source_count = _safe_len(value)
+    out: dict[str, Any] = {}
+    for index, (raw_key, raw_value) in enumerate(value.items()):
+        if index >= _OBSERVATION_MAX_FIELDS:
+            state.mark_truncated(
+                path=path,
+                reason="max_fields",
+                retained_count=len(out),
+                source_count=source_count,
+                source_count_lower_bound=source_count is None,
+            )
+            break
+        key = _OBSERVATION_KEY_ALIASES.get(str(raw_key), str(raw_key))
+        projected = sanitize_metadata({key: raw_value})
+        if key in projected:
+            out[key] = projected[key]
+    return out
+
+
+def _bounded_projection_truncations(
+    value: Any,
+    *,
+    state: _ObservationProjectionState,
+    path: str,
+) -> Any:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        state.mark_incomplete()
+        return _DROP
+    out: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        if index >= _OBSERVATION_MAX_FIELDS:
+            state.mark_truncated(
+                path=path,
+                reason="max_items",
+                retained_count=len(out),
+                source_count=_safe_len(value),
+                source_count_lower_bound=False,
+            )
+            break
+        if not isinstance(item, Mapping):
+            state.mark_incomplete()
+            continue
+        record: dict[str, Any] = {}
+        for key in ("path", "reason"):
+            token = _optional_token(item.get(key))
+            if token is not None:
+                record[key] = token
+        for key in ("retained_count", "source_count"):
+            number = _safe_number(item.get(key))
+            if number is not _DROP:
+                record[key] = number
+        if item.get("source_count_lower_bound") is True:
+            record["source_count_lower_bound"] = True
+        if "path" in record and "reason" in record:
+            out.append(record)
+    return out
+
+
+def _safe_len(value: Any) -> Optional[int]:
+    try:
+        result = len(value)
+    except (TypeError, AttributeError):
+        return None
+    return result if isinstance(result, int) and result >= 0 else None
+
+
+def _continuation_token(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return _DROP
+    if isinstance(value, str):
+        return _optional_token(value)
+    return _safe_number(value)
 
 
 def _quarantine_envelope(
     warnings: Iterable[str],
+    quarantine: Optional[Mapping[str, Any]] = None,
     *,
     future_timestamp_quarantined: bool = False,
 ) -> dict[str, Any]:
-    safe_warnings = _safe_tokens(warnings)
-    reasons = [
-        warning.split(":", 1)[1] for warning in safe_warnings if warning.startswith("quarantine:") and ":" in warning
+    normalized = _normalize_quarantine(quarantine)
+    safe_warnings = [
+        warning
+        for warning in _safe_tokens(warnings, limit=64)
+        if warning == "future_timestamp_quarantined" or warning.startswith("quarantine:")
     ]
-    future_timestamp_quarantined = future_timestamp_quarantined or any(
-        warning in {"future_timestamp_quarantined", "future_timestamp_quarantined=true"} for warning in safe_warnings
-    )
-    if future_timestamp_quarantined and "future_timestamp_quarantined" not in reasons:
-        reasons.append("future_timestamp_quarantined")
+    if future_timestamp_quarantined and "future_timestamp_quarantined" not in safe_warnings:
+        safe_warnings.append("future_timestamp_quarantined")
+    merged_warnings = list(normalized["warnings"])
+    for warning in safe_warnings:
+        if warning not in merged_warnings:
+            merged_warnings.append(warning)
+    state = "quarantined" if (
+        normalized["state"] == "quarantined"
+        or normalized["timestamps"]
+        or merged_warnings
+    ) else "clear"
     return {
-        "state": "quarantined" if reasons or future_timestamp_quarantined else "clear",
-        "reasons": reasons[:32],
+        "state": state,
+        "warnings": sorted(merged_warnings)[:64],
+        "timestamps": list(normalized["timestamps"]),
     }
 
 
 def _quarantine_value(value: Any) -> Any:
+    if value is None:
+        return None
     if isinstance(value, bool):
-        return {"state": "quarantined" if value else "clear", "reasons": []}
+        return _quarantine_envelope(["future_timestamp_quarantined"] if value else [])
     if isinstance(value, str):
         token = _quarantine_state_token(value)
-        return {"state": token or "unknown", "reasons": []}
+        if token is None:
+            return _DROP
+        return _quarantine_envelope([] if token == "clear" else [f"quarantine:{token}"])
     if isinstance(value, Mapping):
-        state = _quarantine_state_token(value.get("state")) or "unknown"
-        raw_reasons = value.get("reasons", [])
-        reasons = _safe_tokens(
-            raw_reasons
-            if isinstance(raw_reasons, Sequence) and not isinstance(raw_reasons, (str, bytes, bytearray))
-            else []
-        )
-        if value.get("future_timestamp_quarantined") is True:
-            state = "quarantined"
-            if "future_timestamp_quarantined" not in reasons:
-                reasons.append("future_timestamp_quarantined")
-        return {"state": state, "reasons": reasons[:32]}
+        return _quarantine_envelope([], value)
     return _DROP
+
+
+def _normalize_quarantine(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {"state": "clear", "warnings": [], "timestamps": []}
+    state = _quarantine_state_token(value.get("state")) or "unknown"
+    raw_warnings = value.get("warnings", value.get("reasons", []))
+    warnings = _safe_tokens(
+        raw_warnings
+        if isinstance(raw_warnings, Sequence) and not isinstance(raw_warnings, (str, bytes, bytearray))
+        else []
+    )
+    if value.get("future_timestamp_quarantined") is True and "future_timestamp_quarantined" not in warnings:
+        warnings.append("future_timestamp_quarantined")
+    timestamps: list[dict[str, Any]] = []
+    raw_timestamps = value.get("timestamps", [])
+    if isinstance(raw_timestamps, Sequence) and not isinstance(raw_timestamps, (str, bytes, bytearray)):
+        for item in raw_timestamps:
+            if not isinstance(item, Mapping):
+                continue
+            field = _optional_token(item.get("field"))
+            if field not in _QUARANTINE_TIMESTAMP_FIELDS:
+                continue
+            timestamp_value = _safe_timestamp(item.get("value"))
+            observed_at = _safe_timestamp(item.get("observedAt", item.get("observed_at")))
+            if timestamp_value is _DROP or observed_at is _DROP:
+                continue
+            evidence: dict[str, Any] = {
+                "field": field,
+                "value": timestamp_value,
+                "observedAt": observed_at,
+            }
+            message_id = _optional_token(item.get("messageId", item.get("message_id")))
+            if message_id is not None:
+                evidence["messageId"] = message_id
+            if evidence not in timestamps:
+                timestamps.append(evidence)
+            if len(timestamps) >= 64:
+                break
+    if state == "quarantined" or warnings or timestamps:
+        normalized_state = "quarantined"
+    elif state == "unknown":
+        normalized_state = "unknown"
+    else:
+        normalized_state = "clear"
+    return {
+        "state": normalized_state,
+        "warnings": sorted(warnings)[:64],
+        "timestamps": timestamps,
+    }
 
 
 def _coverage_details_envelope(details: Optional[Mapping[str, Any]]) -> dict[str, Any]:
@@ -2865,13 +3688,19 @@ def _time_state_sql(
                             THEN 'definite'
                         ELSE 'out'
                     END
+                WHEN earliest_possible_at IS NOT NULL
+                 AND latest_possible_at IS NOT NULL
+                 AND latest_possible_at < earliest_possible_at
+                    THEN 'unknown'
+                WHEN latest_possible_at IS NOT NULL
+                 AND latest_possible_at < %s
+                    THEN 'out'
+                WHEN earliest_possible_at IS NOT NULL
+                 AND earliest_possible_at >= %s
+                    THEN 'out'
                 WHEN earliest_possible_at IS NULL
                   OR latest_possible_at IS NULL
-                  OR latest_possible_at < earliest_possible_at
                     THEN 'unknown'
-                WHEN latest_possible_at < %s
-                  OR earliest_possible_at >= %s
-                    THEN 'out'
                 WHEN earliest_possible_at >= %s
                  AND latest_possible_at < %s
                     THEN 'definite'
@@ -2884,13 +3713,14 @@ def _time_state_sql(
         return (
             """
             CASE
-                WHEN attempt_time IS NOT NULL THEN
-                    CASE WHEN attempt_time < %s THEN 'out' ELSE 'unknown' END
-                WHEN earliest_possible_at IS NULL
-                  OR latest_possible_at IS NULL
-                  OR latest_possible_at < earliest_possible_at
+            WHEN attempt_time IS NOT NULL THEN
+                CASE WHEN attempt_time < %s THEN 'out' ELSE 'unknown' END
+                WHEN earliest_possible_at IS NOT NULL
+                 AND latest_possible_at IS NOT NULL
+                 AND latest_possible_at < earliest_possible_at
                     THEN 'unknown'
-                WHEN latest_possible_at < %s THEN 'out'
+                WHEN latest_possible_at IS NOT NULL
+                 AND latest_possible_at < %s THEN 'out'
                 ELSE 'unknown'
             END
             """,
@@ -2901,11 +3731,12 @@ def _time_state_sql(
         CASE
             WHEN attempt_time IS NOT NULL THEN
                 CASE WHEN attempt_time >= %s THEN 'out' ELSE 'unknown' END
-            WHEN earliest_possible_at IS NULL
-              OR latest_possible_at IS NULL
-              OR latest_possible_at < earliest_possible_at
+            WHEN earliest_possible_at IS NOT NULL
+             AND latest_possible_at IS NOT NULL
+             AND latest_possible_at < earliest_possible_at
                 THEN 'unknown'
-            WHEN earliest_possible_at >= %s THEN 'out'
+            WHEN earliest_possible_at IS NOT NULL
+             AND earliest_possible_at >= %s THEN 'out'
             ELSE 'unknown'
         END
         """,
