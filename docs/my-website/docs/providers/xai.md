@@ -53,6 +53,7 @@ response = completion(
 | | `xai/grok-4-1-fast-non-reasoning` | 2M | Tools, Vision, Audio, Web search, Caching |
 | **Grok 4** | `xai/grok-4` | 256K | Tools, Web search |
 | | `xai/grok-4-0709` | 256K | Tools, Web search |
+| | `xai/grok-4.6` | 500K | **Reasoning**, Tools, Vision, Web search |
 | | `xai/grok-4-fast-reasoning` | 2M | **Reasoning**, Tools, Web search |
 | | `xai/grok-4-fast-non-reasoning` | 2M | Tools, Web search |
 | **Grok 3** | `xai/grok-3` | 131K | Tools, Web search |
@@ -150,6 +151,51 @@ without including caller-provided metadata values. LiteLLM's internal
 observability, routing, authentication, and session metadata remain in the
 separate `litellm_metadata` structure and are never merged into caller
 top-level `metadata`.
+
+## Responses API Compatibility
+
+xAI's Responses API does not accept OpenAI's top-level `instructions` field.
+For supported LiteLLM proxy passthrough routes, LiteLLM preserves caller
+instructions by lowering them into one `system` message in `input` before the
+request is sent to xAI. The outbound request has no top-level `instructions`,
+and the same behavior applies across fresh requests, continuations, retries,
+and proxy redispatch. For direct SDK calls, put system guidance in the
+`input` message sequence yourself; strict mode rejects the unsupported
+parameter and permissive mode drops it.
+
+For supported Codex auto-agent proxy routes, LiteLLM converts configured custom
+and namespace tools into xAI-compatible function tools before egress. The route
+applies required tool-description patches, removes unsupported hosted/request
+fields, and restores the original tool and namespace identities in returned tool
+calls. Send the original tool definitions; do not pre-flatten namespace tools.
+
+### Image Inputs
+
+When a Responses request contains an image item, image URL, or base64 image
+data, LiteLLM forces `store=False` before sending it to xAI. This applies even
+if the caller sets `store=True`. Requests without image input retain the
+caller's `store` value or the provider default.
+
+```python showLineNumbers title="xAI Responses with image input"
+import litellm
+
+response = litellm.responses(
+    model="xai/grok-4.6",
+    input=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Answer concisely. What is in this image?"},
+                {
+                    "type": "input_image",
+                    "image_url": "https://example.com/image.png",
+                },
+            ],
+        }
+    ],
+    store=True,  # LiteLLM sends store=False because the input contains an image.
+)
+```
 
 ## Proxy Retry and Quota Behavior
 
