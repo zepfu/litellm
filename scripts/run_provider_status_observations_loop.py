@@ -13,9 +13,12 @@ import json
 import math
 import os
 import re
+import select
 import signal
+import shutil
 import socket
 import ssl
+import subprocess
 import sys
 import tempfile
 import time
@@ -23,11 +26,23 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import contextmanager
 from concurrent.futures import Future, ThreadPoolExecutor, wait as futures_wait
 from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Union
+from typing import (
+    Any,
+    Callable,
+    Collection,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Union,
+)
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -72,9 +87,7 @@ try:
     from scripts import cursor_agent_auth_refresh
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    cursor_agent_auth_refresh = importlib.import_module(
-        "cursor_agent_auth_refresh"
-    )
+    cursor_agent_auth_refresh = importlib.import_module("cursor_agent_auth_refresh")
 
 # The canonical module is a required image dependency. Missing it must fail at
 # import time instead of silently creating a divergent local contract.
@@ -172,9 +185,7 @@ DEFAULT_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS = kimi_oauth_refresh.DEFAULT_KIMI_OAUTH_
 DEFAULT_NOUS_OAUTH_AUTH_FILE = nous_oauth_refresh.DEFAULT_NOUS_OAUTH_AUTH_FILE
 DEFAULT_NOUS_OAUTH_LOCK_FILE = nous_oauth_refresh.DEFAULT_NOUS_OAUTH_LOCK_FILE
 DEFAULT_NOUS_OAUTH_REFRESH_INTERVAL_SECONDS = 300.0
-DEFAULT_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS = (
-    nous_oauth_refresh.DEFAULT_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS
-)
+DEFAULT_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS = nous_oauth_refresh.DEFAULT_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS
 NOUS_OAUTH_SIDECAR_AUTH_FILE_ENV_VARS = (
     "LITELLM_NOUS_OAUTH_AUTH_FILE",
     "AAWM_HERMES_AUTH_FILE",
@@ -225,6 +236,8 @@ def _resolve_kimi_usage_source_version() -> str:
     if contract is not None:
         return f"kimi_code_{contract.client_version}_managed_usage_v1"
     return KIMI_CODE_USAGE_SOURCE_VERSION_FALLBACK
+
+
 KIMI_CODE_USAGE_CLIENT = "kimi-code"
 KIMI_CODE_NATIVE_FALLBACK_USER_AGENT = "kimi-code-cli/0.29.1"
 KIMI_CODE_USAGE_MODEL = "kimi-code"
@@ -317,19 +330,15 @@ DEFAULT_ALIBABA_QUOTA_POLL_ENABLED = False
 DEFAULT_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS = 600.0
 DEFAULT_ALIBABA_SUBSCRIPTION_POLL_INTERVAL_SECONDS = 21_600.0
 DEFAULT_ALIBABA_QUOTA_POLL_HTTP_TIMEOUT_SECONDS = 30.0
-DEFAULT_ALIBABA_QUOTA_GATEWAY_URL = (
-    "https://bailian-singapore-cs.alibabacloud.com/cli/api.json"
-)
+DEFAULT_ALIBABA_QUOTA_GATEWAY_URL = "https://bailian-singapore-cs.alibabacloud.com/cli/api.json"
 DEFAULT_ALIBABA_QUOTA_POLL_MAX_ATTEMPTS = 2
 DEFAULT_ALIBABA_QUOTA_POLL_RETRY_BACKOFF_SECONDS = 0.5
 ALIBABA_TOKEN_PLAN_USAGE_API = "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage"
 ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API = "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/subscription"
-ALIBABA_TOKEN_PLAN_RESET_CARD_LIST_API = (
-    "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/reset-card/list"
-)
+ALIBABA_TOKEN_PLAN_RESET_CARD_LIST_API = "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/reset-card/list"
 ALIBABA_TOKEN_PLAN_COMMODITY_CODE = "sfm_tokenplansolo_public_intl"
 ALIBABA_TOKEN_PLAN_CONSOLE_URL = (
-    "https://modelstudio.console.alibabacloud.com/ap-southeast-1" "?tab=plan#/efm/subscription/token-plan/personal"
+    "https://modelstudio.console.alibabacloud.com/ap-southeast-1?tab=plan#/efm/subscription/token-plan/personal"
 )
 ALIBABA_TOKEN_PLAN_MINT_HOST = "modelstudio.ap-southeast-1.aliyuncs.com"
 ALIBABA_TOKEN_PLAN_MINT_PATH = "/modelstudio/cli/generateAccessToken"
@@ -366,14 +375,22 @@ DEFAULT_CURSOR_AGENT_USAGE_POLL_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_CURSOR_AGENT_USAGE_DASHBOARD_URL = CURSOR_AGENT_DASHBOARD_HOST
 DEFAULT_CHATGPT_CONVERSATION_INIT_POLL_ENABLED = False
 DEFAULT_CHATGPT_CONVERSATION_INIT_POLL_INTERVAL_SECONDS = 600.0
-DEFAULT_CHATGPT_CONVERSATION_INIT_SOURCE_PATH = (
-    "/run/aawm/chatgpt/conversation-init.json"
-)
+DEFAULT_CHATGPT_CONVERSATION_INIT_THROTTLE_BACKOFF_SECONDS = 600.0
+DEFAULT_CHATGPT_CONVERSATION_INIT_SOURCE_PATH = "/run/aawm/chatgpt/conversation-init.json"
 DEFAULT_CHATGPT_CONVERSATION_INIT_URL = CHATGPT_CONVERSATION_INIT_DEFAULT_URL
 DEFAULT_CHATGPT_CONVERSATION_INIT_BROWSER_TIMEOUT_SECONDS = 30.0
-CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV = (
-    "AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS"
-)
+CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV = "AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS"
+CHATGPT_ORACLE_NODE_EXECUTABLE_ENV = "AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE"
+CHATGPT_ORACLE_PACKAGE_DIR_ENV = "AAWM_CHATGPT_ORACLE_PACKAGE_DIR"
+CHATGPT_ORACLE_CHROME_EXECUTABLE_ENV = "AAWM_CHATGPT_ORACLE_CHROME_EXECUTABLE"
+CHATGPT_ORACLE_BROWSER_SESSION_SCRIPT = Path(__file__).resolve().with_name("chatgpt_oracle_browser_session.mjs")
+DEFAULT_CHATGPT_ORACLE_STARTUP_TIMEOUT_SECONDS = 45.0
+# 30 seconds for the Node helper's bounded launcher settlement plus 5 seconds
+# for the helper and its owned process group to exit normally.
+DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS = 35.0
+DEFAULT_CHATGPT_ORACLE_FORCE_TERMINATION_TIMEOUT_SECONDS = 5.0
+CHATGPT_ORACLE_TEMP_ROOT_PREFIX = "aawm-chatgpt-oracle-"
+MAX_CHATGPT_ORACLE_STARTUP_LINE_BYTES = 1024
 DEFAULT_GROK_BILLING_POLL_ENABLED = False
 DEFAULT_GROK_BILLING_POLL_INTERVAL_SECONDS = 600.0
 DEFAULT_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS = 30.0
@@ -391,9 +408,7 @@ _GROK_BILLING_POLL_BACKOFF_SECONDS = GROK_BILLING_POLL_BACKOFF_SECONDS
 DEFAULT_XAI_RESET_POLL_ENABLED = False
 DEFAULT_XAI_RESET_POLL_INTERVAL_SECONDS = 600.0
 DEFAULT_XAI_RESET_POLL_HTTP_TIMEOUT_SECONDS = 30.0
-DEFAULT_XAI_RESET_POLL_URL = (
-    "https://grok.com/prod_mc_billing.ConsumerUiSvc/GetRemainingResets"
-)
+DEFAULT_XAI_RESET_POLL_URL = "https://grok.com/prod_mc_billing.ConsumerUiSvc/GetRemainingResets"
 XAI_RESET_POLL_ATTEMPTS = GROK_BILLING_POLL_ATTEMPTS
 XAI_RESET_POLL_BACKOFF_SECONDS = GROK_BILLING_POLL_BACKOFF_SECONDS
 XAI_RESET_POLL_EMPTY_FRAME = b"\x00\x00\x00\x00\x00"
@@ -415,12 +430,8 @@ GROK_BILLING_MONTHLY_CREDITS_QUOTA_KEY = "xai_grok_build_monthly_credits:credits
 DEFAULT_CODEX_RESET_CREDIT_POLL_ENABLED = False
 DEFAULT_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS = 600.0
 DEFAULT_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS = 30.0
-DEFAULT_CODEX_USAGE_URL = (
-    "https://chatgpt.com/backend-api/wham/usage"
-)
-DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL = (
-    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
-)
+DEFAULT_CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 DEFAULT_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS = 3
 DEFAULT_CODEX_RESET_CREDIT_POLL_RETRY_BACKOFF_SECONDS = 0.5
 DEFAULT_CODEX_RESET_CREDIT_CREDIT_FAMILY = "codex_rate_limit_reset"
@@ -428,9 +439,7 @@ DEFAULT_CODEX_RESET_CREDIT_CREDIT_TYPE = "reset_credit"
 DEFAULT_CODEX_RESET_CREDIT_SOURCE = "codex_reset_credit_poll"
 DEFAULT_CODEX_QUOTA_SOURCE = "codex_quota_poll"
 DEFAULT_CODEX_QUOTA_CLIENT = "codex"
-DEFAULT_CODEX_RESET_CREDIT_LATEST_VISIBLE_SOURCE_URL = (
-    "https://x.com/thsottiaux/status/2070653282440405046"
-)
+DEFAULT_CODEX_RESET_CREDIT_LATEST_VISIBLE_SOURCE_URL = "https://x.com/thsottiaux/status/2070653282440405046"
 CODEX_RESET_CREDIT_SANITIZED_RAW_FIELD_KEYS = frozenset(
     {
         "id",
@@ -1394,7 +1403,17 @@ FROM ranked
 
 @dataclass(frozen=True)
 class ChatGPTConversationInitAccountBinding:
-    """Nonsecret CDP target binding for one Codex OAuth inventory label."""
+    """Nonsecret browser binding for one Codex OAuth inventory label."""
+
+    cdp_endpoint: Optional[str] = None
+    page_target_id: Optional[str] = None
+    oracle_profile_path: Optional[str] = None
+    oracle_profile_directory: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ChatGPTConversationInitResolvedBinding:
+    """Runtime CDP target binding used by the existing collector."""
 
     cdp_endpoint: str
     page_target_id: str
@@ -1421,12 +1440,8 @@ class ProviderStatusLoopConfig:
     grok_oidc_auth_file: str = DEFAULT_GROK_OIDC_AUTH_FILE
     grok_oidc_auth_file_source: str = "default"
     grok_oidc_lock_file: str = DEFAULT_GROK_OIDC_LOCK_FILE
-    grok_oidc_refresh_interval_seconds: float = (
-        DEFAULT_GROK_OIDC_REFRESH_INTERVAL_SECONDS
-    )
-    grok_oidc_refresh_buffer_seconds: int = (
-        grok_oidc_refresh.DEFAULT_GROK_OIDC_REFRESH_BUFFER_SECONDS
-    )
+    grok_oidc_refresh_interval_seconds: float = DEFAULT_GROK_OIDC_REFRESH_INTERVAL_SECONDS
+    grok_oidc_refresh_buffer_seconds: int = grok_oidc_refresh.DEFAULT_GROK_OIDC_REFRESH_BUFFER_SECONDS
     grok_oidc_force_refresh: bool = False
     grok_oidc_http_timeout_seconds: float = DEFAULT_GROK_OIDC_HTTP_TIMEOUT_SECONDS
     codex_oauth_refresh_enabled: bool = False
@@ -1434,12 +1449,8 @@ class ProviderStatusLoopConfig:
     codex_auth_file: str = DEFAULT_CODEX_AUTH_FILE
     codex_auth_file_source: str = "default"
     codex_lock_file: str = DEFAULT_CODEX_LOCK_FILE
-    codex_refresh_interval_seconds: float = (
-        DEFAULT_CODEX_OAUTH_REFRESH_INTERVAL_SECONDS
-    )
-    codex_refresh_buffer_seconds: int = (
-        codex_oauth_refresh.DEFAULT_CODEX_REFRESH_BUFFER_SECONDS
-    )
+    codex_refresh_interval_seconds: float = DEFAULT_CODEX_OAUTH_REFRESH_INTERVAL_SECONDS
+    codex_refresh_buffer_seconds: int = codex_oauth_refresh.DEFAULT_CODEX_REFRESH_BUFFER_SECONDS
     codex_force_refresh: bool = False
     codex_http_timeout_seconds: float = DEFAULT_CODEX_OAUTH_HTTP_TIMEOUT_SECONDS
     xai_oauth_refresh_enabled: bool = False
@@ -1447,12 +1458,8 @@ class ProviderStatusLoopConfig:
     xai_oauth_auth_file_source: str = "default"
     xai_oauth_lock_file: str = DEFAULT_XAI_OAUTH_LOCK_FILE
     xai_oauth_scope: str = xai_oauth_refresh.DEFAULT_XAI_OAUTH_SCOPE
-    xai_oauth_refresh_interval_seconds: float = (
-        DEFAULT_XAI_OAUTH_REFRESH_INTERVAL_SECONDS
-    )
-    xai_oauth_refresh_buffer_seconds: int = (
-        xai_oauth_refresh.DEFAULT_XAI_OAUTH_REFRESH_BUFFER_SECONDS
-    )
+    xai_oauth_refresh_interval_seconds: float = DEFAULT_XAI_OAUTH_REFRESH_INTERVAL_SECONDS
+    xai_oauth_refresh_buffer_seconds: int = xai_oauth_refresh.DEFAULT_XAI_OAUTH_REFRESH_BUFFER_SECONDS
     xai_oauth_force_refresh: bool = False
     xai_oauth_http_timeout_seconds: float = DEFAULT_XAI_OAUTH_HTTP_TIMEOUT_SECONDS
     kimi_oauth_refresh_enabled: bool = False
@@ -1466,46 +1473,26 @@ class ProviderStatusLoopConfig:
     nous_oauth_auth_file: str = DEFAULT_NOUS_OAUTH_AUTH_FILE
     nous_oauth_auth_file_source: str = "default"
     nous_oauth_lock_file: str = DEFAULT_NOUS_OAUTH_LOCK_FILE
-    nous_oauth_refresh_interval_seconds: float = (
-        DEFAULT_NOUS_OAUTH_REFRESH_INTERVAL_SECONDS
-    )
-    nous_oauth_refresh_buffer_seconds: int = (
-        nous_oauth_refresh.DEFAULT_NOUS_OAUTH_REFRESH_BUFFER_SECONDS
-    )
+    nous_oauth_refresh_interval_seconds: float = DEFAULT_NOUS_OAUTH_REFRESH_INTERVAL_SECONDS
+    nous_oauth_refresh_buffer_seconds: int = nous_oauth_refresh.DEFAULT_NOUS_OAUTH_REFRESH_BUFFER_SECONDS
     nous_oauth_force_refresh: bool = False
     nous_oauth_http_timeout_seconds: float = DEFAULT_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS
     cursor_agent_auth_refresh_enabled: bool = False
-    cursor_agent_auth_file: str = (
-        cursor_agent_auth_refresh.DEFAULT_CURSOR_AGENT_AUTH_FILE
-    )
+    cursor_agent_auth_file: str = cursor_agent_auth_refresh.DEFAULT_CURSOR_AGENT_AUTH_FILE
     cursor_agent_auth_file_source: str = "default"
-    cursor_agent_auth_lock_file: str = (
-        cursor_agent_auth_refresh.DEFAULT_CURSOR_AGENT_AUTH_LOCK_FILE
-    )
-    cursor_agent_auth_refresh_interval_seconds: float = (
-        DEFAULT_CURSOR_AGENT_AUTH_REFRESH_INTERVAL_SECONDS
-    )
-    cursor_agent_auth_refresh_buffer_seconds: int = (
-        DEFAULT_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS
-    )
+    cursor_agent_auth_lock_file: str = cursor_agent_auth_refresh.DEFAULT_CURSOR_AGENT_AUTH_LOCK_FILE
+    cursor_agent_auth_refresh_interval_seconds: float = DEFAULT_CURSOR_AGENT_AUTH_REFRESH_INTERVAL_SECONDS
+    cursor_agent_auth_refresh_buffer_seconds: int = DEFAULT_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS
     cursor_agent_auth_force_refresh: bool = False
-    cursor_agent_auth_http_timeout_seconds: float = (
-        DEFAULT_CURSOR_AGENT_AUTH_HTTP_TIMEOUT_SECONDS
-    )
+    cursor_agent_auth_http_timeout_seconds: float = DEFAULT_CURSOR_AGENT_AUTH_HTTP_TIMEOUT_SECONDS
     provider_auth_health_poll_enabled: bool = DEFAULT_PROVIDER_AUTH_HEALTH_POLL_ENABLED
-    provider_auth_health_poll_interval_seconds: float = (
-        DEFAULT_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS
-    )
+    provider_auth_health_poll_interval_seconds: float = DEFAULT_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS
     kimi_usage_poll_enabled: bool = DEFAULT_KIMI_USAGE_POLL_ENABLED
     kimi_usage_poll_interval_seconds: float = DEFAULT_KIMI_USAGE_POLL_INTERVAL_SECONDS
     kimi_usage_poll_http_timeout_seconds: float = DEFAULT_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS
     zai_coding_plan_quota_poll_enabled: bool = False
-    zai_coding_plan_quota_poll_interval_seconds: float = (
-        DEFAULT_ZAI_CODING_PLAN_QUOTA_POLL_INTERVAL_SECONDS
-    )
-    zai_coding_plan_quota_poll_http_timeout_seconds: float = (
-        DEFAULT_ZAI_CODING_PLAN_QUOTA_POLL_HTTP_TIMEOUT_SECONDS
-    )
+    zai_coding_plan_quota_poll_interval_seconds: float = DEFAULT_ZAI_CODING_PLAN_QUOTA_POLL_INTERVAL_SECONDS
+    zai_coding_plan_quota_poll_http_timeout_seconds: float = DEFAULT_ZAI_CODING_PLAN_QUOTA_POLL_HTTP_TIMEOUT_SECONDS
     zai_coding_plan_quota_url: str = DEFAULT_ZAI_CODING_PLAN_QUOTA_URL
     zai_coding_plan_subscription_url: str = DEFAULT_ZAI_CODING_PLAN_SUBSCRIPTION_URL
     alibaba_quota_poll_enabled: bool = DEFAULT_ALIBABA_QUOTA_POLL_ENABLED
@@ -1517,30 +1504,16 @@ class ProviderStatusLoopConfig:
     alibaba_quota_poll_retry_backoff_seconds: float = DEFAULT_ALIBABA_QUOTA_POLL_RETRY_BACKOFF_SECONDS
     grok_billing_poll_enabled: bool = DEFAULT_GROK_BILLING_POLL_ENABLED
     grok_billing_poll_interval_seconds: float = DEFAULT_GROK_BILLING_POLL_INTERVAL_SECONDS
-    grok_billing_poll_http_timeout_seconds: float = (
-        DEFAULT_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS
-    )
+    grok_billing_poll_http_timeout_seconds: float = DEFAULT_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS
     cursor_agent_usage_poll_enabled: bool = DEFAULT_CURSOR_AGENT_USAGE_POLL_ENABLED
-    cursor_agent_usage_poll_interval_seconds: float = (
-        DEFAULT_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS
-    )
-    cursor_agent_usage_poll_http_timeout_seconds: float = (
-        DEFAULT_CURSOR_AGENT_USAGE_POLL_HTTP_TIMEOUT_SECONDS
-    )
+    cursor_agent_usage_poll_interval_seconds: float = DEFAULT_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS
+    cursor_agent_usage_poll_http_timeout_seconds: float = DEFAULT_CURSOR_AGENT_USAGE_POLL_HTTP_TIMEOUT_SECONDS
     cursor_agent_usage_dashboard_url: str = DEFAULT_CURSOR_AGENT_USAGE_DASHBOARD_URL
-    chatgpt_conversation_init_poll_enabled: bool = (
-        DEFAULT_CHATGPT_CONVERSATION_INIT_POLL_ENABLED
-    )
-    chatgpt_conversation_init_poll_interval_seconds: float = (
-        DEFAULT_CHATGPT_CONVERSATION_INIT_POLL_INTERVAL_SECONDS
-    )
-    chatgpt_conversation_init_source_path: str = (
-        DEFAULT_CHATGPT_CONVERSATION_INIT_SOURCE_PATH
-    )
+    chatgpt_conversation_init_poll_enabled: bool = DEFAULT_CHATGPT_CONVERSATION_INIT_POLL_ENABLED
+    chatgpt_conversation_init_poll_interval_seconds: float = DEFAULT_CHATGPT_CONVERSATION_INIT_POLL_INTERVAL_SECONDS
+    chatgpt_conversation_init_source_path: str = DEFAULT_CHATGPT_CONVERSATION_INIT_SOURCE_PATH
     chatgpt_conversation_init_url: str = DEFAULT_CHATGPT_CONVERSATION_INIT_URL
-    chatgpt_conversation_init_account_bindings: Optional[
-        Dict[str, "ChatGPTConversationInitAccountBinding"]
-    ] = None
+    chatgpt_conversation_init_account_bindings: Optional[Dict[str, "ChatGPTConversationInitAccountBinding"]] = None
     grok_billing_url: str = DEFAULT_GROK_BILLING_URL
     grok_billing_client_version: Optional[str] = None
     grok_billing_client_version_source: Optional[str] = None
@@ -1550,51 +1523,27 @@ class ProviderStatusLoopConfig:
     grok_billing_http_method: str = DEFAULT_GROK_BILLING_HTTP_METHOD
     grok_billing_include_model_override: bool = True
     grok_billing_poll_max_attempts: int = DEFAULT_GROK_BILLING_POLL_MAX_ATTEMPTS
-    grok_billing_poll_retry_backoff_seconds: float = (
-        DEFAULT_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS
-    )
+    grok_billing_poll_retry_backoff_seconds: float = DEFAULT_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS
     xai_reset_poll_enabled: bool = DEFAULT_XAI_RESET_POLL_ENABLED
     xai_reset_poll_interval_seconds: float = DEFAULT_XAI_RESET_POLL_INTERVAL_SECONDS
-    xai_reset_poll_http_timeout_seconds: float = (
-        DEFAULT_XAI_RESET_POLL_HTTP_TIMEOUT_SECONDS
-    )
+    xai_reset_poll_http_timeout_seconds: float = DEFAULT_XAI_RESET_POLL_HTTP_TIMEOUT_SECONDS
     xai_reset_poll_url: str = DEFAULT_XAI_RESET_POLL_URL
     xai_reset_poll_max_attempts: int = XAI_RESET_POLL_ATTEMPTS
     xai_reset_poll_retry_backoff_seconds: float = XAI_RESET_POLL_BACKOFF_SECONDS
     codex_reset_credit_poll_enabled: bool = DEFAULT_CODEX_RESET_CREDIT_POLL_ENABLED
-    codex_reset_credit_poll_interval_seconds: float = (
-        DEFAULT_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS
-    )
-    codex_reset_credit_poll_http_timeout_seconds: float = (
-        DEFAULT_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS
-    )
+    codex_reset_credit_poll_interval_seconds: float = DEFAULT_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS
+    codex_reset_credit_poll_http_timeout_seconds: float = DEFAULT_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS
     codex_usage_url: str = DEFAULT_CODEX_USAGE_URL
-    codex_reset_credit_poll_max_attempts: int = (
-        DEFAULT_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS
-    )
-    codex_reset_credit_poll_retry_backoff_seconds: float = (
-        DEFAULT_CODEX_RESET_CREDIT_POLL_RETRY_BACKOFF_SECONDS
-    )
-    observability_anomaly_scan_enabled: bool = (
-        DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ENABLED
-    )
-    observability_anomaly_scan_interval_seconds: float = (
-        DEFAULT_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS
-    )
-    observability_anomaly_scan_lookback_hours: float = (
-        DEFAULT_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS
-    )
-    observability_anomaly_scan_statement_timeout_ms: int = (
-        DEFAULT_OBSERVABILITY_ANOMALY_SCAN_STATEMENT_TIMEOUT_MS
-    )
-    observability_anomaly_scan_error_log_dir: str = (
-        DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR
-    )
+    codex_reset_credit_poll_max_attempts: int = DEFAULT_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS
+    codex_reset_credit_poll_retry_backoff_seconds: float = DEFAULT_CODEX_RESET_CREDIT_POLL_RETRY_BACKOFF_SECONDS
+    observability_anomaly_scan_enabled: bool = DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ENABLED
+    observability_anomaly_scan_interval_seconds: float = DEFAULT_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS
+    observability_anomaly_scan_lookback_hours: float = DEFAULT_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS
+    observability_anomaly_scan_statement_timeout_ms: int = DEFAULT_OBSERVABILITY_ANOMALY_SCAN_STATEMENT_TIMEOUT_MS
+    observability_anomaly_scan_error_log_dir: str = DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR
 
     @classmethod
-    def from_env(
-        cls, argv: Optional[Sequence[str]] = None
-    ) -> "ProviderStatusLoopConfig":
+    def from_env(cls, argv: Optional[Sequence[str]] = None) -> "ProviderStatusLoopConfig":
         return parse_config([] if argv is None else list(argv))
 
 
@@ -1604,9 +1553,9 @@ class SidecarTaskState:
     grok_oidc_refresh_schedule: "OAuthRefreshScheduleState" = dataclass_field(
         default_factory=lambda: OAuthRefreshScheduleState()
     )
-    codex_oauth_refresh_schedule_by_label: Dict[
-        str, "OAuthRefreshScheduleState"
-    ] = dataclass_field(default_factory=dict)
+    codex_oauth_refresh_schedule_by_label: Dict[str, "OAuthRefreshScheduleState"] = dataclass_field(
+        default_factory=dict
+    )
     xai_oauth_refresh_schedule: "OAuthRefreshScheduleState" = dataclass_field(
         default_factory=lambda: OAuthRefreshScheduleState()
     )
@@ -1620,15 +1569,9 @@ class SidecarTaskState:
         default_factory=lambda: OAuthRefreshScheduleState()
     )
     grok_oidc_last_attempt_monotonic: Optional[float] = None
-    codex_oauth_last_attempt_monotonic_by_label: Dict[str, float] = dataclass_field(
-        default_factory=dict
-    )
-    codex_oauth_usable_by_label: Dict[str, bool] = dataclass_field(
-        default_factory=dict
-    )
-    codex_oauth_status_by_label: Dict[str, str] = dataclass_field(
-        default_factory=dict
-    )
+    codex_oauth_last_attempt_monotonic_by_label: Dict[str, float] = dataclass_field(default_factory=dict)
+    codex_oauth_usable_by_label: Dict[str, bool] = dataclass_field(default_factory=dict)
+    codex_oauth_status_by_label: Dict[str, str] = dataclass_field(default_factory=dict)
     xai_oauth_last_attempt_monotonic: Optional[float] = None
     kimi_oauth_last_attempt_monotonic: Optional[float] = None
     nous_oauth_last_attempt_monotonic: Optional[float] = None
@@ -1647,33 +1590,20 @@ class SidecarTaskState:
     xai_reset_poll_last_attempt_monotonic: Optional[float] = None
     cursor_agent_usage_last_attempt_monotonic: Optional[float] = None
     chatgpt_conversation_init_last_attempt_monotonic: Optional[float] = None
-    codex_reset_credit_last_attempt_monotonic_by_label: Dict[str, float] = (
-        dataclass_field(default_factory=dict)
-    )
-    codex_quota_usable_by_label: Dict[str, bool] = dataclass_field(
+    chatgpt_conversation_init_cooldown_until_monotonic_by_session: Dict[str, float] = dataclass_field(
         default_factory=dict
     )
-    codex_quota_status_by_label: Dict[str, str] = dataclass_field(
-        default_factory=dict
-    )
-    codex_auth_health_last_attempt_monotonic_by_label: Dict[str, float] = (
-        dataclass_field(default_factory=dict)
-    )
-    codex_auth_health_usable_by_label: Dict[str, bool] = dataclass_field(
-        default_factory=dict
-    )
-    codex_auth_health_status_by_label: Dict[str, str] = dataclass_field(
-        default_factory=dict
-    )
+    codex_reset_credit_last_attempt_monotonic_by_label: Dict[str, float] = dataclass_field(default_factory=dict)
+    codex_quota_usable_by_label: Dict[str, bool] = dataclass_field(default_factory=dict)
+    codex_quota_status_by_label: Dict[str, str] = dataclass_field(default_factory=dict)
+    codex_auth_health_last_attempt_monotonic_by_label: Dict[str, float] = dataclass_field(default_factory=dict)
+    codex_auth_health_usable_by_label: Dict[str, bool] = dataclass_field(default_factory=dict)
+    codex_auth_health_status_by_label: Dict[str, str] = dataclass_field(default_factory=dict)
     observability_anomaly_scan_last_attempt_monotonic: Optional[float] = None
-    optional_poll_futures: Dict[str, Future[Any]] = dataclass_field(
-        default_factory=dict
-    )
+    optional_poll_futures: Dict[str, Future[Any]] = dataclass_field(default_factory=dict)
 
 
-_OAUTH_TERMINAL_REFRESH_ERROR_CLASSES = frozenset(
-    {"invalid_grant", "refresh_token_reused"}
-)
+_OAUTH_TERMINAL_REFRESH_ERROR_CLASSES = frozenset({"invalid_grant", "refresh_token_reused"})
 
 
 @dataclass
@@ -1727,9 +1657,7 @@ def _maybe_reject_default_auth_source(source: str) -> None:
         return
     if not _env_bool("AAWM_REQUIRE_EXPLICIT_AUTH_PATHS", False):
         return
-    raise SidecarAuthPathError(
-        "Explicit sidecar auth path required (telemetry_class=auth)"
-    )
+    raise SidecarAuthPathError("Explicit sidecar auth path required (telemetry_class=auth)")
 
 
 def _resolve_grok_sidecar_auth_file(
@@ -1747,9 +1675,7 @@ def _resolve_codex_sidecar_auth_file(
     explicit_auth_file: Optional[str],
 ) -> tuple[str, str]:
     explicit_value = (
-        explicit_auth_file.strip()
-        if isinstance(explicit_auth_file, str) and explicit_auth_file.strip()
-        else None
+        explicit_auth_file.strip() if isinstance(explicit_auth_file, str) and explicit_auth_file.strip() else None
     )
 
     aawm_auth_file = os.getenv("AAWM_CODEX_AUTH_FILE", "").strip()
@@ -1811,9 +1737,7 @@ def _resolve_xai_oauth_sidecar_auth_file(
     explicit_auth_file: Optional[str],
 ) -> tuple[str, str]:
     explicit_value = (
-        explicit_auth_file.strip()
-        if isinstance(explicit_auth_file, str) and explicit_auth_file.strip()
-        else None
+        explicit_auth_file.strip() if isinstance(explicit_auth_file, str) and explicit_auth_file.strip() else None
     )
 
     aawm_auth_file = os.getenv("AAWM_XAI_OAUTH_AUTH_FILE", "").strip()
@@ -1836,9 +1760,7 @@ def _resolve_kimi_oauth_sidecar_auth_file(
     explicit_auth_file: Optional[str],
 ) -> tuple[str, str]:
     explicit_value = (
-        explicit_auth_file.strip()
-        if isinstance(explicit_auth_file, str) and explicit_auth_file.strip()
-        else None
+        explicit_auth_file.strip() if isinstance(explicit_auth_file, str) and explicit_auth_file.strip() else None
     )
 
     aawm_auth_file = os.getenv("AAWM_KIMI_OAUTH_AUTH_FILE", "").strip()
@@ -1856,9 +1778,7 @@ def _resolve_nous_oauth_sidecar_auth_file(
     explicit_auth_file: Optional[str],
 ) -> tuple[str, str]:
     explicit_value = (
-        explicit_auth_file.strip()
-        if isinstance(explicit_auth_file, str) and explicit_auth_file.strip()
-        else None
+        explicit_auth_file.strip() if isinstance(explicit_auth_file, str) and explicit_auth_file.strip() else None
     )
 
     aawm_auth_file = os.getenv("AAWM_NOUS_OAUTH_AUTH_FILE", "").strip()
@@ -1881,9 +1801,7 @@ def _resolve_cursor_agent_auth_file(
     explicit_auth_file: Optional[str],
 ) -> tuple[str, str]:
     explicit_value = (
-        explicit_auth_file.strip()
-        if isinstance(explicit_auth_file, str) and explicit_auth_file.strip()
-        else None
+        explicit_auth_file.strip() if isinstance(explicit_auth_file, str) and explicit_auth_file.strip() else None
     )
 
     aawm_auth_file = os.getenv(
@@ -1893,9 +1811,7 @@ def _resolve_cursor_agent_auth_file(
     if aawm_auth_file:
         return str(Path(aawm_auth_file).expanduser()), "AAWM_CURSOR_AGENT_AUTH_FILE"
 
-    if explicit_value and explicit_value != (
-        cursor_agent_auth_refresh.DEFAULT_CURSOR_AGENT_AUTH_FILE
-    ):
+    if explicit_value and explicit_value != (cursor_agent_auth_refresh.DEFAULT_CURSOR_AGENT_AUTH_FILE):
         return str(Path(explicit_value).expanduser()), "explicit"
 
     _maybe_reject_default_auth_source("default")
@@ -1932,11 +1848,7 @@ def _resolve_grok_billing_client_version(
 ) -> GrokBillingClientVersionResolution:
     explicit_value = config.grok_billing_client_version
     if explicit_value is not None:
-        explicit_source = (
-            "cli"
-            if config.grok_billing_client_version_source == "cli"
-            else "config"
-        )
+        explicit_source = "cli" if config.grok_billing_client_version_source == "cli" else "config"
         return _validate_grok_billing_client_version(
             explicit_value,
             source=explicit_source,
@@ -1958,9 +1870,7 @@ def _resolve_grok_billing_client_version(
         "client_version_cache_path_class": cache_path_class,
     }
     try:
-        record, metadata = (
-            grok_native_version_contract.resolve_grok_native_version()
-        )
+        record, metadata = grok_native_version_contract.resolve_grok_native_version()
     except grok_native_version_contract.GrokNativeVersionError as exc:
         raise GrokBillingClientVersionError(
             f"Grok billing client version cache resolution failed: {exc}",
@@ -1996,9 +1906,7 @@ def _parse_chatgpt_conversation_init_account_bindings(
     try:
         parsed = json.loads(str(raw_value))
     except json.JSONDecodeError as exc:
-        raise SystemExit(
-            f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} must be valid JSON."
-        ) from exc
+        raise SystemExit(f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} must be valid JSON.") from exc
     if not isinstance(parsed, dict):
         raise SystemExit(
             f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} must be a JSON object "
@@ -2006,42 +1914,332 @@ def _parse_chatgpt_conversation_init_account_bindings(
         )
 
     bindings: Dict[str, ChatGPTConversationInitAccountBinding] = {}
-    allowed_fields = {"cdp_endpoint", "page_target_id"}
+    allowed_fields = {
+        "cdp_endpoint",
+        "page_target_id",
+        "oracle_profile_path",
+        "oracle_profile_directory",
+    }
     for raw_label, raw_binding in parsed.items():
         if not isinstance(raw_label, str) or not raw_label.strip():
-            raise SystemExit(
-                f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} labels must be "
-                "non-empty strings."
-            )
+            raise SystemExit(f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} labels must be non-empty strings.")
         label = raw_label.strip()
         if not isinstance(raw_binding, dict):
-            raise SystemExit(
-                f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} entry "
-                f"'{label}' must be an object."
-            )
+            raise SystemExit(f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} entry '{label}' must be an object.")
         unknown_fields = set(raw_binding) - allowed_fields
         if unknown_fields:
             raise SystemExit(
-                f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} entry "
-                f"'{label}' has unsupported fields."
+                f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} entry '{label}' has unsupported fields."
             )
         cdp_endpoint = raw_binding.get("cdp_endpoint")
         page_target_id = raw_binding.get("page_target_id")
+        oracle_profile_path = raw_binding.get("oracle_profile_path")
+        oracle_profile_directory = raw_binding.get("oracle_profile_directory")
+        has_cdp_binding = cdp_endpoint is not None or page_target_id is not None
+        has_oracle_binding = oracle_profile_path is not None or oracle_profile_directory is not None
+        if has_cdp_binding and has_oracle_binding:
+            raise SystemExit(
+                f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} entry "
+                f"'{label}' must use either CDP fields or Oracle profile fields, "
+                "not both."
+            )
+        if has_cdp_binding:
+            if (
+                not isinstance(cdp_endpoint, str)
+                or not cdp_endpoint.strip()
+                or not isinstance(page_target_id, str)
+                or not page_target_id.strip()
+            ):
+                raise SystemExit(
+                    f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} entry "
+                    f"'{label}' requires non-empty cdp_endpoint and page_target_id."
+                )
+            bindings[label] = ChatGPTConversationInitAccountBinding(
+                cdp_endpoint=cdp_endpoint.strip(),
+                page_target_id=page_target_id.strip(),
+            )
+            continue
+        if (
+            not isinstance(oracle_profile_path, str)
+            or not oracle_profile_path.strip()
+            or (
+                oracle_profile_directory is not None
+                and (not isinstance(oracle_profile_directory, str) or not oracle_profile_directory.strip())
+            )
+        ):
+            raise SystemExit(
+                f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} entry "
+                f"'{label}' requires non-empty oracle_profile_path and an optional "
+                "non-empty oracle_profile_directory."
+            )
+        bindings[label] = ChatGPTConversationInitAccountBinding(
+            oracle_profile_path=oracle_profile_path.strip(),
+            oracle_profile_directory=(
+                oracle_profile_directory.strip() if oracle_profile_directory is not None else None
+            ),
+        )
+    return bindings
+
+
+def _chatgpt_oracle_required_env_path(name: str) -> str:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        raise RuntimeError(f"{name} is required for an Oracle profile binding.")
+    return value.strip()
+
+
+def _chatgpt_oracle_startup_argv(
+    binding: ChatGPTConversationInitAccountBinding,
+    temp_root: Path,
+) -> List[str]:
+    if binding.oracle_profile_path is None:
+        raise RuntimeError("Oracle profile binding is missing its profile path.")
+    argv = [
+        _chatgpt_oracle_required_env_path(CHATGPT_ORACLE_NODE_EXECUTABLE_ENV),
+        str(CHATGPT_ORACLE_BROWSER_SESSION_SCRIPT),
+        "--oracle-package-dir",
+        _chatgpt_oracle_required_env_path(CHATGPT_ORACLE_PACKAGE_DIR_ENV),
+        "--chrome-executable",
+        _chatgpt_oracle_required_env_path(CHATGPT_ORACLE_CHROME_EXECUTABLE_ENV),
+        "--base-profile",
+        binding.oracle_profile_path,
+    ]
+    if binding.oracle_profile_directory is not None:
+        argv.extend(["--profile-directory", binding.oracle_profile_directory])
+    if not os.getenv("DISPLAY"):
+        xvfb_run = shutil.which("xvfb-run")
+        if xvfb_run is None:
+            raise RuntimeError("xvfb-run is required for Oracle profile bindings when DISPLAY is absent.")
+        argv = [xvfb_run, "-a", *argv]
+    return argv
+
+
+def _read_chatgpt_oracle_startup_binding(
+    process: subprocess.Popen,
+) -> ChatGPTConversationInitResolvedBinding:
+    stdout = process.stdout
+    if stdout is None:
+        raise RuntimeError("Oracle browser helper did not provide a startup stream.")
+    deadline = time.monotonic() + DEFAULT_CHATGPT_ORACLE_STARTUP_TIMEOUT_SECONDS
+    buffer = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("Oracle browser helper startup timed out.")
+        try:
+            readable, _, _ = select.select([stdout], [], [], remaining)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("Oracle browser helper startup stream failed.") from exc
+        if not readable:
+            raise RuntimeError("Oracle browser helper startup timed out.")
+        try:
+            chunk = os.read(
+                stdout.fileno(),
+                min(256, MAX_CHATGPT_ORACLE_STARTUP_LINE_BYTES + 1 - len(buffer)),
+            )
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("Oracle browser helper startup stream failed.") from exc
+        if not chunk:
+            raise RuntimeError("Oracle browser helper closed its startup stream before readiness.")
+        buffer.extend(chunk)
+        newline_index = buffer.find(b"\n")
+        if newline_index < 0:
+            if len(buffer) > MAX_CHATGPT_ORACLE_STARTUP_LINE_BYTES:
+                raise RuntimeError("Oracle browser helper startup protocol line is too large.")
+            continue
+        if newline_index > MAX_CHATGPT_ORACLE_STARTUP_LINE_BYTES:
+            raise RuntimeError("Oracle browser helper startup protocol line is too large.")
+        try:
+            line = bytes(buffer[:newline_index]).decode("utf-8")
+            payload = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Oracle browser helper returned invalid startup protocol.") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("Oracle browser helper returned invalid startup protocol.")
+        cdp_endpoint = payload.get("cdp_endpoint")
+        page_target_id = payload.get("page_target_id")
         if (
             not isinstance(cdp_endpoint, str)
             or not cdp_endpoint.strip()
             or not isinstance(page_target_id, str)
             or not page_target_id.strip()
         ):
-            raise SystemExit(
-                f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} entry "
-                f"'{label}' requires non-empty cdp_endpoint and page_target_id."
-            )
-        bindings[label] = ChatGPTConversationInitAccountBinding(
+            raise RuntimeError("Oracle browser helper returned an incomplete startup binding.")
+        return ChatGPTConversationInitResolvedBinding(
             cdp_endpoint=cdp_endpoint.strip(),
             page_target_id=page_target_id.strip(),
         )
-    return bindings
+
+
+def _signal_chatgpt_oracle_process_group(
+    process: subprocess.Popen,
+    signal_number: int,
+) -> None:
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal_number)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+    try:
+        process.send_signal(signal_number)
+    except OSError:
+        pass
+
+
+def _chatgpt_oracle_owned_chrome_pids(temp_root: Path) -> List[int]:
+    if os.name != "posix":
+        return []
+    try:
+        resolved_root = temp_root.resolve()
+    except (OSError, RuntimeError):
+        return []
+    try:
+        proc_entries = os.scandir("/proc")
+    except OSError:
+        return []
+
+    owned_pids: List[int] = []
+    with proc_entries:
+        for entry in proc_entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                command_line = Path(entry.path, "cmdline").read_bytes()
+            except OSError:
+                continue
+            for argument in command_line.split(b"\0"):
+                if not argument.startswith(b"--user-data-dir="):
+                    continue
+                raw_user_data_dir = argument.split(b"=", 1)[1]
+                if not raw_user_data_dir:
+                    continue
+                try:
+                    user_data_dir = Path(os.fsdecode(raw_user_data_dir)).resolve()
+                except (OSError, RuntimeError, UnicodeError):
+                    continue
+                try:
+                    user_data_dir.relative_to(resolved_root)
+                except ValueError:
+                    continue
+                owned_pids.append(int(entry.name))
+                break
+    return owned_pids
+
+
+def _signal_chatgpt_oracle_owned_chrome(
+    temp_root: Path,
+    signal_number: int,
+) -> None:
+    if os.name != "posix":
+        return
+    current_process_group = os.getpgrp()
+    process_groups: Dict[int, List[int]] = {}
+    individual_pids: List[int] = []
+    for pid in _chatgpt_oracle_owned_chrome_pids(temp_root):
+        try:
+            process_group = os.getpgid(pid)
+        except OSError:
+            individual_pids.append(pid)
+            continue
+        if process_group <= 0 or process_group == current_process_group:
+            individual_pids.append(pid)
+            continue
+        process_groups.setdefault(process_group, []).append(pid)
+
+    for process_group, pids in process_groups.items():
+        try:
+            os.killpg(process_group, signal_number)
+        except OSError:
+            individual_pids.extend(pids)
+    for pid in individual_pids:
+        try:
+            os.kill(pid, signal_number)
+        except OSError:
+            pass
+
+
+def _cleanup_chatgpt_oracle_process(
+    process: subprocess.Popen,
+    temp_root: Path,
+) -> None:
+    try:
+        if process.stdin is not None:
+            process.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
+    force_cleanup = False
+    try:
+        process.wait(timeout=DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        force_cleanup = True
+        _signal_chatgpt_oracle_process_group(process, signal.SIGTERM)
+        _signal_chatgpt_oracle_owned_chrome(temp_root, signal.SIGTERM)
+        try:
+            process.wait(timeout=DEFAULT_CHATGPT_ORACLE_FORCE_TERMINATION_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+    except OSError:
+        force_cleanup = True
+    finally:
+        if force_cleanup:
+            _signal_chatgpt_oracle_process_group(process, signal.SIGKILL)
+            _signal_chatgpt_oracle_owned_chrome(temp_root, signal.SIGKILL)
+            try:
+                process.wait(timeout=DEFAULT_CHATGPT_ORACLE_FORCE_TERMINATION_TIMEOUT_SECONDS)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        _signal_chatgpt_oracle_owned_chrome(temp_root, signal.SIGKILL)
+        shutil.rmtree(temp_root, ignore_errors=True)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+
+@contextmanager
+def _chatgpt_oracle_browser_binding(
+    binding: ChatGPTConversationInitAccountBinding,
+) -> Iterator[ChatGPTConversationInitResolvedBinding]:
+    if binding.oracle_profile_path is None:
+        if binding.cdp_endpoint is None or binding.page_target_id is None:
+            raise RuntimeError("ChatGPT browser binding is incomplete.")
+        yield ChatGPTConversationInitResolvedBinding(
+            cdp_endpoint=binding.cdp_endpoint,
+            page_target_id=binding.page_target_id,
+        )
+        return
+
+    with tempfile.TemporaryDirectory(
+        prefix=CHATGPT_ORACLE_TEMP_ROOT_PREFIX,
+        ignore_cleanup_errors=True,
+    ) as temp_root_name:
+        temp_root = Path(temp_root_name)
+        process: Optional[subprocess.Popen] = None
+        try:
+            try:
+                child_env = os.environ.copy()
+                child_env["TMPDIR"] = str(temp_root)
+                process = subprocess.Popen(
+                    _chatgpt_oracle_startup_argv(binding, temp_root),
+                    env=child_env,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    shell=False,
+                    close_fds=True,
+                    start_new_session=(os.name == "posix"),
+                )
+            except OSError as exc:
+                raise RuntimeError("Oracle browser helper could not be started.") from exc
+            yield _read_chatgpt_oracle_startup_binding(process)
+        finally:
+            if process is not None:
+                _cleanup_chatgpt_oracle_process(process, temp_root)
 
 
 def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
@@ -2071,10 +2269,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     )
     parser.add_argument(
         "--schema-dsn",
-        default=(
-            os.getenv("AAWM_PROVIDER_STATUS_SCHEMA_DSN")
-            or os.getenv("AAWM_DIRECT_DATABASE_URL")
-        ),
+        default=(os.getenv("AAWM_PROVIDER_STATUS_SCHEMA_DSN") or os.getenv("AAWM_DIRECT_DATABASE_URL")),
         help=(
             "Direct Postgres DSN for explicit provider-status schema setup. "
             "Defaults to AAWM_PROVIDER_STATUS_SCHEMA_DSN or AAWM_DIRECT_DATABASE_URL."
@@ -2152,10 +2347,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         "--require-pgbouncer",
         action="store_true",
         default=_env_bool("AAWM_PROVIDER_STATUS_REQUIRE_PGBOUNCER", False),
-        help=(
-            "Fail startup if steady-state writes do not resolve to the "
-            "PgBouncer transaction pool."
-        ),
+        help=("Fail startup if steady-state writes do not resolve to the PgBouncer transaction pool."),
     )
     grok_group = parser.add_mutually_exclusive_group()
     grok_group.add_argument(
@@ -2232,8 +2424,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             DEFAULT_GROK_OIDC_HTTP_TIMEOUT_SECONDS,
         ),
         help=(
-            "HTTP timeout for Grok OIDC token endpoint calls. Defaults to "
-            "AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS or 30."
+            "HTTP timeout for Grok OIDC token endpoint calls. Defaults to AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS or 30."
         ),
     )
     codex_group = parser.add_mutually_exclusive_group()
@@ -2574,8 +2765,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         action="store_true",
         default=_env_bool("AAWM_CURSOR_AGENT_AUTH_FORCE_REFRESH", False),
         help=(
-            "Refresh the Cursor Agent credential on every scheduled attempt "
-            "even when its access token is still valid."
+            "Refresh the Cursor Agent credential on every scheduled attempt even when its access token is still valid."
         ),
     )
     parser.add_argument(
@@ -2666,8 +2856,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             DEFAULT_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS,
         ),
         help=(
-            "HTTP timeout for Kimi OAuth token endpoint calls. Defaults to "
-            "AAWM_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS or 30."
+            "HTTP timeout for Kimi OAuth token endpoint calls. Defaults to AAWM_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS or 30."
         ),
     )
     kimi_usage_group = parser.add_mutually_exclusive_group()
@@ -2709,9 +2898,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "AAWM_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS",
             DEFAULT_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS,
         ),
-        help=(
-            "HTTP timeout for Kimi Code usage polling. Defaults to " "AAWM_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS or 30."
-        ),
+        help=("HTTP timeout for Kimi Code usage polling. Defaults to AAWM_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS or 30."),
     )
     zai_coding_plan_quota_group = parser.add_mutually_exclusive_group()
     zai_coding_plan_quota_group.add_argument(
@@ -2759,10 +2946,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     )
     parser.add_argument(
         "--zai-coding-plan-quota-url",
-        default=(
-            os.getenv("AAWM_ZAI_CODING_PLAN_QUOTA_URL")
-            or DEFAULT_ZAI_CODING_PLAN_QUOTA_URL
-        ),
+        default=(os.getenv("AAWM_ZAI_CODING_PLAN_QUOTA_URL") or DEFAULT_ZAI_CODING_PLAN_QUOTA_URL),
         help=(
             "Z.AI Coding Plan quota endpoint. Defaults to "
             "AAWM_ZAI_CODING_PLAN_QUOTA_URL or the OpenQuota quota/limit path."
@@ -2770,10 +2954,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     )
     parser.add_argument(
         "--zai-coding-plan-subscription-url",
-        default=(
-            os.getenv("AAWM_ZAI_CODING_PLAN_SUBSCRIPTION_URL")
-            or DEFAULT_ZAI_CODING_PLAN_SUBSCRIPTION_URL
-        ),
+        default=(os.getenv("AAWM_ZAI_CODING_PLAN_SUBSCRIPTION_URL") or DEFAULT_ZAI_CODING_PLAN_SUBSCRIPTION_URL),
         help=(
             "Z.AI Coding Plan subscription endpoint. Defaults to "
             "AAWM_ZAI_CODING_PLAN_SUBSCRIPTION_URL or the subscription list path."
@@ -2788,10 +2969,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "AAWM_ALIBABA_QUOTA_POLL_ENABLED",
             DEFAULT_ALIBABA_QUOTA_POLL_ENABLED,
         ),
-        help=(
-            "Poll Alibaba Token Plan console quota telemetry with a RAM-minted "
-            "console Bearer token."
-        ),
+        help=("Poll Alibaba Token Plan console quota telemetry with a RAM-minted console Bearer token."),
     )
     alibaba_quota_group.add_argument(
         "--no-alibaba-quota-poll",
@@ -2855,7 +3033,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "AAWM_ALIBABA_QUOTA_POLL_MAX_ATTEMPTS",
             DEFAULT_ALIBABA_QUOTA_POLL_MAX_ATTEMPTS,
         ),
-        help=("Maximum attempts for one Alibaba endpoint call, including " "transient retries."),
+        help=("Maximum attempts for one Alibaba endpoint call, including transient retries."),
     )
     parser.add_argument(
         "--alibaba-quota-poll-retry-backoff-seconds",
@@ -2906,8 +3084,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             DEFAULT_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS,
         ),
         help=(
-            "HTTP timeout for Grok billing poll calls. Defaults to "
-            "AAWM_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS or 30."
+            "HTTP timeout for Grok billing poll calls. Defaults to AAWM_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS or 30."
         ),
     )
     parser.add_argument(
@@ -2962,10 +3139,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     parser.add_argument(
         "--grok-billing-model",
         default=os.getenv("AAWM_GROK_BILLING_MODEL", DEFAULT_GROK_BILLING_MODEL),
-        help=(
-            "Model label stored with Grok billing snapshots. Defaults to "
-            "AAWM_GROK_BILLING_MODEL or grok-build."
-        ),
+        help=("Model label stored with Grok billing snapshots. Defaults to AAWM_GROK_BILLING_MODEL or grok-build."),
     )
     parser.add_argument(
         "--grok-billing-http-method",
@@ -2973,10 +3147,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "AAWM_GROK_BILLING_HTTP_METHOD",
             DEFAULT_GROK_BILLING_HTTP_METHOD,
         ),
-        help=(
-            "HTTP method used for Grok billing poll requests. Defaults to "
-            "AAWM_GROK_BILLING_HTTP_METHOD or GET."
-        ),
+        help=("HTTP method used for Grok billing poll requests. Defaults to AAWM_GROK_BILLING_HTTP_METHOD or GET."),
     )
     billing_override_group = parser.add_mutually_exclusive_group()
     billing_override_group.add_argument(
@@ -3212,8 +3383,10 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         default=os.getenv(CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV),
         help=(
             "Optional nonsecret JSON object mapping Codex OAuth inventory labels "
-            "to {cdp_endpoint,page_target_id}. When absent, retain legacy "
-            "file-only conversation-init polling."
+            "to either {cdp_endpoint,page_target_id} or "
+            "{oracle_profile_path,oracle_profile_directory}. Profile bindings "
+            "launch a private owned Oracle browser session. When absent, retain "
+            "legacy file-only conversation-init polling."
         ),
     )
 
@@ -3585,9 +3758,7 @@ def _validate_minimum_refresh_threshold_cadence(
 
 def _validate_provider_auth_health_poll_config_args(args: argparse.Namespace) -> None:
     if args.provider_auth_health_poll_interval_seconds <= 0:
-        raise SystemExit(
-            "--provider-auth-health-poll-interval-seconds must be greater than 0"
-        )
+        raise SystemExit("--provider-auth-health-poll-interval-seconds must be greater than 0")
 
 
 def _validate_kimi_usage_config_args(args: argparse.Namespace) -> None:
@@ -3599,13 +3770,9 @@ def _validate_kimi_usage_config_args(args: argparse.Namespace) -> None:
 
 def _validate_zai_coding_plan_quota_config_args(args: argparse.Namespace) -> None:
     if args.zai_coding_plan_quota_poll_interval_seconds <= 0:
-        raise SystemExit(
-            "--zai-coding-plan-quota-poll-interval-seconds must be greater than 0"
-        )
+        raise SystemExit("--zai-coding-plan-quota-poll-interval-seconds must be greater than 0")
     if args.zai_coding_plan_quota_poll_http_timeout_seconds <= 0:
-        raise SystemExit(
-            "--zai-coding-plan-quota-poll-http-timeout-seconds must be greater than 0"
-        )
+        raise SystemExit("--zai-coding-plan-quota-poll-http-timeout-seconds must be greater than 0")
     if not str(args.zai_coding_plan_quota_url).strip():
         raise SystemExit("--zai-coding-plan-quota-url must not be empty")
     if not str(args.zai_coding_plan_subscription_url).strip():
@@ -3629,13 +3796,9 @@ def _validate_alibaba_quota_config_args(args: argparse.Namespace) -> None:
 
 def _validate_cursor_agent_usage_config_args(args: argparse.Namespace) -> None:
     if args.cursor_agent_usage_poll_interval_seconds <= 0:
-        raise SystemExit(
-            "--cursor-agent-usage-poll-interval-seconds must be greater than 0"
-        )
+        raise SystemExit("--cursor-agent-usage-poll-interval-seconds must be greater than 0")
     if args.cursor_agent_usage_poll_http_timeout_seconds <= 0:
-        raise SystemExit(
-            "--cursor-agent-usage-poll-http-timeout-seconds must be greater than 0"
-        )
+        raise SystemExit("--cursor-agent-usage-poll-http-timeout-seconds must be greater than 0")
     if not str(args.cursor_agent_usage_dashboard_url).strip():
         raise SystemExit("--cursor-agent-usage-dashboard-url must not be empty")
 
@@ -3644,14 +3807,9 @@ def _validate_chatgpt_conversation_init_config_args(
     args: argparse.Namespace,
 ) -> None:
     if args.chatgpt_conversation_init_poll_interval_seconds <= 0:
-        raise SystemExit(
-            "--chatgpt-conversation-init-poll-interval-seconds must be "
-            "greater than 0"
-        )
+        raise SystemExit("--chatgpt-conversation-init-poll-interval-seconds must be greater than 0")
     if not str(args.chatgpt_conversation_init_source_path).strip():
-        raise SystemExit(
-            "--chatgpt-conversation-init-source-path must not be empty"
-        )
+        raise SystemExit("--chatgpt-conversation-init-source-path must not be empty")
     if not str(args.chatgpt_conversation_init_url).strip():
         raise SystemExit("--chatgpt-conversation-init-url must not be empty")
 
@@ -3675,18 +3833,14 @@ def _validate_grok_billing_config_args(args: argparse.Namespace) -> None:
     if args.grok_billing_poll_max_attempts <= 0:
         raise SystemExit("--grok-billing-poll-max-attempts must be greater than 0")
     if args.grok_billing_poll_retry_backoff_seconds < 0:
-        raise SystemExit(
-            "--grok-billing-poll-retry-backoff-seconds must be non-negative"
-        )
+        raise SystemExit("--grok-billing-poll-retry-backoff-seconds must be non-negative")
 
 
 def _validate_xai_reset_poll_config_args(args: argparse.Namespace) -> None:
     if args.xai_reset_poll_interval_seconds <= 0:
         raise SystemExit("--xai-reset-poll-interval-seconds must be greater than 0")
     if args.xai_reset_poll_http_timeout_seconds <= 0:
-        raise SystemExit(
-            "--xai-reset-poll-http-timeout-seconds must be greater than 0"
-        )
+        raise SystemExit("--xai-reset-poll-http-timeout-seconds must be greater than 0")
     if not str(args.xai_reset_poll_url).strip():
         raise SystemExit("--xai-reset-poll-url must not be empty")
     if args.xai_reset_poll_max_attempts <= 0:
@@ -3695,49 +3849,33 @@ def _validate_xai_reset_poll_config_args(args: argparse.Namespace) -> None:
 
 def _validate_observability_anomaly_scan_config_args(args: argparse.Namespace) -> None:
     if args.observability_anomaly_scan_interval_seconds <= 0:
-        raise SystemExit(
-            "--observability-anomaly-scan-interval-seconds must be greater than 0"
-        )
+        raise SystemExit("--observability-anomaly-scan-interval-seconds must be greater than 0")
     if args.observability_anomaly_scan_lookback_hours <= 0:
-        raise SystemExit(
-            "--observability-anomaly-scan-lookback-hours must be greater than 0"
-        )
+        raise SystemExit("--observability-anomaly-scan-lookback-hours must be greater than 0")
     if args.observability_anomaly_scan_statement_timeout_ms <= 0:
-        raise SystemExit(
-            "--observability-anomaly-scan-statement-timeout-ms must be greater than 0"
-        )
+        raise SystemExit("--observability-anomaly-scan-statement-timeout-ms must be greater than 0")
     if not str(args.observability_anomaly_scan_error_log_dir).strip():
         raise SystemExit("--observability-anomaly-scan-error-log-dir must not be empty")
 
 
 def _validate_codex_reset_credit_poll_config_args(args: argparse.Namespace) -> None:
     if args.codex_reset_credit_poll_interval_seconds <= 0:
-        raise SystemExit(
-            "--codex-reset-credit-poll-interval-seconds must be greater than 0"
-        )
+        raise SystemExit("--codex-reset-credit-poll-interval-seconds must be greater than 0")
     if args.codex_reset_credit_poll_http_timeout_seconds <= 0:
-        raise SystemExit(
-            "--codex-reset-credit-poll-http-timeout-seconds must be greater than 0"
-        )
+        raise SystemExit("--codex-reset-credit-poll-http-timeout-seconds must be greater than 0")
     if not str(args.codex_usage_url).strip():
         raise SystemExit("--codex-usage-url must not be empty")
     if args.codex_reset_credit_poll_max_attempts <= 0:
-        raise SystemExit(
-            "--codex-reset-credit-poll-max-attempts must be greater than 0"
-        )
+        raise SystemExit("--codex-reset-credit-poll-max-attempts must be greater than 0")
     if args.codex_reset_credit_poll_retry_backoff_seconds < 0:
-        raise SystemExit(
-            "--codex-reset-credit-poll-retry-backoff-seconds must be non-negative"
-        )
+        raise SystemExit("--codex-reset-credit-poll-retry-backoff-seconds must be non-negative")
 
 
 def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConfig:
     args = _build_parser().parse_args(argv)
     _validate_config_args(args)
-    chatgpt_conversation_init_account_bindings = (
-        _parse_chatgpt_conversation_init_account_bindings(
-            args.chatgpt_conversation_init_account_bindings
-        )
+    chatgpt_conversation_init_account_bindings = _parse_chatgpt_conversation_init_account_bindings(
+        args.chatgpt_conversation_init_account_bindings
     )
     grok_billing_http_method = str(args.grok_billing_http_method).strip().upper()
     codex_oauth_inventory = _load_codex_inventory_for_config(
@@ -3832,34 +3970,20 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         cursor_agent_auth_file=resolved_cursor_agent_auth_file,
         cursor_agent_auth_file_source=resolved_cursor_agent_auth_file_source,
         cursor_agent_auth_lock_file=args.cursor_agent_auth_lock_file,
-        cursor_agent_auth_refresh_interval_seconds=(
-            args.cursor_agent_auth_refresh_interval_seconds
-        ),
-        cursor_agent_auth_refresh_buffer_seconds=(
-            args.cursor_agent_auth_refresh_buffer_seconds
-        ),
+        cursor_agent_auth_refresh_interval_seconds=(args.cursor_agent_auth_refresh_interval_seconds),
+        cursor_agent_auth_refresh_buffer_seconds=(args.cursor_agent_auth_refresh_buffer_seconds),
         cursor_agent_auth_force_refresh=args.cursor_agent_auth_force_refresh,
-        cursor_agent_auth_http_timeout_seconds=(
-            args.cursor_agent_auth_http_timeout_seconds
-        ),
+        cursor_agent_auth_http_timeout_seconds=(args.cursor_agent_auth_http_timeout_seconds),
         provider_auth_health_poll_enabled=args.provider_auth_health_poll_enabled,
-        provider_auth_health_poll_interval_seconds=(
-            args.provider_auth_health_poll_interval_seconds
-        ),
+        provider_auth_health_poll_interval_seconds=(args.provider_auth_health_poll_interval_seconds),
         kimi_usage_poll_enabled=args.kimi_usage_poll_enabled,
         kimi_usage_poll_interval_seconds=args.kimi_usage_poll_interval_seconds,
         kimi_usage_poll_http_timeout_seconds=args.kimi_usage_poll_http_timeout_seconds,
         zai_coding_plan_quota_poll_enabled=args.zai_coding_plan_quota_poll_enabled,
-        zai_coding_plan_quota_poll_interval_seconds=(
-            args.zai_coding_plan_quota_poll_interval_seconds
-        ),
-        zai_coding_plan_quota_poll_http_timeout_seconds=(
-            args.zai_coding_plan_quota_poll_http_timeout_seconds
-        ),
+        zai_coding_plan_quota_poll_interval_seconds=(args.zai_coding_plan_quota_poll_interval_seconds),
+        zai_coding_plan_quota_poll_http_timeout_seconds=(args.zai_coding_plan_quota_poll_http_timeout_seconds),
         zai_coding_plan_quota_url=str(args.zai_coding_plan_quota_url).strip(),
-        zai_coding_plan_subscription_url=str(
-            args.zai_coding_plan_subscription_url
-        ).strip(),
+        zai_coding_plan_subscription_url=str(args.zai_coding_plan_subscription_url).strip(),
         alibaba_quota_poll_enabled=args.alibaba_quota_poll_enabled,
         alibaba_quota_poll_interval_seconds=(args.alibaba_quota_poll_interval_seconds),
         alibaba_subscription_poll_interval_seconds=(args.alibaba_subscription_poll_interval_seconds),
@@ -3871,35 +3995,17 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         grok_billing_poll_interval_seconds=args.grok_billing_poll_interval_seconds,
         grok_billing_poll_http_timeout_seconds=args.grok_billing_poll_http_timeout_seconds,
         cursor_agent_usage_poll_enabled=args.cursor_agent_usage_poll_enabled,
-        cursor_agent_usage_poll_interval_seconds=(
-            args.cursor_agent_usage_poll_interval_seconds
-        ),
-        cursor_agent_usage_poll_http_timeout_seconds=(
-            args.cursor_agent_usage_poll_http_timeout_seconds
-        ),
-        cursor_agent_usage_dashboard_url=str(
-            args.cursor_agent_usage_dashboard_url
-        ).strip(),
-        chatgpt_conversation_init_poll_enabled=(
-            args.chatgpt_conversation_init_poll_enabled
-        ),
-        chatgpt_conversation_init_poll_interval_seconds=(
-            args.chatgpt_conversation_init_poll_interval_seconds
-        ),
-        chatgpt_conversation_init_source_path=str(
-            args.chatgpt_conversation_init_source_path
-        ).strip(),
-        chatgpt_conversation_init_url=str(
-            args.chatgpt_conversation_init_url
-        ).strip(),
-        chatgpt_conversation_init_account_bindings=(
-            chatgpt_conversation_init_account_bindings
-        ),
+        cursor_agent_usage_poll_interval_seconds=(args.cursor_agent_usage_poll_interval_seconds),
+        cursor_agent_usage_poll_http_timeout_seconds=(args.cursor_agent_usage_poll_http_timeout_seconds),
+        cursor_agent_usage_dashboard_url=str(args.cursor_agent_usage_dashboard_url).strip(),
+        chatgpt_conversation_init_poll_enabled=(args.chatgpt_conversation_init_poll_enabled),
+        chatgpt_conversation_init_poll_interval_seconds=(args.chatgpt_conversation_init_poll_interval_seconds),
+        chatgpt_conversation_init_source_path=str(args.chatgpt_conversation_init_source_path).strip(),
+        chatgpt_conversation_init_url=str(args.chatgpt_conversation_init_url).strip(),
+        chatgpt_conversation_init_account_bindings=(chatgpt_conversation_init_account_bindings),
         grok_billing_url=args.grok_billing_url,
         grok_billing_client_version=args.grok_billing_client_version,
-        grok_billing_client_version_source=(
-            "cli" if args.grok_billing_client_version is not None else None
-        ),
+        grok_billing_client_version_source=("cli" if args.grok_billing_client_version is not None else None),
         grok_billing_client_identifier=args.grok_billing_client_identifier,
         grok_billing_xai_token_auth=args.grok_billing_xai_token_auth,
         grok_billing_model=args.grok_billing_model,
@@ -3922,9 +4028,7 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         observability_anomaly_scan_enabled=(args.observability_anomaly_scan_enabled),
         observability_anomaly_scan_interval_seconds=(args.observability_anomaly_scan_interval_seconds),
         observability_anomaly_scan_lookback_hours=(args.observability_anomaly_scan_lookback_hours),
-        observability_anomaly_scan_statement_timeout_ms=(
-            args.observability_anomaly_scan_statement_timeout_ms
-        ),
+        observability_anomaly_scan_statement_timeout_ms=(args.observability_anomaly_scan_statement_timeout_ms),
         observability_anomaly_scan_error_log_dir=(args.observability_anomaly_scan_error_log_dir),
     )
 
@@ -3944,9 +4048,7 @@ def _dsn_args(config: ProviderStatusLoopConfig) -> argparse.Namespace:
 def _resolve_dsn(config: ProviderStatusLoopConfig) -> str:
     dsn = probes._build_dsn(_dsn_args(config))
     if not dsn:
-        raise RuntimeError(
-            "No database DSN found. Set AAWM_DB_* or AAWM_PROVIDER_STATUS_DSN."
-        )
+        raise RuntimeError("No database DSN found. Set AAWM_DB_* or AAWM_PROVIDER_STATUS_DSN.")
     return dsn
 
 
@@ -3993,8 +4095,7 @@ def validate_runtime_guardrails(config: ProviderStatusLoopConfig) -> None:
     dsn = _resolve_dsn(config)
     if not _dsn_targets_pgbouncer(dsn):
         raise RuntimeError(
-            "Provider-status steady-state writes require "
-            "pgbouncer:6432 when AAWM_PROVIDER_STATUS_REQUIRE_PGBOUNCER=1"
+            "Provider-status steady-state writes require pgbouncer:6432 when AAWM_PROVIDER_STATUS_REQUIRE_PGBOUNCER=1"
         )
 
 
@@ -4024,9 +4125,7 @@ def setup_schema_once(config: ProviderStatusLoopConfig) -> Dict[str, Any]:
     }
 
 
-def _bounded_summary_field(
-    value: Any, *, limit: int = PROVIDER_FAILURE_FIELD_LIMIT
-) -> Optional[str]:
+def _bounded_summary_field(value: Any, *, limit: int = PROVIDER_FAILURE_FIELD_LIMIT) -> Optional[str]:
     if value is None:
         return None
     text = re.sub(r"\s+", " ", str(value)).strip()
@@ -4046,9 +4145,7 @@ def _redacted_failure_message(value: Any) -> Optional[str]:
     return _bounded_summary_field(text, limit=PROVIDER_FAILURE_MESSAGE_LIMIT)
 
 
-def _redacted_summary_field(
-    value: Any, *, limit: int = PROVIDER_FAILURE_FIELD_LIMIT
-) -> Optional[str]:
+def _redacted_summary_field(value: Any, *, limit: int = PROVIDER_FAILURE_FIELD_LIMIT) -> Optional[str]:
     text = _bounded_summary_field(value, limit=limit)
     if text is None:
         return None
@@ -4081,10 +4178,7 @@ def _provider_auth_status_from_event(event: Mapping[str, Any]) -> str:
             return "expired"
         if event.get("error_class"):
             return "failed"
-        if (
-            refresh_result_class in {"refresh_due", "refresh_failed"}
-            or credential_health == "degraded"
-        ):
+        if refresh_result_class in {"refresh_due", "refresh_failed"} or credential_health == "degraded":
             return "degraded"
         if credential_health == "malformed":
             return "malformed"
@@ -4144,10 +4238,7 @@ def _oauth_refresh_successful_validation(
 ) -> bool:
     """Use scheduler health when present, retaining legacy event behavior."""
     if event.get("refresh_result_class") is not None:
-        return (
-            event.get("credential_health") == "fresh"
-            and not event.get("error_class")
-        )
+        return event.get("credential_health") == "fresh" and not event.get("error_class")
     return status in {"refreshed", "skipped"} and not event.get("error_class")
 
 
@@ -4161,9 +4252,7 @@ def _build_passive_provider_auth_observation(
     auth_file_source: str,
     credential_scope: Optional[str],
 ) -> Dict[str, Any]:
-    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(
-        timezone.utc
-    )
+    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(timezone.utc)
     status = _provider_auth_status_from_event(event)
     return {
         "observed_at": observed_at,
@@ -4187,9 +4276,7 @@ def _build_passive_provider_auth_observation(
             "passive_read_only": True,
             "network_calls": False,
             "credential_file_mutated": False,
-            "health_poll_interval_seconds": (
-                config.provider_auth_health_poll_interval_seconds
-            ),
+            "health_poll_interval_seconds": (config.provider_auth_health_poll_interval_seconds),
         },
     }
 
@@ -4218,9 +4305,7 @@ def _build_grok_oidc_auth_observation(
     config: ProviderStatusLoopConfig,
     event: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(
-        timezone.utc
-    )
+    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(timezone.utc)
     expires_at = _parse_sidecar_timestamp(event.get("expires_at"))
     status = _provider_auth_status_from_event(event)
     successful_validation = _oauth_refresh_successful_validation(event, status)
@@ -4290,9 +4375,7 @@ def _build_codex_auth_observation(
     *,
     record: Optional[CodexOAuthCredentialRecord] = None,
 ) -> Dict[str, Any]:
-    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(
-        timezone.utc
-    )
+    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(timezone.utc)
     expires_at = _parse_sidecar_timestamp(event.get("expires_at"))
     status = _provider_auth_status_from_event(event)
     successful_validation = _oauth_refresh_successful_validation(event, status)
@@ -4377,9 +4460,7 @@ def _build_xai_oauth_auth_observation(
     config: ProviderStatusLoopConfig,
     event: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(
-        timezone.utc
-    )
+    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(timezone.utc)
     expires_at = _parse_sidecar_timestamp(event.get("expires_at"))
     status = _provider_auth_status_from_event(event)
     successful_validation = _oauth_refresh_successful_validation(event, status)
@@ -4447,9 +4528,7 @@ def _build_nous_oauth_auth_observation(
     config: ProviderStatusLoopConfig,
     event: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(
-        timezone.utc
-    )
+    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(timezone.utc)
     expires_at = _parse_sidecar_timestamp(event.get("expires_at"))
     status = _provider_auth_status_from_event(event)
     successful_validation = _oauth_refresh_successful_validation(event, status)
@@ -4517,9 +4596,7 @@ def _build_cursor_agent_auth_observation(
     config: ProviderStatusLoopConfig,
     event: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(
-        timezone.utc
-    )
+    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(timezone.utc)
     expires_at = _parse_sidecar_timestamp(event.get("expires_at"))
     status = _provider_auth_status_from_event(event)
     successful_validation = _oauth_refresh_successful_validation(event, status)
@@ -4539,12 +4616,8 @@ def _build_cursor_agent_auth_observation(
     metadata.update(_oauth_refresh_observation_metadata(event))
     metadata.update(
         {
-            "credential_fingerprint": _redacted_summary_field(
-                event.get("credential_fingerprint")
-            ),
-            "previous_credential_fingerprint": _redacted_summary_field(
-                event.get("previous_credential_fingerprint")
-            ),
+            "credential_fingerprint": _redacted_summary_field(event.get("credential_fingerprint")),
+            "previous_credential_fingerprint": _redacted_summary_field(event.get("previous_credential_fingerprint")),
         }
     )
     return {
@@ -4553,8 +4626,7 @@ def _build_cursor_agent_auth_observation(
         "provider": "cursor_agent",
         "auth_family": "cursor_agent_auth",
         "credential_scope": _redacted_summary_field(
-            event.get("refresh_method")
-            or "apiKey_exchange",
+            event.get("refresh_method") or "apiKey_exchange",
             limit=512,
         ),
         "auth_file_hash": probes.auth_file_identity_hash(auth_file),
@@ -4598,9 +4670,7 @@ def _build_kimi_oauth_auth_observation(
     config: ProviderStatusLoopConfig,
     event: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(
-        timezone.utc
-    )
+    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(timezone.utc)
     expires_at = _parse_sidecar_timestamp(event.get("expires_at"))
     status = _provider_auth_status_from_event(event)
     successful_validation = _oauth_refresh_successful_validation(event, status)
@@ -4822,11 +4892,7 @@ def _resolve_codex_reset_credit_poll_url(
 
 def _resolve_codex_usage_poll_url(config: ProviderStatusLoopConfig) -> str:
     configured = str(config.codex_usage_url).strip()
-    if (
-        not configured
-        or configured.rstrip("/")
-        == DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL.rstrip("/")
-    ):
+    if not configured or configured.rstrip("/") == DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL.rstrip("/"):
         return DEFAULT_CODEX_USAGE_URL
     return configured
 
@@ -4843,9 +4909,7 @@ def _parse_codex_reset_credit_available_count(response_body: Mapping[str, Any]) 
     if isinstance(legacy, dict):
         available = legacy.get("available_count")
         if isinstance(available, bool):
-            raise ValueError(
-                "Codex reset-credit payload available_count was not an integer."
-            )
+            raise ValueError("Codex reset-credit payload available_count was not an integer.")
         if isinstance(available, int):
             return available
         if isinstance(available, float) and available.is_integer():
@@ -4856,9 +4920,7 @@ def _parse_codex_reset_credit_available_count(response_body: Mapping[str, Any]) 
     if isinstance(camel_credits, dict):
         available = camel_credits.get("availableCount")
         if isinstance(available, bool):
-            raise ValueError(
-                "Codex reset-credit payload availableCount was not an integer."
-            )
+            raise ValueError("Codex reset-credit payload availableCount was not an integer.")
         if isinstance(available, int):
             return available
         if isinstance(available, float) and available.is_integer():
@@ -4885,9 +4947,7 @@ def _parse_codex_reset_credit_field(
 def _parse_codex_reset_credit_credit_entry(
     entry: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    provider_credit_id = _parse_codex_reset_credit_field(
-        entry, "id", "credit_id", "creditId"
-    )
+    provider_credit_id = _parse_codex_reset_credit_field(entry, "id", "credit_id", "creditId")
     if provider_credit_id is not None:
         provider_credit_id = str(provider_credit_id).strip() or None
     granted_at = probes._normalize_provider_credit_timestamp(
@@ -4983,9 +5043,7 @@ def _parse_codex_reset_credit_expires_at(
     except ValueError:
         credits = []
     if credits:
-        expiries = [
-            credit["expires_at"] for credit in credits if credit.get("expires_at")
-        ]
+        expiries = [credit["expires_at"] for credit in credits if credit.get("expires_at")]
         return max(expiries) if expiries else None
     for credits_key, expires_key in (
         ("rate_limit_reset_credits", "expires_at"),
@@ -5080,8 +5138,7 @@ def _apply_codex_reset_credit_visible_source_url(
         return observations
     newest = max(
         available_rows,
-        key=lambda row: row.get("granted_at")
-        or datetime.min.replace(tzinfo=timezone.utc),
+        key=lambda row: row.get("granted_at") or datetime.min.replace(tzinfo=timezone.utc),
     )
     updated: List[Dict[str, Any]] = []
     for row in observations:
@@ -5116,9 +5173,7 @@ def _build_codex_reset_credit_observations(
 ) -> List[Dict[str, Any]]:
     account_hash = _codex_auth_context_account_hash(auth_context)
     if account_hash is None:
-        raise ValueError(
-            "Codex reset-credit poll could not derive a stable hashed account identity."
-        )
+        raise ValueError("Codex reset-credit poll could not derive a stable hashed account identity.")
     detail_endpoint = True
     try:
         parsed_credits = _parse_codex_reset_credit_detail_credits(response_body)
@@ -5189,9 +5244,7 @@ def _build_codex_reset_credit_observations(
                     "source": DEFAULT_CODEX_RESET_CREDIT_SOURCE,
                 }
             )
-        observations = [
-            probes.apply_provider_credit_seed_metadata(row) for row in observations
-        ]
+        observations = [probes.apply_provider_credit_seed_metadata(row) for row in observations]
         return _apply_codex_reset_credit_visible_source_url(observations)
     if detail_endpoint:
         return []
@@ -5226,9 +5279,7 @@ def _build_codex_reset_credit_observation_legacy(
     expires_at = _parse_codex_reset_credit_expires_at(response_body)
     account_hash = _codex_auth_context_account_hash(auth_context)
     if account_hash is None:
-        raise ValueError(
-            "Codex reset-credit poll could not derive a stable hashed account identity."
-        )
+        raise ValueError("Codex reset-credit poll could not derive a stable hashed account identity.")
     credit_identity = probes.derive_provider_credit_identity(
         account_hash=account_hash,
         credit_family=DEFAULT_CODEX_RESET_CREDIT_CREDIT_FAMILY,
@@ -5341,11 +5392,7 @@ def _synthesize_codex_reset_credit_lifecycle_observations(
         evidence.update(
             {
                 "lifecycle_inference": next_status,
-                "lifecycle_reason": (
-                    "credit_missing_before_expiry"
-                    if next_status == "used"
-                    else "credit_past_expiry"
-                ),
+                "lifecycle_reason": ("credit_missing_before_expiry" if next_status == "used" else "credit_past_expiry"),
                 "detail_endpoint": True,
                 "poll_url": poll_url,
                 "status_code": status_code,
@@ -5360,8 +5407,7 @@ def _synthesize_codex_reset_credit_lifecycle_observations(
                 "provider": "openai",
                 "account_hash": account_hash,
                 "credit_family": DEFAULT_CODEX_RESET_CREDIT_CREDIT_FAMILY,
-                "credit_type": current.get("credit_type")
-                or DEFAULT_CODEX_RESET_CREDIT_CREDIT_TYPE,
+                "credit_type": current.get("credit_type") or DEFAULT_CODEX_RESET_CREDIT_CREDIT_TYPE,
                 "credit_identity": identity,
                 "available_count": 0,
                 "granted_at": current.get("granted_at"),
@@ -5386,9 +5432,7 @@ def _build_codex_reset_credit_seed_observations(
     account_hash: str,
     auth_context: Optional[Mapping[str, Any]] = None,
     visible_identities: set[str],
-    visible_credit_windows: Optional[
-        set[tuple[Optional[datetime], Optional[datetime]]]
-    ] = None,
+    visible_credit_windows: Optional[set[tuple[Optional[datetime], Optional[datetime]]]] = None,
     status_code: int,
     attempt_count: int,
     retry_count: int,
@@ -5422,17 +5466,11 @@ def _build_codex_reset_credit_seed_observations(
                 for visible_granted_at, visible_expires_at in visible_credit_windows
             ):
                 continue
-        status = (
-            "expired" if expires_at is not None and observed_at > expires_at else "used"
-        )
+        status = "expired" if expires_at is not None and observed_at > expires_at else "used"
         raw_provider_fields = {
             "seed": {
                 "granted_at": granted_at.isoformat().replace("+00:00", "Z"),
-                "expires_at": (
-                    expires_at.isoformat().replace("+00:00", "Z")
-                    if expires_at is not None
-                    else None
-                ),
+                "expires_at": (expires_at.isoformat().replace("+00:00", "Z") if expires_at is not None else None),
                 "reset_type": reset_type,
                 "operator_annotation": seed.get("operator_annotation"),
                 "source_url": seed.get("source_url"),
@@ -5453,9 +5491,7 @@ def _build_codex_reset_credit_seed_observations(
                 "seed_backfill": True,
                 "lifecycle_inference": status,
                 "lifecycle_reason": (
-                    "seed_credit_absent_before_expiry"
-                    if status == "used"
-                    else "seed_credit_past_expiry"
+                    "seed_credit_absent_before_expiry" if status == "used" else "seed_credit_past_expiry"
                 ),
             }
         )
@@ -5514,9 +5550,7 @@ def _codex_reset_credit_retryable_http_error(
     if (
         status_code == 400
         and normalized_hint
-        and any(
-            hint in normalized_hint for hint in CODEX_RESET_CREDIT_RETRYABLE_ERROR_HINTS
-        )
+        and any(hint in normalized_hint for hint in CODEX_RESET_CREDIT_RETRYABLE_ERROR_HINTS)
     ):
         return True
     if status_code in CODEX_RESET_CREDIT_NON_RETRYABLE_HTTP_STATUS_CODES:
@@ -5578,12 +5612,9 @@ def _fetch_codex_endpoint_payload(
                 error_hint=last_error_hint,
                 fallback_message="",
             )
-            if (
-                attempt_count < max_attempts
-                and _codex_reset_credit_retryable_http_error(
-                    exc,
-                    error_hint=last_error_hint,
-                )
+            if attempt_count < max_attempts and _codex_reset_credit_retryable_http_error(
+                exc,
+                error_hint=last_error_hint,
             ):
                 retry_count += 1
                 _codex_reset_credit_poll_sleep(
@@ -5602,14 +5633,8 @@ def _fetch_codex_endpoint_payload(
         except urllib_error.URLError as exc:
             last_status_code = None
             last_error_hint = None
-            last_error_message = (
-                f"Codex {endpoint_name} poll failed while contacting the "
-                f"{endpoint_name} endpoint."
-            )
-            if (
-                attempt_count < max_attempts
-                and _codex_reset_credit_retryable_url_error(exc)
-            ):
+            last_error_message = f"Codex {endpoint_name} poll failed while contacting the {endpoint_name} endpoint."
+            if attempt_count < max_attempts and _codex_reset_credit_retryable_url_error(exc):
                 retry_count += 1
                 _codex_reset_credit_poll_sleep(
                     _codex_reset_credit_poll_backoff_seconds(
@@ -5688,11 +5713,7 @@ def _fetch_codex_reset_credit_payload(
         "component_errors": errors,
         # Preserve the legacy single-payload shape for test seams and callers
         # that only provide a reset-credit response.
-        **(
-            components.get("reset_credit")
-            or components.get("usage")
-            or {}
-        ),
+        **(components.get("reset_credit") or components.get("usage") or {}),
     }
 
 
@@ -5736,11 +5757,7 @@ def _codex_quota_utc_timestamp(value: datetime) -> str:
 
 def _codex_quota_parse_timestamp(value: Any) -> Optional[datetime]:
     if isinstance(value, datetime):
-        return (
-            value
-            if value.tzinfo is not None
-            else value.replace(tzinfo=timezone.utc)
-        )
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
@@ -5758,11 +5775,7 @@ def _codex_quota_parse_timestamp(value: Any) -> Optional[datetime]:
             return None
     parsed = _parse_sidecar_timestamp(value)
     if parsed is not None:
-        return (
-            parsed
-            if parsed.tzinfo is not None
-            else parsed.replace(tzinfo=timezone.utc)
-        )
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
     if isinstance(value, str):
         numeric_string_value = _codex_quota_number(value.strip())
         if numeric_string_value is not None:
@@ -5801,11 +5814,7 @@ def _codex_quota_normalized_window(
 ) -> Dict[str, Any]:
     normalized = dict(window)
     normalized["window_minutes"] = _codex_quota_window_minutes(window)
-    normalized["resets_at"] = (
-        window.get("resets_at")
-        if "resets_at" in window
-        else window.get("reset_at")
-    )
+    normalized["resets_at"] = window.get("resets_at") if "resets_at" in window else window.get("reset_at")
     return normalized
 
 
@@ -5814,9 +5823,7 @@ def _coerce_codex_quota_payload(value: Any) -> Any:
         return value
     if isinstance(value, bytes):
         try:
-            return _coerce_codex_quota_payload(
-                value.decode("utf-8", errors="replace")
-            )
+            return _coerce_codex_quota_payload(value.decode("utf-8", errors="replace"))
         except Exception:
             return None
     if not isinstance(value, str):
@@ -5941,10 +5948,7 @@ def _infer_codex_quota_model_family_and_tier(
     text = " ".join(str(value) for value in values if value is not None).lower()
 
     def _has_token(token: str) -> bool:
-        return (
-            re.search(rf"(?<![a-z0-9_]){re.escape(token)}(?![a-z0-9_])", text)
-            is not None
-        )
+        return re.search(rf"(?<![a-z0-9_]){re.escape(token)}(?![a-z0-9_])", text) is not None
 
     model_tier = None
     if _has_token("sonnet"):
@@ -5991,11 +5995,7 @@ def _build_codex_quota_limit_key(
     identity = (
         _codex_quota_clean_string(limit_id)
         or _codex_quota_clean_string(limit_name)
-        or (
-            _codex_quota_clean_string(model)
-            if str(limit_scope or "").startswith("model")
-            else None
-        )
+        or (_codex_quota_clean_string(model) if str(limit_scope or "").startswith("model") else None)
         or _codex_quota_clean_string(model_family)
         or "default"
     )
@@ -6010,9 +6010,7 @@ def _build_codex_quota_limit_key(
     if quota_family and quota_family != "overall":
         parts = (*parts, quota_family)
     normalized_parts = [
-        re.sub(r"[^a-z0-9_.-]+", "_", str(part).strip().lower()).strip("_")
-        or "unknown"
-        for part in parts
+        re.sub(r"[^a-z0-9_.-]+", "_", str(part).strip().lower()).strip("_") or "unknown" for part in parts
     ]
     return ":".join(normalized_parts)
 
@@ -6061,13 +6059,9 @@ def _find_codex_quota_rate_limit_sources(
         if not isinstance(rate_limits, Mapping):
             return
         has_live_window = any(
-            isinstance(rate_limits.get(key), Mapping)
-            for key in ("primary_window", "secondary_window")
+            isinstance(rate_limits.get(key), Mapping) for key in ("primary_window", "secondary_window")
         )
-        has_legacy_window = any(
-            isinstance(rate_limits.get(key), Mapping)
-            for key in ("primary", "secondary")
-        )
+        has_legacy_window = any(isinstance(rate_limits.get(key), Mapping) for key in ("primary", "secondary"))
         if not has_live_window and not has_legacy_window:
             return
         sources.append(
@@ -6161,12 +6155,7 @@ def _codex_quota_freshness(
 ) -> str:
     if expected_reset_at is not None and expected_reset_at <= observed_at:
         return "stale"
-    if (
-        window_minutes is None
-        or used_percentage is None
-        or used_percentage < 0
-        or expected_reset_at is None
-    ):
+    if window_minutes is None or used_percentage is None or used_percentage < 0 or expected_reset_at is None:
         return "unknown"
     return "fresh"
 
@@ -6188,12 +6177,8 @@ def _extract_codex_quota_rate_limit_observations(
     """
     limit_id = _codex_quota_clean_string(rate_limits.get("limit_id"))
     limit_name = _codex_quota_clean_string(rate_limits.get("limit_name"))
-    quota_family = str(
-        rate_limits.get("_codex_quota_family") or "overall"
-    ).strip().lower()
-    source_path = str(
-        rate_limits.get("_codex_quota_source_path") or "rate_limits"
-    ).strip()
+    quota_family = str(rate_limits.get("_codex_quota_family") or "overall").strip().lower()
+    source_path = str(rate_limits.get("_codex_quota_source_path") or "rate_limits").strip()
     live_contract = bool(rate_limits.get("_codex_quota_live"))
     metadata = {
         "client_name": DEFAULT_CODEX_QUOTA_CLIENT,
@@ -6209,9 +6194,7 @@ def _extract_codex_quota_rate_limit_observations(
         window_minutes = _codex_quota_window_minutes(window)
         used_percentage = _codex_quota_number(window.get("used_percent"))
         provider_resets_at = _codex_quota_parse_timestamp(window.get("resets_at"))
-        provider_window_key = (
-            f"{limit_scope}_window" if live_contract else limit_scope
-        )
+        provider_window_key = f"{limit_scope}_window" if live_contract else limit_scope
         observations.append(
             {
                 "observed_at": observed_at,
@@ -6227,13 +6210,9 @@ def _extract_codex_quota_rate_limit_observations(
                 "quota_family": quota_family,
                 "model": model,
                 "live_contract": live_contract,
-                "exhausted": bool(
-                    used_percentage is not None and used_percentage >= 100
-                ),
+                "exhausted": bool(used_percentage is not None and used_percentage >= 100),
                 "exhaustion_kind": (
-                    rate_limits.get("rate_limit_reached_type")
-                    if rate_limits.get("rate_limit_reached_type")
-                    else None
+                    rate_limits.get("rate_limit_reached_type") if rate_limits.get("rate_limit_reached_type") else None
                 ),
                 "raw_provider_fields": {
                     "limit_id": limit_id,
@@ -6245,9 +6224,7 @@ def _extract_codex_quota_rate_limit_observations(
                     "resets_at": window.get("resets_at"),
                     "reset_at": window.get("reset_at"),
                     "plan_type": rate_limits.get("plan_type"),
-                    "rate_limit_reached_type": rate_limits.get(
-                        "rate_limit_reached_type"
-                    ),
+                    "rate_limit_reached_type": rate_limits.get("rate_limit_reached_type"),
                     "quota_family": quota_family,
                     "rate_limit_path": source_path,
                 },
@@ -6256,8 +6233,7 @@ def _extract_codex_quota_rate_limit_observations(
                     "provider_fields": [
                         f"{source_path}.{provider_window_key}.used_percent",
                         (
-                            f"{source_path}.{provider_window_key}."
-                            "limit_window_seconds"
+                            f"{source_path}.{provider_window_key}.limit_window_seconds"
                             if live_contract
                             else f"{source_path}.{provider_window_key}.window_minutes"
                         ),
@@ -6276,18 +6252,12 @@ def _extract_codex_quota_rate_limit_observations(
     for observation in observations:
         window_minutes = _codex_quota_int(observation.get("window_minutes"))
         observation["window_minutes"] = window_minutes
-        observation["quota_period"] = _codex_quota_period_from_window_minutes(
-            window_minutes
-        )
-        provider_resets_at = _codex_quota_parse_timestamp(
-            observation.get("provider_resets_at")
-        )
+        observation["quota_period"] = _codex_quota_period_from_window_minutes(window_minutes)
+        provider_resets_at = _codex_quota_parse_timestamp(observation.get("provider_resets_at"))
         observation["provider_resets_at"] = provider_resets_at
         observation["inferred_window_start_at"] = (
             provider_resets_at - timedelta(minutes=window_minutes)
-            if provider_resets_at is not None
-            and window_minutes is not None
-            and window_minutes > 0
+            if provider_resets_at is not None and window_minutes is not None and window_minutes > 0
             else None
         )
         model_family, model_tier = _infer_codex_quota_model_family_and_tier(
@@ -6331,29 +6301,20 @@ def _normalize_codex_quota_rate_limit_source(
             normalized[limit_scope] = _codex_quota_normalized_window(legacy_window)
     quota_family = str(source.get("quota_family") or "overall").strip().lower()
     source_model = _codex_quota_upstream_model(normalized, parent or {})
-    source_quota_key = _codex_quota_clean_string(
-        normalized.get("quota_key") or normalized.get("quotaKey")
-    )
+    source_quota_key = _codex_quota_clean_string(normalized.get("quota_key") or normalized.get("quotaKey"))
     if quota_family == "spark":
         source_model = source_model or _codex_quota_clean_string(
-            (identity_source or {}).get("limit_name")
-            if isinstance(identity_source, Mapping)
-            else None
+            (identity_source or {}).get("limit_name") if isinstance(identity_source, Mapping) else None
         )
         source_model = source_model or _codex_quota_clean_string(
-            (identity_source or {}).get("model")
-            if isinstance(identity_source, Mapping)
-            else None
+            (identity_source or {}).get("model") if isinstance(identity_source, Mapping) else None
         )
         if not source_model or "spark" not in source_model.lower():
             source_model = "gpt-5.3-codex-spark"
     normalized["_codex_quota_family"] = quota_family
-    normalized["_codex_quota_source_path"] = str(
-        source.get("source_path") or "rate_limits"
-    )
+    normalized["_codex_quota_source_path"] = str(source.get("source_path") or "rate_limits")
     normalized["_codex_quota_live"] = any(
-        isinstance(rate_limits.get(key), Mapping)
-        for key in ("primary_window", "secondary_window")
+        isinstance(rate_limits.get(key), Mapping) for key in ("primary_window", "secondary_window")
     )
     normalized["_codex_quota_source_model"] = source_model
     normalized["_codex_quota_source_key"] = source_quota_key
@@ -6388,9 +6349,7 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
     upstream_model_present = False
     for source in sources:
         rate_limits = _normalize_codex_quota_rate_limit_source(source)
-        quota_family = str(
-            rate_limits.get("_codex_quota_family") or "overall"
-        ).strip().lower()
+        quota_family = str(rate_limits.get("_codex_quota_family") or "overall").strip().lower()
         source_model = rate_limits.get("_codex_quota_source_model")
         if source_model is not None:
             upstream_model_present = True
@@ -6409,11 +6368,7 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
         for limit_scope in ("primary", "secondary"):
             observation = extracted_by_scope.get(limit_scope)
             window = rate_limits.get(limit_scope)
-            state_key = (
-                limit_scope
-                if quota_family == "overall"
-                else f"{quota_family}_{limit_scope}"
-            )
+            state_key = limit_scope if quota_family == "overall" else f"{quota_family}_{limit_scope}"
             if observation is None or not isinstance(window, dict):
                 window_states.setdefault(state_key, "absent")
                 quota_periods.setdefault(state_key, None)
@@ -6432,21 +6387,13 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
             quota_period = _codex_quota_period_from_window_minutes(window_minutes)
             window_states[state_key] = freshness
             quota_periods[state_key] = quota_period
-            period_key = (
-                quota_period
-                if quota_family == "overall"
-                else f"{quota_family}:{quota_period}"
-            )
+            period_key = quota_period if quota_family == "overall" else f"{quota_family}:{quota_period}"
             if period_key is not None:
                 period_states[period_key] = freshness
 
-            fresh_used_percentage = (
-                used_percentage if freshness == "fresh" else None
-            )
+            fresh_used_percentage = used_percentage if freshness == "fresh" else None
             remaining_pct = (
-                max(0.0, min(100.0, 100.0 - fresh_used_percentage))
-                if fresh_used_percentage is not None
-                else None
+                max(0.0, min(100.0, 100.0 - fresh_used_percentage)) if fresh_used_percentage is not None else None
             )
             limit_id = _redacted_summary_field(row.get("limit_id"))
             limit_name = _redacted_summary_field(row.get("limit_name"))
@@ -6491,9 +6438,7 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
                     "used_percentage": fresh_used_percentage,
                     "status": freshness,
                     "exhausted": bool(
-                        freshness == "fresh"
-                        and fresh_used_percentage is not None
-                        and fresh_used_percentage >= 100
+                        freshness == "fresh" and fresh_used_percentage is not None and fresh_used_percentage >= 100
                     ),
                     "raw_provider_fields": raw_provider_fields,
                     "evidence": evidence,
@@ -6523,16 +6468,10 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
                 row["quota_key"] = row["limit_key"]
             rows.append(row)
 
-    present_window_states = [
-        state for state in window_states.values() if state != "absent"
-    ]
+    present_window_states = [state for state in window_states.values() if state != "absent"]
     present_window_count = len(present_window_states)
-    fresh_window_count = sum(
-        state == "fresh" for state in present_window_states
-    )
-    present_windows_fresh = bool(present_window_states) and all(
-        state == "fresh" for state in present_window_states
-    )
+    fresh_window_count = sum(state == "fresh" for state in present_window_states)
+    present_windows_fresh = bool(present_window_states) and all(state == "fresh" for state in present_window_states)
     if present_window_count == 0:
         telemetry_status = "absent"
     elif present_windows_fresh:
@@ -6551,9 +6490,7 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
         "fresh_window_count": fresh_window_count,
         "window_count": present_window_count,
         "present_windows_fresh": present_windows_fresh,
-        "upstream_scope_present": any(
-            row.get("limit_id") or row.get("limit_name") for row in rows
-        ),
+        "upstream_scope_present": any(row.get("limit_id") or row.get("limit_name") for row in rows),
         "upstream_model_present": upstream_model_present,
     }
 
@@ -6620,14 +6557,8 @@ def _build_codex_quota_observation_db_payload(
         _codex_quota_number(observation.get("quota_remaining")),
         _codex_quota_parse_timestamp(observation.get("billing_period_start_at")),
         _codex_quota_parse_timestamp(observation.get("billing_period_end_at")),
-        json.dumps(
-            _json_safe_codex_quota_value(
-                observation.get("raw_provider_fields") or {}
-            )
-        ),
-        json.dumps(
-            _json_safe_codex_quota_value(observation.get("evidence") or {})
-        ),
+        json.dumps(_json_safe_codex_quota_value(observation.get("raw_provider_fields") or {})),
+        json.dumps(_json_safe_codex_quota_value(observation.get("evidence") or {})),
         observation.get("source"),
         observation.get("session_id"),
         observation.get("trace_id"),
@@ -6688,6 +6619,7 @@ def _set_codex_quota_database_timeouts(
         (f"{statement_timeout_ms}ms",),
     )
 
+
 def _persist_codex_reset_credit_observation(
     config: ProviderStatusLoopConfig,
     *,
@@ -6710,24 +6642,16 @@ def _persist_codex_reset_credit_observation(
         retry_count=retry_count,
         poll_url=resolved_poll_url,
     )
-    account_hash = (
-        observations[0]["account_hash"]
-        if observations
-        else _codex_auth_context_account_hash(auth_context)
-    )
+    account_hash = observations[0]["account_hash"] if observations else _codex_auth_context_account_hash(auth_context)
     if account_hash is None:
-        raise ValueError(
-            "Codex reset-credit poll could not derive a stable hashed account identity."
-        )
+        raise ValueError("Codex reset-credit poll could not derive a stable hashed account identity.")
     visible_identities = {
         str(row.get("credit_identity") or "").strip()
         for row in observations
         if str(row.get("credit_identity") or "").strip()
     }
     visible_credit_windows = {
-        (row.get("granted_at"), row.get("expires_at"))
-        for row in observations
-        if row.get("granted_at") is not None
+        (row.get("granted_at"), row.get("expires_at")) for row in observations if row.get("granted_at") is not None
     }
     seed_rows = _build_codex_reset_credit_seed_observations(
         config,
@@ -6781,20 +6705,12 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
     events: list[Dict[str, Any]] = []
     attempted_any = False
     for record in records:
-        last_attempt = state.codex_reset_credit_last_attempt_monotonic_by_label.get(
-            record.label
-        )
-        if (
-            last_attempt is not None
-            and now_monotonic - last_attempt
-            < config.codex_reset_credit_poll_interval_seconds
-        ):
+        last_attempt = state.codex_reset_credit_last_attempt_monotonic_by_label.get(record.label)
+        if last_attempt is not None and now_monotonic - last_attempt < config.codex_reset_credit_poll_interval_seconds:
             continue
 
         attempted_any = True
-        state.codex_reset_credit_last_attempt_monotonic_by_label[record.label] = (
-            now_monotonic
-        )
+        state.codex_reset_credit_last_attempt_monotonic_by_label[record.label] = now_monotonic
         observed_at = datetime.now(timezone.utc)
         summary: Dict[str, Any] = {
             "attempted": True,
@@ -6822,9 +6738,7 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
             "status_code": None,
             "attempt_count": 0,
             "retry_count": 0,
-            "poll_max_attempts": max(
-                1, config.codex_reset_credit_poll_max_attempts
-            ),
+            "poll_max_attempts": max(1, config.codex_reset_credit_poll_max_attempts),
             "reset_credit_error_class": None,
             "reset_credit_error_message": None,
             "quota_error_class": None,
@@ -6867,9 +6781,7 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
             usage_fetch_error = component_errors.get("usage")
             if isinstance(usage_fetch, Mapping):
                 summary["usage_status_code"] = usage_fetch.get("status_code")
-                summary["usage_attempt_count"] = usage_fetch.get(
-                    "attempt_count", 1
-                )
+                summary["usage_attempt_count"] = usage_fetch.get("attempt_count", 1)
                 summary["usage_retry_count"] = usage_fetch.get("retry_count", 0)
             elif isinstance(usage_fetch_error, CodexResetCreditPollError):
                 summary["usage_status_code"] = usage_fetch_error.status_code
@@ -6878,35 +6790,23 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
 
             reset_credit_error = component_errors.get("reset_credit")
             if isinstance(reset_credit_error, Exception):
-                summary["reset_credit_error_class"] = (
-                    reset_credit_error.__class__.__name__
-                )
-                summary["reset_credit_error_message"] = _redacted_failure_message(
-                    str(reset_credit_error)
-                )
+                summary["reset_credit_error_class"] = reset_credit_error.__class__.__name__
+                summary["reset_credit_error_message"] = _redacted_failure_message(str(reset_credit_error))
 
             try:
                 if not isinstance(detail_fetch, Mapping):
-                    raise reset_credit_error or ValueError(
-                        "Codex reset-credit detail poll returned no result."
-                    )
-                summary["available_count"] = (
-                    _parse_codex_reset_credit_available_count(
-                        detail_fetch["payload"]
-                    )
-                )
+                    raise reset_credit_error or ValueError("Codex reset-credit detail poll returned no result.")
+                summary["available_count"] = _parse_codex_reset_credit_available_count(detail_fetch["payload"])
                 if config.apply:
-                    credit_count, credit_inserted = (
-                        _persist_codex_reset_credit_observation(
-                            config,
-                            observed_at=observed_at,
-                            response_body=detail_fetch["payload"],
-                            auth_context=detail_fetch["auth_context"],
-                            status_code=detail_fetch["status_code"],
-                            attempt_count=summary["attempt_count"],
-                            retry_count=summary["retry_count"],
-                            poll_url=detail_fetch.get("poll_url"),
-                        )
+                    credit_count, credit_inserted = _persist_codex_reset_credit_observation(
+                        config,
+                        observed_at=observed_at,
+                        response_body=detail_fetch["payload"],
+                        auth_context=detail_fetch["auth_context"],
+                        status_code=detail_fetch["status_code"],
+                        attempt_count=summary["attempt_count"],
+                        retry_count=summary["retry_count"],
+                        poll_url=detail_fetch.get("poll_url"),
                     )
                     summary["credit_observation_count"] = credit_count
                     summary["credit_inserted_count"] = credit_inserted
@@ -6920,28 +6820,23 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
                         status_code=detail_fetch["status_code"],
                         attempt_count=summary["attempt_count"],
                         retry_count=summary["retry_count"],
-                        poll_url=detail_fetch.get("poll_url")
-                        or _resolve_codex_reset_credit_poll_url(config),
+                        poll_url=detail_fetch.get("poll_url") or _resolve_codex_reset_credit_poll_url(config),
                     )
                     summary["credit_observation_count"] = len(credit_rows)
             except Exception as exc:
                 summary["reset_credit_error_class"] = exc.__class__.__name__
-                summary["reset_credit_error_message"] = _redacted_failure_message(
-                    str(exc)
-                )
+                summary["reset_credit_error_message"] = _redacted_failure_message(str(exc))
 
             try:
                 if not isinstance(usage_fetch, Mapping):
                     if isinstance(usage_fetch_error, Exception):
                         raise usage_fetch_error
                     raise ValueError("Codex usage poll returned no result.")
-                quota_observations, quota_summary = (
-                    _build_codex_quota_rate_limit_observations(
-                        config,
-                        record=record,
-                        observed_at=observed_at,
-                        response_body=usage_fetch["payload"],
-                    )
+                quota_observations, quota_summary = _build_codex_quota_rate_limit_observations(
+                    config,
+                    record=record,
+                    observed_at=observed_at,
+                    response_body=usage_fetch["payload"],
                 )
                 summary["quota_observation_count"] = len(quota_observations)
                 summary["quota_window_states"] = quota_summary["window_states"]
@@ -6960,11 +6855,9 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
                 else:
                     summary["quota_health"] = "degraded"
                 if config.apply and quota_observations:
-                    summary["quota_inserted_count"] = (
-                        _persist_codex_quota_observations(
-                            config,
-                            quota_observations,
-                        )
+                    summary["quota_inserted_count"] = _persist_codex_quota_observations(
+                        config,
+                        quota_observations,
                     )
                     summary["quota_storage_status"] = "persisted"
                 elif not config.apply:
@@ -6972,24 +6865,12 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
                 else:
                     summary["quota_storage_status"] = "no_observations"
             except Exception as exc:
-                component_error = (
-                    usage_fetch_error
-                    if isinstance(usage_fetch_error, Exception)
-                    else None
-                )
+                component_error = usage_fetch_error if isinstance(usage_fetch_error, Exception) else None
                 summary["quota_error_class"] = (
-                    component_error.__class__.__name__
-                    if component_error is not None
-                    else exc.__class__.__name__
+                    component_error.__class__.__name__ if component_error is not None else exc.__class__.__name__
                 )
-                summary["quota_error_message"] = _redacted_failure_message(
-                    str(component_error or exc)
-                )
-                summary["quota_storage_status"] = (
-                    "fetch_failed"
-                    if component_error is not None
-                    else "db_write_failed"
-                )
+                summary["quota_error_message"] = _redacted_failure_message(str(component_error or exc))
+                summary["quota_storage_status"] = "fetch_failed" if component_error is not None else "db_write_failed"
                 summary["quota_health"] = "terminal"
 
             summary["inserted_count"] = summary["credit_inserted_count"]
@@ -6998,15 +6879,13 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
             if summary["reset_credit_error_class"] or summary["quota_error_class"]:
                 summary["error_class"] = (
                     "CodexTelemetryComponentsFailed"
-                    if summary["reset_credit_error_class"]
-                    and summary["quota_error_class"]
+                    if summary["reset_credit_error_class"] and summary["quota_error_class"]
                     else "CodexResetCreditComponentFailed"
                     if summary["reset_credit_error_class"]
                     else "CodexUsageComponentFailed"
                 )
                 summary["error_message"] = (
-                    f"Codex reset-credit and/or quota telemetry failed for "
-                    f"account '{record.label}'."
+                    f"Codex reset-credit and/or quota telemetry failed for account '{record.label}'."
                 )
 
         quota_usable = summary["quota_health"] in {"healthy", "degraded", "absent"}
@@ -7106,10 +6985,7 @@ def _fetch_kimi_usage_payload(
                 retry_count=retry_count,
                 refresh_attempted=refresh_attempted,
                 refresh_succeeded=refresh_succeeded,
-                message=(
-                    "Kimi Code native contract descriptor is unavailable or "
-                    "invalid; no upstream call was made."
-                ),
+                message=("Kimi Code native contract descriptor is unavailable or invalid; no upstream call was made."),
             ) from exc
         usage_url = _kimi_resolve_endpoint_url(usage_contract, "usages")
         usage_headers = _kimi_build_outbound_headers(
@@ -7143,7 +7019,7 @@ def _fetch_kimi_usage_payload(
                 retry_count=retry_count,
                 refresh_attempted=refresh_attempted,
                 refresh_succeeded=refresh_succeeded,
-                message=("Kimi Code usage poll failed while contacting the native " "endpoint."),
+                message=("Kimi Code usage poll failed while contacting the native endpoint."),
             ) from exc
 
         if status_code in {401, 403} and attempt_count == 1:
@@ -7163,7 +7039,7 @@ def _fetch_kimi_usage_payload(
                     retry_count=retry_count,
                     refresh_attempted=True,
                     refresh_succeeded=False,
-                    message=("Kimi Code usage credential refresh failed after an " "authentication rejection."),
+                    message=("Kimi Code usage credential refresh failed after an authentication rejection."),
                 ) from None
 
             refresh_succeeded = bool(
@@ -7179,7 +7055,7 @@ def _fetch_kimi_usage_payload(
                     retry_count=retry_count,
                     refresh_attempted=True,
                     refresh_succeeded=False,
-                    message=("Kimi Code usage credential refresh failed after an " "authentication rejection."),
+                    message=("Kimi Code usage credential refresh failed after an authentication rejection."),
                 )
             retry_count = 1
             continue
@@ -7670,7 +7546,7 @@ def _build_kimi_usage_rate_limit_payloads(
             "provider_metadata_keys": sorted(provider_metadata),
             "parallel_row_emitted": False,
             "unit_note": (
-                "Native Kimi Code quota values are preserved as quota units; " "they are not interpreted as tokens."
+                "Native Kimi Code quota values are preserved as quota units; they are not interpreted as tokens."
             ),
         }
         if snapshot["usage_exceeds_limit"]:
@@ -7788,9 +7664,7 @@ def _hash_zai_coding_plan_account_identity(
                     customer_ids.add(str(raw_customer_id).strip())
     if len(customer_ids) == 1:
         customer_id = next(iter(customer_ids))
-        return hashlib.sha256(
-            f"zai_coding_plan|customerId={customer_id}".encode("utf-8")
-        ).hexdigest()
+        return hashlib.sha256(f"zai_coding_plan|customerId={customer_id}".encode("utf-8")).hexdigest()
     return None
 
 
@@ -7941,9 +7815,7 @@ def _build_zai_coding_plan_quota_rate_limit_payloads(  # noqa: PLR0915
             quota_type = "count"
             quota_limit = usage
             quota_remaining = remaining
-            quota_used = (
-                current_value if current_value is not None else usage - remaining
-            )
+            quota_used = current_value if current_value is not None else usage - remaining
             if quota_used is not None and quota_used < 0:
                 continue
         else:
@@ -8110,11 +7982,7 @@ def _run_zai_coding_plan_quota_poll_task(
     if not config.zai_coding_plan_quota_poll_enabled:
         return None
     last_attempt = state.zai_coding_plan_quota_last_attempt_monotonic
-    if (
-        last_attempt is not None
-        and now_monotonic - last_attempt
-        < config.zai_coding_plan_quota_poll_interval_seconds
-    ):
+    if last_attempt is not None and now_monotonic - last_attempt < config.zai_coding_plan_quota_poll_interval_seconds:
         return None
 
     state.zai_coding_plan_quota_last_attempt_monotonic = now_monotonic
@@ -8225,9 +8093,7 @@ def _load_cursor_agent_usage_access_token(auth_file: str) -> Optional[str]:
     count as bearer tokens; ``apiKey`` and ``refreshToken`` are never used
     here and no request-time exchange is performed.
     """
-    payload = cursor_agent_auth_refresh._read_auth_data(
-        Path(auth_file).expanduser()
-    )
+    payload = cursor_agent_auth_refresh._read_auth_data(Path(auth_file).expanduser())
     for key in ("accessToken", "access_token"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
@@ -8242,9 +8108,7 @@ def _fetch_cursor_agent_usage_payload(
     retry_count = 0
     access_token: Optional[str] = None
     try:
-        access_token = _load_cursor_agent_usage_access_token(
-            config.cursor_agent_auth_file
-        )
+        access_token = _load_cursor_agent_usage_access_token(config.cursor_agent_auth_file)
     except Exception:
         access_token = None
     if access_token is None:
@@ -8315,9 +8179,7 @@ def _fetch_cursor_agent_usage_payload(
         )
     # Only a successful HTTP 200 authenticates this exact access token; derive
     # a stable non-secret fallback identity from its JWT iss+sub claims.
-    auth_identity_hash, auth_identity_fields = hash_cursor_agent_auth_jwt_identity(
-        access_token
-    )
+    auth_identity_hash, auth_identity_fields = hash_cursor_agent_auth_jwt_identity(access_token)
     return {
         "status_code": status_code,
         "payload": payload,
@@ -8459,9 +8321,7 @@ def _set_chatgpt_conversation_init_database_timeouts(
 ) -> None:
     cur.execute(
         "SELECT set_config('application_name', %s, false)",
-        (
-            f"{probes._provider_status_db_application_name()}-chatgpt-conversation-init",
-        ),
+        (f"{probes._provider_status_db_application_name()}-chatgpt-conversation-init",),
     )
     cur.execute("SELECT set_config('lock_timeout', %s, true)", (f"{lock_timeout_ms}ms",))
     cur.execute(
@@ -8593,20 +8453,15 @@ def _alibaba_acs3_signed_headers(
         "host": host,
         "x-acs-action": action,
         "x-acs-version": version,
-        "x-acs-date": acs_date
-        or _alibaba_mint_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "x-acs-date": acs_date or _alibaba_mint_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "x-acs-signature-nonce": signature_nonce or _alibaba_mint_nonce(),
         "x-acs-content-sha256": hashed_payload,
         "content-type": "application/json",
     }
     signed_header_names = sorted(
-        name
-        for name in headers
-        if name == "host" or name == "content-type" or name.startswith("x-acs-")
+        name for name in headers if name == "host" or name == "content-type" or name.startswith("x-acs-")
     )
-    canonical_headers = "".join(
-        f"{name}:{headers[name]}\n" for name in signed_header_names
-    )
+    canonical_headers = "".join(f"{name}:{headers[name]}\n" for name in signed_header_names)
     signed_headers = ";".join(signed_header_names)
     canonical_request = "\n".join(
         (
@@ -8621,10 +8476,7 @@ def _alibaba_acs3_signed_headers(
     string_to_sign = f"ACS3-HMAC-SHA256\n{_alibaba_sha256_hex(canonical_request)}"
     signature = _alibaba_hmac_sha256_hex(access_key_secret, string_to_sign)
     headers["authorization"] = (
-        "ACS3-HMAC-SHA256 "
-        f"Credential={access_key_id},"
-        f"SignedHeaders={signed_headers},"
-        f"Signature={signature}"
+        f"ACS3-HMAC-SHA256 Credential={access_key_id},SignedHeaders={signed_headers},Signature={signature}"
     )
     return headers
 
@@ -8764,10 +8616,7 @@ def _mint_alibaba_console_access_token(
             attempt_count=1,
             retry_count=0,
             mint_attempted=True,
-            message=(
-                "Alibaba Token Plan console token mint failed while contacting "
-                "the international mint host."
-            ),
+            message=("Alibaba Token Plan console token mint failed while contacting the international mint host."),
         ) from exc
     payload: Optional[Mapping[str, Any]] = None
     try:
@@ -8817,9 +8666,7 @@ def _ensure_alibaba_console_session(
 ) -> tuple[AlibabaConsoleSession, bool]:
     fingerprint = str(auth["credential_fingerprint"])
     previous = state.alibaba_console_session
-    credential_reset = bool(
-        previous is not None and previous.credential_fingerprint != fingerprint
-    )
+    credential_reset = bool(previous is not None and previous.credential_fingerprint != fingerprint)
     if previous is None or credential_reset:
         cached_token = None if credential_reset else state.alibaba_access_token
         state.alibaba_console_session = AlibabaConsoleSession(
@@ -8901,9 +8748,7 @@ def _alibaba_quota_request_url(
     if parsed.scheme.lower() != "https" or not hostname:
         raise AlibabaAuthError("Alibaba quota gateway must use a configured HTTPS host.")
     if _alibaba_host_is_china(hostname):
-        raise AlibabaAuthError(
-            "Alibaba Token Plan quota polling does not use China console hosts."
-        )
+        raise AlibabaAuthError("Alibaba Token Plan quota polling does not use China console hosts.")
     existing = [
         (key, value)
         for key, value in parse_qsl(parsed.query, keep_blank_values=True)
@@ -9212,20 +9057,14 @@ def _extract_alibaba_console_data(
         # top-level ``data`` (``payload.data.success=false`` + errorCode/
         # errorMsg, no DataV2 wrapper).  A nested DataV2 envelope is also
         # recognized for forward compatibility.  Check both key paths.
-        if _alibaba_console_envelope_is_auth_failure(
-            outer_data
-        ) or _alibaba_console_envelope_is_auth_failure(response):
+        if _alibaba_console_envelope_is_auth_failure(outer_data) or _alibaba_console_envelope_is_auth_failure(response):
             telemetry_class = "auth"
             message = (
-                f"Alibaba Token Plan {endpoint} endpoint returned an "
-                "application-level authentication failure envelope."
+                f"Alibaba Token Plan {endpoint} endpoint returned an application-level authentication failure envelope."
             )
         else:
             telemetry_class = "contract_drift"
-            message = (
-                f"Alibaba Token Plan {endpoint} endpoint returned an "
-                "unrecognized response contract."
-            )
+            message = f"Alibaba Token Plan {endpoint} endpoint returned an unrecognized response contract."
         raise _alibaba_quota_poll_error(
             endpoint=endpoint,
             status_code=200,
@@ -9252,20 +9091,14 @@ def _extract_alibaba_console_reset_card_list(
         or response.get("success") is not True
         or not isinstance(provider_data, list)
     ):
-        if _alibaba_console_envelope_is_auth_failure(
-            outer_data
-        ) or _alibaba_console_envelope_is_auth_failure(response):
+        if _alibaba_console_envelope_is_auth_failure(outer_data) or _alibaba_console_envelope_is_auth_failure(response):
             telemetry_class = "auth"
             message = (
-                f"Alibaba Token Plan {endpoint} endpoint returned an "
-                "application-level authentication failure envelope."
+                f"Alibaba Token Plan {endpoint} endpoint returned an application-level authentication failure envelope."
             )
         else:
             telemetry_class = "contract_drift"
-            message = (
-                f"Alibaba Token Plan {endpoint} endpoint returned an "
-                "unrecognized response contract."
-            )
+            message = f"Alibaba Token Plan {endpoint} endpoint returned an unrecognized response contract."
         raise _alibaba_quota_poll_error(
             endpoint=endpoint,
             status_code=200,
@@ -9314,10 +9147,7 @@ def _handle_alibaba_quota_http_error(
         and state.retry_count < max(1, config.alibaba_quota_poll_max_attempts) - 1
     ):
         state.retry_count += 1
-        ALIBABA_QUOTA_POLL_SLEEP_FN(
-            config.alibaba_quota_poll_retry_backoff_seconds
-            * (2 ** (state.retry_count - 1))
-        )
+        ALIBABA_QUOTA_POLL_SLEEP_FN(config.alibaba_quota_poll_retry_backoff_seconds * (2 ** (state.retry_count - 1)))
         return
     raise _alibaba_quota_poll_error(
         endpoint=endpoint,
@@ -9336,19 +9166,13 @@ def _handle_alibaba_quota_transport_error(
 ) -> None:
     if state.retry_count < max(1, config.alibaba_quota_poll_max_attempts) - 1:
         state.retry_count += 1
-        ALIBABA_QUOTA_POLL_SLEEP_FN(
-            config.alibaba_quota_poll_retry_backoff_seconds
-            * (2 ** (state.retry_count - 1))
-        )
+        ALIBABA_QUOTA_POLL_SLEEP_FN(config.alibaba_quota_poll_retry_backoff_seconds * (2 ** (state.retry_count - 1)))
         return
     raise _alibaba_quota_poll_error(
         endpoint=endpoint,
         status_code=None,
         telemetry_class="transport",
-        message=(
-            f"Alibaba Token Plan {endpoint} poll failed while contacting "
-            "the console gateway."
-        ),
+        message=(f"Alibaba Token Plan {endpoint} poll failed while contacting the console gateway."),
         **state.error_metadata(),
     ) from exc
 
@@ -9377,9 +9201,7 @@ def _parse_alibaba_quota_success(
             endpoint=endpoint,
             status_code=status_code,
             telemetry_class="malformed_telemetry",
-            message=(
-                f"Alibaba Token Plan {endpoint} endpoint returned invalid JSON."
-            ),
+            message=(f"Alibaba Token Plan {endpoint} endpoint returned invalid JSON."),
             **state.error_metadata(),
         ) from exc
     if not isinstance(payload, Mapping):
@@ -9387,10 +9209,7 @@ def _parse_alibaba_quota_success(
             endpoint=endpoint,
             status_code=status_code,
             telemetry_class="malformed_telemetry",
-            message=(
-                f"Alibaba Token Plan {endpoint} endpoint returned a "
-                "non-object payload."
-            ),
+            message=(f"Alibaba Token Plan {endpoint} endpoint returned a non-object payload."),
             **state.error_metadata(),
         )
     try:
@@ -9433,9 +9252,7 @@ def _fetch_alibaba_quota_payload(
     if session is None:
         session = AlibabaConsoleSession(
             credential_fingerprint=str(auth["credential_fingerprint"]),
-            access_token=(
-                None if task_state is None else task_state.alibaba_access_token
-            ),
+            access_token=(None if task_state is None else task_state.alibaba_access_token),
         )
     state = AlibabaQuotaFetchState(session=session)
     while True:
@@ -9587,11 +9404,7 @@ def _parse_alibaba_reset_card_text(
     if not isinstance(value, str):
         raise ValueError(f"Alibaba reset-card {field_name} is not a string.")
     normalized = value.strip()
-    if (
-        not normalized
-        or len(normalized) > max_length
-        or any(ord(character) < 32 for character in normalized)
-    ):
+    if not normalized or len(normalized) > max_length or any(ord(character) < 32 for character in normalized):
         raise ValueError(f"Alibaba reset-card {field_name} is invalid.")
     return normalized
 
@@ -9657,9 +9470,7 @@ def _build_alibaba_reset_card_observations(
             }
         )
 
-    available_count = sum(
-        1 for parsed in parsed_cards if parsed["status"] == "available"
-    )
+    available_count = sum(1 for parsed in parsed_cards if parsed["status"] == "available")
     observations: List[Dict[str, Any]] = []
     for parsed in parsed_cards:
         observations.append(
@@ -9809,9 +9620,7 @@ def _build_alibaba_quota_rate_limit_payloads(
                 )
             )
     if not payloads:
-        raise ValueError(
-            "Alibaba usage payload has no recognized quota window."
-        )
+        raise ValueError("Alibaba usage payload has no recognized quota window.")
     return payloads
 
 
@@ -9899,19 +9708,13 @@ def _synthesize_alibaba_reset_card_lifecycle_observations(
         if not isinstance(expires_at, datetime):
             expires_at = probes._normalize_provider_credit_timestamp(expires_at)
         if expires_at is None:
-            raise ValueError(
-                "Stored Alibaba reset-card current state has no valid expires_at."
-            )
+            raise ValueError("Stored Alibaba reset-card current state has no valid expires_at.")
         next_status = "expired" if observed_at >= expires_at else "used"
         evidence = dict(current.get("evidence") or {})
         evidence.update(
             {
                 "lifecycle_inference": next_status,
-                "lifecycle_reason": (
-                    "card_missing_before_expiry"
-                    if next_status == "used"
-                    else "card_past_expiry"
-                ),
+                "lifecycle_reason": ("card_missing_before_expiry" if next_status == "used" else "card_past_expiry"),
                 "source_endpoint": "reset_card_list",
                 "source_endpoint_class": "read_only_inventory",
                 "api_contract": ALIBABA_TOKEN_PLAN_RESET_CARD_LIST_API,
@@ -9929,8 +9732,7 @@ def _synthesize_alibaba_reset_card_lifecycle_observations(
                 "provider": ALIBABA_TOKEN_PLAN_PROVIDER,
                 "account_hash": account_hash,
                 "credit_family": ALIBABA_TOKEN_PLAN_RESET_CARD_CREDIT_FAMILY,
-                "credit_type": current.get("credit_type")
-                or ALIBABA_TOKEN_PLAN_RESET_CARD_CREDIT_TYPE,
+                "credit_type": current.get("credit_type") or ALIBABA_TOKEN_PLAN_RESET_CARD_CREDIT_TYPE,
                 "credit_identity": identity,
                 "available_count": 0,
                 "granted_at": current.get("granted_at"),
@@ -10214,9 +10016,7 @@ def _xai_parse_result(
     unexpired_count = sum(
         1
         for token in token_tuple
-        if token.token_id.strip()
-        and token.validity_end is not None
-        and token.validity_end > now_ts
+        if token.token_id.strip() and token.validity_end is not None and token.validity_end > now_ts
     )
     known_zero = outcome == "zero"
     unknown = outcome == "unknown"
@@ -10380,9 +10180,7 @@ def fetch_xai_remaining_resets(
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 status_code = int(getattr(response, "status", None) or response.getcode() or 200)
-                response_headers = {
-                    str(key): str(value) for key, value in response.headers.items()
-                }
+                response_headers = {str(key): str(value) for key, value in response.headers.items()}
                 return status_code, response_headers, response.read()
         except urllib.error.HTTPError as exc:
             last_error = exc
@@ -10481,12 +10279,8 @@ def _xai_reset_credit_row(
     expires_at: Any = None,
     environment: str = "dev",
 ) -> Dict[str, Any]:
-    granted_ts = _xai_unix_timestamp(
-        token.validity_start if token is not None else granted_at
-    )
-    expires_ts = _xai_unix_timestamp(
-        token.validity_end if token is not None else expires_at
-    )
+    granted_ts = _xai_unix_timestamp(token.validity_start if token is not None else granted_at)
+    expires_ts = _xai_unix_timestamp(token.validity_end if token is not None else expires_at)
     available = status == "available"
     return {
         "observed_at": _xai_datetime_from_unix(now) or datetime.now(timezone.utc),
@@ -10688,19 +10482,11 @@ def _run_xai_reset_poll_once(
     state: Optional[SidecarTaskState] = None,
 ) -> Optional[Dict[str, Any]]:
     del state
-    enabled = (
-        bool(config.xai_reset_poll_enabled)
-        if config is not None
-        else xai_reset_poll_enabled()
-    )
+    enabled = bool(config.xai_reset_poll_enabled) if config is not None else xai_reset_poll_enabled()
     if not enabled:
         return None
     environment = config.environment if config is not None else "dev"
-    auth_file = (
-        config.grok_oidc_auth_file
-        if config is not None
-        else os.getenv("AAWM_GROK_OIDC_AUTH_FILE")
-    )
+    auth_file = config.grok_oidc_auth_file if config is not None else os.getenv("AAWM_GROK_OIDC_AUTH_FILE")
     try:
         try:
             auth_context = _load_grok_billing_auth_context(auth_file)  # type: ignore[arg-type]
@@ -10723,19 +10509,13 @@ def _run_xai_reset_poll_once(
             environment=environment,
             error_class="reauthentication_required",
         )
-    poll_url = (
-        config.xai_reset_poll_url if config is not None else DEFAULT_XAI_RESET_POLL_URL
-    )
+    poll_url = config.xai_reset_poll_url if config is not None else DEFAULT_XAI_RESET_POLL_URL
     timeout = (
         config.xai_reset_poll_http_timeout_seconds
         if config is not None
         else DEFAULT_XAI_RESET_POLL_HTTP_TIMEOUT_SECONDS
     )
-    max_attempts = (
-        config.xai_reset_poll_max_attempts
-        if config is not None
-        else XAI_RESET_POLL_ATTEMPTS
-    )
+    max_attempts = config.xai_reset_poll_max_attempts if config is not None else XAI_RESET_POLL_ATTEMPTS
     status_code, response_headers, response_body = fetch_xai_remaining_resets(
         access_token=access_token,
         url=poll_url,
@@ -10782,17 +10562,13 @@ def _run_xai_reset_poll_once(
                 _commit_xai_reset_credit_writes(writes, config=config)
     return _emit_xai_reset_poll_telemetry(
         outcome="unknown" if previous_state_load_failed else parsed.outcome,
-        last_good_state_retained=(
-            True if previous_state_load_failed else parsed.last_good_state_retained
-        ),
+        last_good_state_retained=(True if previous_state_load_failed else parsed.last_good_state_retained),
         grpc_status=parsed.grpc_status,
         persisted=bool(writes) and not previous_state_load_failed,
         observation_count=0 if previous_state_load_failed else len(writes),
         status_code=status_code,
         environment=environment,
-        error_class=(
-            "previous_credit_state_load_failed" if previous_state_load_failed else None
-        ),
+        error_class=("previous_credit_state_load_failed" if previous_state_load_failed else None),
     )
 
 
@@ -10815,10 +10591,7 @@ def _run_xai_reset_poll_task(
         return None
     if state is not None and now_monotonic is not None:
         last_attempt = state.xai_reset_poll_last_attempt_monotonic
-        if (
-            last_attempt is not None
-            and now_monotonic - last_attempt < config.xai_reset_poll_interval_seconds
-        ):
+        if last_attempt is not None and now_monotonic - last_attempt < config.xai_reset_poll_interval_seconds:
             return None
         state.xai_reset_poll_last_attempt_monotonic = now_monotonic
     try:
@@ -10917,7 +10690,7 @@ def _grok_billing_identity_headers(
             missing_fields.append(credential_field)
     if missing_fields:
         joined_fields = ", ".join(sorted(missing_fields))
-        raise ValueError("Grok OIDC auth file does not contain required billing identity " f"fields: {joined_fields}.")
+        raise ValueError(f"Grok OIDC auth file does not contain required billing identity fields: {joined_fields}.")
     return headers
 
 
@@ -10977,8 +10750,7 @@ def _grok_billing_request_target_summary(
         "billing_query_present": bool(parsed_url.query),
         "include_model_override": config.grok_billing_include_model_override,
         "model_override_configured": bool(
-            config.grok_billing_include_model_override
-            and str(config.grok_billing_model).strip()
+            config.grok_billing_include_model_override and str(config.grok_billing_model).strip()
         ),
         "client_identifier": config.grok_billing_client_identifier,
         "x_xai_token_auth_configured": bool(config.grok_billing_xai_token_auth),
@@ -10997,9 +10769,7 @@ def _grok_billing_request_contract_summary(
     header_names = sorted(request_headers.keys())
     client_version = request_headers["x-grok-client-version"]
     user_agent = request_headers["user-agent"]
-    version_source_metadata = (
-        request_headers.version_resolution.sanitized_metadata()
-    )
+    version_source_metadata = request_headers.version_resolution.sanitized_metadata()
     fingerprint_payload = {
         "billing_host": target_summary["billing_host"],
         "billing_path": target_summary["billing_path"],
@@ -11011,16 +10781,13 @@ def _grok_billing_request_contract_summary(
         "include_model_override": config.grok_billing_include_model_override,
         "method": config.grok_billing_http_method,
         "model_override_configured": bool(
-            config.grok_billing_include_model_override
-            and str(config.grok_billing_model).strip()
+            config.grok_billing_include_model_override and str(config.grok_billing_model).strip()
         ),
         "user_agent": user_agent,
         "x_xai_token_auth_configured": bool(config.grok_billing_xai_token_auth),
     }
     fingerprint = hashlib.sha256(
-        json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
+        json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     return {
         **target_summary,
@@ -11181,9 +10948,7 @@ def _fetch_grok_billing_payload(
         except urllib_error.URLError as exc:
             last_status_code = None
             last_error_hint = None
-            last_error_message = (
-                "Grok billing poll failed while contacting the billing endpoint."
-            )
+            last_error_message = "Grok billing poll failed while contacting the billing endpoint."
             if attempt_count < max_attempts and _grok_billing_retryable_url_error(exc):
                 retry_count += 1
                 _grok_billing_poll_sleep(
@@ -11220,9 +10985,7 @@ def _fetch_grok_billing_payload(
                 request_headers=request_headers,
             )
         if request_headers is None:
-            raise RuntimeError(
-                "Grok billing request headers were not built for a successful attempt."
-            )
+            raise RuntimeError("Grok billing request headers were not built for a successful attempt.")
         return {
             "status_code": int(status_code),
             "payload": payload,
@@ -11274,8 +11037,7 @@ def _json_safe_grok_billing_value(value: Any) -> Any:
         return {
             str(key): _json_safe_grok_billing_value(nested)
             for key, nested in value.items()
-            if str(key).lower()
-            not in {"access_token", "authorization", "id_token", "refresh_token"}
+            if str(key).lower() not in {"access_token", "authorization", "id_token", "refresh_token"}
         }
     if isinstance(value, list):
         return [_json_safe_grok_billing_value(item) for item in value[:50]]
@@ -11309,9 +11071,7 @@ def _grok_billing_period_bounds(
     billing_period_start_at = _parse_grok_billing_timestamp(
         config.get("billingPeriodStart") or current_period.get("start")
     )
-    billing_period_end_at = _parse_grok_billing_timestamp(
-        config.get("billingPeriodEnd") or current_period.get("end")
-    )
+    billing_period_end_at = _parse_grok_billing_timestamp(config.get("billingPeriodEnd") or current_period.get("end"))
     return billing_period_start_at, billing_period_end_at
 
 
@@ -11335,12 +11095,7 @@ def _grok_billing_snapshot_parts(
         signals.append("grok_billing_payload")
     evidence["signals"] = signals
 
-    if (
-        monthly_limit is not None
-        and monthly_limit > 0
-        and used is not None
-        and used >= 0
-    ):
+    if monthly_limit is not None and monthly_limit > 0 and used is not None and used >= 0:
         used_percentage = max(0.0, min(100.0, (used / monthly_limit) * 100.0))
         remaining_pct = float(int(max(0.0, min(100.0, 100.0 - used_percentage)) + 0.5))
         quota_remaining = max(0.0, monthly_limit - used)
@@ -11357,9 +11112,7 @@ def _grok_billing_snapshot_parts(
             "billing_period_start_at": billing_period_start_at,
             "billing_period_end_at": billing_period_end_at,
             "raw_provider_fields": {
-                "monthlyLimit": _json_safe_grok_billing_value(
-                    config.get("monthlyLimit")
-                ),
+                "monthlyLimit": _json_safe_grok_billing_value(config.get("monthlyLimit")),
                 "used": _json_safe_grok_billing_value(config.get("used")),
                 "onDemandCap": _json_safe_grok_billing_value(config.get("onDemandCap")),
                 "billingPeriodStart": config.get("billingPeriodStart"),
@@ -11375,10 +11128,7 @@ def _grok_billing_snapshot_parts(
                     "config.billingPeriodEnd",
                 ],
                 "rounding": "whole_remaining_percentage",
-                "unit_note": (
-                    "Grok billing does not label used.val; observed tool traffic "
-                    "behaves request-like."
-                ),
+                "unit_note": ("Grok billing does not label used.val; observed tool traffic behaves request-like."),
             },
         }
 
@@ -11402,15 +11152,9 @@ def _grok_billing_snapshot_parts(
             "billing_period_start_at": billing_period_start_at,
             "billing_period_end_at": billing_period_end_at,
             "raw_provider_fields": {
-                "creditUsagePercent": _json_safe_grok_billing_value(
-                    config.get("creditUsagePercent")
-                ),
-                "productUsage": _json_safe_grok_billing_value(
-                    config.get("productUsage")
-                ),
-                "currentPeriod": _json_safe_grok_billing_value(
-                    config.get("currentPeriod")
-                ),
+                "creditUsagePercent": _json_safe_grok_billing_value(config.get("creditUsagePercent")),
+                "productUsage": _json_safe_grok_billing_value(config.get("productUsage")),
+                "currentPeriod": _json_safe_grok_billing_value(config.get("currentPeriod")),
                 "billingPeriodStart": config.get("billingPeriodStart"),
                 "billingPeriodEnd": config.get("billingPeriodEnd"),
                 "quota_unit": "grok_billing_credit_usage_percent",
@@ -11432,9 +11176,7 @@ def _grok_billing_snapshot_parts(
             },
         }
 
-    if is_weekly and (
-        billing_period_start_at is not None or billing_period_end_at is not None
-    ):
+    if is_weekly and (billing_period_start_at is not None or billing_period_end_at is not None):
         if "grok_billing_weekly_fresh_period" not in signals:
             signals.append("grok_billing_weekly_fresh_period")
         return {
@@ -11448,9 +11190,7 @@ def _grok_billing_snapshot_parts(
             "billing_period_start_at": billing_period_start_at,
             "billing_period_end_at": billing_period_end_at,
             "raw_provider_fields": {
-                "currentPeriod": _json_safe_grok_billing_value(
-                    config.get("currentPeriod")
-                ),
+                "currentPeriod": _json_safe_grok_billing_value(config.get("currentPeriod")),
                 "billingPeriodStart": config.get("billingPeriodStart"),
                 "billingPeriodEnd": config.get("billingPeriodEnd"),
                 "quota_unit": "grok_billing_weekly_credit_fresh_period",
@@ -11490,12 +11230,8 @@ def _grok_billing_snapshot_parts(
             "billing_period_start_at": billing_period_start_at,
             "billing_period_end_at": billing_period_end_at,
             "raw_provider_fields": {
-                "creditUsagePercent": _json_safe_grok_billing_value(
-                    config.get("creditUsagePercent")
-                ),
-                "productUsage": _json_safe_grok_billing_value(
-                    config.get("productUsage")
-                ),
+                "creditUsagePercent": _json_safe_grok_billing_value(config.get("creditUsagePercent")),
+                "productUsage": _json_safe_grok_billing_value(config.get("productUsage")),
                 "billingPeriodStart": config.get("billingPeriodStart"),
                 "billingPeriodEnd": config.get("billingPeriodEnd"),
                 "quota_unit": "grok_billing_credit_usage_percent",
@@ -11583,9 +11319,7 @@ def _build_grok_billing_rate_limit_payload(
         ),
     )
     if snapshot is None:
-        raise ValueError(
-            "Grok billing payload did not include absolute or percentage quota fields."
-        )
+        raise ValueError("Grok billing payload did not include absolute or percentage quota fields.")
 
     evidence = dict(snapshot["evidence"])
     signals = evidence.setdefault("signals", [])
@@ -11670,9 +11404,7 @@ def _set_grok_billing_database_timeouts(
         "SELECT set_config('application_name', %s, false)",
         (f"{probes._provider_status_db_application_name()}-grok-billing",),
     )
-    cur.execute(
-        "SELECT set_config('lock_timeout', %s, true)", (f"{lock_timeout_ms}ms",)
-    )
+    cur.execute("SELECT set_config('lock_timeout', %s, true)", (f"{lock_timeout_ms}ms",))
     cur.execute(
         "SELECT set_config('statement_timeout', %s, true)",
         (f"{statement_timeout_ms}ms",),
@@ -11689,9 +11421,7 @@ def _set_observability_anomaly_scan_database_timeouts(
         "SELECT set_config('application_name', %s, false)",
         (f"{probes._provider_status_db_application_name()}-anomaly-scan",),
     )
-    cur.execute(
-        "SELECT set_config('lock_timeout', %s, true)", (f"{lock_timeout_ms}ms",)
-    )
+    cur.execute("SELECT set_config('lock_timeout', %s, true)", (f"{lock_timeout_ms}ms",))
     cur.execute(
         "SELECT set_config('statement_timeout', %s, true)",
         (f"{statement_timeout_ms}ms",),
@@ -11723,9 +11453,7 @@ def _collect_observability_anomalies(
                     _set_observability_anomaly_scan_database_timeouts(
                         cur,
                         lock_timeout_ms=config.db_lock_timeout_ms,
-                        statement_timeout_ms=(
-                            config.observability_anomaly_scan_statement_timeout_ms
-                        ),
+                        statement_timeout_ms=(config.observability_anomaly_scan_statement_timeout_ms),
                     )
                     cur.execute(
                         OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL,
@@ -11810,14 +11538,10 @@ def _normalize_error_log_file_metadata(path: Path) -> None:
         uid_raw = os.getenv("LITELLM_AAWM_ERROR_LOG_FILE_UID", "").strip()
         gid_raw = os.getenv("LITELLM_AAWM_ERROR_LOG_FILE_GID", "").strip()
         target_uid = (
-            _parse_error_log_non_negative_int_env("LITELLM_AAWM_ERROR_LOG_FILE_UID")
-            if uid_raw
-            else parent_stat.st_uid
+            _parse_error_log_non_negative_int_env("LITELLM_AAWM_ERROR_LOG_FILE_UID") if uid_raw else parent_stat.st_uid
         )
         target_gid = (
-            _parse_error_log_non_negative_int_env("LITELLM_AAWM_ERROR_LOG_FILE_GID")
-            if gid_raw
-            else parent_stat.st_gid
+            _parse_error_log_non_negative_int_env("LITELLM_AAWM_ERROR_LOG_FILE_GID") if gid_raw else parent_stat.st_gid
         )
         current_stat = path.stat()
         if (
@@ -11857,8 +11581,7 @@ def _build_observability_anomaly_error_record(
         "environment": config.environment,
         "error_class": "ObservabilityAnomaly",
         "error_message": (
-            f"{anomaly_class}: {row_count} recent row(s) violated "
-            "session-history or rate-limit telemetry expectations"
+            f"{anomaly_class}: {row_count} recent row(s) violated session-history or rate-limit telemetry expectations"
         ),
         "anomaly_class": anomaly_class,
         "anomaly_source": "provider_status_observations_sidecar",
@@ -11872,8 +11595,7 @@ def _build_observability_anomaly_error_record(
             "then remove or archive this error intake file."
         ),
         "cleanup_requirement": (
-            "Clean up this environment error JSONL after the anomaly is resolved "
-            "and represented in completed notes."
+            "Clean up this environment error JSONL after the anomaly is resolved and represented in completed notes."
         ),
     }
 
@@ -11916,10 +11638,7 @@ def _observability_anomaly_identity_key(
     if not anomaly_class:
         return None
     environment = str(record.get("environment") or "").strip() or "unknown"
-    anomaly_source = (
-        str(record.get("anomaly_source") or "").strip()
-        or "provider_status_observations_sidecar"
-    )
+    anomaly_source = str(record.get("anomaly_source") or "").strip() or "provider_status_observations_sidecar"
     return (environment, anomaly_source, anomaly_class)
 
 
@@ -11964,9 +11683,7 @@ def _observability_anomaly_content_signature(
     if not isinstance(examples, Sequence) or isinstance(examples, (str, bytes)):
         example_ids: tuple[Any, ...] = ()
     else:
-        example_ids = tuple(
-            _observability_anomaly_example_identity(example) for example in examples
-        )
+        example_ids = tuple(_observability_anomaly_example_identity(example) for example in examples)
     return (
         int(record.get("row_count") or 0),
         str(record.get("expected") or ""),
@@ -12046,8 +11763,7 @@ def _select_observability_anomaly_records_to_append(
             continue
         existing = latest_by_key.get(key)
         if existing is not None and (
-            _observability_anomaly_content_signature(existing)
-            == _observability_anomaly_content_signature(payload)
+            _observability_anomaly_content_signature(existing) == _observability_anomaly_content_signature(payload)
         ):
             continue
         to_append.append(payload)
@@ -12138,9 +11854,7 @@ def _write_observability_anomaly_error_records(
             _normalize_error_log_file_metadata(path)
         return 0, path
 
-    encoded_lines = [
-        _encode_observability_anomaly_error_line(record) for record in to_append
-    ]
+    encoded_lines = [_encode_observability_anomaly_error_line(record) for record in to_append]
     pending_bytes = sum(len(line.encode("utf-8")) for line in encoded_lines)
     current_bytes = _error_log_path_size_bytes(path)
     max_bytes = _observability_anomaly_error_log_max_bytes()
@@ -12201,8 +11915,7 @@ def _inspect_oauth_refresh_eligibility(
             "expires_at": None,
             "refresh_due_at": None,
             "next_refresh_check_at": _scheduler_timestamp(
-                wall_now
-                + timedelta(seconds=max(1.0, fallback_poll_interval_seconds))
+                wall_now + timedelta(seconds=max(1.0, fallback_poll_interval_seconds))
             ),
             "eligible": True,
             "credential_health": "malformed",
@@ -12223,9 +11936,7 @@ def _merge_oauth_refresh_eligibility(
     threshold_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     merged = dict(post)
-    if merged.get("credential_identity") in {None, ""} and pre.get(
-        "credential_identity"
-    ) not in {None, ""}:
+    if merged.get("credential_identity") in {None, ""} and pre.get("credential_identity") not in {None, ""}:
         merged["credential_identity"] = pre.get("credential_identity")
     effective_threshold_seconds = post.get("refresh_threshold_seconds")
     if effective_threshold_seconds is None:
@@ -12234,36 +11945,21 @@ def _merge_oauth_refresh_eligibility(
         effective_threshold_seconds = threshold_seconds
     if effective_threshold_seconds is not None:
         merged["refresh_threshold_seconds"] = effective_threshold_seconds
-    summary_expires_at = _parse_sidecar_timestamp(
-        (operation_summary or {}).get("expires_at")
-    )
+    summary_expires_at = _parse_sidecar_timestamp((operation_summary or {}).get("expires_at"))
     known_expires_at = (
         _parse_sidecar_timestamp(merged.get("expires_at"))
         or summary_expires_at
         or _parse_sidecar_timestamp(pre.get("expires_at"))
     )
     retry_at = wall_now + timedelta(seconds=max(1.0, cadence_seconds))
-    retry_deadline = (
-        known_expires_at - timedelta(seconds=1)
-        if known_expires_at is not None
-        else None
-    )
-    if (
-        retry_deadline is not None
-        and wall_now < retry_deadline <= retry_at
-    ):
+    retry_deadline = known_expires_at - timedelta(seconds=1) if known_expires_at is not None else None
+    if retry_deadline is not None and wall_now < retry_deadline <= retry_at:
         retry_at = retry_deadline
     if post.get("error_class") and summary_expires_at is not None:
         merged["expires_at"] = _scheduler_timestamp(summary_expires_at)
-        merged["credential_health"] = (
-            "expired" if summary_expires_at <= wall_now else "fresh"
-        )
+        merged["credential_health"] = "expired" if summary_expires_at <= wall_now else "fresh"
         merged["usable"] = summary_expires_at > wall_now
-        window_seconds = (
-            effective_threshold_seconds
-            if effective_threshold_seconds is not None
-            else buffer_seconds
-        )
+        window_seconds = effective_threshold_seconds if effective_threshold_seconds is not None else buffer_seconds
         if window_seconds is not None:
             due_at = summary_expires_at - timedelta(seconds=max(0, window_seconds))
             merged["refresh_due_at"] = _scheduler_timestamp(due_at)
@@ -12319,10 +12015,7 @@ def _oauth_refresh_result_class(
 def _refresh_summary_reports_success(
     summary: Mapping[str, Any],
 ) -> bool:
-    return bool(
-        not summary.get("error_class")
-        and (summary.get("refreshed") or summary.get("skipped"))
-    )
+    return bool(not summary.get("error_class") and (summary.get("refreshed") or summary.get("skipped")))
 
 
 def _effective_oauth_credential_health(
@@ -12340,9 +12033,7 @@ def _effective_oauth_credential_health(
         return str(operation_summary["health_status"])
     if result_class == "expired":
         return "expired"
-    inspected_health = _redacted_summary_field(
-        eligibility.get("credential_health")
-    )
+    inspected_health = _redacted_summary_field(eligibility.get("credential_health"))
     if inspected_health in {"malformed", "degraded"}:
         return inspected_health
     if result_class in {"refresh_due", "refresh_failed"}:
@@ -12390,9 +12081,7 @@ def _oauth_refresh_schedule_evidence(
         "refresh_attempt_interval_seconds": attempt_interval_seconds,
         "refresh_buffer_seconds": buffer_seconds,
         "refresh_threshold_seconds": effective_threshold_seconds,
-        "credential_health": credential_health
-        if credential_health is not None
-        else final.get("credential_health"),
+        "credential_health": credential_health if credential_health is not None else final.get("credential_health"),
         "usable": final.get("usable"),
         "scheduler_error_class": schedule.last_error_class,
         "scheduler_error_message": schedule.last_error_message,
@@ -12433,10 +12122,7 @@ def _oauth_refresh_terminal_blocked(
     schedule: OAuthRefreshScheduleState,
     eligibility: Mapping[str, Any],
 ) -> bool:
-    if (
-        schedule.terminal_refresh_error_class is None
-        or schedule.terminal_refresh_identity is None
-    ):
+    if schedule.terminal_refresh_error_class is None or schedule.terminal_refresh_identity is None:
         return False
     current_identity = _oauth_refresh_identity(eligibility)
     return current_identity == schedule.terminal_refresh_identity
@@ -12459,9 +12145,7 @@ def _record_oauth_refresh_schedule_outcome(
     buffer_seconds: Optional[float],
     threshold_seconds: Optional[float],
 ) -> tuple[str, Dict[str, Any]]:
-    operation_error_class = _redacted_summary_field(
-        operation_summary.get("error_class")
-    )
+    operation_error_class = _redacted_summary_field(operation_summary.get("error_class"))
     result_class = _oauth_refresh_result_class(
         final,
         wall_now=wall_now,
@@ -12481,9 +12165,7 @@ def _record_oauth_refresh_schedule_outcome(
     schedule.last_result_class = result_class
     if operation_error_class:
         schedule.last_error_class = operation_error_class
-        schedule.last_error_message = _redacted_failure_message(
-            operation_summary.get("error_message")
-        )
+        schedule.last_error_message = _redacted_failure_message(operation_summary.get("error_message"))
         terminal_error = _oauth_terminal_refresh_error_class(operation_error_class)
         stored_identity = current_identity or _oauth_refresh_identity(final)
         if terminal_error and stored_identity is not None:
@@ -12582,11 +12264,7 @@ def _run_oauth_refresh_schedule(
         schedule.last_actual_attempt_at = _scheduler_timestamp(wall_now)
         schedule.actual_attempt_count += 1
 
-    should_call = (
-        (force or bool(pre.get("eligible")))
-        and not actual_throttled
-        and not terminal_blocked
-    )
+    should_call = (force or bool(pre.get("eligible"))) and not actual_throttled and not terminal_blocked
     if should_call:
         try:
             operation_summary = refresh_call(on_token_endpoint_attempt)
@@ -12652,9 +12330,7 @@ def _run_grok_oidc_refresh_task(
     final, summary, _post, evidence, helper_called = _run_oauth_refresh_schedule(
         schedule=state.grok_oidc_refresh_schedule,
         last_attempt_monotonic=state.grok_oidc_last_attempt_monotonic,
-        set_last_attempt_monotonic=lambda value: setattr(
-            state, "grok_oidc_last_attempt_monotonic", value
-        ),
+        set_last_attempt_monotonic=lambda value: setattr(state, "grok_oidc_last_attempt_monotonic", value),
         now_monotonic=now_monotonic,
         wall_now=wall_now,
         eligibility_inspector=lambda *, now: grok_oidc_refresh.inspect_grok_oidc_refresh_eligibility(
@@ -12683,9 +12359,7 @@ def _run_grok_oidc_refresh_task(
         "environment": config.environment,
         "attempted": bool(summary.get("attempted")),
         "refreshed": bool(summary.get("refreshed")),
-        "skipped": bool(summary.get("skipped")) or (
-            not helper_called and not summary.get("error_class")
-        ),
+        "skipped": bool(summary.get("skipped")) or (not helper_called and not summary.get("error_class")),
         "auth_file": config.grok_oidc_auth_file,
         "scope": summary.get("scope"),
         "expires_at": final.get("expires_at") or summary.get("expires_at"),
@@ -12743,10 +12417,7 @@ def _run_grok_oidc_metadata_repair_task(
 
 
 def _refresh_event_succeeded(event: Mapping[str, Any]) -> bool:
-    return bool(
-        not event.get("error_class")
-        and (event.get("refreshed") or event.get("skipped"))
-    )
+    return bool(not event.get("error_class") and (event.get("refreshed") or event.get("skipped")))
 
 
 def _codex_account_aggregate_event(
@@ -12842,13 +12513,9 @@ def _run_codex_oauth_refresh_task(
         )
         final, summary, _post, evidence, helper_called = _run_oauth_refresh_schedule(
             schedule=schedule,
-            last_attempt_monotonic=(
-                state.codex_oauth_last_attempt_monotonic_by_label.get(record.label)
-            ),
+            last_attempt_monotonic=(state.codex_oauth_last_attempt_monotonic_by_label.get(record.label)),
             set_last_attempt_monotonic=lambda value, label=record.label: (
-                state.codex_oauth_last_attempt_monotonic_by_label.__setitem__(
-                    label, value
-                )
+                state.codex_oauth_last_attempt_monotonic_by_label.__setitem__(label, value)
             ),
             now_monotonic=now_monotonic,
             wall_now=wall_now,
@@ -12883,9 +12550,7 @@ def _run_codex_oauth_refresh_task(
             "environment": config.environment,
             "attempted": bool(summary.get("attempted")),
             "refreshed": bool(summary.get("refreshed")),
-            "skipped": bool(summary.get("skipped")) or (
-                not helper_called and not summary.get("error_class")
-            ),
+            "skipped": bool(summary.get("skipped")) or (not helper_called and not summary.get("error_class")),
             "account_label": record.label,
             "account_hash": record.expected_account_hash,
             "expires_at": final.get("expires_at") or summary.get("expires_at"),
@@ -12913,14 +12578,10 @@ def _run_codex_oauth_refresh_task(
         # post-read retains the pre-read state rather than trusting flags.
         inspected_usable = final.get("usable")
         if inspected_usable is not None:
-            state.codex_oauth_usable_by_label[record.label] = bool(
-                inspected_usable
-            )
+            state.codex_oauth_usable_by_label[record.label] = bool(inspected_usable)
         elif record.label not in state.codex_oauth_usable_by_label:
             state.codex_oauth_usable_by_label[record.label] = False
-        state.codex_oauth_status_by_label[record.label] = event[
-            "auth_observation_status"
-        ]
+        state.codex_oauth_status_by_label[record.label] = event["auth_observation_status"]
         events.append(event)
 
     if attempted_any:
@@ -12949,19 +12610,15 @@ def _run_xai_oauth_refresh_task(
     final, summary, _post, evidence, helper_called = _run_oauth_refresh_schedule(
         schedule=state.xai_oauth_refresh_schedule,
         last_attempt_monotonic=state.xai_oauth_last_attempt_monotonic,
-        set_last_attempt_monotonic=lambda value: setattr(
-            state, "xai_oauth_last_attempt_monotonic", value
-        ),
+        set_last_attempt_monotonic=lambda value: setattr(state, "xai_oauth_last_attempt_monotonic", value),
         now_monotonic=now_monotonic,
         wall_now=wall_now,
-        eligibility_inspector=lambda *, now: (
-            xai_oauth_refresh.inspect_xai_oauth_refresh_eligibility(
-                config.xai_oauth_auth_file,
-                scope=config.xai_oauth_scope,
-                buffer_seconds=config.xai_oauth_refresh_buffer_seconds,
-                now=now,
-                poll_interval_seconds=config.interval_seconds,
-            )
+        eligibility_inspector=lambda *, now: xai_oauth_refresh.inspect_xai_oauth_refresh_eligibility(
+            config.xai_oauth_auth_file,
+            scope=config.xai_oauth_scope,
+            buffer_seconds=config.xai_oauth_refresh_buffer_seconds,
+            now=now,
+            poll_interval_seconds=config.interval_seconds,
         ),
         refresh_call=lambda callback: xai_oauth_refresh.refresh_xai_oauth_auth_file(
             config.xai_oauth_auth_file,
@@ -12984,9 +12641,7 @@ def _run_xai_oauth_refresh_task(
         "environment": config.environment,
         "attempted": bool(summary.get("attempted")),
         "refreshed": bool(summary.get("refreshed")),
-        "skipped": bool(summary.get("skipped")) or (
-            not helper_called and not summary.get("error_class")
-        ),
+        "skipped": bool(summary.get("skipped")) or (not helper_called and not summary.get("error_class")),
         "auth_file": config.xai_oauth_auth_file,
         "scope": summary.get("scope") or config.xai_oauth_scope,
         "expires_at": final.get("expires_at") or summary.get("expires_at"),
@@ -13021,18 +12676,14 @@ def _run_nous_oauth_refresh_task(
     final, summary, _post, evidence, helper_called = _run_oauth_refresh_schedule(
         schedule=state.nous_oauth_refresh_schedule,
         last_attempt_monotonic=state.nous_oauth_last_attempt_monotonic,
-        set_last_attempt_monotonic=lambda value: setattr(
-            state, "nous_oauth_last_attempt_monotonic", value
-        ),
+        set_last_attempt_monotonic=lambda value: setattr(state, "nous_oauth_last_attempt_monotonic", value),
         now_monotonic=now_monotonic,
         wall_now=wall_now,
-        eligibility_inspector=lambda *, now: (
-            nous_oauth_refresh.inspect_nous_oauth_refresh_eligibility(
-                config.nous_oauth_auth_file,
-                buffer_seconds=config.nous_oauth_refresh_buffer_seconds,
-                now=now,
-                poll_interval_seconds=config.interval_seconds,
-            )
+        eligibility_inspector=lambda *, now: nous_oauth_refresh.inspect_nous_oauth_refresh_eligibility(
+            config.nous_oauth_auth_file,
+            buffer_seconds=config.nous_oauth_refresh_buffer_seconds,
+            now=now,
+            poll_interval_seconds=config.interval_seconds,
         ),
         refresh_call=lambda callback: nous_oauth_refresh.refresh_nous_oauth_auth_file(
             config.nous_oauth_auth_file,
@@ -13054,9 +12705,7 @@ def _run_nous_oauth_refresh_task(
         "environment": config.environment,
         "attempted": bool(summary.get("attempted")),
         "refreshed": bool(summary.get("refreshed")),
-        "skipped": bool(summary.get("skipped")) or (
-            not helper_called and not summary.get("error_class")
-        ),
+        "skipped": bool(summary.get("skipped")) or (not helper_called and not summary.get("error_class")),
         "auth_file": config.nous_oauth_auth_file,
         "scope": summary.get("scope") or nous_oauth_refresh.DEFAULT_NOUS_OAUTH_SCOPE,
         "expires_at": final.get("expires_at") or summary.get("expires_at"),
@@ -13098,26 +12747,20 @@ def _run_cursor_agent_auth_refresh_task(
         ),
         now_monotonic=now_monotonic,
         wall_now=wall_now,
-        eligibility_inspector=lambda *, now: (
-            cursor_agent_auth_refresh.inspect_cursor_agent_auth_refresh_eligibility(
-                config.cursor_agent_auth_file,
-                buffer_seconds=config.cursor_agent_auth_refresh_buffer_seconds,
-                now=now,
-                poll_interval_seconds=(
-                    config.cursor_agent_auth_refresh_interval_seconds
-                ),
-                force=config.cursor_agent_auth_force_refresh,
-            )
+        eligibility_inspector=lambda *, now: cursor_agent_auth_refresh.inspect_cursor_agent_auth_refresh_eligibility(
+            config.cursor_agent_auth_file,
+            buffer_seconds=config.cursor_agent_auth_refresh_buffer_seconds,
+            now=now,
+            poll_interval_seconds=(config.cursor_agent_auth_refresh_interval_seconds),
+            force=config.cursor_agent_auth_force_refresh,
         ),
-        refresh_call=lambda callback: (
-            cursor_agent_auth_refresh.refresh_cursor_agent_auth_file(
-                config.cursor_agent_auth_file,
-                buffer_seconds=config.cursor_agent_auth_refresh_buffer_seconds,
-                force=config.cursor_agent_auth_force_refresh,
-                lock_file=config.cursor_agent_auth_lock_file,
-                http_timeout_seconds=config.cursor_agent_auth_http_timeout_seconds,
-                on_exchange_attempt=callback,
-            )
+        refresh_call=lambda callback: cursor_agent_auth_refresh.refresh_cursor_agent_auth_file(
+            config.cursor_agent_auth_file,
+            buffer_seconds=config.cursor_agent_auth_refresh_buffer_seconds,
+            force=config.cursor_agent_auth_force_refresh,
+            lock_file=config.cursor_agent_auth_lock_file,
+            http_timeout_seconds=config.cursor_agent_auth_http_timeout_seconds,
+            on_exchange_attempt=callback,
         ),
         force=config.cursor_agent_auth_force_refresh,
         attempt_interval_seconds=config.cursor_agent_auth_refresh_interval_seconds,
@@ -13129,28 +12772,18 @@ def _run_cursor_agent_auth_refresh_task(
         "event": "cursor_agent_auth_refresh",
         "observed_at": _scheduler_timestamp(wall_now),
         "environment": config.environment,
-        "health_status": _redacted_summary_field(
-            summary.get("health_status") or final.get("credential_health")
-        ),
+        "health_status": _redacted_summary_field(summary.get("health_status") or final.get("credential_health")),
         "attempted": bool(summary.get("attempted")),
         "refreshed": bool(summary.get("refreshed")),
-        "skipped": bool(summary.get("skipped")) or (
-            not helper_called and not summary.get("error_class")
-        ),
+        "skipped": bool(summary.get("skipped")) or (not helper_called and not summary.get("error_class")),
         "auth_file": config.cursor_agent_auth_file,
-        "credential_shape": _redacted_summary_field(
-            summary.get("credential_shape") or final.get("credential_shape")
-        ),
+        "credential_shape": _redacted_summary_field(summary.get("credential_shape") or final.get("credential_shape")),
         "credential_fingerprint": _redacted_summary_field(
-            summary.get("credential_fingerprint")
-            or final.get("credential_fingerprint")
+            summary.get("credential_fingerprint") or final.get("credential_fingerprint")
         ),
-        "previous_credential_fingerprint": _redacted_summary_field(
-            summary.get("previous_credential_fingerprint")
-        ),
+        "previous_credential_fingerprint": _redacted_summary_field(summary.get("previous_credential_fingerprint")),
         "refresh_capability": _redacted_summary_field(
-            summary.get("refresh_capability")
-            or final.get("refresh_capability"),
+            summary.get("refresh_capability") or final.get("refresh_capability"),
         ),
         "refresh_method": _redacted_summary_field(summary.get("refresh_method")),
         "expires_at": final.get("expires_at") or summary.get("expires_at"),
@@ -13185,17 +12818,13 @@ def _run_kimi_oauth_refresh_task(
     final, summary, _post, evidence, helper_called = _run_oauth_refresh_schedule(
         schedule=state.kimi_oauth_refresh_schedule,
         last_attempt_monotonic=state.kimi_oauth_last_attempt_monotonic,
-        set_last_attempt_monotonic=lambda value: setattr(
-            state, "kimi_oauth_last_attempt_monotonic", value
-        ),
+        set_last_attempt_monotonic=lambda value: setattr(state, "kimi_oauth_last_attempt_monotonic", value),
         now_monotonic=now_monotonic,
         wall_now=wall_now,
-        eligibility_inspector=lambda *, now: (
-            kimi_oauth_refresh.inspect_kimi_oauth_refresh_eligibility(
-                config.kimi_oauth_auth_file,
-                now=now,
-                poll_interval_seconds=config.interval_seconds,
-            )
+        eligibility_inspector=lambda *, now: kimi_oauth_refresh.inspect_kimi_oauth_refresh_eligibility(
+            config.kimi_oauth_auth_file,
+            now=now,
+            poll_interval_seconds=config.interval_seconds,
         ),
         refresh_call=lambda callback: kimi_oauth_refresh.refresh_kimi_oauth_auth_file(
             config.kimi_oauth_auth_file,
@@ -13216,9 +12845,7 @@ def _run_kimi_oauth_refresh_task(
         "environment": config.environment,
         "attempted": bool(summary.get("attempted")),
         "refreshed": bool(summary.get("refreshed")),
-        "skipped": bool(summary.get("skipped")) or (
-            not helper_called and not summary.get("error_class")
-        ),
+        "skipped": bool(summary.get("skipped")) or (not helper_called and not summary.get("error_class")),
         "auth_file": config.kimi_oauth_auth_file,
         "scope": summary.get("scope") or kimi_oauth_refresh.DEFAULT_KIMI_OAUTH_SCOPE,
         "expires_at": final.get("expires_at") or summary.get("expires_at"),
@@ -13257,15 +12884,9 @@ def _inspect_codex_inventory_record_health(
                 "account_hash": record.expected_account_hash,
                 "expires_at": None,
                 "error_class": "CredentialExpiryUnavailable",
-                "error_message": (
-                    f"Codex OAuth credential '{record.label}' expiry is unavailable."
-                ),
+                "error_message": (f"Codex OAuth credential '{record.label}' expiry is unavailable."),
             }
-        expires_at_text = (
-            datetime.fromtimestamp(expires_at, tz=timezone.utc)
-            .isoformat()
-            .replace("+00:00", "Z")
-        )
+        expires_at_text = datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat().replace("+00:00", "Z")
         if expires_at <= time.time():
             return {
                 "attempted": True,
@@ -13274,9 +12895,7 @@ def _inspect_codex_inventory_record_health(
                 "account_hash": record.expected_account_hash,
                 "expires_at": expires_at_text,
                 "error_class": "CredentialExpiredError",
-                "error_message": (
-                    f"Codex OAuth credential '{record.label}' is expired."
-                ),
+                "error_message": (f"Codex OAuth credential '{record.label}' is expired."),
             }
         return {
             "attempted": True,
@@ -13295,9 +12914,7 @@ def _inspect_codex_inventory_record_health(
             "account_hash": record.expected_account_hash,
             "expires_at": None,
             "error_class": exc.__class__.__name__,
-            "error_message": (
-                f"Codex OAuth credential '{record.label}' health inspection failed."
-            ),
+            "error_message": (f"Codex OAuth credential '{record.label}' health inspection failed."),
         }
 
 
@@ -13336,9 +12953,7 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
         return []
     last_attempt = state.provider_auth_health_poll_last_attempt_monotonic
     non_codex_due = not (
-        last_attempt is not None
-        and now_monotonic - last_attempt
-        < config.provider_auth_health_poll_interval_seconds
+        last_attempt is not None and now_monotonic - last_attempt < config.provider_auth_health_poll_interval_seconds
     )
     inspections: tuple[tuple[Any, ...], ...] = (
         (
@@ -13428,8 +13043,8 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
                 auth_file_source=auth_file_source,
                 credential_scope=summary.get(scope_field),
             )
-            persisted, inserted_count, skip_error_class, skip_reason = (
-                _persist_passive_provider_auth_observation(config, observation)
+            persisted, inserted_count, skip_error_class, skip_reason = _persist_passive_provider_auth_observation(
+                config, observation
             )
             event["auth_observation_status"] = observation["status"]
             event["auth_observation_persisted"] = persisted
@@ -13443,9 +13058,7 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
         if not non_codex_due:
             return events
         try:
-            summary = codex_oauth_refresh.inspect_codex_oauth_credential_health(
-                config.codex_auth_file
-            )
+            summary = codex_oauth_refresh.inspect_codex_oauth_credential_health(config.codex_auth_file)
         except Exception as exc:
             summary = {
                 "attempted": True,
@@ -13458,11 +13071,7 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
             "source_task": "provider_auth_health_poll",
             "observed_at": _utc_timestamp(),
             "environment": config.environment,
-            **{
-                key: value
-                for key, value in summary.items()
-                if key not in {"auth_file", "account_id"}
-            },
+            **{key: value for key, value in summary.items() if key not in {"auth_file", "account_id"}},
         }
         observation = _build_passive_provider_auth_observation(
             config,
@@ -13473,8 +13082,8 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
             auth_file_source=config.codex_auth_file_source,
             credential_scope=summary.get("account_id"),
         )
-        persisted, inserted_count, skip_error_class, skip_reason = (
-            _persist_passive_provider_auth_observation(config, observation)
+        persisted, inserted_count, skip_error_class, skip_reason = _persist_passive_provider_auth_observation(
+            config, observation
         )
         event["auth_observation_status"] = observation["status"]
         event["auth_observation_persisted"] = persisted
@@ -13487,19 +13096,14 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
     records = inventory.ordered_records(enabled_only=True)
     inspected_any = False
     for record in records:
-        last_codex_attempt = (
-            state.codex_auth_health_last_attempt_monotonic_by_label.get(record.label)
-        )
+        last_codex_attempt = state.codex_auth_health_last_attempt_monotonic_by_label.get(record.label)
         if (
             last_codex_attempt is not None
-            and now_monotonic - last_codex_attempt
-            < config.provider_auth_health_poll_interval_seconds
+            and now_monotonic - last_codex_attempt < config.provider_auth_health_poll_interval_seconds
         ):
             continue
         inspected_any = True
-        state.codex_auth_health_last_attempt_monotonic_by_label[record.label] = (
-            now_monotonic
-        )
+        state.codex_auth_health_last_attempt_monotonic_by_label[record.label] = now_monotonic
         summary = _inspect_codex_inventory_record_health(record)
         event = {
             "event": "codex_oauth_passive_health_inspection",
@@ -13508,12 +13112,10 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
             "environment": config.environment,
             **summary,
         }
-        persisted, inserted_count, skip_error_class, skip_reason = (
-            _persist_codex_passive_auth_observation(
-                config,
-                event,
-                record=record,
-            )
+        persisted, inserted_count, skip_error_class, skip_reason = _persist_codex_passive_auth_observation(
+            config,
+            event,
+            record=record,
         )
         event["auth_observation_status"] = summary["health_status"]
         event["auth_observation_persisted"] = persisted
@@ -13522,9 +13124,7 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
         event["auth_observation_skip_reason"] = skip_reason
         usable = summary["health_status"] == "fresh"
         state.codex_auth_health_usable_by_label[record.label] = usable
-        state.codex_auth_health_status_by_label[record.label] = summary[
-            "health_status"
-        ]
+        state.codex_auth_health_status_by_label[record.label] = summary["health_status"]
         events.append(event)
     if inspected_any or not records:
         events.append(
@@ -13646,11 +13246,7 @@ def _run_cursor_agent_usage_poll_task(
     if not config.cursor_agent_usage_poll_enabled:
         return None
     last_attempt = state.cursor_agent_usage_last_attempt_monotonic
-    if (
-        last_attempt is not None
-        and now_monotonic - last_attempt
-        < config.cursor_agent_usage_poll_interval_seconds
-    ):
+    if last_attempt is not None and now_monotonic - last_attempt < config.cursor_agent_usage_poll_interval_seconds:
         return None
 
     state.cursor_agent_usage_last_attempt_monotonic = now_monotonic
@@ -13786,7 +13382,9 @@ def _new_chatgpt_conversation_init_account_coverage(
         "persisted": False,
         "fresh_capture": False,
         "status_code": None,
+        "retry_after_seconds": None,
         "telemetry_class": None,
+        "telemetry_status": None,
         "error_class": None,
         "error_message": None,
     }
@@ -13814,6 +13412,9 @@ def _set_chatgpt_account_capture_exception(
     coverage: Dict[str, Any],
     exc: Exception,
 ) -> None:
+    retry_after_seconds = _chatgpt_conversation_init_retry_after_seconds(getattr(exc, "retry_after_seconds", None))
+    if retry_after_seconds is not None:
+        coverage["retry_after_seconds"] = retry_after_seconds
     telemetry_class = getattr(exc, "telemetry_class", None)
     if isinstance(exc, (ImportError, ModuleNotFoundError)):
         stage = "dependency"
@@ -13842,6 +13443,188 @@ def _set_chatgpt_account_capture_exception(
     )
 
 
+def _chatgpt_conversation_init_retry_after_seconds(
+    value: Any,
+) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return seconds
+
+
+def _chatgpt_conversation_init_is_throttled(
+    coverage: Mapping[str, Any],
+) -> bool:
+    status_code = coverage.get("status_code")
+    try:
+        if status_code is not None and not isinstance(status_code, bool) and int(status_code) == 429:
+            return True
+    except (TypeError, ValueError):
+        pass
+
+    for key in (
+        "telemetry_status",
+        "telemetry_class",
+        "capture_status",
+        "error_class",
+    ):
+        value = coverage.get(key)
+        if not isinstance(value, str):
+            continue
+        normalized = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+        if (
+            normalized
+            in {
+                "browser_challenge",
+                "challenge",
+                "captcha",
+                "rate_limit",
+                "rate_limited",
+                "throttle",
+                "throttled",
+            }
+            or "challenge" in normalized
+            or "captcha" in normalized
+        ):
+            return True
+    return False
+
+
+def _chatgpt_conversation_init_throttle_seconds(
+    coverage: Mapping[str, Any],
+) -> float:
+    retry_after_seconds = _chatgpt_conversation_init_retry_after_seconds(coverage.get("retry_after_seconds"))
+    if retry_after_seconds is None:
+        return DEFAULT_CHATGPT_CONVERSATION_INIT_THROTTLE_BACKOFF_SECONDS
+    return max(
+        DEFAULT_CHATGPT_CONVERSATION_INIT_THROTTLE_BACKOFF_SECONDS,
+        retry_after_seconds,
+    )
+
+
+def _chatgpt_conversation_init_canonical_profile_path(
+    value: Any,
+) -> Optional[str]:
+    if not isinstance(value, (str, os.PathLike)):
+        return None
+    try:
+        raw_path = os.fspath(value)
+    except TypeError:
+        return None
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+    try:
+        path = Path(raw_path).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError):
+        path = Path(os.path.abspath(os.path.expanduser(raw_path)))
+    return os.path.normcase(str(path))
+
+
+def _chatgpt_conversation_init_cdp_session_key(
+    value: Any,
+) -> Optional[str]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw_endpoint = value.strip()
+    try:
+        parsed = urlsplit(raw_endpoint)
+    except ValueError:
+        parsed = None
+    if parsed is not None and parsed.scheme and parsed.netloc:
+        endpoint = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path.rstrip('/')}"
+        if parsed.query:
+            endpoint = f"{endpoint}?{parsed.query}"
+    else:
+        endpoint = raw_endpoint.rstrip("/")
+    return f"cdp:{endpoint}" if endpoint else None
+
+
+def _chatgpt_conversation_init_session_keys(
+    binding: ChatGPTConversationInitAccountBinding,
+    *,
+    account_label: str,
+) -> tuple[str, ...]:
+    keys: List[str] = []
+    profile_path = _chatgpt_conversation_init_canonical_profile_path(getattr(binding, "oracle_profile_path", None))
+    if profile_path:
+        keys.append(f"profile:{profile_path}")
+    cdp_key = _chatgpt_conversation_init_cdp_session_key(getattr(binding, "cdp_endpoint", None))
+    if cdp_key:
+        keys.append(cdp_key)
+    if not keys:
+        page_target_id = getattr(binding, "page_target_id", None)
+        if isinstance(page_target_id, str) and page_target_id.strip():
+            keys.append(f"target:{page_target_id.strip()}")
+    if not keys:
+        keys.append(f"account:{account_label}")
+    return tuple(dict.fromkeys(keys))
+
+
+def _chatgpt_conversation_init_session_cooldown_active(
+    state: SidecarTaskState,
+    session_keys: Sequence[str],
+    *,
+    now_monotonic: float,
+) -> bool:
+    for session_key in session_keys:
+        cooldown_until = state.chatgpt_conversation_init_cooldown_until_monotonic_by_session.get(session_key)
+        if cooldown_until is not None and now_monotonic < cooldown_until:
+            return True
+    return False
+
+
+def _set_chatgpt_conversation_init_cooldown(
+    state: SidecarTaskState,
+    *,
+    session_keys: Sequence[str],
+    capture_completed_monotonic: float,
+    coverage: Mapping[str, Any],
+) -> None:
+    cooldown_until = capture_completed_monotonic + _chatgpt_conversation_init_throttle_seconds(coverage)
+    for session_key in session_keys:
+        prior_cooldown_until = state.chatgpt_conversation_init_cooldown_until_monotonic_by_session.get(session_key)
+        if prior_cooldown_until is None or cooldown_until > prior_cooldown_until:
+            state.chatgpt_conversation_init_cooldown_until_monotonic_by_session[session_key] = cooldown_until
+
+
+def _append_chatgpt_conversation_init_cooldown_skip(
+    summary: Dict[str, Any],
+    record: CodexOAuthCredentialRecord,
+    *,
+    binding_configured: bool,
+) -> None:
+    coverage = _new_chatgpt_conversation_init_account_coverage(
+        record,
+        binding_configured=binding_configured,
+    )
+    if binding_configured:
+        _set_chatgpt_account_failure(
+            coverage,
+            stage="shared_session_throttle",
+            error_class="ChatGPTConversationInitSharedSessionCooldown",
+            error_message=(
+                "Conversation-init capture skipped because the shared browser session is cooling down after a throttle."
+            ),
+            telemetry_class="throttled",
+            capture_status="shared_session_cooldown",
+        )
+    else:
+        _set_chatgpt_account_failure(
+            coverage,
+            stage="binding",
+            error_class="ChatGPTConversationInitBindingMissing",
+            error_message=(f"No browser binding configured for Codex OAuth account '{record.label}'."),
+            telemetry_class="configuration",
+            capture_status="missing_binding",
+        )
+    summary["account_coverage"].append(coverage)
+
+
 def _chatgpt_account_coverage_status(success_count: int, total_count: int) -> str:
     if not total_count:
         return "no_enabled_accounts"
@@ -13856,24 +13639,24 @@ def _stamp_chatgpt_conversation_init_account_hash(
     parser_summary: Mapping[str, Any],
     account_hash: str,
 ) -> List[tuple[Any, ...]]:
-    if parser_summary.get("account_identity_source") != "provider_payload":
-        raise ValueError(
-            "Bound conversation-init parser returned no provider identity."
-        )
+    identity_source = parser_summary.get("account_identity_source")
+    if identity_source not in {
+        "provider_payload",
+        "native_request_header",
+    }:
+        raise ValueError("Bound conversation-init parser returned no bound identity.")
     if not parser_summary.get("account_identity_hashed"):
-        raise ValueError(
-            "Bound conversation-init parser returned no provider identity."
-        )
+        raise ValueError("Bound conversation-init parser returned no bound identity.")
+    if identity_source == "native_request_header" and (
+        not parser_summary.get("account_identity_verified") or parser_summary.get("account_hash") != account_hash
+    ):
+        raise ValueError("Bound conversation-init parser returned unverified native identity.")
 
     stamped: List[tuple[Any, ...]] = []
     for payload in payloads:
         if len(payload) < 4:
-            raise ValueError(
-                "Bound conversation-init parser returned an invalid insert tuple."
-            )
-        stamped.append(
-            tuple(payload[:3]) + (account_hash,) + tuple(payload[4:])
-        )
+            raise ValueError("Bound conversation-init parser returned an invalid insert tuple.")
+        stamped.append(tuple(payload[:3]) + (account_hash,) + tuple(payload[4:]))
     return stamped
 
 
@@ -13897,8 +13680,7 @@ def _collect_bound_chatgpt_conversation_init_account(
                 stage="auth_identity",
                 error_class="CodexOAuthIdentityMismatchError",
                 error_message=(
-                    f"Codex OAuth credential '{record.label}' does not match "
-                    "its configured account identity."
+                    f"Codex OAuth credential '{record.label}' does not match its configured account identity."
                 ),
                 telemetry_class="auth",
                 capture_status="auth_mismatch",
@@ -13917,42 +13699,35 @@ def _collect_bound_chatgpt_conversation_init_account(
         return [], coverage
 
     try:
-        source_parent = Path(
-            config.chatgpt_conversation_init_source_path
-        ).expanduser().parent
+        source_parent = Path(config.chatgpt_conversation_init_source_path).expanduser().parent
         source_parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(
             prefix=f".conversation-init-{record.expected_account_hash}-",
             dir=str(source_parent),
         ) as snapshot_dir:
             snapshot_path = str(Path(snapshot_dir) / "snapshot.json")
-            collector_summary = (
-                collect_conversation_init_snapshot_from_oracle_browser(
+            with _chatgpt_oracle_browser_binding(binding) as resolved_binding:
+                collector_summary = collect_conversation_init_snapshot_from_oracle_browser(
                     snapshot_path,
-                    cdp_endpoint=binding.cdp_endpoint,
-                    page_target_id=binding.page_target_id,
+                    cdp_endpoint=resolved_binding.cdp_endpoint,
+                    page_target_id=resolved_binding.page_target_id,
                     expected_account_hash=record.expected_account_hash,
-                    timeout_seconds=(
-                        DEFAULT_CHATGPT_CONVERSATION_INIT_BROWSER_TIMEOUT_SECONDS
-                    ),
+                    timeout_seconds=(DEFAULT_CHATGPT_CONVERSATION_INIT_BROWSER_TIMEOUT_SECONDS),
                     request_url=config.chatgpt_conversation_init_url,
                 )
-            )
-            coverage["collector_written"] = bool(
-                collector_summary.get("written")
-            )
+            coverage["collector_written"] = bool(collector_summary.get("written"))
             coverage["status_code"] = collector_summary.get("status_code")
-            coverage["telemetry_class"] = collector_summary.get("telemetry_class")
-            coverage["account_identity_verified"] = bool(
-                collector_summary.get("account_identity_verified")
+            coverage["retry_after_seconds"] = _chatgpt_conversation_init_retry_after_seconds(
+                collector_summary.get("retry_after_seconds")
             )
+            coverage["telemetry_class"] = collector_summary.get("telemetry_class")
+            coverage["telemetry_status"] = collector_summary.get("telemetry_status")
+            coverage["account_identity_verified"] = bool(collector_summary.get("account_identity_verified"))
             verified_account_hash = collector_summary.get("account_hash")
             coverage["verified_account_hash"] = verified_account_hash
 
             if not coverage["collector_written"]:
-                identity_error = collector_summary.get(
-                    "account_identity_verification_error"
-                )
+                identity_error = collector_summary.get("account_identity_verification_error")
                 if identity_error not in (
                     "account_identity_mismatch",
                     "missing_authoritative_account_id",
@@ -13976,8 +13751,7 @@ def _collect_bound_chatgpt_conversation_init_account(
                     telemetry_class=collector_summary.get("telemetry_class"),
                     capture_status=(
                         "dependency_unavailable"
-                        if collector_summary.get("telemetry_class")
-                        == "dependency_unavailable"
+                        if collector_summary.get("telemetry_class") == "dependency_unavailable"
                         else "capture_failed"
                     ),
                 )
@@ -13987,8 +13761,7 @@ def _collect_bound_chatgpt_conversation_init_account(
             if not coverage["account_identity_verified"]:
                 identity_failure = (
                     "ChatGPTConversationInitIdentityUnverified",
-                    "Conversation-init capture did not verify the browser "
-                    "account identity.",
+                    "Conversation-init capture did not verify the browser account identity.",
                     "identity_unverified",
                 )
             elif (
@@ -13997,8 +13770,7 @@ def _collect_bound_chatgpt_conversation_init_account(
             ):
                 identity_failure = (
                     "ChatGPTConversationInitIdentityMismatch",
-                    "Conversation-init capture returned an invalid or "
-                    "unexpected account identity hash.",
+                    "Conversation-init capture returned an invalid or unexpected account identity hash.",
                     "identity_mismatch",
                 )
             if identity_failure is not None:
@@ -14017,18 +13789,13 @@ def _collect_bound_chatgpt_conversation_init_account(
                 observed_at=observed_at,
                 request_url=config.chatgpt_conversation_init_url,
             )
-            coverage["parser_account_identity_source"] = parser_summary.get(
-                "account_identity_source"
-            )
+            coverage["parser_account_identity_source"] = parser_summary.get("account_identity_source")
             if not payloads:
                 _set_chatgpt_account_failure(
                     coverage,
                     stage="parse",
                     error_class="ChatGPTConversationInitNoCurrentObservations",
-                    error_message=(
-                        "Current identity-verified conversation-init capture "
-                        "produced no observations."
-                    ),
+                    error_message=("Current identity-verified conversation-init capture produced no observations."),
                     telemetry_class=parser_summary.get("telemetry_class"),
                     capture_status="parse_failed",
                 )
@@ -14053,6 +13820,7 @@ def _run_chatgpt_conversation_init_bound_poll(  # noqa: PLR0915
     summary: Dict[str, Any],
     *,
     observed_at: datetime,
+    state: SidecarTaskState,
 ) -> None:
     try:
         inventory = _require_codex_oauth_inventory(config)
@@ -14069,9 +13837,7 @@ def _run_chatgpt_conversation_init_bound_poll(  # noqa: PLR0915
     bindings = config.chatgpt_conversation_init_account_bindings or {}
     labels = {record.label for record in records}
     summary["bound_account_count"] = len(records)
-    summary["unmatched_binding_labels"] = sorted(
-        label for label in bindings if label not in labels
-    )
+    summary["unmatched_binding_labels"] = sorted(label for label in bindings if label not in labels)
 
     for record in records:
         binding = bindings.get(record.label)
@@ -14084,14 +13850,28 @@ def _run_chatgpt_conversation_init_bound_poll(  # noqa: PLR0915
                 coverage,
                 stage="binding",
                 error_class="ChatGPTConversationInitBindingMissing",
-                error_message=(
-                    f"No browser binding configured for Codex OAuth account "
-                    f"'{record.label}'."
-                ),
+                error_message=(f"No browser binding configured for Codex OAuth account '{record.label}'."),
                 telemetry_class="configuration",
                 capture_status="missing_binding",
             )
             summary["account_coverage"].append(coverage)
+            continue
+
+        session_keys = _chatgpt_conversation_init_session_keys(
+            binding,
+            account_label=record.label,
+        )
+        if _chatgpt_conversation_init_session_cooldown_active(
+            state,
+            session_keys,
+            now_monotonic=time.monotonic(),
+        ):
+            summary["last_good_state_retained"] = True
+            _append_chatgpt_conversation_init_cooldown_skip(
+                summary,
+                record,
+                binding_configured=True,
+            )
             continue
 
         payloads, coverage = _collect_bound_chatgpt_conversation_init_account(
@@ -14100,15 +13880,14 @@ def _run_chatgpt_conversation_init_bound_poll(  # noqa: PLR0915
             binding,
             observed_at=observed_at,
         )
+        capture_completed_monotonic = time.monotonic()
 
         summary["observation_count"] += coverage["observation_count"]
         if payloads and config.apply:
             try:
-                coverage["inserted_count"] = (
-                    _persist_chatgpt_conversation_init_observations(
-                        config,
-                        payloads,
-                    )
+                coverage["inserted_count"] = _persist_chatgpt_conversation_init_observations(
+                    config,
+                    payloads,
                 )
                 coverage["persisted"] = True
                 coverage["persistence_status"] = "persisted"
@@ -14119,11 +13898,7 @@ def _run_chatgpt_conversation_init_bound_poll(  # noqa: PLR0915
                     exc,
                     probes.ProviderStatusDatabaseWriteSkipped,
                 )
-                persistence_status = (
-                    "database_write_skipped"
-                    if skipped
-                    else "database_write_failed"
-                )
+                persistence_status = "database_write_skipped" if skipped else "database_write_failed"
                 _set_chatgpt_account_failure(
                     coverage,
                     stage="persistence",
@@ -14138,17 +13913,17 @@ def _run_chatgpt_conversation_init_bound_poll(  # noqa: PLR0915
         elif payloads:
             coverage["persistence_status"] = "not_applied"
         summary["account_coverage"].append(coverage)
+        if _chatgpt_conversation_init_is_throttled(coverage):
+            summary["last_good_state_retained"] = True
+            _set_chatgpt_conversation_init_cooldown(
+                state,
+                session_keys=session_keys,
+                capture_completed_monotonic=capture_completed_monotonic,
+                coverage=coverage,
+            )
 
-    fresh_capture_count = sum(
-        1
-        for coverage in summary["account_coverage"]
-        if coverage.get("fresh_capture")
-    )
-    persisted_account_count = sum(
-        1
-        for coverage in summary["account_coverage"]
-        if coverage.get("persisted")
-    )
+    fresh_capture_count = sum(1 for coverage in summary["account_coverage"] if coverage.get("fresh_capture"))
+    persisted_account_count = sum(1 for coverage in summary["account_coverage"] if coverage.get("persisted"))
     summary["fresh_capture_count"] = fresh_capture_count
     summary["persisted_account_count"] = persisted_account_count
     capture_status = _chatgpt_account_coverage_status(
@@ -14188,30 +13963,23 @@ def _run_chatgpt_conversation_init_poll_task(  # noqa: PLR0915
     last_attempt = state.chatgpt_conversation_init_last_attempt_monotonic
     if (
         last_attempt is not None
-        and now_monotonic - last_attempt
-        < config.chatgpt_conversation_init_poll_interval_seconds
+        and now_monotonic - last_attempt < config.chatgpt_conversation_init_poll_interval_seconds
     ):
         return None
-
     state.chatgpt_conversation_init_last_attempt_monotonic = now_monotonic
     observed_at = datetime.now(timezone.utc)
     bound_mode = config.chatgpt_conversation_init_account_bindings is not None
     summary = _chatgpt_conversation_init_poll_summary(
-        collector_source=(
-            "oracle_browser_bound_per_account" if bound_mode else "file"
-        ),
+        collector_source=("oracle_browser_bound_per_account" if bound_mode else "file"),
         coverage_mode="bound_live" if bound_mode else "file_only_legacy",
-        coverage_scope=(
-            "enabled_codex_oauth_inventory_accounts"
-            if bound_mode
-            else "single_configured_snapshot"
-        ),
+        coverage_scope=("enabled_codex_oauth_inventory_accounts" if bound_mode else "single_configured_snapshot"),
     )
     if bound_mode:
         _run_chatgpt_conversation_init_bound_poll(
             config,
             summary,
             observed_at=observed_at,
+            state=state,
         )
     else:
         try:
@@ -14222,16 +13990,12 @@ def _run_chatgpt_conversation_init_poll_task(  # noqa: PLR0915
             )
             summary.update(parser_summary)
             summary["observation_count"] = len(payloads)
-            summary["capture_coverage_status"] = (
-                "legacy_file_snapshot" if payloads else "no_current_snapshot"
-            )
+            summary["capture_coverage_status"] = "legacy_file_snapshot" if payloads else "no_current_snapshot"
             if config.apply and payloads:
                 summary["persistence_coverage_status"] = "attempted"
-                summary["inserted_count"] = (
-                    _persist_chatgpt_conversation_init_observations(
-                        config,
-                        payloads,
-                    )
+                summary["inserted_count"] = _persist_chatgpt_conversation_init_observations(
+                    config,
+                    payloads,
                 )
                 summary["persisted"] = True
                 summary["persistence_coverage_status"] = "persisted"
@@ -14309,18 +14073,10 @@ def _merge_alibaba_fetch_summary(
     summary[f"{endpoint}_status_code"] = fetched["status_code"]
     summary[f"{endpoint}_attempt_count"] = fetched.get("attempt_count", 1)
     summary[f"{endpoint}_retry_count"] = fetched.get("retry_count", 0)
-    summary["mint_attempted"] = bool(
-        summary["mint_attempted"] or fetched.get("mint_attempted")
-    )
-    summary["mint_succeeded"] = bool(
-        summary["mint_succeeded"] or fetched.get("mint_succeeded")
-    )
-    summary["refresh_attempted"] = bool(
-        summary["refresh_attempted"] or fetched.get("refresh_attempted")
-    )
-    summary["refresh_succeeded"] = bool(
-        summary["refresh_succeeded"] or fetched.get("refresh_succeeded")
-    )
+    summary["mint_attempted"] = bool(summary["mint_attempted"] or fetched.get("mint_attempted"))
+    summary["mint_succeeded"] = bool(summary["mint_succeeded"] or fetched.get("mint_succeeded"))
+    summary["refresh_attempted"] = bool(summary["refresh_attempted"] or fetched.get("refresh_attempted"))
+    summary["refresh_succeeded"] = bool(summary["refresh_succeeded"] or fetched.get("refresh_succeeded"))
 
 
 def _record_alibaba_poll_failure(
@@ -14337,18 +14093,10 @@ def _record_alibaba_poll_failure(
         summary[f"{exc.endpoint}_status_code"] = exc.status_code
         summary[f"{exc.endpoint}_attempt_count"] = exc.attempt_count
         summary[f"{exc.endpoint}_retry_count"] = exc.retry_count
-        summary["mint_attempted"] = bool(
-            summary.get("mint_attempted") or exc.mint_attempted
-        )
-        summary["mint_succeeded"] = bool(
-            summary.get("mint_succeeded") or exc.mint_succeeded
-        )
-        summary["refresh_attempted"] = bool(
-            summary.get("refresh_attempted") or exc.refresh_attempted
-        )
-        summary["refresh_succeeded"] = bool(
-            summary.get("refresh_succeeded") or exc.refresh_succeeded
-        )
+        summary["mint_attempted"] = bool(summary.get("mint_attempted") or exc.mint_attempted)
+        summary["mint_succeeded"] = bool(summary.get("mint_succeeded") or exc.mint_succeeded)
+        summary["refresh_attempted"] = bool(summary.get("refresh_attempted") or exc.refresh_attempted)
+        summary["refresh_succeeded"] = bool(summary.get("refresh_succeeded") or exc.refresh_succeeded)
     elif isinstance(exc, probes.ProviderStatusDatabaseWriteSkipped):
         summary["telemetry_class"] = "database_write_skipped"
         summary["error_endpoint"] = "database"
@@ -14485,17 +14233,15 @@ def _run_alibaba_quota_poll_task(
             endpoint="reset_cards",
         )
         try:
-            reset_card_observations, reset_card_available_count = (
-                _build_alibaba_reset_card_observations(
-                    config,
-                    observed_at=observed_at,
-                    reset_cards=fetched_reset_cards["payload"],
-                    subscription=subscription,
-                    status_code=int(fetched_reset_cards["status_code"]),
-                    attempt_count=int(fetched_reset_cards.get("attempt_count", 1)),
-                    retry_count=int(fetched_reset_cards.get("retry_count", 0)),
-                    auth_source=str(auth["auth_source"]),
-                )
+            reset_card_observations, reset_card_available_count = _build_alibaba_reset_card_observations(
+                config,
+                observed_at=observed_at,
+                reset_cards=fetched_reset_cards["payload"],
+                subscription=subscription,
+                status_code=int(fetched_reset_cards["status_code"]),
+                attempt_count=int(fetched_reset_cards.get("attempt_count", 1)),
+                retry_count=int(fetched_reset_cards.get("retry_count", 0)),
+                auth_source=str(auth["auth_source"]),
             )
         except ValueError as exc:
             raise _alibaba_quota_poll_error(
@@ -14580,9 +14326,7 @@ def _run_grok_billing_poll_task(
         fetched = _fetch_grok_billing_payload(config)
         request_headers = fetched.get("request_headers")
         if not isinstance(request_headers, GrokBillingRequestHeaders):
-            raise TypeError(
-                "Grok billing fetch did not return the request headers used."
-            )
+            raise TypeError("Grok billing fetch did not return the request headers used.")
         summary.update(
             _grok_billing_request_contract_summary(
                 config,
@@ -14613,10 +14357,7 @@ def _run_grok_billing_poll_task(
     except Exception as exc:
         if isinstance(exc, GrokBillingClientVersionError):
             summary.update(exc.source_metadata)
-        elif (
-            isinstance(exc, GrokBillingPollError)
-            and exc.request_headers is not None
-        ):
+        elif isinstance(exc, GrokBillingPollError) and exc.request_headers is not None:
             summary.update(
                 _grok_billing_request_contract_summary(
                     config,
@@ -14679,9 +14420,7 @@ def _run_observability_anomaly_scan_task(
                 {
                     "status": "anomalies_found",
                     "anomaly_count": len(anomalies),
-                    "anomaly_classes": [
-                        anomaly.get("anomaly_class") for anomaly in anomalies
-                    ],
+                    "anomaly_classes": [anomaly.get("anomaly_class") for anomaly in anomalies],
                     "error_log_record_count": written_count,
                     "error_log_path": str(path),
                 }
@@ -14811,9 +14550,7 @@ def run_due_sidecar_tasks(
         _append_optional_poll_future_result(events, config, event_name, future)
 
     optional_to_submit = [
-        (event_name, runner)
-        for event_name, runner in optional_pending
-        if event_name not in pending_optional_names
+        (event_name, runner) for event_name, runner in optional_pending if event_name not in pending_optional_names
     ]
     if optional_to_submit:
         executor = _SIDECAR_OPTIONAL_POLL_EXECUTOR
@@ -14897,20 +14634,10 @@ def _build_one_shot_status_event(
     config: ProviderStatusLoopConfig,
     events: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
-    required_events = [
-        event
-        for event in events
-        if _sidecar_one_shot_policy(event) == "required"
-    ]
-    optional_events = [
-        event
-        for event in events
-        if _sidecar_one_shot_policy(event) == "optional"
-    ]
+    required_events = [event for event in events if _sidecar_one_shot_policy(event) == "required"]
+    optional_events = [event for event in events if _sidecar_one_shot_policy(event) == "optional"]
     failures = _required_one_shot_refresh_failures(events)
-    optional_failures = [
-        event for event in optional_events if event.get("error_class")
-    ]
+    optional_failures = [event for event in optional_events if event.get("error_class")]
     return {
         "event": "provider_status_sidecar_one_shot_status",
         "observed_at": _utc_timestamp(),
@@ -15139,9 +14866,7 @@ def _run_due_managed_refresh_tasks(
 
 
 def _utc_timestamp() -> str:
-    return (
-        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-    )
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _next_sidecar_wake_delay(
@@ -15246,9 +14971,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         generic_cycle_deadline = sidecar_state.next_generic_cycle_due_monotonic
         if generic_cycle_deadline is None:
             generic_cycle_deadline = now
-            sidecar_state.next_generic_cycle_due_monotonic = (
-                generic_cycle_deadline
-            )
+            sidecar_state.next_generic_cycle_due_monotonic = generic_cycle_deadline
         if now < generic_cycle_deadline:
             sidecar_events = _run_due_managed_refresh_tasks(
                 config,
@@ -15264,9 +14987,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             continue
 
-        sidecar_state.next_generic_cycle_due_monotonic = (
-            generic_cycle_deadline + config.interval_seconds
-        )
+        sidecar_state.next_generic_cycle_due_monotonic = generic_cycle_deadline + config.interval_seconds
         try:
             _emit(run_cycle(config))
         except Exception as exc:
