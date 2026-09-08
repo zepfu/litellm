@@ -145,6 +145,19 @@ interface TimestampResult {
   warning: "conversation_missing_update_time" | "conversation_invalid_update_time" | null;
 }
 
+interface OriginSource {
+  [key: string]: unknown;
+}
+
+const ORIGIN_EXCLUSION_GROUPS: ReadonlyArray<{
+  fields: readonly string[];
+  origin: "imported" | "copied" | "shared";
+}> = [
+  { fields: ["imported"], origin: "imported" },
+  { fields: ["copied", "from_copy"], origin: "copied" },
+  { fields: ["shared", "from_shared"], origin: "shared" },
+];
+
 export interface HistoryTransport {
   request(
     method: string,
@@ -814,14 +827,7 @@ function messageFromNode(
       sanitizeToken(metadata.message_request_id),
     requestId: sanitizeToken(metadata.request_id),
     surface: conversationSurface,
-    origin:
-      (metadata.imported === true
-        ? "imported"
-        : metadata.from_copy === true
-          ? "copied"
-          : metadata.from_shared === true
-            ? "shared"
-            : sanitizeToken(metadata.origin)),
+    origin: resolveOriginEvidence([message, node], metadata),
     metadata,
   };
 }
@@ -1130,10 +1136,9 @@ function summaryOrigin(
   item: Record<string, unknown>,
   warnings: string[],
 ): string | null {
-  const origin = optionalString(item.origin);
   const metadataRaw = item.metadata;
   if (!isRecord(metadataRaw)) {
-    return origin;
+    return resolveOriginEvidence([item], {});
   }
   const metadataProjection = sanitizeMetadataWithDiagnostics(metadataRaw);
   if (metadataProjection.diagnostics.status !== "complete") {
@@ -1142,15 +1147,58 @@ function summaryOrigin(
     );
   }
   const metadata = metadataProjection.metadata;
-  return (
-    (metadata.imported === true
-      ? "imported"
-      : metadata.from_copy === true
-        ? "copied"
-        : metadata.from_shared === true
-          ? "shared"
-          : origin ?? optionalString(metadata.origin))
-  );
+  return resolveOriginEvidence([item], metadata);
+}
+
+function resolveOriginEvidence(
+  roots: ReadonlyArray<OriginSource>,
+  metadata: OriginSource,
+): string | null {
+  const sources = [...roots, metadata];
+  for (const group of ORIGIN_EXCLUSION_GROUPS) {
+    if (
+      sources.some((source) =>
+        group.fields.some((field) => source[field] === true),
+      )
+    ) {
+      return group.origin;
+    }
+  }
+
+  let benignOrigin: string | null = null;
+  for (const source of sources) {
+    const label = originLabel(source.origin);
+    if (label === null) {
+      continue;
+    }
+    const excludedOrigin = excludedOriginLabel(label);
+    if (excludedOrigin !== null) {
+      return excludedOrigin;
+    }
+    benignOrigin ??= label;
+  }
+  return benignOrigin;
+}
+
+function originLabel(value: unknown): string | null {
+  if (value === true) {
+    return "true";
+  }
+  return sanitizeToken(value);
+}
+
+function excludedOriginLabel(value: string): "imported" | "copied" | "shared" | null {
+  switch (value.toLowerCase()) {
+    case "imported":
+      return "imported";
+    case "copied":
+      return "copied";
+    case "shared":
+    case "true":
+      return "shared";
+    default:
+      return null;
+  }
 }
 
 function normalizeTimestamp(value: unknown): string | null {
