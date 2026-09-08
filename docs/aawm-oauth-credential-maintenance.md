@@ -125,6 +125,17 @@ Managed Codex proxy consumers require the explicit inventory below and do not
 fall back to `~/.codex/auth.json`, directory scans, backup files, path globs, or
 `api.openai.com`.
 
+## xAI credential scope selection
+
+Managed xAI and native Grok OIDC readers select the exact configured scope.
+They never choose the first nested credential-like record. An unambiguous
+legacy flat record remains supported only when the top-level object contains
+the credential fields and no nested credential-like records. A multi-record
+document with a missing configured scope fails closed before provider/token I/O
+or refresh publication; migrate it by placing the intended record under the
+configured scope key. Diagnostics identify the selection failure without
+including credential contents.
+
 ## Codex ordered account inventory (OPENAI-001)
 
 `LITELLM_CODEX_OAUTH_INVENTORY` is a versioned JSON object whose `accounts`
