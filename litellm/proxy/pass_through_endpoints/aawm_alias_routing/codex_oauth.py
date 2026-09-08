@@ -1068,9 +1068,16 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             }
         )
 
+    planned_portable_failover = interchangeable_accounts and bool(
+        getattr(
+            request.state,
+            "_aawm_direct_codex_account_failover_planned",
+            False,
+        )
+    )
     affinity: Optional[dict[str, Any]] = None
     session_identity = _sa.resolve_canonical_session_identity(request, body)
-    if session_identity is not None:
+    if session_identity is not None and not planned_portable_failover:
         owner_record, _cache_key, owner_error = await _sa.get_session_owner_record(
             session_identity=session_identity,
         )
@@ -1181,7 +1188,12 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             "All enabled Codex OAuth inventory accounts are currently cooled "
             "down or unavailable for direct Responses traffic."
         )
-        if affinity_selection_reason == "session_owner_pin":
+        if planned_portable_failover:
+            unavailable_message = (
+                "No alternate Codex OAuth inventory account is available for "
+                "the planned portable account failover."
+            )
+        elif affinity_selection_reason == "session_owner_pin":
             unavailable_message = (
                 "The required pinned Codex OAuth owner account is currently "
                 "exhausted or unavailable for direct Responses traffic. Alternate "
@@ -1205,7 +1217,20 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             "attempted_provider_call": False,
             "failure_phase": "direct_inventory_selection",
         }
-        if affinity is not None and affinity_selection_reason is not None:
+        if planned_portable_failover:
+            terminal_reset = (
+                _selection._build_codex_oauth_terminal_reset_information(states)
+            )
+            if terminal_reset is not None:
+                detail["terminal_reset"] = terminal_reset
+            detail.update(
+                {
+                    "selection_reason": "codex_oauth_account_failover",
+                    "alternate_accounts_considered": True,
+                    "continuation_portable": True,
+                }
+            )
+        elif affinity is not None and affinity_selection_reason is not None:
             terminal_reset = (
                 _selection._build_codex_oauth_terminal_reset_information(states)
             )
@@ -1234,7 +1259,9 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         )
     selected_auth = await _load_bound_codex_oauth_auth(request)
 
-    if int(selected_state.get("failover_ordinal") or 0) > 0:
+    if planned_portable_failover:
+        selection_reason = "codex_oauth_account_failover"
+    elif int(selected_state.get("failover_ordinal") or 0) > 0:
         selection_reason = "codex_oauth_account_failover"
     elif affinity_selection_reason is not None:
         selection_reason = affinity_selection_reason

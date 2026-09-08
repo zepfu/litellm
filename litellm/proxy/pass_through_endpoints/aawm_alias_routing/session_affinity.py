@@ -3906,12 +3906,6 @@ async def clear_compatible_non_held_request_session_owner_guard_for_failover(
                 require_exact_attributes=True,
             )
             is not None
-            or _compatibility_mismatch_reason(
-                owner_record=owner_record,
-                requested_attributes=alternate,
-                require_exact_attributes=True,
-            )
-            is not None
         ):
             return False
 

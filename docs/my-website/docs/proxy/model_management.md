@@ -336,3 +336,16 @@ for `anthropic/*` in model group settings. In that case, a
 client-supplied Anthropic `x-api-key` that was **not** used for LiteLLM proxy auth
 may be promoted to `api_key` for the upstream request. Proxy-only keys and
 non-Anthropic routes do not use this path.
+
+## Managed Codex OAuth account failover
+
+Managed Codex OAuth direct Responses requests preserve canonical session
+ownership and allow at most one replay-safe account move. The guard validates
+that the original durable owner still owns the session before clearing the
+request-local lease. When the move is eligible and interchangeable, second
+selection is not pinned to the account that was just exhausted. Requests with
+genuine account-bound state remain non-portable.
+
+If no alternate is available after a planned failover, telemetry identifies the
+second-selection failure. This is distinct from an owner-bound rejection of a
+non-portable continuation.

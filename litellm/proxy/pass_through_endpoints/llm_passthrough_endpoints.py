@@ -3700,6 +3700,12 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             provider_status_code=retry_attempt_record["error_status_code"],
         )
     )
+    if retry_planned and hasattr(request, "state"):
+        setattr(
+            request.state,
+            "_aawm_direct_codex_account_failover_planned",
+            True,
+        )
     if retry_planned:
         retry_attempt_record["failover_decision"] = "move_account"
         retry_attempt_record["terminal_reason"] = "success"
