@@ -966,6 +966,68 @@ async def handle_alias_route(  # noqa: PLR0915
             )
         )
 
+    def _validated_unowned_replay(selection: Mapping[str, Any]) -> bool:
+        """Allow portable replay only while durable ownership is unpromoted."""
+        if (
+            _provider_owned_continuation()
+            or has_previous_response_id
+            or bool(selection.get("has_account_bound_state"))
+        ):
+            return False
+        validate_replay = getattr(
+            _session_affinity_mod(),
+            "validate_cursor_replay_matches_body",
+            None,
+        )
+        if not callable(validate_replay):
+            return False
+        try:
+            if not validate_replay(request, body=prepared_request_body):
+                return False
+        except Exception:
+            return False
+
+        compatible_owner_decisions = {
+            "compatible_owner",
+            "redispatch_required",
+        }
+
+        def _owner_decision(value: Any) -> str:
+            return str(
+                getattr(value, "value", value) or ""
+            ).strip().casefold()
+
+        selection_decision = _owner_decision(
+            selection.get("session_owner_decision")
+        )
+        if selection_decision in compatible_owner_decisions:
+            return False
+        provenance = selection.get("session_owner_provenance")
+        if isinstance(provenance, Mapping):
+            provenance_decision = _owner_decision(
+                provenance.get("session_owner_decision")
+            )
+            if provenance_decision in compatible_owner_decisions:
+                return False
+
+        lease_getter = getattr(
+            _session_affinity_mod(),
+            "get_request_session_owner_lease",
+            None,
+        )
+        if callable(lease_getter):
+            try:
+                lease = lease_getter(request)
+            except Exception:
+                return False
+            if lease is not None:
+                if getattr(lease, "promoted", False) is True:
+                    return False
+                lease_decision = _owner_decision(getattr(lease, "decision", ""))
+                if lease_decision in compatible_owner_decisions:
+                    return False
+        return True
+
     def _genuinely_fresh_dispatch(selection: Mapping[str, Any]) -> bool:
         return (
             not _provider_owned_continuation()
@@ -2831,8 +2893,15 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                 )
                 fresh_dispatch = _genuinely_fresh_dispatch(selection)
+                validated_unowned_replay = _validated_unowned_replay(selection)
+                deterministic_exclusion_eligible = (
+                    fresh_dispatch or validated_unowned_replay
+                )
                 marker_reason: str | None = None
-                if deterministically_ineligible and fresh_dispatch:
+                if (
+                    deterministically_ineligible
+                    and deterministic_exclusion_eligible
+                ):
                     marker_reason = (
                         getattr(failure_exc, "ineligibility_reason", None)
                         or "deterministic_candidate_ineligible"
@@ -2878,11 +2947,14 @@ async def handle_alias_route(  # noqa: PLR0915
                         attempt_record[
                             "candidate_semantic_ineligibility_remaining_seconds"
                         ] = semantic_marker.get("remaining_seconds")
-                if deterministically_ineligible and (
-                    fresh_dispatch
-                    or (replay_safety is not None and replay_safety.safe)
+                if (
+                    deterministically_ineligible
+                    and (
+                        deterministic_exclusion_eligible
+                        or (replay_safety is not None and replay_safety.safe)
+                    )
                 ):
-                    if fresh_dispatch:
+                    if deterministic_exclusion_eligible:
                         provider_candidate_attempts = max(
                             0,
                             provider_candidate_attempts - 1,
