@@ -166,6 +166,17 @@ LiteLLM sends `store=false` automatically. This applies to URL and base64
 image forms on both native xAI and managed xAI OAuth routes. Text-only
 requests preserve the caller's explicit `store` value or the provider default.
 
+## Responses API Tool Compatibility
+
+For supported Codex auto-agent native Grok routes, LiteLLM converts mixed
+custom and namespace tools into xAI-compatible function tools before egress.
+It applies the required description patches, removes unsupported hosted tools,
+request fields, input items, and empty tool choices, then restores the
+original custom and namespace identities in both streaming and non-streaming
+responses. Name collisions use the established deterministic policy; retries
+start from the caller's original tool definitions, so conversions are not
+applied twice.
+
 ## Native Grok Route Capabilities
 
 Native `xai/grok-4.5` and `xai/grok-4.6` declare the
@@ -175,6 +186,18 @@ capability and a native Grok route family. Managed `oa_xai/*`, Cursor, Composer,
 Grok Build, and unprofiled future models do not inherit the native policy.
 Malformed native output remains request-local and does not create a durable
 candidate cooldown.
+
+## Native Grok Continuation Recovery
+
+For a provider-owned continuation on a capability-enabled native Grok route,
+bare `upstream_transient_internal` failures use the native request-scoped
+continuation budget. The planner runs before generic pre-commit retry handling,
+so transient recovery uses bounded short backoff instead of the generic
+ten-second wait. Five transient failures can therefore be followed by a sixth
+provider attempt, while exhaustion terminates at the configured request budget.
+
+Fresh requests, managed `oa_xai/*` routes, and non-transient failures retain
+their existing generic retry and cooldown policy.
 
 ## Sample Usage - Vision
 
