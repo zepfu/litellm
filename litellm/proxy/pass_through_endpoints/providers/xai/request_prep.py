@@ -7,6 +7,7 @@ The later integration step configures host-owned helpers through
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, cast
 from uuid import uuid4 as _uuid4
@@ -128,6 +129,13 @@ XAI_REQUEST_PREP_SEAM_DISPOSITION = {
 
 
 _request_prep_runtime: Optional[XAIRequestPrepRuntime] = None
+
+_GROK_NATIVE_OAUTH_OWNER_SESSION_ID_METADATA_KEY = (
+    "grok_native_oauth_owner_session_id"
+)
+_GROK_NATIVE_OAUTH_OWNER_SESSION_ID_HASH_DOMAIN = (
+    "litellm:grok-native-oauth:session-owner:v1:"
+)
 
 
 def _host_sanitize_xai_responses_request_body_in_place(
@@ -324,6 +332,75 @@ def _xai_responses_sanitized_tool_changes(
     return tool_changes
 
 
+def _xai_input_item_matches_instructions(
+    item: Any,
+    instructions: str,
+) -> bool:
+    if not isinstance(item, dict) or item.get("role") != "system":
+        return False
+
+    content = item.get("content")
+    if isinstance(content, str):
+        return content == instructions
+    if not isinstance(content, list):
+        return False
+
+    text_parts: list[str] = []
+    for part in content:
+        if isinstance(part, str):
+            text_parts.append(part)
+        elif (
+            isinstance(part, dict)
+            and part.get("type") in {"input_text", "text"}
+            and isinstance(part.get("text"), str)
+        ):
+            text_parts.append(part["text"])
+    return "\n".join(text_parts) == instructions
+
+
+def _lower_xai_instructions_to_input(
+    request_body: dict[str, Any],
+) -> None:
+    """Lower unsupported top-level instructions into one system input item."""
+    instructions = request_body.get("instructions")
+    if not isinstance(instructions, str):
+        return
+
+    request_body.pop("instructions", None)
+    if not instructions.strip():
+        return
+
+    input_value = request_body.get("input")
+    if isinstance(input_value, list):
+        input_items = list(input_value)
+    elif isinstance(input_value, str):
+        input_items = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": input_value,
+            }
+        ]
+    elif input_value is None:
+        input_items = []
+    else:
+        input_items = [input_value]
+
+    if not any(
+        _xai_input_item_matches_instructions(item, instructions)
+        for item in input_items
+    ):
+        input_items.insert(
+            0,
+            {
+                "type": "message",
+                "role": "system",
+                "content": instructions,
+            },
+        )
+    request_body["input"] = input_items
+
+
 def _sanitize_xai_responses_request_body(
     request_body: dict[str, Any],
 ) -> tuple[dict[str, Any], list[str], list[dict[str, Any]]]:
@@ -353,7 +430,16 @@ def _sanitize_xai_responses_request_body(
             sanitized_body["previous_response_id"] = decoded
             decoded_previous_response_id = True
 
-    if not removed_params and not tool_changes and not decoded_previous_response_id:
+    store_forced_false = (
+        sanitized_body.get("store") is False
+        and request_body.get("store") is not False
+    )
+    if (
+        not removed_params
+        and not tool_changes
+        and not decoded_previous_response_id
+        and not store_forced_false
+    ):
         return request_body, [], []
 
     tool_types = runtime._dedupe_sorted_str_list(
@@ -383,6 +469,11 @@ def _sanitize_xai_responses_request_body(
                 else []
             ),
             *(
+                ["xai-responses-store-forced-false-image"]
+                if store_forced_false
+                else []
+            ),
+            *(
                 f"xai-responses-removed-param:{param}"
                 for param in normalized_removed_params
             ),
@@ -402,6 +493,7 @@ def _sanitize_xai_responses_request_body(
             "xai_responses_previous_response_id_decoded": (
                 decoded_previous_response_id
             ),
+            "xai_responses_store_forced_false_image": store_forced_false,
             "langfuse_spans": [
                 runtime._build_langfuse_span_descriptor(
                     name="xai.responses_request_sanitized",
@@ -412,6 +504,7 @@ def _sanitize_xai_responses_request_body(
                         "previous_response_id_decoded": (
                             decoded_previous_response_id
                         ),
+                        "store_forced_false_image": store_forced_false,
                     },
                 )
             ],
@@ -512,6 +605,7 @@ async def _prepare_oa_xai_passthrough_request(
         runtime._replace_request_body_in_place(request_body, updated_body)
         _rewrite_codex_agent_message_items_in_place(request_body)
         _rewrite_grok_native_unsupported_input_items_in_place(request_body)
+        _lower_xai_instructions_to_input(request_body)
         runtime._sanitize_xai_responses_request_body_in_place(request_body)
         (
             updated_body,
@@ -581,6 +675,10 @@ def _get_grok_native_oauth_session_id(
     request: Request,
     request_body: dict[str, Any],
 ) -> Optional[str]:
+    owner_session_id = _get_grok_native_oauth_owner_session_id(request)
+    if owner_session_id is not None:
+        return owner_session_id
+
     runtime = _require_runtime()
     metadata = request_body.get("litellm_metadata")
     if isinstance(metadata, dict):
@@ -601,6 +699,44 @@ def _get_grok_native_oauth_session_id(
         if header_value:
             return header_value
     return None
+
+
+def _get_grok_native_oauth_owner_session_id(request: Request) -> Optional[str]:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity,
+    )
+
+    lease = session_affinity.get_request_session_owner_lease(request)
+    session_identity = getattr(lease, "session_identity", None)
+    if not isinstance(session_identity, str) or not session_identity.strip():
+        return None
+
+    return hashlib.sha256(
+        (
+            _GROK_NATIVE_OAUTH_OWNER_SESSION_ID_HASH_DOMAIN
+            + session_identity.strip()
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _bind_grok_native_oauth_owner_session_header(
+    headers: dict[str, Any],
+    *,
+    request: Request,
+) -> dict[str, Any]:
+    """Replace caller session headers only when a server owner lease exists."""
+
+    owner_session_id = _get_grok_native_oauth_owner_session_id(request)
+    if owner_session_id is None:
+        return headers
+
+    bound_headers = {
+        key: value
+        for key, value in headers.items()
+        if str(key).lower() != "x-grok-session-id"
+    }
+    bound_headers["x-grok-session-id"] = owner_session_id
+    return bound_headers
 
 
 def _get_grok_native_oauth_request_id(request: Request) -> str:
@@ -710,11 +846,17 @@ async def _prepare_grok_native_oauth_passthrough_request(
 
     prepared_body = dict(request_body)
     prepared_body["model"] = model
+    owner_session_id = _get_grok_native_oauth_owner_session_id(request)
+    native_extra_fields = dict(extra_fields or {})
+    if owner_session_id is not None:
+        native_extra_fields[
+            _GROK_NATIVE_OAUTH_OWNER_SESSION_ID_METADATA_KEY
+        ] = owner_session_id
     prepared_body = _add_grok_native_oauth_metadata(
         prepared_body,
         model=model,
         tags_to_add=tags_to_add,
-        extra_fields=extra_fields,
+        extra_fields=native_extra_fields,
     )
     (
         prepared_body,
@@ -737,6 +879,7 @@ async def _prepare_grok_native_oauth_passthrough_request(
     _rewrite_codex_agent_message_items_in_place(prepared_body)
     _sanitize_grok_native_function_call_arguments_in_place(prepared_body)
     _rewrite_grok_native_unsupported_input_items_in_place(prepared_body)
+    _lower_xai_instructions_to_input(prepared_body)
     runtime._sanitize_xai_responses_request_body_in_place(prepared_body)
     (
         prepared_body,

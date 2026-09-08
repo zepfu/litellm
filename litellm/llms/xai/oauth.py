@@ -14,7 +14,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, MutableMapping, Optional
 
 import httpx  # noqa: F401  # harness patch surface; refresh path removed (RR-040)
 
@@ -30,6 +30,9 @@ from litellm.secret_managers.grok_oidc_auth_path import (
     resolve_grok_oidc_auth_path,
 )
 from litellm.secret_managers.main import get_secret_str
+from litellm.secret_managers.xai_oauth_credentials import (
+    select_xai_oauth_credential_record,
+)
 
 OA_XAI_PROVIDER_PREFIX = _xai_route_descriptors.OA_XAI_PROVIDER_PREFIX
 XAI_OAUTH_ROUTE_FAMILY = _xai_route_descriptors.XAI_OAUTH_ROUTE_FAMILY
@@ -652,38 +655,22 @@ def _read_credential_payload(credential_path: Path) -> Dict[str, Any]:
 def _select_credential_record(
     payload: Dict[str, Any],
     scope: str,
-) -> Dict[str, Any]:
-    if _looks_like_credential_record(payload):
-        return payload
-
-    scoped_record = payload.get(scope)
-    if isinstance(scoped_record, dict):
-        return scoped_record
-
-    for value in payload.values():
-        if isinstance(value, dict) and _looks_like_credential_record(value):
-            return value
-
-    raise ValueError(
-        "xAI OAuth credential file does not contain a usable credential record. "
-        "Expected a Grok-style scoped record or a flat object with key/access_token."
+) -> MutableMapping[str, Any]:
+    return select_xai_oauth_credential_record(
+        payload,
+        scope,
+        provider_label="xAI OAuth",
     )
 
 
-def _looks_like_credential_record(value: Dict[str, Any]) -> bool:
-    return bool(
-        value.get("key") or value.get("access_token") or value.get("refresh_token")
-    )
-
-
-def _credential_access_token(credential: Dict[str, Any]) -> Optional[str]:
+def _credential_access_token(credential: Mapping[str, Any]) -> Optional[str]:
     token = credential.get("access_token") or credential.get("key")
     if isinstance(token, str) and token.strip():
         return token.strip()
     return None
 
 
-def _credential_needs_refresh(credential: Dict[str, Any]) -> bool:
+def _credential_needs_refresh(credential: Mapping[str, Any]) -> bool:
     """Return True when the credential should not be used as-is.
 
     Missing or unparseable ``expires_at`` fails safe toward refresh (not

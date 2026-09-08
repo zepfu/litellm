@@ -25,6 +25,10 @@ from typing import Any, Callable, Mapping, Optional
 import httpx
 
 import litellm
+from litellm.llms.xai.route_descriptors import (
+    XAI_NATIVE_GROK_CONTINUATION_RETRY_CAPABILITY,
+    has_grok_native_route_capability,
+)
 from litellm.llms.anthropic.experimental_pass_through.providers.grok import (
     side_channel as _grok_side_channel,
 )
@@ -760,34 +764,44 @@ def _is_codex_auto_agent_spark_candidate(candidate: Optional[dict[str, Any]]) ->
     return str(candidate.get("model") or "") == _CODEX_AUTO_AGENT_SPARK_MODEL
 
 
-def _is_codex_auto_agent_grok_4_5_candidate(
+_CODEX_AUTO_AGENT_NATIVE_GROK_RECOVERY_ROUTE_FAMILIES = frozenset(
+    {
+        "codex_grok_native_responses_adapter",
+        "anthropic_grok_native_responses_adapter",
+    }
+)
+
+
+def _is_codex_auto_agent_native_grok_recovery_candidate(
     candidate: Optional[dict[str, Any]],
 ) -> bool:
     if not isinstance(candidate, dict):
         return False
     if candidate.get("provider") != _CODEX_AUTO_AGENT_XAI_PROVIDER:
         return False
-    model = str(candidate.get("model") or "")
-    if model in {"oa_xai/grok-4.5", "grok-4.5", "xai/grok-4.5"}:
-        return True
     route_family = str(candidate.get("route_family") or "")
-    return route_family in {
-        "codex_xai_oauth_responses_adapter",
-        "codex_grok_native_responses_adapter",
-        "anthropic_grok_native_responses_adapter",
-    } and model.endswith("grok-4.5")
+    if route_family not in _CODEX_AUTO_AGENT_NATIVE_GROK_RECOVERY_ROUTE_FAMILIES:
+        return False
+    return has_grok_native_route_capability(
+        candidate.get("model"),
+        XAI_NATIVE_GROK_CONTINUATION_RETRY_CAPABILITY,
+    )
+
+
+def _is_codex_auto_agent_grok_4_5_candidate(
+    candidate: Optional[dict[str, Any]],
+) -> bool:
+    """Compatibility facade for the former version-named native predicate."""
+
+    return _is_codex_auto_agent_native_grok_recovery_candidate(candidate)
 
 
 def _is_codex_auto_agent_native_grok_4_5_candidate(
     candidate: Optional[dict[str, Any]],
 ) -> bool:
-    if not _is_codex_auto_agent_grok_4_5_candidate(candidate):
-        return False
-    route_family = str((candidate or {}).get("route_family") or "")
-    return route_family in {
-        "codex_grok_native_responses_adapter",
-        "anthropic_grok_native_responses_adapter",
-    }
+    """Compatibility facade for callers using the former private name."""
+
+    return _is_codex_auto_agent_native_grok_recovery_candidate(candidate)
 
 
 def _is_codex_auto_agent_xai_candidate(
@@ -1311,14 +1325,16 @@ def _get_codex_auto_agent_native_grok_continuation_transient_backoff_seconds(
 
 def _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
     *,
-    is_native_grok_4_5_candidate: bool,
     has_continuation_state: bool,
     error_class: Optional[str],
     cooldown_scope: Optional[str],
+    is_native_grok_recovery_candidate: Optional[bool] = None,
+    is_native_grok_4_5_candidate: Optional[bool] = None,
 ) -> bool:
     """Whether this failure may consume the native Grok continuation transient budget.
 
-    Deliberately excludes ``candidate_unavailable`` even when native Grok 4.5 uses
+    Deliberately excludes ``candidate_unavailable`` even when a native Grok
+    recovery-capable route uses
     cooldown scope ``none`` for that class. Generic probe/credential unavailability
     must not enter the same-candidate 502-style retry budget; only bare transient
     internal failures (``upstream_transient_internal``) are eligible.
@@ -1327,7 +1343,11 @@ def _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
     return bool(
         has_continuation_state
         and cooldown_scope == "none"
-        and is_native_grok_4_5_candidate
+        and (
+            is_native_grok_recovery_candidate
+            if is_native_grok_recovery_candidate is not None
+            else is_native_grok_4_5_candidate
+        )
         and _is_codex_auto_agent_transient_internal_error_class(error_class)
     )
 
@@ -1357,7 +1377,6 @@ def _build_codex_auto_agent_native_grok_continuation_retry_metadata(
 
 def _plan_codex_auto_agent_native_grok_continuation_transient_retry(
     *,
-    is_native_grok_4_5_candidate: bool,
     has_continuation_state: bool,
     error_class: Optional[str],
     cooldown_scope: Optional[str],
@@ -1366,6 +1385,8 @@ def _plan_codex_auto_agent_native_grok_continuation_transient_retry(
     model: Optional[str],
     route_family: Optional[str],
     max_attempts: Optional[int] = None,
+    is_native_grok_recovery_candidate: Optional[bool] = None,
+    is_native_grok_4_5_candidate: Optional[bool] = None,
 ) -> tuple[
     bool,
     Optional[float],
@@ -1379,10 +1400,11 @@ def _plan_codex_auto_agent_native_grok_continuation_transient_retry(
     retry is scheduled; callers must not sleep after the final failed attempt.
     """
     if not _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
-        is_native_grok_4_5_candidate=is_native_grok_4_5_candidate,
         has_continuation_state=has_continuation_state,
         error_class=error_class,
         cooldown_scope=cooldown_scope,
+        is_native_grok_recovery_candidate=is_native_grok_recovery_candidate,
+        is_native_grok_4_5_candidate=is_native_grok_4_5_candidate,
     ):
         return False, None, None
 
@@ -1478,23 +1500,23 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
         "upstream_transient_internal",
     }:
         return "request_local"
-    # Native Grok 4.5 is live. Broad candidate-unavailable probes can still
+    # Recovery-capable native Grok routes are live. Broad candidate-unavailable probes can still
     # happen on transient/request-shape blips, so do not evict the native
     # candidate from routing. Other xAI alias candidates (Composer, Grok Build,
     # managed OAuth Grok 4.5, etc.) stay request-local so missing/refreshing
     # credentials cannot leave multi-hour Redis candidate cooldowns.
     # Explicit rate-limit / capacity / quota classes still use candidate scope.
-    if error_class == "candidate_unavailable" and _is_codex_auto_agent_native_grok_4_5_candidate(candidate):
+    if error_class == "candidate_unavailable" and _is_codex_auto_agent_native_grok_recovery_candidate(candidate):
         return "none"
     if error_class == "candidate_unavailable" and _is_codex_auto_agent_xai_candidate(candidate):
         return "request_local"
-    # Native Grok 4.5 malformed tool-call text remains rejected and can still
+    # Recovery-capable native Grok malformed tool-call text remains rejected and can still
     # redispatch in-flight, but must not write a durable candidate cooldown.
     # Composer / Grok Build / non-native candidates keep durable candidate
     # cooldowns for this class.
-    if error_class == "malformed_tool_call_text" and _is_codex_auto_agent_native_grok_4_5_candidate(candidate):
+    if error_class == "malformed_tool_call_text" and _is_codex_auto_agent_native_grok_recovery_candidate(candidate):
         return "request_local"
-    if _is_codex_auto_agent_native_grok_4_5_candidate(
+    if _is_codex_auto_agent_native_grok_recovery_candidate(
         candidate
     ) and _is_codex_auto_agent_transient_internal_error_class(error_class):
         return "none"
@@ -2950,6 +2972,7 @@ _HOST_FUNCTION_NAMES = (
     "_extract_codex_auto_agent_error_tokens",
     "_is_codex_auto_agent_durable_cooldown_error_class",
     "_is_codex_auto_agent_spark_candidate",
+    "_is_codex_auto_agent_native_grok_recovery_candidate",
     "_is_codex_auto_agent_grok_4_5_candidate",
     "_is_codex_auto_agent_native_grok_4_5_candidate",
     "_is_codex_auto_agent_xai_candidate",

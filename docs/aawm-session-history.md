@@ -2018,6 +2018,16 @@ expiry, last successful validation time, and redacted failure class/message.
 Rows must never include access tokens, refresh tokens, raw auth-file contents,
 or the raw auth-file path.
 
+Direct Codex OAuth continuation affinity is server-owned. Only durable session
+ownership or the private ``aawm_codex_affinity_token`` issuer can provide an
+account pin; raw account label/hash/lane fields in request bodies and
+``litellm_metadata`` are ignored. The short-lived token binds issuer,
+audience, route family, model, session, expiry, and a server-keyed opaque
+account reference. It is removed before provider serialization and is not
+persisted in session-history metadata, diagnostics, or provider-auth telemetry.
+Malformed, conflicting, tampered, expired, or cross-scope declared state fails
+closed before provider egress rather than selecting a fresh account.
+
 Grok native and `oa_xai/*` Responses candidates remove request fields, hosted
 tools, and unsupported `reasoning` input items that the selected Grok-family
 model declares unsupported. This does not strip the supported
@@ -2777,6 +2787,16 @@ Native Grok passthrough session identity prefers an explicit
 `x-grok-session-id` header. If that header is absent, LiteLLM uses the native
 `x-grok-conv-id` header as the persisted `session_id` so usage-bearing Grok TUI
 rows remain reportable under a stable conversation identifier.
+
+For a native Grok request with a live server-owned session lease, LiteLLM
+replaces the outbound `x-grok-session-id` with a domain-separated SHA-256
+digest of that lease identity. This provider-safe value overrides every
+caller-supplied session header or metadata value without exposing the raw
+internal identity. Direct and Anthropic-native requests without an
+authoritative lease retain the legacy header and conversation-id resolution
+above. Caller metadata alone
+never establishes owner binding, and parent, child, and auto-review identity
+selection remains owned by the shared session-affinity policy.
 
 Native Grok passthrough model attribution prefers `x-grok-model-override`.
 When that header is absent but the JSON request body contains a supported

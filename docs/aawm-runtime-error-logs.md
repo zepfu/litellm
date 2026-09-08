@@ -1142,6 +1142,41 @@ with the same code remains ``openai_chatgpt_codex_invalid_encrypted_content``.
 The OpenAI API-key class is not hidden-retried as a capacity 502, it warns
 without a generic traceback, and it stays visible to the client.
 
+This sanitation is driven by explicit ``encrypted_content`` fields and typed
+``type=encrypted_content`` parts. LiteLLM does not infer that an ordinary
+string ``output`` is ciphertext, so plaintext tool output, including empty or
+whitespace-only strings, remains unchanged.
+The ``call_id`` and input-item ordering are preserved, as are supported
+structured outputs using ``input_text``, ``input_image``, or ``input_file``.
+The exact serialized request body rejected in the incident was not captured;
+the rejected shape therefore remains unresolved.
+
+## Codex OAuth continuation affinity
+
+Direct Codex OAuth account affinity comes only from durable server-owned session
+ownership or the server-issued ``aawm_codex_affinity_token`` continuation
+value. Raw ``codex_oauth_account_label``, ``codex_oauth_account_hash``,
+``codex_oauth_lane_key``, and ``codex_auto_agent_selected_account_*`` request
+fields never select an account.
+
+The private issuer signs a short-lived HS256 token with the existing
+LiteLLM salt/master key. Its required ``iss``, ``aud``, ``type``, ``version``,
+``route_family``, ``model``, ``session``, ``iat``, and ``exp`` claims bind the
+continuation to the Codex Responses route, model, and session. The account is
+represented by a server-keyed opaque reference resolved against the current
+inventory; raw account labels, account IDs, OAuth credentials, and lane keys
+are not token claims. The token must stay in trusted server continuation state
+and must not be copied into provider metadata or logs.
+
+When no durable owner pin exists, a declared token that is malformed, repeated
+with conflicting values, tampered, expired, cross-session, cross-model,
+cross-route, or unavailable in the current inventory fails before provider
+egress with ``aawm_codex_oauth_affinity_token_invalid``. It does not fall
+through to fresh account selection. The proxy removes the token from the
+provider wire body. Unavailable authenticated pins report only the
+non-portable selection state and bounded reset metadata; they do not expose
+the selected account identity.
+
 A Codex TUI parent that prints local ``/root/hv2_codex_child`` chrome with
 ``No agents completed yet`` is Codex client job chrome, not OpenCode Go
 child-spawn evidence. Go selection for that window still comes from

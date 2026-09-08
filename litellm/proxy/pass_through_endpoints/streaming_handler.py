@@ -48,6 +48,7 @@ from .llm_provider_handlers.vertex_passthrough_logging_handler import (
     VertexPassthroughLoggingHandler,
 )
 from .aawm_alias_routing.audit_persist import _emit_aawm_terminal_error
+from .aawm_adapter_runtime.deferred_success import DeferredPassthroughSuccess
 from .success_handler import PassThroughEndpointLogging
 
 
@@ -1358,6 +1359,7 @@ class PassThroughStreamingHandler:
         upstream_wait_completed_at: Optional[datetime] = None,
         local_prepare_ms: Optional[float] = None,
         error_log_context: Optional[Dict[str, Any]] = None,
+        deferred_success_holder: Optional[DeferredPassthroughSuccess] = None,
     ):
         """
         - Yields chunks from the response
@@ -1876,40 +1878,45 @@ class PassThroughStreamingHandler:
                     "downstream_byte_count": downstream_byte_count,
                 },
             )
-            await safe_finalize(
-                transfer_identity,
-                "completed",
-                extra={
-                    "upstream_chunk_count": chunk_count,
-                    "upstream_byte_count": total_stream_bytes,
-                    "downstream_chunk_count": downstream_chunk_count,
-                    "downstream_byte_count": downstream_byte_count,
-                },
-            )
 
-            precomputed_lines: Optional[List[str]] = None
-            if line_accumulator is not None:
-                precomputed_lines = line_accumulator.finish()
-
-            asyncio.create_task(
-                PassThroughStreamingHandler._route_streaming_logging_to_handler(
-                    litellm_logging_obj=litellm_logging_obj,
-                    passthrough_success_handler_obj=passthrough_success_handler_obj,
-                    response=response,
-                    url_route=url_route,
-                    request_body=request_body or {},
-                    endpoint_type=endpoint_type,
-                    start_time=start_time,
-                    raw_bytes=raw_bytes,
-                    precomputed_lines=precomputed_lines,
-                    end_time=end_time,
-                    passthrough_logging_payload=passthrough_logging_payload,
-                    custom_llm_provider=custom_llm_provider,
-                    success_handler_kwargs=success_handler_kwargs,
-                    local_prepare_ms=local_prepare_ms,
-                    error_log_context=error_log_context,
+            async def _finalize_deferred_success() -> None:
+                await safe_finalize(
+                    transfer_identity,
+                    "completed",
+                    extra={
+                        "upstream_chunk_count": chunk_count,
+                        "upstream_byte_count": total_stream_bytes,
+                        "downstream_chunk_count": downstream_chunk_count,
+                        "downstream_byte_count": downstream_byte_count,
+                    },
                 )
-            )
+                precomputed_lines: Optional[List[str]] = None
+                if line_accumulator is not None:
+                    precomputed_lines = line_accumulator.finish()
+                asyncio.create_task(
+                    PassThroughStreamingHandler._route_streaming_logging_to_handler(
+                        litellm_logging_obj=litellm_logging_obj,
+                        passthrough_success_handler_obj=passthrough_success_handler_obj,
+                        response=response,
+                        url_route=url_route,
+                        request_body=request_body or {},
+                        endpoint_type=endpoint_type,
+                        start_time=start_time,
+                        raw_bytes=raw_bytes,
+                        precomputed_lines=precomputed_lines,
+                        end_time=end_time,
+                        passthrough_logging_payload=passthrough_logging_payload,
+                        custom_llm_provider=custom_llm_provider,
+                        success_handler_kwargs=success_handler_kwargs,
+                        local_prepare_ms=local_prepare_ms,
+                        error_log_context=error_log_context,
+                    )
+                )
+
+            if deferred_success_holder is not None:
+                deferred_success_holder.set_finalizer(_finalize_deferred_success)
+            else:
+                await _finalize_deferred_success()
         except asyncio.CancelledError:
             local_identity = (
                 transfer_identity if "transfer_identity" in locals() else {}
