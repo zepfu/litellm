@@ -9,7 +9,9 @@ host-global integration dependencies, not locally owned functions.
 
 from __future__ import annotations
 
+import asyncio
 import codecs
+import inspect
 import json
 from typing import Any, AsyncIterator, Optional, cast
 
@@ -140,7 +142,218 @@ _RESPONSES_VALIDATION_STATE_ATTR = "_aawm_responses_validation_state"
 _RESPONSES_VALIDATION_COMPLETE_ATTR = "_aawm_responses_validation_complete"
 _RESPONSES_VALIDATION_VALID_ATTR = "_aawm_responses_validation_valid"
 _RESPONSES_VALIDATION_CLEANUP_ATTR = "_aawm_responses_validation_cleanup"
+_RESPONSES_PRE_TERMINAL_VALIDATION_ATTR = (
+    "_aawm_responses_pre_terminal_validation"
+)
+_RESPONSES_BACKGROUND_OWNER_ATTR = "_aawm_responses_background_owner"
+_RESPONSES_PREFETCH_ABORT_ATTR = "_aawm_responses_prefetch_abort"
 _STREAM_CLEANUP_ATTR = "_aawm_streaming_response_cleanup"
+
+
+def _install_responses_background_owner(target: Any) -> Any:
+    existing_owner = getattr(target, _RESPONSES_BACKGROUND_OWNER_ATTR, None)
+    if callable(existing_owner):
+        if getattr(target, "background", None) is None:
+            setattr(target, "background", existing_owner)
+        return existing_owner
+
+    background = getattr(target, "background", None)
+    if not callable(background):
+        return None
+    background_task: Optional[asyncio.Task[Any]] = None
+
+    async def _invoke_background() -> None:
+        result = background()
+        if inspect.isawaitable(result):
+            await result
+
+    async def _run_background_once() -> None:
+        nonlocal background_task
+        if background_task is None:
+            background_task = asyncio.create_task(_invoke_background())
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+            _await_shielded,
+        )
+
+        await _await_shielded(background_task)
+
+    setattr(target, _RESPONSES_BACKGROUND_OWNER_ATTR, _run_background_once)
+    setattr(target, "background", _run_background_once)
+    return _run_background_once
+
+
+def _mark_prefetch_abort_state(
+    target: Any,
+    disposition: Any,
+) -> None:
+    state = getattr(target, _RESPONSES_VALIDATION_STATE_ATTR, None)
+    if not isinstance(state, dict):
+        return
+    cancelled = getattr(disposition, "value", disposition) == "cancelled"
+    reason = (
+        "stream_prefetch_cancelled"
+        if cancelled
+        else "stream_prefetch_aborted"
+    )
+    was_invalid = bool(state.get("invalid"))
+    state.update(
+        {
+            "complete": True,
+            "valid": False,
+            "invalid": True,
+            "invalid_reason": state.get("invalid_reason") or reason,
+            "reason": state.get("reason") if was_invalid else reason,
+        }
+    )
+    setattr(target, _RESPONSES_VALIDATION_COMPLETE_ATTR, True)
+    setattr(target, _RESPONSES_VALIDATION_VALID_ATTR, False)
+    owner_response = getattr(target, "_aawm_upstream_response", None)
+    if owner_response is not None and owner_response is not target:
+        setattr(owner_response, _RESPONSES_VALIDATION_STATE_ATTR, state)
+        setattr(owner_response, _RESPONSES_VALIDATION_COMPLETE_ATTR, True)
+        setattr(owner_response, _RESPONSES_VALIDATION_VALID_ATTR, False)
+
+
+def _install_responses_prefetch_abort_owner(  # noqa: PLR0915
+    target: Any,
+    *,
+    create_wire_trace: bool = False,
+) -> Any:
+    existing_owner = getattr(target, _RESPONSES_PREFETCH_ABORT_ATTR, None)
+    if callable(existing_owner):
+        register = getattr(
+            existing_owner,
+            "_aawm_register_prefetch_continuation",
+            None,
+        )
+        if callable(register):
+            register(target, None)
+        return existing_owner
+
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        OpenAIResponsesWireDisposition,
+        OpenAIResponsesWireTrace,
+        _await_shielded,
+    )
+
+    wire_trace = getattr(target, "wire_trace", None)
+    if create_wire_trace and not callable(
+        getattr(wire_trace, "finalize_prefetch_abort", None)
+    ):
+        wire_trace = OpenAIResponsesWireTrace()
+        setattr(target, "wire_trace", wire_trace)
+    background_owner = _install_responses_background_owner(target)
+    abort_task: Optional[asyncio.Task[Any]] = None
+    latest_response = target
+
+    def _register_prefetch_continuation(
+        response: Any,
+        cleanup: Any,
+    ) -> None:
+        nonlocal latest_response
+        if response is not None:
+            latest_response = response
+        if not callable(cleanup):
+            return
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.repetitive_output import (
+            _compose_stream_cleanups,
+        )
+
+        combined = _compose_stream_cleanups(
+            getattr(target, _STREAM_CLEANUP_ATTR, None),
+            cleanup,
+        )
+        if combined is not None:
+            setattr(target, _STREAM_CLEANUP_ATTR, combined)
+
+    async def _close_resource(resource: Any, message: str) -> None:
+        close = getattr(resource, "aclose", None)
+        if not callable(close):
+            close = getattr(resource, "close", None)
+        if not callable(close):
+            return
+        try:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        except BaseException:
+            verbose_proxy_logger.debug(message, exc_info=True)
+
+    async def _run_abort_sequence(
+        disposition: OpenAIResponsesWireDisposition,
+    ) -> None:
+        if callable(getattr(wire_trace, "finalize_prefetch_abort", None)):
+            try:
+                await wire_trace.finalize_prefetch_abort(disposition)
+            except BaseException:
+                verbose_proxy_logger.debug(
+                    "Failed to finalize Responses prefetch abort",
+                    exc_info=True,
+                )
+        cleanup = getattr(target, _STREAM_CLEANUP_ATTR, None)
+        if callable(cleanup):
+            try:
+                result = cleanup()
+                if inspect.isawaitable(result):
+                    await result
+            except BaseException:
+                verbose_proxy_logger.debug(
+                    "Failed to close Responses prefetch cleanup",
+                    exc_info=True,
+                )
+        await _close_resource(
+            getattr(target, "body_iterator", None),
+            "Failed to close Responses prefetch iterator",
+        )
+        upstream_response = getattr(target, "_aawm_upstream_response", None)
+        if upstream_response is not None and upstream_response is not target:
+            await _close_resource(
+                upstream_response,
+                "Failed to close Responses prefetch upstream",
+            )
+        if callable(background_owner):
+            try:
+                await background_owner()
+            except BaseException:
+                verbose_proxy_logger.debug(
+                    "Failed to complete Responses prefetch background",
+                    exc_info=True,
+                )
+
+    async def _abort_prefetch(
+        disposition: OpenAIResponsesWireDisposition = (
+            OpenAIResponsesWireDisposition.FAILED
+        ),
+    ) -> None:
+        nonlocal abort_task
+        _mark_prefetch_abort_state(latest_response, disposition)
+        if latest_response is not target:
+            _mark_prefetch_abort_state(target, disposition)
+        if abort_task is None:
+            abort_task = asyncio.create_task(_run_abort_sequence(disposition))
+        await _await_shielded(abort_task)
+
+    setattr(
+        _abort_prefetch,
+        "_aawm_register_prefetch_continuation",
+        _register_prefetch_continuation,
+    )
+    setattr(_abort_prefetch, "_aawm_prefetch_abort_target", target)
+    setattr(target, _RESPONSES_PREFETCH_ABORT_ATTR, _abort_prefetch)
+    return _abort_prefetch
+
+
+def prepare_responses_prefetch_lifecycle(
+    target: Any,
+    *,
+    create_wire_trace: bool = False,
+) -> Any:
+    """Install response-local ownership before any bounded stream read."""
+
+    return _install_responses_prefetch_abort_owner(
+        target,
+        create_wire_trace=create_wire_trace,
+    )
 
 
 def install(host_globals: dict) -> None:
@@ -151,6 +364,8 @@ def install(host_globals: dict) -> None:
     rebound object is published to both this module and the host module.
     """
     _mod = globals()
+    host_globals["asyncio"] = asyncio
+    host_globals["inspect"] = inspect
     host_globals["_RESPONSES_VALID_STATUSES"] = _RESPONSES_VALID_STATUSES
     host_globals["_RESPONSES_OUTPUT_ITEM_TYPES"] = _RESPONSES_OUTPUT_ITEM_TYPES
     host_globals["_RESPONSES_VALID_ITEM_STATUSES"] = _RESPONSES_VALID_ITEM_STATUSES
@@ -199,7 +414,22 @@ def install(host_globals: dict) -> None:
     host_globals["_RESPONSES_VALIDATION_CLEANUP_ATTR"] = (
         _RESPONSES_VALIDATION_CLEANUP_ATTR
     )
+    host_globals["_RESPONSES_PRE_TERMINAL_VALIDATION_ATTR"] = (
+        _RESPONSES_PRE_TERMINAL_VALIDATION_ATTR
+    )
+    host_globals["_RESPONSES_BACKGROUND_OWNER_ATTR"] = (
+        _RESPONSES_BACKGROUND_OWNER_ATTR
+    )
+    host_globals["_RESPONSES_PREFETCH_ABORT_ATTR"] = (
+        _RESPONSES_PREFETCH_ABORT_ATTR
+    )
     host_globals["_STREAM_CLEANUP_ATTR"] = _STREAM_CLEANUP_ATTR
+    host_globals["_install_responses_prefetch_abort_owner"] = (
+        _install_responses_prefetch_abort_owner
+    )
+    host_globals["prepare_responses_prefetch_lifecycle"] = (
+        prepare_responses_prefetch_lifecycle
+    )
     for _name in _HOST_FUNCTION_NAMES:
         _obj = _mod[_name]
         _rebound = FunctionType(
@@ -1401,6 +1631,19 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             _RESPONSES_VALIDATION_VALID_ATTR,
             bool(state.get("valid")),
         )
+        owner_response = getattr(target, "_aawm_upstream_response", None)
+        if owner_response is not None and owner_response is not target:
+            setattr(owner_response, _RESPONSES_VALIDATION_STATE_ATTR, state)
+            setattr(
+                owner_response,
+                _RESPONSES_VALIDATION_COMPLETE_ATTR,
+                bool(state.get("complete")),
+            )
+            setattr(
+                owner_response,
+                _RESPONSES_VALIDATION_VALID_ATTR,
+                bool(state.get("valid")),
+            )
 
     def _update_stream_validation_state(
         target: Any,
@@ -1436,31 +1679,51 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             "reason": "awaiting_terminal_validation",
         }
 
-    async def _close_peeked_stream(peeked_response: Any) -> None:
-        iterator = getattr(peeked_response, "body_iterator", None)
-        close = getattr(iterator, "aclose", None)
-        if callable(close):
-            try:
-                result = close()
-                if getattr(result, "__await__", None) is not None:
-                    await result
-                return
-            except BaseException:
-                verbose_proxy_logger.debug(
-                    "Failed to close marked Responses stream after bounded rejection",
-                    exc_info=True,
-                )
-        cleanup = getattr(peeked_response, _STREAM_CLEANUP_ATTR, None)
-        if callable(cleanup):
-            try:
-                result = cleanup()
-                if getattr(result, "__await__", None) is not None:
-                    await result
-            except BaseException:
-                verbose_proxy_logger.debug(
-                    "Failed to close marked Responses stream cleanup",
-                    exc_info=True,
-                )
+    async def _close_peeked_stream(
+        peeked_response: Any,
+        *,
+        disposition: Any = None,
+    ) -> None:
+        owner = getattr(peeked_response, _RESPONSES_PREFETCH_ABORT_ATTR, None)
+        if not callable(owner):
+            owner = _install_responses_prefetch_abort_owner(peeked_response)
+        if disposition is None:
+            from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+                OpenAIResponsesWireDisposition,
+            )
+
+            disposition = OpenAIResponsesWireDisposition.FAILED
+        try:
+            await owner(disposition)
+        except BaseException:
+            verbose_proxy_logger.debug(
+                "Failed to finish marked Responses stream prefetch abort",
+                exc_info=True,
+            )
+
+    prefetch_state = _validated_stream_state()
+    _set_stream_validation_state(response, prefetch_state)
+    owner_response = getattr(response, "_aawm_upstream_response", None)
+    if owner_response is not None and owner_response is not response:
+        _set_stream_validation_state(owner_response, prefetch_state)
+    prepare_responses_prefetch_lifecycle(
+        response,
+        create_wire_trace=adapter
+        in {
+            "codex_auto_agent_grok_native_responses",
+            "codex_auto_agent_xai_oauth_responses",
+        },
+    )
+
+    def _mark_prefetch_abort(reason: str) -> None:
+        _invalidate_stream(response, prefetch_state, reason)
+        _update_stream_validation_state(
+            response,
+            prefetch_state,
+            complete=True,
+            valid=False,
+            reason=reason,
+        )
 
     async def _collect_pending_grok_marker_stream(peek: Any) -> Any:
         if adapter not in {
@@ -1478,18 +1741,13 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
         if not _buffered_sse_has_literal_tool_label_marker(peek.buffered_chunks):
             return peek
 
-        try:
-            collected_chunks = await _extend_marked_stream_until_exhausted_or_ceiling(
-                peek,
-                max_chunks=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS,  # noqa: F821
-                max_bytes=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES,  # noqa: F821
-            )
-        except BaseException:
-            await _close_peeked_stream(peek.response)
-            raise
+        collected_chunks = await _extend_marked_stream_until_exhausted_or_ceiling(
+            peek,
+            max_chunks=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS,  # noqa: F821
+            max_bytes=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES,  # noqa: F821
+        )
 
         if collected_chunks is None:
-            await _close_peeked_stream(peek.response)
             _raise_codex_auto_agent_malformed_tool_call_text_payload(
                 response_body={
                     "status": "incomplete",
@@ -1659,6 +1917,136 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 state["terminal_status"] = None
                 _invalidate_stream(target, state, "missing_terminal_response")
 
+        def _validate_terminal_semantics(
+            *,
+            raise_failed_response: bool,
+        ) -> None:
+            if state.get("complete"):
+                return
+            if state.get("invalid"):
+                _update_stream_validation_state(
+                    target,
+                    state,
+                    complete=True,
+                    valid=False,
+                    reason=state.get("reason") or "invalid_stream",
+                )
+                _raise_codex_auto_agent_invalid_responses_shape(
+                    response_body=terminal_response,
+                    adapter_model=adapter_model,
+                    adapter=adapter,
+                    adapter_label=adapter_label,
+                    stream_event_summaries=event_summaries,
+                )
+            if terminal_response is None:
+                _update_stream_validation_state(
+                    target,
+                    state,
+                    complete=True,
+                    valid=False,
+                    reason="missing_terminal_response",
+                )
+                _raise_codex_auto_agent_invalid_responses_shape(
+                    response_body=None,
+                    adapter_model=adapter_model,
+                    adapter=adapter,
+                    adapter_label=adapter_label,
+                    stream_event_summaries=event_summaries,
+                )
+            if is_repetitive_output_loop_failure(terminal_response):
+                _update_stream_validation_state(
+                    target,
+                    state,
+                    complete=True,
+                    valid=False,
+                    reason="repetitive_output_failure",
+                )
+                return
+            if _responses_body_is_unsuccessful(
+                terminal_response,
+                terminal_event_type=terminal_event_type,
+            ):
+                _update_stream_validation_state(
+                    target,
+                    state,
+                    complete=True,
+                    valid=False,
+                    reason="failed_response",
+                )
+                if raise_failed_response:
+                    _raise_codex_auto_agent_failed_responses_payload(
+                        response_body=terminal_response,
+                        adapter_model=adapter_model,
+                        adapter=adapter,
+                        adapter_label=adapter_label,
+                        stream_event_summaries=event_summaries,
+                    )
+                return
+            if (
+                terminal_event_type not in {"response.completed", "response.done"}
+                or terminal_response.get("status") != "completed"
+            ):
+                _update_stream_validation_state(
+                    target,
+                    state,
+                    complete=True,
+                    valid=False,
+                    reason="unsuccessful_terminal_status",
+                )
+                _raise_codex_auto_agent_invalid_responses_shape(
+                    response_body=terminal_response,
+                    adapter_model=adapter_model,
+                    adapter=adapter,
+                    adapter_label=adapter_label,
+                    stream_event_summaries=event_summaries,
+                )
+            if not _is_responses_shaped_body(terminal_response):
+                _update_stream_validation_state(
+                    target,
+                    state,
+                    complete=True,
+                    valid=False,
+                    reason="invalid_response_shape",
+                )
+                _raise_codex_auto_agent_invalid_responses_shape(
+                    response_body=terminal_response,
+                    adapter_model=adapter_model,
+                    adapter=adapter,
+                    adapter_label=adapter_label,
+                    stream_event_summaries=event_summaries,
+                )
+            _update_stream_validation_state(
+                target,
+                state,
+                complete=True,
+                valid=True,
+                reason="validated_terminal_response",
+            )
+
+        async def _validate_terminal_before_delivery(
+            _terminal_block: bytes,
+            event_type: str,
+            payload: Optional[dict[str, Any]],
+            _disposition: Any,
+        ) -> None:
+            nonlocal terminal_response, terminal_event_type
+            if state.get("complete"):
+                return
+            terminal_event_type = event_type
+            if isinstance(payload, dict) and isinstance(
+                payload.get("response"), dict
+            ):
+                terminal_response = payload["response"]
+            else:
+                terminal_response = payload if isinstance(payload, dict) else None
+            state["terminal_seen"] = True
+            state["terminal_status"] = (
+                terminal_response.get("status")
+                if isinstance(terminal_response, dict)
+                else None
+            )
+            _validate_terminal_semantics(raise_failed_response=False)
+
         def _consume_sse_text(text: str, *, final: bool = False) -> None:
             nonlocal buffer_limit_exceeded, sse_buffer, trailing_cr
             if buffer_limit_exceeded:
@@ -1782,106 +2170,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                     except UnicodeDecodeError:
                         decoder_failed = True
                         _invalidate_stream(target, state, "malformed_sse_event")
-                if state.get("invalid"):
-                    _update_stream_validation_state(
-                        target,
-                        state,
-                        complete=True,
-                        valid=False,
-                        reason=state.get("reason") or "invalid_stream",
-                    )
-                    _raise_codex_auto_agent_invalid_responses_shape(
-                        response_body=terminal_response,
-                        adapter_model=adapter_model,
-                        adapter=adapter,
-                        adapter_label=adapter_label,
-                        stream_event_summaries=event_summaries,
-                    )
-                if terminal_response is None:
-                    _update_stream_validation_state(
-                        target,
-                        state,
-                        complete=True,
-                        valid=False,
-                        reason="missing_terminal_response",
-                    )
-                    _raise_codex_auto_agent_invalid_responses_shape(
-                        response_body=None,
-                        adapter_model=adapter_model,
-                        adapter=adapter,
-                        adapter_label=adapter_label,
-                        stream_event_summaries=event_summaries,
-                    )
-                repetitive_failure = is_repetitive_output_loop_failure(
-                    terminal_response
-                )
-                if repetitive_failure:
-                    _update_stream_validation_state(
-                        target,
-                        state,
-                        complete=True,
-                        valid=False,
-                        reason="repetitive_output_failure",
-                    )
-                    return
-                if _responses_body_is_unsuccessful(
-                    terminal_response,
-                    terminal_event_type=terminal_event_type,
-                ):
-                    _update_stream_validation_state(
-                        target,
-                        state,
-                        complete=True,
-                        valid=False,
-                        reason="failed_response",
-                    )
-                    _raise_codex_auto_agent_failed_responses_payload(
-                        response_body=terminal_response,
-                        adapter_model=adapter_model,
-                        adapter=adapter,
-                        adapter_label=adapter_label,
-                        stream_event_summaries=event_summaries,
-                    )
-                if (
-                    terminal_event_type not in {"response.completed", "response.done"}
-                    or terminal_response.get("status") != "completed"
-                ):
-                    _update_stream_validation_state(
-                        target,
-                        state,
-                        complete=True,
-                        valid=False,
-                        reason="unsuccessful_terminal_status",
-                    )
-                    _raise_codex_auto_agent_invalid_responses_shape(
-                        response_body=terminal_response,
-                        adapter_model=adapter_model,
-                        adapter=adapter,
-                        adapter_label=adapter_label,
-                        stream_event_summaries=event_summaries,
-                    )
-                if not _is_responses_shaped_body(terminal_response):
-                    _update_stream_validation_state(
-                        target,
-                        state,
-                        complete=True,
-                        valid=False,
-                        reason="invalid_response_shape",
-                    )
-                    _raise_codex_auto_agent_invalid_responses_shape(
-                        response_body=terminal_response,
-                        adapter_model=adapter_model,
-                        adapter=adapter,
-                        adapter_label=adapter_label,
-                        stream_event_summaries=event_summaries,
-                    )
-                _update_stream_validation_state(
-                    target,
-                    state,
-                    complete=True,
-                    valid=True,
-                    reason="validated_terminal_response",
-                )
+                _validate_terminal_semantics(raise_failed_response=True)
             except BaseException:
                 if not state.get("complete"):
                     if state.get("invalid"):
@@ -1910,19 +2199,40 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             _RESPONSES_VALIDATION_CLEANUP_ATTR,
             _close_validation_resources,
         )
+        setattr(
+            target,
+            _RESPONSES_PRE_TERMINAL_VALIDATION_ATTR,
+            _validate_terminal_before_delivery,
+        )
         _set_stream_validation_state(target, state)
         return target
 
     if isinstance(response, StreamingResponse):
         event_summaries: list[dict[str, Any]] = []
-        peek = await _aawm_alias_streaming.peek_streaming_response(  # noqa: F821
-            response,
-            max_chunks=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS,  # noqa: F821
-            max_bytes=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES,  # noqa: F821
-            terminalizer=_aawm_alias_streaming._get_stream_timeout_terminalizer(  # noqa: F821
-                response
-            ),
-        )
+        try:
+            peek = await _aawm_alias_streaming.peek_streaming_response(  # noqa: F821
+                response,
+                max_chunks=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS,  # noqa: F821
+                max_bytes=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES,  # noqa: F821
+                terminalizer=_aawm_alias_streaming._get_stream_timeout_terminalizer(  # noqa: F821
+                    response
+                ),
+            )
+        except asyncio.CancelledError:
+            _mark_prefetch_abort("stream_prefetch_cancelled")
+            from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+                OpenAIResponsesWireDisposition,
+            )
+
+            await _close_peeked_stream(
+                response,
+                disposition=OpenAIResponsesWireDisposition.CANCELLED,
+            )
+            raise
+        except BaseException:
+            _mark_prefetch_abort("stream_prefetch_aborted")
+            await _close_peeked_stream(response)
+            raise
         peek = await _collect_pending_grok_marker_stream(peek)
         if not peek.exhausted:
             correlation = intake_context or {}
@@ -1989,7 +2299,8 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             )
             if callable(stream_cleanup):
                 setattr(validated_response, _STREAM_CLEANUP_ATTR, stream_cleanup)
-            validation_state = _validated_stream_state()
+            validation_state = prefetch_state
+            _set_stream_validation_state(validated_response, validation_state)
             _bind_incremental_stream_validation(
                 validated_response,
                 validation_state,
@@ -1997,7 +2308,8 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 reject_malformed_tool_text=True,
             )
             return validated_response
-        validation_state = _validated_stream_state()
+        validation_state = prefetch_state
+        _set_stream_validation_state(peek.response, validation_state)
         validated_response = _bind_incremental_stream_validation(
             peek.response,
             validation_state,
@@ -2118,16 +2430,16 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 reconstructed,
                 source_response=response,
             )
-            _set_stream_validation_state(
-                validated_response,
+            prefetch_state.update(
                 {
                     "complete": True,
                     "valid": True,
                     "terminal_seen": True,
                     "terminal_status": response_body.get("status"),
                     "reason": "validated_terminal_response",
-                },
+                }
             )
+            _set_stream_validation_state(validated_response, prefetch_state)
             return validated_response
 
         async def _replay_iterator() -> Any:
@@ -2158,16 +2470,16 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             reconstructed,
             source_response=response,
         )
-        _set_stream_validation_state(
-            validated_response,
+        prefetch_state.update(
             {
                 "complete": True,
                 "valid": True,
                 "terminal_seen": True,
                 "terminal_status": response_body.get("status"),
                 "reason": "validated_terminal_response",
-            },
+            }
         )
+        _set_stream_validation_state(validated_response, prefetch_state)
         return validated_response
 
     if isinstance(response, Response) and not isinstance(response, StreamingResponse):
