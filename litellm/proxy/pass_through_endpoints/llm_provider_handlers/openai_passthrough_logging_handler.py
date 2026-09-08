@@ -1237,10 +1237,14 @@ class _ResponsesSSEStateTracker:
         """Return one synthetic terminal event when the provider omitted its own."""
         if self._terminal_event_type is not None:
             return None
-        incomplete_reason = self._determine_incomplete_reason()
-        if incomplete_reason is not None:
-            return self._build_incomplete_payload(incomplete_reason)
-        return self._build_completed_payload()
+        # Native OpenAI/ChatGPT Responses completion is authoritative only when
+        # the provider emits ``response.completed``. Reconstructed output state
+        # can still be useful for diagnostics/logging, but it cannot become a
+        # successful wire disposition after EOF.
+        return self._build_incomplete_payload(
+            self._determine_incomplete_reason()
+            or "upstream_stream_ended_without_terminal_event"
+        )
 
     def synthetic_terminal_payload_at_eof(self) -> Optional[Dict[str, Any]]:
         """Compatibility alias for ``classify_clean_eof``."""

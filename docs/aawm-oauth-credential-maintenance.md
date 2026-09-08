@@ -227,13 +227,28 @@ lock. `AAWM_XAI_OAUTH_LOCK_FILE` and `--xai-oauth-lock-file` may be supplied
 only as aliases of that canonical sibling; arbitrary lock paths, lock
 symlinks, and auth-file collisions fail closed.
 
-## Managed xAI egress headers
+## Managed xAI egress boundary (XAI-035/XAI-041)
 
-Managed `oa_xai/*` requests send the selected access token only as
-`Authorization: Bearer ...`. Inbound authorization and duplicate
-`api-key`/`x-api-key` headers are excluded from the managed request, while
-`forward_headers=False` remains in force. The generic OpenAI/Azure header
+Managed `oa_xai/*` requests retain the `xai_oauth` credential family and the
+`xai_oauth_api` route family through transport, output guards, and egress
+telemetry. Native `xai/*`/Grok OIDC requests remain separate
+(`xai_grok_oidc` and `grok_cli_chat_proxy`); neither family may be substituted
+for the other.
+
+The managed API base must be HTTPS on `api.x.ai`, with no URL credentials,
+fragment, non-default port, or query string. The base may be the host root or
+`/v1`; the final request target is restricted to
+`/v1/chat/completions` or `/v1/responses`. Managed requests send the selected
+access token only as `Authorization: Bearer ...`. Inbound authorization and
+duplicate `api-key`/`x-api-key` headers are excluded from the managed request,
+while `forward_headers=False` remains in force. The generic OpenAI/Azure header
 assembler is unchanged for callers that require `api-key`.
+
+Managed xAI transport disables automatic redirect following and rejects a
+`3xx` response before any credential-bearing follow-up request. Egress
+rejections preserve the managed/native family distinction in sanitized
+telemetry; authorization values, access tokens, and full inbound headers are
+never recorded.
 
 ## Codex ordered account inventory (OPENAI-001)
 

@@ -350,10 +350,20 @@ def _raise_unimplemented_stream_policy(
 
 
 def _raise_unremovable_stream(audit: Optional[dict[str, Any]]) -> None:
-    raise HTTPException(
+    exception = HTTPException(
         status_code=409,
         detail={"watermark_output_audit": audit or {"mode": "enforce"}},
     )
+    setattr(
+        exception,
+        "_aawm_policy_failure",
+        {
+            "policy_failure_kind": "watermark_output_rejected",
+            "policy_failure_code": "aawm_watermark_output_rejected",
+            "policy_failure_class": "output_policy",
+        },
+    )
+    raise exception
 
 
 async def _wrap_passthrough_watermark_responses_stream_audit_only(

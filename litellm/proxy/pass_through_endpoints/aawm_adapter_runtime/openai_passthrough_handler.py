@@ -33,6 +33,12 @@ from typing import (
 import httpx
 
 import litellm
+from litellm.llms.xai.route_descriptors import (
+    GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+    GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+    XAI_OAUTH_CREDENTIAL_FAMILY,
+    XAI_OAUTH_ROUTE_FAMILY,
+)
 from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
     load_text_watermark_config,
 )
@@ -611,9 +617,9 @@ class BaseOpenAIPassThroughHandler:
                 ) = oa_xai_context
                 custom_llm_provider = litellm.LlmProviders.XAI
                 forward_headers = False
-                egress_credential_family = "xai"
+                egress_credential_family = XAI_OAUTH_CREDENTIAL_FAMILY
                 managed_xai_oauth_request = True
-                expected_target_family = "xai"
+                expected_target_family = XAI_OAUTH_ROUTE_FAMILY
             elif rt.is_openai_responses_endpoint_fn(endpoint):
                 grok_native_context = await BaseOpenAIPassThroughHandler._prepare_openai_grok_native_oauth_context(
                     endpoint=endpoint,
@@ -633,8 +639,8 @@ class BaseOpenAIPassThroughHandler:
                     api_key = None
                     custom_llm_provider = litellm.LlmProviders.XAI
                     forward_headers = False
-                    egress_credential_family = "xai"
-                    expected_target_family = "xai"
+                    egress_credential_family = GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY
+                    expected_target_family = GROK_NATIVE_OAUTH_ROUTE_FAMILY
                 elif is_codex_responses_request:
                     dispatched_response = await rt.try_dispatch_codex_request_fn(
                         endpoint=endpoint,
