@@ -749,10 +749,9 @@ class PgCollectorState:
         safe_snapshot = _token(snapshot_id, "snapshot_id")
         snapshot = self._snapshots.pop(safe_snapshot, None)
         if snapshot is not None:
-            try:
-                snapshot.connection.rollback()
-            finally:
-                snapshot.connection.close()
+            # The snapshot is read-only; closing the owned libpq connection
+            # releases the server transaction without a second network wait.
+            snapshot.connection.close()
 
     def _release_lease_locked(
         self,
@@ -1108,7 +1107,8 @@ class PgCollectorState:
                     )
                 """
                 self._refresh_snapshot_timeout(snapshot)
-                cur.execute(
+                self.ledger.execute_with_deadline(
+                    cur,
                     scope_cte
                     + """
                     SELECT COUNT(*)
@@ -1119,10 +1119,12 @@ class PgCollectorState:
                       AND observation.is_current_projection
                     """,
                     (account, conversation),
+                    deadline_at=snapshot.deadline_at,
                 )
                 total = int(cur.fetchone()[0])
                 self._refresh_snapshot_timeout(snapshot)
-                cur.execute(
+                self.ledger.execute_with_deadline(
+                    cur,
                     scope_cte
                     + """
                     SELECT observation.observation_id, observation.scope_key,
@@ -1155,6 +1157,7 @@ class PgCollectorState:
                         cursor_id,
                         limit + 1,
                     ),
+                    deadline_at=snapshot.deadline_at,
                 )
                 rows = cur.fetchall()
             has_more = len(rows) > limit
@@ -1271,7 +1274,8 @@ class PgCollectorState:
                     )
                 """
                 self._refresh_snapshot_timeout(snapshot)
-                cur.execute(
+                self.ledger.execute_with_deadline(
+                    cur,
                     scope_cte
                     + """
                     SELECT COUNT(*)
@@ -1281,10 +1285,12 @@ class PgCollectorState:
                     WHERE NOT attempt.tombstone
                     """,
                     (account,),
+                    deadline_at=snapshot.deadline_at,
                 )
                 total_attempts = int(cur.fetchone()[0])
                 self._refresh_snapshot_timeout(snapshot)
-                cur.execute(
+                self.ledger.execute_with_deadline(
+                    cur,
                     scope_cte
                     + """
                     SELECT COUNT(*)
@@ -1294,10 +1300,12 @@ class PgCollectorState:
                     WHERE gap.state <> 'resolved'
                     """,
                     (account,),
+                    deadline_at=snapshot.deadline_at,
                 )
                 open_gaps = int(cur.fetchone()[0])
                 self._refresh_snapshot_timeout(snapshot)
-                cur.execute(
+                self.ledger.execute_with_deadline(
+                    cur,
                     scope_cte
                     + """
                     SELECT stored_scope_key, canonical_scope_key
@@ -1305,10 +1313,12 @@ class PgCollectorState:
                     ORDER BY stored_scope_key
                     """,
                     (account,),
+                    deadline_at=snapshot.deadline_at,
                 )
                 scope_rows = cur.fetchall()
                 self._refresh_snapshot_timeout(snapshot)
-                cur.execute(
+                self.ledger.execute_with_deadline(
+                    cur,
                     scope_cte
                     + """
                     SELECT gap.source_kind, gap.source_id, gap.reason,
@@ -1322,10 +1332,12 @@ class PgCollectorState:
                     LIMIT %s
                     """,
                     (account, MAX_QUEUE_PAGE),
+                    deadline_at=snapshot.deadline_at,
                 )
                 gap_rows = cur.fetchall()
                 self._refresh_snapshot_timeout(snapshot)
-                cur.execute(
+                self.ledger.execute_with_deadline(
+                    cur,
                     scope_cte
                     + """
                     , scoped_attempts AS (
@@ -1750,6 +1762,7 @@ class PgCollectorState:
                         cursor_identity,
                         limit + 1,
                     ),
+                    deadline_at=snapshot.deadline_at,
                 )
                 rows = cur.fetchall()
             has_more = len(rows) > limit
@@ -2927,9 +2940,16 @@ class PgCollectorState:
             # starting the bounded repeatable-read snapshot so the transaction-
             # local timeout settings apply to the actual read.
             self._remaining_snapshot_ms(snapshot_deadline, created_at=created_at)
-            conn.rollback()
+            self.ledger.rollback_with_deadline(
+                conn,
+                deadline_at=snapshot_deadline,
+            )
             self._remaining_snapshot_ms(snapshot_deadline, created_at=created_at)
-            conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            self.ledger.command_with_deadline(
+                conn,
+                "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+                deadline_at=snapshot_deadline,
+            )
             self._remaining_snapshot_ms(snapshot_deadline, created_at=created_at)
             safe_snapshot = uuid4().hex
             snapshot = _ReadSnapshot(
@@ -2946,7 +2966,8 @@ class PgCollectorState:
             )
             self._refresh_snapshot_timeout(snapshot)
             with conn.cursor() as cur:
-                cur.execute(
+                self.ledger.execute_with_deadline(
+                    cur,
                     """
                     SELECT lease.lease_fencing_token, lease.lease_expires_at,
                            state.active_trigger
@@ -2958,6 +2979,7 @@ class PgCollectorState:
                       AND lease.collector_account_id = %s
                     """,
                     (safe_owner_profile, account),
+                    deadline_at=snapshot_deadline,
                 )
                 owner_row = cur.fetchone()
             active_trigger = (
@@ -2977,10 +2999,7 @@ class PgCollectorState:
             return snapshot, True
         except BaseException:
             if conn is not None:
-                try:
-                    conn.rollback()
-                finally:
-                    conn.close()
+                conn.close()
             raise
 
     def _reuse_snapshot(
@@ -3041,14 +3060,20 @@ class PgCollectorState:
 
     def _refresh_snapshot_timeout(self, snapshot: _ReadSnapshot) -> None:
         remaining_ms = self._remaining_snapshot_ms(snapshot.deadline_at)
-        snapshot.connection.execute(
-            "SELECT set_config('statement_timeout', %s, true)",
-            (f"{min(self.ledger.statement_timeout_ms, remaining_ms)}ms",),
-        )
-        snapshot.connection.execute(
-            "SELECT set_config('lock_timeout', %s, true)",
-            (f"{min(self.ledger.lock_timeout_ms, remaining_ms)}ms",),
-        )
+        with snapshot.connection.cursor() as cur:
+            self.ledger.execute_with_deadline(
+                cur,
+                "SELECT set_config('statement_timeout', %s, true)",
+                (f"{min(self.ledger.statement_timeout_ms, remaining_ms)}ms",),
+                deadline_at=snapshot.deadline_at,
+            )
+            remaining_ms = self._remaining_snapshot_ms(snapshot.deadline_at)
+            self.ledger.execute_with_deadline(
+                cur,
+                "SELECT set_config('lock_timeout', %s, true)",
+                (f"{min(self.ledger.lock_timeout_ms, remaining_ms)}ms",),
+                deadline_at=snapshot.deadline_at,
+            )
 
     @staticmethod
     def _remaining_snapshot_ms(
