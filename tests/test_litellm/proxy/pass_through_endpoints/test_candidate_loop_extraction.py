@@ -4225,7 +4225,7 @@ async def test_candidate_loop_cursor_session_continuation_is_session_scoped(  # 
     assert attempt_record["attempted_provider_call"] is False
     assert attempt_record["failure_phase"] == "cursor_session_continuation"
     assert attempt_record["source_error"]
-    assert evidence_calls[0]["cooldown_key"] == selection["cooldown_key"]
+    assert evidence_calls == []
     assert publication_calls == []
     assert terminal_events and terminal_events[0]["exc"].status_code == 409
     assert routing_state.codex.cooldown_until_monotonic_by_key == {}

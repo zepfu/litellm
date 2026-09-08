@@ -316,6 +316,8 @@ _SUPPORTED_REDISPATCH_ERROR_CODES = (
 _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER = (
     "_cursor_session_continuation_failure"
 )
+_CURSOR_RETAINED_TRANSPORT_FAILURE_MARKER = "_cursor_retained_transport_failure"
+_CURSOR_CONTINUATION_EVIDENCE_FIELD = "cursor_continuation_evidence"
 _CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD = "cursor_sanitized_proto_structure"
 _CURSOR_PROTO_STRUCTURE_MAX_DEPTH = 3
 _CURSOR_PROTO_STRUCTURE_MAX_ITEMS = 64
@@ -359,7 +361,10 @@ def _is_cursor_session_continuation_failure(
     return bool(
         isinstance(candidate, Mapping)
         and candidate.get("provider") == "cursor_agent"
-        and getattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, False)
+        and (
+            getattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, False)
+            or getattr(exc, _CURSOR_RETAINED_TRANSPORT_FAILURE_MARKER, False)
+        )
     )
 
 
@@ -3262,6 +3267,13 @@ async def handle_alias_route(  # noqa: PLR0915
                     failure_exc,
                     candidate=candidate,
                 ):
+                    continuation_evidence = getattr(
+                        failure_exc, _CURSOR_CONTINUATION_EVIDENCE_FIELD, None
+                    )
+                    if isinstance(continuation_evidence, dict):
+                        attempt_record[_CURSOR_CONTINUATION_EVIDENCE_FIELD] = dict(
+                            continuation_evidence
+                        )
                     continuation_error_class = (
                         _classify_codex_auto_agent_retryable_exhaustion(
                             failure_exc,
@@ -3323,10 +3335,11 @@ async def handle_alias_route(  # noqa: PLR0915
                             if replay_safety is not None
                             else True
                         )
-                        provider_candidate_attempts = max(
-                            0,
-                            provider_candidate_attempts - 1,
-                        )
+                        if not attempted_provider_call:
+                            provider_candidate_attempts = max(
+                                0,
+                                provider_candidate_attempts - 1,
+                            )
                         deterministically_ineligible_candidate_keys.add(cooldown_key)
                         last_retryable_exc = failure_exc
                         break
@@ -4131,6 +4144,16 @@ def _resolve_failure_plan(
         exc=exc,
         candidate=candidate,
     )
+    if _is_cursor_session_continuation_failure(exc, candidate=candidate):
+        # This is loss of one retained session, not evidence against unrelated
+        # requests. Bypass the evidence accumulator as well as timed cooldowns.
+        return CooldownPublicationPlan(
+            memory_keys=(),
+            durable_keys=(),
+            duration_seconds=0.0,
+            applied_scope="none",
+            request_local_action=None,
+        )
     if (
         _error_signals._is_codex_auto_agent_candidate_deterministically_ineligible(
             exc
