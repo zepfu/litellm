@@ -3111,14 +3111,8 @@ def _codex_oauth_dual_family_remaining(
         _CODEX_OAUTH_QUOTA_FAMILY_OVERALL: None,
         _CODEX_OAUTH_QUOTA_FAMILY_SPARK: None,
     }
-    candidate = state.get("candidate")
-    if not isinstance(candidate, Mapping):
-        return remaining_by_family
-    account_hash = str(
-        candidate.get("codex_oauth_account_hash") or ""
-    ).strip()
-    if not account_hash:
-        return remaining_by_family
+    candidate = state["candidate"]
+    account_hash = str(candidate.get("codex_oauth_account_hash") or "").strip()
 
     windows = alias_routing_state.resolve_normalized_quota_windows_for_account(
         provider=str(candidate.get("provider") or ""),
@@ -3142,7 +3136,7 @@ def _codex_oauth_dual_family_remaining(
             ):
                 continue
             status = str(window.get("status") or "").strip().lower()
-            if status and status != "fresh":
+            if status != "fresh":
                 continue
             if not _codex_oauth_window_is_weekly(window):
                 continue
@@ -3154,7 +3148,7 @@ def _codex_oauth_dual_family_remaining(
                 except (TypeError, ValueError):
                     continue
                 weekly_ages.append(max(0.0, age))
-        if weekly_values:
+        if weekly_values and len(weekly_ages) == len(weekly_values):
             selected_index = weekly_values.index(min(weekly_values))
             remaining_by_family[family] = weekly_values[selected_index]
             weekly_age = (
@@ -3756,8 +3750,15 @@ def _apply_codex_oauth_account_context_to_state(
             state["terminal_reset"] = _build_codex_oauth_terminal_reset_information([state])
         candidate = state["candidate"]
         if _is_codex_oauth_account_candidate(candidate):
-            candidate["selection_group"] = "codex_oauth_accounts"
-            candidate["selection_strategy"] = "weekly_quota_balance"
+            identity = (
+                str(candidate.get("provider") or ""),
+                str(candidate.get("model") or ""),
+                str(candidate.get("route_family") or ""),
+            )
+            candidate["selection_group"] = f"codex_oauth_identity:{identity}"
+            candidate["selection_strategy"] = (
+                "weekly_quota_balance"
+            )
             candidate["selection_choice"] = str(
                 candidate.get("codex_oauth_account_label")
             )
@@ -4200,6 +4201,13 @@ def _select_available_state(
             counts[str(group)] = counts.get(str(group), 0) + 1
         if strategy == "proportional":
             selected_choice = _weighted_choice(choices, weights)
+            if strategy == "weekly_quota_balance":
+                account_state = _select_first_available_codex_oauth_account_state(
+                    states_by_choice[selected_choice],
+                    allow_cooled_down=last_resort,
+                )
+                if account_state is not None:
+                    selected_state = account_state
         elif strategy == "round_robin":
             selected_state = _select_round_robin_available_state(
                 request,
@@ -4207,16 +4215,6 @@ def _select_available_state(
                 group=str(group),
                 ingress=ingress,
             )
-            selected_choice = str(
-                selected_state["candidate"].get("selection_choice") or ""
-            )
-        elif strategy == "weekly_quota_balance":
-            selected_state = _select_first_available_codex_oauth_account_state(
-                tier,
-                allow_cooled_down=last_resort,
-            )
-            if selected_state is None:
-                return None
             selected_choice = str(
                 selected_state["candidate"].get("selection_choice") or ""
             )

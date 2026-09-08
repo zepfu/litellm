@@ -352,6 +352,7 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
     for field in (
         "quota_snapshot_age_seconds",
         "quota_windows",
+        "quota_balancing",
         "failover_ordinal",
         "prior_account_outcome",
         "terminal_reset",
