@@ -707,6 +707,7 @@ def install(host_globals: dict) -> None:
         ("_build_auto_agent_alias_audit_events", _build_auto_agent_alias_audit_events),
         ("_persist_auto_agent_alias_audit_only_events_best_effort", _persist_auto_agent_alias_audit_only_events_best_effort),
         ("_build_auto_agent_terminal_candidate_inventory", _build_auto_agent_terminal_candidate_inventory),
+        ("_provider_attempt_count", _provider_attempt_count),
         ("normalize_schema_rejection", normalize_schema_rejection),
         (
             "resolve_schema_rejection_failure_identity",

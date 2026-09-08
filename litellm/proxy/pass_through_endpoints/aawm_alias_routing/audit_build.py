@@ -354,6 +354,8 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
     for field in (
         "quota_snapshot_age_seconds",
         "quota_windows",
+        "quota_balancing",
+        "selection_diagnostics",
         "failover_ordinal",
         "prior_account_outcome",
         "terminal_reset",
@@ -362,7 +364,14 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
         "candidate_semantic_ineligibility_remaining_seconds",
     ):
         value = candidate.get(field)
-        if value is None:
+        attempt_local = field in {"quota_balancing", "selection_diagnostics"} or (
+            candidate.get("provider") == _CODEX_AUTO_AGENT_NATIVE_PROVIDER
+            and field in {
+                "quota_snapshot_age_seconds", "quota_windows", "failover_ordinal",
+                "prior_account_outcome", "terminal_reset",
+            }
+        )
+        if value is None and not attempt_local:
             value = selection.get(field)
         if value is not None:
             if field == "candidate_semantic_ineligibility_remaining_seconds":
@@ -496,12 +505,19 @@ def _build_auto_agent_alias_audit_events(  # noqa: PLR0915
 
     audit_attempts = attempts
     if not audit_attempts and isinstance(selection.get("candidate"), dict):
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_quota_balance import (
+            snapshot_selection,
+        )
+
         audit_attempts = [
-            _codex_auto_agent_candidate_public_shape(
-                selection["candidate"],
-                lane_key=selection.get("lane_key"),
-                reason=selection.get("selection_reason"),
-            )
+            {
+                **_codex_auto_agent_candidate_public_shape(
+                    selection["candidate"],
+                    lane_key=selection.get("lane_key"),
+                    reason=selection.get("selection_reason"),
+                ),
+                **snapshot_selection(selection),
+            }
         ]
 
     provider_attempt_number = 0

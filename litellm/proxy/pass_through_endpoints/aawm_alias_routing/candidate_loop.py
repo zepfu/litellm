@@ -68,6 +68,7 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.deferred_success 
 from . import codex_oauth as _codex_oauth_mod
 from . import error_signals as _error_signals
 from . import dev_fault_plan as _dev_fault_plan
+from .codex_quota_balance import snapshot_selection
 from .interfaces import (
     AliasRouteServices,
     ClassifyKimiFailureFn,
@@ -1060,6 +1061,7 @@ async def handle_alias_route(  # noqa: PLR0915
     # attempts. Must not reset when the outer candidate-selection loop re-enters.
     native_grok_continuation_transient_provider_attempts = 0
     provider_candidate_attempts = 0
+    request_provider_egress_reached = False
     same_account_transient_attempts_by_slot: dict[Optional[str], int] = {}
     managed_xai_generation_retry_attempted = False
     request_retry_started_at = time.monotonic()
@@ -1177,6 +1179,8 @@ async def handle_alias_route(  # noqa: PLR0915
         attempt_record: dict[str, Any],
         reason: str,
         budget_was_counted: bool,
+        request_provider_egress_reached: bool,
+        selection_provider_egress_reached: bool,
     ) -> None:
         """Refund one counted xAI selection and mark its bounded skip outcome."""
         nonlocal provider_candidate_attempts
@@ -1189,7 +1193,12 @@ async def handle_alias_route(  # noqa: PLR0915
         budget_refunded = (
             attempt_record.get("provider_attempt_budget_refunded") is True
         )
-        if budget_was_counted and not budget_refunded:
+        if (
+            budget_was_counted
+            and not request_provider_egress_reached
+            and not selection_provider_egress_reached
+            and not budget_refunded
+        ):
             provider_candidate_attempts = max(
                 0,
                 provider_candidate_attempts - 1,
@@ -1961,16 +1970,7 @@ async def handle_alias_route(  # noqa: PLR0915
             lane_key=selection.get("lane_key"),
             reason=selection.get("selection_reason"),
         )
-        for field in (
-            "quota_snapshot_age_seconds",
-            "quota_windows",
-            "failover_ordinal",
-            "prior_account_outcome",
-            "terminal_reset",
-        ):
-            value = selection.get(field)
-            if value is not None:
-                attempt_record[field] = value
+        attempt_record.update(snapshot_selection(selection))
         attempt_record["attempted_provider_call"] = False
         if (
             capacity_retry_coordinator is not None
@@ -2009,8 +2009,10 @@ async def handle_alias_route(  # noqa: PLR0915
                     }
                 },
             ))
-        if failover_ordinal == 0:
+        selection_budget_counted = failover_ordinal == 0
+        if selection_budget_counted:
             provider_candidate_attempts += 1
+        selection_provider_egress_reached = False
         # D1-564: provider/account lane admission after selection and before
         # attempt-start / probe lock / provider I/O. Separate from cooldown and
         # session ownership. Fail-fast only: never queue/sleep/background-retry.
@@ -2313,6 +2315,8 @@ async def handle_alias_route(  # noqa: PLR0915
 
                         async def _perform_candidate_request() -> Response:
                             nonlocal attempted_provider_call
+                            nonlocal request_provider_egress_reached
+                            nonlocal selection_provider_egress_reached
                             candidate_is_openai = (
                                 str(candidate.get("provider") or "").strip().lower()
                                 == "openai"
@@ -2420,6 +2424,12 @@ async def handle_alias_route(  # noqa: PLR0915
                                         )
                                 attempt_record["attempted_provider_call"] = (
                                     attempted_provider_call
+                                )
+                                request_provider_egress_reached, selection_provider_egress_reached = (
+                                    request_provider_egress_reached
+                                    or attempted_provider_call,
+                                    selection_provider_egress_reached
+                                    or attempted_provider_call,
                                 )
                                 if "hidden_logical_retry_count" not in attempt_record:
                                     attempt_record["hidden_logical_retry_count"] = (
@@ -3845,7 +3855,13 @@ async def handle_alias_route(  # noqa: PLR0915
                     _account_xai_no_io_selection(
                         attempt_record=attempt_record,
                         reason=xai_no_io_selection_skip_reason,
-                        budget_was_counted=failover_ordinal == 0,
+                        budget_was_counted=selection_budget_counted,
+                        request_provider_egress_reached=(
+                            request_provider_egress_reached
+                        ),
+                        selection_provider_egress_reached=(
+                            selection_provider_egress_reached
+                        ),
                     )
                     if not xai_no_io_selection_reselect_eligible:
                         attempt_record["status"] = "terminal_xai_no_io"

@@ -12,9 +12,29 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, AsyncIterable, AsyncIterator, Awaitable, Callable, Dict, Optional
+from typing import (
+    Any,
+    AsyncIterable,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    Optional,
+)
 
 from starlette.responses import Response, StreamingResponse
+
+
+_POLICY_FAILURE_VALUE_MAX_LENGTH = 128
+
+
+def _bounded_policy_value(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    return normalized[:_POLICY_FAILURE_VALUE_MAX_LENGTH]
 
 
 class OpenAIResponsesWireDisposition(str, Enum):
@@ -33,6 +53,18 @@ class OpenAIResponsesWireState(str, Enum):
     TERMINAL_SENT = "terminal_sent"
     DONE_SENT = "done_sent"
     CLOSED = "closed"
+
+
+_KNOWN_POLICY_FAILURE_CODES = frozenset(
+    {
+        "aawm_repetitive_output_loop",
+        "aawm_watermark_output_rejected",
+    }
+)
+
+
+def _is_local_policy_failure_code(code: Any) -> bool:
+    return str(code or "").strip() in _KNOWN_POLICY_FAILURE_CODES
 
 
 @dataclass
@@ -61,6 +93,9 @@ class OpenAIResponsesWireTrace:
     _finalize_transport: Optional[
         Callable[[OpenAIResponsesWireDisposition], Awaitable[None]]
     ] = field(default=None, repr=False, compare=False)
+    _finalize_prefetch_abort: Optional[
+        Callable[[OpenAIResponsesWireDisposition], Awaitable[None]]
+    ] = field(default=None, repr=False, compare=False)
     _terminal_body: Optional[bytes] = field(
         default=None,
         repr=False,
@@ -76,6 +111,29 @@ class OpenAIResponsesWireTrace:
         repr=False,
         compare=False,
     )
+    _post_finalization_callbacks: list[
+        Callable[[Dict[str, Any]], Awaitable[None]]
+    ] = field(
+        default_factory=list,
+        repr=False,
+        compare=False,
+    )
+    _post_finalization_task: Optional[Any] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _finalized_snapshot: Optional[Dict[str, Any]] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _delivered_snapshot: Optional[Dict[str, Any]] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    asgi_delivery_complete: bool = False
 
     def publish_request_commitment(self) -> None:
         request = self._request
@@ -122,7 +180,100 @@ class OpenAIResponsesWireTrace:
             "close_error": self.close_error,
             "finalization_started": self.finalization_started,
             "finalized": self.finalized,
+            "asgi_delivery_complete": self.asgi_delivery_complete,
+            "policy_failure_kind": self.metadata.get("policy_failure_kind"),
+            "policy_failure_code": self.metadata.get("policy_failure_code"),
+            "policy_failure_class": self.metadata.get("policy_failure_class"),
         }
+
+    def record_policy_failure(
+        self,
+        *,
+        kind: Any = None,
+        code: Any = None,
+        classification: Any = None,
+    ) -> bool:
+        """Freeze a bounded policy cause before delivered consumers run."""
+
+        values = {
+            "policy_failure_kind": _bounded_policy_value(kind),
+            "policy_failure_code": _bounded_policy_value(code),
+            "policy_failure_class": _bounded_policy_value(classification),
+        }
+        if not any(values.values()):
+            return False
+        for key, value in values.items():
+            if value is not None and self.metadata.get(key) is None:
+                self.metadata[key] = value
+        self.publish_request_commitment()
+        return True
+
+    def record_policy_failure_from_payload(self, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        response_payload = payload.get("response")
+        if not isinstance(response_payload, dict):
+            return False
+        metadata = response_payload.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            return False
+        error = response_payload.get("error")
+        if not isinstance(error, dict):
+            error = payload.get("error")
+        if not isinstance(error, dict):
+            error = {}
+        code = error.get("code") or metadata.get("error_code")
+        if not _is_local_policy_failure_code(code):
+            return False
+        kind = metadata.get("failure_kind")
+        classification = (
+            metadata.get("failure_class")
+            or metadata.get("policy_failure_class")
+            or kind
+        )
+        return self.record_policy_failure(
+            kind=kind,
+            code=code,
+            classification=classification,
+        )
+
+    def record_policy_failure_from_exception(self, exc: BaseException) -> bool:
+        marker = getattr(exc, "_aawm_policy_failure", None)
+        if not isinstance(marker, dict):
+            detail = getattr(exc, "detail", None)
+            if isinstance(detail, dict):
+                marker = detail
+        if not isinstance(marker, dict):
+            return False
+        metadata = marker.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = marker
+        error = marker.get("error")
+        if not isinstance(error, dict):
+            error = {}
+        marker_code = (
+            error.get("code")
+            or metadata.get("error_code")
+            or marker.get("policy_failure_code")
+        )
+        if not _is_local_policy_failure_code(marker_code):
+            return False
+        return self.record_policy_failure(
+            kind=(
+                metadata.get("failure_kind")
+                or metadata.get("policy_failure_kind")
+                or marker.get("policy_failure_kind")
+            ),
+            code=marker_code,
+            classification=(
+                metadata.get("failure_class")
+                or metadata.get("policy_failure_class")
+                or marker.get("policy_failure_class")
+                or metadata.get("failure_kind")
+            ),
+        )
 
     def record_response_start_delivery(self) -> None:
         """Record headers only after the ASGI send completed."""
@@ -159,6 +310,84 @@ class OpenAIResponsesWireTrace:
                 self.state = OpenAIResponsesWireState.BODY_STARTED
         self.publish_request_commitment()
 
+    def register_post_finalization_callback(
+        self,
+        callback: Callable[[Dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        """Register a consumer that runs after final disposition delivery."""
+
+        if self._delivered_snapshot is not None:
+            return
+        self._post_finalization_callbacks.append(callback)
+
+    def record_asgi_delivery_complete(self) -> None:
+        """Freeze the delivered snapshot after the response attempt finishes."""
+
+        self.asgi_delivery_complete = True
+        if self.finalized:
+            delivered_snapshot = dict(
+                self._finalized_snapshot or self.snapshot()
+            )
+            delivered_snapshot["asgi_delivery_complete"] = True
+            self._delivered_snapshot = delivered_snapshot
+            request = self._request
+            state = getattr(request, "state", None)
+            if state is not None:
+                try:
+                    setattr(
+                        state,
+                        "_aawm_openai_responses_delivered_snapshot",
+                        dict(delivered_snapshot),
+                    )
+                except Exception:
+                    pass
+        self.publish_request_commitment()
+
+    async def run_post_finalization_callbacks(self) -> None:
+        """Run terminal consumers against one immutable delivered snapshot."""
+
+        if not self.finalized or not self.asgi_delivery_complete:
+            return
+        if self._post_finalization_task is None:
+            snapshot = dict(
+                self._delivered_snapshot
+                or self._finalized_snapshot
+                or self.snapshot()
+            )
+            callbacks = tuple(self._post_finalization_callbacks)
+
+            async def _run_callbacks() -> None:
+                for callback in callbacks:
+                    try:
+                        await callback(dict(snapshot))
+                    except Exception as exc:  # noqa: BLE001
+                        self.metadata["post_finalization_callback_error"] = (
+                            type(exc).__name__
+                        )
+
+            self._post_finalization_task = asyncio.create_task(_run_callbacks())
+        await _await_shielded(self._post_finalization_task)
+
+    async def finalize_prefetch_abort(
+        self,
+        disposition: OpenAIResponsesWireDisposition,
+    ) -> None:
+        """Finalize an aborted prefetch without downstream ASGI delivery."""
+
+        async def _run() -> None:
+            finalizer = self._finalize_prefetch_abort
+            if finalizer is not None:
+                await finalizer(disposition)
+                return
+            if self._finalize_transport is not None:
+                await self._finalize_transport(disposition)
+            if not self.finalized:
+                await self._finalize_disposition(disposition, None)
+            self.record_asgi_delivery_complete()
+            await self.run_post_finalization_callbacks()
+
+        await _await_shielded(_run())
+
     async def _finalize_disposition(
         self,
         disposition: OpenAIResponsesWireDisposition,
@@ -186,6 +415,7 @@ class OpenAIResponsesWireTrace:
                 finally:
                     self.finalized = True
                     self.commitment = "finalized"
+                    self._finalized_snapshot = self.snapshot()
                     self.publish_request_commitment()
 
             finalization_task = asyncio.create_task(_run_finalization())
@@ -508,6 +738,21 @@ class OpenAIResponsesWireCoordinator:
             if not self._closed:
                 await _await_shielded(self._close_source())
 
+    async def finalize_prefetch_abort(
+        self,
+        disposition: OpenAIResponsesWireDisposition,
+    ) -> None:
+        """Publish no-delivery bookkeeping before closing the transport."""
+
+        try:
+            if not self.trace.finalized:
+                await self._notify(disposition)
+            self.trace.record_asgi_delivery_complete()
+            await self.trace.run_post_finalization_callbacks()
+        finally:
+            if not self._closed:
+                await _await_shielded(self._close_source())
+
     def _discard_partial_buffer(self) -> None:
         if self._buffer:
             self.trace.partial_frame_discarded = True
@@ -595,6 +840,7 @@ class OpenAIResponsesWireCoordinator:
                         return
                     disposition = _terminal_disposition(event_type, payload)
                     if disposition is not None:
+                        self.trace.record_policy_failure_from_payload(payload)
                         if saw_done:
                             self.trace.upstream_done_suppressed += 1
                         terminal_response_payload = (
@@ -697,15 +943,23 @@ class OpenAIResponsesWireCoordinator:
             self._discard_partial_buffer()
             await self.finalize_transport(OpenAIResponsesWireDisposition.DISCONNECTED)
             raise
-        except Exception:
+        except Exception as exc:
             self._discard_partial_buffer()
+            policy_failure_recorded = (
+                self.trace.record_policy_failure_from_exception(exc)
+            )
             if self.trace.terminal_selected:
                 await self.finalize_transport(OpenAIResponsesWireDisposition.FAILED)
                 return
             if self.trace.first_body_sent or self.trace.response_start_sent:
                 async for emitted in self._emit_synthetic_terminal(
                     disposition=OpenAIResponsesWireDisposition.FAILED,
-                    reason="openai_responses_wire_source_error",
+                    reason=(
+                        self.trace.metadata.get("policy_failure_code")
+                        or self.trace.metadata.get("policy_failure_kind")
+                        if policy_failure_recorded
+                        else "openai_responses_wire_source_error"
+                    ),
                 ):
                     yield emitted
                 await _await_shielded(self._close_source())
@@ -766,7 +1020,7 @@ class OpenAIResponsesStreamingResponse(StreamingResponse):
                         await _await_shielded(
                             finalizer(OpenAIResponsesWireDisposition.DISCONNECTED)
                         )
-                    except Exception as exc:  # noqa: BLE001
+                    except BaseException as exc:  # noqa: BLE001
                         self.wire_trace.metadata[
                             "disposition_callback_error"
                         ] = type(exc).__name__
@@ -776,10 +1030,19 @@ class OpenAIResponsesStreamingResponse(StreamingResponse):
                             OpenAIResponsesWireDisposition.DISCONNECTED,
                             self._on_disposition,
                         )
-                    except Exception as exc:  # noqa: BLE001
+                    except BaseException as exc:  # noqa: BLE001
                         self.wire_trace.metadata[
                             "disposition_callback_error"
                         ] = type(exc).__name__
+            self.wire_trace.record_asgi_delivery_complete()
+            try:
+                await _await_shielded(
+                    self.wire_trace.run_post_finalization_callbacks()
+                )
+            except BaseException as exc:  # noqa: BLE001
+                self.wire_trace.metadata[
+                    "post_finalization_callback_error"
+                ] = type(exc).__name__
             self.wire_trace.metadata.update(self.wire_trace.snapshot())
 
 
@@ -808,10 +1071,11 @@ class OpenAIResponsesBufferedResponse(Response):
         self,
         disposition: OpenAIResponsesWireDisposition,
     ) -> None:
-        await self.wire_trace._finalize_disposition(
-            disposition,
-            self._on_disposition,
-        )
+        finalizer = self.wire_trace._finalize_transport
+        if finalizer is not None:
+            await finalizer(disposition)
+            return
+        await self.wire_trace._finalize_disposition(disposition, self._on_disposition)
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         async def tracked_send(message: Dict[str, Any]) -> None:
@@ -836,6 +1100,15 @@ class OpenAIResponsesBufferedResponse(Response):
         else:
             await self._finalize(self._disposition)
         finally:
+            self.wire_trace.record_asgi_delivery_complete()
+            try:
+                await _await_shielded(
+                    self.wire_trace.run_post_finalization_callbacks()
+                )
+            except BaseException as exc:  # noqa: BLE001
+                self.wire_trace.metadata[
+                    "post_finalization_callback_error"
+                ] = type(exc).__name__
             self.wire_trace.metadata.update(self.wire_trace.snapshot())
 
 
@@ -844,11 +1117,12 @@ def wrap_openai_responses_stream(
     *,
     upstream_response: Any = None,
     on_disposition: Optional[WireDispositionCallback] = None,
+    trace: Optional[OpenAIResponsesWireTrace] = None,
     model: Optional[str] = None,
 ) -> tuple[AsyncIterator[bytes], OpenAIResponsesWireTrace]:
     """Wrap a processed stream and return its iterator plus lifecycle trace."""
 
-    trace = OpenAIResponsesWireTrace()
+    trace = trace or OpenAIResponsesWireTrace()
     coordinator = OpenAIResponsesWireCoordinator(
         source,
         upstream_response=upstream_response,
@@ -857,4 +1131,5 @@ def wrap_openai_responses_stream(
         model=model,
     )
     trace._finalize_transport = coordinator.finalize_transport
+    trace._finalize_prefetch_abort = coordinator.finalize_prefetch_abort
     return coordinator.__aiter__(), trace

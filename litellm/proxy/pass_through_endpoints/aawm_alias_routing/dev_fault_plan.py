@@ -21,6 +21,7 @@ from . import audit_build as _audit_build
 from . import audit_persist as _audit_persist
 from . import codex_oauth as _codex_oauth
 from . import selection as _selection
+from .codex_quota_balance import snapshot_selection
 from .selection import (
     _attempt_has_provider_call,
     _provider_attempt_count,
@@ -504,16 +505,7 @@ def _new_direct_attempt_record(
         lane_key=selection.get("lane_key"),
         reason=selection.get("selection_reason"),
     )
-    for field in (
-        "quota_snapshot_age_seconds",
-        "quota_windows",
-        "failover_ordinal",
-        "prior_account_outcome",
-        "terminal_reset",
-    ):
-        value = selection.get(field)
-        if value is not None:
-            attempt_record[field] = value
+    attempt_record.update(snapshot_selection(selection))
     attempt_record["attempted_provider_call"] = False
     _direct_attempts(request).append(attempt_record)
     setattr(
