@@ -273,6 +273,13 @@ parser. Finite integral response values become JSON integers in both JSON and
 SSE output. Fractional values, unrelated numeric arguments, original tool names,
 and the caller's replay definitions remain unchanged.
 
+Native Grok and managed xAI Codex routes repair supported literal tool-call
+text in JSON and fully buffered Responses output. Once a stream is being
+forwarded lazily, malformed tool-call text instead fails closed before its
+successful terminal event and deferred session-owner promotion. LiteLLM does
+not replay already forwarded text as executable calls or buffer an unbounded
+response to repair it.
+
 ## Responses API Instructions
 
 xAI Responses does not accept OpenAI's top-level `instructions` field. On
