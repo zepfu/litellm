@@ -572,15 +572,6 @@ paths, credential fields, or filesystem metadata. The separate nonsecret
 lifecycle fields, never token values. Configuration conflicts return sanitized
 errors without selecting an identity or contacting the provider.
 
-Managed xAI refresh observations distinguish identity-only bootstrap from token
-refresh with `identity_only`, `identity_bootstrapped`, and `identity_verified`.
-`identity_previous_generation` identifies a metadata-only publication so
-scheduled and passive observations retain failures for the unchanged refresh
-grant. A completed bootstrap has zero token-endpoint attempts; pending or
-mismatched identity remains unavailable even with an unexpired access token.
-See [verified account identity](aawm-oauth-credential-maintenance.md#managed-xai-verified-account-identity)
-for the writer contract and private metadata restrictions.
-
 Combined credential/process health requires **both** credential records to have:
 
 - a current access credential (`key` or `access_token`)
