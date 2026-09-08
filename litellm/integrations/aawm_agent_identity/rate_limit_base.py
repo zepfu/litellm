@@ -436,6 +436,8 @@ def _infer_rate_limit_client_family(
         or model_lower.startswith(("opencode/", "opencode-zen/", "zen/"))
     ):
         return "opencode_zen"
+    if credential_family == "xai_grok_oidc" or metadata.get("grok_native_oauth_managed") is True:
+        return "grok-build"
     if (
         "xai_oauth" in source_lower
         or credential_family == "xai_oauth"
@@ -792,6 +794,7 @@ def _rate_limit_candidate_roots(kwargs: Dict[str, Any], result: Any) -> List[Any
         "anthropic_response_headers",
         "anthropic_rate_limit_headers",
         "xai_oauth_response_headers",
+        "xai_grok_oidc_response_headers",
     ):
         if key in metadata:
             roots.append(metadata.get(key))

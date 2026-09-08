@@ -174,6 +174,14 @@ Reset values may be bounded durations, epoch timestamps, ISO timestamps, or
 HTTP-date values. Malformed, expired, non-finite, and unreasonably future
 values are ignored instead of creating a durable cooldown.
 
+Native Grok OIDC and managed xAI OAuth responses keep separate rate-limit
+observation identities. Native headers are captured under
+`xai_grok_oidc_response_headers` and labeled with the `xai_grok_oidc`
+credential family and `grok-build` client family; managed headers use
+`xai_oauth_response_headers` and the `xai_oauth` client family. A legacy
+native observation under the managed key is read only when native metadata
+proves ownership, and authorization or unrelated headers are excluded.
+
 ## OAuth Credential Scope Selection
 
 Managed xAI OAuth and native Grok OIDC credential files must contain the exact
