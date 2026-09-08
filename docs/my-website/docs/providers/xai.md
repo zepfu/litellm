@@ -158,6 +158,16 @@ LiteLLM sends `store=false` automatically. This applies to URL and base64
 image forms on both native xAI and managed xAI OAuth routes. Text-only
 requests preserve the caller's explicit `store` value or the provider default.
 
+## Native Grok Route Capabilities
+
+Native `xai/grok-4.5` and `xai/grok-4.6` declare the
+`native_grok_continuation_retry` capability in the canonical xAI model
+metadata. Native recovery and cooldown handling require both this explicit
+capability and a native Grok route family. Managed `oa_xai/*`, Cursor, Composer,
+Grok Build, and unprofiled future models do not inherit the native policy.
+Malformed native output remains request-local and does not create a durable
+candidate cooldown.
+
 ## Sample Usage - Vision
 
 ```python showLineNumbers title="LiteLLM python sdk usage - Vision"
