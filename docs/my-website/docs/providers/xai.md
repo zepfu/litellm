@@ -151,6 +151,25 @@ observability, routing, authentication, and session metadata remain in the
 separate `litellm_metadata` structure and are never merged into caller
 top-level `metadata`.
 
+## Rate-limit handling
+
+For an xAI provider `429`, LiteLLM uses a valid `Retry-After` value first.
+Otherwise it uses the request or token reset header for the exhausted
+dimension. If the response does not identify a usable dimension-specific
+reset, `x-ratelimit-reset` and `x-rate-limit-reset` are bounded generic
+fallbacks. When the response does not identify the exhausted dimension and
+both dimension-specific values are valid, LiteLLM waits for the later reset.
+
+Retry values may be bounded durations, timestamps, ISO timestamps, or
+HTTP-date values. Malformed, expired, non-finite, and unreasonably future
+values are ignored instead of creating a durable cooldown.
+
+Native Grok OIDC and managed xAI OAuth headers are recorded as separate
+observation sources. When xAI supplies quota values without reset evidence,
+the observation leaves the reset time and quota period unknown; LiteLLM does
+not estimate a monthly boundary. Explicit provider reset or billing-period
+evidence is retained.
+
 ## Sample Usage - Vision
 
 ```python showLineNumbers title="LiteLLM python sdk usage - Vision"
