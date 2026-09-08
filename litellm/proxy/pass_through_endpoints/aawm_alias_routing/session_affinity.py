@@ -140,6 +140,14 @@ class SessionOwnerLease:
 
 
 @dataclass(frozen=True)
+class SessionOwnerLeaseRebindResult:
+    """Exact outcome of a validated portable failover lease rebinding."""
+
+    rebound: bool
+    rejection_reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class SessionOwnerReplaySafetyResult:
     """Pure structural replay-safety classification for one request body."""
 
@@ -864,6 +872,36 @@ def _hosted_provider_from_attributes(attrs: Mapping[str, Any]) -> str:
     return provider
 
 
+def derive_session_owner_effective_identity(
+    base_session_identity: Optional[str],
+) -> Optional[str]:
+    """Derive, without activating, the first-generation redispatch identity."""
+
+    base = _clean_optional_str(base_session_identity)
+    if base is None:
+        return None
+    digest = hashlib.sha256(
+        (
+            _SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_DOMAIN_SEPARATOR + base
+        ).encode("utf-8")
+    ).hexdigest()
+    return (
+        f"{_SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX}{digest}"
+    )
+
+
+def is_session_owner_redispatch_effective_identity(
+    session_identity: Optional[str],
+) -> bool:
+    """Return whether an identity is already a first-generation derived id."""
+
+    identity = _clean_optional_str(session_identity)
+    return bool(
+        identity
+        and identity.startswith(_SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX)
+    )
+
+
 def _hosted_providers_match(
     left: Mapping[str, Any],
     right: Optional[Mapping[str, Any]] = None,
@@ -1482,6 +1520,24 @@ def owner_record_as_affinity_hint(
     if attrs.get("account_lane") and include_account_identity:
         affinity["codex_oauth_lane_key"] = attrs.get("account_lane")
     return {k: v for k, v in affinity.items() if v is not None}
+
+
+def owner_record_as_strict_affinity_hint(
+    owner_record: Optional[Mapping[str, Any]],
+    *,
+    preserve_account_identity: bool = False,
+) -> Optional[dict[str, Any]]:
+    if owner_record is None or not isinstance(owner_record, Mapping):
+        return None
+    if _record_state(owner_record) not in {
+        SessionOwnerRecordState.OWNED.value,
+        SessionOwnerRecordState.RESERVED.value,
+    }:
+        return None
+    return owner_record_as_affinity_hint(
+        owner_record,
+        preserve_account_identity=preserve_account_identity,
+    )
 
 
 def _build_reserved_record(
@@ -2608,7 +2664,13 @@ def start_session_owner_lease_renewal(
     reservation_ttl_seconds: float = _DEFAULT_RESERVATION_TTL_SECONDS,
     renewal_interval_seconds: Optional[float] = None,
 ) -> Optional[Any]:
-    """Start or reuse the response-owned renewer for a held reservation."""
+    """Start a response-owned renewer for a still-held reservation.
+
+    ``run_with_session_owner_lease_renewal`` owns its task only for the
+    provider operation. Deferred responses need the same renewal contract
+    while their body iterator is being consumed, so the response lifecycle
+    takes ownership of a separate task and joins it during finalization.
+    """
 
     if not _session_owner_lease_is_renewable(lease):
         return None
@@ -3175,6 +3237,389 @@ async def finalize_request_session_owner_lease(
             request=request,
         )
     return result
+
+
+def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
+    response: Any,
+    *,
+    request: Any,
+    lease: Optional[SessionOwnerLease],
+    attributes: Optional[Mapping[str, Any]] = None,
+    candidate: Optional[Mapping[str, Any]] = None,
+    failure_phase: str = "session_owner_stream_promote",
+    success_finalizer: Optional[
+        Callable[[], Awaitable[Optional[SessionOwnerMutationResult]]]
+    ] = None,
+    success_outcomes: Optional[set[SessionOwnerMutationOutcome]] = None,
+    on_success: Optional[Callable[[], Awaitable[None]]] = None,
+    on_failure: Optional[Callable[[Optional[BaseException]], Awaitable[None]]] = None,
+) -> bool:
+    """Bind ownership to the complete, validated response stream.
+
+    The provider operation ends when a ``StreamingResponse`` is constructed,
+    but ownership remains pending until the response validator has observed a
+    terminal valid event and the client-side iterator reaches EOF. The
+    response therefore owns renewal, finalization, and iterator cleanup.
+    """
+
+    from fastapi.responses import StreamingResponse
+
+    if not isinstance(response, StreamingResponse):
+        return False
+    if getattr(
+        response,
+        "_aawm_session_owner_deferred_finalizer_bound",
+        False,
+    ):
+        return True
+    original_iterator = getattr(response, "body_iterator", None)
+    if original_iterator is None:
+        return False
+
+    renewal_task = start_session_owner_lease_renewal(lease)
+
+    async def _promote() -> Optional[SessionOwnerMutationResult]:
+        return await finalize_session_owner_lease_on_success(
+            lease,
+            attributes=attributes,
+            candidate=candidate,
+        )
+
+    if success_finalizer is None:
+        success_finalizer = _promote
+    if success_outcomes is None:
+        success_outcomes = {
+            SessionOwnerMutationOutcome.PROMOTED,
+            SessionOwnerMutationOutcome.ALREADY_OWNED,
+        }
+
+    def _validation_status() -> tuple[bool, str]:
+        state = getattr(response, "_aawm_responses_validation_state", None)
+        if isinstance(state, Mapping):
+            complete = state.get("complete") is True
+            valid = state.get("valid") is True
+            terminal_seen = state.get("terminal_seen") is True
+            terminal_status = state.get("terminal_status")
+            if (
+                complete
+                and valid
+                and terminal_seen
+                and terminal_status == "completed"
+            ):
+                return True, ""
+            reason = state.get("reason")
+            if complete and valid and terminal_seen:
+                reason = "response validation terminal status was not completed"
+            return (
+                False,
+                str(reason)
+                if reason is not None
+                else "response validation did not reach a valid terminal event",
+            )
+        return False, "response validation state was not available"
+
+    def _mutation_error(reason: str) -> SessionOwnerMutationResult:
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.ERROR,
+            session_identity=(
+                lease.session_identity if lease is not None else None
+            ),
+            cache_key=lease.cache_key if lease is not None else None,
+            reservation_token=(
+                lease.reservation_token if lease is not None else None
+            ),
+            error=reason,
+        )
+
+    def _raise_structured_failure(
+        *,
+        mutation: SessionOwnerMutationResult,
+        phase: str,
+    ) -> None:
+        raise_session_owner_redispatch_required(
+            session_identity=(
+                lease.session_identity if lease is not None else None
+            ),
+            mutation=mutation,
+            candidate=candidate,
+            failure_phase=phase,
+            attempted_provider_call=True,
+            request=request,
+        )
+
+    def _renewal_error() -> Optional[BaseException]:
+        if renewal_task is None or lease is None:
+            return None
+        return _session_owner_renewal_task_error(renewal_task, lease)
+
+    finalization_task: Optional[Any] = None
+
+    async def _notify_failure(cause: Optional[BaseException]) -> None:
+        if on_failure is not None:
+            await on_failure(cause)
+
+    async def _attempt_failure_cleanup(
+        cause: Optional[BaseException],
+    ) -> tuple[
+        Optional[SessionOwnerMutationResult],
+        Optional[BaseException],
+    ]:
+        """Release a failed deferred lease without losing the failure callback."""
+        cleanup_task = asyncio.ensure_future(
+            finalize_session_owner_lease_on_failure(lease)
+        )
+        release_result: Optional[SessionOwnerMutationResult] = None
+        cleanup_error: Optional[BaseException] = None
+        try:
+            release_result = await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            try:
+                release_result = await asyncio.shield(cleanup_task)
+            except BaseException as exc:  # noqa: BLE001
+                cleanup_error = exc
+        except BaseException as exc:  # noqa: BLE001
+            cleanup_error = exc
+        try:
+            await _notify_failure(cause)
+        except BaseException as exc:  # noqa: BLE001
+            if cleanup_error is None:
+                cleanup_error = exc
+        return release_result, cleanup_error
+
+    async def _run_finalization(
+        success: bool,
+        cause: Optional[BaseException],
+    ) -> None:
+        if not success:
+            release_result = await finalize_session_owner_lease_on_failure(lease)
+            await _notify_failure(cause)
+            if (
+                cause is None
+                and release_result is not None
+                and release_result.outcome is SessionOwnerMutationOutcome.ERROR
+            ):
+                _raise_structured_failure(
+                    mutation=release_result,
+                    phase=f"{failure_phase}_release",
+                )
+            return
+
+        renewal_error = _renewal_error()
+        if renewal_error is not None:
+            release_result = await finalize_session_owner_lease_on_failure(lease)
+            await _notify_failure(renewal_error)
+            _raise_structured_failure(
+                mutation=(
+                    release_result
+                    if release_result is not None
+                    and release_result.outcome
+                    is SessionOwnerMutationOutcome.ERROR
+                    else _mutation_error(str(renewal_error))
+                ),
+                phase="session_owner_reservation_renewal",
+            )
+
+        validation_ok, validation_reason = _validation_status()
+        if not validation_ok:
+            await finalize_session_owner_lease_on_failure(lease)
+            validation_error = RuntimeError(
+                f"session_owner: deferred response validation failed: "
+                f"{validation_reason}"
+            )
+            await _notify_failure(validation_error)
+            _raise_structured_failure(
+                mutation=_mutation_error(str(validation_error)),
+                phase=f"{failure_phase}_validation",
+            )
+
+        try:
+            result = await success_finalizer()
+        except BaseException as finalization_error:  # noqa: BLE001
+            release_result, cleanup_error = await _attempt_failure_cleanup(
+                finalization_error
+            )
+            if (
+                release_result is not None
+                and release_result.outcome is SessionOwnerMutationOutcome.ERROR
+            ):
+                _raise_structured_failure(
+                    mutation=release_result,
+                    phase=f"{failure_phase}_release",
+                )
+            if cleanup_error is not None:
+                _raise_structured_failure(
+                    mutation=_mutation_error(str(cleanup_error)),
+                    phase=f"{failure_phase}_release",
+                )
+            raise
+        if (
+            result is not None
+            and result.outcome not in success_outcomes
+        ):
+            await finalize_session_owner_lease_on_failure(lease)
+            finalization_error = RuntimeError(
+                "session_owner: deferred lease finalization did not commit "
+                f"outcome={result.outcome.value}"
+            )
+            await _notify_failure(finalization_error)
+            _raise_structured_failure(
+                mutation=result,
+                phase=failure_phase,
+            )
+        if on_success is not None:
+            await on_success()
+
+    async def _finalize(
+        success: bool,
+        cause: Optional[BaseException] = None,
+    ) -> None:
+        nonlocal finalization_task
+        if finalization_task is None:
+            finalization_task = asyncio.create_task(
+                _run_finalization(success, cause)
+            )
+        task = finalization_task
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await asyncio.shield(task)
+            raise
+
+    original_closed = False
+
+    async def _close_original_iterator() -> None:
+        nonlocal original_closed
+        if original_closed:
+            return
+        original_closed = True
+        close = getattr(original_iterator, "aclose", None)
+        if callable(close):
+            try:
+                await close()
+            except BaseException:
+                verbose_proxy_logger.debug(
+                    "Failed to close deferred session-owner stream iterator",
+                    exc_info=True,
+                )
+        cleanup = getattr(
+            response,
+            "_aawm_responses_validation_cleanup",
+            None,
+        )
+        if callable(cleanup):
+            try:
+                await cleanup()
+            except BaseException:
+                verbose_proxy_logger.debug(
+                    "Failed to close deferred Responses validation resources",
+                    exc_info=True,
+                )
+
+    class _DeferredLeaseIterator:
+        def __init__(self) -> None:
+            self._iterator = original_iterator.__aiter__()
+            self._closed = False
+            self._completed = False
+
+        def __aiter__(self) -> "_DeferredLeaseIterator":
+            return self
+
+        async def __anext__(self) -> Any:
+            if self._closed:
+                raise StopAsyncIteration
+            renewal_error = _renewal_error()
+            if renewal_error is not None:
+                await _finalize(False, renewal_error)
+                await _close_original_iterator()
+                _raise_structured_failure(
+                    mutation=_mutation_error(str(renewal_error)),
+                    phase="session_owner_reservation_renewal",
+                )
+            next_task = asyncio.ensure_future(self._iterator.__anext__())
+            try:
+                if renewal_task is None:
+                    chunk = await next_task
+                else:
+                    done, _ = await asyncio.wait(
+                        {next_task, renewal_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if renewal_task in done:
+                        renewal_error = _renewal_error()
+                        if renewal_error is not None:
+                            await _cancel_and_await_tasks(next_task)
+                            await _finalize(False, renewal_error)
+                            await _close_original_iterator()
+                            self._closed = True
+                            _raise_structured_failure(
+                                mutation=_mutation_error(str(renewal_error)),
+                                phase="session_owner_reservation_renewal",
+                            )
+                    chunk = await next_task
+            except StopAsyncIteration:
+                self._completed = True
+                try:
+                    await _finalize(True)
+                finally:
+                    self._closed = True
+                    await _close_original_iterator()
+                raise
+            except BaseException as exc:
+                try:
+                    await _cancel_and_await_tasks(next_task)
+                    await _finalize(False, exc)
+                finally:
+                    self._closed = True
+                    await _close_original_iterator()
+                raise
+            renewal_error = _renewal_error()
+            if renewal_error is not None:
+                try:
+                    await _finalize(False, renewal_error)
+                finally:
+                    self._closed = True
+                    await _close_original_iterator()
+                _raise_structured_failure(
+                    mutation=_mutation_error(str(renewal_error)),
+                    phase="session_owner_reservation_renewal",
+                )
+            return chunk
+
+        async def aclose(self) -> None:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                if not self._completed:
+                    await _finalize(False)
+            finally:
+                await _close_original_iterator()
+
+    wrapped_iterator = _DeferredLeaseIterator()
+    response.body_iterator = wrapped_iterator
+    setattr(response, "_aawm_session_owner_deferred_finalizer_bound", True)
+
+    original_stream_response = getattr(response, "stream_response", None)
+    if callable(original_stream_response):
+
+        async def _stream_response_with_finalizer(send: Any) -> None:
+            try:
+                renewal_error = _renewal_error()
+                if renewal_error is not None:
+                    await _finalize(False, renewal_error)
+                    _raise_structured_failure(
+                        mutation=_mutation_error(str(renewal_error)),
+                        phase="session_owner_reservation_renewal",
+                    )
+                await original_stream_response(send)
+            except BaseException as exc:
+                await _finalize(False, exc)
+                raise
+            finally:
+                await wrapped_iterator.aclose()
+
+        response.stream_response = _stream_response_with_finalizer
+    return True
 
 
 def extract_account_identity_from_context(
@@ -3847,6 +4292,24 @@ _REQUEST_STATE_LEASE_ATTR = "_aawm_session_owner_lease"
 _REQUEST_STATE_GUARDED_ATTR = "_aawm_session_owner_guarded"
 
 
+def _cursor_replay_body_fingerprint(body: Any) -> Optional[str]:
+    """Return a stable digest for a JSON request body, without retaining values."""
+
+    if not isinstance(body, dict):
+        return None
+    try:
+        encoded = json.dumps(
+            body,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def get_request_session_owner_lease(request: Any) -> Optional[SessionOwnerLease]:
     if request is None:
         return None
@@ -3886,8 +4349,69 @@ def request_session_owner_already_guarded(request: Any) -> bool:
     return value is True
 
 
+def validate_cursor_replay_matches_body(
+    request: Any,
+    *,
+    body: Any,
+) -> bool:
+    """Return true only for validation bound to this exact body object."""
+
+    if request is None:
+        return False
+    state = getattr(request, "state", None)
+    if state is None:
+        return False
+    validation = getattr(
+        state,
+        "_aawm_validated_cursor_replay",
+        None,
+    )
+    if (
+        not isinstance(validation, Mapping)
+        or validation.get("body_ref") is not body
+        or validation.get("body_id") != id(body)
+    ):
+        return False
+    fingerprint = _cursor_replay_body_fingerprint(body)
+    return (
+        fingerprint is not None
+        and validation.get("body_fingerprint") == fingerprint
+    )
+
+
+def set_validated_cursor_replay(
+    request: Any,
+    *,
+    body: Any,
+    stage: str,
+    reason: str,
+) -> None:
+    """Bind server-owned replay validation to the exact rebuilt body."""
+
+    if request is None or not isinstance(body, dict):
+        return
+    state = getattr(request, "state", None)
+    if state is None:
+        return
+    setattr(
+        state,
+        "_aawm_validated_cursor_replay",
+        {
+            "body_ref": body,
+            "body_id": id(body),
+            "body_fingerprint": _cursor_replay_body_fingerprint(body),
+            "stage": stage,
+            "reason": reason,
+        },
+    )
+
+
 def reset_released_request_session_owner_guard(request: Any) -> bool:
-    """Allow a fresh-request retry after its reservation was released."""
+    """Clear a released fresh-request reservation before account failover.
+
+    This only resets request-local state from a fresh dispatch whose reservation
+    was released. It does not rebind a durable compatible owner.
+    """
     if request is None:
         return False
     state = getattr(request, "state", None)
@@ -3910,11 +4434,47 @@ def clear_non_held_request_session_owner_lease(request: Any) -> bool:
     if state is None:
         return False
     lease = get_request_session_owner_lease(request)
-    if lease is not None and lease.held_reservation:
+    if lease is not None and (lease.held_reservation or lease.promoted):
         return False
     setattr(state, _REQUEST_STATE_LEASE_ATTR, None)
     setattr(state, _REQUEST_STATE_GUARDED_ATTR, False)
     return True
+
+
+def clear_expected_non_held_request_session_owner_lease(
+    request: Any,
+    *,
+    expected_session_identity: str,
+) -> bool:
+    """Clear only the expected compatible, non-held base lease."""
+
+    if request is None:
+        return False
+    state = getattr(request, "state", None)
+    if state is None:
+        return False
+    lease = get_request_session_owner_lease(request)
+    if lease is None:
+        return True
+    expected = _clean_optional_str(expected_session_identity)
+    lease_identity = _clean_optional_str(lease.session_identity)
+    if (
+        expected is None
+        or lease_identity is None
+        or is_session_owner_redispatch_effective_identity(expected)
+        or lease.decision != SessionOwnerGuardDecision.COMPATIBLE_OWNER.value
+        or lease.held_reservation
+        or lease.promoted
+        or lease.released
+        or _clean_optional_str(lease.owner_id) is None
+    ):
+        return False
+    if (
+        _strip_legacy_affinity_prefixes(lease_identity)
+        != _strip_legacy_affinity_prefixes(expected)
+    ):
+        return False
+    return clear_non_held_request_session_owner_lease(request)
 
 
 async def clear_compatible_non_held_request_session_owner_guard_for_failover(
@@ -3929,30 +4489,60 @@ async def clear_compatible_non_held_request_session_owner_guard_for_failover(
     post_commit_retry: bool,
     failover_ordinal: int = 1,
     validate_durable_owner: bool = True,
-) -> bool:
-    """Validate one portable account move, then clear only request state."""
+) -> SessionOwnerLeaseRebindResult:
+    """Validate one portable account move, then clear only request state.
+
+    A released fresh reservation may retain an ``UNOWNED_RESERVED`` or
+    ``RESERVATION_RENEWED`` decision, which is distinct from a live
+    ``COMPATIBLE_OWNER`` durable owner. Released request-local state is cleared
+    only after the same portability and ownership checks.
+    """
 
     if not request_session_owner_already_guarded(request):
-        return False
+        return SessionOwnerLeaseRebindResult(False, "guard_not_acquired")
     lease = get_request_session_owner_lease(request)
+    if lease is None:
+        return SessionOwnerLeaseRebindResult(False, "lease_missing")
+    released_decisions = {
+        SessionOwnerGuardDecision.UNOWNED_RESERVED.value,
+        SessionOwnerGuardDecision.RESERVATION_RENEWED.value,
+        SessionOwnerGuardDecision.COMPATIBLE_OWNER.value,
+    }
     if (
-        lease is None
-        or lease.decision != SessionOwnerGuardDecision.COMPATIBLE_OWNER.value
-        or lease.held_reservation
-        or lease.released
-        or lease.promoted
-        or _clean_optional_str(lease.owner_id) is None
+        lease.released
+        and lease.decision not in released_decisions
+    ) or (
+        not lease.released
+        and lease.decision != SessionOwnerGuardDecision.COMPATIBLE_OWNER.value
     ):
-        return False
-    if (
-        not account_failover_planned
-        or not account_failover_replay_safe
-        or has_account_bound_state
-        or post_commit_retry
-        or failover_ordinal != 1
-        or not is_replay_safe_session_owner_redispatch_body(request_body)
-    ):
-        return False
+        return SessionOwnerLeaseRebindResult(
+            False,
+            "lease_decision_not_compatible_owner",
+        )
+    if lease.promoted:
+        return SessionOwnerLeaseRebindResult(False, "lease_promoted")
+    if not lease.released and lease.held_reservation:
+        return SessionOwnerLeaseRebindResult(False, "lease_held_reservation")
+    if _clean_optional_str(lease.owner_id) is None:
+        return SessionOwnerLeaseRebindResult(False, "lease_owner_missing")
+    if not account_failover_planned:
+        return SessionOwnerLeaseRebindResult(
+            False,
+            "account_failover_not_planned",
+        )
+    if not account_failover_replay_safe:
+        return SessionOwnerLeaseRebindResult(False, "replay_unsafe")
+    if has_account_bound_state:
+        return SessionOwnerLeaseRebindResult(
+            False,
+            "account_bound_state_nonportable",
+        )
+    if post_commit_retry:
+        return SessionOwnerLeaseRebindResult(False, "post_commit_retry")
+    if failover_ordinal != 1:
+        return SessionOwnerLeaseRebindResult(False, "unexpected_failover_ordinal")
+    if not is_replay_safe_session_owner_redispatch_body(request_body):
+        return SessionOwnerLeaseRebindResult(False, "body_not_replay_safe")
 
     current = _core_owner_attributes(
         build_session_owner_attributes(extra=current_attributes or lease.attributes)
@@ -3969,13 +4559,19 @@ async def clear_compatible_non_held_request_session_owner_guard_for_failover(
                 for key in ("account_hash", "account_lane", "account_label")
             )
         ):
-            return False
+            return SessionOwnerLeaseRebindResult(
+                False,
+                "incomplete_owner_attributes",
+            )
     if not _accounts_are_interchangeable(current, alternate):
-        return False
+        return SessionOwnerLeaseRebindResult(
+            False,
+            "accounts_not_interchangeable",
+        )
     if _clean_optional_str(current.get("model")) != _clean_optional_str(
         alternate.get("model")
     ):
-        return False
+        return SessionOwnerLeaseRebindResult(False, "model_mismatch")
     if (
         _compatibility_mismatch_reason(
             owner_record={
@@ -3988,7 +4584,7 @@ async def clear_compatible_non_held_request_session_owner_guard_for_failover(
         )
         is not None
     ):
-        return False
+        return SessionOwnerLeaseRebindResult(False, "request_lease_owner_mismatch")
 
     if validate_durable_owner:
         owner_record, _, error = await get_session_owner_record(
@@ -3996,37 +4592,52 @@ async def clear_compatible_non_held_request_session_owner_guard_for_failover(
             request=request,
             wait_for_foreign_reservation=False,
         )
-        if (
+        durable_record_absent = owner_record is None and error is None
+        if lease.released and durable_record_absent:
+            owner_record = None
+        elif (
             error is not None
             or owner_record is None
             or _record_state(owner_record) != SessionOwnerRecordState.OWNED.value
             or _clean_optional_str(owner_record.get(_RECORD_OWNER_FIELD))
             != _clean_optional_str(lease.owner_id)
         ):
-            return False
-        owner_attributes = _core_owner_attributes(_owner_attributes(owner_record))
-        if (
-            incomplete_owner_attribute_reason(
-                owner_attributes, for_promotion=True
+            return SessionOwnerLeaseRebindResult(
+                False,
+                "durable_owner_changed_or_missing",
             )
-            is not None
-            or not _accounts_are_interchangeable(owner_attributes, alternate)
-            or _compatibility_mismatch_reason(
-                owner_record=owner_record,
-                requested_attributes=current,
-                require_exact_attributes=True,
+        if owner_record is not None:
+            owner_attributes = _core_owner_attributes(
+                _owner_attributes(owner_record)
             )
-            is not None
-            or _compatibility_mismatch_reason(
-                owner_record=owner_record,
-                requested_attributes=alternate,
-                require_exact_attributes=True,
-            )
-            is not None
-        ):
-            return False
+            if (
+                incomplete_owner_attribute_reason(
+                    owner_attributes, for_promotion=True
+                )
+                is not None
+                or not _accounts_are_interchangeable(
+                    owner_attributes, alternate
+                )
+                or _compatibility_mismatch_reason(
+                    owner_record=owner_record,
+                    requested_attributes=current,
+                    require_exact_attributes=True,
+                )
+                is not None
+            ):
+                return SessionOwnerLeaseRebindResult(
+                    False,
+                    "durable_owner_mismatch",
+                )
 
-    return clear_non_held_request_session_owner_lease(request)
+    clear_request_lease = (
+        reset_released_request_session_owner_guard
+        if lease.released
+        else clear_non_held_request_session_owner_lease
+    )
+    if not clear_request_lease(request):
+        return SessionOwnerLeaseRebindResult(False, "request_lease_clear_failed")
+    return SessionOwnerLeaseRebindResult(True)
 
 
 def is_exact_owned_session_owner_route_mismatch(
@@ -4073,15 +4684,66 @@ async def ensure_session_owner_guard_for_request(
     a second competing reservation.
     """
 
+    resolved_session_identity = resolve_canonical_session_identity(
+        request,
+        request_body,
+        session_identity=session_identity,
+    )
     existing = get_request_session_owner_lease(request)
     active_lease = (
         existing
         if existing is not None and not existing.released and not existing.promoted
         else None
     )
+    if active_lease is not None:
+        lease_identity = _clean_optional_str(active_lease.session_identity)
+        identities_match = (
+            resolved_session_identity is not None
+            and lease_identity is not None
+            and _strip_legacy_affinity_prefixes(lease_identity)
+            == _strip_legacy_affinity_prefixes(resolved_session_identity)
+        )
+        if not identities_match:
+            mismatch_reason = (
+                "session_owner: request lease identity does not match "
+                "the requested session identity"
+            )
+            mismatch_cache_key = (
+                build_aawm_alias_routing_session_owner_cache_key(
+                    session_identity=resolved_session_identity
+                )
+                if resolved_session_identity is not None
+                else None
+            )
+            guard = SessionOwnerGuardResult(
+                decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                session_identity=resolved_session_identity,
+                cache_key=mismatch_cache_key,
+                owner_id=active_lease.owner_id,
+                reservation_token=active_lease.reservation_token,
+                mismatch_reason=mismatch_reason,
+                provenance=build_session_owner_provenance(
+                    session_identity=resolved_session_identity,
+                    decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,
+                    owner_id=active_lease.owner_id,
+                    mismatch_reason=mismatch_reason,
+                    cache_key=mismatch_cache_key,
+                    reservation_token=active_lease.reservation_token,
+                ),
+            )
+            if raise_on_redispatch:
+                raise_session_owner_redispatch_required(
+                    session_identity=resolved_session_identity,
+                    guard=guard,
+                    alias_model=alias_model,
+                    candidate=requested_attributes or candidate,
+                    failure_phase="session_owner_request_lease_identity_conflict",
+                    request=request,
+                )
+            return guard
     token = active_lease.reservation_token if active_lease is not None else None
     guard = await guard_session_owner_before_egress(
-        session_identity=session_identity,
+        session_identity=resolved_session_identity,
         request=request,
         request_body=request_body,
         requested_attributes=requested_attributes
@@ -4105,6 +4767,8 @@ async def ensure_session_owner_guard_for_request(
             request=request,
         )
     if active_lease is not None and guard.held_reservation:
+        active_lease.session_identity = guard.session_identity
+        active_lease.cache_key = guard.cache_key
         active_lease.reservation_token = guard.reservation_token
         active_lease.held_reservation = True
         active_lease.decision = guard.decision.value

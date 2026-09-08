@@ -168,6 +168,10 @@ from .aawm_alias_routing.output_guard_config import (
     output_guard_context_from_passthrough,
 )
 from .aawm_alias_routing.audit_persist import _emit_aawm_terminal_error
+from .aawm_adapter_runtime.deferred_success import (
+    DeferredPassthroughSuccess,
+    bind_deferred_success_holder,
+)
 from .streaming_handler import (
     RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS,
     PassThroughStreamingHandler,
@@ -188,6 +192,7 @@ from .aawm_adapter_runtime.provider_call_ledger import (
     current_candidate_context,
     ensure_openai_wire_replay_allowed,
     get_or_create_openai_provider_call_ledger,
+    get_request_provider_call_ledger,
     get_request_provider_call_ledger_snapshot,
     publish_reservation_metadata,
     publish_wire_commitment_snapshot,
@@ -1783,6 +1788,9 @@ def _record_passthrough_hidden_retry_metadata(
     wait_seconds: float,
     final_outcome: Optional[str] = None,
     failure_classification: Optional[str] = None,
+    request: Optional[Request] = None,
+    logical_provider_call_start: Optional[int] = None,
+    reservation_rejected: bool = False,
 ) -> None:
     if not isinstance(kwargs, dict):
         return
@@ -1798,17 +1806,73 @@ def _record_passthrough_hidden_retry_metadata(
         "max_attempts": max_attempts,
         "failure_class": failure_class,
         "wait_seconds": round(wait_seconds, 3),
-        "attempt_kind": "logical_provider_send_retry",
+        "attempt_kind": (
+            "reservation_denied"
+            if reservation_rejected
+            else "logical_provider_send_retry"
+        ),
     }
+    if reservation_rejected:
+        attempt_record["attempted_provider_call"] = False
     if status_code is not None:
         attempt_record["status_code"] = status_code
     if failure_classification is not None:
         attempt_record["failure_classification"] = failure_classification
+
+    logical_provider_send_count: Optional[int] = None
+    request_ledger = (
+        get_request_provider_call_ledger(request)
+        if request is not None
+        else None
+    )
+    if request_ledger is not None:
+        if logical_provider_call_start is not None:
+            logical_provider_send_count = max(
+                0,
+                request_ledger.logical_provider_calls
+                - logical_provider_call_start,
+            )
+            attempt_record["logical_provider_send_count"] = (
+                logical_provider_send_count
+            )
+        transport_connection_attempts = getattr(
+            request_ledger,
+            "transport_connection_attempts",
+            getattr(request_ledger, "transport_connection_failures", 0),
+        )
+        metadata["aawm_passthrough_hidden_connection_attempts"] = (
+            transport_connection_attempts
+        )
+        metadata["aawm_passthrough_hidden_connection_failures"] = (
+            transport_connection_attempts
+        )
     attempts.append(attempt_record)
 
-    metadata["aawm_passthrough_hidden_retry_count"] = len(attempts)
-    metadata["aawm_passthrough_hidden_logical_retry_count"] = len(attempts)
+    if logical_provider_send_count is not None:
+        retry_count = max(0, logical_provider_send_count - 1)
+    else:
+        retry_count = sum(
+            1
+            for record in attempts
+            if isinstance(record, dict)
+            and record.get("attempt_kind") == "logical_provider_send_retry"
+            and str(record.get("failure_class") or "").strip().lower()
+            != "success"
+        )
+    metadata["aawm_passthrough_hidden_retry_count"] = retry_count
+    metadata["aawm_passthrough_hidden_logical_retry_count"] = retry_count
     if final_outcome is not None:
+        if logical_provider_send_count is not None:
+            if final_outcome.startswith("success"):
+                final_outcome = (
+                    "success_after_retry" if retry_count > 0 else "success"
+                )
+            elif final_outcome.startswith("failed"):
+                final_outcome = (
+                    "failed_after_retry"
+                    if retry_count > 0
+                    else "failed_without_retry"
+                )
         metadata["aawm_passthrough_hidden_retry_final_outcome"] = final_outcome
     if failure_classification is not None:
         metadata[
@@ -1868,6 +1932,11 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
     start_monotonic = time.monotonic()
     attempt_number = 0
     last_capacity_exception: Optional[Exception] = None
+    logical_provider_call_start: Optional[int] = None
+    if request is not None:
+        request_ledger = get_request_provider_call_ledger(request)
+        if request_ledger is not None:
+            logical_provider_call_start = request_ledger.logical_provider_calls
     while True:
         attempt_number += 1
         if request is not None:
@@ -1954,6 +2023,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     failure_class="success",
                     wait_seconds=0.0,
                     final_outcome="success_after_retry",
+                    request=request,
+                    logical_provider_call_start=logical_provider_call_start,
                 )
             return result
         except Exception as exc:
@@ -1977,6 +2048,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         else "failed_without_retry"
                     ),
                     failure_classification=failure_classification,
+                    request=request,
+                    logical_provider_call_start=logical_provider_call_start,
                 )
                 _mark_passthrough_hidden_retry_budget_exhausted(
                     kwargs,
@@ -2085,6 +2158,20 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         wait_seconds=0.0,
                         final_outcome="failed_after_retry",
                         failure_classification=failure_classification,
+                        request=request,
+                        logical_provider_call_start=logical_provider_call_start,
+                        reservation_rejected=bool(
+                            getattr(
+                                terminal_exception,
+                                "aawm_call_ledger_exhausted",
+                                False,
+                            )
+                            or getattr(
+                                terminal_exception,
+                                "aawm_openai_wire_replay_blocked",
+                                False,
+                            )
+                        ),
                     )
                     _mark_passthrough_hidden_retry_budget_exhausted(
                         kwargs,
@@ -2131,6 +2218,16 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         else "failed_without_retry"
                     ),
                     failure_classification=failure_classification,
+                    request=request,
+                    logical_provider_call_start=logical_provider_call_start,
+                    reservation_rejected=bool(
+                        getattr(exc, "aawm_call_ledger_exhausted", False)
+                        or getattr(
+                            exc,
+                            "aawm_openai_wire_replay_blocked",
+                            False,
+                        )
+                    ),
                 )
                 raise
 
@@ -2169,6 +2266,16 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         else "failed_without_retry"
                     ),
                     failure_classification=failure_classification,
+                    request=request,
+                    logical_provider_call_start=logical_provider_call_start,
+                    reservation_rejected=bool(
+                        getattr(exc, "aawm_call_ledger_exhausted", False)
+                        or getattr(
+                            exc,
+                            "aawm_openai_wire_replay_blocked",
+                            False,
+                        )
+                    ),
                 )
                 _mark_passthrough_hidden_retry_budget_exhausted(
                     kwargs,
@@ -2195,6 +2302,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 failure_class=failure_class,
                 wait_seconds=wait_seconds,
                 failure_classification=failure_classification,
+                request=request,
+                logical_provider_call_start=logical_provider_call_start,
             )
             verbose_proxy_logger.info(
                 "Pass-through %s hidden retry attempt %s/%s after %s; sleeping %.1fs",
@@ -4447,6 +4556,7 @@ async def _aawm_session_owner_pre_send_guard(
     expected_target_family: Optional[str],
     url: Optional[httpx.URL],
     provider_bound_body: Optional[dict] = None,
+    defer_session_owner_promotion: bool = False,
 ) -> None:
     """Ensure tokenized session-owner reservation before upstream send.
 
@@ -4483,6 +4593,16 @@ async def _aawm_session_owner_pre_send_guard(
         # Renew held reservation before potentially long upstream I/O.
         lease = sa.get_request_session_owner_lease(request)
         if lease is not None and lease.held_reservation and not lease.promoted:
+            if (
+                (egress_credential_family or "").casefold() == "xai"
+                and not defer_session_owner_promotion
+            ):
+                sa.raise_session_owner_redispatch_required(
+                    session_identity=lease.session_identity,
+                    candidate=lease.attributes,
+                    failure_phase="session_owner_unpromoted_lease_managed_xai",
+                    request=request,
+                )
             await sa.ensure_session_owner_guard_for_request(
                 request=request,
                 request_body=parsed_body if isinstance(parsed_body, dict) else {},
@@ -4561,7 +4681,10 @@ async def _aawm_session_owner_on_upstream_result(
     *,
     request: Request,
     success: bool,
+    defer_session_owner_promotion: bool = False,
 ) -> None:
+    if defer_session_owner_promotion:
+        return
     sa = _session_affinity_mod()
     if not success:
         state = getattr(request, "state", None)
@@ -4840,6 +4963,7 @@ async def pass_through_request(  # noqa: PLR0915
     blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
     retryable_upstream_status_codes: Optional[list[int]] = None,
     caller_managed_hidden_retry: bool = False,
+    defer_session_owner_promotion: bool = False,
     raw_body_passthrough: bool = False,
     passthrough_logging_metadata: Optional[dict[str, Any]] = None,
 ):
@@ -4866,6 +4990,8 @@ async def pass_through_request(  # noqa: PLR0915
             caller, so generic passthrough failure logging should be deferred to the adapter layer
         caller_managed_hidden_retry: When true, disables shared pre-first-byte hidden retries so
             adapter/candidate-rotation callers do not double-retry upstream failures
+        defer_session_owner_promotion: When true, the caller owns lease
+            promotion after validating the complete candidate response.
         raw_body_passthrough: Forward the original request body as bytes while
             using a small synthetic body for logging. This is intended for
             native binary/protobuf side-channel endpoints.
@@ -4896,6 +5022,11 @@ async def pass_through_request(  # noqa: PLR0915
     raw_body: Optional[bytes] = None
     responses_function_name_rewrite: Optional[ResponsesFunctionNameRewrite] = None
     _transfer_identity: Optional[dict[str, Any]] = None
+    deferred_success_holder = (
+        DeferredPassthroughSuccess()
+        if defer_session_owner_promotion
+        else None
+    )
     route_custom_headers = dict(custom_headers or {})
     headers: Dict[str, Any] = dict(route_custom_headers)
     retryable_status_codes = {
@@ -4903,6 +5034,54 @@ async def pass_through_request(  # noqa: PLR0915
         for status_code in (retryable_upstream_status_codes or [])
         if isinstance(status_code, int)
     }
+    openai_call_ledger = None
+
+    def _publish_openai_send_telemetry() -> None:
+        request_state = getattr(request, "state", None)
+        if request_state is None:
+            return
+        if openai_call_ledger is not None:
+            ledger_snapshot = get_request_provider_call_ledger_snapshot(request)
+            if ledger_snapshot is None:
+                ledger_snapshot = openai_call_ledger.snapshot()
+            transport_connection_attempts = ledger_snapshot.get(
+                "transport_connection_attempts",
+                ledger_snapshot.get("transport_connection_failures", 0),
+            )
+            setattr(
+                request_state,
+                "aawm_openai_send_ledger_snapshot",
+                ledger_snapshot,
+            )
+            setattr(
+                request_state,
+                "aawm_openai_logical_provider_calls",
+                ledger_snapshot["logical_provider_calls"],
+            )
+            setattr(
+                request_state,
+                "aawm_openai_transport_connection_attempts",
+                transport_connection_attempts,
+            )
+            setattr(
+                request_state,
+                "aawm_openai_transport_connection_failures",
+                transport_connection_attempts,
+            )
+        retry_metadata = _ensure_passthrough_metadata(kwargs)
+        setattr(
+            request_state,
+            "aawm_passthrough_hidden_retry_count",
+            retry_metadata.get("aawm_passthrough_hidden_retry_count", 0),
+        )
+        setattr(
+            request_state,
+            "aawm_passthrough_hidden_logical_retry_count",
+            retry_metadata.get(
+                "aawm_passthrough_hidden_logical_retry_count",
+                retry_metadata.get("aawm_passthrough_hidden_retry_count", 0),
+            ),
+        )
 
     #########################################################
     try:
@@ -5402,45 +5581,6 @@ async def pass_through_request(  # noqa: PLR0915
 
             openai_send_request_fn = _send_prepared_openai_request
 
-        def _publish_openai_send_telemetry() -> None:
-            request_state = getattr(request, "state", None)
-            if request_state is None:
-                return
-            if openai_call_ledger is not None:
-                ledger_snapshot = (
-                    get_request_provider_call_ledger_snapshot(request)
-                    or openai_call_ledger.snapshot()
-                )
-                setattr(
-                    request_state,
-                    "aawm_openai_send_ledger_snapshot",
-                    ledger_snapshot,
-                )
-                setattr(
-                    request_state,
-                    "aawm_openai_logical_provider_calls",
-                    ledger_snapshot["logical_provider_calls"],
-                )
-                setattr(
-                    request_state,
-                    "aawm_openai_transport_connection_attempts",
-                    ledger_snapshot["transport_connection_attempts"],
-                )
-            retry_metadata = _ensure_passthrough_metadata(kwargs)
-            setattr(
-                request_state,
-                "aawm_passthrough_hidden_retry_count",
-                retry_metadata.get("aawm_passthrough_hidden_retry_count", 0),
-            )
-            setattr(
-                request_state,
-                "aawm_passthrough_hidden_logical_retry_count",
-                retry_metadata.get(
-                    "aawm_passthrough_hidden_logical_retry_count",
-                    retry_metadata.get("aawm_passthrough_hidden_retry_count", 0),
-                ),
-            )
-
         if stream:
             await _aawm_session_owner_pre_send_guard(
                 request=request,
@@ -5454,6 +5594,7 @@ async def pass_through_request(  # noqa: PLR0915
                     if isinstance(provider_bound_body, dict)
                     else None
                 ),
+                defer_session_owner_promotion=defer_session_owner_promotion,
             )
             upstream_wait_started_at = datetime.now()
             try:
@@ -5502,6 +5643,7 @@ async def pass_through_request(  # noqa: PLR0915
                             upstream_url=str(url) if url is not None else None,
                         ),
                         namespace=get_aawm_alias_routing_state_namespace(),
+                        account_context=current_candidate_context(request),
                     )
                 )
 
@@ -5601,12 +5743,16 @@ async def pass_through_request(  # noqa: PLR0915
                 )
             except ResponsesStreamPreCommitFailure as pre_commit_exc:
                 await _aawm_session_owner_on_upstream_result(
-                    request=request, success=False
+                    request=request,
+                    success=False,
+                    defer_session_owner_promotion=defer_session_owner_promotion,
                 )
                 raise pre_commit_exc.as_http_exception() from pre_commit_exc
             except Exception:
                 await _aawm_session_owner_on_upstream_result(
-                    request=request, success=False
+                    request=request,
+                    success=False,
+                    defer_session_owner_promotion=defer_session_owner_promotion,
                 )
                 raise
             # First upstream byte path succeeded enough to return a response object.
@@ -5618,7 +5764,9 @@ async def pass_through_request(  # noqa: PLR0915
                     request
                 )
             await _aawm_session_owner_on_upstream_result(
-                request=request, success=status_ok
+                request=request,
+                success=status_ok,
+                defer_session_owner_promotion=defer_session_owner_promotion,
             )
             if not status_ok:
                 # Keep existing error handling below.
@@ -5648,6 +5796,7 @@ async def pass_through_request(  # noqa: PLR0915
                 upstream_wait_completed_at=upstream_wait_completed_at,
                 local_prepare_ms=local_prepare_ms,
                 error_log_context=error_log_context,
+                deferred_success_holder=deferred_success_holder,
             )
             if (
                 responses_function_name_rewrite is not None
@@ -5712,7 +5861,10 @@ async def pass_through_request(  # noqa: PLR0915
                 )
             _publish_openai_send_telemetry()
             return bind_output_guard_to_streaming_response(
-                stream_response,
+                bind_deferred_success_holder(
+                    stream_response,
+                    deferred_success_holder,
+                ),
                 request_context=output_guard_request_context,
             )
 
@@ -5728,6 +5880,7 @@ async def pass_through_request(  # noqa: PLR0915
                 if isinstance(provider_bound_body, dict)
                 else None
             ),
+            defer_session_owner_promotion=defer_session_owner_promotion,
         )
         upstream_wait_started_at = datetime.now()
 
@@ -5750,6 +5903,7 @@ async def pass_through_request(  # noqa: PLR0915
                         upstream_url=str(url) if url is not None else None,
                     ),
                     namespace=get_aawm_alias_routing_state_namespace(),
+                    account_context=current_candidate_context(request),
                 )
             )
 
@@ -5881,7 +6035,9 @@ async def pass_through_request(  # noqa: PLR0915
             )
         except Exception:
             await _aawm_session_owner_on_upstream_result(
-                request=request, success=False
+                request=request,
+                success=False,
+                defer_session_owner_promotion=defer_session_owner_promotion,
             )
             raise
         status_ok = bool(getattr(response, "status_code", 500) < 300)
@@ -5890,7 +6046,9 @@ async def pass_through_request(  # noqa: PLR0915
                 request
             )
         await _aawm_session_owner_on_upstream_result(
-            request=request, success=status_ok
+            request=request,
+            success=status_ok,
+            defer_session_owner_promotion=defer_session_owner_promotion,
         )
         upstream_wait_completed_at = datetime.now()
         _record_passthrough_duration(
@@ -5919,6 +6077,7 @@ async def pass_through_request(  # noqa: PLR0915
                 upstream_wait_completed_at=upstream_wait_completed_at,
                 local_prepare_ms=local_prepare_ms,
                 error_log_context=error_log_context,
+                deferred_success_holder=deferred_success_holder,
             )
             if (
                 responses_function_name_rewrite is not None
@@ -5983,7 +6142,10 @@ async def pass_through_request(  # noqa: PLR0915
                 )
             _publish_openai_send_telemetry()
             return bind_output_guard_to_streaming_response(
-                stream_response,
+                bind_deferred_success_holder(
+                    stream_response,
+                    deferred_success_holder,
+                ),
                 request_context=output_guard_request_context,
             )
 
@@ -6096,21 +6258,55 @@ async def pass_through_request(  # noqa: PLR0915
             extra_metadata={"stream": False},
         )
         end_time = datetime.now()
-        asyncio.create_task(
-            pass_through_endpoint_logging.pass_through_async_success_handler(
-                httpx_response=response,
-                response_body=response_body,
-                url_route=str(url),
-                result="",
-                start_time=start_time,
-                end_time=end_time,
-                logging_obj=logging_obj,
-                cache_hit=False,
-                request_body=_parsed_body,
-                custom_llm_provider=custom_llm_provider,
-                **kwargs,
+
+        async def _finalize_deferred_success() -> None:
+            asyncio.create_task(
+                pass_through_endpoint_logging.pass_through_async_success_handler(
+                    httpx_response=response,
+                    response_body=response_body,
+                    url_route=str(url),
+                    result="",
+                    start_time=start_time,
+                    end_time=end_time,
+                    logging_obj=logging_obj,
+                    cache_hit=False,
+                    request_body=_parsed_body,
+                    custom_llm_provider=custom_llm_provider,
+                    **kwargs,
+                )
             )
-        )
+            try:
+                from litellm.proxy.aawm_session_transfer.hooks import (
+                    publish_transfer_terminal,
+                )
+
+                if _transfer_identity:
+                    await publish_transfer_terminal(
+                        _transfer_identity,
+                        "completed",
+                    )
+            except Exception:
+                verbose_proxy_logger.debug(
+                    "Failed to publish session-transfer completed phase",
+                    exc_info=True,
+                )
+
+        if not defer_session_owner_promotion:
+            asyncio.create_task(
+                pass_through_endpoint_logging.pass_through_async_success_handler(
+                    httpx_response=response,
+                    response_body=response_body,
+                    url_route=str(url),
+                    result="",
+                    start_time=start_time,
+                    end_time=end_time,
+                    logging_obj=logging_obj,
+                    cache_hit=False,
+                    request_body=_parsed_body,
+                    custom_llm_provider=custom_llm_provider,
+                    **kwargs,
+                )
+            )
         local_finalize_ms = _record_passthrough_duration(
             kwargs,
             metric_key="aawm_local_finalize_ms",
@@ -6158,7 +6354,11 @@ async def pass_through_request(  # noqa: PLR0915
                 publish_transfer_terminal,
             )
 
-            if not stream and _transfer_identity:
+            if (
+                not defer_session_owner_promotion
+                and not stream
+                and _transfer_identity
+            ):
                 await publish_transfer_terminal(_transfer_identity, "completed")
         except Exception:
             verbose_proxy_logger.debug(
@@ -6193,7 +6393,7 @@ async def pass_through_request(  # noqa: PLR0915
                 )
 
             bind_openai_responses_wire_trace_to_request(request, wire_trace)
-            return OpenAIResponsesBufferedResponse(
+            response_to_return = OpenAIResponsesBufferedResponse(
                 content=content,
                 wire_trace=wire_trace,
                 disposition=disposition,
@@ -6201,16 +6401,24 @@ async def pass_through_request(  # noqa: PLR0915
                 status_code=response.status_code,
                 headers=response_headers,
             )
-        return Response(
-            content=content,
-            status_code=response.status_code,
-            headers=response_headers,
+        else:
+            response_to_return = Response(
+                content=content,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
+        if deferred_success_holder is not None:
+            deferred_success_holder.set_finalizer(_finalize_deferred_success)
+        return bind_deferred_success_holder(
+            response_to_return,
+            deferred_success_holder,
         )
     except asyncio.CancelledError:
         try:
             await _aawm_session_owner_on_upstream_result(
                 request=request,
                 success=False,
+                defer_session_owner_promotion=defer_session_owner_promotion,
             )
         except Exception:
             verbose_proxy_logger.debug(
@@ -6221,11 +6429,13 @@ async def pass_through_request(  # noqa: PLR0915
         raise
     except Exception as e:
         _publish_openai_send_telemetry()
-        await close_active_upstream_response(request)
+        if not getattr(e, "aawm_openai_wire_replay_blocked", False):
+            await close_active_upstream_response(request)
         try:
             await _aawm_session_owner_on_upstream_result(
                 request=request,
                 success=False,
+                defer_session_owner_promotion=defer_session_owner_promotion,
             )
         except Exception:
             verbose_proxy_logger.debug(
@@ -6669,8 +6879,7 @@ async def pass_through_request(  # noqa: PLR0915
             setattr(
                 proxy_exc,
                 "status_code",
-                status_code
-                or getattr(e, "status_code", status.HTTP_409_CONFLICT),
+                status_code or getattr(e, "status_code", status.HTTP_409_CONFLICT),
             )
             setattr(proxy_exc, "aawm_openai_wire_replay_blocked", True)
             setattr(proxy_exc, "attempted_provider_call", False)

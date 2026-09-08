@@ -61,6 +61,9 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_led
     bind_openai_candidate_context,
     get_request_provider_call_ledger,
 )
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.deferred_success import (
+    finalize_deferred_success,
+)
 
 from . import codex_oauth as _codex_oauth_mod
 from . import error_signals as _error_signals
@@ -300,6 +303,16 @@ _IN_FLIGHT_REDISPATCH_ERROR_CODES = frozenset(
         "aawm_anthropic_auto_agent_in_flight_provider_cooling_down",
     }
 )
+_TYPED_REDISPATCH_ERROR_CODES = frozenset(
+    {
+        "aawm_codex_auto_agent_redispatch_required",
+        "aawm_anthropic_auto_agent_redispatch_required",
+        "aawm_session_owner_redispatch_required",
+    }
+)
+_SUPPORTED_REDISPATCH_ERROR_CODES = (
+    _IN_FLIGHT_REDISPATCH_ERROR_CODES | _TYPED_REDISPATCH_ERROR_CODES
+)
 _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER = (
     "_cursor_session_continuation_failure"
 )
@@ -427,6 +440,24 @@ def _extract_cursor_sanitized_proto_structure(
     return {"fields": copied_fields}
 
 
+def _redispatch_error_codes(
+    exc: Exception,
+    detail_mapping: Mapping[str, Any],
+) -> set[str]:
+    detail_error = detail_mapping.get("error")
+    detail_error = detail_error if isinstance(detail_error, Mapping) else {}
+    return {
+        str(value)
+        for value in (
+            detail_error.get("code"),
+            detail_mapping.get("error_code"),
+            getattr(exc, "error_code", None),
+            getattr(exc, "code", None),
+        )
+        if value is not None
+    }
+
+
 def _validated_redispatch_terminal_metadata(
     exc: Exception,
     *,
@@ -437,20 +468,9 @@ def _validated_redispatch_terminal_metadata(
     detail_mapping = detail if isinstance(detail, Mapping) else {}
     detail_error = detail_mapping.get("error")
     detail_error = detail_error if isinstance(detail_error, Mapping) else {}
-    redispatch_error_codes = {
-        str(value)
-        for value in (
-            detail_error.get("code"),
-            detail_mapping.get("error_code"),
-            getattr(exc, "error_code", None),
-            getattr(exc, "code", None),
-        )
-        if value is not None
-    }
+    redispatch_error_codes = _redispatch_error_codes(exc, detail_mapping)
     if not (
-        getattr(exc, "redispatch_required", None) is True
-        or detail_mapping.get("redispatch_required") is True
-        or bool(redispatch_error_codes & _IN_FLIGHT_REDISPATCH_ERROR_CODES)
+        bool(redispatch_error_codes & _SUPPORTED_REDISPATCH_ERROR_CODES)
     ):
         return None
 
@@ -545,6 +565,8 @@ def _emit_validated_redispatch_terminal_event(
     metadata = _validated_redispatch_terminal_metadata(exc, request=request)
     if metadata is None:
         return False
+    if metadata["extra_fields"].get("_aawm_terminal_error_already_emitted"):
+        return True
     terminal_candidate = metadata["candidate"]
     if terminal_candidate is None and isinstance(selection, Mapping):
         selected_candidate = selection.get("candidate")
@@ -870,6 +892,9 @@ async def handle_alias_route(  # noqa: PLR0915
     verbose_proxy_logger = _lpe.verbose_proxy_logger
     status = _lpe.status
     HTTPException = _lpe.HTTPException
+    raise_authenticated_continuation_unavailable_fn = (
+        _lpe._raise_codex_auto_agent_authenticated_continuation_unavailable
+    )
 
     select_candidate_fn = services.select_candidate_fn
     perform_candidate_request_fn = services.perform_candidate_request_fn
@@ -898,6 +923,10 @@ async def handle_alias_route(  # noqa: PLR0915
                 upstream_url=_lpe._codex_oauth_responses_target_url(),
             ),
             namespace=get_aawm_alias_routing_state_namespace(),
+            account_context={
+                "account_hash": candidate.get("codex_oauth_account_hash"),
+                "lane_key": candidate.get("codex_oauth_lane_key"),
+            },
         )
 
     def _classify_codex_auto_agent_retryable_exhaustion(
@@ -980,9 +1009,79 @@ async def handle_alias_route(  # noqa: PLR0915
         )
     )
 
+    def _provider_owned_continuation() -> bool:
+        return has_continuation_state and not (
+            _session_affinity_mod().validate_cursor_replay_matches_body(
+                request,
+                body=prepared_request_body,
+            )
+        )
+
+    def _validated_unowned_replay(selection: Mapping[str, Any]) -> bool:
+        """Allow portable replay only while durable ownership is unpromoted."""
+        if (
+            _provider_owned_continuation()
+            or has_previous_response_id
+            or bool(selection.get("has_account_bound_state"))
+        ):
+            return False
+        validate_replay = getattr(
+            _session_affinity_mod(),
+            "validate_cursor_replay_matches_body",
+            None,
+        )
+        if not callable(validate_replay):
+            return False
+        try:
+            if not validate_replay(request, body=prepared_request_body):
+                return False
+        except Exception:
+            return False
+
+        compatible_owner_decisions = {
+            "compatible_owner",
+            "redispatch_required",
+        }
+
+        def _owner_decision(value: Any) -> str:
+            return str(
+                getattr(value, "value", value) or ""
+            ).strip().casefold()
+
+        selection_decision = _owner_decision(
+            selection.get("session_owner_decision")
+        )
+        if selection_decision in compatible_owner_decisions:
+            return False
+        provenance = selection.get("session_owner_provenance")
+        if isinstance(provenance, Mapping):
+            provenance_decision = _owner_decision(
+                provenance.get("session_owner_decision")
+            )
+            if provenance_decision in compatible_owner_decisions:
+                return False
+
+        lease_getter = getattr(
+            _session_affinity_mod(),
+            "get_request_session_owner_lease",
+            None,
+        )
+        if callable(lease_getter):
+            try:
+                lease = lease_getter(request)
+            except Exception:
+                return False
+            if lease is not None:
+                if getattr(lease, "promoted", False) is True:
+                    return False
+                lease_decision = _owner_decision(getattr(lease, "decision", ""))
+                if lease_decision in compatible_owner_decisions:
+                    return False
+        return True
+
     def _genuinely_fresh_dispatch(selection: Mapping[str, Any]) -> bool:
         return (
-            not has_continuation_state
+            not _provider_owned_continuation()
             and not has_previous_response_id
             and not bool(selection.get("has_account_bound_state"))
             and not bool(selection.get("in_flight_session"))
@@ -1091,10 +1190,17 @@ async def handle_alias_route(  # noqa: PLR0915
                         ),
                     )
             return None
-        return _lpe._merge_litellm_metadata(
+        final_fallback_body = _lpe._merge_litellm_metadata(
             fresh_fallback_body,
             extra_fields={"aawm_redispatch_ordinal": 1},
         )
+        _session_affinity_mod().set_validated_cursor_replay(
+            request,
+            body=final_fallback_body,
+            stage="cursor_replay_built",
+            reason="strict_reconstruction_validated",
+        )
+        return final_fallback_body
 
     def _prefer_codex_oauth_account_failover(
         *,
@@ -1121,9 +1227,69 @@ async def handle_alias_route(  # noqa: PLR0915
         ) and not account_failover_replay_safe:
             return False
         return (
-            not has_continuation_state
+            not _provider_owned_continuation()
             or candidate.get("codex_oauth_credential_affinity")
             == "interchangeable"
+        )
+
+    def _is_authenticated_codex_continuation_pin(
+        selection: Mapping[str, Any],
+    ) -> bool:
+        return bool(
+            is_codex_alias
+            and selection.get("selection_reason")
+            == "authenticated_continuation_token_pin"
+        )
+
+    def _raise_authenticated_codex_continuation_unavailable(
+        *,
+        candidate: dict[str, Any],
+        selection: Mapping[str, Any],
+        attempt_record: dict[str, Any],
+        attempts: list[dict[str, Any]],
+        failure_body: Mapping[str, Any],
+        error_tokens: set[str],
+        cooldown_seconds: float,
+        cooldown_scope: Optional[str],
+        failure_phase: str,
+    ) -> None:
+        failure_metadata = failure_body.get("litellm_metadata") or {}
+        _mark_auto_agent_alias_request_terminal_failure(
+            request,
+            attempt_record,
+        )
+        raise_authenticated_continuation_unavailable_fn(
+            candidate=candidate,
+            lane_key=selection.get("lane_key"),
+            cooldown_seconds=cooldown_seconds,
+            alias_model=alias_model,
+            error_class=attempt_record.get("error_class"),
+            cooldown_scope=cooldown_scope,
+            error_status_code=attempt_record.get("error_status_code"),
+            error_type=attempt_record.get("error_type"),
+            error_code=attempt_record.get("error_code"),
+            retry_after_seconds=attempt_record.get("retry_after_seconds"),
+            failure_phase=failure_phase,
+            attempted_provider_call=attempt_record.get(
+                "attempted_provider_call"
+            ),
+            error_tokens=error_tokens,
+            audit_events=(
+                failure_metadata.get("aawm_alias_routing_audit_events")
+                if isinstance(failure_metadata, dict)
+                else None
+            ),
+            attempts=(
+                failure_metadata.get(attempts_metadata_key)
+                if isinstance(failure_metadata, dict)
+                else attempts
+            ),
+            skipped_candidates=(
+                failure_metadata.get(skipped_candidates_metadata_key)
+                if isinstance(failure_metadata, dict)
+                else None
+            ),
+            terminal_reset=selection.get("terminal_reset"),
         )
 
     def _raise_terminal_alias_failure(  # noqa: PLR0915
@@ -1595,13 +1761,16 @@ async def handle_alias_route(  # noqa: PLR0915
                 if isinstance(selection_error, dict)
                 else None
             )
+            selection_error_codes = _redispatch_error_codes(exc, selection_detail)
             if (
                 exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS
                 and (
                     getattr(exc, "redispatch_required", None) is True
                     or selection_detail.get("redispatch_required") is True
                 )
-                and selection_error_code not in _IN_FLIGHT_REDISPATCH_ERROR_CODES
+                and not (
+                    selection_error_codes & _SUPPORTED_REDISPATCH_ERROR_CODES
+                )
             ):
                 raise
             if _emit_validated_redispatch_terminal_event(
@@ -1746,7 +1915,7 @@ async def handle_alias_route(  # noqa: PLR0915
                 selection=selection,
                 attempt_record=attempt_record,
                 error_class=admission_error_class,
-                has_continuation_state=has_continuation_state,
+                has_continuation_state=_provider_owned_continuation(),
                 has_previous_response_id=has_previous_response_id,
                 account_failover_replay_safe=account_failover_replay_safe,
                 provider_status_code=attempt_record.get("error_status_code"),
@@ -2037,21 +2206,25 @@ async def handle_alias_route(  # noqa: PLR0915
                                 else None
                             )
                             ledger_start_count = (
-                                request_ledger.logical_provider_calls
+                                len(request_ledger.reservations)
                                 if request_ledger is not None
                                 else 0
                             )
                             attempts.append(attempt_record)
-                            attempt_record["attempted_provider_call"] = True
-                            attempted_provider_call = True
+                            attempt_record["attempted_provider_call"] = False
+                            attempted_provider_call = False
+                            perform_exc: Optional[BaseException] = None
                             try:
-                                return await perform_candidate_request_fn(
+                                response = await perform_candidate_request_fn(
                                     candidate=candidate,
                                     candidate_body=candidate_body,
                                 )
-                            except Exception as perform_exc:
-                                attempt_record["hidden_logical_retry_count"] = (
-                                    getattr(
+                            except BaseException as caught_exc:
+                                perform_exc = caught_exc
+                                if isinstance(caught_exc, Exception):
+                                    attempt_record[
+                                        "hidden_logical_retry_count"
+                                    ] = getattr(
                                         request.state,
                                         "aawm_passthrough_hidden_logical_retry_count",
                                         getattr(
@@ -2060,23 +2233,13 @@ async def handle_alias_route(  # noqa: PLR0915
                                             0,
                                         ),
                                     )
-                                )
-                                if (
-                                    getattr(
-                                        perform_exc,
-                                        "attempted_provider_call",
-                                        None,
-                                    )
-                                    is False
-                                ):
-                                    attempt_record["attempted_provider_call"] = False
-                                    attempted_provider_call = False
                                 raise
                             finally:
                                 if request_ledger is None and candidate_is_openai:
                                     request_ledger = (
                                         get_request_provider_call_ledger(request)
                                     )
+                                ordinals: list[int] = []
                                 if request_ledger is not None:
                                     new_reservations = request_ledger.reservations[
                                         ledger_start_count:
@@ -2085,22 +2248,62 @@ async def handle_alias_route(  # noqa: PLR0915
                                         reservation.ordinal
                                         for reservation in new_reservations
                                     ]
+                                    attempt_record[
+                                        "logical_provider_send_count"
+                                    ] = len(ordinals)
                                     if ordinals:
-                                        attempt_record["send_ledger_ordinals"] = (
-                                            ordinals
-                                        )
+                                        attempt_record["send_ledger_ordinals"] = ordinals
                                         attempt_record["send_ledger_ordinal"] = (
                                             ordinals[-1]
                                         )
+                                    if (
+                                        perform_exc is not None
+                                        and getattr(
+                                            perform_exc,
+                                            "aawm_call_ledger_exhausted",
+                                            False,
+                                        )
+                                        and not ordinals
+                                    ):
                                         attempt_record[
-                                            "logical_provider_send_count"
-                                        ] = len(ordinals)
+                                            "send_ledger_reservation_rejected"
+                                        ] = True
                                     attempt_record["send_ledger_snapshot"] = (
                                         request_ledger.snapshot()
                                     )
                                     attempt_record[
-                                        "transport_connection_attempts"
-                                    ] = request_ledger.transport_connection_attempts
+                                        "transport_connection_failures"
+                                    ] = request_ledger.transport_connection_failures
+                                if candidate_is_openai and request_ledger is not None:
+                                    attempted_provider_call = bool(ordinals)
+                                elif perform_exc is None:
+                                    attempted_provider_call = True
+                                else:
+                                    explicit_attempted_provider_call = getattr(
+                                        perform_exc,
+                                        "attempted_provider_call",
+                                        None,
+                                    )
+                                    if isinstance(
+                                        explicit_attempted_provider_call,
+                                        bool,
+                                    ):
+                                        attempted_provider_call = (
+                                            explicit_attempted_provider_call
+                                        )
+                                    elif not candidate_is_openai:
+                                        attempted_provider_call = True
+                                    else:
+                                        attempted_provider_call = bool(
+                                            getattr(
+                                                perform_exc,
+                                                "_aawm_provider_returned",
+                                                False,
+                                            )
+                                        )
+                                attempt_record["attempted_provider_call"] = (
+                                    attempted_provider_call
+                                )
                                 if "hidden_logical_retry_count" not in attempt_record:
                                     attempt_record["hidden_logical_retry_count"] = (
                                         getattr(
@@ -2113,6 +2316,7 @@ async def handle_alias_route(  # noqa: PLR0915
                                             ),
                                         )
                                     )
+                            return response
 
                         async def _run_candidate_operation() -> Response:
                             run_with_lease_renewal = getattr(
@@ -2160,13 +2364,155 @@ async def handle_alias_route(  # noqa: PLR0915
                             )
                             is not None
                         )
-                        if is_auto_review:
+                        deferred_session_owner_stream = False
+                        deferred_success_committed = False
+
+                        async def _commit_candidate_success() -> None:
+                            nonlocal deferred_success_committed
+                            if deferred_success_committed:
+                                return
+                            deferred_success_committed = True
+                            assert intent is not None
+                            try:
+                                if (
+                                    codex_failure_evidence_alias is not None
+                                    and alias_routing_state.codex_failure_evidence_gate.contains(
+                                        canonical_alias=codex_failure_evidence_alias,
+                                        cooldown_key=selection["cooldown_key"],
+                                    )
+                                ):
+                                    alias_routing_state.codex_failure_evidence_gate.clear_entries(
+                                        canonical_aliases=(
+                                            codex_failure_evidence_alias,
+                                        ),
+                                        cooldown_keys=(selection["cooldown_key"],),
+                                    )
+                                await set_session_affinity_fn(
+                                    selection.get("session_key"),
+                                    candidate,
+                                )
+                                assert response is not None
+                                attempt_record["attempted_provider_call"] = (
+                                    attempted_provider_call
+                                )
+                                _record_auto_agent_alias_attempt_success(
+                                    alias_family=alias_family,
+                                    alias_model=alias_model,
+                                    request=request,
+                                    prepared_request_body=prepared_request_body,
+                                    selection=selection,
+                                    attempts=attempts,
+                                    attempt_record=attempt_record,
+                                    add_alias_metadata_fn=add_alias_metadata_fn,
+                                )
+                                if capacity_retry_coordinator is not None:
+                                    await capacity_retry_coordinator.signal_success()
+                                    capacity_retry_coordinator.record_terminal(
+                                        "success",
+                                        error_class="success",
+                                        status_code=getattr(
+                                            response,
+                                            "status_code",
+                                            200,
+                                        ),
+                                    )
+                            except BaseException as success_exc:
+                                if not intent.done.is_set():
+                                    intent.complete(error=success_exc)
+                                alias_routing_state.publication_intents.remove(intent)
+                                raise
+                            intent.complete()
+                            alias_routing_state.publication_intents.remove(intent)
+                            await finalize_deferred_success(response)
+
+                        async def _complete_deferred_failure(cause):
+                            assert intent is not None
+                            if not intent.done.is_set():
+                                intent.complete(
+                                    error=(
+                                        cause
+                                        if isinstance(cause, BaseException)
+                                        else RuntimeError(
+                                            "deferred candidate stream did not "
+                                            "complete successfully"
+                                        )
+                                    )
+                                )
+                            alias_routing_state.publication_intents.remove(intent)
+
+                        async def _finalize_deferred_success():
+                            if is_auto_review:
+                                return (
+                                    await sa.finalize_codex_auto_review_lease_on_success(
+                                        session_owner_lease
+                                    )
+                                )
+                            return await sa.finalize_session_owner_lease_on_success(
+                                session_owner_lease,
+                                attributes=owner_attributes,
+                                candidate=candidate,
+                            )
+
+                        if getattr(
+                            response,
+                            "_aawm_session_owner_promotion_deferred",
+                            False,
+                        ):
+                            deferred_session_owner_stream = (
+                                sa.bind_deferred_session_owner_lease_to_streaming_response(
+                                    response,
+                                    request=request,
+                                    lease=session_owner_lease,
+                                    attributes=owner_attributes,
+                                    candidate=candidate,
+                                    failure_phase=(
+                                        "session_owner_stream_promote"
+                                    ),
+                                    success_finalizer=_finalize_deferred_success,
+                                    success_outcomes=(
+                                        {
+                                            sa.SessionOwnerMutationOutcome.RELEASED,
+                                            sa.SessionOwnerMutationOutcome.NOT_HELD,
+                                            sa.SessionOwnerMutationOutcome.ALREADY_OWNED,
+                                        }
+                                        if is_auto_review
+                                        else {
+                                            sa.SessionOwnerMutationOutcome.PROMOTED,
+                                            sa.SessionOwnerMutationOutcome.ALREADY_OWNED,
+                                        }
+                                    ),
+                                    on_success=_commit_candidate_success,
+                                    on_failure=_complete_deferred_failure,
+                                )
+                            )
+                        if deferred_session_owner_stream:
+                            finalize_result = None
+                        elif is_auto_review:
                             finalize_result = (
                                 await sa.finalize_codex_auto_review_lease_on_success(
                                     session_owner_lease
                                 )
                             )
-                        else:
+                            if (
+                                finalize_result is not None
+                                and finalize_result.outcome
+                                not in {
+                                    sa.SessionOwnerMutationOutcome.RELEASED,
+                                    sa.SessionOwnerMutationOutcome.NOT_HELD,
+                                    sa.SessionOwnerMutationOutcome.ALREADY_OWNED,
+                                }
+                            ):
+                                sa.raise_session_owner_redispatch_required(
+                                    session_identity=session_owner_identity,
+                                    mutation=finalize_result,
+                                    alias_model=selection.get("alias_model")
+                                    or alias_model,
+                                    candidate=candidate,
+                                    failure_phase="session_owner_auto_review_release",
+                                    attempted_provider_call=attempted_provider_call,
+                                    request=request,
+                                )
+                        elif not deferred_session_owner_stream:
                             # Authoritative success: promote reserved -> owned.
                             finalize_result = (
                                 await sa.finalize_session_owner_lease_on_success(
@@ -2191,6 +2537,7 @@ async def handle_alias_route(  # noqa: PLR0915
                                     or alias_model,
                                     candidate=candidate,
                                     failure_phase="session_owner_promote_after_success",
+                                    attempted_provider_call=attempted_provider_call,
                                     request=request,
                                 )
                     except asyncio.CancelledError:
@@ -2263,7 +2610,7 @@ async def handle_alias_route(  # noqa: PLR0915
                             ),
                         )
                     ):
-                        if not has_continuation_state:
+                        if not _provider_owned_continuation():
                             raise probe_failure_exc
                         attempt_record["status"] = (
                             "terminal_in_flight_unpersisted_item_not_found"
@@ -2377,7 +2724,7 @@ async def handle_alias_route(  # noqa: PLR0915
                             candidate=candidate,
                             selection=selection,
                             is_codex_alias=codex_failure_evidence_alias is not None,
-                            has_continuation_state=has_continuation_state,
+                            has_continuation_state=_provider_owned_continuation(),
                             has_previous_response_id=has_previous_response_id,
                             attempted_provider_call=attempted_provider_call,
                         )
@@ -2404,48 +2751,17 @@ async def handle_alias_route(  # noqa: PLR0915
                         alias_routing_state.publication_intents.remove(intent)
                         break
                     if probe_failure_exc is None:
-                        intent.complete()
-                        alias_routing_state.publication_intents.remove(intent)
-                        if (
-                            codex_failure_evidence_alias is not None
-                            and alias_routing_state.codex_failure_evidence_gate.contains(
-                                canonical_alias=codex_failure_evidence_alias,
-                                cooldown_key=selection["cooldown_key"],
-                            )
-                        ):
-                            alias_routing_state.codex_failure_evidence_gate.clear_entries(
-                                canonical_aliases=(codex_failure_evidence_alias,),
-                                cooldown_keys=(selection["cooldown_key"],),
-                            )
-                        if not _is_native_openai_responses_candidate(
-                            request=request,
-                            candidate=candidate,
-                        ):
-                            await set_session_affinity_fn(
-                                selection.get("session_key"),
-                                candidate,
-                            )
-                        assert response is not None
-                        attempt_record["attempted_provider_call"] = (
-                            attempted_provider_call
-                        )
-                        _record_auto_agent_alias_attempt_success(
-                            alias_family=alias_family,
-                            alias_model=alias_model,
-                            request=request,
-                            prepared_request_body=prepared_request_body,
-                            selection=selection,
-                            attempts=attempts,
-                            attempt_record=attempt_record,
-                            add_alias_metadata_fn=add_alias_metadata_fn,
-                        )
-                        if capacity_retry_coordinator is not None:
-                            await capacity_retry_coordinator.signal_success()
-                            capacity_retry_coordinator.record_terminal(
-                                "success",
-                                error_class="success",
-                                status_code=getattr(response, "status_code", 200),
-                            )
+                        if deferred_session_owner_stream:
+                            # Release single-flight coordination as soon as
+                            # provider response acceptance succeeds. Ownership
+                            # promotion and authoritative success callbacks
+                            # remain deferred until the stream finalizer has
+                            # validated the complete response.
+                            intent.complete()
+                            alias_routing_state.publication_intents.remove(intent)
+                            return response
+                        else:
+                            await _commit_candidate_success()
                         return response
 
                     early_pre_commit_error_class = (
@@ -2716,6 +3032,49 @@ async def handle_alias_route(  # noqa: PLR0915
                 # --- failure handling (post-release) ---------------------------
                 failure_exc = probe_failure_exc
                 assert failure_exc is not None
+                if isinstance(failure_exc, ProviderCallReplayBlocked) or getattr(
+                    failure_exc,
+                    "aawm_openai_wire_replay_blocked",
+                    False,
+                ):
+                    attempt_record["status"] = (
+                        "terminal_openai_wire_replay_blocked"
+                    )
+                    attempt_record["failure_phase"] = (
+                        "openai_wire_replay_blocked"
+                    )
+                    attempt_record["attempted_provider_call"] = False
+                    attempt_record["wire_commitment"] = getattr(
+                        failure_exc,
+                        "wire_commitment",
+                        None,
+                    )
+                    _record_auto_agent_alias_attempt_failure(
+                        alias_family=alias_family,
+                        alias_model=alias_model,
+                        request=request,
+                        prepared_request_body=prepared_request_body,
+                        selection=selection,
+                        attempts=attempts,
+                        attempt_record=attempt_record,
+                        error_class="openai_wire_replay_blocked",
+                        add_alias_metadata_fn=add_alias_metadata_fn,
+                    )
+                    _raise_terminal_alias_failure(
+                        failure_exc,
+                        extra_fields={
+                            "wire_commitment": getattr(
+                                failure_exc,
+                                "wire_commitment",
+                                None,
+                            ),
+                            "request_call_ledger": getattr(
+                                failure_exc,
+                                "ledger_snapshot",
+                                None,
+                            ),
+                        },
+                    )
                 if isinstance(failure_exc, ProviderCallLedgerExhausted) or getattr(
                     failure_exc,
                     "aawm_call_ledger_exhausted",
@@ -2724,7 +3083,12 @@ async def handle_alias_route(  # noqa: PLR0915
                     attempt_record["status"] = (
                         "terminal_request_call_ledger_exhausted"
                     )
-                    attempt_record["attempted_provider_call"] = False
+                    attempted_provider_call = bool(
+                        attempt_record.get("attempted_provider_call")
+                    )
+                    attempt_record["attempted_provider_call"] = (
+                        attempted_provider_call
+                    )
                     attempt_record["request_call_ledger"] = (
                         getattr(failure_exc, "ledger_snapshot", None)
                     )
@@ -2808,10 +3172,8 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                     if fresh_fallback_body is not None:
                         prepared_request_body = fresh_fallback_body
-                        has_continuation_state = (
-                            _codex_auto_agent_request_has_continuation_state(
-                                prepared_request_body
-                            )
+                        has_continuation_state = _codex_auto_agent_request_has_continuation_state(
+                            prepared_request_body
                         )
                         has_previous_response_id = bool(
                             prepared_request_body.get("previous_response_id")
@@ -2929,8 +3291,15 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                 )
                 fresh_dispatch = _genuinely_fresh_dispatch(selection)
+                validated_unowned_replay = _validated_unowned_replay(selection)
+                deterministic_exclusion_eligible = (
+                    fresh_dispatch or validated_unowned_replay
+                )
                 marker_reason: str | None = None
-                if deterministically_ineligible and fresh_dispatch:
+                if (
+                    deterministically_ineligible
+                    and deterministic_exclusion_eligible
+                ):
                     marker_reason = (
                         getattr(failure_exc, "ineligibility_reason", None)
                         or "deterministic_candidate_ineligible"
@@ -2976,17 +3345,129 @@ async def handle_alias_route(  # noqa: PLR0915
                         attempt_record[
                             "candidate_semantic_ineligibility_remaining_seconds"
                         ] = semantic_marker.get("remaining_seconds")
-                if deterministically_ineligible and (
-                    fresh_dispatch
-                    or (replay_safety is not None and replay_safety.safe)
+                if (
+                    deterministically_ineligible
+                    and (
+                        deterministic_exclusion_eligible
+                        or (replay_safety is not None and replay_safety.safe)
+                    )
                 ):
-                    if fresh_dispatch:
+                    if deterministic_exclusion_eligible:
                         provider_candidate_attempts = max(
                             0,
                             provider_candidate_attempts - 1,
                         )
                     deterministically_ineligible_candidate_keys.add(cooldown_key)
                 last_retryable_exc = failure_exc
+                native_grok_recovery_candidate = (
+                    _is_codex_auto_agent_native_grok_4_5_candidate(candidate)
+                )
+                native_grok_cooldown_scope = (
+                    probe_failure_plan.applied_scope
+                    if probe_failure_plan is not None
+                    else "none"
+                )
+                native_grok_retry_eligible = (
+                    _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
+                        is_native_grok_4_5_candidate=(
+                            native_grok_recovery_candidate
+                        ),
+                        has_continuation_state=_provider_owned_continuation(),
+                        error_class=error_class,
+                        cooldown_scope=native_grok_cooldown_scope,
+                    )
+                )
+                if native_grok_retry_eligible:
+                    if failover_ordinal > 0:
+                        provider_candidate_attempts += 1
+                    native_grok_continuation_transient_provider_attempts += 1
+                    (
+                        should_retry_same_candidate,
+                        same_candidate_backoff_seconds,
+                        native_grok_retry_metadata,
+                    ) = _plan_codex_auto_agent_native_grok_continuation_transient_retry(
+                        is_native_grok_4_5_candidate=(
+                            native_grok_recovery_candidate
+                        ),
+                        has_continuation_state=_provider_owned_continuation(),
+                        error_class=error_class,
+                        cooldown_scope=native_grok_cooldown_scope,
+                        provider_attempt=(
+                            native_grok_continuation_transient_provider_attempts
+                        ),
+                        provider=str(candidate.get("provider") or "") or None,
+                        model=str(candidate.get("model") or "") or None,
+                        route_family=str(candidate.get("route_family") or "") or None,
+                        max_attempts=native_grok_continuation_transient_max_attempts,
+                    )
+                    if native_grok_retry_metadata is not None:
+                        attempt_record[
+                            "native_grok_continuation_retry"
+                        ] = native_grok_retry_metadata
+                    error_tokens = _update_codex_auto_agent_retryable_attempt_record(
+                        attempt_record=attempt_record,
+                        exc=failure_exc,
+                        error_class=error_class,
+                        cooldown_seconds=(
+                            probe_failure_plan.duration_seconds
+                            if probe_failure_plan is not None
+                            else 0.0
+                        ),
+                        cooldown_scope=native_grok_cooldown_scope,
+                        alias_model=alias_model,
+                        candidate=candidate,
+                    )
+                    attempt_record["shadow_failure_action"] = (
+                        _error_signals.build_shadow_failure_action_decision_from_exc(
+                            failure_exc,
+                            candidate=candidate,
+                            current_error_class=error_class,
+                            current_cooldown_scope=native_grok_cooldown_scope,
+                            current_status=attempt_record.get("status"),
+                        ).to_observability_dict()
+                    )
+                    _record_auto_agent_alias_attempt_failure(
+                        alias_family=alias_family,
+                        alias_model=alias_model,
+                        request=request,
+                        prepared_request_body=prepared_request_body,
+                        selection=selection,
+                        attempts=attempts,
+                        attempt_record=attempt_record,
+                        error_class=error_class,
+                        add_alias_metadata_fn=add_alias_metadata_fn,
+                    )
+                    verbose_proxy_logger.debug(
+                        "%s auto-agent alias %s target %s/%s hit %s on "
+                        "native continuation attempt %s; cooldown %.1fs scope=%s "
+                        "tokens=%s",
+                        log_label,
+                        alias_model,
+                        candidate["provider"],
+                        candidate["model"],
+                        error_class,
+                        len(attempts),
+                        0.0,
+                        native_grok_cooldown_scope,
+                        sorted(error_tokens),
+                    )
+                    if should_retry_same_candidate:
+                        # Native-grok backoff sleep is NEVER inside the probe lock.
+                        if (
+                            same_candidate_backoff_seconds
+                            and same_candidate_backoff_seconds > 0
+                        ):
+                            await asyncio.sleep(same_candidate_backoff_seconds)
+                        attempt_record = _codex_auto_agent_candidate_public_shape(
+                            candidate,
+                            lane_key=selection.get("lane_key"),
+                            reason="native_grok_continuation_same_candidate_retry",
+                        )
+                        attempt_record["attempted_provider_call"] = False
+                        continue
+                    # Native policy owns terminal behavior after its exact
+                    # request-scoped budget is exhausted.
+                    _raise_terminal_alias_failure(last_retryable_exc)
                 account_slot = _codex_oauth_candidate_slot(candidate)
                 if error_class in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES:
                     same_account_transient_attempts_by_slot[account_slot] = (
@@ -3096,7 +3577,7 @@ async def handle_alias_route(  # noqa: PLR0915
                         "apply_account_exhaustion_cooldown": False,
                         "retryable": True,
                     }
-                    if has_continuation_state:
+                    if _provider_owned_continuation():
                         raise HTTPException(
                             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail={
@@ -3184,20 +3665,29 @@ async def handle_alias_route(  # noqa: PLR0915
                         add_alias_metadata_fn=add_alias_metadata_fn,
                     )
                     _raise_terminal_alias_failure(failure_exc)
-                account_failover_planned = _plan_codex_oauth_account_failover(
-                    request,
-                    candidate=candidate,
-                    selection=selection,
-                    attempt_record=attempt_record,
-                    error_class=error_class,
-                    has_continuation_state=has_continuation_state,
-                    has_previous_response_id=has_previous_response_id,
-                    account_failover_replay_safe=account_failover_replay_safe,
-                    provider_status_code=attempt_record.get("error_status_code"),
+                authenticated_token_pin = (
+                    _is_authenticated_codex_continuation_pin(selection)
+                )
+                account_failover_planned = (
+                    False
+                    if authenticated_token_pin
+                    else _plan_codex_oauth_account_failover(
+                        request,
+                        candidate=candidate,
+                        selection=selection,
+                        attempt_record=attempt_record,
+                        error_class=error_class,
+                        has_continuation_state=_provider_owned_continuation(),
+                        has_previous_response_id=has_previous_response_id,
+                        account_failover_replay_safe=account_failover_replay_safe,
+                        provider_status_code=attempt_record.get(
+                            "error_status_code"
+                        ),
+                    )
                 )
                 if (
                     cooldown_scope == "none"
-                    and not has_continuation_state
+                    and not _provider_owned_continuation()
                     and not deterministically_ineligible
                 ):
                     _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
@@ -3207,12 +3697,22 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                 if (
                     error_class == "token_invalidated"
-                    and has_continuation_state
-                    and not account_failover_replay_safe
+                    and (
+                        (
+                            _provider_owned_continuation()
+                            and not account_failover_replay_safe
+                        )
+                        or (
+                            authenticated_token_pin
+                            and has_continuation_state
+                        )
+                    )
                     and not account_failover_planned
                 ):
                     attempt_record["status"] = (
-                        "terminal_in_flight_token_invalidated"
+                        "terminal_authenticated_continuation_unavailable"
+                        if authenticated_token_pin
+                        else "terminal_in_flight_token_invalidated"
                     )
                     failure_body = _record_auto_agent_alias_attempt_failure(
                         alias_family=alias_family,
@@ -3224,9 +3724,21 @@ async def handle_alias_route(  # noqa: PLR0915
                         attempt_record=attempt_record,
                         error_class=error_class,
                         add_alias_metadata_fn=add_alias_metadata_fn,
-                        redispatch_required=True,
+                        redispatch_required=not authenticated_token_pin,
                         defer_terminal_error=True,
                     )
+                    if authenticated_token_pin:
+                        _raise_authenticated_codex_continuation_unavailable(
+                            candidate=candidate,
+                            selection=selection,
+                            attempt_record=attempt_record,
+                            attempts=attempts,
+                            failure_body=failure_body,
+                            error_tokens=error_tokens,
+                            cooldown_seconds=cooldown_seconds,
+                            cooldown_scope="none",
+                            failure_phase="token_invalidated_continuation",
+                        )
                     failure_metadata = failure_body.get("litellm_metadata") or {}
                     try:
                         raise_redispatch_required_fn(
@@ -3268,7 +3780,7 @@ async def handle_alias_route(  # noqa: PLR0915
                         )
                         raise
                 if (
-                    has_continuation_state
+                    _provider_owned_continuation()
                     and cooldown_scope != "none"
                     and not account_failover_planned
                     and not (
@@ -3276,7 +3788,11 @@ async def handle_alias_route(  # noqa: PLR0915
                         and account_failover_replay_safe
                     )
                 ):
-                    attempt_record["status"] = "terminal_in_flight_cooldown_set"
+                    attempt_record["status"] = (
+                        "terminal_authenticated_continuation_unavailable"
+                        if authenticated_token_pin
+                        else "terminal_in_flight_cooldown_set"
+                    )
                     failure_body = _record_auto_agent_alias_attempt_failure(
                         alias_family=alias_family,
                         alias_model=alias_model,
@@ -3287,9 +3803,24 @@ async def handle_alias_route(  # noqa: PLR0915
                         attempt_record=attempt_record,
                         error_class=error_class,
                         add_alias_metadata_fn=add_alias_metadata_fn,
-                        redispatch_required=True,
+                        redispatch_required=not authenticated_token_pin,
                         defer_terminal_error=True,
                     )
+                    if authenticated_token_pin:
+                        _raise_authenticated_codex_continuation_unavailable(
+                            candidate=candidate,
+                            selection=selection,
+                            attempt_record=attempt_record,
+                            attempts=attempts,
+                            failure_body=failure_body,
+                            error_tokens=error_tokens,
+                            cooldown_seconds=cooldown_seconds,
+                            cooldown_scope=cooldown_scope,
+                            failure_phase=(
+                                attempt_record.get("failure_phase")
+                                or "authenticated_continuation_cooldown"
+                            ),
+                        )
                     failure_metadata = failure_body.get("litellm_metadata") or {}
                     verbose_proxy_logger.debug(
                         "%s auto-agent alias %s target %s/%s hit %s "
@@ -3371,34 +3902,6 @@ async def handle_alias_route(  # noqa: PLR0915
                     break
                 if failover_ordinal > 0:
                     provider_candidate_attempts += 1
-                native_grok_retry_eligible = _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
-                    is_native_grok_4_5_candidate=(_is_codex_auto_agent_native_grok_4_5_candidate(candidate)),
-                    has_continuation_state=has_continuation_state,
-                    error_class=error_class,
-                    cooldown_scope=cooldown_scope,
-                )
-                if native_grok_retry_eligible:
-                    native_grok_continuation_transient_provider_attempts += 1
-                    native_grok_provider_attempt = native_grok_continuation_transient_provider_attempts
-                else:
-                    native_grok_provider_attempt = 0
-                (
-                    should_retry_same_candidate,
-                    same_candidate_backoff_seconds,
-                    native_grok_retry_metadata,
-                ) = _plan_codex_auto_agent_native_grok_continuation_transient_retry(
-                    is_native_grok_4_5_candidate=(_is_codex_auto_agent_native_grok_4_5_candidate(candidate)),
-                    has_continuation_state=has_continuation_state,
-                    error_class=error_class,
-                    cooldown_scope=cooldown_scope,
-                    provider_attempt=native_grok_provider_attempt,
-                    provider=str(candidate.get("provider") or "") or None,
-                    model=str(candidate.get("model") or "") or None,
-                    route_family=str(candidate.get("route_family") or "") or None,
-                    max_attempts=native_grok_continuation_transient_max_attempts,
-                )
-                if native_grok_retry_metadata is not None:
-                    attempt_record["native_grok_continuation_retry"] = native_grok_retry_metadata
                 _record_auto_agent_alias_attempt_failure(
                     alias_family=alias_family,
                     alias_model=alias_model,
@@ -3422,20 +3925,6 @@ async def handle_alias_route(  # noqa: PLR0915
                     cooldown_scope,
                     sorted(error_tokens),
                 )
-                if should_retry_same_candidate:
-                    # Native-grok backoff sleep is NEVER inside the probe lock.
-                    if same_candidate_backoff_seconds and same_candidate_backoff_seconds > 0:
-                        await asyncio.sleep(same_candidate_backoff_seconds)
-                    attempt_record = _codex_auto_agent_candidate_public_shape(
-                        candidate,
-                        lane_key=selection.get("lane_key"),
-                        reason="native_grok_continuation_same_candidate_retry",
-                    )
-                    attempt_record["attempted_provider_call"] = False
-                    continue
-                if native_grok_retry_eligible:
-                    # Same-candidate budget exhausted; do not switch providers.
-                    _raise_terminal_alias_failure(last_retryable_exc)
                 break
 
         finally:

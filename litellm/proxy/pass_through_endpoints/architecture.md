@@ -138,6 +138,21 @@ tracked separately from logical calls, and telemetry exposes only bounded
 fingerprints for targets, candidates, and account lanes. Non-OpenAI pass-through
 providers bypass this ledger and retain their existing transport behavior.
 
+The Responses wire coordinator remains the sole authority for replay
+commitment. It publishes a bounded request snapshot through
+`publish_wire_commitment_snapshot`; the send wrapper calls
+`ensure_openai_wire_replay_allowed` before reserving a new logical send and
+raises `ProviderCallReplayBlocked` when headers/body/terminal delivery,
+cancellation, or disconnect makes replay unsafe. The ledger mirrors that
+state for telemetry but does not independently decide wire ownership.
+Hidden-retry metadata derives the logical retry count from actual logical
+sends during the retry operation: the request-ledger send delta minus the
+initial send. A denied reservation is recorded separately as
+`reservation_denied` with no provider-call attempt and cannot become a logical
+retry. Transport connection attempts remain separate evidence; the legacy
+attempts-named projection aliases the failure-only count for existing
+consumers.
+
 ### Tool-schema normalization gate (issue #9)
 
 - OpenAI function-tool `type: object` `properties` fixes run only for

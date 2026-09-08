@@ -529,6 +529,10 @@ launcher validates managed metadata from `stat` and, when the file is unreadable
 uses a disposable **read-only** `docker run` of the existing prod image with a
 read-only mount to validate JSON safely. No secrets are printed.
 
+Managed preflight uses the same exact-scope selector as the request and refresh
+paths. It rejects missing scopes in multi-record documents and does not select
+records by JSON key order; only an unambiguous legacy flat record is accepted.
+
 Combined credential/process health requires **both** credential records to have:
 
 - a current access credential (`key` or `access_token`)
@@ -759,68 +763,198 @@ Dashboard polling uses `urllib` with those stdlib helpers.
 
 ## ChatGPT conversation-init observations
 
-The current ChatGPT frontend issues `POST /backend-api/conversation/init` with
-no body. GET is invalid: a browser GET returned HTTP 400
-`{"detail":"Invalid conversation init"}`, and a headless GET returned HTTP 403.
-The collector must not submit a model message or conversation content.
+The collector observes the ChatGPT frontend's native
+`POST /backend-api/conversation/init` request and response on an owned page.
+It does not fabricate a fetch or submit model messages or conversation content.
+Whether the native request actually omitted its body is recorded as evidence,
+not imposed as a universal no-body contract. Account-pin provenance comes from
+the matching native request and its CDP `ExtraInfo` events, not from assumed
+account fields in the conversation-init response.
 
 This path has two cooperating pieces:
 
 - Browser-boundary collector: `litellm/llms/chatgpt/conversation_init.py`
-  accepts an injected transport, issues the no-body POST contract, redacts
+  accepts an injected transport, observes the native exchange, redacts
   cookies, tokens, headers, raw storage, and personal fields, then atomically
-  writes a credential-safe JSON snapshot. It refuses symlink destinations.
-  Fixture transports make this unit-testable without live auth. The public
+  writes a credential-safe JSON snapshot no larger than the 1,000,000-byte
+  reader budget. It refuses symlink destinations. A failed current capture
+  retains the prior file only when that file parses and passes the same
+  sanitized persistability and serialized-size checks.
+  The public
   `collect_conversation_init_snapshot_from_oracle_browser(...)` entry point
-  attaches to an existing Oracle browser over CDP and evaluates only the
-  authenticated no-body POST from an existing ChatGPT page. It does not launch
-  Chrome, create a persistent context, read browser cookies or storage, export
-  credentials, or return response headers.
-- Sidecar file consumer: `scripts/run_provider_status_observations_loop.py`
-  rereads that snapshot from a regular file. The sidecar never HTTP-calls
-  chatgpt.com, never reads Oracle cookies, and never ships `authenticator.py`,
+  attaches to a bound Oracle browser over CDP and observes the native exchange
+  on an owned page. The attach path does not launch Chrome or open a persistent
+  profile. It does not export cookies, storage, credentials, or raw headers.
+- Sidecar task: `scripts/run_provider_status_observations_loop.py` retains a
+  legacy regular-file consumer and optionally runs bound live capture through
+  the public collector. The sidecar never directly HTTP-calls `chatgpt.com`,
+  never reads Oracle cookies, and never ships `authenticator.py`,
   `common_utils.py`, or `httpx`.
 
-The sidecar image copies only `conversation_init.py` and touches
-`litellm/llms/chatgpt/__init__.py`. Persist uses the existing
-`rate_limit_observations` insert path. Account identifiers and collector source
-paths are hashed; titles, names, usernames, workspace fields, feature notes,
-emails, cookies, token values, and unknown string fields are redacted. Strings
-are retained only for explicit telemetry fields such as model/feature identity,
-status, state, mode, window, and reset timestamps. Finite numeric token usage
-counters such as `input_tokens`, `output_tokens`, and `token_limit` remain
-available in sanitized projections. Snapshot `raw_provider_fields` omit
-`observed_at` so repeated identical polls do not defeat dedup. Empty
-`model_limits`, `limits_progress`, or `blocked_features` collections, and
-absent fields, are `empty_unknown` / `absent_unknown`. They are not proof of
-unlimited capacity or zero usage. HTTP 400/403, authentication loss, malformed
-JSON, and non-init shapes retain the last valid observation.
+The sidecar image packages `conversation_init.py`, the owned
+`scripts/chatgpt_oracle_browser_session.mjs` helper, and pinned Playwright with
+Chromium shared libraries/Xvfb, `rsync`, and `xauth`; it does not download another
+browser. Persist uses the existing
+`rate_limit_observations` insert path. Conversation-init writes use
+`AAWM_CODEX_QUOTA_DSN` through the same DSN resolver as Codex quota writes,
+falling back to the general provider-status DSN. Account identifiers and
+collector source paths are hashed; titles, names, usernames, workspace fields,
+feature notes, emails, cookies, token values, and unknown string fields are
+redacted. Strings are retained only for explicit telemetry fields such as
+model/feature identity (including native limits-progress `feature_name`),
+status, state, mode, window, and reset timestamps.
+Finite numeric token usage counters such as `input_tokens`, `output_tokens`,
+and `token_limit` remain available in sanitized projections. Snapshot
+`raw_provider_fields` omit `observed_at` so repeated identical polls do not
+defeat dedup. Empty `model_limits`, `limits_progress`, or `blocked_features`
+collections, and absent fields, are `empty_unknown` / `absent_unknown`. They
+are not proof of unlimited capacity or zero usage.
+
+Validated bare identities in named collections, numeric-string usage values,
+and supported reset-field aliases survive projection. Non-finite or overflowing
+numbers are rejected locally. A wholly malformed collection response does not
+replace a reusable snapshot; usable partial responses and genuinely empty
+collections remain distinct. Projection limits carry explicit truncation
+evidence through file rereads, rather than inferring loss from row counts.
+Malformed numeric fields are retained only as safe field-name markers, so the
+affected entry is excluded while usable sibling entries remain. Browser
+challenge evidence is retained separately from browser-cleanup failures and
+continues to drive the bound-session cooldown.
+
+When `AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS` is absent, the sidecar
+preserves legacy file-only mode. That mode covers only the one
+configured snapshot path and must not be described as live all-account
+coverage. The existing last-good file behavior applies only to this mode.
+Explicit empty or whitespace values are invalid JSON; `{}` enables bound mode
+with missing-binding coverage. A legacy database write failure preserves
+`capture_coverage_status=legacy_file_snapshot` and reports
+`persistence_coverage_status=database_write_failed`.
+
+When the binding variable is present, its exact nonsecret interface is a JSON
+object keyed by the `LITELLM_CODEX_OAUTH_INVENTORY` label:
+
+```json
+{
+  "account1": {
+    "cdp_endpoint": "http://127.0.0.1:9222",
+    "page_target_id": "target-id-for-account1"
+  },
+  "account2": {
+    "oracle_profile_path": "/run/aawm/oracle/account2",
+    "oracle_profile_directory": "Default"
+  }
+}
+```
+
+Each label selects either an existing `cdp_endpoint` plus `page_target_id`
+binding or an `oracle_profile_path` binding with optional
+`oracle_profile_directory`. The example illustrates configuration, not verified
+account2 coverage. The value is supplied through
+`AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS` (or the matching CLI
+option). Bound mode iterates
+`_require_codex_oauth_inventory(config).ordered_records(enabled_only=True)`
+with no model filter, so every enabled inventory account needs a matching
+binding. Each account is captured to a separate fresh sanitized temporary
+path. The sidecar parses and persists only when the current capture was
+written, the collector returned `account_identity_verified=true`, and its
+canonical-12 `account_hash` matches the inventory pin. A source-path hash is
+never accepted for bound persistence. Binding, browser-session, dependency,
+and identity failures are isolated in explicit per-account coverage and do
+not cause another account's current capture to be persisted incorrectly. A
+retained old snapshot is never counted as a fresh bound capture.
+Bound telemetry reports `capture_coverage_status` separately from
+`persistence_coverage_status`; `fresh_capture_count` counts only current
+identity-verified bound captures, so legacy file rereads leave it at zero.
+The aggregate `request_body_omitted` is null until native capture evidence is
+available; `request_body_omission_status` is `not_observed`, `observed`, or
+`mixed`. Per-account `account_coverage` entries expose the corresponding
+nullable native-capture value without retaining request bodies. In one-shot
+status, bound capture or persistence coverage of `partial`, `failed`,
+`inventory_unavailable`, `database_write_failed`, or
+`database_write_skipped` degrades optional health. Persistence
+`not_applied` is intentional dry-run behavior and does not degrade health;
+required refresh failures still control the one-shot exit code.
+
+When a bound capture cannot write a current snapshot,
+`account_coverage[].collector_failure_reason` is either null or one of these
+fixed sanitized values:
+`invalid_expected_account_hash`, `browser_boundary_unavailable`,
+`malformed_browser_response`, `browser_challenge`, `http_auth`,
+`http_error`, `http_http_error`, `native_identity_unverified`, `native_capture_error`,
+`native_capture_incomplete`,
+`native_capture_invalid_account_hash`,
+`native_capture_invalid_identity_source`,
+`native_capture_incomplete_selector_evidence`, `native_capture_uncorrelated`,
+`native_capture_invalid_request_method`,
+`native_capture_invalid_body_observation`,
+`native_capture_invalid_browser_challenge`,
+`conflicting_native_payload_account_id`, `native_payload_identity_mismatch`,
+`invalid_retry_after_seconds`,
+`account_identity_mismatch`, `missing_authoritative_account_id`,
+`conflicting_authoritative_account_id`, `payload_not_present`,
+`payload_not_mapping`, `payload_marker_missing`,
+`collections_wholly_malformed`, `account_identity_unverified`,
+`account_identity_missing`, or `snapshot_write_failed`. These values describe
+the rejected current capture; they do not replace a reusable last-good
+snapshot.
+
+The same per-account entry exposes bounded structural diagnostics from the
+sanitized current payload: `model_limits_state`, `limits_progress_state`, and
+`blocked_features_state` are fixed enums (`absent_unknown`, `empty_unknown`,
+`present`, `partial`, or `malformed`); `malformed_entry_count` and
+`valid_observation_count` are nonnegative counts capped at 800;
+`projection_truncated` reports projection truncation; and
+`malformed_collection_projection` reports collection members dropped by
+sanitization. These fields contain no collection values, identities, dynamic
+keys, schema strings, or raw errors, and remain zero/unknown when no payload
+was available.
 
 Relevant environment variables:
 
 - `AAWM_CHATGPT_CONVERSATION_INIT_POLL_ENABLED`: enables the sidecar file
-  consumer. Defaults to disabled.
+  consumer or bound capture. Defaults to disabled.
 - `AAWM_CHATGPT_CONVERSATION_INIT_POLL_INTERVAL_SECONDS`: minimum seconds
   between attempts; default `600`.
 - `AAWM_CHATGPT_CONVERSATION_INIT_SOURCE_PATH`: regular-file JSON snapshot;
   default `/run/aawm/chatgpt/conversation-init.json`.
 - `AAWM_CHATGPT_CONVERSATION_INIT_URL`: documented POST URL. The sidecar does
   not fetch this URL.
+- `AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS`: optional nonsecret JSON
+  object mapping inventory labels to a CDP or Oracle profile binding;
+  enables bound per-account live capture.
 - `AAWM_CHATGPT_CONVERSATION_INIT_BROWSER_CDP_ENDPOINT`: optional CDP endpoint
-  used by the attach-only Oracle browser entry point.
+  used by direct attach-only collector calls; bound sidecar mode uses the
+  endpoint from each account binding.
 - `ORACLE_BROWSER_CDP_ENDPOINT`: fallback CDP endpoint for the established
   Oracle browser boundary. The default is `http://127.0.0.1:9222`.
+- `AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE`: mounted Oracle Node executable.
+- `AAWM_CHATGPT_ORACLE_PACKAGE_DIR`: mounted installed Oracle package/module tree.
+- `AAWM_CHATGPT_ORACLE_CHROME_EXECUTABLE`: mounted Chrome executable.
 
-The live boundary requires all of the following at runtime: an already-running
-authenticated Oracle browser with an existing ChatGPT page, a reachable CDP
-endpoint, and Playwright installed in the process that invokes the public
-entry point. The default Oracle profile
-`/home/zepfu/.oracle/browser-profile` is a locked shared profile and must not
-be opened by a competing persistent browser context; CDP attachment is the
-only supported collection path here. The current focused tests use fakes and
-do not establish live authenticated acceptance or live quota counts. If the
-existing browser is not running or its CDP endpoint is unavailable, the
-collector fails closed and the sidecar retains its last good snapshot.
+The profile alternative uses existing Oracle code through the owned helper,
+copies the read-only base profile into a private working profile, and cleans up
+only its private processes and files. It must not open the shared base profile
+as a competing persistent browser context. It runs headed Chrome with an Xvfb
+fallback when `DISPLAY` is absent; it is not a standalone service.
+The Linux caller checks process-handle support before launch, creates a private
+scratch root, uses private `HOME`/XDG config and cache directories, and retains
+stable handles for its children through cancellation.
+Cleanup also runs after helper exit, stops residual owned children, and verifies
+scratch removal. Failed process or file cleanup is an explicit capture failure,
+not a silently successful poll. No shared Oracle session is terminated.
+
+The actual sidecar is owned by
+`aawm-infrastructure/docker-compose.thoth-litellm.yml` and runs as UID 1000.
+Chrome, the installed Oracle Node/module tree, and base profiles are supplied
+through read-only runtime mounts. Allocate sufficient memory for the existing
+sidecar plus Chrome and its temporary profile. Keep copied profiles on private
+ephemeral storage; do not mount the base profile writable. Deployment and
+per-account recurring persistence require separate operational verification.
+
+Polling uses a 600-second default cadence. `Retry-After` and backoff apply to
+the shared browser session, preserving other sessions and prior observation
+rows. A deferred or failed capture is not fresh evidence and does not replace
+prior rows or establish account coverage.
 
 ## Alibaba Token Plan quota polling
 

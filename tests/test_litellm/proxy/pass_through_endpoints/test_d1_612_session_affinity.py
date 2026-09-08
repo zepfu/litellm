@@ -2557,7 +2557,9 @@ async def test_codex_compatible_owned_redispatch_metadata_remains_pinned(
     )
 
     assert selected["selection_reason"] == "session_affinity"
-    assert selected["request_mode"] == "fresh_redispatch"
+    # The client ordinal is telemetry only; fresh redispatch requires
+    # server-owned replay validation bound to the exact rebuilt body.
+    assert selected["request_mode"] == "ordinary_continuation"
     assert selected["candidate"] == candidate
     activate.assert_not_called()
 
@@ -2813,13 +2815,20 @@ async def test_codex_owned_owner_cooldown_reselects_with_effective_identity(
     activate = MagicMock(wraps=sa.activate_session_owner_redispatch_effective_identity)
     monkeypatch.setattr(sa, "activate_session_owner_redispatch_effective_identity", activate)
 
+    request_body = {
+        "model": "alias",
+        "litellm_metadata": {"redispatch_ordinal": 1},
+        "input": [{"type": "function_call", "name": "inspect"}],
+    }
+    sa.set_validated_cursor_replay(
+        request,
+        body=request_body,
+        stage="test",
+        reason="owned-affinity-effective-identity-reselection",
+    )
     selected = await sel._select_codex_auto_agent_candidate(
         request=request,
-        request_body={
-            "model": "alias",
-            "litellm_metadata": {"redispatch_ordinal": 1},
-            "input": [{"type": "function_call", "name": "inspect"}],
-        },
+        request_body=request_body,
     )
 
     assert selected["selection_reason"] == "first_available"

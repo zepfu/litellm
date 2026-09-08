@@ -62,6 +62,7 @@ _CURSOR_REQUEST_SCHEMA_REJECTION_REASONS = frozenset(
         "unresolved_call_id",
         "item_not_object",
         "item_type",
+        "cursor_continuation_identifier",
     }
 )
 _CURSOR_REQUEST_SCHEMA_REJECTION_CATEGORIES = frozenset(
@@ -69,6 +70,11 @@ _CURSOR_REQUEST_SCHEMA_REJECTION_CATEGORIES = frozenset(
 )
 _CURSOR_REQUEST_SCHEMA_REJECTION_OBJECT_TYPES = frozenset(
     {"function_call", "function_call_output", "object", "unknown"}
+)
+_CURSOR_SUBAGENT_SCHEMA_REJECTION_PREFIXES = (
+    "Cursor Agent advertised ",
+    "Cursor Agent subagent operation requires the advertised spawn_agent tool.",
+    "Cursor Agent subagent operation requests readonly execution, ",
 )
 _CURSOR_REQUEST_SCHEMA_SAFE_KEYS = frozenset(
     {
@@ -147,6 +153,7 @@ _CURSOR_REPLAY_FRESH_DISPATCH_REJECTION_REASONS = frozenset(
         "id_only_reasoning_reference",
         "explicit_item_reference",
         "invalid_body_shape",
+        "cursor_continuation_identifier",
     }
 )
 _CURSOR_CONTINUATION_FIELDS = frozenset(
@@ -1068,6 +1075,7 @@ def _maybe_wrap_xai_passthrough_responses_stream(
     )
     return inherit_or_wrap_passthrough_streaming_response(
         reconstructed,
+        source_response=response,
         request_context=request_context,
     )
 
@@ -2109,10 +2117,25 @@ def _cursor_replay_stock_codex_function_call_item(
     )
 
 
-def _cursor_replay_stock_codex_full_history_input(
+def _cursor_replay_stock_codex_full_history_input(  # noqa: PLR0915
     request_body: dict[str, Any],
 ) -> _CursorReplayValidationResult:
+    """Accept only the bounded stock full-history replay grammar.
+
+    The supported shape is one user-bearing history with exactly one
+    ``function_call`` immediately followed by exactly one completed
+    ``function_call_output``. Other stock history variants fail closed.
+    """
     input_items = request_body.get("input")
+    continuation_rejection = _cursor_replay_continuation_identifier_rejection(
+        input_items,
+        stage="stock_full_history",
+    )
+    if continuation_rejection is not None:
+        return _CursorReplayValidationResult(
+            value=None,
+            rejection=continuation_rejection,
+        )
     if not isinstance(input_items, list):
         return _cursor_replay_rejected(
             "stock_full_history",
@@ -2296,6 +2319,15 @@ def _cursor_replay_stock_codex_full_history_input(
             "stock_full_history",
             "unresolved_call_id",
         )
+    continuation_key = _cursor_replay_input_contains_cursor_continuation_identifier(
+        replayed_input
+    )
+    if continuation_key is not None:
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "cursor_continuation_identifier",
+            item=continuation_key,
+        )
     return _CursorReplayValidationResult(value=replayed_input)
 
 
@@ -2367,7 +2399,70 @@ def _cursor_replay_unresolved_function_call_ids(
 
     if not seen_call_ids:
         return _cursor_replay_rejected(stage, "function_call_count")
+    if unresolved_call_ids:
+        return _cursor_replay_rejected(stage, "unresolved_call_id")
     return _CursorReplayValidationResult(value=unresolved_call_ids)
+
+
+def _cursor_replay_input_contains_cursor_continuation_identifier(
+    value: Any,
+    *,
+    seen: Optional[set[int]] = None,
+) -> Optional[str]:
+    if seen is None:
+        seen = set()
+    if isinstance(value, Mapping):
+        marker = id(value)
+        if marker in seen:
+            return None
+        seen.add(marker)
+        continuation_fields = {
+            field.casefold() for field in _CURSOR_CONTINUATION_FIELDS
+        }
+        for key, child in value.items():
+            if (
+                isinstance(key, str)
+                and key.casefold() in continuation_fields
+                and child is not None
+            ):
+                return key
+            found = _cursor_replay_input_contains_cursor_continuation_identifier(
+                child,
+                seen=seen,
+            )
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, list):
+        marker = id(value)
+        if marker in seen:
+            return None
+        seen.add(marker)
+        for child in value:
+            found = _cursor_replay_input_contains_cursor_continuation_identifier(
+                child,
+                seen=seen,
+            )
+            if found is not None:
+                return found
+    return None
+
+
+def _cursor_replay_continuation_identifier_rejection(
+    value: Any,
+    *,
+    stage: str,
+) -> Optional[_CursorReplayFreshDispatchReject]:
+    continuation_key = _cursor_replay_input_contains_cursor_continuation_identifier(
+        value
+    )
+    if continuation_key is None:
+        return None
+    return _cursor_replay_rejection(
+        stage,
+        "cursor_continuation_identifier",
+        item={continuation_key: True},
+    )
 
 
 def _cursor_replay_canonicalize_stock_tool_search(
@@ -2442,6 +2537,133 @@ def _cursor_replay_canonicalize_stock_web_search(
     ):
         return None
     return dict(tool)
+
+
+_CURSOR_REPLAY_NAMESPACE_TOOL_NAMES = {
+    "collaboration": frozenset(
+        {
+            "followup_task",
+            "interrupt_agent",
+            "list_agents",
+            "send_message",
+            "spawn_agent",
+            "wait_agent",
+        }
+    ),
+    "multi_agent_v1": frozenset(
+        {
+            "close_agent",
+            "resume_agent",
+            "send_input",
+            "spawn_agent",
+            "wait_agent",
+        }
+    ),
+}
+_CURSOR_REPLAY_NAMESPACE_NAME_ALIASES = {
+    "functions.collaboration": "collaboration",
+    "functions.multi_agent_v1": "multi_agent_v1",
+}
+_CURSOR_REPLAY_NAMESPACE_CHILD_NAME_ALIASES = {"wait": "wait_agent"}
+_CURSOR_REPLAY_NAMESPACE_ALLOWED_KEYS = frozenset(
+    {"type", "name", "description", "tools"}
+)
+_CURSOR_REPLAY_NAMESPACE_CHILD_ALLOWED_KEYS = frozenset(
+    {
+        "type",
+        "name",
+        "description",
+        "parameters",
+        "strict",
+        "defer_loading",
+    }
+)
+
+
+def _cursor_replay_canonicalize_stock_namespace(
+    tool: Mapping[str, Any],
+    *,
+    tool_adapter: Any,
+) -> Optional[dict[str, Any]]:
+    if set(tool) - _CURSOR_REPLAY_NAMESPACE_ALLOWED_KEYS:
+        return None
+    if tool.get("type") != "namespace":
+        return None
+
+    raw_namespace_name = tool.get("name")
+    if not isinstance(raw_namespace_name, str) or not raw_namespace_name.strip():
+        return None
+    namespace_name = raw_namespace_name.strip()
+    namespace_key = _CURSOR_REPLAY_NAMESPACE_NAME_ALIASES.get(
+        namespace_name,
+        namespace_name,
+    )
+    allowed_child_names = _CURSOR_REPLAY_NAMESPACE_TOOL_NAMES.get(namespace_key)
+    if allowed_child_names is None:
+        return None
+
+    description = tool.get("description")
+    if description is not None and not isinstance(description, str):
+        return None
+
+    children = tool.get("tools")
+    if not isinstance(children, list):
+        return None
+
+    seen_child_names: set[str] = set()
+    for child in children:
+        if not isinstance(child, Mapping):
+            return None
+        if set(child) - _CURSOR_REPLAY_NAMESPACE_CHILD_ALLOWED_KEYS:
+            return None
+        if child.get("type") != "function":
+            return None
+
+        raw_child_name = child.get("name")
+        if not isinstance(raw_child_name, str) or not raw_child_name.strip():
+            return None
+        child_name = raw_child_name.strip()
+        canonical_child_name = _CURSOR_REPLAY_NAMESPACE_CHILD_NAME_ALIASES.get(
+            child_name,
+            child_name,
+        )
+        if canonical_child_name not in allowed_child_names:
+            return None
+        if canonical_child_name in seen_child_names:
+            return None
+        seen_child_names.add(canonical_child_name)
+
+        if "defer_loading" in child and not isinstance(
+            child["defer_loading"],
+            bool,
+        ):
+            return None
+
+        validation_child = dict(child)
+        validation_child["name"] = child_name
+        validation_child.pop("defer_loading", None)
+        validation_child.setdefault("parameters", {})
+        validation_child.setdefault("strict", None)
+        try:
+            validated_child = tool_adapter.validate_python(
+                validation_child,
+                strict=True,
+            )
+            canonical_child = json.loads(tool_adapter.dump_json(validated_child))
+        except Exception:  # noqa: BLE001
+            return None
+        if canonical_child != validation_child:
+            return None
+
+    try:
+        canonical_tool = json.loads(json.dumps(dict(tool)))
+    except Exception:  # noqa: BLE001
+        return None
+    return (
+        canonical_tool
+        if isinstance(canonical_tool, dict) and canonical_tool == dict(tool)
+        else None
+    )
 
 
 def _cursor_replay_provider_neutral_tools(
@@ -2532,7 +2754,26 @@ def _cursor_replay_provider_neutral_tools(
             validation_tool["name"] = name.strip()
             validation_tool.setdefault("parameters", {})
             validation_tool.setdefault("strict", None)
-        if validation_tool.get("type") == "tool_search":
+        if validation_tool.get("type") == "namespace":
+            try:
+                validated_tool = tool_adapter.validate_python(
+                    validation_tool,
+                    strict=True,
+                )
+                canonical_tool = json.loads(tool_adapter.dump_json(validated_tool))
+            except Exception:  # noqa: BLE001
+                canonical_tool = _cursor_replay_canonicalize_stock_namespace(
+                    validation_tool,
+                    tool_adapter=tool_adapter,
+                )
+                if canonical_tool is None:
+                    return _cursor_replay_rejected(
+                        "provider_neutral_tools",
+                        "tool_validation",
+                        tool_index=tool_index,
+                        tool=original_tool,
+                    )
+        elif validation_tool.get("type") == "tool_search":
             canonical_tool = _cursor_replay_canonicalize_stock_tool_search(
                 validation_tool
             )
@@ -2593,6 +2834,96 @@ def _cursor_replay_provider_neutral_tools(
     return _CursorReplayValidationResult(value=provider_neutral_tools)
 
 
+def _cursor_replay_build_stored_history_input(
+    replay_state: dict[str, Any],
+    request_body: dict[str, Any],
+) -> _CursorReplayValidationResult:
+    messages = replay_state.get("messages")
+    if not isinstance(messages, list):
+        return _cursor_replay_rejected(
+            "fresh_body_copy",
+            "messages_container",
+        )
+    messages_continuation_rejection = (
+        _cursor_replay_continuation_identifier_rejection(
+            messages,
+            stage="fresh_body_copy",
+        )
+    )
+    if messages_continuation_rejection is not None:
+        return _CursorReplayValidationResult(
+            value=None,
+            rejection=messages_continuation_rejection,
+        )
+    if not messages:
+        return _cursor_replay_rejected(
+            "fresh_body_copy",
+            "messages_empty",
+        )
+    if any(
+        str(_cursor_as_mapping(message).get("role") or "").strip().lower()
+        not in {"system", "developer", "user", "assistant", "tool"}
+        for message in messages
+    ):
+        return _cursor_replay_rejected(
+            "fresh_body_copy",
+            "message_role",
+        )
+    if not any(
+        str(_cursor_as_mapping(message).get("role") or "").strip().lower()
+        == "user"
+        and bool(
+            _cursor_response_content_text(
+                _cursor_as_mapping(message).get("content")
+            ).strip()
+        )
+        for message in messages
+    ):
+        return _cursor_replay_rejected(
+            "fresh_body_copy",
+            "empty_user_text",
+        )
+    try:
+        from litellm.llms.openai.responses.count_tokens.transformation import (
+            OpenAICountTokensConfig,
+        )
+
+        replayed_input, instructions = (
+            OpenAICountTokensConfig.messages_to_responses_input(messages)
+        )
+    except Exception:  # noqa: BLE001
+        return _cursor_replay_rejected(
+            "fresh_body_copy",
+            "message_conversion",
+        )
+    if not isinstance(replayed_input, list):
+        return _cursor_replay_rejected(
+            "fresh_body_copy",
+            "replayed_input_container",
+        )
+
+    # Stored history can end with an unresolved call because the current
+    # request carries its outputs. Merge those outputs before the sole
+    # authoritative closed-graph check.
+    output_result = _cursor_replay_function_call_output_items(request_body)
+    if output_result.rejection is not None:
+        return output_result
+    combined_input = [*replayed_input, *output_result.value]
+    graph_result = _cursor_replay_unresolved_function_call_ids(
+        combined_input,
+        stage="fresh_body_copy",
+    )
+    if graph_result.rejection is not None:
+        return graph_result
+    return _CursorReplayValidationResult(
+        value={
+            "input": combined_input,
+            "instructions": instructions,
+            "tools": replay_state.get("tools"),
+        }
+    )
+
+
 def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
     request_body: Any,
     *,
@@ -2604,6 +2935,18 @@ def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
             "request_body_shape",
         )
 
+    input_continuation_rejection = (
+        _cursor_replay_continuation_identifier_rejection(
+            request_body.get("input"),
+            stage="fresh_body_copy",
+        )
+    )
+    if input_continuation_rejection is not None:
+        return _CursorReplayFreshDispatchBuildResult(
+            body=None,
+            rejection=input_continuation_rejection,
+        )
+
     replay_state = getattr(
         continuation_exc,
         _CURSOR_REPLAY_STATE_FIELD,
@@ -2611,7 +2954,6 @@ def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
     )
     registry_state: Optional[dict[str, Any]] = None
     replayed_input: Optional[list[dict[str, Any]]] = None
-    output_items: Optional[list[dict[str, Any]]] = None
     instructions: Optional[str] = None
     replay_tools_source: Any = None
     if not isinstance(replay_state, dict):
@@ -2665,87 +3007,29 @@ def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
                 "retained_session_present",
             )
 
-        messages = replay_state.get("messages")
-        if not isinstance(messages, list):
-            return _cursor_replay_build_rejected(
-                "fresh_body_copy",
-                "messages_container",
-            )
-        if not messages:
-            return _cursor_replay_build_rejected(
-                "fresh_body_copy",
-                "messages_empty",
-            )
-        if any(
-            str(_cursor_as_mapping(message).get("role") or "").strip().lower()
-            not in {"system", "developer", "user", "assistant", "tool"}
-            for message in messages
-        ):
-            return _cursor_replay_build_rejected(
-                "fresh_body_copy",
-                "message_role",
-            )
-        if not any(
-            str(_cursor_as_mapping(message).get("role") or "").strip().lower()
-            == "user"
-            and bool(
-                _cursor_response_content_text(
-                    _cursor_as_mapping(message).get("content")
-                ).strip()
-            )
-            for message in messages
-        ):
-            return _cursor_replay_build_rejected(
-                "fresh_body_copy",
-                "empty_user_text",
-            )
-        try:
-            from litellm.llms.openai.responses.count_tokens.transformation import (
-                OpenAICountTokensConfig,
-            )
-
-            replayed_input, instructions = (
-                OpenAICountTokensConfig.messages_to_responses_input(messages)
-            )
-        except Exception:  # noqa: BLE001
-            return _cursor_replay_build_rejected(
-                "fresh_body_copy",
-                "message_conversion",
-            )
-        if not isinstance(replayed_input, list):
-            return _cursor_replay_build_rejected(
-                "fresh_body_copy",
-                "replayed_input_container",
-            )
-        unresolved_result = _cursor_replay_unresolved_function_call_ids(
-            replayed_input,
-            stage="fresh_body_copy",
+        stored_history_result = _cursor_replay_build_stored_history_input(
+            replay_state,
+            request_body,
         )
-        if unresolved_result.rejection is not None:
+        if stored_history_result.rejection is not None:
             return _CursorReplayFreshDispatchBuildResult(
                 body=None,
-                rejection=unresolved_result.rejection,
+                rejection=stored_history_result.rejection,
             )
-        unresolved_call_ids = unresolved_result.value
-        output_result = _cursor_replay_function_call_output_items(request_body)
-        if output_result.rejection is not None:
-            return _CursorReplayFreshDispatchBuildResult(
-                body=None,
-                rejection=output_result.rejection,
-            )
-        output_items = output_result.value
+        stored_history = stored_history_result.value
+        replayed_input = stored_history["input"]
+        instructions = stored_history["instructions"]
+        replay_tools_source = stored_history["tools"]
 
-        for output_index, output_item in enumerate(output_items):
-            call_id = output_item["call_id"]
-            if call_id not in unresolved_call_ids:
-                return _cursor_replay_build_rejected(
-                    "fresh_body_copy",
-                    "unresolved_call_id",
-                    item_index=output_index,
-                    item=output_item,
-                )
-            unresolved_call_ids.remove(call_id)
-        replay_tools_source = replay_state.get("tools")
+    final_graph_result = _cursor_replay_unresolved_function_call_ids(
+        replayed_input or [],
+        stage="fresh_body_copy",
+    )
+    if final_graph_result.rejection is not None:
+        return _CursorReplayFreshDispatchBuildResult(
+            body=None,
+            rejection=final_graph_result.rejection,
+        )
 
     replay_tools_result = _cursor_replay_provider_neutral_tools(replay_tools_source)
     if replay_tools_result.rejection is not None:
@@ -2757,10 +3041,7 @@ def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
 
     try:
         fresh_body = copy.deepcopy(request_body)
-        fresh_body["input"] = [
-            *replayed_input,
-            *(output_items or []),
-        ]
+        fresh_body["input"] = replayed_input
         fresh_body["tools"] = replay_tools
     except Exception:  # noqa: BLE001
         return _cursor_replay_build_rejected(
@@ -2771,6 +3052,15 @@ def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
         fresh_body.pop(field, None)
     if instructions is not None:
         fresh_body["instructions"] = instructions
+    continuation_key = _cursor_replay_input_contains_cursor_continuation_identifier(
+        fresh_body
+    )
+    if continuation_key is not None:
+        return _cursor_replay_build_rejected(
+            "fresh_body_copy",
+            "cursor_continuation_identifier",
+            item=continuation_key,
+        )
 
     if registry_state is not None:
         previous_response_id = request_body.get("previous_response_id")
@@ -2929,6 +3219,7 @@ def _responses_input_to_cursor_messages(  # noqa: PLR0915
 def _cursor_messages_with_result_tool_calls(
     messages: list[dict[str, Any]],
     tool_calls: list[Any],
+    assistant_text: Any = None,
 ) -> list[dict[str, Any]]:
     replay_messages = copy.deepcopy(messages)
     _validate_cursor_returned_tool_calls(tool_calls)
@@ -2943,6 +3234,13 @@ def _cursor_messages_with_result_tool_calls(
                 message.get("tool_calls") or message.get("toolCalls"),
                 function_calls,
             )
+    if isinstance(assistant_text, str) and assistant_text:
+        replay_messages.append(
+            {
+                "role": "assistant",
+                "content": assistant_text,
+            }
+        )
     for tool_call in tool_calls:
         replay_messages.append(
             _cursor_function_call_message(tool_call, function_calls)
@@ -3107,10 +3405,47 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         rollup_kwargs=rollup_kwargs,
         adapter_label="Cursor Agent",
     )
+    input_continuation_key = (
+        _cursor_replay_input_contains_cursor_continuation_identifier(
+            request_body.get("input")
+        )
+    )
+    if input_continuation_key is not None:
+        raise _CursorRequestSchemaError(
+            (
+                "Cursor Agent request input contains unsupported nested "
+                f"continuation identifier {input_continuation_key!r}."
+            ),
+            reason="cursor_continuation_identifier",
+            category="request_shape",
+            object_type="object",
+            item={input_continuation_key: True},
+        )
     replay_state: Optional[dict[str, Any]] = None
     previous_response_id = request_body.get("previous_response_id")
     if isinstance(previous_response_id, str) and previous_response_id:
         replay_state = _peek_cursor_replay_state(previous_response_id)
+    stored_messages = (
+        replay_state.get("messages")
+        if isinstance(replay_state, dict)
+        else None
+    )
+    stored_messages_continuation_key = (
+        _cursor_replay_input_contains_cursor_continuation_identifier(
+            stored_messages
+        )
+    )
+    if stored_messages_continuation_key is not None:
+        raise _CursorRequestSchemaError(
+            (
+                "Cursor Agent stored messages contain unsupported nested "
+                f"continuation identifier {stored_messages_continuation_key!r}."
+            ),
+            reason="cursor_continuation_identifier",
+            category="request_shape",
+            object_type="object",
+            item={stored_messages_continuation_key: True},
+        )
     request_tools = request_body.get("tools")
     if not isinstance(request_tools, list) and isinstance(replay_state, dict):
         request_tools = replay_state.get("tools")
@@ -3164,6 +3499,7 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             replay_messages = _cursor_messages_with_result_tool_calls(
                 messages,
                 result.tool_calls,
+                result.text,
             )
         except _CursorPostEgressOutputError as exc:
             _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
@@ -3275,6 +3611,7 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             replay_messages = _cursor_messages_with_result_tool_calls(
                 messages,
                 result.tool_calls,
+                result.text,
             )
         except _CursorPostEgressOutputError as exc:
             _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
@@ -3403,11 +3740,14 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
     """Translate a Cursor Agent failure while preserving upstream semantics.
 
     Pre-egress request-conversion ``ValueError`` failures and Cursor Connect
-    protocol rejections of unsupported exec/interactive operations are
-    deterministic candidate ineligibility, not upstream 502s: they map to
-    the ``aawm_codex_auto_agent_candidate_ineligible`` contract so the
-    candidate loop records a no-cooldown ineligibility instead of a
-    transient upstream retry.
+    protocol rejections of unsupported exec/interactive/subagent operations
+    are deterministic candidate ineligibility, not upstream 502s: they map
+    to the ``aawm_codex_auto_agent_candidate_ineligible`` contract so the
+    candidate loop records a no-cooldown ineligibility instead of a transient
+    upstream retry.
+    Advertised ``spawn_agent`` schema failures use the same deterministic
+    ineligibility contract; malformed Connect framing and transport failures
+    remain on their existing upstream error paths.
     Transport/upstream 500/502/503/529 keep their status and map to the
     existing transient/timeout classification so a Cursor blip advances to
     the next candidate instead of publishing a durable candidate cooldown.
@@ -3525,11 +3865,29 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
             "Cursor Agent requested unsupported external exec field ",
             "Cursor Agent requested unsupported local exec operation ",
             "Cursor Agent requested an unsupported interactive client response.",
+            "Cursor Agent subagent operation contains unsupported optional field(s):",
         )
     ):
         attempted_provider_call = True
         ineligibility_summary = (
             "the Cursor Agent session requested an unsupported operation"
+        )
+    elif isinstance(exc, CursorConnectProtocolError) and message.startswith(
+        _CURSOR_SUBAGENT_SCHEMA_REJECTION_PREFIXES
+    ):
+        schema_attempted_provider_call = getattr(
+            exc,
+            "attempted_provider_call",
+            True,
+        )
+        attempted_provider_call = (
+            schema_attempted_provider_call
+            if isinstance(schema_attempted_provider_call, bool)
+            else True
+        )
+        ineligibility_summary = (
+            "the Cursor Agent session advertised an unsupported "
+            "spawn_agent schema"
         )
     if isinstance(exc, _CursorPostEgressOutputError):
         error_message = (
@@ -4429,10 +4787,42 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
     user_api_key_dict: Any,
     request_body: dict[str, Any],
 ) -> Response:
+    canonical_request_body = copy.deepcopy(request_body)
+    adapted_request_body = copy.deepcopy(request_body)
     (
         adapted_request_body,
         _adapted_custom_tools,
-    ) = _adapt_codex_custom_tools_to_functions_from_request_body(request_body)
+    ) = _adapt_codex_custom_tools_to_functions_from_request_body(
+        adapted_request_body
+    )
+    (
+        adapted_request_body,
+        _adapted_namespace_tools,
+    ) = _adapt_codex_namespace_tools_to_functions_from_request_body(
+        adapted_request_body
+    )
+    (
+        adapted_request_body,
+        _tool_description_patch_events,
+    ) = _apply_codex_tool_description_patches_to_request_body(
+        adapted_request_body
+    )
+    (
+        adapted_request_body,
+        _unsupported_hosted_tools,
+    ) = _drop_unsupported_codex_hosted_tools_from_request_body(adapted_request_body)
+    (
+        adapted_request_body,
+        _unsupported_request_params,
+    ) = _drop_unsupported_codex_request_params_from_request_body(adapted_request_body)
+    (
+        adapted_request_body,
+        _unsupported_input_items,
+    ) = _drop_unsupported_codex_input_items_from_request_body(adapted_request_body)
+    (
+        adapted_request_body,
+        _removed_tool_choice,
+    ) = _drop_tool_choice_without_tools_from_request_body(adapted_request_body)
     try:
         grok_context = await BaseOpenAIPassThroughHandler._prepare_openai_grok_native_oauth_context(
             endpoint=endpoint,
@@ -4467,6 +4857,7 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
                 *_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES,
             ],
             caller_managed_hidden_retry=True,
+            defer_session_owner_promotion=True,
         )
     except Exception as exc:
         if _grok_native_candidate_unavailable_detail(exc) is not None:
@@ -4475,24 +4866,27 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
     response = _maybe_wrap_xai_passthrough_responses_stream(
         response,
         request=request,
-        request_body=request_body,
+        request_body=canonical_request_body,
         route_family="codex_auto_agent_grok_native_responses",
         resolved_model=grok_prepared_body.get("model") or request_body.get("model"),
     )
-    return await _validate_codex_auto_agent_responses_payload(
+    validated_response = await _validate_codex_auto_agent_responses_payload(
         response,
         adapter_model=str(grok_prepared_body.get("model") or request_body.get("model") or "unknown-model"),
         adapter="codex_auto_agent_grok_native_responses",
         adapter_label="Grok native",
         intake_context=_build_malformed_tool_call_intake_context(
             request,
-            request_body,
+            canonical_request_body,
             adapter="codex_auto_agent_grok_native_responses",
             upstream_url=str(updated_url),
             provider="grok",
         ),
-        request_body=request_body,
+        request_body=canonical_request_body,
     )
+    if getattr(validated_response, "body_iterator", None) is not None:
+        setattr(validated_response, "_aawm_session_owner_promotion_deferred", True)
+    return validated_response
 
 
 async def _perform_codex_auto_agent_oa_xai_responses_request(
@@ -4554,6 +4948,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
                 *_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES,
             ],
             caller_managed_hidden_retry=True,
+            defer_session_owner_promotion=True,
         )
     except Exception as exc:
         if _xai_oauth_candidate_unavailable_detail(exc) is not None:
@@ -4567,7 +4962,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         resolved_model=oa_xai_prepared_body.get("model")
         or canonical_request_body.get("model"),
     )
-    return await _validate_codex_auto_agent_responses_payload(
+    validated_response = await _validate_codex_auto_agent_responses_payload(
         response,
         adapter_model=str(oa_xai_prepared_body.get("model") or canonical_request_body.get("model") or "unknown-model"),
         adapter="codex_auto_agent_xai_oauth_responses",
@@ -4581,6 +4976,9 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         ),
         request_body=canonical_request_body,
     )
+    if getattr(validated_response, "body_iterator", None) is not None:
+        setattr(validated_response, "_aawm_session_owner_promotion_deferred", True)
+    return validated_response
 
 
 def _bind_responses_stream_timeout_terminalizer(

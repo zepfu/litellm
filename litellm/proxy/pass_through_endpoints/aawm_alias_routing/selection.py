@@ -341,9 +341,13 @@ def _resolve_codex_request_mode_and_ordinal(
     *,
     has_continuation_state: bool,
     request_body: dict[str, Any],
+    server_validated_replay: bool = False,
 ) -> tuple[str, Optional[int]]:
     redispatch_ordinal = _extract_codex_request_redispatch_ordinal(request_body)
-    if redispatch_ordinal is not None:
+    # The ordinal is client-visible telemetry only. A fresh redispatch mode is
+    # authorized solely by server-owned validation bound to the exact rebuilt
+    # replay body.
+    if server_validated_replay:
         return "fresh_redispatch", redispatch_ordinal
     if has_continuation_state:
         return "ordinary_continuation", None
@@ -362,6 +366,7 @@ def _codex_auto_agent_candidate_public_shape(
     cooldown_seconds: Optional[float] = None,
     reason: Optional[str] = None,
     account_display: Optional[str] = None,
+    include_account_identity: bool = True,
 ) -> dict[str, Any]:
     shaped: dict[str, Any] = {
         "provider": candidate["provider"],
@@ -379,18 +384,89 @@ def _codex_auto_agent_candidate_public_shape(
         ("codex_oauth_credential_affinity", "credential_affinity"),
         ("codex_oauth_selection_strategy", "selection_strategy"),
     ):
+        if not include_account_identity and source_field in {
+            "codex_oauth_account_label",
+            "codex_oauth_account_hash",
+            "codex_oauth_lane_key",
+            "codex_oauth_account_display",
+        }:
+            continue
         value = candidate.get(source_field)
         if value is not None:
             shaped[public_field] = value
-    if lane_key is not None:
+    if lane_key is not None and include_account_identity:
         shaped["lane_key"] = lane_key
     if cooldown_seconds is not None:
         shaped["cooldown_seconds"] = round(float(cooldown_seconds), 3)
     if reason is not None:
         shaped["reason"] = reason
-    if account_display is not None:
+    if account_display is not None and include_account_identity:
         shaped["account_display"] = account_display
     return shaped
+
+
+_AUTO_AGENT_ACCOUNT_IDENTITY_FIELDS = frozenset(
+    {
+        "account",
+        "account_label",
+        "account_hash",
+        "account_lane",
+        "account_display",
+        "account_ref",
+        "lane_key",
+        "prior_account_hash",
+        "attempted_account_hashes",
+        "codex_oauth_account_label",
+        "codex_oauth_account_hash",
+        "codex_oauth_lane_key",
+        "codex_oauth_account_display",
+        "codex_auto_agent_selected_account_label",
+        "codex_auto_agent_selected_account_hash",
+        "codex_auto_agent_selected_account_lane",
+        "codex_auto_agent_selected_account_display",
+        "session_owner_account_lane",
+    }
+)
+
+
+def _redact_auto_agent_account_identity(
+    value: Any,
+    *,
+    redact_cooldown_keys: bool = False,
+) -> Any:
+    """Remove account identity from client-visible alias diagnostics."""
+    excluded_fields = _AUTO_AGENT_ACCOUNT_IDENTITY_FIELDS
+    if redact_cooldown_keys:
+        excluded_fields = excluded_fields | {
+            "cooldown_key",
+            "logical_cooldown_key",
+        }
+    if isinstance(value, dict):
+        return {
+            key: _redact_auto_agent_account_identity(
+                nested,
+                redact_cooldown_keys=redact_cooldown_keys,
+            )
+            for key, nested in value.items()
+            if key not in excluded_fields
+        }
+    if isinstance(value, list):
+        return [
+            _redact_auto_agent_account_identity(
+                item,
+                redact_cooldown_keys=redact_cooldown_keys,
+            )
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _redact_auto_agent_account_identity(
+                item,
+                redact_cooldown_keys=redact_cooldown_keys,
+            )
+            for item in value
+        )
+    return value
 
 
 def _codex_oauth_routing_candidate_fields(inventory: Any) -> dict[str, Any]:
@@ -899,19 +975,25 @@ def _plan_codex_oauth_account_failover(
     provider_status_code: Optional[int] = None,
 ) -> bool:
     """Plan a request-local move to another eligible account for one slot."""
+
+    def reject(reason: str) -> bool:
+        attempt_record["account_failover_rejection_reason"] = reason
+        return False
+
+    attempt_record.pop("account_failover_rejection_reason", None)
     if not _is_codex_oauth_account_candidate(candidate):
-        return False
+        return reject("candidate_not_codex_oauth")
     if (
-        has_account_bound_state
-        or selection.get("has_account_bound_state")
-        or has_previous_response_id
+        has_account_bound_state or selection.get("has_account_bound_state")
     ) and not account_failover_replay_safe:
-        return False
+        return reject("account_bound_state_nonportable")
+    if has_previous_response_id and not account_failover_replay_safe:
+        return reject("previous_response_id_nonportable")
     interchangeable = (
         candidate.get("codex_oauth_credential_affinity") == "interchangeable"
     )
     if has_continuation_state and not interchangeable:
-        return False
+        return reject("account_not_interchangeable_for_continuation")
 
     existing = _get_codex_oauth_request_local_failover_context(
         request,
@@ -923,7 +1005,7 @@ def _plan_codex_oauth_account_failover(
     )
     if account_hash in attempted_account_hashes:
         attempt_record["account_failover_limit_reached"] = True
-        return False
+        return reject("account_failover_limit_reached")
 
     if error_class == "provider_terminal_error":
         fresh_unbound_request_401 = (
@@ -934,7 +1016,7 @@ def _plan_codex_oauth_account_failover(
             and provider_status_code == 401
         )
         if not fresh_unbound_request_401:
-            return False
+            return reject("provider_terminal_error_not_fresh_unbound_401")
     elif error_class not in {
         "capacity_exhausted",
         "rate_limited",
@@ -942,7 +1024,7 @@ def _plan_codex_oauth_account_failover(
         "usage_limit_reached",
         "candidate_unavailable",
     }:
-        return False
+        return reject("error_class_not_failover_eligible")
 
     prior_account_outcome: dict[str, Any] = {
         "account_label": candidate.get("codex_oauth_account_label"),
@@ -2136,6 +2218,8 @@ def _find_codex_auto_agent_affinity_candidate(
     for candidate in pool:
         if candidate.get("model") == affinity_model:
             return dict(candidate)
+    if _codex_oauth_affinity_is_authenticated_token(affinity):
+        return None
     return dict(pool[0])
 
 
@@ -2263,9 +2347,20 @@ def _candidate_matches_affinity(
         return False
     if not _route_families_compatible_for_affinity(candidate, affinity):
         return False
+    if _codex_oauth_affinity_is_authenticated_token(affinity):
+        return candidate.get("model") == affinity.get("model")
     # OPENAI-020: model and OpenAI account are mutable on the same hosted
     # provider. Do not require candidate.model or account_label/hash/lane.
     return True
+
+
+def _codex_oauth_affinity_is_authenticated_token(
+    affinity: Mapping[str, Any],
+) -> bool:
+    return (
+        affinity.get("affinity_state_source")
+        == "authenticated_continuation_token"
+    )
 
 
 def _apply_codex_oauth_inventory_affinity_policy(
@@ -4055,6 +4150,7 @@ def _raise_codex_auto_agent_in_flight_cooldown(
         lane_key=lane_key,
         cooldown_seconds=cooldown_seconds,
         reason="in_flight_session_affinity_cooldown",
+        include_account_identity=False,
     )
     raise HTTPException(
         status_code=429,
@@ -4126,6 +4222,10 @@ def _build_auto_agent_redispatch_http_exception_detail(
     attempts: Optional[list[dict[str, Any]]] = None,
     skipped_candidates: Optional[list[dict[str, Any]]] = None,
     terminal_reset: Optional[dict[str, Any]] = None,
+    account_failover_rejection_reason: Optional[str] = None,
+    redispatch_required: bool = True,
+    continuation_portable: Optional[bool] = None,
+    alternate_accounts_considered: Optional[bool] = None,
     code: str,
     message: str,
 ) -> dict[str, Any]:
@@ -4140,6 +4240,7 @@ def _build_auto_agent_redispatch_http_exception_detail(
         lane_key=lane_key,
         cooldown_seconds=cooldown_seconds,
         reason="in_flight_retryable_provider_exhaustion",
+        include_account_identity=alias_family != "codex_auto_agent",
     )
     detail: dict[str, Any] = {
         "error": {
@@ -4149,9 +4250,6 @@ def _build_auto_agent_redispatch_http_exception_detail(
         },
         "alias_family": alias_family,
         "alias_model": alias_model,
-        "redispatch_model": alias_model,
-        "redispatch_reason": "in_flight_retryable_provider_exhaustion",
-        "redispatch_required": True,
         "selected_provider": candidate.get("provider"),
         "selected_model": candidate.get("model"),
         "selected_route_family": candidate.get("route_family"),
@@ -4161,6 +4259,20 @@ def _build_auto_agent_redispatch_http_exception_detail(
         "error_tokens": sorted(error_tokens),
         "candidate": shaped_candidate,
     }
+    if redispatch_required:
+        detail.update(
+            {
+                "redispatch_model": alias_model,
+                "redispatch_reason": "in_flight_retryable_provider_exhaustion",
+                "redispatch_required": True,
+            }
+        )
+    else:
+        detail["redispatch_required"] = False
+    if continuation_portable is not None:
+        detail["continuation_portable"] = continuation_portable
+    if alternate_accounts_considered is not None:
+        detail["alternate_accounts_considered"] = alternate_accounts_considered
     if error_class is not None:
         detail["failure_class"] = error_class
     if error_status_code is not None:
@@ -4173,15 +4285,109 @@ def _build_auto_agent_redispatch_http_exception_detail(
         detail["failure_phase"] = failure_phase
     if attempted_provider_call is not None:
         detail["attempted_provider_call"] = attempted_provider_call
+    if account_failover_rejection_reason is not None:
+        detail["account_failover_rejection_reason"] = (
+            account_failover_rejection_reason
+        )
+    redact_account_identity = alias_family == "codex_auto_agent"
     if isinstance(audit_events, list):
-        detail["aawm_alias_routing_audit_events"] = audit_events
+        detail["aawm_alias_routing_audit_events"] = (
+            _redact_auto_agent_account_identity(
+                audit_events,
+                redact_cooldown_keys=redact_account_identity,
+            )
+            if redact_account_identity
+            else audit_events
+        )
     if isinstance(attempts, list):
-        detail["attempts"] = attempts
+        detail["attempts"] = (
+            _redact_auto_agent_account_identity(
+                attempts,
+                redact_cooldown_keys=True,
+            )
+            if redact_account_identity
+            else attempts
+        )
     if isinstance(skipped_candidates, list):
-        detail["skipped_candidates"] = skipped_candidates
+        detail["skipped_candidates"] = (
+            _redact_auto_agent_account_identity(
+                skipped_candidates,
+                redact_cooldown_keys=True,
+            )
+            if redact_account_identity
+            else skipped_candidates
+        )
     if isinstance(terminal_reset, dict):
-        detail["terminal_reset"] = terminal_reset
+        detail["terminal_reset"] = (
+            _redact_auto_agent_account_identity(
+                terminal_reset,
+                redact_cooldown_keys=True,
+            )
+            if redact_account_identity
+            else terminal_reset
+        )
     return detail
+
+
+def _raise_codex_auto_agent_authenticated_continuation_unavailable(
+    *,
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+    cooldown_seconds: float,
+    alias_model: str,
+    failure_phase: Optional[str],
+    error_class: Optional[str] = None,
+    cooldown_scope: Optional[str] = "account",
+    retry_after_seconds: Optional[Any] = None,
+    error_tokens: Optional[set[str]] = None,
+    error_status_code: Optional[Any] = None,
+    error_type: Optional[str] = None,
+    error_code: Optional[Any] = None,
+    attempted_provider_call: Optional[bool] = None,
+    audit_events: Optional[list[dict[str, Any]]] = None,
+    attempts: Optional[list[dict[str, Any]]] = None,
+    skipped_candidates: Optional[list[dict[str, Any]]] = None,
+    terminal_reset: Optional[dict[str, Any]] = None,
+    account_failover_rejection_reason: Optional[str] = None,
+) -> None:
+    """Fail closed when a valid token-pinned account cannot serve."""
+    detail = _build_auto_agent_redispatch_http_exception_detail(
+        alias_family="codex_auto_agent",
+        alias_model=alias_model,
+        candidate=candidate,
+        lane_key=lane_key,
+        cooldown_seconds=cooldown_seconds,
+        error_tokens=error_tokens if error_tokens is not None else set(),
+        error_class=error_class,
+        cooldown_scope=cooldown_scope,
+        error_status_code=error_status_code,
+        error_type=error_type,
+        error_code=error_code,
+        retry_after_seconds=retry_after_seconds,
+        failure_phase=failure_phase,
+        attempted_provider_call=attempted_provider_call,
+        audit_events=audit_events,
+        attempts=attempts,
+        skipped_candidates=skipped_candidates,
+        terminal_reset=terminal_reset,
+        account_failover_rejection_reason=account_failover_rejection_reason,
+        redispatch_required=False,
+        continuation_portable=False,
+        alternate_accounts_considered=False,
+        code="aawm_codex_auto_agent_affinity_unavailable",
+        message=(
+            "The required continuation-token-pinned Codex OAuth account is "
+            "currently exhausted or unavailable. Alternate accounts were "
+            "intentionally not considered because this continuation is pinned "
+            "and non-portable."
+        ),
+    )
+    detail["selection_reason"] = "authenticated_continuation_token_pin"
+    raise HTTPException(
+        status_code=429,
+        detail=detail,
+        headers={"Retry-After": str(detail["retry_after_seconds"])},
+    )
 
 
 def _raise_codex_auto_agent_redispatch_required(
@@ -4398,29 +4604,6 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         request,
         request_body,
     )
-    review_replay_safety = None
-    if is_auto_review:
-        review_replay_safety = (
-            _replay_safety
-            if _replay_safety is not None
-            else sa.classify_session_owner_replay_safety_body(request_body)
-        )
-        replay_safe = review_replay_safety.safe
-    else:
-        replay_safe = sa.is_replay_safe_session_owner_redispatch_body(request_body)
-    if review_replay_safety is not None and not replay_safe:
-        sa.raise_session_owner_redispatch_required(
-            session_identity=resolved_session_identity,
-            alias_model=alias_model,
-            failure_phase="session_owner_replay_unsafe_auto_review",
-            message=(
-                "Codex auto-review cannot own provider response state. Send a "
-                "self-contained replay-safe body without previous_response_id "
-                "or unsafe opaque rs_* provider state."
-            ),
-            request=request,
-            replay_safety=review_replay_safety,
-        )
     canonical_session_identity = resolved_session_identity
     session_owner_identity = resolved_session_identity
     if is_auto_review:
@@ -4448,18 +4631,74 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 request_call_identity=_bind_auto_agent_alias_request_identity(request),
             )
         )
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        codex_oauth as _codex_oauth_mod,
+    )
+
+    codex_oauth_continuation = (
+        _codex_oauth_mod._get_codex_oauth_affinity_continuation_state(
+            request,
+            body=request_body,
+            # Alias names are not the token's model scope. The authenticated
+            # continuation freezes its signed concrete model before affinity
+            # membership and owner compatibility are evaluated below.
+            model=None,
+            session_identity=canonical_session_identity,
+        )
+    )
+    if codex_oauth_continuation.invalid:
+        raise _codex_oauth_mod._codex_oauth_affinity_token_invalid_exception()
+    token_affinity = codex_oauth_continuation.as_affinity()
+
+    review_replay_safety = None
+    if is_auto_review:
+        review_replay_safety = (
+            _replay_safety
+            if _replay_safety is not None
+            else sa.classify_session_owner_replay_safety_body(request_body)
+        )
+        replay_safe = review_replay_safety.safe
+    else:
+        replay_safe = sa.is_replay_safe_session_owner_redispatch_body(request_body)
+    if review_replay_safety is not None and not replay_safe:
+        sa.raise_session_owner_redispatch_required(
+            session_identity=resolved_session_identity,
+            alias_model=alias_model,
+            failure_phase="session_owner_replay_unsafe_auto_review",
+            message=(
+                "Codex auto-review cannot own provider response state. Send a "
+                "self-contained replay-safe body without previous_response_id "
+                "or unsafe opaque rs_* provider state."
+            ),
+            request=request,
+            replay_safety=review_replay_safety,
+        )
+
     client_product_label = _extract_client_product_label(request, request_body)
     session_key = _resolve_codex_session_key(
         request,
         request_body,
         alias_model=alias_model,
     )
-    has_continuation_state = _has_continuation_state(request_body)
+    has_continuation_state = _has_continuation_state(
+        request_body
+    ) or codex_oauth_continuation.declared
     has_previous_response_id = bool(request_body.get("previous_response_id"))
-    has_account_bound_state = _has_account_bound_state(request_body)
+    has_account_bound_state = _has_account_bound_state(
+        request_body
+    ) or token_affinity is not None
+    server_validated_replay = sa.validate_cursor_replay_matches_body(
+        request,
+        body=request_body,
+    )
     request_mode, redispatch_ordinal = _resolve_codex_request_mode_and_ordinal(
         has_continuation_state=has_continuation_state,
         request_body=request_body,
+        server_validated_replay=server_validated_replay,
+    )
+    provider_owned_continuation = (
+        has_continuation_state and not server_validated_replay
     )
 
     # Read-path ownership check before free selection. Reservation happens at
@@ -4579,6 +4818,30 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 ),
                 request=request,
             )
+        lease_cleared = sa.clear_expected_non_held_request_session_owner_lease(
+            request,
+            expected_session_identity=session_owner_identity,
+        )
+        if not lease_cleared:
+            sa.raise_session_owner_redispatch_required(
+                session_identity=session_owner_identity,
+                alias_model=alias_model,
+                candidate=candidate,
+                failure_phase="session_owner_held_lease_on_identity_transition",
+                guard=sa.SessionOwnerGuardResult(
+                    decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                    session_identity=session_owner_identity,
+                    cache_key=_cache_key,
+                    owner_record=session_owner_record,
+                    owner_id=session_owner_record.get("owner")
+                    if isinstance(session_owner_record, dict)
+                    else None,
+                    mismatch_reason=(
+                        "session_owner: held lease cannot transition to derived identity"
+                    ),
+                ),
+                request=request,
+            )
         effective_identity = sa.activate_session_owner_redispatch_effective_identity(
             request=request,
             base_session_identity=session_owner_identity,
@@ -4620,10 +4883,152 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         )
 
     if isinstance(session_owner_record, dict) and sa._record_state(session_owner_record) == "owned":
-        affinity = sa.owner_record_as_affinity_hint(
-            session_owner_record,
-            preserve_account_identity=True,
-        )
+        cursor_effective_record: Optional[dict[str, Any]] = None
+        cursor_effective_identity: Optional[str] = None
+        cursor_effective_cache_key: Optional[str] = None
+        if (
+            not is_auto_review
+            and sa._hosted_provider_from_attributes(
+                sa._owner_attributes(session_owner_record)
+            )
+            == "cursor"
+        ):
+            cursor_effective_identity = (
+                session_owner_identity
+                if sa.is_session_owner_redispatch_effective_identity(
+                    session_owner_identity
+                )
+                else sa.derive_session_owner_effective_identity(
+                    session_owner_identity
+                )
+            )
+            if cursor_effective_identity is None:
+                sa.raise_session_owner_redispatch_required(
+                    session_identity=session_owner_identity,
+                    alias_model=alias_model,
+                    failure_phase="session_owner_rediscovery_unavailable",
+                    guard=sa.SessionOwnerGuardResult(
+                        decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                        session_identity=session_owner_identity,
+                        cache_key=_cache_key,
+                        owner_record=session_owner_record,
+                        owner_id=session_owner_record.get("owner"),
+                        mismatch_reason="session_owner: Cursor rediscovery identity unavailable",
+                    ),
+                    request=request,
+                )
+            cursor_effective_record, cursor_effective_cache_key, cursor_effective_error = (
+                await sa.get_session_owner_record(
+                    session_identity=cursor_effective_identity,
+                    request=request,
+                    wait_for_foreign_reservation=True,
+                )
+            )
+            if cursor_effective_error is not None:
+                sa.raise_session_owner_redispatch_required(
+                    session_identity=cursor_effective_identity,
+                    alias_model=alias_model,
+                    failure_phase="session_owner_rediscovery_unavailable",
+                    guard=sa.SessionOwnerGuardResult(
+                        decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                        session_identity=cursor_effective_identity,
+                        cache_key=cursor_effective_cache_key,
+                        owner_record=cursor_effective_record,
+                        owner_id=(
+                            cursor_effective_record.get("owner")
+                            if isinstance(cursor_effective_record, dict)
+                            else None
+                        ),
+                        mismatch_reason=cursor_effective_error,
+                    ),
+                    request=request,
+                )
+            if cursor_effective_record is None:
+                # The base Cursor owner remains authoritative for the initial
+                # request. Do not activate an unproven derived identity.
+                if sa.is_session_owner_redispatch_effective_identity(
+                    session_owner_identity
+                ):
+                    sa.raise_session_owner_redispatch_required(
+                        session_identity=session_owner_identity,
+                        alias_model=alias_model,
+                        failure_phase="session_owner_rediscovery_unavailable",
+                        guard=sa.SessionOwnerGuardResult(
+                            decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                            session_identity=session_owner_identity,
+                            cache_key=_cache_key,
+                            owner_record=session_owner_record,
+                            owner_id=session_owner_record.get("owner"),
+                            mismatch_reason=(
+                                "session_owner: derived Cursor owner record unavailable"
+                            ),
+                        ),
+                        request=request,
+                    )
+                affinity = sa.owner_record_as_strict_affinity_hint(
+                    session_owner_record,
+                    preserve_account_identity=True,
+                )
+            elif sa._record_state(cursor_effective_record) == "owned":
+                if cursor_effective_identity != session_owner_identity:
+                    activated_identity = (
+                        sa.activate_session_owner_redispatch_effective_identity(
+                            request=request,
+                            base_session_identity=session_owner_identity,
+                            replace_existing_auto_review_owner=is_auto_review,
+                        )
+                    )
+                    if activated_identity != cursor_effective_identity:
+                        sa.raise_session_owner_redispatch_required(
+                            session_identity=session_owner_identity,
+                            alias_model=alias_model,
+                            failure_phase="session_owner_effective_identity_conflict",
+                            guard=sa.SessionOwnerGuardResult(
+                                decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                                session_identity=session_owner_identity,
+                                cache_key=_cache_key,
+                                owner_record=session_owner_record,
+                                owner_id=session_owner_record.get("owner"),
+                                mismatch_reason=(
+                                    "session_owner: Cursor derived identity could "
+                                    "not be activated"
+                                ),
+                            ),
+                            request=request,
+                        )
+                session_owner_identity = cursor_effective_identity
+                session_owner_record = cursor_effective_record
+                _cache_key = cursor_effective_cache_key
+                affinity = sa.owner_record_as_strict_affinity_hint(
+                    cursor_effective_record,
+                    preserve_account_identity=True,
+                )
+            else:
+                sa.raise_session_owner_redispatch_required(
+                    session_identity=cursor_effective_identity,
+                    alias_model=alias_model,
+                    failure_phase="session_owner_rediscovery_unavailable",
+                    guard=sa.SessionOwnerGuardResult(
+                        decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                        session_identity=cursor_effective_identity,
+                        cache_key=cursor_effective_cache_key,
+                        owner_record=cursor_effective_record,
+                        owner_id=(
+                            cursor_effective_record.get("owner")
+                            if isinstance(cursor_effective_record, dict)
+                            else None
+                        ),
+                        mismatch_reason=(
+                            "session_owner: Cursor derived owner is not owned"
+                        ),
+                    ),
+                    request=request,
+                )
+        else:
+            affinity = sa.owner_record_as_affinity_hint(
+                session_owner_record,
+                preserve_account_identity=True,
+            )
         session_owner_guard_meta.update(
             {
                 "decision": "compatible_owner",
@@ -4692,7 +5097,17 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         if existing_affinity is not None:
             affinity_bypassed = True
 
+    affinity = _codex_oauth_mod._codex_oauth_resolve_affinity(
+        durable_affinity=affinity,
+        token_affinity=token_affinity,
+        conflict_message=(
+            "Codex OAuth continuation affinity state conflicts "
+            "with durable session affinity."
+        ),
+    )
+
     account_identity_pinned = has_account_bound_state
+    authenticated_token_affinity = token_affinity is not None
     account_failover_context = (
         _get_codex_oauth_request_local_failover_context(
             request,
@@ -4704,6 +5119,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
     if (
         account_failover_context is not None
         and account_failover_context.get("portable_replay")
+        and token_affinity is None
     ):
         account_identity_pinned = False
 
@@ -4711,6 +5127,54 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         affinity,
         account_bound=account_identity_pinned,
     )
+    affinity_selection_reason = (
+        _codex_oauth_mod._codex_oauth_affinity_selection_reason(affinity)
+        if affinity is not None
+        else None
+    )
+    if (
+        provider_owned_continuation
+        and affinity is None
+        and not (is_auto_review and replay_safe)
+    ):
+        owner_state = (
+            sa._record_state(session_owner_record)
+            if isinstance(session_owner_record, dict)
+            else None
+        )
+        owner_id = (
+            session_owner_record.get("owner")
+            if isinstance(session_owner_record, dict)
+            else None
+        )
+        mismatch_reason = (
+            "session_owner: provider-owned continuation requires an "
+            "owned durable owner record or compatible affinity "
+            f"(state={owner_state or 'missing'})"
+        )
+        sa.raise_session_owner_redispatch_required(
+            session_identity=session_owner_identity,
+            alias_model=alias_model,
+            candidate=None,
+            failure_phase="session_owner_continuation_no_owner_affinity",
+            guard=sa.SessionOwnerGuardResult(
+                decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                session_identity=session_owner_identity,
+                cache_key=_cache_key,
+                owner_record=session_owner_record,
+                owner_id=owner_id,
+                mismatch_reason=mismatch_reason,
+                provenance=sa.build_session_owner_provenance(
+                    session_identity=session_owner_identity,
+                    decision="redispatch_required",
+                    owner_record=session_owner_record,
+                    owner_id=owner_id,
+                    mismatch_reason=mismatch_reason,
+                    cache_key=_cache_key,
+                ),
+            ),
+            request=request,
+        )
     if affinity is not None:
         affinity_candidate = _find_codex_auto_agent_affinity_candidate(
             affinity,
@@ -4722,6 +5186,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             if (
                 isinstance(session_owner_record, dict)
                 and sa._record_state(session_owner_record) == "owned"
+                and not authenticated_token_affinity
                 and (
                     # Preserve ordinary account-bound owner pinning while
                     # allowing portable auto-review history to move under its
@@ -4760,6 +5225,14 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 ):
                     if affinity.get(field) is not None:
                         pinned_candidate_shape[field] = affinity.get(field)
+                if authenticated_token_affinity:
+                    _raise_codex_auto_agent_authenticated_continuation_unavailable(
+                        candidate=pinned_candidate_shape,
+                        lane_key=affinity.get("codex_oauth_lane_key"),
+                        cooldown_seconds=0.0,
+                        alias_model=alias_model,
+                        failure_phase="account_bound_owner_unavailable",
+                    )
                 _raise_codex_auto_agent_redispatch_required(
                     candidate=pinned_candidate_shape,
                     lane_key=affinity.get("codex_oauth_lane_key"),
@@ -4829,6 +5302,19 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 excluded_candidate_keys=excluded_candidate_keys,
             )
             if affinity_state["cooldown_seconds"] > 0:
+                if authenticated_token_affinity:
+                    _raise_codex_auto_agent_authenticated_continuation_unavailable(
+                        candidate=affinity_state["candidate"],
+                        lane_key=affinity_state.get("lane_key"),
+                        cooldown_seconds=affinity_state["cooldown_seconds"],
+                        alias_model=alias_model,
+                        failure_phase=affinity_state.get("failure_phase")
+                        or "affinity_account_cooldown",
+                        skipped_candidates=_build_auto_agent_skipped_candidates_from_states(
+                            [affinity_state]
+                        ),
+                        terminal_reset=affinity_state.get("terminal_reset"),
+                    )
                 _raise_codex_auto_agent_in_flight_cooldown(
                     candidate=affinity_state["candidate"],
                     lane_key=affinity_state.get("lane_key"),
@@ -4848,7 +5334,9 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                             **affinity_state,
                             "alias_model": alias_model,
                             "session_key": session_key,
-                            "selection_reason": "session_affinity",
+                            "selection_reason": (
+                                affinity_selection_reason or "session_affinity"
+                            ),
                             "skipped": [],
                             "in_flight_session": True,
                             "request_mode": request_mode,
@@ -4868,10 +5356,15 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         if (
             isinstance(session_owner_record, dict)
             and sa._record_state(session_owner_record) == "owned"
+            and not authenticated_token_affinity
         ):
-            if account_identity_pinned and _candidate_matches_affinity(
-                affinity_state["candidate"],
-                affinity,
+            if (
+                account_identity_pinned
+                and _affinity_pins_account_identity(affinity)
+                and _candidate_matches_affinity(
+                    affinity_state["candidate"],
+                    affinity,
+                )
             ):
                 _raise_codex_auto_agent_redispatch_required(
                     candidate=dict(affinity_state.get("candidate") or {}),
@@ -4894,6 +5387,20 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 mismatch_reason="session_owner: owner candidate unavailable",
             )
         if account_identity_pinned and _affinity_pins_account_identity(affinity):
+            if authenticated_token_affinity:
+                _raise_codex_auto_agent_authenticated_continuation_unavailable(
+                    candidate=dict(affinity_state.get("candidate") or affinity),
+                    lane_key=affinity_state.get("lane_key")
+                    or affinity.get("codex_oauth_lane_key"),
+                    cooldown_seconds=0.0,
+                    alias_model=alias_model,
+                    error_class="candidate_unavailable",
+                    failure_phase="account_bound_owner_unavailable",
+                    skipped_candidates=_build_auto_agent_skipped_candidates_from_states(
+                        [affinity_state]
+                    ),
+                    terminal_reset=affinity_state.get("terminal_reset"),
+                )
             _raise_codex_auto_agent_redispatch_required(
                 candidate=dict(affinity_state.get("candidate") or affinity),
                 lane_key=affinity_state.get("lane_key")
@@ -4911,11 +5418,28 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             )
         if affinity_state["cooldown_seconds"] > 0:
             # Owned/cooldown owner is unavailable: fail before free selection.
-            if session_owner_record is not None and sa._record_state(session_owner_record) == "owned":
+            if (
+                session_owner_record is not None
+                and sa._record_state(session_owner_record) == "owned"
+                and not authenticated_token_affinity
+            ):
                 return await _reselect_owned_affinity_with_effective_identity(
                     candidate=affinity_state.get("candidate"),
                     failure_phase="session_owner_owner_cooldown",
                     mismatch_reason="session_owner: owner unavailable (cooldown)",
+                )
+            if authenticated_token_affinity:
+                _raise_codex_auto_agent_authenticated_continuation_unavailable(
+                    candidate=affinity_state["candidate"],
+                    lane_key=affinity_state.get("lane_key"),
+                    cooldown_seconds=affinity_state["cooldown_seconds"],
+                    alias_model=alias_model,
+                    failure_phase=affinity_state.get("failure_phase")
+                    or "affinity_account_cooldown",
+                    skipped_candidates=_build_auto_agent_skipped_candidates_from_states(
+                        [affinity_state]
+                    ),
+                    terminal_reset=affinity_state.get("terminal_reset"),
                 )
             _raise_codex_auto_agent_in_flight_cooldown(
                 candidate=affinity_state["candidate"],
@@ -4932,6 +5456,22 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         if terminal_reset is not None:
             redispatch_candidate["_codex_oauth_terminal_reset"] = (
                 terminal_reset
+            )
+        if authenticated_token_affinity:
+            _raise_codex_auto_agent_authenticated_continuation_unavailable(
+                candidate=redispatch_candidate,
+                lane_key=affinity_state.get("lane_key"),
+                cooldown_seconds=0.0,
+                alias_model=alias_model,
+                error_class=(
+                    "usage_limit_reached"
+                    if affinity_state.get("skip_reason") == "quota_exhausted"
+                    else "candidate_unavailable"
+                ),
+                failure_phase=affinity_state.get("failure_phase")
+                or "affinity_account_unavailable",
+                skipped_candidates=affinity_skipped,
+                terminal_reset=terminal_reset,
             )
         _raise_codex_auto_agent_redispatch_required(
             candidate=redispatch_candidate,
@@ -4952,7 +5492,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         )
 
     in_flight_session = bool(
-        has_continuation_state
+        provider_owned_continuation
         or affinity_bypassed
         or affinity is not None
         or (
@@ -5011,7 +5551,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         include_candidate_semantic_ineligibility=(
             _candidate_semantic_marker_consult_eligible(
                 request_mode=request_mode,
-                has_continuation_state=has_continuation_state,
+                has_continuation_state=provider_owned_continuation,
                 has_previous_response_id=has_previous_response_id,
                 has_account_bound_state=has_account_bound_state,
                 in_flight_session=in_flight_session,
@@ -5102,11 +5642,17 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             "type": "rate_limit_error",
             "code": "aawm_codex_auto_agent_all_candidates_cooling_down",
         },
-        "candidates": skipped,
+        "candidates": _redact_auto_agent_account_identity(
+            skipped,
+            redact_cooldown_keys=True,
+        ),
     }
     terminal_reset = _build_codex_oauth_terminal_reset_information(states)
     if terminal_reset is not None:
-        detail["terminal_reset"] = terminal_reset
+        detail["terminal_reset"] = _redact_auto_agent_account_identity(
+            terminal_reset,
+            redact_cooldown_keys=True,
+        )
     raise HTTPException(
         status_code=429,
         detail=detail,
@@ -5549,6 +6095,7 @@ _HOST_FUNCTION_NAMES = (
     "_extract_codex_request_redispatch_ordinal",
     "_resolve_codex_request_mode_and_ordinal",
     "_codex_auto_agent_candidate_public_shape",
+    "_redact_auto_agent_account_identity",
     "_codex_oauth_routing_candidate_fields",
     "_is_auto_agent_candidate_state_available",
     "_build_auto_agent_skipped_candidates_from_states",
@@ -5598,6 +6145,7 @@ _HOST_FUNCTION_NAMES = (
     "_affinity_pins_account_identity",
     "_attach_account_bound_selection_metadata",
     "_candidate_matches_affinity",
+    "_codex_oauth_affinity_is_authenticated_token",
     "_apply_codex_oauth_inventory_affinity_policy",
     "_resolve_codex_oauth_account_candidate_contexts",
     "_get_anthropic_auto_agent_candidate_cooldown_state",
@@ -5633,6 +6181,7 @@ _HOST_FUNCTION_NAMES = (
     "_raise_codex_auto_agent_in_flight_cooldown",
     "_raise_anthropic_auto_agent_in_flight_cooldown",
     "_build_auto_agent_redispatch_http_exception_detail",
+    "_raise_codex_auto_agent_authenticated_continuation_unavailable",
     "_raise_codex_auto_agent_redispatch_required",
     "_raise_anthropic_auto_agent_redispatch_required",
     "_select_codex_auto_agent_candidate",
@@ -5696,6 +6245,9 @@ def install(host_globals: dict) -> None:
         "alias_routing_state": alias_routing_state,
         "inspect": inspect,
         "math": math,
+        "_AUTO_AGENT_ACCOUNT_IDENTITY_FIELDS": (
+            _AUTO_AGENT_ACCOUNT_IDENTITY_FIELDS
+        ),
         "_CODEX_OAUTH_QUOTA_FAMILY_OVERALL": _CODEX_OAUTH_QUOTA_FAMILY_OVERALL,
         "_CODEX_OAUTH_QUOTA_FAMILY_SPARK": _CODEX_OAUTH_QUOTA_FAMILY_SPARK,
         "_get_codex_active_cooldown_state": _get_codex_active_cooldown_state,

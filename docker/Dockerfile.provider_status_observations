@@ -22,13 +22,20 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         iputils-ping \
+        rsync \
+        xauth \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir "psycopg[binary]==3.3.4"
+RUN pip install --no-cache-dir \
+    "psycopg[binary]==3.3.4" \
+    "playwright==1.62.0"
+
+RUN python -m playwright install-deps chromium
 
 COPY scripts/record_provider_status_observations.py /app/scripts/record_provider_status_observations.py
+COPY scripts/chatgpt_oracle_browser_session.mjs /app/scripts/chatgpt_oracle_browser_session.mjs
 COPY scripts/grok_oidc_refresh.py /app/scripts/grok_oidc_refresh.py
 COPY scripts/codex_oauth_refresh.py /app/scripts/codex_oauth_refresh.py
 COPY scripts/xai_oauth_refresh.py /app/scripts/xai_oauth_refresh.py
@@ -40,6 +47,8 @@ COPY litellm/secret_managers/credential_error_sanitizer.py /app/litellm/secret_m
 COPY litellm/secret_managers/credential_file_lock.py /app/litellm/secret_managers/credential_file_lock.py
 COPY litellm/secret_managers/credential_file_metadata.py /app/litellm/secret_managers/credential_file_metadata.py
 COPY litellm/secret_managers/credential_file_write.py /app/litellm/secret_managers/credential_file_write.py
+# Shared exact-scope xAI credential selector (pure-stdlib).
+COPY litellm/secret_managers/xai_oauth_credentials.py /app/litellm/secret_managers/xai_oauth_credentials.py
 # Grok native OIDC auth-path resolver (pure-stdlib).
 COPY litellm/secret_managers/grok_oidc_auth_path.py /app/litellm/secret_managers/grok_oidc_auth_path.py
 # Codex OAuth credential inventory (pure-stdlib).

@@ -236,7 +236,7 @@ class ProviderCallLedger:
         self._started_at_monotonic = time.monotonic()
         self._next_ordinal = 1
         self._logical_provider_calls = 0
-        self._transport_connection_attempts = 0
+        self._transport_connection_failures = 0
         self._records: list[ProviderCallReservation] = []
         self._request_fingerprint = uuid4().hex[:16]
 
@@ -245,8 +245,14 @@ class ProviderCallLedger:
         return self._logical_provider_calls
 
     @property
+    def transport_connection_failures(self) -> int:
+        return self._transport_connection_failures
+
+    @property
     def transport_connection_attempts(self) -> int:
-        return self._transport_connection_attempts
+        """Backward-compatible alias for the failure-only counter."""
+
+        return self.transport_connection_failures
 
     @property
     def reservations(self) -> tuple[ProviderCallReservation, ...]:
@@ -301,10 +307,15 @@ class ProviderCallLedger:
         self._next_ordinal += 1
         return reservation
 
-    def record_transport_connection_attempt(self) -> None:
+    def record_transport_connection_failure(self) -> None:
         """Record an observable connection failure separately from sends."""
 
-        self._transport_connection_attempts += 1
+        self._transport_connection_failures += 1
+
+    def record_transport_connection_attempt(self) -> None:
+        """Backward-compatible alias for the failure-only counter."""
+
+        self.record_transport_connection_failure()
 
     def snapshot(self) -> dict[str, Any]:
         remaining = max(
@@ -319,7 +330,7 @@ class ProviderCallLedger:
             "logical_provider_calls": self._logical_provider_calls,
             "remaining_logical_provider_calls": remaining,
             "next_attempt_ordinal": self._next_ordinal,
-            "transport_connection_attempts": self._transport_connection_attempts,
+            "transport_connection_failures": self._transport_connection_failures,
             "deadline_seconds": self.deadline_seconds,
             "elapsed_seconds": round(max(0.0, elapsed_seconds), 3),
             "reservations": [record.to_metadata() for record in self._records],
@@ -517,11 +528,11 @@ def publish_reservation_metadata(
         )
 
 
-def record_transport_connection_attempt(request: Request) -> None:
+def record_transport_connection_failure(request: Request) -> None:
     ledger = get_request_provider_call_ledger(request)
     if ledger is None:
         return
-    ledger.record_transport_connection_attempt()
+    ledger.record_transport_connection_failure()
     state = _request_state(request)
     if state is not None:
         setattr(
@@ -529,6 +540,10 @@ def record_transport_connection_attempt(request: Request) -> None:
             "aawm_openai_send_ledger_snapshot",
             get_request_provider_call_ledger_snapshot(request),
         )
+def record_transport_connection_attempt(request: Request) -> None:
+    """Backward-compatible alias for the failure-only telemetry."""
+
+    record_transport_connection_failure(request)
 
 
 def register_active_upstream_response(
@@ -591,6 +606,7 @@ __all__ = [
     "is_openai_logical_send_target",
     "publish_reservation_metadata",
     "publish_wire_commitment_snapshot",
+    "record_transport_connection_failure",
     "record_transport_connection_attempt",
     "register_active_upstream_response",
 ]
