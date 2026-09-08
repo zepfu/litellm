@@ -848,6 +848,9 @@ async def handle_alias_route(  # noqa: PLR0915
     verbose_proxy_logger = _lpe.verbose_proxy_logger
     status = _lpe.status
     HTTPException = _lpe.HTTPException
+    raise_authenticated_continuation_unavailable_fn = (
+        _lpe._raise_codex_auto_agent_authenticated_continuation_unavailable
+    )
 
     select_candidate_fn = services.select_candidate_fn
     perform_candidate_request_fn = services.perform_candidate_request_fn
@@ -1117,6 +1120,66 @@ async def handle_alias_route(  # noqa: PLR0915
             not _provider_owned_continuation()
             or candidate.get("codex_oauth_credential_affinity")
             == "interchangeable"
+        )
+
+    def _is_authenticated_codex_continuation_pin(
+        selection: Mapping[str, Any],
+    ) -> bool:
+        return bool(
+            is_codex_alias
+            and selection.get("selection_reason")
+            == "authenticated_continuation_token_pin"
+        )
+
+    def _raise_authenticated_codex_continuation_unavailable(
+        *,
+        candidate: dict[str, Any],
+        selection: Mapping[str, Any],
+        attempt_record: dict[str, Any],
+        attempts: list[dict[str, Any]],
+        failure_body: Mapping[str, Any],
+        error_tokens: set[str],
+        cooldown_seconds: float,
+        cooldown_scope: Optional[str],
+        failure_phase: str,
+    ) -> None:
+        failure_metadata = failure_body.get("litellm_metadata") or {}
+        _mark_auto_agent_alias_request_terminal_failure(
+            request,
+            attempt_record,
+        )
+        raise_authenticated_continuation_unavailable_fn(
+            candidate=candidate,
+            lane_key=selection.get("lane_key"),
+            cooldown_seconds=cooldown_seconds,
+            alias_model=alias_model,
+            error_class=attempt_record.get("error_class"),
+            cooldown_scope=cooldown_scope,
+            error_status_code=attempt_record.get("error_status_code"),
+            error_type=attempt_record.get("error_type"),
+            error_code=attempt_record.get("error_code"),
+            retry_after_seconds=attempt_record.get("retry_after_seconds"),
+            failure_phase=failure_phase,
+            attempted_provider_call=attempt_record.get(
+                "attempted_provider_call"
+            ),
+            error_tokens=error_tokens,
+            audit_events=(
+                failure_metadata.get("aawm_alias_routing_audit_events")
+                if isinstance(failure_metadata, dict)
+                else None
+            ),
+            attempts=(
+                failure_metadata.get(attempts_metadata_key)
+                if isinstance(failure_metadata, dict)
+                else attempts
+            ),
+            skipped_candidates=(
+                failure_metadata.get(skipped_candidates_metadata_key)
+                if isinstance(failure_metadata, dict)
+                else None
+            ),
+            terminal_reset=selection.get("terminal_reset"),
         )
 
     def _raise_terminal_alias_failure(  # noqa: PLR0915
@@ -3093,16 +3156,25 @@ async def handle_alias_route(  # noqa: PLR0915
                         add_alias_metadata_fn=add_alias_metadata_fn,
                     )
                     _raise_terminal_alias_failure(failure_exc)
-                account_failover_planned = _plan_codex_oauth_account_failover(
-                    request,
-                    candidate=candidate,
-                    selection=selection,
-                    attempt_record=attempt_record,
-                    error_class=error_class,
-                    has_continuation_state=_provider_owned_continuation(),
-                    has_previous_response_id=has_previous_response_id,
-                    account_failover_replay_safe=account_failover_replay_safe,
-                    provider_status_code=attempt_record.get("error_status_code"),
+                authenticated_token_pin = (
+                    _is_authenticated_codex_continuation_pin(selection)
+                )
+                account_failover_planned = (
+                    False
+                    if authenticated_token_pin
+                    else _plan_codex_oauth_account_failover(
+                        request,
+                        candidate=candidate,
+                        selection=selection,
+                        attempt_record=attempt_record,
+                        error_class=error_class,
+                        has_continuation_state=has_continuation_state,
+                        has_previous_response_id=has_previous_response_id,
+                        account_failover_replay_safe=account_failover_replay_safe,
+                        provider_status_code=attempt_record.get(
+                            "error_status_code"
+                        ),
+                    )
                 )
                 if (
                     cooldown_scope == "none"
@@ -3117,11 +3189,16 @@ async def handle_alias_route(  # noqa: PLR0915
                 if (
                     error_class == "token_invalidated"
                     and _provider_owned_continuation()
-                    and not account_failover_replay_safe
+                    and (
+                        not account_failover_replay_safe
+                        or authenticated_token_pin
+                    )
                     and not account_failover_planned
                 ):
                     attempt_record["status"] = (
-                        "terminal_in_flight_token_invalidated"
+                        "terminal_authenticated_continuation_unavailable"
+                        if authenticated_token_pin
+                        else "terminal_in_flight_token_invalidated"
                     )
                     failure_body = _record_auto_agent_alias_attempt_failure(
                         alias_family=alias_family,
@@ -3133,9 +3210,21 @@ async def handle_alias_route(  # noqa: PLR0915
                         attempt_record=attempt_record,
                         error_class=error_class,
                         add_alias_metadata_fn=add_alias_metadata_fn,
-                        redispatch_required=True,
+                        redispatch_required=not authenticated_token_pin,
                         defer_terminal_error=True,
                     )
+                    if authenticated_token_pin:
+                        _raise_authenticated_codex_continuation_unavailable(
+                            candidate=candidate,
+                            selection=selection,
+                            attempt_record=attempt_record,
+                            attempts=attempts,
+                            failure_body=failure_body,
+                            error_tokens=error_tokens,
+                            cooldown_seconds=cooldown_seconds,
+                            cooldown_scope="none",
+                            failure_phase="token_invalidated_continuation",
+                        )
                     failure_metadata = failure_body.get("litellm_metadata") or {}
                     try:
                         raise_redispatch_required_fn(
@@ -3180,12 +3269,16 @@ async def handle_alias_route(  # noqa: PLR0915
                     _provider_owned_continuation()
                     and cooldown_scope != "none"
                     and not account_failover_planned
-                    and not (
-                        error_class == "candidate_unavailable"
-                        and account_failover_replay_safe
-                    )
+                        and not (
+                            error_class == "candidate_unavailable"
+                            and account_failover_replay_safe
+                        )
                 ):
-                    attempt_record["status"] = "terminal_in_flight_cooldown_set"
+                    attempt_record["status"] = (
+                        "terminal_authenticated_continuation_unavailable"
+                        if authenticated_token_pin
+                        else "terminal_in_flight_cooldown_set"
+                    )
                     failure_body = _record_auto_agent_alias_attempt_failure(
                         alias_family=alias_family,
                         alias_model=alias_model,
@@ -3196,9 +3289,24 @@ async def handle_alias_route(  # noqa: PLR0915
                         attempt_record=attempt_record,
                         error_class=error_class,
                         add_alias_metadata_fn=add_alias_metadata_fn,
-                        redispatch_required=True,
+                        redispatch_required=not authenticated_token_pin,
                         defer_terminal_error=True,
                     )
+                    if authenticated_token_pin:
+                        _raise_authenticated_codex_continuation_unavailable(
+                            candidate=candidate,
+                            selection=selection,
+                            attempt_record=attempt_record,
+                            attempts=attempts,
+                            failure_body=failure_body,
+                            error_tokens=error_tokens,
+                            cooldown_seconds=cooldown_seconds,
+                            cooldown_scope=cooldown_scope,
+                            failure_phase=(
+                                attempt_record.get("failure_phase")
+                                or "authenticated_continuation_cooldown"
+                            ),
+                        )
                     failure_metadata = failure_body.get("litellm_metadata") or {}
                     verbose_proxy_logger.debug(
                         "%s auto-agent alias %s target %s/%s hit %s "
