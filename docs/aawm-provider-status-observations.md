@@ -1144,6 +1144,18 @@ successful history and does not advance a completed per-model count. Native
 reader activation, schema provisioning, deployment, and fresh per-account
 row verification remain separate gates.
 
+The sidecar wires `bootstrap_native_history_binding` and
+`prepare_native_history` from `chatgpt_chat_usage_capture/native_history.py`.
+Both currently return `history_contract_unavailable` without opening a browser.
+Configured identity is not authenticated identity and cannot initialize a new
+ledger binding. The existing native observer returns structural metadata only;
+it is not a `readHistory` implementation. The adapter's endpoint evidence is
+synthetic, so neither source is promoted into verified history capabilities.
+Completing these callbacks requires native evidence for session identity,
+index/detail/message records, and pagination under the existing read-only
+request and lifecycle contracts. The observed same-origin bootstrap POST remains
+blocked until its read-only contract is established; no route was added.
+
 Capability inventories may describe unavailable operations alongside verified
 ones. Each requested operation and archive scope still requires its own
 manifest evidence; a missing optional capability does not disable other

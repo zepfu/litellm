@@ -17991,6 +17991,10 @@ def _run_chatgpt_usage_bridge_accounts(
     profile_filter: Optional[str],
     authentication_recovery_requested: bool,
 ) -> list[Dict[str, Any]]:
+    from scripts.chatgpt_chat_usage_capture.native_history import (
+        bootstrap_native_history_binding,
+        prepare_native_history,
+    )
     from scripts.chatgpt_chat_usage_capture.pg_collector_state import (
         PgCollectorState,
     )
@@ -18019,6 +18023,8 @@ def _run_chatgpt_usage_bridge_accounts(
                 node_executable=config.chatgpt_usage_bridge_node_executable,
                 worker_root=config.chatgpt_usage_bridge_worker_root,
                 mapping=dict(DEFAULT_MODEL_MAPPING),
+                binding_bootstrapper=bootstrap_native_history_binding,
+                history_preparer=prepare_native_history,
             ),
         )
         task_state.chatgpt_usage_bridge_owner = bridge
