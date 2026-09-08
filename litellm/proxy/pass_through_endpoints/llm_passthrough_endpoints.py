@@ -3500,6 +3500,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
     selection: dict[str, Any],
     exc: Exception,
     error_class: str,
+    attempted_provider_call: bool,
 ) -> Optional[tuple[Any, dict[str, Any]]]:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         session_affinity as _sa,
@@ -3545,13 +3546,15 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             selection=selection,
             exc=exc,
             cooldown_seconds=cooldown_seconds,
+            attempted_provider_call=attempted_provider_call,
+            error_class=error_class,
         )
     )
     retry_attempt_record = injected_attempt_record
     if retry_attempt_record is None:
         retry_attempt_record = {
             "failure_phase": "direct_openai_provider_response",
-            "attempted_provider_call": True,
+            "attempted_provider_call": attempted_provider_call,
             "cooldown_seconds": round(float(cooldown_seconds), 3),
             "error_status_code": _aawm_error_signals._extract_adapter_exception_status_code(
                 exc
@@ -3705,13 +3708,20 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             provider_status_code=retry_attempt_record["error_status_code"],
         )
     )
+    if retry_planned and hasattr(request, "state"):
+        setattr(
+            request.state,
+            "_aawm_direct_codex_account_failover_planned",
+            True,
+        )
     if retry_planned:
         retry_attempt_record["failover_decision"] = "move_account"
         retry_attempt_record["terminal_reason"] = "success"
     else:
         retry_attempt_record["failover_decision"] = "terminal"
         retry_attempt_record["terminal_reason"] = (
-            "account_failover_exhausted"
+            retry_attempt_record.get("account_failover_rejection_reason")
+            or "account_failover_exhausted"
         )
     if not retry_planned:
         return None
@@ -3823,7 +3833,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
                 ),
             )
         )
-        if not guard_rebound:
+        if not guard_rebound.rebound:
             request_state = getattr(request, "state", None)
             if request_state is not None:
                 if pre_selection_bound_account is missing_request_state:
@@ -3845,6 +3855,9 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             else:
                 request.scope["parsed_body"] = pre_selection_parsed_body
             retry_attempt_record["guard_reset_outcome"] = "rebind_rejected"
+            retry_attempt_record["guard_rebind_rejection_reason"] = (
+                guard_rebound.rejection_reason
+            )
             retry_attempt_record["failover_decision"] = "terminal"
             retry_attempt_record["terminal_reason"] = (
                 "account_failover_guard_rebind_failed"
@@ -6312,6 +6325,7 @@ async def openai_proxy_route(  # noqa: PLR0915
                 selection=direct_codex_selection_state,
                 exc=exc,
                 error_class=direct_account_error_class,
+                attempted_provider_call=attempted_provider_call,
             )
             if retry is None:
                 _aawm_dev_fault_plan.note_direct_openai_managed_terminal_exhaustion(

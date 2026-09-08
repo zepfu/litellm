@@ -887,19 +887,25 @@ def _plan_codex_oauth_account_failover(
     provider_status_code: Optional[int] = None,
 ) -> bool:
     """Plan a request-local move to another eligible account for one slot."""
+
+    def reject(reason: str) -> bool:
+        attempt_record["account_failover_rejection_reason"] = reason
+        return False
+
+    attempt_record.pop("account_failover_rejection_reason", None)
     if not _is_codex_oauth_account_candidate(candidate):
-        return False
+        return reject("candidate_not_codex_oauth")
     if (
-        has_account_bound_state
-        or selection.get("has_account_bound_state")
-        or has_previous_response_id
+        has_account_bound_state or selection.get("has_account_bound_state")
     ) and not account_failover_replay_safe:
-        return False
+        return reject("account_bound_state_nonportable")
+    if has_previous_response_id and not account_failover_replay_safe:
+        return reject("previous_response_id_nonportable")
     interchangeable = (
         candidate.get("codex_oauth_credential_affinity") == "interchangeable"
     )
     if has_continuation_state and not interchangeable:
-        return False
+        return reject("account_not_interchangeable_for_continuation")
 
     existing = _get_codex_oauth_request_local_failover_context(
         request,
@@ -911,7 +917,7 @@ def _plan_codex_oauth_account_failover(
     )
     if account_hash in attempted_account_hashes:
         attempt_record["account_failover_limit_reached"] = True
-        return False
+        return reject("account_failover_limit_reached")
 
     if error_class == "provider_terminal_error":
         fresh_unbound_request_401 = (
@@ -922,7 +928,7 @@ def _plan_codex_oauth_account_failover(
             and provider_status_code == 401
         )
         if not fresh_unbound_request_401:
-            return False
+            return reject("provider_terminal_error_not_fresh_unbound_401")
     elif error_class not in {
         "capacity_exhausted",
         "rate_limited",
@@ -930,7 +936,7 @@ def _plan_codex_oauth_account_failover(
         "usage_limit_reached",
         "candidate_unavailable",
     }:
-        return False
+        return reject("error_class_not_failover_eligible")
 
     prior_account_outcome: dict[str, Any] = {
         "account_label": candidate.get("codex_oauth_account_label"),

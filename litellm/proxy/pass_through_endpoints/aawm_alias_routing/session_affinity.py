@@ -135,6 +135,14 @@ class SessionOwnerLease:
 
 
 @dataclass(frozen=True)
+class SessionOwnerLeaseRebindResult:
+    """Exact outcome of a validated portable failover lease rebinding."""
+
+    rebound: bool
+    rejection_reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class SessionOwnerReplaySafetyResult:
     """Pure structural replay-safety classification for one request body."""
 
@@ -3776,7 +3784,11 @@ def request_session_owner_already_guarded(request: Any) -> bool:
 
 
 def reset_released_request_session_owner_guard(request: Any) -> bool:
-    """Allow a fresh-request retry after its reservation was released."""
+    """Clear a released fresh-request reservation before account failover.
+
+    This only resets request-local state from a fresh dispatch whose reservation
+    was released. It does not rebind a durable compatible owner.
+    """
     if request is None:
         return False
     state = getattr(request, "state", None)
@@ -3818,30 +3830,60 @@ async def clear_compatible_non_held_request_session_owner_guard_for_failover(
     post_commit_retry: bool,
     failover_ordinal: int = 1,
     validate_durable_owner: bool = True,
-) -> bool:
-    """Validate one portable account move, then clear only request state."""
+) -> SessionOwnerLeaseRebindResult:
+    """Validate one portable account move, then clear only request state.
+
+    A released fresh reservation may retain an ``UNOWNED_RESERVED`` or
+    ``RESERVATION_RENEWED`` decision, which is distinct from a live
+    ``COMPATIBLE_OWNER`` durable owner. Released request-local state is cleared
+    only after the same portability and ownership checks.
+    """
 
     if not request_session_owner_already_guarded(request):
-        return False
+        return SessionOwnerLeaseRebindResult(False, "guard_not_acquired")
     lease = get_request_session_owner_lease(request)
+    if lease is None:
+        return SessionOwnerLeaseRebindResult(False, "lease_missing")
+    released_decisions = {
+        SessionOwnerGuardDecision.UNOWNED_RESERVED.value,
+        SessionOwnerGuardDecision.RESERVATION_RENEWED.value,
+        SessionOwnerGuardDecision.COMPATIBLE_OWNER.value,
+    }
     if (
-        lease is None
-        or lease.decision != SessionOwnerGuardDecision.COMPATIBLE_OWNER.value
-        or lease.held_reservation
-        or lease.released
-        or lease.promoted
-        or _clean_optional_str(lease.owner_id) is None
+        lease.released
+        and lease.decision not in released_decisions
+    ) or (
+        not lease.released
+        and lease.decision != SessionOwnerGuardDecision.COMPATIBLE_OWNER.value
     ):
-        return False
-    if (
-        not account_failover_planned
-        or not account_failover_replay_safe
-        or has_account_bound_state
-        or post_commit_retry
-        or failover_ordinal != 1
-        or not is_replay_safe_session_owner_redispatch_body(request_body)
-    ):
-        return False
+        return SessionOwnerLeaseRebindResult(
+            False,
+            "lease_decision_not_compatible_owner",
+        )
+    if lease.promoted:
+        return SessionOwnerLeaseRebindResult(False, "lease_promoted")
+    if not lease.released and lease.held_reservation:
+        return SessionOwnerLeaseRebindResult(False, "lease_held_reservation")
+    if _clean_optional_str(lease.owner_id) is None:
+        return SessionOwnerLeaseRebindResult(False, "lease_owner_missing")
+    if not account_failover_planned:
+        return SessionOwnerLeaseRebindResult(
+            False,
+            "account_failover_not_planned",
+        )
+    if not account_failover_replay_safe:
+        return SessionOwnerLeaseRebindResult(False, "replay_unsafe")
+    if has_account_bound_state:
+        return SessionOwnerLeaseRebindResult(
+            False,
+            "account_bound_state_nonportable",
+        )
+    if post_commit_retry:
+        return SessionOwnerLeaseRebindResult(False, "post_commit_retry")
+    if failover_ordinal != 1:
+        return SessionOwnerLeaseRebindResult(False, "unexpected_failover_ordinal")
+    if not is_replay_safe_session_owner_redispatch_body(request_body):
+        return SessionOwnerLeaseRebindResult(False, "body_not_replay_safe")
 
     current = _core_owner_attributes(
         build_session_owner_attributes(extra=current_attributes or lease.attributes)
@@ -3858,13 +3900,19 @@ async def clear_compatible_non_held_request_session_owner_guard_for_failover(
                 for key in ("account_hash", "account_lane", "account_label")
             )
         ):
-            return False
+            return SessionOwnerLeaseRebindResult(
+                False,
+                "incomplete_owner_attributes",
+            )
     if not _accounts_are_interchangeable(current, alternate):
-        return False
+        return SessionOwnerLeaseRebindResult(
+            False,
+            "accounts_not_interchangeable",
+        )
     if _clean_optional_str(current.get("model")) != _clean_optional_str(
         alternate.get("model")
     ):
-        return False
+        return SessionOwnerLeaseRebindResult(False, "model_mismatch")
     if (
         _compatibility_mismatch_reason(
             owner_record={
@@ -3877,7 +3925,7 @@ async def clear_compatible_non_held_request_session_owner_guard_for_failover(
         )
         is not None
     ):
-        return False
+        return SessionOwnerLeaseRebindResult(False, "request_lease_owner_mismatch")
 
     if validate_durable_owner:
         owner_record, _, error = await get_session_owner_record(
@@ -3885,37 +3933,52 @@ async def clear_compatible_non_held_request_session_owner_guard_for_failover(
             request=request,
             wait_for_foreign_reservation=False,
         )
-        if (
+        durable_record_absent = owner_record is None and error is None
+        if lease.released and durable_record_absent:
+            owner_record = None
+        elif (
             error is not None
             or owner_record is None
             or _record_state(owner_record) != SessionOwnerRecordState.OWNED.value
             or _clean_optional_str(owner_record.get(_RECORD_OWNER_FIELD))
             != _clean_optional_str(lease.owner_id)
         ):
-            return False
-        owner_attributes = _core_owner_attributes(_owner_attributes(owner_record))
-        if (
-            incomplete_owner_attribute_reason(
-                owner_attributes, for_promotion=True
+            return SessionOwnerLeaseRebindResult(
+                False,
+                "durable_owner_changed_or_missing",
             )
-            is not None
-            or not _accounts_are_interchangeable(owner_attributes, alternate)
-            or _compatibility_mismatch_reason(
-                owner_record=owner_record,
-                requested_attributes=current,
-                require_exact_attributes=True,
+        if owner_record is not None:
+            owner_attributes = _core_owner_attributes(
+                _owner_attributes(owner_record)
             )
-            is not None
-            or _compatibility_mismatch_reason(
-                owner_record=owner_record,
-                requested_attributes=alternate,
-                require_exact_attributes=True,
-            )
-            is not None
-        ):
-            return False
+            if (
+                incomplete_owner_attribute_reason(
+                    owner_attributes, for_promotion=True
+                )
+                is not None
+                or not _accounts_are_interchangeable(
+                    owner_attributes, alternate
+                )
+                or _compatibility_mismatch_reason(
+                    owner_record=owner_record,
+                    requested_attributes=current,
+                    require_exact_attributes=True,
+                )
+                is not None
+            ):
+                return SessionOwnerLeaseRebindResult(
+                    False,
+                    "durable_owner_mismatch",
+                )
 
-    return clear_non_held_request_session_owner_lease(request)
+    clear_request_lease = (
+        reset_released_request_session_owner_guard
+        if lease.released
+        else clear_non_held_request_session_owner_lease
+    )
+    if not clear_request_lease(request):
+        return SessionOwnerLeaseRebindResult(False, "request_lease_clear_failed")
+    return SessionOwnerLeaseRebindResult(True)
 
 
 def is_exact_owned_session_owner_route_mismatch(
