@@ -39,6 +39,22 @@ affinity remain request-scoped while the stream is active. A completed terminal
 can promote the owner and commit affinity. Failed, incomplete, cancelled, or
 disconnected streams release the reservation and do not write new affinity.
 
+The final delivered disposition is also published for logging, rollup, and
+session-transfer consumers. Consumers must use this disposition rather than
+the upstream HTTP status: `completed` is the only successful outcome;
+`failed`, `incomplete`, `cancelled`, and `disconnected` are non-success
+outcomes. The disposition is selected once, after the terminal event and
+`[DONE]` have been delivered for streams or after the response body has been
+sent for non-streaming Responses.
+
+The internal callback contract is
+`on_disposition(disposition, trace)`. Consumers should read a copy from
+`trace.snapshot()` containing the wire state, response/body commitment,
+terminal and `[DONE]` markers, final disposition, and bounded malformed,
+duplicate, partial-frame, and close-error fields. Consumers must not promote
+ownership, write legacy affinity, or infer success independently from the
+provider response.
+
 ## When to use this?
 
 - For 90% of your use cases, you should use the [native LiteLLM OpenAI Integration](https://docs.litellm.ai/docs/providers/openai) (`/chat/completions`, `/embeddings`, `/completions`, `/images`, `/batches`, etc.)
