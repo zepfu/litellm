@@ -4429,10 +4429,39 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
     user_api_key_dict: Any,
     request_body: dict[str, Any],
 ) -> Response:
+    canonical_request_body = copy.deepcopy(request_body)
     (
         adapted_request_body,
         _adapted_custom_tools,
     ) = _adapt_codex_custom_tools_to_functions_from_request_body(request_body)
+    (
+        adapted_request_body,
+        _adapted_namespace_tools,
+    ) = _adapt_codex_namespace_tools_to_functions_from_request_body(
+        adapted_request_body
+    )
+    (
+        adapted_request_body,
+        _tool_description_patch_events,
+    ) = _apply_codex_tool_description_patches_to_request_body(
+        adapted_request_body
+    )
+    (
+        adapted_request_body,
+        _unsupported_hosted_tools,
+    ) = _drop_unsupported_codex_hosted_tools_from_request_body(adapted_request_body)
+    (
+        adapted_request_body,
+        _unsupported_request_params,
+    ) = _drop_unsupported_codex_request_params_from_request_body(adapted_request_body)
+    (
+        adapted_request_body,
+        _unsupported_input_items,
+    ) = _drop_unsupported_codex_input_items_from_request_body(adapted_request_body)
+    (
+        adapted_request_body,
+        _removed_tool_choice,
+    ) = _drop_tool_choice_without_tools_from_request_body(adapted_request_body)
     try:
         grok_context = await BaseOpenAIPassThroughHandler._prepare_openai_grok_native_oauth_context(
             endpoint=endpoint,
@@ -4475,7 +4504,7 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
     response = _maybe_wrap_xai_passthrough_responses_stream(
         response,
         request=request,
-        request_body=request_body,
+        request_body=canonical_request_body,
         route_family="codex_auto_agent_grok_native_responses",
         resolved_model=grok_prepared_body.get("model") or request_body.get("model"),
     )
@@ -4486,12 +4515,12 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
         adapter_label="Grok native",
         intake_context=_build_malformed_tool_call_intake_context(
             request,
-            request_body,
+            canonical_request_body,
             adapter="codex_auto_agent_grok_native_responses",
             upstream_url=str(updated_url),
             provider="grok",
         ),
-        request_body=request_body,
+        request_body=canonical_request_body,
     )
 
 
