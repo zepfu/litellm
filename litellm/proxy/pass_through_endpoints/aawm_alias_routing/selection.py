@@ -4209,6 +4209,7 @@ def _build_auto_agent_redispatch_http_exception_detail(
     attempts: Optional[list[dict[str, Any]]] = None,
     skipped_candidates: Optional[list[dict[str, Any]]] = None,
     terminal_reset: Optional[dict[str, Any]] = None,
+    account_failover_rejection_reason: Optional[str] = None,
     redispatch_required: bool = True,
     continuation_portable: Optional[bool] = None,
     alternate_accounts_considered: Optional[bool] = None,
@@ -4271,6 +4272,10 @@ def _build_auto_agent_redispatch_http_exception_detail(
         detail["failure_phase"] = failure_phase
     if attempted_provider_call is not None:
         detail["attempted_provider_call"] = attempted_provider_call
+    if account_failover_rejection_reason is not None:
+        detail["account_failover_rejection_reason"] = (
+            account_failover_rejection_reason
+        )
     redact_account_identity = alias_family == "codex_auto_agent"
     if isinstance(audit_events, list):
         detail["aawm_alias_routing_audit_events"] = (
@@ -4330,6 +4335,7 @@ def _raise_codex_auto_agent_authenticated_continuation_unavailable(
     attempts: Optional[list[dict[str, Any]]] = None,
     skipped_candidates: Optional[list[dict[str, Any]]] = None,
     terminal_reset: Optional[dict[str, Any]] = None,
+    account_failover_rejection_reason: Optional[str] = None,
 ) -> None:
     """Fail closed when a valid token-pinned account cannot serve."""
     detail = _build_auto_agent_redispatch_http_exception_detail(
@@ -4351,6 +4357,7 @@ def _raise_codex_auto_agent_authenticated_continuation_unavailable(
         attempts=attempts,
         skipped_candidates=skipped_candidates,
         terminal_reset=terminal_reset,
+        account_failover_rejection_reason=account_failover_rejection_reason,
         redispatch_required=False,
         continuation_portable=False,
         alternate_accounts_considered=False,
