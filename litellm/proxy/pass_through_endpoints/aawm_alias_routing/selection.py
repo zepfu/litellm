@@ -845,6 +845,18 @@ def _peek_codex_auto_agent_request_local_excluded_keys(
 def _codex_oauth_candidate_slot(
     candidate: dict[str, Any],
 ) -> Optional[str]:
+    account_hash = candidate.get("codex_oauth_account_hash")
+    if not account_hash:
+        return None
+    base_slot = _codex_oauth_candidate_base_slot(candidate)
+    if base_slot is None:
+        return None
+    return f"{base_slot}:{account_hash}"
+
+
+def _codex_oauth_candidate_base_slot(
+    candidate: dict[str, Any],
+) -> Optional[str]:
     if not candidate.get("codex_oauth_account_hash"):
         return None
     return "{}:{}:{}:{}".format(
@@ -909,8 +921,8 @@ def _get_codex_oauth_request_local_failover_context(
         return None
     context = dict(context)
     if candidate is not None:
-        candidate_slot = _codex_oauth_candidate_slot(candidate)
-        if context.get("slot") != candidate_slot:
+        candidate_base_slot = _codex_oauth_candidate_base_slot(candidate)
+        if context.get("base_slot") != candidate_base_slot:
             identity = context.get("candidate_identity")
             if not isinstance(identity, dict):
                 return None
@@ -1051,6 +1063,7 @@ def _plan_codex_oauth_account_failover(
         "aawm_codex_oauth_request_local_failover_context",
         {
             "slot": _codex_oauth_candidate_slot(candidate),
+            "base_slot": _codex_oauth_candidate_base_slot(candidate),
             "candidate_identity": {
                 field: candidate.get(field)
                 for field in ("provider", "model", "route_family")
@@ -6094,6 +6107,7 @@ _HOST_FUNCTION_NAMES = (
     "_get_codex_auto_agent_request_local_excluded_keys",
     "_peek_codex_auto_agent_request_local_excluded_keys",
     "_codex_oauth_candidate_slot",
+    "_codex_oauth_candidate_base_slot",
     "_get_codex_oauth_request_local_blocked_slots",
     "_peek_codex_oauth_request_local_blocked_slots",
     "_block_codex_oauth_request_local_candidate_slot",

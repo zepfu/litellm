@@ -121,6 +121,33 @@ by provider routes. Operator-facing behaviors that are easy to miss:
   before full-body buffering; true SSE hands off to the streaming handler.
 - Non-SSE bodies (success and error) are drained with `aread()`.
 
+### Request-wide OpenAI logical-call ledger (OPENAI-037)
+
+OpenAI pass-through sends use one request-scoped `ProviderCallLedger`. The
+ledger reserves a monotonic logical-call ordinal immediately before the final
+`AsyncClient.send`, so hidden retries, candidate changes, and OAuth-account
+changes share one immutable budget. The default maximum is three logical
+provider calls; `AAWM_OPENAI_MAX_LOGICAL_PROVIDER_CALLS` may lower or raise it
+within the bounded range 1-32. OpenAI ledger exhaustion is raised before a
+fourth send and is terminal: it does not trigger candidate cooldown, account
+failover, or another hidden retry.
+
+Reservation closes any previously active upstream response first and disables
+opaque redirects for ledger-owned sends. Observable connection failures are
+tracked separately from logical calls, and telemetry exposes only bounded
+fingerprints for targets, candidates, and account lanes. Non-OpenAI pass-through
+providers bypass this ledger and retain their existing transport behavior.
+
+The Responses wire coordinator remains the sole authority for replay
+commitment. It publishes a bounded request snapshot through
+`publish_wire_commitment_snapshot`; the send wrapper calls
+`ensure_openai_wire_replay_allowed` before reserving a new logical send and
+raises `ProviderCallReplayBlocked` when headers/body/terminal delivery,
+cancellation, or disconnect makes replay unsafe. The ledger mirrors that
+state for telemetry but does not independently decide wire ownership.
+Hidden-retry metadata counts recorded non-success logical-send failures;
+the trailing success record is excluded from the retry count.
+
 ### Tool-schema normalization gate (issue #9)
 
 - OpenAI function-tool `type: object` `properties` fixes run only for
@@ -281,6 +308,7 @@ sequencing, stream validation, and response finalization, are package-owned:
 | Responses-to-Anthropic finalization | `aawm_alias_routing/responses_finalize.py` |
 | Shared retry attempt sequencing and cooldown waits | `aawm_alias_routing/retry.py` |
 | Shared alias candidate retry loop and R3-1 single-flight cooldown publication | `aawm_alias_routing/candidate_loop.py` |
+| Request-wide OpenAI logical-call budget, send ordinals, active-response closure, and safe send telemetry | `aawm_adapter_runtime/provider_call_ledger.py`, integrated by `pass_through_endpoints.py` and `aawm_alias_routing/candidate_loop.py` |
 | Typed alias-route seam contracts (`AliasRouteServices`, cooldown publication plan) | `aawm_alias_routing/interfaces.py` |
 | Structured task-state source selection | `aawm_alias_routing/task_state.py` |
 | Snapshot ordering, distribution strategy, TUI/schedule gates, selection-context memoization, alias-candidate getters | `aawm_alias_routing/snapshot_select.py` |

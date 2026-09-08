@@ -41,6 +41,7 @@ _OPENAI_CAPACITY_SUCCESS_POLL_SECONDS = 1.0
 _OPENAI_CAPACITY_RETRY_STATE_KEY = "aawm_openai_capacity_retry"
 _LOCAL_CAPACITY_WAKEUP_EVENTS: dict[tuple[str, str], set[asyncio.Event]] = {}
 _CLIENT_DISCONNECT_POLL_SECONDS = 0.25
+_UNVALIDATED_RETRY_ACCOUNT_KEY = "__unvalidated__"
 _T = TypeVar("_T")
 
 
@@ -181,6 +182,20 @@ def _build_openai_capacity_success_redis_key(
 def _hash_target_identity(target_identity: str) -> str:
     """Short hash for log-safe target identification."""
     return hashlib.sha256(target_identity.encode()).hexdigest()[:12]
+
+
+def _validated_retry_account_key(
+    account_context: Optional[dict[str, Any]],
+) -> str:
+    """Return a stable account bucket only from validated public identity."""
+
+    if not isinstance(account_context, dict):
+        return _UNVALIDATED_RETRY_ACCOUNT_KEY
+    account_hash = str(account_context.get("account_hash") or "").strip()
+    lane_key = str(account_context.get("lane_key") or "").strip()
+    if not account_hash or not lane_key:
+        return _UNVALIDATED_RETRY_ACCOUNT_KEY
+    return f"{account_hash}:{lane_key}"
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +493,7 @@ class OpenAIAlphaCapacityRetryCoordinator:
         target_identity: str,
         budget: Optional[OpenAIAlphaCapacityRetryBudget] = None,
         namespace: Optional[str] = None,
+        account_context: Optional[dict[str, Any]] = None,
     ):
         self._target_identity = target_identity
         self._target_hash = _hash_target_identity(target_identity)
@@ -489,10 +505,12 @@ class OpenAIAlphaCapacityRetryCoordinator:
         )
         self._start_monotonic = time.monotonic()
         self._retry_count = 0
+        self._retry_counts_by_account: dict[str, int] = {}
+        self._pending_wait_seconds_by_account: dict[str, float] = {}
+        self._active_account_key = _validated_retry_account_key(account_context)
         self._terminal_reason: str = ""
         self._last_error_class: Optional[str] = None
         self._last_status_code: Optional[int] = None
-        self._pending_wait_seconds: Optional[float] = None
         self._redis_cache = _resolve_redis_for_capacity_wakeup()
         self._redis_key = (
             _build_openai_capacity_success_redis_key(target_identity, self._namespace)
@@ -516,8 +534,11 @@ class OpenAIAlphaCapacityRetryCoordinator:
         *,
         target_identity: str,
         namespace: Optional[str] = None,
+        account_context: Optional[dict[str, Any]] = None,
     ) -> None:
         """Update target-scoped wakeup state without resetting request state."""
+        if account_context is not None:
+            self._active_account_key = _validated_retry_account_key(account_context)
         resolved_namespace = (
             self._namespace
             if namespace is None
@@ -576,6 +597,10 @@ class OpenAIAlphaCapacityRetryCoordinator:
 
     @property
     def retry_count(self) -> int:
+        return self._retry_counts_by_account.get(self._active_account_key, 0)
+
+    @property
+    def total_retry_count(self) -> int:
         return self._retry_count
 
     @property
@@ -584,7 +609,7 @@ class OpenAIAlphaCapacityRetryCoordinator:
 
     def next_wait_seconds(self) -> float:
         """Return the wait for the next retry attempt."""
-        return openai_alpha_capacity_retry_wait_seconds(self._retry_count)
+        return openai_alpha_capacity_retry_wait_seconds(self.retry_count)
 
     def within_deadline(self) -> bool:
         return openai_alpha_capacity_retry_within_deadline(
@@ -735,12 +760,14 @@ class OpenAIAlphaCapacityRetryCoordinator:
             error_class=error_class,
             status_code=status_code,
         )
-        self._pending_wait_seconds = wait_seconds
+        self._pending_wait_seconds_by_account[self._active_account_key] = (
+            wait_seconds
+        )
         _emit_capacity_retry_log(
             CapacityRetryLogEntry(
                 target_class=self._target_class,
                 target_hash=self._target_hash,
-                retry_ordinal=self._retry_count,
+                retry_ordinal=self.retry_count,
                 wait_seconds=wait_seconds,
                 elapsed_seconds=self.elapsed_seconds,
                 deadline_seconds=self.deadline_seconds,
@@ -767,14 +794,14 @@ class OpenAIAlphaCapacityRetryCoordinator:
             error_class=error_class,
             status_code=status_code,
         )
-        ordinal = self._retry_count
-        wait_seconds = (
-            self._pending_wait_seconds
-            if self._pending_wait_seconds is not None
-            else self.next_wait_seconds()
+        account_key = self._active_account_key
+        ordinal = self._retry_counts_by_account.get(account_key, 0)
+        wait_seconds = self._pending_wait_seconds_by_account.pop(
+            account_key,
+            self.next_wait_seconds(),
         )
-        self._pending_wait_seconds = None
         self._retry_count += 1
+        self._retry_counts_by_account[account_key] = ordinal + 1
 
         _emit_capacity_retry_log(
             CapacityRetryLogEntry(
@@ -837,6 +864,7 @@ def get_or_create_openai_alpha_capacity_retry_coordinator(
     target_identity: str,
     namespace: str = "default",
     budget: Optional[OpenAIAlphaCapacityRetryBudget] = None,
+    account_context: Optional[dict[str, Any]] = None,
 ) -> OpenAIAlphaCapacityRetryCoordinator:
     """Return the one capacity retry coordinator carried by *request*."""
     coordinator = getattr(
@@ -849,11 +877,13 @@ def get_or_create_openai_alpha_capacity_retry_coordinator(
             target_identity=target_identity,
             budget=budget,
             namespace=namespace,
+            account_context=account_context,
         )
         setattr(request.state, _OPENAI_CAPACITY_RETRY_STATE_KEY, coordinator)
     else:
         coordinator.rebind_target(
             target_identity=target_identity,
             namespace=namespace,
+            account_context=account_context,
         )
     return coordinator
