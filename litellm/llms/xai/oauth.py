@@ -10,6 +10,7 @@ This module keeps private-mode credential writes for Hermes migration only.
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -70,6 +71,10 @@ _XAI_UNSUPPORTED_INPUT_ITEM_TYPES = frozenset(
 )
 
 _refresh_locks: Dict[str, asyncio.Lock] = {}
+_xai_oauth_request_identity_context: ContextVar[Optional[str]] = ContextVar(
+    "xai_oauth_request_identity",
+    default=None,
+)
 
 
 def _write_private_file_text(path: Path, content: str, *, mode: int = 0o600) -> None:
@@ -172,6 +177,9 @@ async def prepare_oa_xai_request(data: Dict[str, Any]) -> bool:
     upstream_model = resolve_oa_xai_upstream_model(public_model)
     data["model"] = upstream_model
     data["api_base"] = get_secret_str("LITELLM_XAI_OAUTH_API_BASE") or XAI_API_BASE
+    # Clear a prior value so patched callers of the public accessor do not
+    # inherit identity metadata from an earlier request in this context.
+    _xai_oauth_request_identity_context.set(None)
     data["api_key"] = await get_xai_oauth_access_token()
     request_credential_identity = _get_xai_oauth_request_identity()
     data["custom_llm_provider"] = "xai"
@@ -334,25 +342,9 @@ async def get_xai_oauth_access_token() -> str:
 
 
 def _get_xai_oauth_request_identity() -> Optional[str]:
-    """Read the same managed record identity used by sidecar evidence."""
+    """Return identity captured by the public token accessor's read."""
 
-    try:
-        resolution = resolve_xai_oauth_credentials(value_getter=get_secret_str)
-        if resolution.auth_file_source == "default":
-            return None
-        credential = _select_credential_record(
-            _read_credential_payload(resolution.auth_file),
-            resolution.scope,
-        )
-        return credential_identity(
-            resolution.auth_file,
-            credential,
-            scope=resolution.scope,
-        )
-    except (OSError, TypeError, ValueError):
-        # Token access remains authoritative; metadata must not turn a
-        # successful request into a failure during an atomic sidecar update.
-        return None
+    return _xai_oauth_request_identity_context.get()
 
 
 async def get_grok_native_oauth_access_token() -> str:
@@ -447,11 +439,36 @@ def _get_xai_oauth_access_token_read_only(
     credential_path: Path,
     scope: str,
 ) -> str:
+    token, request_identity = _get_xai_oauth_access_token_snapshot(
+        credential_path=credential_path,
+        scope=scope,
+    )
+    _xai_oauth_request_identity_context.set(request_identity)
+    return token
+
+
+def _get_xai_oauth_access_token_snapshot(
+    *,
+    credential_path: Path,
+    scope: str,
+) -> tuple[str, Optional[str]]:
+    """Read one selected credential record for both token and identity."""
+
     raw_payload = _read_credential_payload(credential_path)
     credential = _select_credential_record(raw_payload, scope)
     token = _credential_access_token(credential)
     if token and not _credential_needs_refresh(credential):
-        return token
+        try:
+            request_identity = credential_identity(
+                credential_path,
+                credential,
+                scope=scope,
+            )
+        except (OSError, TypeError, ValueError):
+            # Token access remains authoritative; metadata must not turn a
+            # successful request into a failure during an atomic sidecar update.
+            request_identity = None
+        return token, request_identity
     if not token:
         raise _xai_oauth_refresh_required_error(missing_token=True)
     raise _xai_oauth_refresh_required_error(missing_token=False)

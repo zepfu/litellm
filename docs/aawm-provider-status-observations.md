@@ -112,8 +112,7 @@ Managed xAI request, refresh, health, and status consumers share the same
 auth-file and scope resolver. The sidecar records source labels and a
 nonsecret credential-generation identity, but never records the canonical
 filesystem path or token contents. Conflicting configured paths or scopes fail
-closed before any credential or provider I/O; a custom auth file gets its
-canonical sibling lock unless a validated lock override is supplied.
+closed before any credential or provider I/O.
 
 Relevant environment variables:
 
