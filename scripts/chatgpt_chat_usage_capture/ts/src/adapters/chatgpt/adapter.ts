@@ -525,6 +525,7 @@ export function adaptConversationDetail(
   const page = adaptMessagePage(payload, {
     conversationId,
     conversationSurface: surface,
+    detailRoute: options.detailRoute ?? "modern",
   });
   const warnings = [...page.warnings];
   const updatedAt = conversationUpdateTime(payload, warnings);
@@ -547,9 +548,17 @@ export function adaptConversationDetail(
 
 export function adaptMessagePage(
   payload: Record<string, unknown>,
-  options: { conversationId: string; conversationSurface?: Surface },
+  options: {
+    conversationId: string;
+    conversationSurface?: Surface;
+    detailRoute?: "modern" | "legacy";
+  },
 ): AdaptedPage<MessageRecord> {
-  const { conversationId, conversationSurface = "unknown" } = options;
+  const {
+    conversationId,
+    conversationSurface = "unknown",
+    detailRoute = "modern",
+  } = options;
   const warnings: string[] = [];
   const records: MessageRecord[] = [];
   const hasMapping = isRecord(payload.mapping);
@@ -603,6 +612,17 @@ export function adaptMessagePage(
   }
 
   if (hasMapping && !hasMessages && !("page_info" in payload)) {
+    if (detailRoute === "legacy") {
+      return {
+        items: records,
+        continuation: null,
+        exhausted: true,
+        paginationState: "complete",
+        schemaVersion: ADAPTER_VERSION,
+        coverage: warnings.length > 0 ? "partial" : "validated_page",
+        warnings,
+      };
+    }
     warnings.push("missing_pagination_controls");
     return {
       items: records,
@@ -796,7 +816,13 @@ function messageFromNode(
     surface: conversationSurface,
     origin:
       sanitizeToken(metadata.origin) ??
-      (metadata.from_shared === true ? "shared" : null),
+      (metadata.imported === true
+        ? "imported"
+        : metadata.from_copy === true
+          ? "copied"
+          : metadata.from_shared === true
+            ? "shared"
+            : null),
     metadata,
   };
 }
@@ -823,12 +849,10 @@ export function raiseIfHttpError(
   payload: Record<string, unknown>,
   path: string,
 ): void {
+  raiseIfAuthenticationRequired(payload, path);
   const status = httpStatus(payload, path);
   if (status >= 200 && status < 300) {
     return;
-  }
-  if (status === 401 || status === 403) {
-    raiseIfAuthenticationRequired(payload, path);
   }
   if (status === 429) {
     raiseIfRateLimited(payload, path);

@@ -63,6 +63,13 @@ total evidence as exhaustion. HTTP 200 HTML authentication challenges are
 classified as authentication-required before generic adapter handling. The
 capability record is versioned with `chatgpt-chat-history-v1`.
 
+Legacy mapping-only detail responses are an established terminal shape and are
+complete only when reached through the capability-approved legacy route.
+Modern mapping-only responses without `page_info` remain partial/unknown with
+no continuation, so they cannot be mistaken for complete history. Message
+metadata flags `imported` and `from_copy` project to `imported` and `copied`
+origins, respectively, and remain excluded from ordinary Chat accounting.
+
 ### Identity
 
 `src/normalize/identity.ts` requires all three configured bindings:
