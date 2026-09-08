@@ -3651,9 +3651,13 @@ def collect_conversation_init_snapshot(  # noqa: PLR0915 - collector state
         else None
     )
     summary["native_capture_error"] = sanitized.get("native_capture_error")
-    writable = _snapshot_is_persistable(sanitized)
+    persistability_failure_reason = _snapshot_persistability_failure_reason(
+        sanitized
+    )
+    writable = persistability_failure_reason is None
     reusable = _destination_has_reusable_snapshot(source_path)
     if not writable:
+        summary["failure_reason"] = persistability_failure_reason
         summary["telemetry_status"] = _failure_telemetry_status(sanitized)
         summary["telemetry_class"] = _failure_telemetry_class(sanitized)
         summary["last_good_state_retained"] = reusable
@@ -3662,6 +3666,7 @@ def collect_conversation_init_snapshot(  # noqa: PLR0915 - collector state
     try:
         write_conversation_init_snapshot(source_path, sanitized)
     except ChatGPTConversationInitError as exc:
+        summary["failure_reason"] = "snapshot_write_failed"
         summary["telemetry_class"] = exc.telemetry_class
         summary["last_good_state_retained"] = True
         return summary
@@ -3919,17 +3924,17 @@ def _collect_bound_conversation_init_snapshot(  # noqa: PLR0915 - bound state
         "account_identity_verification_source"
     ]
     summary["live_authenticated_oracle_browser"] = True
-    writable = _snapshot_is_persistable(
+    persistability_failure_reason = _snapshot_persistability_failure_reason(
         sanitized,
         expected_account_hash=expected_account_hash,
         require_verified_identity=True,
     )
-    if not writable:
+    if persistability_failure_reason is not None:
         return _bound_capture_failure(
             summary,
             source_path=source_path,
             expected_account_hash=expected_account_hash,
-            error="current_snapshot_not_persistable",
+            error=persistability_failure_reason,
             telemetry_status=_failure_telemetry_status(sanitized),
             telemetry_class=_failure_telemetry_class(sanitized),
             reusable=reusable,
