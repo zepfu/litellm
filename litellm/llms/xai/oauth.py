@@ -14,7 +14,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Mapping, MutableMapping, Optional
+from typing import Any, Dict, Mapping, MutableMapping, Optional, Tuple
 
 import httpx  # noqa: F401  # harness patch surface; refresh path removed (RR-040)
 
@@ -31,6 +31,10 @@ from litellm.secret_managers.grok_oidc_auth_path import (
 )
 from litellm.secret_managers.main import get_secret_str
 from litellm.secret_managers.xai_oauth_credentials import (
+    DEFAULT_XAI_OAUTH_AUTH_FILE,
+    DEFAULT_XAI_OAUTH_SCOPE,
+    XaiOAuthCredentialResolution,
+    resolve_xai_oauth_credentials,
     select_xai_oauth_credential_record,
 )
 
@@ -46,12 +50,12 @@ GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY = (
 )
 GROK_NATIVE_OAUTH_CLIENT_NAME = "grok-build"
 
-_DEFAULT_XAI_OAUTH_SCOPE = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
+_DEFAULT_XAI_OAUTH_SCOPE = DEFAULT_XAI_OAUTH_SCOPE
 _DEFAULT_XAI_OAUTH_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
 _DEFAULT_REFRESH_BUFFER_SECONDS = 300
 _DEFAULT_HERMES_XAI_OAUTH_PROVIDER_ID = "xai-oauth"
 _DEFAULT_HERMES_AUTH_PATH = "~/.hermes/auth.json"
-_DEFAULT_LITELLM_XAI_OAUTH_AUTH_PATH = "~/.litellm/xai/oauth-auth.json"
+_DEFAULT_LITELLM_XAI_OAUTH_AUTH_PATH = DEFAULT_XAI_OAUTH_AUTH_FILE
 
 _XAI_RESPONSES_PREVIOUS_RESPONSE_ID_DECODED_METADATA = {
     "xai_responses_previous_response_id_decoded": True,
@@ -166,7 +170,10 @@ async def prepare_oa_xai_request(data: Dict[str, Any]) -> bool:
     upstream_model = resolve_oa_xai_upstream_model(public_model)
     data["model"] = upstream_model
     data["api_base"] = get_secret_str("LITELLM_XAI_OAUTH_API_BASE") or XAI_API_BASE
-    data["api_key"] = await get_xai_oauth_access_token()
+    access_token, credential_resolution = (
+        await _get_xai_oauth_access_token_with_resolution()
+    )
+    data["api_key"] = access_token
     data["custom_llm_provider"] = "xai"
     decoded_previous_response_id = _decode_previous_response_id_in_place(data)
     removed_input_items = _drop_xai_unsupported_input_items_in_place(data)
@@ -182,6 +189,15 @@ async def prepare_oa_xai_request(data: Dict[str, Any]) -> bool:
     _merge_metadata(
         litellm_metadata,
         build_oa_xai_metadata(public_model, upstream_model),
+        authoritative=True,
+    )
+    _merge_metadata(
+        litellm_metadata,
+        {
+            "credential_identity": credential_resolution.credential_identity,
+            "auth_file_source": credential_resolution.auth_file_source,
+            "scope_source": credential_resolution.scope_source,
+        },
         authoritative=True,
     )
     if decoded_previous_response_id:
@@ -298,23 +314,36 @@ def _merge_metadata(
 
 
 async def get_xai_oauth_access_token() -> str:
-    credential_path = get_secret_str("LITELLM_XAI_OAUTH_AUTH_FILE")
-    if not credential_path:
+    access_token, _resolution = await _get_xai_oauth_access_token_with_resolution()
+    return access_token
+
+
+async def _get_xai_oauth_access_token_with_resolution(
+) -> Tuple[str, XaiOAuthCredentialResolution]:
+    """Read one managed credential and return its immutable file/scope binding."""
+
+    resolution = resolve_xai_oauth_credentials(value_getter=get_secret_str)
+    if resolution.auth_file_source == "default":
         raise ValueError(
-            "xAI OAuth-managed models require LITELLM_XAI_OAUTH_AUTH_FILE to "
-            "point at the sidecar-maintained xAI OAuth credential file. Run "
-            "the provider-status sidecar xAI OAuth refresh or reseed/relogin "
-            "the managed credential before calling oa_xai/*."
+            "xAI OAuth-managed models require an explicit managed auth-file "
+            "configuration (AAWM_XAI_OAUTH_AUTH_FILE or "
+            "LITELLM_XAI_OAUTH_AUTH_FILE) pointing at the sidecar-maintained "
+            "xAI OAuth credential file. Run the provider-status sidecar xAI "
+            "OAuth refresh or reseed/relogin the managed credential before "
+            "calling oa_xai/*."
         )
 
-    scope = get_secret_str("LITELLM_XAI_OAUTH_SCOPE") or _DEFAULT_XAI_OAUTH_SCOPE
-    lock_key = f"xai-oauth-read:{credential_path}:{scope}"
+    lock_key = (
+        f"xai-oauth-read:{resolution.canonical_auth_file}:"
+        f"{resolution.scope}"
+    )
     lock = _refresh_locks.setdefault(lock_key, asyncio.Lock())
     async with lock:
-        return _get_xai_oauth_access_token_read_only(
-            credential_path=Path(credential_path),
-            scope=scope,
+        access_token = _get_xai_oauth_access_token_read_only(
+            credential_path=resolution.canonical_auth_file,
+            scope=resolution.scope,
         )
+    return access_token, resolution
 
 
 async def get_grok_native_oauth_access_token() -> str:
