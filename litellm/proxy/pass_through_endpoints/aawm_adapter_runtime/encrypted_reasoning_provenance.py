@@ -776,15 +776,37 @@ def _strip_route_identity_node(value: Any, *, _depth: int) -> tuple[Any, bool]:
 
 def strip_route_identity_from_request_body(
     request_body: Mapping[str, Any] | dict[str, Any] | None,
+    *,
+    protocol_owned_only: bool = False,
 ) -> Any:
     """Drop outbound ``aawm_route_identity`` before provider send.
 
     OpenAI and xAI reject unknown item fields such as
     ``input[N].aawm_route_identity``. Identity is client-facing only.
+    ``protocol_owned_only`` preserves nested user/tool values and strips only
+    the request envelope and top-level ``input``/``output`` item envelopes.
     """
 
     if not isinstance(request_body, dict):
         return dict(request_body) if isinstance(request_body, Mapping) else {}
+    if protocol_owned_only:
+        stripped_body = dict(request_body)
+        stripped_body.pop(ROUTE_IDENTITY_FIELD, None)
+        for item_field in ("input", "output"):
+            items = request_body.get(item_field)
+            if not isinstance(items, list):
+                continue
+            stripped_body[item_field] = [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key != ROUTE_IDENTITY_FIELD
+                }
+                if isinstance(item, dict) and ROUTE_IDENTITY_FIELD in item
+                else item
+                for item in items
+            ]
+        return stripped_body
     stripped, changed = _strip_route_identity_node(request_body, _depth=0)
     return stripped if changed else request_body
 
@@ -845,16 +867,6 @@ def prepare_encrypted_reasoning_items_for_openai_egress(
             ),
         }
 
-    request_body = strip_route_identity_from_request_body(request_body)
-    if not isinstance(request_body, dict):
-        return request_body, {
-            "encrypted_reasoning_item_count": 0,
-            "encrypted_reasoning_disposition": "absent",
-            "encrypted_reasoning_compatibility_source": (
-                ENCRYPTED_REASONING_COMPATIBILITY_SOURCE
-            ),
-        }
-
     input_items = request_body.get("input")
     if not isinstance(input_items, list):
         return request_body, {
@@ -890,18 +902,6 @@ def prepare_encrypted_reasoning_items_for_openai_egress(
         if isinstance(encrypted, str) and original != encrypted:
             clean_item["encrypted_content"] = original
             changed = True
-        # Keep sidecar for local observability on the request object only when
-        # already present; do not invent ciphertext-bearing fields.
-        if provenance is not None and PROVENANCE_ITEM_FIELD not in clean_item:
-            clean_item[PROVENANCE_ITEM_FIELD] = dict(provenance)
-            changed = True
-
-        # OpenAI rejects unknown fields on reasoning items; strip sidecar before
-        # upstream send while retaining disposition from the extracted copy.
-        if PROVENANCE_ITEM_FIELD in clean_item:
-            clean_item.pop(PROVENANCE_ITEM_FIELD, None)
-            changed = True
-
         normalized_input.append(clean_item)
 
         family = (
@@ -1320,10 +1320,6 @@ def prepare_encrypted_function_output_items_for_openai_egress(
             else encrypted
         )
         clean_item = dict(item)
-        if PROVENANCE_ITEM_FIELD in clean_item:
-            clean_item.pop(PROVENANCE_ITEM_FIELD, None)
-            item.pop(PROVENANCE_ITEM_FIELD, None)
-            changed = True
 
         has_plaintext = _function_call_output_has_plaintext(clean_item)
         should_strip_nested = has_plaintext or strip_ciphertext_without_plaintext
@@ -1528,7 +1524,7 @@ def guard_openai_encrypted_reasoning_egress(
     prior-owner source; this layer fail-closes without one.
     """
     prepared, disposition = prepare_encrypted_reasoning_items_for_openai_egress(
-        request_body if isinstance(request_body, dict) else dict(request_body or {})
+        request_body if isinstance(request_body, dict) else dict(request_body or {}),
     )
     prepared = restore_codex_agent_message_payloads_for_openai_egress(prepared)
     prepared, function_output_disposition = (

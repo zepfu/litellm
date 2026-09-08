@@ -5,6 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from litellm.llms.xai.route_descriptors import (
+    GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+    GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     adapter_config,
     adapter_driver,
@@ -108,8 +112,8 @@ async def prepare_responses_route(
         perform_kwargs={
             "forward_headers": False,
             "custom_llm_provider": runtime.provider,
-            "egress_credential_family": "xai",
-            "expected_target_family": "xai",
+            "egress_credential_family": GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+            "expected_target_family": GROK_NATIVE_OAUTH_ROUTE_FAMILY,
         },
         handle_exception=handle_exception,
     )

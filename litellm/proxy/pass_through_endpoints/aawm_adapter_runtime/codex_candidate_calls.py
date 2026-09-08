@@ -20,6 +20,12 @@ from dataclasses import dataclass
 from types import FunctionType
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
+from litellm.llms.xai.route_descriptors import (
+    GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+    GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+    XAI_OAUTH_CREDENTIAL_FAMILY,
+    XAI_OAUTH_ROUTE_FAMILY,
+)
 from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
     load_text_watermark_config,
 )
@@ -1040,6 +1046,7 @@ def _maybe_wrap_xai_passthrough_responses_stream(
     request_body: dict[str, Any],
     route_family: str,
     resolved_model: Any = None,
+    egress_credential_family: str = XAI_OAUTH_CREDENTIAL_FAMILY,
 ) -> Response:
     """Live-forward CFG-025 wrap for xAI alias Responses SSE."""
     from fastapi.responses import StreamingResponse
@@ -1057,7 +1064,7 @@ def _maybe_wrap_xai_passthrough_responses_stream(
         ingress_path=str(getattr(getattr(request, "url", None), "path", "") or ""),
         method=str(getattr(request, "method", None) or "POST"),
         custom_llm_provider=litellm.LlmProviders.XAI.value,
-        egress_credential_family="xai",
+        egress_credential_family=egress_credential_family,
         route_family=route_family,
         resolved_model=resolved_model,
         request_body=request_body,
@@ -1172,19 +1179,24 @@ async def _perform_codex_auto_agent_alias_candidate_request(
     _bind_codex_oauth_candidate_to_request(request, candidate)
     bind_xai_oauth_candidate_to_request(request, candidate)
     if isinstance(candidate_body, dict):
-        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
-            strip_route_identity_from_request_body,
-        )
+        # Native OpenAI candidates are compiled below. Other adapter routes
+        # still need the protocol-owned sidecar removal before their provider
+        # translators run, but must not recursively inspect user/tool data.
+        if str(candidate.get("provider") or "").strip().lower() != "openai":
+            from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_body import (
+                sanitize_wire_envelope,
+            )
 
-        stripped_candidate_body = strip_route_identity_from_request_body(
-            candidate_body
-        )
-        if (
-            stripped_candidate_body is not candidate_body
-            and isinstance(stripped_candidate_body, dict)
-        ):
-            candidate_body.clear()
-            candidate_body.update(stripped_candidate_body)
+            sanitized_candidate_body, _ = sanitize_wire_envelope(
+                candidate_body,
+                preserve_top_level_keys=("litellm_metadata",),
+            )
+            if (
+                sanitized_candidate_body is not candidate_body
+                and isinstance(sanitized_candidate_body, dict)
+            ):
+                candidate_body.clear()
+                candidate_body.update(sanitized_candidate_body)
     adapter_model = candidate["model"]
     cohere_provider = globals().get("_CODEX_AUTO_AGENT_COHERE_PROVIDER", "cohere")
     zai_coding_plan_provider = globals().get(
@@ -4787,37 +4799,12 @@ async def _perform_codex_auto_agent_native_openai_request(
     request_body: dict[str, Any],
     custom_headers: Optional[dict[str, str]] = None,
 ) -> Response:
-    # OPENAI-007: legacy history may collapse provider tool ids into item id.
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.direct_openai_function_call_history import (
-        normalize_direct_openai_legacy_function_call_history_ids,
-    )
-
-    request_body = normalize_direct_openai_legacy_function_call_history_ids(
-        request_body
-    )
-    # Ingress drop keys off the caller/alias model id. Alias names such as
-    # ``work`` / ``expert`` / ``sota`` are not cost-map keys, so Ohmypi
-    # ``max_output_tokens`` survives until this resolved Codex candidate.
-    (
-        request_body,
-        _codex_unsupported_request_params,
-    ) = _drop_unsupported_codex_request_params_from_request_body(request_body)
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
-        guard_openai_encrypted_reasoning_egress,
-    )
-
-    request_body, _encrypted_reasoning_disposition = (
-        guard_openai_encrypted_reasoning_egress(
-            request_body,
-            url=target_url,
-        )
-    )
-    request_body = {
-        **request_body,
-        "store": False,
-        "stream": True,
-    }
-    is_streaming_request = bool(request_body.get("stream"))
+    # Managed Codex Responses egress is always streamed and unpersisted,
+    # including nested alias candidates that bypass direct-route shaping.
+    request_body = dict(request_body)
+    request_body["stream"] = True
+    request_body["store"] = False
+    is_streaming_request = True
     # The candidate loop attaches this coordinator only for eligible alpha
     # OpenAI capacity-retry requests. Preserve stock hidden transport retries
     # for every native OpenAI request without that shared owner.
@@ -4950,8 +4937,8 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
             stream=bool(grok_prepared_body.get("stream")),
             custom_body=grok_prepared_body,
             custom_llm_provider=litellm.LlmProviders.XAI.value,
-            egress_credential_family="xai",
-            expected_target_family="xai",
+            egress_credential_family=GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+            expected_target_family=GROK_NATIVE_OAUTH_ROUTE_FAMILY,
             retryable_upstream_status_codes=[
                 429,
                 *_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES,
@@ -4969,6 +4956,7 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
         request_body=canonical_request_body,
         route_family="codex_auto_agent_grok_native_responses",
         resolved_model=grok_prepared_body.get("model") or request_body.get("model"),
+        egress_credential_family=GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
     )
     validated_response = await _validate_codex_auto_agent_responses_payload(
         response,
@@ -5048,8 +5036,8 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             stream=bool(oa_xai_prepared_body.get("stream")),
             custom_body=oa_xai_prepared_body,
             custom_llm_provider=litellm.LlmProviders.XAI.value,
-            egress_credential_family="xai",
-            expected_target_family="xai",
+            egress_credential_family=XAI_OAUTH_CREDENTIAL_FAMILY,
+            expected_target_family=XAI_OAUTH_ROUTE_FAMILY,
             managed_xai_oauth_request=True,
             blocked_pass_through_prefixed_headers=[
                 "authorization",
@@ -5074,6 +5062,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         route_family="codex_auto_agent_xai_oauth_responses",
         resolved_model=oa_xai_prepared_body.get("model")
         or canonical_request_body.get("model"),
+        egress_credential_family=XAI_OAUTH_CREDENTIAL_FAMILY,
     )
     validated_response = await _validate_codex_auto_agent_responses_payload(
         response,
@@ -6074,6 +6063,27 @@ async def _perform_codex_zai_coding_plan_adapter_call(
 
     _ = config
     _annotate_request_scope_for_adapted_access_log(request, httpx.URL(str(target_url)))
+    _watermark_intake = None
+    try:
+        _watermark_intake = getattr(
+            getattr(request, "state", None), "watermark_intake", None
+        )
+    except Exception:
+        _watermark_intake = None
+    _watermark_metadata = (
+        litellm_metadata if isinstance(litellm_metadata, dict) else {}
+    )
+    _watermark_egress = apply_request_watermark_egress(
+        body=completion_kwargs,
+        intake=_watermark_intake,
+        config=_get_runtime_text_watermark_config(),
+        endpoint=_watermark_endpoint_from_path("chat/completions", target_url),
+        direction="request",
+        metadata=_watermark_metadata,
+        litellm_metadata=_watermark_metadata,
+    )
+    if isinstance(getattr(_watermark_egress, "body", None), dict):
+        completion_kwargs = _watermark_egress.body
     completion_response = await litellm.acompletion(
         **completion_kwargs,
         api_key=api_key,
@@ -7250,6 +7260,18 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
         "api_base": "https://inference-api.nousresearch.com/v1",
         "litellm_metadata": litellm_metadata,
     }
+    _watermark_metadata = litellm_metadata if isinstance(litellm_metadata, dict) else {}
+    _watermark_egress = apply_request_watermark_egress(
+        body=completion_call_kwargs,
+        intake=getattr(getattr(request, "state", None), "watermark_intake", None),
+        config=_get_runtime_text_watermark_config(),
+        endpoint=_watermark_endpoint_from_path("chat/completions", target_url),
+        direction="request",
+        metadata=_watermark_metadata,
+        litellm_metadata=_watermark_metadata,
+    )
+    if isinstance(getattr(_watermark_egress, "body", None), dict):
+        completion_call_kwargs = _watermark_egress.body
     try:
         completion_response = await litellm.acompletion(**completion_call_kwargs)
     except Exception as exc:
@@ -7329,16 +7351,19 @@ async def _perform_codex_auto_agent_openrouter_completion_request(  # noqa: PLR0
         )
 
     if isinstance(request_body, dict):
-        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
-            strip_route_identity_from_request_body,
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_body import (
+            sanitize_wire_envelope,
         )
 
-        stripped_request_body = strip_route_identity_from_request_body(request_body)
-        if stripped_request_body is not request_body and isinstance(
-            stripped_request_body, dict
+        sanitized_request_body, _ = sanitize_wire_envelope(
+            request_body,
+            preserve_top_level_keys=("litellm_metadata",),
+        )
+        if sanitized_request_body is not request_body and isinstance(
+            sanitized_request_body, dict
         ):
             request_body.clear()
-            request_body.update(stripped_request_body)
+            request_body.update(sanitized_request_body)
     requested_model = request_body.get("model")
     upstream_adapter_model = _get_openrouter_completion_adapter_upstream_model(adapter_model) or adapter_model
     route_family = "codex_openrouter_completion_adapter"

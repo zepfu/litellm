@@ -41332,7 +41332,8 @@
         "provider_specific_entry": {
             "xai": {
                 "capabilities": [
-                    "native_grok_continuation_retry"
+                    "native_grok_continuation_retry",
+                    "native_responses_tool_history"
                 ]
             }
         },

@@ -6,6 +6,10 @@ import inspect
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, NoReturn, Optional, Protocol
 
+from litellm.llms.xai.route_descriptors import (
+    XAI_OAUTH_CREDENTIAL_FAMILY,
+    XAI_OAUTH_ROUTE_FAMILY,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     adapter_config,
     adapter_driver,
@@ -163,8 +167,8 @@ async def prepare_responses_route(
         perform_kwargs={
             "forward_headers": False,
             "custom_llm_provider": runtime.provider,
-            "egress_credential_family": "xai",
-            "expected_target_family": "xai",
+            "egress_credential_family": XAI_OAUTH_CREDENTIAL_FAMILY,
+            "expected_target_family": XAI_OAUTH_ROUTE_FAMILY,
             "managed_xai_oauth_request": True,
             "blocked_pass_through_prefixed_headers": [
                 "authorization",

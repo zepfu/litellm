@@ -49,6 +49,9 @@ WRAPPED_STREAM_ATTR = "_aawm_repetitive_output_guard_wrapped"
 OUTPUT_GUARD_CONTEXT_ATTR = "_aawm_output_guard_request_context"
 _STREAM_CLEANUP_ATTR = "_aawm_streaming_response_cleanup"
 _STREAM_CLEANUP_CALLBACKS_ATTR = "_aawm_stream_cleanup_callbacks"
+# Kept local to avoid importing the alias streaming module back into this
+# module while preserving an already-bound provider-neutral terminalizer.
+_STREAM_TIMEOUT_TERMINALIZER_ATTR = "_aawm_stream_timeout_terminalizer"
 
 
 def _event_type(event: Any) -> str:
@@ -568,6 +571,41 @@ def _flatten_stream_cleanups(*cleanups: Any) -> list[Callable[[], Any]]:
     return callbacks
 
 
+def _headers_without_content_length(headers: Any) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in dict(headers or {}).items()
+        if str(key).lower() != "content-length"
+    }
+
+
+def _strip_content_length_header(response: Any) -> None:
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return
+    keys = list(headers)
+    for key in keys:
+        if str(key).lower() != "content-length":
+            continue
+        try:
+            del headers[key]
+        except (KeyError, TypeError):
+            pass
+
+
+def _inherit_stream_lifecycle(response: Any, source_response: Any) -> None:
+    if source_response is None:
+        return
+    if getattr(response, "background", None) is None:
+        background = getattr(source_response, "background", None)
+        if background is not None:
+            response.background = background
+    if getattr(response, _STREAM_TIMEOUT_TERMINALIZER_ATTR, None) is None:
+        terminalizer = getattr(source_response, _STREAM_TIMEOUT_TERMINALIZER_ATTR, None)
+        if terminalizer is not None:
+            setattr(response, _STREAM_TIMEOUT_TERMINALIZER_ATTR, terminalizer)
+
+
 def _terminal_metadata(
     *,
     match: VisibleTextRepetitionMatch,
@@ -930,6 +968,8 @@ def inherit_or_wrap_passthrough_streaming_response(
     inherit_deferred_success_holder(response, source_response=source_response)
     if not isinstance(response, StreamingResponse):
         return response
+    _inherit_stream_lifecycle(response, source_response)
+    _strip_content_length_header(response)
     inherited_cleanup = _compose_stream_cleanups(
         getattr(response, _STREAM_CLEANUP_ATTR, None),
         getattr(source_response, _STREAM_CLEANUP_ATTR, None),
@@ -973,12 +1013,14 @@ def inherit_or_wrap_passthrough_streaming_response(
         )
     guarded = StreamingResponse(
         wrapped_iter,
-        headers=dict(response.headers),
+        headers=_headers_without_content_length(response.headers),
         status_code=response.status_code,
         media_type=response.media_type or "text/event-stream",
+        background=getattr(response, "background", None),
     )
     if inherited_cleanup is not None:
         setattr(guarded, _STREAM_CLEANUP_ATTR, inherited_cleanup)
+    _inherit_stream_lifecycle(guarded, response)
     inherit_deferred_success_holder(guarded, source_response=response)
     return bind_output_guard_to_streaming_response(
         guarded,
