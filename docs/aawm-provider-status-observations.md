@@ -990,10 +990,12 @@ explicitly invoke `PgLedger.ensure_schema()` or apply
 The adapter accepts the versioned `chatgpt-chat-history-v1` transfer contract.
 Observation, attempt, provenance, coverage, and alias inputs are projected
 through fixed allowlists before any database write. The envelope preserves
-coverage/quarantine state and requested, recorded-final, and resolved raw model
-evidence separately; unknown fields are represented only by bounded structural
-counts. Secret-like values, content, titles, credentials, browser state, and
-unallowlisted metadata are rejected or dropped before persistence.
+coverage/quarantine state, requested, recorded-final, and resolved raw model
+evidence separately, and keeps bounded `items`, `messages`, and `mapping`
+collections after recursive content sanitization. Unknown fields are also
+represented by bounded structural counts and provenance. Secret-like values,
+content, titles, credentials, browser state, and unallowlisted metadata are
+rejected or dropped before persistence.
 
 Verified identities converge by
 provider/provider-user/workspace/quota-owner/surface; an unverified identity
@@ -1024,15 +1026,18 @@ evidence; count readers must keep them out of definite totals while exposing
 the retained uncertainty for reconciliation.
 
 `count_attempts(account, model_family=..., window_start=..., window_end=...)`
-uses one PostgreSQL statement snapshot, counts only non-tombstoned ordinary
-Chat attempts with generation evidence, and returns separate requested,
-recorded-final, and resolved raw-model/family maps. It does not count provider
-charges or capacity snapshots. Definite totals use exact timestamps or fully
-contained evidence intervals; crossing intervals and one-sided bounds are
-reported as `ambiguous` or `unknown_time`, never assigned to a window by
-fallback timestamp selection. The result also exposes excluded non-Chat/shared
-activity, unknown identity/surface/origin/model classes, uncertain outcomes,
-and observed model mismatches.
+uses one PostgreSQL statement snapshot, resolves retired scopes to the
+canonical scope owned by the active collector binding, counts only
+non-tombstoned ordinary Chat attempts with generation evidence, and returns
+separate requested, recorded-final, and resolved raw-model/family maps. It does
+not count provider charges or capacity snapshots. Definite totals use exact
+timestamps or fully contained evidence intervals; crossing intervals and
+one-sided bounds are reported as `ambiguous` or `unknown_time`, never assigned
+to a window by fallback timestamp selection. Unknown and excluded counters keep
+ambiguous or unknown-time activity but omit rows proven outside the window. The
+result also exposes excluded non-Chat/shared activity, unknown
+identity/surface/origin/model classes, uncertain outcomes, and observed model
+mismatches.
 
 These tables are independent of `rate_limit_observations`, which remains the
 capacity-only observation store. Source delivery requires separate operational

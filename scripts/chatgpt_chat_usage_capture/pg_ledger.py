@@ -17,9 +17,11 @@ from .privacy import (
     assert_no_secrets,
     classify_surface,
     sanitize_metadata,
+    sanitize_mapping,
     sanitize_token,
+    sanitize_value,
 )
-from .timeutil import ensure_utc, isoformat_utc
+from .timeutil import ensure_utc, isoformat_utc, parse_datetime
 
 
 MIGRATION_PATH = Path(__file__).resolve().parent.parent / "apply_chatgpt_usage_ledger_2026_09_08.sql"
@@ -42,7 +44,12 @@ PROVENANCE_ALLOWLIST = frozenset(
         "source_id",
         "source_kind",
         "surface",
+        "transfer_version",
         "transfer_schema_version",
+        "run_id",
+        "evidence_id",
+        "schema_fingerprint",
+        "unknown_fields",
         "warnings",
     }
 )
@@ -80,6 +87,7 @@ _ALLOWED_ALIAS_KINDS = frozenset(
 )
 _STRONG_ALIAS_KINDS = frozenset({"generation", "message", "branch"})
 _ALLOWED_GAP_STATES = frozenset({"open", "resolved", "unknown"})
+_ALLOWED_QUARANTINE_STATES = frozenset({"clear", "quarantined", "unknown"})
 _OBSERVATION_KEY_ALIASES = {
     "conversationId": "conversation_id",
     "messageId": "message_id",
@@ -100,12 +108,30 @@ _OBSERVATION_KEY_ALIASES = {
     "isStarred": "is_starred",
     "hasVersions": "has_versions",
     "hasPreviousPage": "has_previous_page",
+    "hasNextPage": "has_next_page",
     "startCursor": "start_cursor",
+    "endCursor": "end_cursor",
     "schemaVersion": "schema_version",
+    "schemaFingerprint": "schema_fingerprint",
     "errorType": "error_type",
     "errorCode": "error_code",
     "quarantineState": "quarantine_state",
-    "transferSchemaVersion": "transfer_schema_version",
+    "transferSchemaVersion": "transfer_version",
+    "transferVersion": "transfer_version",
+    "transfer_schema_version": "transfer_version",
+    "resolvedModel": "resolved_model",
+    "resolvedModelRaw": "resolved_model_raw",
+    "requestedModelRaw": "requested_model_raw",
+    "recordedFinalModelRaw": "recorded_final_model_raw",
+    "futureTimestampQuarantined": "future_timestamp_quarantined",
+    "quarantineTimestamp": "quarantine_timestamp",
+    "quarantineAt": "quarantine_at",
+    "quarantinedAt": "quarantined_at",
+    "quarantineWarning": "quarantine_warning",
+    "quarantineWarnings": "quarantine_warnings",
+    "quarantineReason": "quarantine_reason",
+    "evidenceId": "evidence_id",
+    "unknownFields": "unknown_fields",
 }
 _OBSERVATION_FIELDS = frozenset(
     {
@@ -115,13 +141,18 @@ _OBSERVATION_FIELDS = frozenset(
         "node_id",
         "parent",
         "parent_id",
+        "children",
         "current_node",
         "model_slug",
         "requested_model",
+        "requested_model_raw",
         "requested_model_slug",
         "requested_mode",
         "reasoning_effort",
         "default_model_slug",
+        "recorded_final_model_raw",
+        "resolved_model",
+        "resolved_model_raw",
         "generation_id",
         "request_id",
         "message_request_id",
@@ -140,10 +171,15 @@ _OBSERVATION_FIELDS = frozenset(
         "is_starred",
         "has_versions",
         "has_previous_page",
+        "has_next_page",
         "start_cursor",
+        "end_cursor",
         "offset",
         "limit",
         "total",
+        "items",
+        "messages",
+        "mapping",
         "page_info",
         "metadata",
         "author",
@@ -160,8 +196,19 @@ _OBSERVATION_FIELDS = frozenset(
         "error_code",
         "quarantine",
         "quarantine_state",
+        "future_timestamp_quarantined",
+        "quarantine_timestamp",
+        "quarantine_at",
+        "quarantined_at",
+        "quarantine_warning",
+        "quarantine_warnings",
+        "quarantine_reason",
         "warnings",
         "schema_fingerprint",
+        "unknown_fields",
+        "evidence_id",
+        "provenance",
+        "transfer_version",
         "transfer_schema_version",
     }
 )
@@ -173,13 +220,18 @@ _OBSERVATION_TOKEN_FIELDS = frozenset(
         "node_id",
         "parent",
         "parent_id",
+        "children",
         "current_node",
         "model_slug",
         "requested_model",
+        "requested_model_raw",
         "requested_model_slug",
         "requested_mode",
         "reasoning_effort",
         "default_model_slug",
+        "recorded_final_model_raw",
+        "resolved_model",
+        "resolved_model_raw",
         "generation_id",
         "request_id",
         "message_request_id",
@@ -199,7 +251,22 @@ _OBSERVATION_TOKEN_FIELDS = frozenset(
         "error_type",
         "error_code",
         "quarantine_state",
+        "quarantine_reason",
+        "quarantine_warning",
         "schema_fingerprint",
+        "evidence_id",
+        "transfer_version",
+    }
+)
+_OBSERVATION_TIMESTAMP_FIELDS = frozenset(
+    {
+        "created_at",
+        "updated_at",
+        "create_time",
+        "update_time",
+        "quarantine_timestamp",
+        "quarantine_at",
+        "quarantined_at",
     }
 )
 _OBSERVATION_BOOLEAN_FIELDS = frozenset(
@@ -209,13 +276,20 @@ _OBSERVATION_BOOLEAN_FIELDS = frozenset(
         "is_starred",
         "has_versions",
         "has_previous_page",
+        "has_next_page",
         "shared",
         "imported",
         "copied",
+        "future_timestamp_quarantined",
     }
 )
 _OBSERVATION_NUMBER_FIELDS = frozenset({"offset", "limit", "total", "weight", "timestamp_"})
-_OBSERVATION_LIST_FIELDS = frozenset({"children"})
+_OBSERVATION_LIST_FIELDS = frozenset({"children", "unknown_fields"})
+_OBSERVATION_COLLECTION_FIELDS = frozenset({"items", "messages", "mapping"})
+_OBSERVATION_WARNING_FIELDS = frozenset({"warnings", "quarantine_warnings"})
+_OBSERVATION_MAX_DEPTH = 8
+_OBSERVATION_MAX_FIELDS = 128
+_OBSERVATION_MAX_ITEMS = 800
 
 
 @dataclass(frozen=True)
@@ -337,12 +411,14 @@ class PgLedger:
         """Open one page write transaction; provider/network work stays outside."""
         if expected_binding is not None and scope is None:
             raise LedgerError("expected_binding requires scope")
+        safe_scope = _normalize_scope(scope) if scope is not None else None
+        safe_seen_at = _utc_datetime(seen_at, "seen_at") if seen_at is not None else None
         with self.connect() as conn:
             page = PgLedgerPage(self, conn, expected_binding=expected_binding)
-            if scope is not None:
+            if safe_scope is not None:
                 page.bind_scope(
-                    scope,
-                    seen_at=seen_at or datetime.now().astimezone(),
+                    safe_scope,
+                    seen_at=safe_seen_at or datetime.now().astimezone(),
                     expected_binding=expected_binding,
                 )
             yield page
@@ -355,8 +431,10 @@ class PgLedger:
             return page.bind_scope(scope, seen_at=seen_at)
 
     def upsert_scope(self, scope: LedgerScope, *, seen_at: datetime) -> str:
+        safe_scope = _normalize_scope(scope)
+        safe_seen_at = _utc_datetime(seen_at, "seen_at")
         with self.transaction() as page:
-            return page.bind_scope(scope, seen_at=seen_at).scope_key
+            return page.bind_scope(safe_scope, seen_at=safe_seen_at).scope_key
 
     def record_observation(
         self,
@@ -366,12 +444,14 @@ class PgLedger:
         *,
         expected_binding: Optional[LedgerBinding] = None,
     ) -> tuple[str, bool]:
+        safe_scope = _normalize_scope(scope)
+        safe_context = _normalize_context(context)
         with self.transaction(
-            scope=scope,
-            seen_at=context.observed_at,
+            scope=safe_scope,
+            seen_at=safe_context.observed_at,
             expected_binding=expected_binding,
         ) as page:
-            return page.record_observation(scope, context, payload)
+            return page.record_observation(safe_scope, safe_context, payload)
 
     def upsert_attempt(
         self,
@@ -381,12 +461,14 @@ class PgLedger:
         *,
         expected_binding: Optional[LedgerBinding] = None,
     ) -> AttemptUpsertResult:
+        safe_scope = _normalize_scope(scope)
+        safe_context = _normalize_context(context)
         with self.transaction(
-            scope=scope,
-            seen_at=context.observed_at,
+            scope=safe_scope,
+            seen_at=safe_context.observed_at,
             expected_binding=expected_binding,
         ) as page:
-            return page.upsert_attempt(scope, attempt, context)
+            return page.upsert_attempt(safe_scope, attempt, safe_context)
 
     def record_coverage_gap(
         self,
@@ -400,19 +482,21 @@ class PgLedger:
         seen_at: datetime,
         expected_binding: Optional[LedgerBinding] = None,
     ) -> str:
+        safe_scope = _normalize_scope(scope)
+        safe_seen_at = _utc_datetime(seen_at, "seen_at")
         with self.transaction(
-            scope=scope,
-            seen_at=seen_at,
+            scope=safe_scope,
+            seen_at=safe_seen_at,
             expected_binding=expected_binding,
         ) as page:
             return page.record_coverage_gap(
-                scope,
+                safe_scope,
                 source_kind=source_kind,
                 source_id=source_id,
                 reason=reason,
                 state=state,
                 details=details,
-                seen_at=seen_at,
+                seen_at=safe_seen_at,
             )
 
     def resolve_coverage_gaps(
@@ -424,21 +508,24 @@ class PgLedger:
         seen_at: datetime,
         expected_binding: Optional[LedgerBinding] = None,
     ) -> None:
+        safe_scope = _normalize_scope(scope)
+        safe_seen_at = _utc_datetime(seen_at, "seen_at")
         with self.transaction(
-            scope=scope,
-            seen_at=seen_at,
+            scope=safe_scope,
+            seen_at=safe_seen_at,
             expected_binding=expected_binding,
         ) as page:
             page.resolve_coverage_gaps(
-                scope,
+                safe_scope,
                 source_kind=source_kind,
                 source_id=source_id,
-                seen_at=seen_at,
+                seen_at=safe_seen_at,
             )
 
     def scope_keys_for_account(self, collector_account_id: str) -> tuple[str, ...]:
         """Return active and retired scope keys bound to one collector."""
-        self.assert_safe_record({"collector_account_id": collector_account_id})
+        account_token = _required_token(collector_account_id, "collector_account_id")
+        self.assert_safe_record({"collector_account_id": account_token})
         with self.connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
@@ -454,7 +541,7 @@ class PgLedger:
                 )
                 SELECT scope_key FROM scope_tree ORDER BY scope_key
                 """,
-                (collector_account_id,),
+                (account_token,),
             )
             return tuple(row[0] for row in cur.fetchall())
 
@@ -467,13 +554,9 @@ class PgLedger:
         window_end: Optional[datetime] = None,
     ) -> UsageCounts:
         account_token = _required_token(account, "account")
-        family_token = (
-            _required_token(model_family, "model_family")
-            if model_family is not None
-            else None
-        )
-        start = ensure_utc(window_start) if window_start is not None else None
-        end = ensure_utc(window_end) if window_end is not None else None
+        family_token = _required_token(model_family, "model_family") if model_family is not None else None
+        start = _utc_datetime(window_start, "window_start") if window_start is not None else None
+        end = _utc_datetime(window_end, "window_end") if window_end is not None else None
         if start is not None and end is not None and start >= end:
             raise LedgerError("window_start must be before window_end")
         time_state_sql, time_params = _time_state_sql(start, end)
@@ -482,44 +565,79 @@ class PgLedger:
         if family_token is not None:
             model_clause = """
                 AND (
-                    requested_family = %s
-                    OR recorded_final_family = %s
-                    OR resolved_family = %s
+                    attempts.requested_family = %s
+                    OR attempts.recorded_final_family = %s
+                    OR attempts.resolved_family = %s
                 )
             """
             params.extend((family_token, family_token, family_token))
         params.extend(time_params)
         query = f"""
-            WITH RECURSIVE account_scope_keys(scope_key) AS (
-                SELECT scope_key
-                FROM public.chatgpt_usage_scope_bindings
-                WHERE collector_account_id = %s
-                  AND binding_state = 'active'
+            WITH RECURSIVE scope_chain AS (
+                SELECT
+                    scope_key AS stored_scope_key,
+                    scope_key AS canonical_scope_key
+                FROM public.chatgpt_usage_scopes
                 UNION
-                SELECT redirects.retired_scope_key
-                FROM public.chatgpt_usage_scope_redirects AS redirects
-                JOIN account_scope_keys AS canonical
-                  ON canonical.scope_key = redirects.canonical_scope_key
+                SELECT
+                    chain.stored_scope_key,
+                    redirects.canonical_scope_key
+                FROM scope_chain AS chain
+                JOIN public.chatgpt_usage_scope_redirects AS redirects
+                  ON redirects.retired_scope_key = chain.canonical_scope_key
+            ),
+            canonical_scope_map AS (
+                SELECT DISTINCT ON (chain.stored_scope_key)
+                    chain.stored_scope_key,
+                    chain.canonical_scope_key
+                FROM scope_chain AS chain
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM public.chatgpt_usage_scope_redirects AS redirects
+                    WHERE redirects.retired_scope_key = chain.canonical_scope_key
+                )
+                ORDER BY chain.stored_scope_key, chain.canonical_scope_key
             ),
             scoped AS (
-                SELECT attempts.*
+                SELECT
+                    attempts.*,
+                    canonical_scope.provider_user_id AS canonical_provider_user_id,
+                    canonical_scope.workspace_id AS canonical_workspace_id,
+                    canonical_scope.quota_owner_id AS canonical_quota_owner_id,
+                    canonical_scope.identity_state AS canonical_identity_state,
+                    canonical_scope.surface AS canonical_surface
                 FROM public.chatgpt_usage_attempts AS attempts
-                WHERE attempts.scope_key IN (SELECT scope_key FROM account_scope_keys)
-                  AND NOT attempts.tombstone
+                JOIN canonical_scope_map AS scope_map
+                  ON scope_map.stored_scope_key = attempts.scope_key
+                JOIN public.chatgpt_usage_scopes AS canonical_scope
+                  ON canonical_scope.scope_key = scope_map.canonical_scope_key
+                JOIN public.chatgpt_usage_scope_bindings AS bindings
+                    ON bindings.scope_key = canonical_scope.scope_key
+                 AND bindings.collector_account_id = %s
+                 AND bindings.binding_state = 'active'
+                WHERE NOT attempts.tombstone
                   {model_clause}
             ),
             classified AS (
                 SELECT
                     scoped.*,
                     CASE
-                        WHEN surface = 'unknown' THEN 'unknown_surface'
-                        WHEN surface <> 'chat' THEN 'excluded_surface'
+                        WHEN canonical_surface = 'unknown'
+                          OR surface = 'unknown'
+                            THEN 'unknown_surface'
+                        WHEN canonical_surface <> 'chat'
+                          OR surface <> 'chat'
+                            THEN 'excluded_surface'
                         WHEN origin IN ('shared', 'imported', 'copied')
                             THEN 'excluded_origin'
                         WHEN outcome = 'rejected_before_start'
                             OR NOT (generation_started OR completed_answer)
                             THEN 'excluded_non_generation'
-                        WHEN identity_basis IN ('unresolved', 'unknown')
+                        WHEN canonical_identity_state <> 'verified'
+                          OR canonical_provider_user_id IS NULL
+                          OR canonical_workspace_id IS NULL
+                          OR canonical_quota_owner_id IS NULL
+                          OR identity_basis IN ('unresolved', 'unknown')
                             THEN 'unknown_identity'
                         ELSE 'eligible'
                     END AS evidence_state,
@@ -546,17 +664,20 @@ class PgLedger:
                 ) AS unknown_time,
                 count(*) FILTER (
                     WHERE evidence_state = 'unknown_identity'
+                      AND time_state <> 'out'
                 ) AS unknown_identity,
                 count(*) FILTER (
                     WHERE evidence_state = 'unknown_surface'
+                      AND time_state <> 'out'
                 ) AS unknown_surface,
                 count(*) FILTER (
                     WHERE evidence_state = 'eligible'
+                      AND time_state <> 'out'
                       AND (origin IS NULL OR origin = 'unknown')
                 ) AS unknown_origin,
                 count(*) FILTER (
                     WHERE evidence_state = 'eligible'
-                      AND time_state = 'definite'
+                      AND time_state <> 'out'
                       AND COALESCE(
                           NULLIF(requested_family, 'unknown'),
                           NULLIF(recorded_final_family, 'unknown'),
@@ -565,12 +686,15 @@ class PgLedger:
                 ) AS unknown_model,
                 count(*) FILTER (
                     WHERE evidence_state = 'excluded_surface'
+                      AND time_state <> 'out'
                 ) AS excluded_surface,
                 count(*) FILTER (
                     WHERE evidence_state = 'excluded_origin'
+                      AND time_state <> 'out'
                 ) AS excluded_origin,
                 count(*) FILTER (
                     WHERE evidence_state = 'excluded_non_generation'
+                      AND time_state <> 'out'
                 ) AS excluded_non_generation,
                 count(*) FILTER (
                     WHERE evidence_state = 'eligible'
@@ -862,9 +986,7 @@ class PgLedgerPage:
                         (prior_scope_key,),
                     )
                     prior_scope = cur.fetchone()
-                    prior_identity_state = (
-                        str(prior_scope[0]) if prior_scope is not None else None
-                    )
+                    prior_identity_state = str(prior_scope[0]) if prior_scope is not None else None
                     cur.execute(
                         """
                         UPDATE public.chatgpt_usage_scope_bindings
@@ -879,10 +1001,7 @@ class PgLedgerPage:
                             normalized_scope.collector_account_id,
                         ),
                     )
-                    if (
-                        prior_identity_state == "provisional"
-                        and identity_state == "verified"
-                    ):
+                    if prior_identity_state == "provisional" and identity_state == "verified":
                         _redirect_scope(
                             cur,
                             retired_scope_key=prior_scope_key,
@@ -921,29 +1040,29 @@ class PgLedgerPage:
         context: IngestContext,
         payload: Mapping[str, Any],
     ) -> tuple[str, bool]:
-        binding = self.bind_scope(scope, seen_at=context.observed_at)
+        safe_scope = _normalize_scope(scope)
+        safe_context = _normalize_context(context)
+        binding = self.bind_scope(safe_scope, seen_at=safe_context.observed_at)
         sanitized = _observation_envelope(payload)
         self.ledger.assert_safe_record(sanitized)
-        provenance = sanitize_provenance(
-                {
-                    **(context.provenance or {}),
-                    "collector_account_id": scope.collector_account_id,
-                    "schema_version": context.schema_version,
-                    "source_id": context.source_id,
-                    "source_kind": context.source_kind,
-                    "transfer_schema_version": TRANSFER_SCHEMA_VERSION,
-                }
+        provenance = sanitize_provenance(safe_context.provenance)
+        provenance.update(
+            {
+                "collector_account_id": safe_scope.collector_account_id,
+                "schema_version": safe_context.schema_version,
+                "source_id": safe_context.source_id,
+                "source_kind": safe_context.source_kind,
+            }
         )
+        provenance.setdefault("transfer_schema_version", TRANSFER_SCHEMA_VERSION)
         self.ledger.assert_safe_record(provenance)
         stable_payload = _without_keys(sanitized, "provenance", "run_id")
-        revision_fingerprint = fingerprint_value(
-            {"payload": stable_payload, "provenance": provenance}
-        )
-        observed_at = ensure_utc(context.observed_at)
+        revision_fingerprint = fingerprint_value({"payload": stable_payload, "provenance": provenance})
+        observed_at = safe_context.observed_at
         with self.conn.cursor() as cur:
             _lock_scope(cur, binding.scope_key)
-            prior = _latest_observation(cur, binding.scope_key, context)
-            current = _current_observation(cur, binding.scope_key, context)
+            prior = _latest_observation(cur, binding.scope_key, safe_context)
+            current = _current_observation(cur, binding.scope_key, safe_context)
             if prior is not None and prior["revision_fingerprint"] == revision_fingerprint:
                 should_promote = (
                     current is None
@@ -989,7 +1108,7 @@ class PgLedgerPage:
                     (
                         observed_at,
                         observed_at,
-                        context.run_id,
+                        safe_context.run_id,
                         observed_at,
                         json.dumps(provenance, separators=(",", ":"), default=str),
                         binding.scope_key,
@@ -1001,7 +1120,7 @@ class PgLedgerPage:
                     binding.scope_key,
                     "observation",
                     prior["observation_id"],
-                    scope.collector_account_id,
+                    safe_scope.collector_account_id,
                     observed_at,
                 )
                 return prior["observation_id"], False
@@ -1009,8 +1128,8 @@ class PgLedgerPage:
             occurrence_number = int(prior["occurrence_number"]) + 1 if prior else 1
             observation_id = stable_id(
                 binding.scope_key,
-                context.source_kind,
-                context.source_id,
+                safe_context.source_kind,
+                safe_context.source_id,
                 "occurrence",
                 str(occurrence_number),
             )
@@ -1044,26 +1163,26 @@ class PgLedgerPage:
                 (
                     observation_id,
                     binding.scope_key,
-                    scope.collector_account_id,
-                    scope.provider,
-                    scope.provider_user_id,
-                    scope.workspace_id,
-                    scope.quota_owner_id,
-                    context.source_kind,
-                    context.source_id,
+                    safe_scope.collector_account_id,
+                    safe_scope.provider,
+                    safe_scope.provider_user_id,
+                    safe_scope.workspace_id,
+                    safe_scope.quota_owner_id,
+                    safe_context.source_kind,
+                    safe_context.source_id,
                     revision_fingerprint,
                     occurrence_number,
                     occurrence_number,
-                    scope.surface,
+                    safe_scope.surface,
                     sanitized.get("conversation_id") or sanitized.get("conversationId"),
                     json.dumps(sanitized, separators=(",", ":"), default=str),
                     observed_at,
-                    context.run_id,
-                    context.schema_version,
+                    safe_context.run_id,
+                    safe_context.schema_version,
                     json.dumps(provenance, separators=(",", ":"), default=str),
                     observed_at,
                     observed_at,
-                    context.run_id,
+                    safe_context.run_id,
                     json.dumps(provenance, separators=(",", ":"), default=str),
                     is_current,
                     current["observation_id"] if is_current and current else None,
@@ -1074,7 +1193,7 @@ class PgLedgerPage:
                 binding.scope_key,
                 "observation",
                 observation_id,
-                scope.collector_account_id,
+                safe_scope.collector_account_id,
                 observed_at,
             )
             return observation_id, True
@@ -1085,9 +1204,12 @@ class PgLedgerPage:
         attempt: AttemptRecord,
         context: IngestContext,
     ) -> AttemptUpsertResult:
-        binding = self.bind_scope(scope, seen_at=context.observed_at)
+        safe_scope = _normalize_scope(scope)
+        safe_context = _normalize_context(context)
         aliases = _unique_aliases(attempt.aliases)
-        observed_at = ensure_utc(context.observed_at)
+        safe_attempt = _normalize_attempt(attempt, aliases)
+        binding = self.bind_scope(safe_scope, seen_at=safe_context.observed_at)
+        observed_at = safe_context.observed_at
         with self.conn.cursor() as cur:
             _lock_scope(cur, binding.scope_key)
             (
@@ -1098,14 +1220,14 @@ class PgLedgerPage:
             ) = _resolve_attempt_identity(
                 self,
                 cur,
-                scope,
+                safe_scope,
                 binding.scope_key,
-                attempt,
+                safe_attempt,
                 aliases,
                 observed_at,
             )
             attempt_payload = _attempt_payload(
-                attempt,
+                safe_attempt,
                 aliases,
                 attempt_id=effective_id,
                 quarantine_reason=quarantine_reason,
@@ -1117,7 +1239,7 @@ class PgLedgerPage:
                 _record_identity_gap(
                     self,
                     cur,
-                    scope,
+                    safe_scope,
                     binding.scope_key,
                     source_id=effective_id,
                     reason="retired_attempt_reappeared",
@@ -1178,7 +1300,7 @@ class PgLedgerPage:
                 conflicts = _merge_attempt_links(
                     self,
                     cur,
-                    scope,
+                    safe_scope,
                     effective_id,
                     aliases,
                     observed_at,
@@ -1188,7 +1310,7 @@ class PgLedgerPage:
                     binding.scope_key,
                     "attempt",
                     effective_id,
-                    scope.collector_account_id,
+                    safe_scope.collector_account_id,
                     observed_at,
                 )
                 return AttemptUpsertResult(
@@ -1239,9 +1361,9 @@ class PgLedgerPage:
             if current is None:
                 _insert_attempt_head(
                     cur,
-                    scope=scope,
+                    scope=safe_scope,
                     scope_key_value=binding.scope_key,
-                    attempt=attempt,
+                    attempt=safe_attempt,
                     attempt_id=effective_id,
                     revision=revision,
                     projection_fingerprint=projection_fingerprint,
@@ -1274,8 +1396,8 @@ class PgLedgerPage:
                     WHERE scope_key = %s AND attempt_id = %s
                     """,
                     _attempt_projection_params(
-                        scope,
-                        attempt,
+                        safe_scope,
+                        safe_attempt,
                         revision,
                         projection_fingerprint,
                         observed_at,
@@ -1328,11 +1450,11 @@ class PgLedgerPage:
                     revision,
                     projection_fingerprint,
                     json.dumps(attempt_payload, separators=(",", ":"), default=str),
-                    context.source_kind,
-                    context.source_id,
-                    context.run_id,
-                    context.schema_version,
-                    scope.collector_account_id,
+                    safe_context.source_kind,
+                    safe_context.source_id,
+                    safe_context.run_id,
+                    safe_context.schema_version,
+                    safe_scope.collector_account_id,
                     observed_at,
                     not stale,
                 ),
@@ -1340,7 +1462,7 @@ class PgLedgerPage:
             conflicts = _merge_attempt_links(
                 self,
                 cur,
-                scope,
+                safe_scope,
                 effective_id,
                 aliases,
                 observed_at,
@@ -1350,7 +1472,7 @@ class PgLedgerPage:
                 binding.scope_key,
                 "attempt",
                 effective_id,
-                scope.collector_account_id,
+                safe_scope.collector_account_id,
                 observed_at,
             )
             return AttemptUpsertResult(
@@ -1370,11 +1492,16 @@ class PgLedgerPage:
         details: Optional[Mapping[str, Any]] = None,
         seen_at: datetime,
     ) -> str:
-        binding = self.bind_scope(scope, seen_at=seen_at)
-        safe_details = _coverage_details_envelope(details or {})
+        safe_scope = _normalize_scope(scope)
+        safe_source_kind = _required_token(source_kind, "source_kind")
+        safe_source_id = _required_token(source_id, "source_id")
+        safe_reason = _required_token(reason, "reason")
+        safe_state = _enum_token(state, _ALLOWED_GAP_STATES, "unknown")
+        safe_details = _coverage_details_envelope(details)
+        safe_seen_at = _utc_datetime(seen_at, "seen_at")
+        binding = self.bind_scope(safe_scope, seen_at=safe_seen_at)
         self.ledger.assert_safe_record(safe_details)
-        gap_id = stable_id(binding.scope_key, source_kind, source_id, reason)
-        observed_at = ensure_utc(seen_at)
+        gap_id = stable_id(binding.scope_key, safe_source_kind, safe_source_id, safe_reason)
         with self.conn.cursor() as cur:
             _lock_scope(cur, binding.scope_key)
             cur.execute(
@@ -1404,13 +1531,13 @@ class PgLedgerPage:
                 (
                     gap_id,
                     binding.scope_key,
-                    scope.collector_account_id,
-                    source_kind,
-                    source_id,
-                    reason,
-                    state,
-                    observed_at,
-                    observed_at,
+                    safe_scope.collector_account_id,
+                    safe_source_kind,
+                    safe_source_id,
+                    safe_reason,
+                    safe_state,
+                    safe_seen_at,
+                    safe_seen_at,
                     json.dumps(safe_details, separators=(",", ":"), default=str),
                 ),
             )
@@ -1424,8 +1551,11 @@ class PgLedgerPage:
         source_id: str,
         seen_at: datetime,
     ) -> None:
-        binding = self.bind_scope(scope, seen_at=seen_at)
-        observed_at = ensure_utc(seen_at)
+        safe_scope = _normalize_scope(scope)
+        safe_source_kind = _required_token(source_kind, "source_kind")
+        safe_source_id = _required_token(source_id, "source_id")
+        safe_seen_at = _utc_datetime(seen_at, "seen_at")
+        binding = self.bind_scope(safe_scope, seen_at=safe_seen_at)
         with self.conn.cursor() as cur:
             _lock_scope(cur, binding.scope_key)
             cur.execute(
@@ -1436,11 +1566,11 @@ class PgLedgerPage:
                   AND state = 'open' AND last_seen_at <= %s
                 """,
                 (
-                    observed_at,
+                    safe_seen_at,
                     binding.scope_key,
-                    source_kind,
-                    source_id,
-                    observed_at,
+                    safe_source_kind,
+                    safe_source_id,
+                    safe_seen_at,
                 ),
             )
 
@@ -1460,11 +1590,7 @@ def scope_key(scope: LedgerScope) -> str:
 
 
 def _scope_identity_state(scope: LedgerScope) -> str:
-    if (
-        scope.provider_user_id is not None
-        and scope.workspace_id is not None
-        and scope.quota_owner_id is not None
-    ):
+    if scope.provider_user_id is not None and scope.workspace_id is not None and scope.quota_owner_id is not None:
         return "verified"
     return "provisional"
 
@@ -1795,11 +1921,9 @@ def _resolve_attempt_identity(
         )
         return incoming_id, 1, None, "alias_to_retired_attempt"
 
-    if (
-        _identity_rank(attempt.identity_basis)
-        > _identity_rank(str(candidate["identity_basis"]))
-        and str(candidate["identity_basis"]) in {"provisional", "unresolved"}
-    ):
+    if _identity_rank(attempt.identity_basis) > _identity_rank(str(candidate["identity_basis"])) and str(
+        candidate["identity_basis"]
+    ) in {"provisional", "unresolved"}:
         _retire_provisional_attempt(
             cur,
             scope_key_value=scope_key_value,
@@ -1897,9 +2021,13 @@ def _record_identity_gap(
     details: Mapping[str, Any],
     seen_at: datetime,
 ) -> None:
+    safe_scope = _normalize_scope(scope)
+    safe_source_id = _required_token(source_id, "source_id")
+    safe_reason = _required_token(reason, "reason")
     safe_details = _coverage_details_envelope(details)
     page.ledger.assert_safe_record(safe_details)
-    gap_id = stable_id(scope_key_value, "attempt_identity", source_id, reason)
+    safe_seen_at = _utc_datetime(seen_at, "seen_at")
+    gap_id = stable_id(scope_key_value, "attempt_identity", safe_source_id, safe_reason)
     cur.execute(
         """
         INSERT INTO public.chatgpt_usage_coverage_gaps (
@@ -1923,11 +2051,11 @@ def _record_identity_gap(
         (
             gap_id,
             scope_key_value,
-            scope.collector_account_id,
-            source_id,
-            reason,
-            seen_at,
-            seen_at,
+            safe_scope.collector_account_id,
+            safe_source_id,
+            safe_reason,
+            safe_seen_at,
+            safe_seen_at,
             json.dumps(safe_details, separators=(",", ":"), default=str),
         ),
     )
@@ -2093,13 +2221,12 @@ def _merge_attempt_links(
     seen_at: datetime,
 ) -> int:
     conflicts = 0
-    key = scope_key(scope)
-    for alias_kind, alias_value in aliases:
-        if alias_kind not in _ALLOWED_ALIAS_KINDS:
-            continue
-        safe_value = sanitize_token(alias_value)
-        if safe_value is None:
-            continue
+    safe_scope = _normalize_scope(scope)
+    key = scope_key(safe_scope)
+    safe_aliases = _unique_aliases(aliases)
+    safe_seen_at = _utc_datetime(seen_at, "seen_at")
+    ledger.assert_safe_record(safe_aliases)
+    for alias_kind, safe_value in safe_aliases:
         cur.execute(
             """
             SELECT attempt_id FROM public.chatgpt_usage_attempt_aliases
@@ -2113,12 +2240,12 @@ def _merge_attempt_links(
             _record_alias_collision(
                 ledger,
                 cur,
-                scope,
+                safe_scope,
                 alias_kind,
                 safe_value,
                 str(row[0]),
                 attempt_id,
-                seen_at,
+                safe_seen_at,
             )
             continue
         if row is not None:
@@ -2128,7 +2255,7 @@ def _merge_attempt_links(
                 SET last_seen_at = GREATEST(last_seen_at, %s)
                 WHERE scope_key = %s AND alias_kind = %s AND alias_value = %s
                 """,
-                (ensure_utc(seen_at), key, alias_kind, safe_value),
+                (safe_seen_at, key, alias_kind, safe_value),
             )
             continue
         cur.execute(
@@ -2143,8 +2270,8 @@ def _merge_attempt_links(
                 alias_kind,
                 safe_value,
                 attempt_id,
-                ensure_utc(seen_at),
-                ensure_utc(seen_at),
+                safe_seen_at,
+                safe_seen_at,
             ),
         )
     return conflicts
@@ -2160,14 +2287,22 @@ def _record_alias_collision(
     incoming_attempt_id: str,
     seen_at: datetime,
 ) -> None:
-    key = scope_key(scope)
-    source_id = f"{alias_kind}:{alias_value}"
+    safe_scope = _normalize_scope(scope)
+    safe_alias_kind = _required_token(alias_kind, "alias_kind")
+    safe_alias_value = _required_token(alias_value, "alias_value")
+    safe_existing_id = _required_token(existing_attempt_id, "existing_attempt_id")
+    safe_incoming_id = _required_token(incoming_attempt_id, "incoming_attempt_id")
+    safe_seen_at = _utc_datetime(seen_at, "seen_at")
+    key = scope_key(safe_scope)
+    source_id = f"{safe_alias_kind}:{safe_alias_value}"
     gap_id = stable_id(key, "attempt_alias", source_id, "alias_collision")
-    details = {
-        "alias_kind": alias_kind,
-        "existing_attempt_id": existing_attempt_id,
-        "incoming_attempt_id": incoming_attempt_id,
-    }
+    details = _coverage_details_envelope(
+        {
+            "alias_kind": safe_alias_kind,
+            "existing_attempt_id": safe_existing_id,
+            "incoming_attempt_id": safe_incoming_id,
+        }
+    )
     ledger.assert_safe_record(details)
     cur.execute(
         """
@@ -2188,10 +2323,10 @@ def _record_alias_collision(
         (
             gap_id,
             key,
-            scope.collector_account_id,
+            safe_scope.collector_account_id,
             source_id,
-            ensure_utc(seen_at),
-            ensure_utc(seen_at),
+            safe_seen_at,
+            safe_seen_at,
             json.dumps(details, separators=(",", ":"), default=str),
         ),
     )
@@ -2349,9 +2484,11 @@ def _normalize_scope(scope: LedgerScope) -> LedgerScope:
 def _normalize_context(context: IngestContext) -> IngestContext:
     if not isinstance(context, IngestContext):
         raise LedgerError("context must be an IngestContext")
+    if context.provenance is not None and not isinstance(context.provenance, Mapping):
+        raise LedgerError("provenance must be a mapping")
     return IngestContext(
         run_id=_required_token(context.run_id, "run_id"),
-        observed_at=ensure_utc(context.observed_at),
+        observed_at=_utc_datetime(context.observed_at, "observed_at"),
         source_kind=_required_token(context.source_kind, "source_kind"),
         source_id=_required_token(context.source_id, "source_id"),
         schema_version=_required_token(context.schema_version, "schema_version"),
@@ -2413,6 +2550,12 @@ def _required_bool(value: Any, field_name: str) -> bool:
     if not isinstance(value, bool):
         raise LedgerError(f"{field_name} must be a boolean")
     return value
+
+
+def _utc_datetime(value: Any, field_name: str) -> datetime:
+    if not isinstance(value, datetime):
+        raise LedgerError(f"{field_name} must be a datetime")
+    return ensure_utc(value)
 
 
 def _optional_token(value: Any) -> Optional[str]:
@@ -2491,26 +2634,57 @@ def _observation_envelope(payload: Mapping[str, Any]) -> dict[str, Any]:
         ("messages", "message_count"),
         ("mapping", "mapping_node_count"),
     ):
-        if collection_key in payload:
-            value = payload[collection_key]
-            if isinstance(value, (Mapping, Sequence)) and not isinstance(value, (str, bytes, bytearray)):
-                projected[count_key] = min(len(value), 800)
+        value = projected.get(collection_key)
+        if isinstance(value, (Mapping, Sequence)) and not isinstance(value, (str, bytes, bytearray)):
+            projected[count_key] = min(len(value), _OBSERVATION_MAX_ITEMS)
+    future_timestamp_quarantined = projected.get("future_timestamp_quarantined") is True
+    if future_timestamp_quarantined:
+        projected["quarantine_state"] = "quarantined"
+        quarantine = projected.get("quarantine")
+        if isinstance(quarantine, Mapping):
+            reasons = _safe_tokens(quarantine.get("reasons", []), limit=32)
+            if "future_timestamp_quarantined" not in reasons:
+                reasons.append("future_timestamp_quarantined")
+            projected["quarantine"] = {
+                **quarantine,
+                "state": "quarantined",
+                "reasons": reasons[:32],
+            }
+        else:
+            projected["quarantine"] = {
+                "state": "quarantined",
+                "reasons": ["future_timestamp_quarantined"],
+            }
     return projected
 
 
 def _project_observation_field(key: str, value: Any) -> Any:
     if key in {"surface", "origin"}:
         return _surface_token(value) if key == "surface" else _origin_token(value)
+    if key in _OBSERVATION_TIMESTAMP_FIELDS:
+        return _safe_timestamp(value)
     if key in _OBSERVATION_BOOLEAN_FIELDS:
         return value if isinstance(value, bool) else _DROP
     if key in _OBSERVATION_NUMBER_FIELDS:
         return _safe_number(value)
-    if key in _OBSERVATION_TOKEN_FIELDS:
-        return _optional_token(value)
+    if key in _OBSERVATION_COLLECTION_FIELDS:
+        return _observation_collection_envelope(value)
+    if key in _OBSERVATION_WARNING_FIELDS:
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+            return _DROP
+        return _safe_tokens(value, limit=64)
+    if key == "provenance":
+        return sanitize_provenance(value) if isinstance(value, Mapping) else _DROP
+    if key == "quarantine_state":
+        return _quarantine_state_token(value)
+    if key == "transfer_version":
+        return _transfer_version_token(value)
     if key in _OBSERVATION_LIST_FIELDS:
         if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
             return _DROP
         return _safe_tokens(value, limit=800)
+    if key in _OBSERVATION_TOKEN_FIELDS:
+        return _optional_token(value)
     if key == "metadata":
         return sanitize_metadata(value) if isinstance(value, Mapping) else _DROP
     if key == "author":
@@ -2522,12 +2696,42 @@ def _project_observation_field(key: str, value: Any) -> Any:
         return _page_info_envelope(value)
     if key == "quarantine":
         return _quarantine_value(value)
-    if key == "warnings":
-        if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-            return _DROP
-        return _safe_tokens(value, limit=64)
     if key == "transfer_schema_version":
         return TRANSFER_SCHEMA_VERSION
+    return _DROP
+
+
+def _observation_collection_envelope(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        sanitized: Any = sanitize_mapping(value)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        sanitized = [sanitize_value(item) for item in value]
+    else:
+        return _DROP
+    return _bound_observation_value(sanitized)
+
+
+def _bound_observation_value(value: Any, *, depth: int = 0) -> Any:
+    if depth > _OBSERVATION_MAX_DEPTH:
+        return _DROP
+    if isinstance(value, Mapping):
+        out: dict[str, Any] = {}
+        for raw_key, raw_value in list(value.items())[:_OBSERVATION_MAX_FIELDS]:
+            child = _bound_observation_value(raw_value, depth=depth + 1)
+            if child is not _DROP:
+                out[str(raw_key)] = child
+        return out
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        out_list: list[Any] = []
+        for raw_value in list(value)[:_OBSERVATION_MAX_ITEMS]:
+            child = _bound_observation_value(raw_value, depth=depth + 1)
+            if child is not _DROP:
+                out_list.append(child)
+        return out_list
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        return _safe_number(value)
     return _DROP
 
 
@@ -2549,14 +2753,22 @@ def _page_info_envelope(value: Any) -> Any:
     return out
 
 
-def _quarantine_envelope(warnings: Iterable[str]) -> dict[str, Any]:
+def _quarantine_envelope(
+    warnings: Iterable[str],
+    *,
+    future_timestamp_quarantined: bool = False,
+) -> dict[str, Any]:
+    safe_warnings = _safe_tokens(warnings)
     reasons = [
-        warning.split(":", 1)[1]
-        for warning in _safe_tokens(warnings)
-        if warning.startswith("quarantine:") and ":" in warning
+        warning.split(":", 1)[1] for warning in safe_warnings if warning.startswith("quarantine:") and ":" in warning
     ]
+    future_timestamp_quarantined = future_timestamp_quarantined or any(
+        warning in {"future_timestamp_quarantined", "future_timestamp_quarantined=true"} for warning in safe_warnings
+    )
+    if future_timestamp_quarantined and "future_timestamp_quarantined" not in reasons:
+        reasons.append("future_timestamp_quarantined")
     return {
-        "state": "quarantined" if reasons else "clear",
+        "state": "quarantined" if reasons or future_timestamp_quarantined else "clear",
         "reasons": reasons[:32],
     }
 
@@ -2565,23 +2777,29 @@ def _quarantine_value(value: Any) -> Any:
     if isinstance(value, bool):
         return {"state": "quarantined" if value else "clear", "reasons": []}
     if isinstance(value, str):
-        token = _optional_token(value)
+        token = _quarantine_state_token(value)
         return {"state": token or "unknown", "reasons": []}
     if isinstance(value, Mapping):
-        state = _optional_token(value.get("state")) or "unknown"
+        state = _quarantine_state_token(value.get("state")) or "unknown"
         raw_reasons = value.get("reasons", [])
         reasons = _safe_tokens(
             raw_reasons
             if isinstance(raw_reasons, Sequence) and not isinstance(raw_reasons, (str, bytes, bytearray))
             else []
         )
+        if value.get("future_timestamp_quarantined") is True:
+            state = "quarantined"
+            if "future_timestamp_quarantined" not in reasons:
+                reasons.append("future_timestamp_quarantined")
         return {"state": state, "reasons": reasons[:32]}
     return _DROP
 
 
-def _coverage_details_envelope(details: Mapping[str, Any]) -> dict[str, Any]:
-    if not isinstance(details, Mapping):
+def _coverage_details_envelope(details: Optional[Mapping[str, Any]]) -> dict[str, Any]:
+    if details is None:
         return {"transfer_schema_version": TRANSFER_SCHEMA_VERSION}
+    if not isinstance(details, Mapping):
+        raise LedgerError("coverage details must be a mapping")
     projected = _observation_envelope(details)
     projected["transfer_schema_version"] = TRANSFER_SCHEMA_VERSION
     return projected
@@ -2593,6 +2811,30 @@ def _safe_number(value: Any) -> Any:
     if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
         return _DROP
     return value
+
+
+def _safe_timestamp(value: Any) -> Any:
+    if isinstance(value, bool):
+        return _DROP
+    try:
+        parsed = parse_datetime(value)
+    except (OverflowError, TypeError, ValueError, OSError):
+        return _DROP
+    return isoformat_utc(parsed) if parsed is not None else _DROP
+
+
+def _quarantine_state_token(value: Any) -> Optional[str]:
+    token = _optional_token(value)
+    return token if token in _ALLOWED_QUARANTINE_STATES else "unknown"
+
+
+def _transfer_version_token(value: Any) -> Any:
+    token = _optional_token(value)
+    if token is None:
+        return _DROP
+    # Keep an unsupported source version as evidence; the envelope's own
+    # transfer_schema_version remains the current persistence contract.
+    return token
 
 
 def _json_count_map(value: Any) -> dict[str, int]:
