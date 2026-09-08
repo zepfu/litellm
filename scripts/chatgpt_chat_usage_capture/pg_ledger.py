@@ -5,13 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import selectors
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from time import monotonic
 from typing import Any, Iterator, Iterable, Mapping, Optional, Sequence
 
 import psycopg
+from psycopg import pq, waiting
 
 from .models import AttemptRecord
 from .privacy import (
@@ -601,21 +604,168 @@ class PgLedger:
         self.lock_timeout_ms = lock_timeout_ms
         self.statement_timeout_ms = statement_timeout_ms
 
-    def connect(self) -> psycopg.Connection:
-        conn = psycopg.connect(self.dsn)
-        conn.execute(
-            "SELECT set_config('application_name', %s, false)",
-            (self.application_name,),
+    def connect(self, *, deadline_at: Optional[datetime] = None) -> psycopg.Connection:
+        """Open a connection, bounding establishment and session setup when requested."""
+        deadline = _utc_datetime(deadline_at, "deadline_at") if deadline_at is not None else None
+        conn = (
+            self._connect_with_deadline(deadline)
+            if deadline is not None
+            else psycopg.connect(self.dsn)
         )
-        conn.execute(
-            "SELECT set_config('lock_timeout', %s, true)",
-            (f"{self.lock_timeout_ms}ms",),
-        )
-        conn.execute(
-            "SELECT set_config('statement_timeout', %s, true)",
-            (f"{self.statement_timeout_ms}ms",),
-        )
-        return conn
+        try:
+            if deadline is not None:
+                with conn.cursor() as cur:
+                    self.execute_with_deadline(
+                        cur,
+                        "SELECT set_config('application_name', %s, false)",
+                        (self.application_name,),
+                        deadline_at=deadline,
+                    )
+                    remaining_ms = _remaining_deadline_ms(deadline)
+                    self.execute_with_deadline(
+                        cur,
+                        "SELECT set_config('lock_timeout', %s, true)",
+                        (f"{min(self.lock_timeout_ms, remaining_ms)}ms",),
+                        deadline_at=deadline,
+                    )
+                    remaining_ms = _remaining_deadline_ms(deadline)
+                    self.execute_with_deadline(
+                        cur,
+                        "SELECT set_config('statement_timeout', %s, true)",
+                        (f"{min(self.statement_timeout_ms, remaining_ms)}ms",),
+                        deadline_at=deadline,
+                    )
+                    _assert_before_deadline(deadline)
+            else:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT set_config('application_name', %s, false)",
+                        (self.application_name,),
+                    )
+                    cur.execute(
+                        "SELECT set_config('lock_timeout', %s, true)",
+                        (f"{self.lock_timeout_ms}ms",),
+                    )
+                    cur.execute(
+                        "SELECT set_config('statement_timeout', %s, true)",
+                        (f"{self.statement_timeout_ms}ms",),
+                    )
+            return conn
+        except BaseException:
+            conn.close()
+            raise
+
+    def execute_with_deadline(
+        self,
+        cursor: psycopg.Cursor,
+        query: Any,
+        params: Any = None,
+        *,
+        deadline_at: datetime,
+    ) -> psycopg.Cursor:
+        """Execute one cursor operation under the caller-owned absolute deadline."""
+        deadline = _utc_datetime(deadline_at, "deadline_at")
+        connection = cursor.connection
+        try:
+            with connection.lock:
+                _wait_operation(
+                    cursor._execute_gen(query, params),
+                    connection.pgconn.socket,
+                    deadline,
+                )
+        except LedgerError:
+            connection.close()
+            raise
+        return cursor
+
+    def rollback_with_deadline(
+        self,
+        connection: psycopg.Connection,
+        *,
+        deadline_at: datetime,
+    ) -> None:
+        """Rollback without allowing a stalled server response to outlive the deadline."""
+        deadline = _utc_datetime(deadline_at, "deadline_at")
+        try:
+            with connection.lock:
+                _wait_operation(
+                    connection._rollback_gen(),
+                    connection.pgconn.socket,
+                    deadline,
+                )
+        except LedgerError:
+            connection.close()
+            raise
+
+    def command_with_deadline(
+        self,
+        connection: psycopg.Connection,
+        command: Any,
+        *,
+        deadline_at: datetime,
+    ) -> None:
+        """Run a protocol command without implicit transaction setup."""
+        deadline = _utc_datetime(deadline_at, "deadline_at")
+        try:
+            with connection.lock:
+                _wait_operation(
+                    connection._exec_command(command),
+                    connection.pgconn.socket,
+                    deadline,
+                )
+        except LedgerError:
+            connection.close()
+            raise
+
+    def _connect_with_deadline(self, deadline_at: datetime) -> psycopg.Connection:
+        """Create one libpq connection while retaining ownership through timeout."""
+        deadline = _utc_datetime(deadline_at, "deadline_at")
+        wait_deadline = monotonic() + _remaining_deadline_seconds(deadline)
+        pgconn: Any = None
+        try:
+            pgconn = pq.PGconn.connect_start(self.dsn.encode("utf-8"))
+            while True:
+                status = pq.PollingStatus(pgconn.connect_poll())
+                if monotonic() >= wait_deadline:
+                    raise LedgerError("collector database deadline has expired")
+                if status == pq.PollingStatus.OK:
+                    pgconn.nonblocking = 1
+                    connection = psycopg.Connection(pgconn)
+                    pgconn = None
+                    if monotonic() >= wait_deadline:
+                        connection.close()
+                        raise LedgerError("collector database deadline has expired")
+                    return connection
+                if status == pq.PollingStatus.FAILED:
+                    message = pgconn.get_error_message(pgconn._encoding)
+                    finished = psycopg.errors.finish_pgconn(pgconn)
+                    pgconn = None
+                    raise psycopg.errors.OperationalError(
+                        f"connection failed: {message}",
+                        pgconn=finished,
+                    )
+                if status == pq.PollingStatus.READING:
+                    events = selectors.EVENT_READ
+                elif status == pq.PollingStatus.WRITING:
+                    events = selectors.EVENT_WRITE
+                else:
+                    message = pgconn.get_error_message(pgconn._encoding)
+                    finished = psycopg.errors.finish_pgconn(pgconn)
+                    pgconn = None
+                    raise psycopg.errors.OperationalError(
+                        f"connection failed: {message}",
+                        pgconn=finished,
+                    )
+                remaining = wait_deadline - monotonic()
+                if remaining <= 0:
+                    raise LedgerError("collector database deadline has expired")
+                with selectors.DefaultSelector() as selector:
+                    selector.register(pgconn.socket, events)
+                    if not selector.select(timeout=remaining):
+                        raise LedgerError("collector database deadline has expired")
+        finally:
+            if pgconn is not None:
+                pgconn.finish()
 
     def ensure_schema(self) -> None:
         sql = MIGRATION_PATH.read_text(encoding="utf-8")
@@ -3767,6 +3917,57 @@ def _utc_datetime(value: Any, field_name: str) -> datetime:
     if not isinstance(value, datetime):
         raise LedgerError(f"{field_name} must be a datetime")
     return ensure_utc(value)
+
+
+def _assert_before_deadline(deadline_at: datetime) -> None:
+    if datetime.now().astimezone() >= deadline_at:
+        raise LedgerError("collector database deadline has expired")
+
+
+def _remaining_deadline_seconds(deadline_at: datetime) -> float:
+    remaining = (deadline_at - datetime.now().astimezone()).total_seconds()
+    if remaining <= 0:
+        raise LedgerError("collector database deadline has expired")
+    return remaining
+
+
+def _wait_operation(generator: Any, socket: int, deadline_at: datetime) -> Any:
+    """Consume one Psycopg operation generator with an owned absolute deadline."""
+    wait_deadline = monotonic() + _remaining_deadline_seconds(deadline_at)
+    try:
+        wait = next(generator)
+        with selectors.DefaultSelector() as selector:
+            while True:
+                remaining = wait_deadline - monotonic()
+                if remaining <= 0:
+                    raise LedgerError("collector database deadline has expired")
+                selector.register(socket, int(wait))
+                try:
+                    ready = selector.select(timeout=remaining)
+                finally:
+                    selector.unregister(socket)
+                if not ready:
+                    raise LedgerError("collector database deadline has expired")
+                wait = generator.send(waiting.Ready(ready[0][1]))
+    except StopIteration as exc:
+        if monotonic() >= wait_deadline:
+            raise LedgerError("collector database deadline has expired") from None
+        return exc.value
+    except BaseException:
+        try:
+            generator.close()
+        except BaseException:
+            pass
+        raise
+
+
+def _remaining_deadline_ms(deadline_at: datetime) -> int:
+    remaining_ms = int(
+        (deadline_at - datetime.now().astimezone()).total_seconds() * 1000
+    )
+    if remaining_ms <= 0:
+        raise LedgerError("collector database deadline has expired")
+    return remaining_ms
 
 
 def _optional_token(value: Any) -> Optional[str]:
