@@ -184,7 +184,9 @@ from .aawm_adapter_runtime.provider_call_ledger import (
     current_candidate_context,
     ensure_openai_wire_replay_allowed,
     get_or_create_openai_provider_call_ledger,
+    get_request_openai_wire_commitment,
     get_request_provider_call_ledger,
+    get_request_provider_call_ledger_snapshot,
     publish_reservation_metadata,
     record_transport_connection_failure,
     register_active_upstream_response,
@@ -1780,6 +1782,7 @@ def _record_passthrough_hidden_retry_metadata(
     failure_classification: Optional[str] = None,
     request: Optional[Request] = None,
     logical_provider_call_start: Optional[int] = None,
+    reservation_rejected: bool = False,
 ) -> None:
     if not isinstance(kwargs, dict):
         return
@@ -1795,8 +1798,14 @@ def _record_passthrough_hidden_retry_metadata(
         "max_attempts": max_attempts,
         "failure_class": failure_class,
         "wait_seconds": round(wait_seconds, 3),
-        "attempt_kind": "logical_provider_send_retry",
+        "attempt_kind": (
+            "reservation_denied"
+            if reservation_rejected
+            else "logical_provider_send_retry"
+        ),
     }
+    if reservation_rejected:
+        attempt_record["attempted_provider_call"] = False
     if status_code is not None:
         attempt_record["status_code"] = status_code
     if failure_classification is not None:
@@ -1823,12 +1832,26 @@ def _record_passthrough_hidden_retry_metadata(
             1
             for record in attempts
             if isinstance(record, dict)
+            and record.get("attempt_kind") == "logical_provider_send_retry"
             and str(record.get("failure_class") or "").strip().lower()
             != "success"
         )
     metadata["aawm_passthrough_hidden_retry_count"] = retry_count
     metadata["aawm_passthrough_hidden_logical_retry_count"] = retry_count
     if final_outcome is not None:
+        if logical_provider_send_count is not None:
+            if final_outcome.startswith("success"):
+                final_outcome = (
+                    "success_after_retry"
+                    if retry_count > 0
+                    else "success"
+                )
+            elif final_outcome.startswith("failed"):
+                final_outcome = (
+                    "failed_after_retry"
+                    if retry_count > 0
+                    else "failed_without_retry"
+                )
         metadata["aawm_passthrough_hidden_retry_final_outcome"] = final_outcome
     if failure_classification is not None:
         metadata[
@@ -2006,6 +2029,14 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     failure_classification=failure_classification,
                     request=request,
                     logical_provider_call_start=logical_provider_call_start,
+                    reservation_rejected=bool(
+                        getattr(exc, "aawm_call_ledger_exhausted", False)
+                        or getattr(
+                            exc,
+                            "aawm_openai_wire_replay_blocked",
+                            False,
+                        )
+                    ),
                 )
                 _mark_passthrough_hidden_retry_budget_exhausted(
                     kwargs,
@@ -2116,6 +2147,18 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         failure_classification=failure_classification,
                         request=request,
                         logical_provider_call_start=logical_provider_call_start,
+                        reservation_rejected=bool(
+                            getattr(
+                                terminal_exception,
+                                "aawm_call_ledger_exhausted",
+                                False,
+                            )
+                            or getattr(
+                                terminal_exception,
+                                "aawm_openai_wire_replay_blocked",
+                                False,
+                            )
+                        ),
                     )
                     _mark_passthrough_hidden_retry_budget_exhausted(
                         kwargs,
@@ -2164,6 +2207,14 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     failure_classification=failure_classification,
                     request=request,
                     logical_provider_call_start=logical_provider_call_start,
+                    reservation_rejected=bool(
+                        getattr(exc, "aawm_call_ledger_exhausted", False)
+                        or getattr(
+                            exc,
+                            "aawm_openai_wire_replay_blocked",
+                            False,
+                        )
+                    ),
                 )
                 raise
 
@@ -2204,6 +2255,14 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     failure_classification=failure_classification,
                     request=request,
                     logical_provider_call_start=logical_provider_call_start,
+                    reservation_rejected=bool(
+                        getattr(exc, "aawm_call_ledger_exhausted", False)
+                        or getattr(
+                            exc,
+                            "aawm_openai_wire_replay_blocked",
+                            False,
+                        )
+                    ),
                 )
                 _mark_passthrough_hidden_retry_budget_exhausted(
                     kwargs,
@@ -2232,6 +2291,14 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 failure_classification=failure_classification,
                 request=request,
                 logical_provider_call_start=logical_provider_call_start,
+                reservation_rejected=bool(
+                    getattr(exc, "aawm_call_ledger_exhausted", False)
+                    or getattr(
+                        exc,
+                        "aawm_openai_wire_replay_blocked",
+                        False,
+                    )
+                ),
             )
             verbose_proxy_logger.info(
                 "Pass-through %s hidden retry attempt %s/%s after %s; sleeping %.1fs",
@@ -4753,7 +4820,9 @@ async def pass_through_request(  # noqa: PLR0915
         if request_state is None:
             return
         if openai_call_ledger is not None:
-            ledger_snapshot = openai_call_ledger.snapshot()
+            ledger_snapshot = get_request_provider_call_ledger_snapshot(request)
+            if ledger_snapshot is None:
+                ledger_snapshot = openai_call_ledger.snapshot()
             setattr(
                 request_state,
                 "aawm_openai_send_ledger_snapshot",
@@ -5250,11 +5319,13 @@ async def pass_through_request(  # noqa: PLR0915
                     if request_state is not None
                     else None
                 )
+                wire_commitment = get_request_openai_wire_commitment(request)
                 reservation = openai_call_ledger.reserve(
                     target=prepared_request.url,
                     reason=reason or "passthrough_provider_request",
                     candidate_context=current_candidate_context(request),
                     prior_response_closed=True,
+                    wire_commitment=wire_commitment,
                 )
                 publish_reservation_metadata(
                     request,
@@ -6001,7 +6072,17 @@ async def pass_through_request(  # noqa: PLR0915
         )
     except Exception as e:
         _publish_openai_send_telemetry()
-        if not getattr(e, "aawm_openai_wire_replay_blocked", False):
+        if getattr(e, "aawm_openai_wire_replay_blocked", False):
+            try:
+                await close_active_upstream_response(request)
+            except Exception:
+                # Preserve the authoritative replay denial if response cleanup
+                # itself fails; the close helper clears the stale registration.
+                verbose_proxy_logger.debug(
+                    "Failed to close active upstream response after replay denial",
+                    exc_info=True,
+                )
+        else:
             await close_active_upstream_response(request)
         custom_headers = ProxyBaseLLMRequestProcessing.get_custom_headers(
             user_api_key_dict=user_api_key_dict,

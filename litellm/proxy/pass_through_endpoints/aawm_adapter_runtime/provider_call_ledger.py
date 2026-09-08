@@ -258,6 +258,17 @@ class ProviderCallLedger:
     def reservations(self) -> tuple[ProviderCallReservation, ...]:
         return tuple(self._records)
 
+    def ensure_reservation_allowed(self, *, wire_commitment: Any = None) -> None:
+        """Reject sends after the final OpenAI Responses wire is committed."""
+
+        reason = _wire_commitment_denial_reason(wire_commitment)
+        if reason is not None:
+            raise ProviderCallReplayBlocked(
+                commitment=wire_commitment,
+                ledger=self,
+                reason=reason,
+            )
+
     def reserve(
         self,
         *,
@@ -265,11 +276,13 @@ class ProviderCallLedger:
         reason: str = "provider_request",
         candidate_context: Optional[dict[str, Any]] = None,
         prior_response_closed: bool,
+        wire_commitment: Any = None,
     ) -> ProviderCallReservation:
         if not prior_response_closed:
             raise RuntimeError(
                 "provider call reservation requires prior response closure"
             )
+        self.ensure_reservation_allowed(wire_commitment=wire_commitment)
         elapsed_seconds = time.monotonic() - self._started_at_monotonic
         if (
             self.deadline_seconds is not None
@@ -349,7 +362,9 @@ class ProviderCallReplayBlocked(RuntimeError):
         *,
         commitment: Mapping[str, Any],
         ledger: Optional[ProviderCallLedger] = None,
+        reason: str = "wire_replay_prohibited",
     ) -> None:
+        self.reason = _safe_context_value(reason) or "wire_replay_prohibited"
         self.wire_commitment = _safe_wire_commitment(commitment)
         self.ledger_snapshot = ledger.snapshot() if ledger is not None else None
         self.detail = {
@@ -361,6 +376,7 @@ class ProviderCallReplayBlocked(RuntimeError):
                 "type": "openai_wire_replay_blocked",
                 "code": "aawm_openai_wire_replay_blocked",
                 "retryable": False,
+                "reason": self.reason,
                 "wire_commitment": self.wire_commitment,
             }
         }
@@ -399,14 +415,27 @@ def get_request_openai_wire_commitment(
     """Return an immutable-by-convention copy of the wire lifecycle snapshot."""
 
     state = _request_state(request)
-    commitment = (
-        getattr(state, _WIRE_COMMITMENT_STATE_KEY, None)
-        if state is not None
-        else None
-    )
+    if state is None:
+        return None
+    commitment = getattr(state, _WIRE_COMMITMENT_STATE_KEY, None)
+    if not isinstance(commitment, Mapping):
+        trace = getattr(state, "_aawm_openai_responses_wire_trace", None)
+        snapshot = getattr(trace, "snapshot", None)
+        if not callable(snapshot):
+            return None
+        try:
+            commitment = snapshot()
+        except Exception:
+            return None
     if not isinstance(commitment, Mapping):
         return None
     return _safe_wire_commitment(commitment)
+
+
+def get_openai_wire_commitment(request: Request) -> Optional[dict[str, Any]]:
+    """Backward-compatible alias for the request-scoped wire snapshot."""
+
+    return get_request_openai_wire_commitment(request)
 
 
 def is_openai_wire_replay_prohibited(
@@ -420,7 +449,9 @@ def is_openai_wire_replay_prohibited(
         commitment.get(flag) is True for flag in _WIRE_REPLAY_BLOCKING_FLAGS
     ):
         return True
-    return commitment.get("disposition") in _WIRE_REPLAY_BLOCKING_DISPOSITIONS
+    return str(commitment.get("disposition") or "").strip().lower() in (
+        _WIRE_REPLAY_BLOCKING_DISPOSITIONS
+    )
 
 
 def ensure_openai_wire_replay_allowed(
@@ -436,6 +467,46 @@ def ensure_openai_wire_replay_allowed(
             commitment=commitment or {},
             ledger=ledger,
         )
+
+
+def _wire_commitment_denial_reason(
+    wire_commitment: Any,
+) -> Optional[str]:
+    if not isinstance(wire_commitment, Mapping):
+        return None
+
+    disposition = str(wire_commitment.get("disposition") or "").strip().lower()
+    if disposition in {"cancelled", "disconnected"}:
+        return f"wire_{disposition}"
+
+    commitment = str(wire_commitment.get("commitment") or "").strip().lower()
+    if commitment in {"headers", "body", "terminal", "done", "finalized"}:
+        return f"wire_commitment_{commitment}"
+
+    state = str(wire_commitment.get("state") or "").strip().lower()
+    if state in {
+        "headers_started",
+        "body_started",
+        "terminal_selected",
+        "terminal_sent",
+        "done_sent",
+    }:
+        return f"wire_state_{state}"
+
+    for field in (
+        "response_start_sent",
+        "first_body_sent",
+        "terminal_selected",
+        "terminal_sent",
+        "done_sent",
+        "terminal_wire_committed",
+        "done_wire_committed",
+        "finalization_started",
+        "finalized",
+    ):
+        if wire_commitment.get(field) is True:
+            return f"wire_{field}"
+    return None
 
 
 def publish_wire_commitment_snapshot(
@@ -600,6 +671,7 @@ __all__ = [
     "close_active_upstream_response",
     "current_candidate_context",
     "ensure_openai_wire_replay_allowed",
+    "get_openai_wire_commitment",
     "get_or_create_openai_provider_call_ledger",
     "get_request_openai_wire_commitment",
     "get_request_provider_call_ledger",
