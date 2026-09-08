@@ -2328,7 +2328,7 @@ def _validate_spawn_agent_schema_property(
     field_name: str,
     expected_type: str,
     value: Any,
-) -> None:
+) -> str:
     aliases = _SPAWN_AGENT_SCHEMA_FIELD_ALIASES.get(
         field_name,
         frozenset({field_name}),
@@ -2339,15 +2339,21 @@ def _validate_spawn_agent_schema_property(
             "Cursor Agent advertised spawn_agent has an ambiguous "
             f"{field_name} field mapping."
         )
-    if field_name not in properties:
+    property_name = present_aliases[0] if present_aliases else None
+    if property_name is None:
         raise CursorConnectProtocolError(
             "Cursor Agent advertised spawn_agent does not accept the required "
             f"{field_name} value."
         )
-    property_schema = properties[field_name]
+    property_schema = properties[property_name]
     if not isinstance(property_schema, Mapping):
         raise CursorConnectProtocolError(
             f"Cursor Agent advertised spawn_agent has an invalid {field_name} schema."
+        )
+    if property_schema.get("readOnly") is True or property_schema.get("read_only") is True:
+        raise CursorConnectProtocolError(
+            "Cursor Agent advertised spawn_agent marks the required "
+            f"{field_name} value as read-only."
         )
     declared_type = property_schema.get("type")
     if isinstance(declared_type, str):
@@ -2361,14 +2367,24 @@ def _validate_spawn_agent_schema_property(
             f"Cursor Agent advertised spawn_agent has an unsupported {field_name} type."
         )
     enum = property_schema.get("enum")
-    if enum is not None and (not isinstance(enum, list) or value not in enum):
+    if enum is not None and (
+        not isinstance(enum, list)
+        or not any(
+            type(enum_value) is type(value) and enum_value == value
+            for enum_value in enum
+        )
+    ):
         raise CursorConnectProtocolError(
             f"Cursor Agent advertised spawn_agent rejects the explicit {field_name} value."
         )
-    if "const" in property_schema and property_schema["const"] != value:
+    if "const" in property_schema and (
+        type(property_schema["const"]) is not type(value)
+        or property_schema["const"] != value
+    ):
         raise CursorConnectProtocolError(
             f"Cursor Agent advertised spawn_agent rejects the explicit {field_name} value."
         )
+    return property_name
 
 
 def _build_spawn_agent_arguments(
@@ -2396,27 +2412,27 @@ def _build_spawn_agent_arguments(
         ("model", "string", model_id),
         ("message", "string", prompt),
     ):
-        _validate_spawn_agent_schema_property(
+        property_name = _validate_spawn_agent_schema_property(
             properties,
             field_name=field_name,
             expected_type=expected_type,
             value=value,
         )
-        arguments[field_name] = value
+        arguments[property_name] = value
 
     if readonly_present:
         if "readonly" in properties:
-            _validate_spawn_agent_schema_property(
+            property_name = _validate_spawn_agent_schema_property(
                 properties,
                 field_name="readonly",
                 expected_type="boolean",
                 value=readonly,
             )
-            arguments["readonly"] = readonly
-        elif readonly:
+            arguments[property_name] = readonly
+        else:
             raise CursorConnectProtocolError(
-                "Cursor Agent subagent operation requests readonly execution, "
-                "but the advertised spawn_agent schema cannot represent it."
+                "Cursor Agent subagent operation contains an explicit readonly "
+                "value, but the advertised spawn_agent schema cannot represent it."
             )
 
     missing_required = [

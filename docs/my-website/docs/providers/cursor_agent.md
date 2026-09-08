@@ -115,6 +115,37 @@ sidecar does not execute or depend on the Cursor CLI. If no exchangeable
 or unusable access token. Optional usage polling remains disabled and is not
 auth-refresh evidence.
 
+## Stock Codex child agents
+
+Stock Codex child-agent requests arrive from Cursor as ExecServerMessage field
+28, `SubagentArgs`. LiteLLM bridges the supported fields to the advertised
+`spawn_agent` tool and returns the child result on the same request and
+`exec_id` correlation:
+
+| `SubagentArgs` field | `spawn_agent` argument |
+|---|---|
+| `subagent_type` | `agent_type`, `subagent_type`, or `type` |
+| `model_id` | `model` or `model_id` |
+| `prompt` | `message` or `prompt` |
+| `readonly` | `readonly` |
+
+When Cursor advertises `spawn_agent`, `inputSchemaJson` may contain the schema
+as a JSON string or `parameters` may contain it as an object. In either form,
+the schema must be an object with `properties`. Each bridged property must
+declare the matching scalar `type`; `enum` and `const` restrictions must
+accept the requested value. Required properties must be representable by the
+request. LiteLLM emits the advertised property spelling, rejects ambiguous
+aliases, and fails closed when an explicit `readonly` value or another
+required field cannot be represented. Without an advertised schema, it uses
+the canonical
+`agent_type`/`model`/`message` argument names.
+
+Credential, selected-context, resume, fork, continuation, parent-state,
+background, non-default environment, and model-parameter fields are not
+portable across this bridge. Unsupported or non-default values fail closed;
+they are never forwarded as generic tool arguments or logged in protocol
+errors.
+
 ## What this is not
 
 - Cloud Agents `/v0/agents` on `https://api.cursor.com`
