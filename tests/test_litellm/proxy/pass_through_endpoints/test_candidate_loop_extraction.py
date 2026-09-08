@@ -4219,19 +4219,14 @@ async def test_candidate_loop_cursor_session_continuation_is_session_scoped(  # 
     )
     assert failure_records[0]["error_class"] == "continuation_state_unavailable"
     attempt_record = failure_records[0]["attempt_record"]
-    assert attempt_record["status"] == "cooldown_set"
-    assert attempt_record["cooldown_scope"] == "candidate"
-    assert attempt_record["cooldown_seconds"] == 300.0
+    assert attempt_record["status"] == "retryable_no_cooldown"
+    assert attempt_record["cooldown_scope"] == "none"
+    assert attempt_record.get("cooldown_seconds", 0.0) == 0.0
     assert attempt_record["attempted_provider_call"] is False
     assert attempt_record["failure_phase"] == "cursor_session_continuation"
     assert attempt_record["source_error"]
     assert evidence_calls[0]["cooldown_key"] == selection["cooldown_key"]
-    assert len(publication_calls) == 1
-    publication_plan = publication_calls[0]["plan"]
-    assert publication_plan.applied_scope == "candidate"
-    assert publication_plan.duration_seconds == 300.0
-    assert publication_plan.memory_keys == (selection["cooldown_key"],)
-    assert publication_plan.durable_keys == (selection["cooldown_key"],)
+    assert publication_calls == []
     assert terminal_events and terminal_events[0]["exc"].status_code == 409
     assert routing_state.codex.cooldown_until_monotonic_by_key == {}
     assert routing_state.codex.candidate_semantic_ineligibility_by_key == {}
@@ -4557,17 +4552,7 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
         },
     ]
     assert replay_safe_classifier(candidate_bodies[1]) is True
-    assert len(publication_calls) == 1
-    publication_plan = publication_calls[0]["plan"]
-    assert publication_plan.applied_scope == "candidate"
-    assert publication_plan.duration_seconds == 300.0
-    assert publication_plan.memory_keys == (
-        "cursor_agent:cursor-grok-4.6-high",
-    )
-    assert publication_plan.durable_keys == (
-        "cursor_agent:cursor-grok-4.6-high",
-    )
-    assert publication_calls[0]["candidate"] is cursor_candidate
+    assert publication_calls == []
     assert routing_state.codex.cooldown_until_monotonic_by_key == {}
     assert routing_state.codex.candidate_semantic_ineligibility_by_key == {}
 
@@ -5078,24 +5063,15 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
     assert metadata_attempts
     assert all(captured is metadata_attempts[0] for captured in metadata_attempts)
     attempts = metadata_attempts[-1]
-    assert attempts[0]["status"] == "cooldown_set"
+    assert attempts[0]["status"] == "retryable_no_cooldown"
     assert attempts[0]["error_class"] == "continuation_state_unavailable"
     assert attempts[0]["attempted_provider_call"] is False
-    assert attempts[0]["cooldown_scope"] == "candidate"
-    assert attempts[0]["cooldown_seconds"] == 300.0
+    assert attempts[0]["cooldown_scope"] == "none"
+    assert attempts[0].get("cooldown_seconds", 0.0) == 0.0
     assert attempts[0]["failure_phase"] == "cursor_session_continuation"
     assert attempts[0]["source_error"]
     assert attempts[1]["error_class"] == "rate_limited"
-    assert len(publication_calls) == 1
-    publication_plan = publication_calls[0]["plan"]
-    assert publication_plan.applied_scope == "candidate"
-    assert publication_plan.duration_seconds == 300.0
-    assert publication_plan.memory_keys == (
-        "cursor_agent:cursor-grok-4.6-high",
-    )
-    assert publication_plan.durable_keys == (
-        "cursor_agent:cursor-grok-4.6-high",
-    )
+    assert publication_calls == []
     assert routing_state.codex.cooldown_until_monotonic_by_key == {}
     assert routing_state.codex.candidate_semantic_ineligibility_by_key == {}
 
@@ -5383,8 +5359,8 @@ async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_a
     attempt = failure_records[0]["attempt_record"]
     assert attempt[field_name] == expected_structure
     assert attempt["error_class"] == "continuation_state_unavailable"
-    assert attempt["cooldown_scope"] == "candidate"
-    assert attempt["cooldown_seconds"] == 300.0
+    assert attempt["cooldown_scope"] == "none"
+    assert attempt.get("cooldown_seconds", 0.0) == 0.0
     assert attempt["attempted_provider_call"] is False
     assert attempt["failure_phase"] == "cursor_session_continuation"
     rejection_field = codex_candidate_calls._CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD
@@ -5395,12 +5371,8 @@ async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_a
     assert attempt[rejection_field] == expected_rejection
     assert attempt["schema_rejection"]["category"] == "cursor_replay"
     assert attempt["schema_rejection"]["reason"] == "replay_state_lookup"
-    assert cooldown_memory_publications == [
-        {"keys": (selection["cooldown_key"],), "seconds": 300.0}
-    ]
-    assert cooldown_persistences == [
-        {"keys": (selection["cooldown_key"],), "seconds": 300.0}
-    ]
+    assert cooldown_memory_publications == []
+    assert cooldown_persistences == []
     assert len(persisted) == 1
     terminal_event = persisted[0][-1]
     assert terminal_event["event_type"] == "no_candidate_available"

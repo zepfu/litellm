@@ -1265,7 +1265,7 @@ _LOCAL_EXEC_BRIDGE_FIELDS = {
     2: "shell_args",
     14: "shell_stream_args",
 }
-_RETAINED_EXTERNAL_EXEC_FIELDS = frozenset({2, 7, 14, 28})
+_RETAINED_EXTERNAL_EXEC_FIELDS = frozenset({2, 7, 11, 14, 28})
 _LOCAL_EXEC_TOOL_NAMES = (
     "exec_command",
     "shell",
@@ -2155,6 +2155,29 @@ def _encode_subagent_terminal_result(
     ]
 
 
+def _encode_mcp_terminal_result(
+    exec_request: Mapping[str, Any],
+    output: Any,
+) -> List[bytes]:
+    text = output if isinstance(output, str) else json.dumps(
+        output, ensure_ascii=False, separators=(",", ":")
+    )
+    # McpResult.success.content[].text.text preserves the external tool output.
+    content = _encode_proto_message_field(
+        1, _encode_proto_string_field(1, text, include_empty=True)
+    )
+    success = _encode_proto_message_field(1, content)
+    exec_fields = cast(List[tuple[int, int, Any]], exec_request["exec_fields"])
+    return [
+        _encode_exec_client_message(
+            exec_fields,
+            message_field=11,
+            message_payload=_encode_proto_message_field(1, success),
+        ),
+        _encode_exec_stream_close(exec_fields),
+    ]
+
+
 def _encode_external_exec_terminal_result(
     exec_request: Mapping[str, Any],
     output: Any,
@@ -2164,6 +2187,8 @@ def _encode_external_exec_terminal_result(
         return _encode_shell_terminal_result(exec_request, output)
     if message_field == 7:
         return _encode_read_terminal_result(exec_request, output)
+    if message_field == 11:
+        return _encode_mcp_terminal_result(exec_request, output)
     if message_field == 14:
         return _encode_shell_stream_terminal_result(exec_request, output)
     if message_field == 28:
@@ -2742,6 +2767,14 @@ def _process_agent_server_message(
             }
             if tool_call["id"]:
                 completed_tool_call["itemId"] = tool_call["id"]
+            if external_exec_requests is not None:
+                external_exec_requests.append(
+                    {
+                        "call_id": call_id,
+                        "message_field": 11,
+                        "exec_fields": _exec_identity_fields(exec_fields),
+                    }
+                )
             return (
                 {
                     "interactionUpdate": {
@@ -2843,6 +2876,7 @@ class CursorAgentRetainedSession:
         local_exec_tool_name: Optional[str],
         spawn_agent_tool_definition: Optional[Mapping[str, Any]],
         saw_response_headers: bool,
+        retain_on_tool_call: bool = False,
     ) -> None:
         self.reader = reader
         self.writer = writer
@@ -2853,6 +2887,7 @@ class CursorAgentRetainedSession:
         self.local_exec_tool_name = local_exec_tool_name
         self.spawn_agent_tool_definition = spawn_agent_tool_definition
         self.saw_response_headers = saw_response_headers
+        self.retain_on_tool_call = retain_on_tool_call
         self.response_status_code: Optional[int] = None
         self.response_headers: Dict[str, str] = {}
         self.error_response_body = bytearray()
@@ -2878,7 +2913,7 @@ class CursorAgentRetainedSession:
             )
         if int(exec_request.get("message_field") or 0) not in _RETAINED_EXTERNAL_EXEC_FIELDS:
             raise CursorConnectProtocolError(
-                "Cursor Agent retained continuation supports only fields 2, 7, 14, and 28."
+                "Cursor Agent retained continuation supports only fields 2, 7, 11, 14, and 28."
             )
         self._external_exec_requests[call_id] = dict(exec_request)
 
@@ -2948,7 +2983,7 @@ class CursorAgentRetainedSession:
             ):
                 self.pending.extend(encode_connect_proto_frame(client_message))
         result = await self._read_until_boundary(
-            stop_on_tool_call=True,
+            stop_on_tool_call=False,
             timeout=timeout,
         )
         if result.tool_calls and self.can_continue:
@@ -3016,11 +3051,24 @@ class CursorAgentRetainedSession:
             self.pending.extend(encode_connect_proto_frame(client_message))
         if normalized:
             result.add_payload(normalized)
+        if self.retain_on_tool_call:
+            # Interaction notifications alone do not authorize external execution.
+            result.tool_calls = [
+                tool_call
+                for tool_call in result.tool_calls
+                if tool_call["call_id"] in self._external_exec_requests
+            ]
         if result.turn_ended:
             return True
         return bool(
             result.tool_calls
-            and (stop_on_tool_call or self._external_exec_requests)
+            and (
+                stop_on_tool_call
+                or all(
+                    tool_call["call_id"] in self._external_exec_requests
+                    for tool_call in result.tool_calls
+                )
+            )
         )
 
     async def _read_until_boundary(  # noqa: PLR0915
@@ -4174,13 +4222,14 @@ class CursorAgentConnectClient:
                 local_exec_tool_name=local_exec_tool_name,
                 spawn_agent_tool_definition=spawn_agent_tool_definition,
                 saw_response_headers=False,
+                retain_on_tool_call=retain_on_tool_call,
             )
             writer.write(connection.data_to_send())
             await writer.drain()
             result = await session.start(
                 request_body,
                 timeout=terminal_timeout,
-                stop_on_tool_call=stop_on_tool_call,
+                stop_on_tool_call=stop_on_tool_call and not retain_on_tool_call,
             )
             if retain_on_tool_call and result.tool_calls and session.can_continue:
                 result.retained_session = session
