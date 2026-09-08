@@ -1024,17 +1024,48 @@ appears, the result explicitly uses `observation_state=no_history_observed`;
 auth, throttle, challenge, identity, boundary, and body failures use an
 explicit failed observation state and preserve only a safe retry-after value.
 
-The sidecar has an explicit opt-in entrypoint for this observer. Supply
+The sidecar has an explicit opt-in entrypoint for this observer. Before
+execution, the parent must verify that the bound browser session has no active
+conversation-history cooldown, then supply both
 `--chatgpt-native-history-probe-account-label account1` (or the matching
-`AAWM_CHATGPT_NATIVE_HISTORY_PROBE_ACCOUNT_LABEL` environment value) together
-with an Oracle profile binding for that exact label. The label must resolve to
-exactly one enabled Codex OAuth inventory record whose pinned account hash is
+`AAWM_CHATGPT_NATIVE_HISTORY_PROBE_ACCOUNT_LABEL` environment value) and
+`--chatgpt-native-history-probe-cooldown-cleared` (or
+`AAWM_CHATGPT_NATIVE_HISTORY_PROBE_COOLDOWN_CLEARED=1`) together with an
+Oracle profile binding for that exact label. The label must resolve to exactly
+one enabled Codex OAuth inventory record whose pinned account hash is
 `8e92854835c4`; a CDP-only binding is rejected because native history requires
 the private profile owner's supervised lifecycle capability. This action runs
-before provider observations and all other sidecar tasks, performs no database
-setup or persistence, and emits one structural observation event with the
-existing fixed classification fields only. It is a one-shot foreground action,
-not a recurring schedule.
+before provider observations, schema setup, and all other sidecar tasks,
+performs no database setup or persistence, and uses one 150-second operation
+budget including startup, observation, and owner cleanup. It emits one
+structural observation event with the existing fixed classification fields
+only; preflight and boundary failures use fixed classes and never echo raw
+labels, URLs, identifiers, headers, content, or exception text. It is a
+one-shot foreground action, not a recurring schedule. A
+`history_observation_failed` result exits nonzero; `no_history_observed` is a
+distinct bounded outcome and exits zero.
+
+Parent-run shape (replace only the profile path and deployment-specific
+executable paths):
+
+```bash
+AAWM_CHATGPT_NATIVE_HISTORY_PROBE_ACCOUNT_LABEL=account1 \
+AAWM_CHATGPT_NATIVE_HISTORY_PROBE_COOLDOWN_CLEARED=1 \
+AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS='{"account1":{"oracle_profile_path":"/path/to/operator-approved-profile"}}' \
+AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE=/path/to/node \
+AAWM_CHATGPT_ORACLE_PACKAGE_DIR=/path/to/oracle-package \
+AAWM_CHATGPT_ORACLE_CHROME_EXECUTABLE=/path/to/chrome \
+python3 scripts/run_provider_status_observations_loop.py \
+  --chatgpt-native-history-probe-account-label account1 \
+  --chatgpt-native-history-probe-cooldown-cleared
+```
+
+The parent must also provide the explicit Codex OAuth inventory containing the
+enabled `account1` record pinned to `8e92854835c4`, and `xvfb-run` when no
+`DISPLAY` is available. The profile, node, package, and Chrome paths are
+runtime prerequisites, not fallback discovery inputs. This command must be
+run only after the parent checks that no other process owns the browser session
+or has an active conversation-history cooldown.
 
 ## Alibaba Token Plan quota polling
 

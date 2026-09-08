@@ -414,6 +414,9 @@ DEFAULT_CHATGPT_NATIVE_HISTORY_PROBE_TIMEOUT_SECONDS = 150.0
 CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV = (
     "AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS"
 )
+CHATGPT_NATIVE_HISTORY_PROBE_COOLDOWN_CLEARED_ENV = (
+    "AAWM_CHATGPT_NATIVE_HISTORY_PROBE_COOLDOWN_CLEARED"
+)
 CHATGPT_ORACLE_NODE_EXECUTABLE_ENV = "AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE"
 CHATGPT_ORACLE_PACKAGE_DIR_ENV = "AAWM_CHATGPT_ORACLE_PACKAGE_DIR"
 CHATGPT_ORACLE_CHROME_EXECUTABLE_ENV = "AAWM_CHATGPT_ORACLE_CHROME_EXECUTABLE"
@@ -1611,6 +1614,7 @@ class ProviderStatusLoopConfig:
         Dict[str, "ChatGPTConversationInitAccountBinding"]
     ] = None
     chatgpt_native_history_probe_account_label: Optional[str] = None
+    chatgpt_native_history_probe_cooldown_cleared: bool = False
     grok_billing_url: str = DEFAULT_GROK_BILLING_URL
     grok_billing_client_version: Optional[str] = None
     grok_billing_client_version_source: Optional[str] = None
@@ -4840,6 +4844,21 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "profile binding for pinned account 8e92854835c4."
         ),
     )
+    parser.add_argument(
+        "--chatgpt-native-history-probe-cooldown-cleared",
+        dest="chatgpt_native_history_probe_cooldown_cleared",
+        action="store_true",
+        default=_env_bool(
+            CHATGPT_NATIVE_HISTORY_PROBE_COOLDOWN_CLEARED_ENV,
+            False,
+        ),
+        help=(
+            "Require the parent/operator to verify that the bound browser "
+            "session has no active conversation-history cooldown before the "
+            "one-shot probe starts. Defaults to "
+            f"{CHATGPT_NATIVE_HISTORY_PROBE_COOLDOWN_CLEARED_ENV} or false."
+        ),
+    )
 
     codex_credit_group = parser.add_mutually_exclusive_group()
     codex_credit_group.add_argument(
@@ -5535,6 +5554,9 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
             str(args.chatgpt_native_history_probe_account_label).strip()
             if args.chatgpt_native_history_probe_account_label is not None
             else None
+        ),
+        chatgpt_native_history_probe_cooldown_cleared=(
+            args.chatgpt_native_history_probe_cooldown_cleared
         ),
         grok_billing_url=args.grok_billing_url,
         grok_billing_client_version=args.grok_billing_client_version,
@@ -16995,7 +17017,106 @@ def _build_one_shot_status_event(
     }
 
 
-def _run_chatgpt_native_history_probe(
+_CHATGPT_NATIVE_HISTORY_PROBE_OBSERVATION_STATES = frozenset(
+    {
+        "history_observed",
+        "history_observation_failed",
+        "no_history_observed",
+    }
+)
+_CHATGPT_NATIVE_HISTORY_PROBE_OBSERVATION_KEYS = frozenset(
+    {
+        "observer",
+        "observation_state",
+        "route_class",
+        "http_status",
+        "account_identity_verified",
+        "account_identity_source",
+        "identity_match",
+        "request_response_correlated",
+        "request_method",
+        "request_body_omitted",
+        "page_target_id_matched",
+        "request_count",
+        "request_count_truncated",
+        "request_count_is_lower_bound",
+        "history_request_count",
+        "history_request_count_truncated",
+        "history_request_count_is_lower_bound",
+        "response_bytes",
+        "response_content_type",
+        "retry_after_seconds",
+        "browser_challenge",
+        "structural_metadata",
+        "model_field_presence",
+        "field_presence_type_counts",
+        "traversal",
+        "failure_reason",
+        "warnings",
+    }
+)
+
+
+def _set_chatgpt_native_history_probe_failure(
+    event: Dict[str, Any],
+    *,
+    error_class: str,
+    telemetry_class: str,
+) -> None:
+    event["error_class"] = error_class
+    event["telemetry_class"] = telemetry_class
+
+
+def _chatgpt_native_history_probe_exception_class(exc: BaseException) -> tuple[
+    str, str
+]:
+    if isinstance(exc, OracleBrowserCleanupError):
+        return "ChatGPTNativeHistoryProbeCleanupFailed", "cleanup"
+    if isinstance(exc, TimeoutError):
+        return "ChatGPTNativeHistoryProbeDeadlineExceeded", "timeout"
+    if isinstance(exc, ChatGPTConversationInitError):
+        return "ChatGPTNativeHistoryProbeBoundaryUnavailable", "boundary"
+    return "ChatGPTNativeHistoryProbeFailed", "internal"
+
+
+def _sanitize_chatgpt_native_history_probe_observation(
+    value: Any,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    state = value.get("observation_state")
+    if state not in _CHATGPT_NATIVE_HISTORY_PROBE_OBSERVATION_STATES:
+        return None
+    return {
+        key: value[key]
+        for key in _CHATGPT_NATIVE_HISTORY_PROBE_OBSERVATION_KEYS
+        if key in value
+    }
+
+
+def _chatgpt_native_history_probe_exit_status(
+    event: Mapping[str, Any],
+) -> int:
+    if event.get("error_class"):
+        return 1
+    observation = event.get("observation")
+    if not isinstance(observation, Mapping):
+        return 1
+    observation_state = observation.get("observation_state")
+    if observation_state == "history_observation_failed":
+        return 1
+    if observation_state == "no_history_observed":
+        return (
+            0
+            if observation.get("failure_reason") in (None, "no_history_observed")
+            else 1
+        )
+    if observation_state == "history_observed":
+        return 0 if observation.get("failure_reason") is None else 1
+    return 1
+
+
+def _run_chatgpt_native_history_probe(  # noqa: PLR0915 - bounded one-shot probe
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
 ) -> Dict[str, Any]:
@@ -17007,72 +17128,159 @@ def _run_chatgpt_native_history_probe(
         "environment": config.environment,
         "attempted": False,
     }
+    probe_deadline = (
+        time.monotonic() + DEFAULT_CHATGPT_NATIVE_HISTORY_PROBE_TIMEOUT_SECONDS
+    )
+    if state.chatgpt_oracle_browser_shutdown_deadline is None:
+        state.chatgpt_oracle_browser_shutdown_deadline = probe_deadline
+    else:
+        state.chatgpt_oracle_browser_shutdown_deadline = min(
+            state.chatgpt_oracle_browser_shutdown_deadline,
+            probe_deadline,
+        )
+
     label = config.chatgpt_native_history_probe_account_label
     if label is None:
-        event.update(
-            {
-                "error_class": "ChatGPTNativeHistoryProbeNotConfigured",
-                "error_message": "Native-history probe account label is absent.",
-                "telemetry_class": "configuration",
-            }
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeNotConfigured",
+            telemetry_class="configuration",
         )
         return event
-    event["account_label"] = label
 
     try:
         inventory = _require_codex_oauth_inventory(config)
+    except Exception:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeInventoryUnavailable",
+            telemetry_class="configuration",
+        )
+        return event
+
+    try:
         matches = [
             record
             for record in inventory.ordered_records(enabled_only=True)
             if record.label == label
         ]
-        if len(matches) != 1:
-            raise RuntimeError(
-                f"Codex OAuth inventory label '{label}' is not uniquely enabled."
-            )
-        record = matches[0]
-        event["account_hash"] = record.expected_account_hash
-        if record.expected_account_hash != (
-            CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH
-        ):
-            raise RuntimeError(
-                "Native-history probe requires pinned account hash "
-                f"'{CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH}'."
-            )
-        binding = (config.chatgpt_conversation_init_account_bindings or {}).get(
-            label
+    except Exception:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeInventoryUnavailable",
+            telemetry_class="configuration",
         )
-        if binding is None:
-            raise RuntimeError(
-                f"No ChatGPT browser binding configured for account '{label}'."
-            )
-        if binding.oracle_profile_path is None:
-            raise RuntimeError(
-                "Native-history probe requires an Oracle profile binding so the "
-                "sidecar owns the private browser lifecycle."
-            )
+        return event
+    if not matches:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeAccountNotFound",
+            telemetry_class="configuration",
+        )
+        return event
+    if len(matches) != 1:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeAccountNotUnique",
+            telemetry_class="configuration",
+        )
+        return event
 
-        event["attempted"] = True
+    record = matches[0]
+    if record.expected_account_hash != CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeAccountHashMismatch",
+            telemetry_class="configuration",
+        )
+        return event
+    event["account_label"] = record.label
+    event["account_hash"] = record.expected_account_hash
+
+    binding = (config.chatgpt_conversation_init_account_bindings or {}).get(label)
+    if binding is None:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeBindingMissing",
+            telemetry_class="configuration",
+        )
+        return event
+    if binding.oracle_profile_path is None:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeProfileBindingRequired",
+            telemetry_class="configuration",
+        )
+        return event
+
+    session_keys = _chatgpt_conversation_init_session_keys(
+        binding,
+        account_label=record.label,
+    )
+    if _chatgpt_conversation_init_session_cooldown_active(
+        state,
+        session_keys,
+        now_monotonic=time.monotonic(),
+    ):
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeSharedSessionCooldown",
+            telemetry_class="throttled",
+        )
+        return event
+    if not config.chatgpt_native_history_probe_cooldown_cleared:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeCooldownClearanceRequired",
+            telemetry_class="configuration",
+        )
+        return event
+
+    remaining = probe_deadline - time.monotonic()
+    if remaining <= DEFAULT_CHATGPT_ORACLE_STARTUP_TIMEOUT_SECONDS:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeDeadlineExceeded",
+            telemetry_class="timeout",
+        )
+        return event
+
+    event["attempted"] = True
+    try:
         with _chatgpt_oracle_browser_binding(
             binding,
             history_task_state=state,
         ) as resolved:
+            remaining = probe_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("native-history probe deadline expired")
             result = observe_native_chatgpt_history_from_oracle_browser(
                 page_target_id=resolved.page_target_id,
                 cdp_endpoint=resolved.cdp_endpoint,
                 lifecycle_capability=resolved.lifecycle_capability,
                 expected_account_hash=record.expected_account_hash,
-                timeout_seconds=(
-                    DEFAULT_CHATGPT_NATIVE_HISTORY_PROBE_TIMEOUT_SECONDS
+                timeout_seconds=min(
+                    DEFAULT_CHATGPT_NATIVE_HISTORY_PROBE_TIMEOUT_SECONDS,
+                    remaining,
                 ),
             )
-        event["observation"] = result
+        observation = _sanitize_chatgpt_native_history_probe_observation(result)
+        if observation is None:
+            _set_chatgpt_native_history_probe_failure(
+                event,
+                error_class="ChatGPTNativeHistoryProbeMalformedObservation",
+                telemetry_class="boundary",
+            )
+        else:
+            event["observation"] = observation
     except Exception as exc:
-        event.update(
-            {
-                "error_class": exc.__class__.__name__,
-                "error_message": _redacted_failure_message(str(exc)),
-            }
+        error_class, telemetry_class = _chatgpt_native_history_probe_exception_class(
+            exc
+        )
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class=error_class,
+            telemetry_class=telemetry_class,
         )
     return event
 
@@ -17083,7 +17291,7 @@ def _run_chatgpt_native_history_probe_once(
 ) -> int:
     result = _run_chatgpt_native_history_probe(config, state)
     _emit(result)
-    return 1 if result.get("error_class") else 0
+    return _chatgpt_native_history_probe_exit_status(result)
 
 
 def _emit(payload: Dict[str, Any]) -> None:
@@ -17355,19 +17563,6 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
             }
         )
         return 1
-    try:
-        validate_runtime_guardrails(config)
-    except Exception as exc:
-        _emit(
-            {
-                "event": "provider_status_observations_guardrail_error",
-                "observed_at": _utc_timestamp(),
-                "environment": config.environment,
-                "error_class": exc.__class__.__name__,
-                "error_message": str(exc),
-            }
-        )
-        return 1
     stopping = False
     sidecar_state: Optional[SidecarTaskState] = None
 
@@ -17390,6 +17585,51 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
             for owner in owners:
                 owner.request_shutdown()
 
+    if native_probe_label is not None:
+        exit_status = 1
+        drained = True
+        sidecar_state = SidecarTaskState()
+        try:
+            _admit_sidecar_task_state(sidecar_state)
+            signal.signal(signal.SIGINT, _stop)
+            signal.signal(signal.SIGTERM, _stop)
+            exit_status = _run_chatgpt_native_history_probe_once(
+                config,
+                sidecar_state,
+            )
+        except Exception:
+            # The probe event itself uses only fixed classifications. A failure
+            # before it can be emitted must still reach the bounded drain.
+            exit_status = 1
+        finally:
+            shutdown_deadline = (
+                sidecar_state.chatgpt_oracle_browser_shutdown_deadline
+                or time.monotonic() + DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS
+            )
+            try:
+                drained = _drain_pending_chatgpt_oracle_browser_owners(
+                    sidecar_state,
+                    deadline=shutdown_deadline,
+                )
+            except Exception:
+                drained = False
+            _release_sidecar_task_state(sidecar_state)
+        return exit_status or (0 if drained else 1)
+
+    try:
+        validate_runtime_guardrails(config)
+    except Exception as exc:
+        _emit(
+            {
+                "event": "provider_status_observations_guardrail_error",
+                "observed_at": _utc_timestamp(),
+                "environment": config.environment,
+                "error_class": exc.__class__.__name__,
+                "error_message": str(exc),
+            }
+        )
+        return 1
+
     if config.apply and config.setup_schema:
         try:
             _emit(setup_schema_once(config))
@@ -17406,40 +17646,6 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
             )
             if config.once:
                 return 1
-
-    if native_probe_label is not None:
-        try:
-            sidecar_state = SidecarTaskState()
-            _admit_sidecar_task_state(sidecar_state)
-            signal.signal(signal.SIGINT, _stop)
-            signal.signal(signal.SIGTERM, _stop)
-            exit_status = _run_chatgpt_native_history_probe_once(
-                config,
-                sidecar_state,
-            )
-            shutdown_deadline = (
-                sidecar_state.chatgpt_oracle_browser_shutdown_deadline
-                or time.monotonic() + DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS
-            )
-            drained = _drain_pending_chatgpt_oracle_browser_owners(
-                sidecar_state,
-                deadline=shutdown_deadline,
-            )
-            while not drained:
-                _service_pending_chatgpt_oracle_browser_owners(
-                    sidecar_state,
-                    deadline=shutdown_deadline,
-                )
-                with sidecar_state.pending_chatgpt_oracle_browser_owners_lock:
-                    pending = bool(sidecar_state.pending_chatgpt_oracle_browser_owners)
-                if not pending:
-                    drained = True
-                    break
-                time.sleep(0.1)
-            return exit_status or (0 if drained else 1)
-        finally:
-            if sidecar_state is not None:
-                _release_sidecar_task_state(sidecar_state)
 
     sidecar_state = SidecarTaskState()
     _admit_sidecar_task_state(sidecar_state)
