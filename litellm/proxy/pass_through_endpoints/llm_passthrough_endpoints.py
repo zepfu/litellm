@@ -81,6 +81,9 @@ from litellm.llms.xai.oauth import (
     normalize_grok_native_oauth_model,
     resolve_oa_xai_upstream_model,
 )
+from litellm.llms.xai.route_descriptors import (
+    GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+)
 from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 from litellm.proxy._types import *
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
@@ -2423,7 +2426,9 @@ _ANTHROPIC_XAI_PROVIDER_RUNTIME = _anthropic_xai_provider.Runtime(
     normalize_endpoint=lambda **kwargs: (BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(**kwargs)),
     join_url=lambda *args: BaseOpenAIPassThroughHandler._join_url_paths(*args),
     url_factory=httpx.URL,
-    assemble_headers=lambda **kwargs: (BaseOpenAIPassThroughHandler._assemble_headers(**kwargs)),
+    assemble_headers=lambda **kwargs: (
+        BaseOpenAIPassThroughHandler._assemble_xai_oauth_headers(**kwargs)
+    ),
     prepare_completion_body=lambda body, **kwargs: (_prepare_anthropic_completion_adapter_request_body(body, **kwargs)),
     validate_egress=lambda **kwargs: (HttpPassThroughEndpointHelpers.validate_outgoing_egress(**kwargs)),
     provider=litellm.LlmProviders.XAI.value,
@@ -4282,7 +4287,7 @@ async def grok_proxy_route(
         query_params=query_params,
         stream="stream" in str(target_url),
         custom_llm_provider=litellm.LlmProviders.XAI.value,
-        egress_credential_family="xai",
+        egress_credential_family=GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
         expected_target_family="xai",
         allowed_forward_headers=list(_GROK_CLI_FORWARD_HEADER_ALLOWLIST),
         raw_body_passthrough=raw_body_passthrough,

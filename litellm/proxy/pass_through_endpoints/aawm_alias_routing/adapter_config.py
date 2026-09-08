@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 from typing_extensions import NotRequired, TypedDict
 
+from litellm.llms.xai.route_descriptors import XAI_OAUTH_CREDENTIAL_FAMILY
+
 from .types import Payload
 
 # Callable type aliases keep the god-file free of re-declaring the same shapes.
@@ -124,7 +126,7 @@ XAI_OAUTH_COMPLETION = AnthropicCompletionAdapterConfig(
     tag_prefix="anthropic-xai-oauth-completion-adapter",
     span_name="anthropic.xai_oauth_completion_adapter",
     target_endpoint_label="xai:/v1/chat/completions",
-    credential_family="xai",
+    credential_family=XAI_OAUTH_CREDENTIAL_FAMILY,
     expected_target_family="xai",
     custom_llm_provider="xai",
 )
