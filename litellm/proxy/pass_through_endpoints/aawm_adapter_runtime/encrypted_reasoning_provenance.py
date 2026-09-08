@@ -509,6 +509,31 @@ def _function_call_output_has_plaintext(item: Mapping[str, Any]) -> bool:
     return _function_call_output_part_is_plaintext(item.get("output"))
 
 
+def _function_call_output_has_supported_output_part(value: Any) -> bool:
+    """True when a non-ciphertext Responses output part remains.
+
+    ``function_call_output.output`` normally holds plaintext text, but Codex
+    clients can serialize structured result parts such as images and files.
+    Those parts are supported tool data and must survive ciphertext removal.
+    """
+    if isinstance(value, Mapping):
+        if str(value.get("type") or "").strip() in {
+            "input_image",
+            "input_file",
+        }:
+            return True
+        return any(
+            _function_call_output_has_supported_output_part(nested)
+            for nested in value.values()
+        )
+    if isinstance(value, list):
+        return any(
+            _function_call_output_has_supported_output_part(nested)
+            for nested in value
+        )
+    return False
+
+
 def _strip_nested_encrypted_function_output(value: Any) -> tuple[Any, bool]:
     """Drop nested encrypted_content parts; keep plaintext tool results."""
     if isinstance(value, Mapping):
@@ -1335,7 +1360,11 @@ def prepare_encrypted_function_output_items_for_openai_egress(
                 item.pop("encrypted_content", None)
                 stripped_count += 1
                 changed = True
-            if not _function_call_output_has_plaintext(clean_item):
+            if not _function_call_output_has_plaintext(clean_item) and not (
+                _function_call_output_has_supported_output_part(
+                    clean_item.get("output")
+                )
+            ):
                 # Ciphertext may be the output value itself, not only an
                 # encrypted_content part nested inside a structured output.
                 # Preserve the call ID with the same harmless placeholder.
