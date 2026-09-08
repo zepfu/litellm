@@ -152,6 +152,62 @@ else:
 
 class BaseLLMHTTPHandler:
     @staticmethod
+    def _is_managed_xai_oauth_request(litellm_params: dict) -> bool:
+        metadata = litellm_params.get("litellm_metadata")
+        if not isinstance(metadata, dict):
+            metadata = litellm_params.get("metadata")
+        if not isinstance(metadata, dict):
+            return False
+        return (
+            metadata.get("xai_oauth_managed") is True
+            and metadata.get("auth_mode") == "oauth"
+            and metadata.get("credential_family") == "xai_oauth"
+            and metadata.get("route_family") == "xai_oauth_api"
+        )
+
+    @staticmethod
+    async def _raise_managed_xai_oauth_redirect_error(
+        e: httpx.HTTPStatusError,
+        provider_config: BaseConfig,
+    ) -> None:
+        try:
+            await e.response.aclose()
+        except Exception:
+            verbose_logger.debug(
+                "Failed to close rejected managed xAI OAuth redirect response",
+                exc_info=True,
+            )
+        raise provider_config.get_error_class(
+            error_message=(
+                "Blocked managed xAI OAuth redirect response before "
+                "follow-up request."
+            ),
+            status_code=500,
+            headers={},
+        ) from None
+
+    @staticmethod
+    def _raise_managed_xai_oauth_redirect_error_sync(
+        e: httpx.HTTPStatusError,
+        provider_config: BaseConfig,
+    ) -> None:
+        try:
+            e.response.close()
+        except Exception:
+            verbose_logger.debug(
+                "Failed to close rejected managed xAI OAuth redirect response",
+                exc_info=True,
+            )
+        raise provider_config.get_error_class(
+            error_message=(
+                "Blocked managed xAI OAuth redirect response before "
+                "follow-up request."
+            ),
+            status_code=500,
+            headers={},
+        ) from None
+
+    @staticmethod
     def _resolve_shared_session_for_http_client(
         litellm_params: Optional[dict],
         shared_session: Optional["ClientSession"] = None,
@@ -180,6 +236,9 @@ class BaseLLMHTTPHandler:
         max_retry_on_unprocessable_entity_error = (
             provider_config.max_retry_on_unprocessable_entity_error
         )
+        managed_xai_oauth_request = self._is_managed_xai_oauth_request(
+            litellm_params
+        )
 
         response: Optional[httpx.Response] = None
         for i in range(max(max_retry_on_unprocessable_entity_error, 1)):
@@ -195,8 +254,19 @@ class BaseLLMHTTPHandler:
                     timeout=timeout,
                     stream=stream,
                     logging_obj=logging_obj,
+                    follow_redirects=(
+                        False if managed_xai_oauth_request else None
+                    ),
                 )
             except httpx.HTTPStatusError as e:
+                if (
+                    managed_xai_oauth_request
+                    and 300 <= e.response.status_code < 400
+                ):
+                    await self._raise_managed_xai_oauth_redirect_error(
+                        e,
+                        provider_config,
+                    )
                 hit_max_retry = i + 1 == max_retry_on_unprocessable_entity_error
                 should_retry = provider_config.should_retry_llm_api_inside_llm_translation_on_http_error(
                     e=e, litellm_params=litellm_params
@@ -239,6 +309,9 @@ class BaseLLMHTTPHandler:
         max_retry_on_unprocessable_entity_error = (
             provider_config.max_retry_on_unprocessable_entity_error
         )
+        managed_xai_oauth_request = self._is_managed_xai_oauth_request(
+            litellm_params
+        )
 
         response: Optional[httpx.Response] = None
 
@@ -255,8 +328,19 @@ class BaseLLMHTTPHandler:
                     timeout=timeout,
                     stream=stream,
                     logging_obj=logging_obj,
+                    follow_redirects=(
+                        False if managed_xai_oauth_request else None
+                    ),
                 )
             except httpx.HTTPStatusError as e:
+                if (
+                    managed_xai_oauth_request
+                    and 300 <= e.response.status_code < 400
+                ):
+                    self._raise_managed_xai_oauth_redirect_error_sync(
+                        e,
+                        provider_config,
+                    )
                 hit_max_retry = i + 1 == max_retry_on_unprocessable_entity_error
                 should_retry = provider_config.should_retry_llm_api_inside_llm_translation_on_http_error(
                     e=e, litellm_params=litellm_params
