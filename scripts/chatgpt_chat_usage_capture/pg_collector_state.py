@@ -133,6 +133,7 @@ STATE_SUMMARY_KEYS = {
 STATE_COVERAGE_KEYS = {
     "active",
     "archived",
+    "history",
     "projects",
     "branches",
     "overall",
@@ -149,6 +150,38 @@ STATE_COVERAGE_KEYS = {
     "warnings",
     "olderHistoryAudit",
 }
+STATE_SCOPE_COVERAGE_KEYS = {
+    "scope",
+    "status",
+    "coverage",
+    "pagesFetched",
+    "candidates",
+    "continuation",
+    "paginationState",
+    "candidateCutoff",
+    "warnings",
+    "olderHistoryAudit",
+}
+STATE_HISTORY_COVERAGE_KEYS = {
+    "active",
+    "archived",
+    "projects",
+    "branches",
+    "olderHistoryAudit",
+    "overall",
+    "gaps",
+}
+STATE_AUDIT_RESULT_KEYS = {
+    "enabled",
+    "status",
+    "continuation",
+    "pagesFetched",
+    "conversationsAudited",
+    "lastStartedAt",
+    "lastPageAt",
+    "lastCompletedAt",
+}
+STATE_AUDIT_AGGREGATE_KEYS = {"enabled", "status", "active", "archived"}
 STATE_IDENTITY_KEYS = {
     "providerUserId",
     "workspaceId",
@@ -212,6 +245,13 @@ STATE_AUDIT_KEYS = {
     "lastStartedAt",
     "lastPageAt",
     "lastCompletedAt",
+}
+STATE_QUARANTINE_KEYS = {"state", "warnings", "timestamps"}
+STATE_QUARANTINE_TIMESTAMP_KEYS = {
+    "field",
+    "value",
+    "observedAt",
+    "messageId",
 }
 STATE_FORBIDDEN_KEYS = {
     "title",
@@ -278,6 +318,7 @@ STATE_STRING_KEYS = {
     "candidateCutoff",
     "scanStartedAt",
     "lastCompleteDiscoveryStartedAt",
+    "lastStartedAt",
     "lastPageAt",
     "updatedAt",
     "nextEligibleAt",
@@ -296,6 +337,94 @@ STATE_STRING_KEYS = {
     "pausedAt",
     "cooldownUntil",
     "since",
+    "observedAt",
+    "value",
+    "messageId",
+    "field",
+}
+STATE_STRING_ARRAY_KEYS = {
+    "warnings",
+    "gaps",
+    "identityErrors",
+    "evidenceMessageIds",
+    "unknownFields",
+}
+STATE_IDENTIFIER_KEYS = {
+    "accountId",
+    "collectorAccountId",
+    "profileId",
+    "providerUserId",
+    "workspaceId",
+    "quotaOwnerId",
+    "scope",
+    "triggerId",
+    "runId",
+    "conversationId",
+    "currentNode",
+    "candidateCutoff",
+    "continuationRevision",
+    "sourceId",
+    "sourceKind",
+}
+STATE_ENUM_VALUES = {
+    "status": {
+        "not_started",
+        "in_progress",
+        "complete",
+        "partial",
+        "ready",
+        "paused",
+        "pending",
+        "cancelled",
+        "active",
+        "claimed",
+        "running",
+        "idle",
+        "disabled",
+        "blocked",
+        "unknown",
+    },
+    "mode": {"backfill", "incremental", "reconciliation"},
+    "kind": {"scheduled", "manual", "coalesced"},
+    "coverage": {"complete", "partial", "unknown", "validated_page", "unrecognized"},
+    "paginationState": {
+        "complete",
+        "continuation",
+        "contradictory",
+        "unknown",
+        "repeated_cursor",
+        "budget_exhausted",
+    },
+    "scope": {"active", "archived"},
+    "outcome": {
+        "success",
+        "failure",
+        "authentication",
+        "completed",
+        "failed_after_start",
+        "cancelled_after_start",
+        "rejected_after_start",
+        "completion_unknown",
+        "rejected_before_start",
+        "unresolved",
+        "unknown",
+    },
+    "reason": {
+        "authentication",
+        "cooldown",
+        "incomplete_detail",
+        "partial_detail",
+        "unrecognized_detail",
+        "repeated_cursor",
+        "bad_continuation",
+        "page_budget",
+        "unknown_pagination",
+        "contradictory_pagination",
+        "detail_unavailable",
+        "missing_update_time",
+        "nonterminal_generation",
+        "coverage_gap_resolution",
+    },
 }
 _UNSET = object()
 
@@ -369,6 +498,7 @@ class _PreparedPageCommit:
     candidate_mutations: tuple[Mapping[str, Any], ...]
     coverage_mutations: tuple[Mapping[str, Any], ...]
     expected_state_version: Optional[int]
+    trigger_id: str
     fingerprint: str
 
 
@@ -381,6 +511,9 @@ class _ReadSnapshot:
     connection: psycopg.Connection
     created_at: datetime
     deadline_at: datetime
+    owner_run_id: str
+    owner_profile: str
+    owner_fencing_token: int
 
 
 class PgCollectorState:
@@ -407,6 +540,7 @@ class PgCollectorState:
         account = _account(collector_account_id)
         profile = _token(profile_id, "profile_id")
         with self.ledger.connect() as conn, conn.cursor() as cur:
+            self._lock_state_authority(cur, account, profile)
             header = self._load_header(cur, account, profile)
         return header, CandidatePage(
             (),
@@ -444,6 +578,7 @@ class PgCollectorState:
                 profile_id=profile,
                 expected=lease,
             )
+            self._lock_state_authority(cur, account, profile)
             current = self._load_header(cur, account, profile, lock=True)
             if current is None:
                 if expected_state_version not in (None, 0):
@@ -648,6 +783,7 @@ class PgCollectorState:
         candidate_mutations: Sequence[Mapping[str, Any]],
         coverage_mutations: Sequence[Mapping[str, Any]],
         expected_state_version: Optional[int],
+        trigger_id: Optional[str],
     ) -> _PreparedPageCommit:
         account = _account(lease.collector_account_id)
         profile = _token(lease.profile_id, "profile_id")
@@ -685,6 +821,21 @@ class PgCollectorState:
             if expected_state_version is not None
             else _optional_int(wire_payload.get("expectedStateVersion"))
         )
+        payload_trigger_id = wire_payload.get("triggerId")
+        if payload_trigger_id is None:
+            source = wire_payload.get("source", wire_payload.get("context"))
+            if isinstance(source, Mapping):
+                payload_trigger_id = source.get("triggerId")
+        safe_trigger = _token(
+            trigger_id if trigger_id is not None else payload_trigger_id,
+            "trigger_id",
+        )
+        if (
+            trigger_id is not None
+            and payload_trigger_id is not None
+            and safe_trigger != _token(payload_trigger_id, "triggerId")
+        ):
+            raise LedgerError("collector page trigger identity conflicts with its payload")
         self.assert_safe_record(canonical_payload)
         serialized_payload = json.dumps(
             canonical_payload,
@@ -712,6 +863,7 @@ class PgCollectorState:
                 "ingestOperations": list(actual_operations),
                 "candidateMutations": list(actual_candidates),
                 "coverageMutations": list(actual_coverage),
+                "triggerId": safe_trigger,
             }
         )
         return _PreparedPageCommit(
@@ -724,6 +876,7 @@ class PgCollectorState:
             actual_candidates,
             actual_coverage,
             expected_version,
+            safe_trigger,
             fingerprint,
         )
 
@@ -739,6 +892,7 @@ class PgCollectorState:
         candidate_mutations: Sequence[Mapping[str, Any]] = (),
         coverage_mutations: Sequence[Mapping[str, Any]] = (),
         expected_state_version: Optional[int] = None,
+        trigger_id: Optional[str] = None,
     ) -> PageAck:
         prepared = self._prepare_page_commit(
             lease=lease,
@@ -749,6 +903,7 @@ class PgCollectorState:
             candidate_mutations=candidate_mutations,
             coverage_mutations=coverage_mutations,
             expected_state_version=expected_state_version,
+            trigger_id=trigger_id,
         )
         acknowledgment: Optional[PageAck] = None
         with self.ledger.connect() as conn, conn.cursor() as cur:
@@ -758,6 +913,7 @@ class PgCollectorState:
                 profile_id=prepared.profile,
                 expected=lease,
             )
+            self._lock_state_authority(cur, prepared.account, prepared.profile)
             binding = self._binding_for_scope(
                 cur, scope, prepared.account, lease.binding
             )
@@ -812,6 +968,7 @@ class PgCollectorState:
                     run_id=prepared.run_id,
                     checkpoint=self._checkpoint_from_canonical(prepared.wire_payload),
                     expected_state_version=prepared.expected_state_version,
+                    trigger_id=prepared.trigger_id,
                 )
                 for rank, mutation in enumerate(
                     prepared.candidate_mutations, start=1
@@ -877,6 +1034,9 @@ class PgCollectorState:
         cursor: Optional[str] = None,
         snapshot_id: Optional[str] = None,
         deadline_at: Optional[datetime] = None,
+        run_id: str,
+        profile_id: str,
+        lease_fencing_token: int,
     ) -> Mapping[str, Any]:
         account = _account(collector_account_id)
         conversation = _token(conversation_id, "conversation_id")
@@ -886,10 +1046,13 @@ class PgCollectorState:
             raise LedgerError("conversation metadata limit is outside the supported range")
         snapshot, _ = self._get_snapshot(
             account=account,
-            profile=None,
+            profile=profile_id,
             kind="metadata",
             snapshot_id=snapshot_id,
             deadline_at=deadline_at,
+            owner_run_id=run_id,
+            owner_profile=profile_id,
+            owner_fencing_token=lease_fencing_token,
         )
         try:
             conn = snapshot.connection
@@ -901,70 +1064,70 @@ class PgCollectorState:
                     else None
                 )
                 cursor_id = cursor_values["id"] if cursor_values is not None else None
-                cur.execute(
-                    """
+                scope_cte = """
                     WITH RECURSIVE scope_chain(
                         stored_scope_key, canonical_scope_key
                     ) AS (
-                        SELECT binding.scope_key, binding.scope_key
-                        FROM public.chatgpt_usage_scope_bindings AS binding
-                        WHERE binding.collector_account_id = %s
-                          AND binding.binding_state = 'active'
+                        SELECT scope.scope_key, scope.scope_key
+                        FROM public.chatgpt_usage_scopes AS scope
                         UNION
-                        SELECT redirect.retired_scope_key,
-                               scope_chain.canonical_scope_key
-                        FROM public.chatgpt_usage_scope_redirects AS redirect
-                        JOIN scope_chain
-                          ON scope_chain.stored_scope_key =
-                             redirect.canonical_scope_key
+                        SELECT chain.stored_scope_key,
+                               redirect.canonical_scope_key
+                        FROM scope_chain AS chain
+                        JOIN public.chatgpt_usage_scope_redirects AS redirect
+                          ON redirect.retired_scope_key =
+                             chain.canonical_scope_key
                     ),
                     canonical_scope_map AS (
-                        SELECT DISTINCT ON (stored_scope_key)
-                               stored_scope_key, canonical_scope_key
-                        FROM scope_chain
-                        ORDER BY stored_scope_key, canonical_scope_key
+                        SELECT DISTINCT ON (chain.stored_scope_key)
+                               chain.stored_scope_key,
+                               chain.canonical_scope_key
+                        FROM scope_chain AS chain
+                        WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM public.chatgpt_usage_scope_redirects AS redirect
+                            WHERE redirect.retired_scope_key =
+                                  chain.canonical_scope_key
+                        )
+                        ORDER BY chain.stored_scope_key, chain.canonical_scope_key
+                    ),
+                    account_scope_map AS (
+                        SELECT map.stored_scope_key,
+                               map.canonical_scope_key,
+                               binding.collector_account_id
+                        FROM canonical_scope_map AS map
+                        JOIN public.chatgpt_usage_scope_bindings AS binding
+                          ON binding.scope_key = map.canonical_scope_key
+                         AND binding.collector_account_id = %s
+                         AND binding.binding_state = 'active'
                     )
+                """
+                cur.execute(
+                    scope_cte
+                    + """
                     SELECT COUNT(*)
                     FROM public.chatgpt_usage_observations AS observation
-                    WHERE observation.collector_account_id = %s
-                      AND observation.conversation_id = %s
+                    JOIN account_scope_map AS scope_map
+                      ON scope_map.stored_scope_key = observation.scope_key
+                    WHERE observation.conversation_id = %s
                       AND observation.is_current_projection
-                      AND observation.scope_key IN (
-                          SELECT stored_scope_key FROM scope_chain
-                      )
                     """,
-                    (account, account, conversation),
+                    (account, conversation),
                 )
                 total = int(cur.fetchone()[0])
                 cur.execute(
-                    """
-                    WITH RECURSIVE scope_chain(
-                        stored_scope_key, canonical_scope_key
-                    ) AS (
-                        SELECT binding.scope_key, binding.scope_key
-                        FROM public.chatgpt_usage_scope_bindings AS binding
-                        WHERE binding.collector_account_id = %s
-                          AND binding.binding_state = 'active'
-                        UNION
-                        SELECT redirect.retired_scope_key,
-                               scope_chain.canonical_scope_key
-                        FROM public.chatgpt_usage_scope_redirects AS redirect
-                        JOIN scope_chain
-                          ON scope_chain.stored_scope_key =
-                             redirect.canonical_scope_key
-                    )
+                    scope_cte
+                    + """
                     SELECT observation.observation_id, observation.scope_key,
                            observation.source_kind, observation.source_id,
                            observation.run_id, observation.observed_at,
                            observation.schema_version, observation.provenance,
                            observation.payload
                     FROM public.chatgpt_usage_observations AS observation
-                    WHERE observation.collector_account_id = %s
-                      AND observation.conversation_id = %s
+                    JOIN account_scope_map AS scope_map
+                      ON scope_map.stored_scope_key = observation.scope_key
+                    WHERE observation.conversation_id = %s
                       AND observation.is_current_projection
-                      AND observation.scope_key IN (
-                          SELECT stored_scope_key FROM scope_chain
-                      )
                       AND (
                           %s::timestamptz IS NULL
                           OR observation.observed_at < %s::timestamptz
@@ -977,7 +1140,6 @@ class PgCollectorState:
                     LIMIT %s
                     """,
                     (
-                        account,
                         account,
                         conversation,
                         cursor_time,
@@ -1033,6 +1195,9 @@ class PgCollectorState:
         cursor: Optional[str] = None,
         snapshot_id: Optional[str] = None,
         deadline_at: Optional[datetime] = None,
+        run_id: str,
+        profile_id: str,
+        lease_fencing_token: int,
     ) -> Mapping[str, Any]:
         account = _account(collector_account_id)
         if cursor is not None and snapshot_id is None:
@@ -1041,38 +1206,60 @@ class PgCollectorState:
             raise LedgerError("report snapshot limit is outside the supported range")
         snapshot, _ = self._get_snapshot(
             account=account,
-            profile=None,
+            profile=profile_id,
             kind="report",
             snapshot_id=snapshot_id,
             deadline_at=deadline_at,
+            owner_run_id=run_id,
+            owner_profile=profile_id,
+            owner_fencing_token=lease_fencing_token,
         )
         try:
             cursor_values = _decode_cursor(cursor, "attempt")
-            cursor_scope = cursor_values["scopeKey"] if cursor_values else None
-            cursor_attempt = cursor_values["attemptId"] if cursor_values else None
+            cursor_scope = (
+                cursor_values["canonicalScopeKey"] if cursor_values else None
+            )
+            cursor_identity = (
+                cursor_values["identityKey"] if cursor_values else None
+            )
             conn = snapshot.connection
             with conn.cursor() as cur:
                 scope_cte = """
                     WITH RECURSIVE scope_chain(
                         stored_scope_key, canonical_scope_key
                     ) AS (
-                        SELECT binding.scope_key, binding.scope_key
-                        FROM public.chatgpt_usage_scope_bindings AS binding
-                        WHERE binding.collector_account_id = %s
-                          AND binding.binding_state = 'active'
+                        SELECT scope.scope_key, scope.scope_key
+                        FROM public.chatgpt_usage_scopes AS scope
                         UNION
-                        SELECT redirect.retired_scope_key,
-                               scope_chain.canonical_scope_key
-                        FROM public.chatgpt_usage_scope_redirects AS redirect
-                        JOIN scope_chain
-                          ON scope_chain.stored_scope_key =
-                             redirect.canonical_scope_key
+                        SELECT chain.stored_scope_key,
+                               redirect.canonical_scope_key
+                        FROM scope_chain AS chain
+                        JOIN public.chatgpt_usage_scope_redirects AS redirect
+                          ON redirect.retired_scope_key =
+                             chain.canonical_scope_key
                     ),
                     canonical_scope_map AS (
-                        SELECT DISTINCT ON (stored_scope_key)
-                               stored_scope_key, canonical_scope_key
-                        FROM scope_chain
-                        ORDER BY stored_scope_key, canonical_scope_key
+                        SELECT DISTINCT ON (chain.stored_scope_key)
+                               chain.stored_scope_key,
+                               chain.canonical_scope_key
+                        FROM scope_chain AS chain
+                        WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM public.chatgpt_usage_scope_redirects AS redirect
+                            WHERE redirect.retired_scope_key =
+                                  chain.canonical_scope_key
+                        )
+                        ORDER BY chain.stored_scope_key, chain.canonical_scope_key
+                    ),
+                    account_scope_map AS (
+                        SELECT map.stored_scope_key,
+                               map.canonical_scope_key,
+                               binding.collector_account_id
+                        FROM canonical_scope_map AS map
+                        JOIN public.chatgpt_usage_scope_bindings AS binding
+                          ON binding.scope_key = map.canonical_scope_key
+                         AND binding.collector_account_id = %s
+                         AND binding.binding_state = 'active'
                     )
                 """
                 cur.execute(
@@ -1080,16 +1267,11 @@ class PgCollectorState:
                     + """
                     SELECT COUNT(*)
                     FROM public.chatgpt_usage_attempts AS attempt
-                    JOIN canonical_scope_map AS scope_map
+                    JOIN account_scope_map AS scope_map
                       ON scope_map.stored_scope_key = attempt.scope_key
-                    JOIN public.chatgpt_usage_scope_bindings AS binding
-                      ON binding.scope_key = scope_map.canonical_scope_key
-                     AND binding.collector_account_id = %s
-                     AND binding.binding_state = 'active'
-                    WHERE attempt.collector_account_id = %s
-                      AND NOT attempt.tombstone
+                    WHERE NOT attempt.tombstone
                     """,
-                    (account, account, account),
+                    (account,),
                 )
                 total_attempts = int(cur.fetchone()[0])
                 cur.execute(
@@ -1097,23 +1279,18 @@ class PgCollectorState:
                     + """
                     SELECT COUNT(*)
                     FROM public.chatgpt_usage_coverage_gaps AS gap
-                    JOIN canonical_scope_map AS scope_map
+                    JOIN account_scope_map AS scope_map
                       ON scope_map.stored_scope_key = gap.scope_key
-                    JOIN public.chatgpt_usage_scope_bindings AS binding
-                      ON binding.scope_key = scope_map.canonical_scope_key
-                     AND binding.collector_account_id = %s
-                     AND binding.binding_state = 'active'
-                    WHERE gap.collector_account_id = %s
-                      AND gap.state <> 'resolved'
+                    WHERE gap.state <> 'resolved'
                     """,
-                    (account, account, account),
+                    (account,),
                 )
                 open_gaps = int(cur.fetchone()[0])
                 cur.execute(
                     scope_cte
                     + """
                     SELECT stored_scope_key, canonical_scope_key
-                    FROM canonical_scope_map
+                    FROM account_scope_map
                     ORDER BY stored_scope_key
                     """,
                     (account,),
@@ -1126,23 +1303,250 @@ class PgCollectorState:
                            gap.state, gap.first_seen_at, gap.last_seen_at,
                            gap.details
                     FROM public.chatgpt_usage_coverage_gaps AS gap
-                    JOIN canonical_scope_map AS scope_map
+                    JOIN account_scope_map AS scope_map
                       ON scope_map.stored_scope_key = gap.scope_key
-                    JOIN public.chatgpt_usage_scope_bindings AS binding
-                      ON binding.scope_key = scope_map.canonical_scope_key
-                     AND binding.collector_account_id = %s
-                     AND binding.binding_state = 'active'
-                    WHERE gap.collector_account_id = %s
+                    WHERE true
                     ORDER BY gap.last_seen_at DESC, gap.source_kind, gap.source_id
                     LIMIT %s
                     """,
-                    (account, account, account, MAX_QUEUE_PAGE),
+                    (account, MAX_QUEUE_PAGE),
                 )
                 gap_rows = cur.fetchall()
                 cur.execute(
                     scope_cte
                     + """
-                    SELECT attempt.scope_key, scope_map.canonical_scope_key,
+                    , scoped_attempts AS (
+                        SELECT attempt.*,
+                               scope_map.canonical_scope_key,
+                               scope_map.collector_account_id
+                                   AS canonical_collector_account_id,
+                               canonical_scope.provider,
+                               canonical_scope.provider_user_id,
+                               canonical_scope.workspace_id,
+                               canonical_scope.quota_owner_id,
+                               canonical_scope.surface AS canonical_surface,
+                               canonical_scope.identity_state
+                        FROM public.chatgpt_usage_attempts AS attempt
+                        JOIN account_scope_map AS scope_map
+                          ON scope_map.stored_scope_key = attempt.scope_key
+                        JOIN public.chatgpt_usage_scopes AS canonical_scope
+                          ON canonical_scope.scope_key = scope_map.canonical_scope_key
+                        WHERE NOT attempt.tombstone
+                    ),
+                    alias_rows AS (
+                        SELECT scoped_attempts.canonical_scope_key,
+                               scoped_attempts.scope_key,
+                               scoped_attempts.attempt_id,
+                               aliases.alias_kind,
+                               aliases.alias_value
+                        FROM scoped_attempts
+                        JOIN public.chatgpt_usage_attempt_aliases AS aliases
+                          ON aliases.scope_key = scoped_attempts.scope_key
+                         AND aliases.attempt_id = scoped_attempts.attempt_id
+                    ),
+                    alias_values AS (
+                        SELECT scoped_attempts.canonical_scope_key,
+                               scoped_attempts.scope_key,
+                               scoped_attempts.attempt_id,
+                                string_agg(
+                                   alias_rows.alias_value,
+                                   ',' ORDER BY alias_rows.alias_value
+                               ) FILTER (WHERE alias_rows.alias_kind = 'generation')
+                                   AS generation_aliases,
+                               string_agg(
+                                   alias_rows.alias_value,
+                                   ',' ORDER BY alias_rows.alias_value
+                               ) FILTER (WHERE alias_rows.alias_kind = 'message')
+                                   AS message_aliases,
+                               string_agg(
+                                   alias_rows.alias_value,
+                                   ',' ORDER BY alias_rows.alias_value
+                               ) FILTER (WHERE alias_rows.alias_kind = 'branch')
+                                   AS branch_aliases
+                        FROM scoped_attempts
+                        LEFT JOIN alias_rows
+                          ON alias_rows.canonical_scope_key =
+                                 scoped_attempts.canonical_scope_key
+                         AND alias_rows.scope_key = scoped_attempts.scope_key
+                         AND alias_rows.attempt_id = scoped_attempts.attempt_id
+                        GROUP BY scoped_attempts.canonical_scope_key,
+                                 scoped_attempts.scope_key,
+                                 scoped_attempts.attempt_id
+                    ),
+                    generation_keys AS (
+                        SELECT canonical_scope_key,
+                               scope_key,
+                               attempt_id,
+                               'generation:' || generation_aliases AS generation_key
+                        FROM alias_values
+                        WHERE generation_aliases IS NOT NULL
+                    ),
+                    strong_edges AS (
+                        SELECT DISTINCT
+                               left_alias.canonical_scope_key,
+                               left_alias.scope_key AS left_scope_key,
+                               left_alias.attempt_id AS left_attempt_id,
+                               right_alias.scope_key AS right_scope_key,
+                               right_alias.attempt_id AS right_attempt_id
+                        FROM alias_rows AS left_alias
+                        JOIN alias_rows AS right_alias
+                          ON right_alias.canonical_scope_key =
+                                 left_alias.canonical_scope_key
+                         AND right_alias.alias_kind = left_alias.alias_kind
+                         AND right_alias.alias_value = left_alias.alias_value
+                        WHERE left_alias.alias_kind IN ('message', 'branch')
+                          AND (
+                              left_alias.scope_key <> right_alias.scope_key
+                              OR left_alias.attempt_id <> right_alias.attempt_id
+                          )
+                    ),
+                    strong_reach(
+                        canonical_scope_key,
+                        node_scope_key,
+                        node_attempt_id,
+                        root_scope_key,
+                        root_attempt_id
+                    ) AS (
+                        SELECT scoped_attempts.canonical_scope_key,
+                               scoped_attempts.scope_key,
+                               scoped_attempts.attempt_id,
+                               scoped_attempts.scope_key,
+                               scoped_attempts.attempt_id
+                        FROM scoped_attempts
+                        UNION
+                        SELECT reach.canonical_scope_key,
+                               CASE
+                                   WHEN edges.left_scope_key =
+                                        reach.node_scope_key
+                                    AND edges.left_attempt_id =
+                                        reach.node_attempt_id
+                                       THEN edges.right_scope_key
+                                   ELSE edges.left_scope_key
+                               END,
+                               CASE
+                                   WHEN edges.left_scope_key =
+                                        reach.node_scope_key
+                                    AND edges.left_attempt_id =
+                                        reach.node_attempt_id
+                                       THEN edges.right_attempt_id
+                                   ELSE edges.left_attempt_id
+                               END,
+                               reach.root_scope_key,
+                               reach.root_attempt_id
+                        FROM strong_reach AS reach
+                        JOIN strong_edges AS edges
+                          ON edges.canonical_scope_key =
+                                 reach.canonical_scope_key
+                         AND (
+                             (
+                                 edges.left_scope_key = reach.node_scope_key
+                                 AND edges.left_attempt_id = reach.node_attempt_id
+                             )
+                             OR (
+                                 edges.right_scope_key = reach.node_scope_key
+                                 AND edges.right_attempt_id = reach.node_attempt_id
+                             )
+                         )
+                    ),
+                    strong_components AS (
+                        SELECT canonical_scope_key,
+                               node_scope_key AS scope_key,
+                               node_attempt_id AS attempt_id,
+                               MIN(
+                                   jsonb_build_array(root_scope_key, root_attempt_id)::text
+                               ) AS component_key
+                        FROM strong_reach
+                        GROUP BY canonical_scope_key, node_scope_key, node_attempt_id
+                    ),
+                    component_generation_keys AS (
+                        SELECT components.canonical_scope_key,
+                               components.component_key,
+                               count(DISTINCT generations.generation_key)
+                                   AS generation_key_count,
+                               MIN(generations.generation_key) AS generation_key
+                        FROM strong_components AS components
+                        LEFT JOIN strong_components AS members
+                          ON members.canonical_scope_key =
+                                 components.canonical_scope_key
+                         AND members.component_key = components.component_key
+                        LEFT JOIN generation_keys AS generations
+                          ON generations.canonical_scope_key =
+                                 members.canonical_scope_key
+                         AND generations.scope_key = members.scope_key
+                         AND generations.attempt_id = members.attempt_id
+                        GROUP BY components.canonical_scope_key,
+                                 components.component_key
+                    ),
+                    component_generation_count AS (
+                        SELECT components.canonical_scope_key,
+                               components.component_key,
+                               count(DISTINCT generation_keys.generation_key)
+                                   AS generation_key_count
+                        FROM strong_components AS components
+                        LEFT JOIN generation_keys
+                          ON generation_keys.canonical_scope_key =
+                                 components.canonical_scope_key
+                         AND generation_keys.scope_key = components.scope_key
+                         AND generation_keys.attempt_id = components.attempt_id
+                        GROUP BY components.canonical_scope_key,
+                                 components.component_key
+                    ),
+                    identified_attempts AS (
+                        SELECT scoped_attempts.*,
+                               CASE
+                                   WHEN alias_values.generation_aliases IS NOT NULL
+                                       THEN 'generation:' ||
+                                            alias_values.generation_aliases
+                                   WHEN component_generation_keys.generation_key_count = 1
+                                       THEN component_generation_keys.generation_key
+                                   WHEN component_generation_keys.generation_key_count > 1
+                                       THEN 'attempt:' || scoped_attempts.scope_key ||
+                                            ':' || scoped_attempts.attempt_id
+                                   WHEN component_generation_count.generation_key_count > 1
+                                       THEN 'attempt:' || scoped_attempts.scope_key ||
+                                            ':' || scoped_attempts.attempt_id
+                                   WHEN alias_values.message_aliases IS NOT NULL
+                                     OR alias_values.branch_aliases IS NOT NULL
+                                       THEN 'strong:' || strong_components.component_key
+                                   ELSE 'attempt:' || scoped_attempts.scope_key ||
+                                        ':' || scoped_attempts.attempt_id
+                               END AS identity_key
+                        FROM scoped_attempts
+                        LEFT JOIN alias_values
+                          ON alias_values.canonical_scope_key =
+                                 scoped_attempts.canonical_scope_key
+                         AND alias_values.scope_key = scoped_attempts.scope_key
+                         AND alias_values.attempt_id = scoped_attempts.attempt_id
+                        JOIN strong_components
+                          ON strong_components.canonical_scope_key =
+                                 scoped_attempts.canonical_scope_key
+                         AND strong_components.scope_key = scoped_attempts.scope_key
+                         AND strong_components.attempt_id = scoped_attempts.attempt_id
+                        LEFT JOIN component_generation_count
+                          ON component_generation_count.canonical_scope_key =
+                                 strong_components.canonical_scope_key
+                         AND component_generation_count.component_key =
+                                 strong_components.component_key
+                         LEFT JOIN component_generation_keys
+                          ON component_generation_keys.canonical_scope_key =
+                                 strong_components.canonical_scope_key
+                         AND component_generation_keys.component_key =
+                                 strong_components.component_key
+                    ),
+                    canonicalized_attempts AS (
+                        SELECT DISTINCT ON (canonical_scope_key, identity_key)
+                               identified_attempts.*
+                        FROM identified_attempts
+                        ORDER BY canonical_scope_key, identity_key,
+                                 observed_at DESC,
+                                 (COALESCE(quarantine_state, 'unknown') <> 'clear') DESC,
+                                 revision DESC,
+                                 last_seen_at DESC,
+                                 (scope_key = canonical_scope_key) DESC,
+                                 scope_key, attempt_id
+                    )
+                    SELECT attempt.scope_key, attempt.canonical_scope_key,
+                           attempt.identity_key,
                            attempt.attempt_id, attempt.conversation_id,
                            attempt.identity_basis, attempt.time_basis,
                            attempt.attempt_time, attempt.earliest_possible_at,
@@ -1173,35 +1577,32 @@ class PgCollectorState:
                                  AND revision.attempt_id = attempt.attempt_id
                                  AND revision.is_current_projection
                                LIMIT 1
-                           ), '{}'::jsonb) AS revision_payload
-                    FROM public.chatgpt_usage_attempts AS attempt
-                    JOIN canonical_scope_map AS scope_map
-                      ON scope_map.stored_scope_key = attempt.scope_key
-                    JOIN public.chatgpt_usage_scope_bindings AS binding
-                      ON binding.scope_key = scope_map.canonical_scope_key
-                     AND binding.collector_account_id = %s
-                     AND binding.binding_state = 'active'
-                    WHERE attempt.collector_account_id = %s
-                      AND NOT attempt.tombstone
-                      AND (
+                           ), '{}'::jsonb) AS revision_payload,
+                           attempt.canonical_collector_account_id,
+                           attempt.provider,
+                           attempt.provider_user_id,
+                           attempt.workspace_id,
+                           attempt.quota_owner_id,
+                           attempt.canonical_surface,
+                           attempt.identity_state
+                    FROM canonicalized_attempts AS attempt
+                    WHERE (
                           %s::text IS NULL
-                          OR attempt.scope_key > %s::text
+                          OR attempt.canonical_scope_key > %s::text
                           OR (
-                              attempt.scope_key = %s::text
-                              AND attempt.attempt_id > %s::text
+                              attempt.canonical_scope_key = %s::text
+                              AND attempt.identity_key > %s::text
                           )
                       )
-                    ORDER BY attempt.scope_key, attempt.attempt_id
+                    ORDER BY attempt.canonical_scope_key, attempt.identity_key
                     LIMIT %s
                     """,
                     (
                         account,
-                        account,
-                        account,
                         cursor_scope,
                         cursor_scope,
                         cursor_scope,
-                        cursor_attempt,
+                        cursor_identity,
                         limit + 1,
                     ),
                 )
@@ -1213,8 +1614,8 @@ class PgCollectorState:
                 _encode_cursor(
                     "attempt",
                     {
-                        "scopeKey": str(rows[-1][0]),
-                        "attemptId": str(rows[-1][2]),
+                        "canonicalScopeKey": str(rows[-1][1]),
+                        "identityKey": str(rows[-1][2]),
                     },
                 )
                 if has_more and rows
@@ -1234,6 +1635,13 @@ class PgCollectorState:
                 coverage_gaps=coverage_gaps,
                 truncated=has_more,
             )
+            report_coverage = {
+                "history": history_coverage["overall"],
+                "overall": history_coverage["overall"],
+                "projects": _usage_coverage_level(history_coverage["projects"]),
+                "branches": _usage_coverage_level(history_coverage["branches"]),
+                "gaps": history_coverage["gaps"],
+            }
             result = {
                 "snapshotVersion": 1,
                 "schemaVersion": "chatgpt-chat-history-v1",
@@ -1241,16 +1649,15 @@ class PgCollectorState:
                 "snapshotId": snapshot.snapshot_id if has_more else None,
                 "asOf": snapshot.created_at.isoformat(),
                 "attempts": attempts,
-                "coverage": {
+                "coverage": report_coverage,
+                "historyCoverage": history_coverage,
+                "coverageDetails": {
                     "truncated": has_more,
-                    "partial": True,
                     "totalAttempts": total_attempts,
                     "returnedAttempts": len(attempts),
                     "openCoverageGaps": open_gaps,
-                    "history": history_coverage,
                     "gaps": coverage_gaps,
                 },
-                "historyCoverage": history_coverage,
                 "scope": {
                     "collectorAccountId": account,
                     "bindings": scope_keys,
@@ -1279,6 +1686,7 @@ class PgCollectorState:
         if limit <= 0 or limit > MAX_QUEUE_PAGE:
             raise LedgerError("candidate read limit is outside the supported range")
         with self.ledger.connect() as conn, conn.cursor() as cur:
+            self._lock_state_authority(cur, account, profile)
             header = self._load_header(cur, account, profile, lock=True)
             current_version = header.state_version if header is not None else 0
             if expected_state_version is None:
@@ -1346,6 +1754,11 @@ class PgCollectorState:
                 account=lease.collector_account_id,
                 profile_id=lease.profile_id,
                 expected=lease,
+            )
+            self._lock_state_authority(
+                cur,
+                lease.collector_account_id,
+                lease.profile_id,
             )
             current = self._load_header(
                 cur,
@@ -1417,6 +1830,10 @@ class PgCollectorState:
         outcome: Optional[str] = None,
         summary: Optional[Mapping[str, Any]] = None,
     ) -> CollectorStateHeader:
+        self._close_owned_snapshots(
+            account=lease.collector_account_id,
+            profile=lease.profile_id,
+        )
         if expected_state_version is None:
             raise LedgerError("collector state version is required")
         if trigger_id is None:
@@ -1494,6 +1911,10 @@ class PgCollectorState:
         outcome: Optional[str] = None,
         summary: Optional[Mapping[str, Any]] = None,
     ) -> CollectorStateHeader:
+        self._close_owned_snapshots(
+            account=lease.collector_account_id,
+            profile=lease.profile_id,
+        )
         if expected_state_version is None:
             raise LedgerError("collector state version is required")
         if trigger_id is None:
@@ -1724,6 +2145,18 @@ class PgCollectorState:
             (f"chatgpt-collector-profile|{profile_id}",),
         )
 
+    @staticmethod
+    def _lock_state_authority(
+        cur: psycopg.Cursor,
+        account: str,
+        profile: str,
+    ) -> None:
+        """Serialize state reads and absent-row creation for one collector."""
+        cur.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s)::bigint)",
+            (f"chatgpt-collector-state|{profile}|{account}",),
+        )
+
     def _assert_expected_state_version(
         self,
         cur: psycopg.Cursor,
@@ -1783,6 +2216,7 @@ class PgCollectorState:
         run_id: str,
         checkpoint: Any,
         expected_state_version: Optional[int],
+        trigger_id: str,
     ) -> CollectorStateHeader:
         current = self._load_header(
             cur,
@@ -1803,6 +2237,18 @@ class PgCollectorState:
             or str(active_trigger.get("runId")) != run_id
         ):
             raise LedgerError("collector run is not active")
+        if str(active_trigger.get("triggerId")) != trigger_id:
+            raise LedgerError("collector trigger is not active")
+        trigger_state = active_trigger.get("state", "active")
+        if trigger_state not in {"active", "claimed", "running"}:
+            raise LedgerError("collector trigger is not active")
+        fencing_token = active_trigger.get("fencingToken")
+        if (
+            isinstance(fencing_token, bool)
+            or not isinstance(fencing_token, int)
+            or fencing_token != lease.lease_fencing_token
+        ):
+            raise LedgerError("collector trigger fence is stale")
         next_version = current_version + 1
         schedule_transition = current.schedule_transition if current else None
         prior_checkpoint = current.checkpoint if current else None
@@ -1853,9 +2299,10 @@ class PgCollectorState:
         if explicit is not None:
             if not isinstance(explicit, Sequence) or isinstance(explicit, (str, bytes)):
                 raise LedgerError("collector ingest operations are not an array")
-            operations.extend(
-                item for item in explicit if isinstance(item, Mapping)
-            )
+            for item in explicit:
+                if not isinstance(item, Mapping):
+                    raise LedgerError("collector ingest operation is not an object")
+                operations.append(item)
         source = payload.get("source", payload.get("context"))
         source_map = dict(source) if isinstance(source, Mapping) else {}
         source_map.setdefault("runId", payload.get("runId", default_run_id))
@@ -1871,6 +2318,11 @@ class PgCollectorState:
         ):
             if key not in source_map:
                 source_map[key] = payload.get(key)
+        for required_key in ("runId", "observedAt", "sourceKind", "sourceId", "schemaVersion"):
+            if source_map.get(required_key) is None:
+                raise LedgerError(
+                    f"collector ingest context is missing {required_key}"
+                )
         canonical_sections = [
             section
             for section in (payload.get("discovery"), payload.get("page"))
@@ -1931,20 +2383,25 @@ class PgCollectorState:
         default_run_id: Optional[str],
     ) -> Mapping[str, Any]:
         section_source = dict(source_map)
-        section_source.update(
-            {
-                key: section.get(key)
-                for key in (
-                    "runId",
-                    "observedAt",
-                    "sourceKind",
-                    "sourceId",
-                    "schemaVersion",
-                    "provenance",
+        for key in (
+            "runId",
+            "observedAt",
+            "sourceKind",
+            "sourceId",
+            "schemaVersion",
+            "provenance",
+        ):
+            section_value = section.get(key)
+            source_value = section_source.get(key)
+            if section_value is not None and source_value is not None:
+                if str(section_value) != str(source_value):
+                    raise LedgerError(
+                        f"canonical page {key} conflicts with its ingest context"
+                    )
+            elif section_value is not None and source_value is None:
+                raise LedgerError(
+                    f"canonical page {key} is not supplied by its ingest context"
                 )
-                if section.get(key) is not None
-            }
-        )
         if section_source.get("runId") is None:
             section_source["runId"] = default_run_id
         if section_source.get("observedAt") is None:
@@ -1956,49 +2413,30 @@ class PgCollectorState:
         if (
             section_source.get("runId") is None
             or section_source.get("observedAt") is None
+            or section_source.get("sourceKind") is None
+            or section_source.get("sourceId") is None
+            or section_source.get("schemaVersion") is None
         ):
             raise LedgerError("canonical page is missing its ingest context")
         if "checkpoint" in section:
             checkpoint = section.get("checkpoint")
             if not isinstance(checkpoint, Mapping):
                 raise LedgerError("discovery checkpoint is not an object")
-            scope = checkpoint.get("scope", "unknown")
-            source_id = section.get("sourceId")
-            if source_id is None:
-                source_id = (
-                    f"discovery:{scope}:"
-                    f"{checkpoint.get('updatedAt', 'unknown')}"
-                )
             return {
                 "kind": "observation",
                 **section_source,
-                "sourceKind": section.get("sourceKind", "history_discovery"),
-                "sourceId": source_id,
-                "schemaVersion": section.get(
-                    "schemaVersion",
-                    "chatgpt-chat-history-v1",
+                "payload": _discovery_observation_payload(
+                    checkpoint,
+                    coverage=section.get("coverage"),
+                    warnings=section.get("warnings"),
                 ),
-                "payload": _discovery_observation_payload(checkpoint),
             }
-        summary = section.get("summary")
-        summary_map = summary if isinstance(summary, Mapping) else {}
-        conversation_id = section.get("conversationId")
-        if conversation_id is None:
-            conversation_id = summary_map.get("conversationId", "unknown")
-        page_kind = section.get("pageKind", "page")
-        page_number = section.get("pageNumber", 0)
-        source_id = section.get("sourceId")
-        if source_id is None:
-            source_id = f"conversation:{conversation_id}:{page_kind}:{page_number}"
         return {
             "kind": "observation",
             **section_source,
-            "sourceKind": section.get("sourceKind", "history_detail"),
-            "sourceId": source_id,
-            "schemaVersion": section.get(
-                "schemaVersion",
-                "chatgpt-chat-history-v1",
-            ),
+            "sourceKind": section_source["sourceKind"],
+            "sourceId": section_source["sourceId"],
+            "schemaVersion": section_source["schemaVersion"],
             "payload": _page_observation_payload(section),
         }
 
@@ -2006,37 +2444,31 @@ class PgCollectorState:
     def _derive_candidate_mutations(
         payload: Mapping[str, Any],
     ) -> tuple[Mapping[str, Any], ...]:
+        has_explicit = "candidateMutations" in payload
         explicit = payload.get("candidateMutations", ())
         if explicit is not None:
             if not isinstance(explicit, Sequence) or isinstance(explicit, (str, bytes)):
                 raise LedgerError("collector candidate mutations are not an array")
-            mutations = tuple(
-                item for item in explicit if isinstance(item, Mapping)
-            )
+            mutations_list: list[Mapping[str, Any]] = []
+            for item in explicit:
+                if not isinstance(item, Mapping):
+                    raise LedgerError("collector candidate mutation is not an object")
+                mutations_list.append(item)
+            mutations = tuple(mutations_list)
         else:
             mutations = ()
-        discovery = payload.get("discovery")
-        if isinstance(discovery, Mapping):
-            checkpoint = discovery.get("checkpoint")
-            if isinstance(checkpoint, Mapping):
-                queue = checkpoint.get("candidateQueue", ())
-                if isinstance(queue, Sequence) and not isinstance(queue, (str, bytes)):
-                    mutations += tuple(
-                        {
-                            "candidateKey": _candidate_key(candidate),
-                            "operation": "replace",
-                            "payload": candidate,
-                        }
-                        for candidate in queue
-                        if isinstance(candidate, Mapping)
-                    )
+        if has_explicit:
+            return mutations
         page = payload.get("page")
         if isinstance(page, Mapping):
             summary = page.get("summary")
-            summary_map = summary if isinstance(summary, Mapping) else {}
             conversation_id = page.get("conversationId")
             if conversation_id is None:
-                conversation_id = summary_map.get("conversationId")
+                conversation_id = (
+                    summary.get("conversationId")
+                    if isinstance(summary, Mapping)
+                    else None
+                )
             if conversation_id is not None:
                 revisit = page.get("revisit")
                 mutations += (
@@ -2044,7 +2476,7 @@ class PgCollectorState:
                         "candidateKey": conversation_id,
                         "operation": "replace" if revisit is not None else "remove",
                         "payload": {
-                            "summary": summary_map,
+                            "summary": summary if isinstance(summary, Mapping) else {},
                             **({"revisit": revisit} if revisit is not None else {}),
                         },
                     },
@@ -2059,9 +2491,12 @@ class PgCollectorState:
         if explicit is not None:
             if not isinstance(explicit, Sequence) or isinstance(explicit, (str, bytes)):
                 raise LedgerError("collector coverage mutations are not an array")
-            return tuple(
-                item for item in explicit if isinstance(item, Mapping)
-            )
+            mutations: list[Mapping[str, Any]] = []
+            for item in explicit:
+                if not isinstance(item, Mapping):
+                    raise LedgerError("collector coverage mutation is not an object")
+                mutations.append(item)
+            return tuple(mutations)
         return ()
 
     def _apply_ingest_operations(
@@ -2324,7 +2759,15 @@ class PgCollectorState:
         kind: str,
         snapshot_id: Optional[str],
         deadline_at: Optional[datetime] = None,
+        owner_run_id: str,
+        owner_profile: str,
+        owner_fencing_token: int,
     ) -> tuple[_ReadSnapshot, bool]:
+        safe_owner_run = _token(owner_run_id, "run_id")
+        safe_owner_profile = _token(owner_profile, "profile_id")
+        if profile is not None and profile != safe_owner_profile:
+            raise LedgerError("collector snapshot profile does not match its owner")
+        safe_owner_fence = _positive_int(owner_fencing_token, "lease_fencing_token")
         if snapshot_id is not None:
             safe_snapshot = _token(snapshot_id, "snapshot_id")
             snapshot = self._snapshots.get(safe_snapshot)
@@ -2332,8 +2775,11 @@ class PgCollectorState:
                 raise LedgerError("collector read snapshot is unavailable")
             if (
                 snapshot.account != account
-                or snapshot.profile != profile
+                or snapshot.profile != safe_owner_profile
                 or snapshot.kind != kind
+                or snapshot.owner_run_id != safe_owner_run
+                or snapshot.owner_profile != safe_owner_profile
+                or snapshot.owner_fencing_token != safe_owner_fence
             ):
                 raise LedgerError("collector read snapshot identity is stale")
             now = datetime.now(timezone.utc)
@@ -2342,38 +2788,83 @@ class PgCollectorState:
                 self.close_snapshot(safe_snapshot)
                 raise LedgerError("collector read snapshot expired")
             return snapshot, False
-        conn = self.ledger.connect()
-        # PgLedger.connect() configures the session in its first transaction;
-        # commit that setup before opening the bounded repeatable-read view.
-        conn.commit()
-        conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        conn.execute(
-            "SELECT set_config('statement_timeout', %s, true)",
-            (f"{self.ledger.statement_timeout_ms}ms",),
-        )
-        conn.execute(
-            "SELECT set_config('lock_timeout', %s, true)",
-            (f"{self.ledger.lock_timeout_ms}ms",),
-        )
-        safe_snapshot = uuid4().hex
-        created_at = datetime.now(timezone.utc)
         requested_deadline = (
             ensure_utc(deadline_at) if deadline_at is not None else None
         )
+        created_at = datetime.now(timezone.utc)
         snapshot_deadline = created_at + timedelta(seconds=MAX_SNAPSHOT_AGE_SECONDS)
         if requested_deadline is not None:
+            if requested_deadline <= created_at:
+                raise LedgerError("collector read snapshot deadline has expired")
             snapshot_deadline = min(snapshot_deadline, requested_deadline)
-        snapshot = _ReadSnapshot(
-            safe_snapshot,
-            account,
-            profile,
-            kind,
-            conn,
-            created_at,
-            snapshot_deadline,
+        remaining_ms = max(
+            1,
+            int((snapshot_deadline - created_at).total_seconds() * 1000),
         )
-        self._snapshots[safe_snapshot] = snapshot
-        return snapshot, True
+        conn = self.ledger.connect()
+        try:
+            # PgLedger.connect() opens a setup transaction. Roll it back before
+            # starting the bounded repeatable-read snapshot so the transaction-
+            # local timeout settings apply to the actual read.
+            conn.rollback()
+            conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            conn.execute(
+                "SELECT set_config('statement_timeout', %s, true)",
+                (f"{min(self.ledger.statement_timeout_ms, remaining_ms)}ms",),
+            )
+            conn.execute(
+                "SELECT set_config('lock_timeout', %s, true)",
+                (f"{min(self.ledger.lock_timeout_ms, remaining_ms)}ms",),
+            )
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT lease.lease_fencing_token, lease.lease_expires_at,
+                           state.active_trigger
+                    FROM public.chatgpt_usage_collector_leases AS lease
+                    LEFT JOIN public.chatgpt_usage_collector_state AS state
+                      ON state.profile_id = lease.profile_id
+                     AND state.collector_account_id = lease.collector_account_id
+                    WHERE lease.profile_id = %s
+                      AND lease.collector_account_id = %s
+                    """,
+                    (safe_owner_profile, account),
+                )
+                owner_row = cur.fetchone()
+            active_trigger = (
+                owner_row[2] if owner_row is not None else None
+            )
+            if (
+                owner_row is None
+                or int(owner_row[0]) != safe_owner_fence
+                or ensure_utc(owner_row[1]) <= created_at
+                or not isinstance(active_trigger, Mapping)
+                or str(active_trigger.get("runId")) != safe_owner_run
+                or active_trigger.get("state", "active")
+                not in {"active", "claimed", "running"}
+            ):
+                raise LedgerError("collector read snapshot owner lease is stale")
+            safe_snapshot = uuid4().hex
+            snapshot = _ReadSnapshot(
+                safe_snapshot,
+                account,
+                safe_owner_profile,
+                kind,
+                conn,
+                created_at,
+                snapshot_deadline,
+                safe_owner_run,
+                safe_owner_profile,
+                safe_owner_fence,
+            )
+            self._snapshots[safe_snapshot] = snapshot
+            return snapshot, True
+        except BaseException:
+            try:
+                conn.rollback()
+            finally:
+                conn.close()
+            raise
 
     def _close_owned_snapshots(
         self,
@@ -2428,61 +2919,73 @@ class PgCollectorState:
 
     @staticmethod
     def _attempt_snapshot(row: Sequence[Any]) -> dict[str, Any]:
-        revision_payload = row[29] if len(row) > 29 and isinstance(row[29], Mapping) else {}
-        aliases = row[28] if len(row) > 28 and isinstance(row[28], Sequence) else ()
+        revision_payload = (
+            row[30] if len(row) > 30 and isinstance(row[30], Mapping) else {}
+        )
+        aliases = (
+            row[29] if len(row) > 29 and isinstance(row[29], Sequence) else ()
+        )
         revision_quarantine = (
             revision_payload.get("quarantine")
             if isinstance(revision_payload.get("quarantine"), Mapping)
-            else {}
+            else None
         )
-        quarantine_timestamps = (
-            list(revision_quarantine.get("timestamps", ()))
-            if isinstance(revision_quarantine, Mapping)
-            and isinstance(revision_quarantine.get("timestamps"), Sequence)
-            and not isinstance(revision_quarantine.get("timestamps"), (str, bytes))
-            else []
+        quarantine = _validated_quarantine_snapshot(
+            revision_quarantine,
+            fallback_state=row[26] if len(row) > 26 else "unknown",
         )
         item = {
             "scopeKey": str(row[0]),
             "canonicalScopeKey": str(row[1]),
-            "attemptId": str(row[2]),
-            "conversationId": str(row[3]),
-            "identityBasis": str(row[4]),
-            "timeBasis": str(row[5]),
-            "attemptTime": row[6].isoformat() if row[6] else None,
-            "earliestPossibleAt": row[7].isoformat() if row[7] else None,
-            "latestPossibleAt": row[8].isoformat() if row[8] else None,
-            "requestedModelRaw": row[9],
-            "requestedModeRaw": row[10],
-            "requestedReasoningEffortRaw": row[11],
-            "recordedFinalModelRaw": row[12],
-            "resolvedModelRaw": row[13],
-            "requestedFamily": row[14],
-            "recordedFinalFamily": row[15],
-            "resolvedFamily": row[16],
-            "mappingVersion": str(row[17]),
-            "outcome": str(row[18]),
-            "completedAnswer": bool(row[19]),
-            "generationStarted": bool(row[20]),
-            "surface": str(row[21]),
-            "origin": row[22],
-            "revision": int(row[23]),
-            "warnings": list(row[24] or []),
-            "quarantine": {
-                "state": str(row[25]),
-                "warnings": list(row[24] or []),
-                "timestamps": quarantine_timestamps,
-            },
-            "quarantineState": str(row[25]),
-            "observedAt": row[26].isoformat() if row[26] else None,
-            "lastSeenAt": row[27].isoformat() if row[27] else None,
+            "identityKey": str(row[2]),
+            "attemptId": str(row[3]),
+            "conversationId": str(row[4]),
+            "identityBasis": str(row[5]),
+            "timeBasis": str(row[6]),
+            "attemptTime": row[7].isoformat() if row[7] else None,
+            "earliestPossibleAt": row[8].isoformat() if row[8] else None,
+            "latestPossibleAt": row[9].isoformat() if row[9] else None,
+            "requestedModelRaw": row[10],
+            "requestedModeRaw": row[11],
+            "requestedReasoningEffortRaw": row[12],
+            "recordedFinalModelRaw": row[13],
+            "resolvedModelRaw": row[14],
+            "requestedFamily": row[15],
+            "recordedFinalFamily": row[16],
+            "resolvedFamily": row[17],
+            "mappingVersion": str(row[18]),
+            "outcome": str(row[19]),
+            "completedAnswer": bool(row[20]),
+            "generationStarted": bool(row[21]),
+            "surface": str(row[22]),
+            "origin": row[23],
+            "revision": int(row[24]),
+            "warnings": list(row[25] or []),
+            "quarantine": quarantine,
+            "quarantineState": str(row[26]),
+            "observedAt": row[27].isoformat() if row[27] else None,
+            "lastSeenAt": row[28].isoformat() if row[28] else None,
             "aliases": [
                 [str(alias[0]), str(alias[1])]
                 for alias in aliases
                 if isinstance(alias, Sequence) and len(alias) == 2
             ],
-            "evidenceMessageIds": list(revision_payload.get("evidenceMessageIds", ())),
-            "revisionPayload": dict(revision_payload),
+            "evidenceMessageIds": [
+                str(value)
+                for value in revision_payload.get("evidenceMessageIds", ())
+            ],
+            "revisionPayload": _copy_metadata_value(
+                revision_payload,
+                "report.attempt.revisionPayload",
+            ),
+            "scope": {
+                "collectorAccountId": str(row[31]),
+                "provider": str(row[32]),
+                "providerUserId": row[33],
+                "workspaceId": row[34],
+                "quotaOwnerId": row[35],
+                "surface": str(row[36]),
+            },
         }
         assert_no_secrets(item)
         return item
@@ -2501,6 +3004,85 @@ def _coverage_gap_snapshot(row: Sequence[Any]) -> dict[str, Any]:
     }
     assert_no_secrets(item)
     return item
+
+
+def _validated_quarantine_snapshot(
+    value: Any,
+    *,
+    fallback_state: Any,
+) -> dict[str, Any]:
+    fallback = (
+        str(fallback_state)
+        if isinstance(fallback_state, str)
+        and fallback_state in {"clear", "quarantined", "unknown"}
+        else "unknown"
+    )
+    if value is None:
+        return {"state": fallback, "warnings": [], "timestamps": []}
+    if not isinstance(value, Mapping):
+        raise LedgerError("stored attempt quarantine is not an object")
+    state = value.get("state", fallback)
+    if state not in {"clear", "quarantined", "unknown"}:
+        raise LedgerError("stored attempt quarantine state is invalid")
+    raw_warnings = value.get("warnings", ())
+    if not isinstance(raw_warnings, Sequence) or isinstance(
+        raw_warnings, (str, bytes)
+    ):
+        raise LedgerError("stored attempt quarantine warnings are invalid")
+    warnings: list[str] = []
+    for warning in raw_warnings:
+        if not isinstance(warning, str) or sanitize_token(warning) is None:
+            raise LedgerError("stored attempt quarantine warning is invalid")
+        warnings.append(warning)
+    raw_timestamps = value.get("timestamps", ())
+    if not isinstance(raw_timestamps, Sequence) or isinstance(
+        raw_timestamps, (str, bytes)
+    ):
+        raise LedgerError("stored attempt quarantine timestamps are invalid")
+    timestamps: list[dict[str, str]] = []
+    for evidence in raw_timestamps:
+        if not isinstance(evidence, Mapping):
+            raise LedgerError("stored attempt quarantine timestamp is invalid")
+        unknown_keys = set(evidence) - STATE_QUARANTINE_TIMESTAMP_KEYS
+        if unknown_keys:
+            raise LedgerError("stored attempt quarantine timestamp has unknown fields")
+        field = evidence.get("field")
+        value_text = evidence.get("value")
+        observed_at = evidence.get("observedAt")
+        if field not in {
+            "createdAt",
+            "updatedAt",
+            "attemptTime",
+            "earliestPossibleAt",
+            "latestPossibleAt",
+        }:
+            raise LedgerError("stored attempt quarantine timestamp field is invalid")
+        if not isinstance(value_text, str) or not isinstance(observed_at, str):
+            raise LedgerError("stored attempt quarantine timestamp values are invalid")
+        try:
+            parse_datetime(observed_at)
+        except (TypeError, ValueError, OverflowError, OSError) as exc:
+            raise LedgerError(
+                "stored attempt quarantine timestamp observedAt is invalid"
+            ) from exc
+        normalized = {
+            "field": field,
+            "value": value_text,
+            "observedAt": observed_at,
+        }
+        if "messageId" in evidence:
+            message_id = evidence["messageId"]
+            if not isinstance(message_id, str) or sanitize_token(message_id) is None:
+                raise LedgerError("stored attempt quarantine messageId is invalid")
+            normalized["messageId"] = message_id
+        timestamps.append(normalized)
+    result = {
+        "state": str(state),
+        "warnings": warnings,
+        "timestamps": timestamps,
+    }
+    assert_no_secrets(result)
+    return result
 
 
 def _unknown_scope_coverage(scope: str) -> dict[str, Any]:
@@ -2525,6 +3107,18 @@ def _unknown_scope_coverage(scope: str) -> dict[str, Any]:
             "lastCompletedAt": None,
         },
     }
+
+
+def _usage_coverage_level(value: Any) -> str:
+    if value in {"complete", "partial", "unknown"}:
+        return str(value)
+    if value in {
+        "validated_for_discovered_projects",
+        "version_metadata_observed",
+        "active_branch_only",
+    }:
+        return "partial"
+    return "unknown"
 
 
 def _unknown_history_coverage(
@@ -2569,6 +3163,9 @@ def _candidate_key(candidate: Mapping[str, Any]) -> str:
 
 def _discovery_observation_payload(
     checkpoint: Mapping[str, Any],
+    *,
+    coverage: Any = None,
+    warnings: Any = None,
 ) -> dict[str, Any]:
     queue = checkpoint.get("candidateQueue", ())
     items = (
@@ -2588,7 +3185,7 @@ def _discovery_observation_payload(
         if pagination_state in {"continuation", "budget_exhausted"}
         else "unrecognized"
     )
-    return {
+    payload = {
         "items": items,
         "continuation": checkpoint.get("continuation"),
         "exhausted": checkpoint.get("continuation") is None
@@ -2600,6 +3197,23 @@ def _discovery_observation_payload(
         "schemaVersion": "chatgpt-chat-history-v1",
         "surface": "chat",
     }
+    for key in (
+        "accountId",
+        "mode",
+        "range",
+        "candidateCutoff",
+        "pagesFetched",
+        "pageBudget",
+        "lastCompleteDiscoveryStartedAt",
+        "lastPageAt",
+    ):
+        if checkpoint.get(key) is not None:
+            payload[key] = checkpoint[key]
+    if coverage is not None:
+        payload["coverage"] = coverage
+    if warnings is not None:
+        payload["warnings"] = warnings
+    return payload
 
 
 def _page_observation_payload(page: Mapping[str, Any]) -> dict[str, Any]:
@@ -2682,7 +3296,7 @@ def _validate_state_field(
         if allowed_keys is not None and key not in allowed_keys:
             raise LedgerError(f"collector state field {field_name} contains an unknown key")
         if isinstance(child, Mapping):
-            nested_keys = _nested_state_keys(key)
+            nested_keys = _nested_state_keys(key, field_name)
             if nested_keys is None:
                 raise LedgerError(
                     f"collector state field {field_name}.{key} has an unsupported object"
@@ -2693,7 +3307,7 @@ def _validate_state_field(
                 raise LedgerError(f"collector state field {field_name}.{key} is too large")
             for index, item in enumerate(child):
                 if isinstance(item, Mapping):
-                    nested_keys = _nested_state_keys(key)
+                    nested_keys = _nested_state_keys(key, field_name)
                     if nested_keys is None:
                         raise LedgerError(
                             f"collector state field {field_name}.{key} has unsupported objects"
@@ -2704,66 +3318,155 @@ def _validate_state_field(
                         nested_keys,
                     )
                 elif isinstance(item, (str, int, float, bool)) or item is None:
-                    if key in {"warnings", "gaps", "identityErrors"} and not (
-                        isinstance(item, str) or item is None
-                    ):
+                    if key in STATE_STRING_ARRAY_KEYS and not isinstance(item, str):
                         raise LedgerError(
-                            f"collector state field {field_name}.{key} must contain strings"
+                            f"collector state field {field_name}.{key}[{index}] must be a string"
                         )
+                    _validate_state_scalar(
+                        f"{field_name}.{key}[{index}]",
+                        key,
+                        item,
+                    )
                     continue
                 else:
                     raise LedgerError(
                         f"collector state field {field_name}.{key} contains unsupported data"
                     )
         elif child is not None:
-            if key in STATE_BOOLEAN_KEYS and not isinstance(child, bool):
-                raise LedgerError(
-                    f"collector state field {field_name}.{key} must be boolean"
-                )
-            if key in STATE_NUMBER_KEYS and (
-                isinstance(child, bool) or not isinstance(child, (int, float))
-            ):
-                raise LedgerError(
-                    f"collector state field {field_name}.{key} must be numeric"
-                )
-            if key in STATE_STRING_KEYS and not isinstance(child, str):
-                raise LedgerError(
-                    f"collector state field {field_name}.{key} must be a string"
-                )
-            if isinstance(child, str) and len(child.encode("utf-8")) > 4096:
-                raise LedgerError(
-                    f"collector state field {field_name}.{key} is too large"
-                )
-            if not isinstance(child, (str, int, float, bool)):
-                raise LedgerError(
-                    f"collector state field {field_name}.{key} contains unsupported data"
-                )
-            if isinstance(child, float) and not math.isfinite(child):
-                raise LedgerError(
-                    f"collector state field {field_name}.{key} is not finite"
-                )
+            _validate_state_scalar(field_name, key, child)
 
 
-def _nested_state_keys(key: str) -> Optional[set[str]]:
+def _validate_state_scalar(field_name: str, key: str, value: Any) -> None:
+    """Validate scalar fields with the schema that owns the field."""
+    audit_path = "olderHistoryAudit" in field_name
+    if key == "continuation":
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise LedgerError(
+                f"collector state field {field_name}.{key} must be a cursor or offset"
+            )
+    elif key == "scopes":
+        if value not in {"active", "archived"}:
+            raise LedgerError(
+                f"collector state field {field_name}.{key} has an invalid scope"
+            )
+    elif key == "lastCompletedAt" and audit_path:
+        if not isinstance(value, str):
+            raise LedgerError(
+                f"collector state field {field_name}.{key} must be an ISO timestamp"
+            )
+        try:
+            parse_datetime(value)
+        except (TypeError, ValueError, OverflowError, OSError) as exc:
+            raise LedgerError(
+                f"collector state field {field_name}.{key} must be an ISO timestamp"
+            ) from exc
+    elif key in STATE_BOOLEAN_KEYS and not isinstance(value, bool):
+        raise LedgerError(f"collector state field {field_name}.{key} must be boolean")
+    elif key in STATE_NUMBER_KEYS and (
+        isinstance(value, bool) or not isinstance(value, (int, float))
+    ):
+        raise LedgerError(f"collector state field {field_name}.{key} must be numeric")
+    elif key in STATE_IDENTIFIER_KEYS:
+        if not isinstance(value, str) or sanitize_token(value) is None:
+            raise LedgerError(
+                f"collector state field {field_name}.{key} must be an identifier"
+            )
+    elif key in STATE_STRING_KEYS and not isinstance(value, str):
+        raise LedgerError(f"collector state field {field_name}.{key} must be a string")
+    elif not isinstance(value, (str, int, float, bool)):
+        raise LedgerError(
+            f"collector state field {field_name}.{key} contains unsupported data"
+        )
+    if isinstance(value, str) and len(value.encode("utf-8")) > 4096:
+        raise LedgerError(f"collector state field {field_name}.{key} is too large")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise LedgerError(f"collector state field {field_name}.{key} is not finite")
+    allowed = _state_allowed_values(field_name, key)
+    if allowed is not None and value not in allowed:
+        raise LedgerError(f"collector state field {field_name}.{key} has an invalid value")
+
+
+def _state_allowed_values(field_name: str, key: str) -> Optional[set[str]]:
+    if key == "state" and "quarantine" in field_name:
+        return {"clear", "quarantined", "unknown"}
+    if key == "field" and "timestamps" in field_name:
+        return {
+            "createdAt",
+            "updatedAt",
+            "attemptTime",
+            "earliestPossibleAt",
+            "latestPossibleAt",
+        }
+    if key == "scope":
+        if (
+            "checkpoint" in field_name
+            or "historyCoverage" in field_name
+            or "coverage" in field_name
+        ):
+            return {"active", "archived"}
+        return None
+    if key == "projects":
+        return {"validated_for_discovered_projects", "unknown", "complete", "partial"}
+    if key == "branches":
+        return {"version_metadata_observed", "active_branch_only", "unknown", "complete", "partial"}
+    if key in {"history", "overall"} and "coverage" in field_name:
+        return {"complete", "partial", "unknown"}
+    if key == "reason":
+        if "revisit" in field_name:
+            return STATE_ENUM_VALUES["reason"]
+        if "accountState" in field_name:
+            return {"authentication", "cooldown"}
+        return None
+    if key == "coverage" and "coverage" in field_name:
+        return {"complete", "partial", "unknown", "validated_page", "unrecognized"}
+    if key == "paginationState":
+        return STATE_ENUM_VALUES["paginationState"]
+    if key != "status":
+        return STATE_ENUM_VALUES.get(key)
+    if "olderHistoryAudit" in field_name:
+        return {"disabled", "in_progress", "partial", "complete"}
+    if "accountState" in field_name:
+        return {"ready", "paused"}
+    if "revisit" in field_name:
+        return {"pending", "complete"}
+    if "activeTrigger" in field_name or field_name.endswith(".active"):
+        return {"active", "claimed", "running", "idle", "cancelled"}
+    return {"not_started", "in_progress", "complete", "partial"}
+
+
+def _nested_state_keys(key: str, field_name: str) -> Optional[set[str]]:
+    if key in {"active", "archived"}:
+        if "olderHistoryAudit" in field_name:
+            return STATE_AUDIT_RESULT_KEYS
+        if "coverage" in field_name.lower():
+            return STATE_SCOPE_COVERAGE_KEYS
+        return STATE_TRIGGER_KEYS
+    if key == "olderHistoryAudit":
+        if "historyCoverage" in field_name or field_name.endswith(".coverage"):
+            return STATE_AUDIT_AGGREGATE_KEYS
+        return STATE_AUDIT_RESULT_KEYS
+    if key == "coverage" and "historyCoverage" in field_name:
+        return STATE_HISTORY_COVERAGE_KEYS
+    if key == "historyCoverage":
+        return STATE_HISTORY_COVERAGE_KEYS
     return {
         "checkpoint": STATE_CHECKPOINT_KEYS,
         "scope": STATE_SCOPE_KEYS | STATE_COVERAGE_KEYS,
         "pending": STATE_PENDING_KEYS,
-        "active": STATE_TRIGGER_KEYS | STATE_COVERAGE_KEYS,
         "range": STATE_RANGE_KEYS,
         "candidateQueue": STATE_CANDIDATE_KEYS,
         "summary": STATE_SUMMARY_KEYS | STATE_TERMINAL_SUMMARY_KEYS,
         "coverage": STATE_COVERAGE_KEYS,
-        "historyCoverage": STATE_COVERAGE_KEYS,
         "identity": STATE_IDENTITY_KEYS,
         "accountState": STATE_ACCOUNT_KEYS,
         "terminalSummary": STATE_TERMINAL_SUMMARY_KEYS,
-        "scopes": STATE_COVERAGE_KEYS,
+        "scopes": STATE_SCOPE_COVERAGE_KEYS,
         "candidate": STATE_CANDIDATE_KEYS | STATE_REVISIT_KEYS,
         "revisit": STATE_REVISIT_KEYS,
         "malformedPage": STATE_MALFORMED_PAGE_KEYS,
         "outstandingGeneration": STATE_OUTSTANDING_GENERATION_KEYS,
-        "olderHistoryAudit": STATE_AUDIT_KEYS,
+        "quarantine": STATE_QUARANTINE_KEYS,
+        "timestamps": STATE_QUARANTINE_TIMESTAMP_KEYS,
         "paginationState": STATE_PAGINATION_KEYS,
     }.get(key)
 
@@ -2829,6 +3532,12 @@ def _optional_int(value: Any) -> Optional[int]:
         raise LedgerError("state version must be an integer")
     if value < 0:
         raise LedgerError("state version must not be negative")
+    return value
+
+
+def _positive_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise LedgerError(f"{field_name} must be a positive integer")
     return value
 
 
