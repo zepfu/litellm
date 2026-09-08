@@ -232,6 +232,7 @@ _CANONICAL_ACCOUNT_HASH_RE = re.compile(
 _ACCOUNT_IDENTITY_CONTAINERS = ("user", "account", "profile", "membership")
 _IDENTITY_FIELD_NAMES = (
     "feature",
+    "feature_name",
     "feature_id",
     "featureId",
     "feature_slug",
@@ -325,6 +326,14 @@ _USAGE_NUMBER_FIELD_ALIASES = (
     *_USED_KEYS,
 )
 _NAMED_USAGE_COLLECTIONS = frozenset({"model_limits", "limits_progress"})
+_NAMED_COLLECTION_IDENTITY_FIELDS = {
+    "limits_progress": "feature",
+    "model_limits": "model",
+}
+_COLLECTION_STATE_VALUES = frozenset(
+    {"absent_unknown", "empty_unknown", "present", "partial", "malformed"}
+)
+_MAX_COLLECTION_DIAGNOSTIC_COUNT = MAX_PROJECTION_LIST_ITEMS * 4
 _CONVERSATION_INIT_MARKERS = {
     "model_limits",
     "limits_progress",
@@ -1158,6 +1167,72 @@ def _collections_are_wholly_malformed(parsed: Mapping[str, Any]) -> bool:
     )
 
 
+def _collection_diagnostics(
+    payload: Any,
+    *,
+    malformed_collection_projection: bool,
+    projection_truncated: bool,
+) -> Dict[str, Any]:
+    diagnostics = {
+        "model_limits_state": "absent_unknown",
+        "limits_progress_state": "absent_unknown",
+        "blocked_features_state": "absent_unknown",
+        "malformed_entry_count": 0,
+        "valid_observation_count": 0,
+        "projection_truncated": bool(projection_truncated),
+        "malformed_collection_projection": bool(
+            malformed_collection_projection
+        ),
+    }
+    if not isinstance(payload, Mapping):
+        return diagnostics
+
+    parsed = _parse_collections(
+        payload,
+        {
+            "malformed_collection_projection": (
+                malformed_collection_projection
+            ),
+            "projection_truncated": projection_truncated,
+        },
+    )
+    for field_name in (
+        "model_limits_state",
+        "limits_progress_state",
+        "blocked_features_state",
+    ):
+        state = parsed[field_name]
+        diagnostics[field_name] = (
+            state if state in _COLLECTION_STATE_VALUES else "malformed"
+        )
+    diagnostics["malformed_entry_count"] = min(
+        max(int(parsed["malformed"]), 0),
+        _MAX_COLLECTION_DIAGNOSTIC_COUNT,
+    )
+    diagnostics["projection_truncated"] = bool(
+        projection_truncated or parsed["truncated"] is True
+    )
+    diagnostics["malformed_collection_projection"] = (
+        parsed["projection_malformed"] is True
+    )
+    if _collections_are_wholly_malformed(parsed):
+        return diagnostics
+    valid_rows = sum(
+        len(parsed[field_name])
+        for field_name in (
+            "feature_rows",
+            "model_rows",
+            "default_model_rows",
+            "blocked_rows",
+        )
+    )
+    diagnostics["valid_observation_count"] = min(
+        valid_rows + 1,
+        _MAX_COLLECTION_DIAGNOSTIC_COUNT,
+    )
+    return diagnostics
+
+
 def build_conversation_init_rate_limit_tuples(
     observations: Sequence[Mapping[str, Any]],
     *,
@@ -1428,8 +1503,25 @@ def _redact_mapping(
                 malformed_fields.append(malformed_usage_field)
             redacted_count += 1
             continue
+        redaction_value = value
+        if collection_map and isinstance(value, Mapping):
+            identity_field = _NAMED_COLLECTION_IDENTITY_FIELDS.get(
+                parent_normalized
+            )
+            identity = _safe_identity(name)
+            if (
+                identity_field is not None
+                and identity is not None
+                and not any(
+                    _normalize_key(existing_key)
+                    == _normalize_key(identity_field)
+                    for existing_key in value
+                )
+            ):
+                redaction_value = dict(value)
+                redaction_value[identity_field] = identity
         redacted_value, node, nested_redacted = _redact_value(
-            value,
+            redaction_value,
             depth=depth + 1,
             parent_key=child_parent_key,
             collection_entry=(
@@ -1986,6 +2078,34 @@ def _normalize_named_collection(
     if isinstance(raw, list):
         for item in raw:
             if isinstance(item, Mapping):
+                if len(item) == 1 and _entry_identity(item) is None:
+                    key, value = next(iter(item.items()))
+                    normalized_key = _normalize_key(key)
+                    if normalized_key in {
+                        _normalize_key("_identity"),
+                        *(_normalize_key(field) for field in _IDENTITY_FIELD_NAMES),
+                    }:
+                        entries.append(item)
+                        continue
+                    if _is_usage_number_field_name(normalized_key) or any(
+                        normalized_key == _normalize_key(reset_key)
+                        for reset_key in _RESET_KEYS
+                    ):
+                        entries.append(item)
+                        continue
+                    identity = _safe_identity(key)
+                    if identity is not None and isinstance(value, Mapping):
+                        merged = dict(value)
+                        merged.setdefault("_identity", identity)
+                        entries.append(merged)
+                        continue
+                    if identity is not None and (
+                        isinstance(value, (int, float, str)) or value is None
+                    ):
+                        entries.append(
+                            {"_identity": identity, "remaining": value}
+                        )
+                        continue
                 entries.append(item)
             elif isinstance(item, str):
                 entries.append({"_identity": item})
@@ -3615,9 +3735,22 @@ def collect_conversation_init_snapshot(  # noqa: PLR0915 - collector state
         else None
     )
     summary["native_capture_error"] = sanitized.get("native_capture_error")
-    writable = _snapshot_is_persistable(sanitized)
+    summary.update(
+        _collection_diagnostics(
+            sanitized.get("payload"),
+            malformed_collection_projection=(
+                sanitized.get("malformed_collection_projection") is True
+            ),
+            projection_truncated=sanitized.get("projection_truncated") is True,
+        )
+    )
+    persistability_failure_reason = _snapshot_persistability_failure_reason(
+        sanitized
+    )
+    writable = persistability_failure_reason is None
     reusable = _destination_has_reusable_snapshot(source_path)
     if not writable:
+        summary["failure_reason"] = persistability_failure_reason
         summary["telemetry_status"] = _failure_telemetry_status(sanitized)
         summary["telemetry_class"] = _failure_telemetry_class(sanitized)
         summary["last_good_state_retained"] = reusable
@@ -3626,6 +3759,7 @@ def collect_conversation_init_snapshot(  # noqa: PLR0915 - collector state
     try:
         write_conversation_init_snapshot(source_path, sanitized)
     except ChatGPTConversationInitError as exc:
+        summary["failure_reason"] = "snapshot_write_failed"
         summary["telemetry_class"] = exc.telemetry_class
         summary["last_good_state_retained"] = True
         return summary
@@ -3771,6 +3905,15 @@ def _collect_bound_conversation_init_snapshot(  # noqa: PLR0915 - bound state
         else None
     )
     summary["native_capture_error"] = sanitized.get("native_capture_error")
+    summary.update(
+        _collection_diagnostics(
+            sanitized.get("payload"),
+            malformed_collection_projection=(
+                sanitized.get("malformed_collection_projection") is True
+            ),
+            projection_truncated=sanitized.get("projection_truncated") is True,
+        )
+    )
     summary["account_hash"] = sanitized.get("account_hash")
     summary["account_identity_hashed"] = bool(sanitized.get("account_hash"))
     summary["account_identity_source"] = sanitized.get("account_identity_source")
@@ -3883,17 +4026,17 @@ def _collect_bound_conversation_init_snapshot(  # noqa: PLR0915 - bound state
         "account_identity_verification_source"
     ]
     summary["live_authenticated_oracle_browser"] = True
-    writable = _snapshot_is_persistable(
+    persistability_failure_reason = _snapshot_persistability_failure_reason(
         sanitized,
         expected_account_hash=expected_account_hash,
         require_verified_identity=True,
     )
-    if not writable:
+    if persistability_failure_reason is not None:
         return _bound_capture_failure(
             summary,
             source_path=source_path,
             expected_account_hash=expected_account_hash,
-            error="current_snapshot_not_persistable",
+            error=persistability_failure_reason,
             telemetry_status=_failure_telemetry_status(sanitized),
             telemetry_class=_failure_telemetry_class(sanitized),
             reusable=reusable,
@@ -3950,6 +4093,7 @@ def _bound_capture_failure(
     summary["written"] = False
     summary["snapshot_fresh"] = False
     summary["last_good_state_retained"] = reusable
+    summary["failure_reason"] = error
     summary["account_identity_verification_error"] = error
     summary["telemetry_status"] = telemetry_status
     summary["telemetry_class"] = telemetry_class
@@ -3979,10 +4123,18 @@ def _collector_summary(contract: Mapping[str, Any], source_path: str) -> Dict[st
         "account_identity_hash_length": None,
         "account_identity_verification_source": None,
         "account_identity_verification_error": None,
+        "failure_reason": None,
         "native_capture": None,
         "native_capture_error": None,
         "browser_challenge": False,
         "retry_after_seconds": None,
+        "model_limits_state": "absent_unknown",
+        "limits_progress_state": "absent_unknown",
+        "blocked_features_state": "absent_unknown",
+        "malformed_entry_count": 0,
+        "valid_observation_count": 0,
+        "projection_truncated": False,
+        "malformed_collection_projection": False,
         "redacted_field_count": 0,
         "source_identity_hash": hash_chatgpt_conversation_init_source_identity(
             source_path
@@ -4049,10 +4201,26 @@ def _snapshot_is_persistable(
     expected_account_hash: Optional[str] = None,
     require_verified_identity: bool = False,
 ) -> bool:
+    return (
+        _snapshot_persistability_failure_reason(
+            sanitized,
+            expected_account_hash=expected_account_hash,
+            require_verified_identity=require_verified_identity,
+        )
+        is None
+    )
+
+
+def _snapshot_persistability_failure_reason(
+    sanitized: Mapping[str, Any],
+    *,
+    expected_account_hash: Optional[str] = None,
+    require_verified_identity: bool = False,
+) -> Optional[str]:
     if sanitized.get("browser_challenge") is True:
-        return False
+        return "browser_challenge"
     if sanitized.get("native_capture_error"):
-        return False
+        return "native_capture_error"
     if (
         sanitized.get("account_identity_source")
         == CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
@@ -4061,14 +4229,16 @@ def _snapshot_is_persistable(
             sanitized.get("account_hash"),
         )
     ):
-        return False
+        return "native_identity_unverified"
     if _http_status_failure(sanitized.get("status_code")) is not None:
-        return False
+        return "http_error"
     if sanitized.get("payload_state") != "present":
-        return False
+        return "payload_not_present"
     payload = sanitized.get("payload")
-    if not isinstance(payload, Mapping) or not looks_like_conversation_init_payload(payload):
-        return False
+    if not isinstance(payload, Mapping):
+        return "payload_not_mapping"
+    if not looks_like_conversation_init_payload(payload):
+        return "payload_marker_missing"
     if _collections_are_wholly_malformed(
         _parse_collections(
             payload,
@@ -4079,19 +4249,21 @@ def _snapshot_is_persistable(
             },
         )
     ):
-        return False
+        return "collections_wholly_malformed"
     if require_verified_identity:
-        return bool(
-            _is_verified_bound_identity(
-                sanitized,
-                sanitized.get("account_hash"),
-            )
-            and (
-                expected_account_hash is None
-                or sanitized.get("account_hash") == expected_account_hash
-            )
-        )
-    return bool(sanitized.get("account_hash") or sanitized.get("source_identity_hash"))
+        if not _is_verified_bound_identity(
+            sanitized,
+            sanitized.get("account_hash"),
+        ):
+            return "account_identity_unverified"
+        if (
+            expected_account_hash is not None
+            and sanitized.get("account_hash") != expected_account_hash
+        ):
+            return "account_identity_mismatch"
+    elif not sanitized.get("account_hash") and not sanitized.get("source_identity_hash"):
+        return "account_identity_missing"
+    return None
 
 
 def _snapshot_fits_write_budget(sanitized: Mapping[str, Any]) -> bool:

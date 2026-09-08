@@ -401,7 +401,7 @@ async def test_rr054_stream_validation_pending_stream_is_not_logged_as_overflow(
 async def test_rr054_stream_validation_overflow_bypasses_validation_without_truncation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Overflow stops eager validation and preserves the complete upstream stream."""
+    """Overflow still validates and rejects a failed terminal response."""
     monkeypatch.setattr(lpe, "_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS", 1)
 
     failed_body = {
@@ -439,9 +439,10 @@ async def test_rr054_stream_validation_overflow_bypasses_validation_without_trun
         adapter="codex_auto_agent_openai_responses",
         adapter_label="OpenAI Responses",
     )
-    replayed = await _drain_stream(response)
-    assert [_decode_chunk(c) for c in replayed] == [_decode_chunk(c) for c in chunks]
-    assert "response.failed" in _rendered(replayed)
+    from litellm.proxy._types import ProxyException
+
+    with pytest.raises(ProxyException):
+        await _drain_stream(response)
 
 
 @pytest.mark.asyncio

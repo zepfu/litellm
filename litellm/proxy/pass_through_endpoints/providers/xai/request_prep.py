@@ -361,7 +361,16 @@ def _sanitize_xai_responses_request_body(
             sanitized_body["previous_response_id"] = decoded
             decoded_previous_response_id = True
 
-    if not removed_params and not tool_changes and not decoded_previous_response_id:
+    store_forced_false = (
+        sanitized_body.get("store") is False
+        and request_body.get("store") is not False
+    )
+    if (
+        not removed_params
+        and not tool_changes
+        and not decoded_previous_response_id
+        and not store_forced_false
+    ):
         return request_body, [], []
 
     tool_types = runtime._dedupe_sorted_str_list(
@@ -391,6 +400,11 @@ def _sanitize_xai_responses_request_body(
                 else []
             ),
             *(
+                ["xai-responses-store-forced-false-image"]
+                if store_forced_false
+                else []
+            ),
+            *(
                 f"xai-responses-removed-param:{param}"
                 for param in normalized_removed_params
             ),
@@ -410,6 +424,7 @@ def _sanitize_xai_responses_request_body(
             "xai_responses_previous_response_id_decoded": (
                 decoded_previous_response_id
             ),
+            "xai_responses_store_forced_false_image": store_forced_false,
             "langfuse_spans": [
                 runtime._build_langfuse_span_descriptor(
                     name="xai.responses_request_sanitized",
@@ -420,6 +435,7 @@ def _sanitize_xai_responses_request_body(
                         "previous_response_id_decoded": (
                             decoded_previous_response_id
                         ),
+                        "store_forced_false_image": store_forced_false,
                     },
                 )
             ],
