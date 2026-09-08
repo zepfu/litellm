@@ -1669,6 +1669,7 @@ _HOST_FUNCTION_NAMES = (
     "_first_quota_float",
     "_looks_like_xai_oauth_rate_limit_context",
     "_looks_like_xai_grok_oidc_rate_limit_context",
+    "_validated_xai_oauth_server_account_metadata",
     "_extract_xai_oauth_account_hash",
     "_extract_xai_grok_oidc_account_hash",
     "_xai_oauth_header_remaining_pct",
