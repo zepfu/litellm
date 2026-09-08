@@ -398,3 +398,62 @@ FROM bootstrap_scopes
 ON CONFLICT (scope_key, collector_account_id, binding_generation) DO NOTHING;
 
 COMMIT;
+
+BEGIN;
+
+CREATE TABLE IF NOT EXISTS public.chatgpt_usage_collector_state (
+    profile_id TEXT NOT NULL,
+    collector_account_id TEXT NOT NULL,
+    state_version BIGINT NOT NULL,
+    schedule_transition JSONB NOT NULL DEFAULT '{}'::jsonb,
+    checkpoint JSONB NOT NULL DEFAULT '{}'::jsonb,
+    active_trigger JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (profile_id, collector_account_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.chatgpt_usage_collector_leases (
+    profile_id TEXT NOT NULL,
+    collector_account_id TEXT NOT NULL,
+    scope_key TEXT NOT NULL
+        REFERENCES public.chatgpt_usage_scopes(scope_key) ON DELETE CASCADE,
+    binding_generation INTEGER NOT NULL,
+    lease_fencing_token BIGINT NOT NULL,
+    lease_expires_at TIMESTAMPTZ NOT NULL,
+    claimed_at TIMESTAMPTZ NOT NULL,
+    renewed_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (profile_id, collector_account_id),
+    CHECK (lease_fencing_token > 0)
+);
+
+CREATE TABLE IF NOT EXISTS public.chatgpt_usage_collector_candidates (
+    profile_id TEXT NOT NULL,
+    collector_account_id TEXT NOT NULL,
+    candidate_key TEXT NOT NULL,
+    rank INTEGER NOT NULL,
+    operation TEXT NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    has_more BOOLEAN NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (profile_id, collector_account_id, candidate_key)
+);
+
+CREATE INDEX IF NOT EXISTS chatgpt_usage_collector_candidates_rank_idx
+    ON public.chatgpt_usage_collector_candidates (
+        profile_id, collector_account_id, rank
+    );
+
+CREATE TABLE IF NOT EXISTS public.chatgpt_usage_collector_page_acks (
+    profile_id TEXT NOT NULL,
+    collector_account_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    page_commit_id TEXT NOT NULL,
+    serial BIGINT NOT NULL,
+    state_version BIGINT NOT NULL,
+    payload_fingerprint TEXT NOT NULL,
+    acked_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (profile_id, collector_account_id, run_id, page_commit_id),
+    UNIQUE (profile_id, collector_account_id, serial),
+    CHECK (serial > 0)
+);
+
+COMMIT;
