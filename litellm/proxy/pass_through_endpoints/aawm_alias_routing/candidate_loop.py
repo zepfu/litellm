@@ -2387,10 +2387,14 @@ async def handle_alias_route(  # noqa: PLR0915
                                         ),
                                         cooldown_keys=(selection["cooldown_key"],),
                                     )
-                                await set_session_affinity_fn(
-                                    selection.get("session_key"),
-                                    candidate,
-                                )
+                                if not _is_native_openai_responses_candidate(
+                                    request=request,
+                                    candidate=candidate,
+                                ):
+                                    await set_session_affinity_fn(
+                                        selection.get("session_key"),
+                                        candidate,
+                                    )
                                 assert response is not None
                                 attempt_record["attempted_provider_call"] = (
                                     attempted_provider_call
