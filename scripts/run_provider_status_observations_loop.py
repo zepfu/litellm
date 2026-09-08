@@ -12944,12 +12944,21 @@ def _oauth_refresh_result_class(
     actual_attempt_count: int,
     operation_error_class: Optional[str],
     prior_result_class: Optional[str],
+    preserve_failure_when_not_due: bool = False,
 ) -> str:
     expires_at = _parse_sidecar_timestamp(eligibility.get("expires_at"))
     if expires_at is not None and expires_at <= wall_now:
         return "expired"
+    if operation_error_class and preserve_failure_when_not_due:
+        return "refresh_failed"
     eligible = bool(eligibility.get("eligible")) or not eligibility.get("expires_at")
     if not eligible:
+        if (
+            preserve_failure_when_not_due
+            and actual_attempt_count == 0
+            and prior_result_class == "refresh_failed"
+        ):
+            return "refresh_failed"
         return "refresh_not_due"
     if operation_error_class:
         return "refresh_failed"
@@ -13008,6 +13017,7 @@ def _oauth_refresh_schedule_evidence(
     threshold_seconds: Optional[float] = None,
     credential_health: Optional[str] = None,
     terminal_refresh_blocked: bool = False,
+    resolved_credential_identity: Optional[str] = None,
 ) -> Dict[str, Any]:
     effective_threshold_seconds = final.get("refresh_threshold_seconds")
     if effective_threshold_seconds is None:
@@ -13032,7 +13042,8 @@ def _oauth_refresh_schedule_evidence(
         "refresh_attempt_interval_seconds": attempt_interval_seconds,
         "refresh_buffer_seconds": buffer_seconds,
         "refresh_threshold_seconds": effective_threshold_seconds,
-        "credential_identity": final.get("credential_identity")
+        "credential_identity": resolved_credential_identity
+        or final.get("credential_identity")
         or pre.get("credential_identity")
         or schedule.credential_identity,
         "credential_health": credential_health
@@ -13074,6 +13085,42 @@ def _oauth_refresh_identity(eligibility: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def _oauth_refresh_failure_remains_authoritative(
+    schedule: OAuthRefreshScheduleState,
+) -> bool:
+    return bool(
+        schedule.last_result_class == "refresh_failed"
+        or schedule.last_error_class
+        or schedule.terminal_refresh_error_class
+    )
+
+
+def _clear_oauth_refresh_failure_on_usable_identity_change(
+    schedule: OAuthRefreshScheduleState,
+    eligibility: Mapping[str, Any],
+) -> bool:
+    candidate_identity = _oauth_refresh_identity(eligibility)
+    if (
+        not _oauth_refresh_failure_remains_authoritative(schedule)
+        or schedule.credential_identity is None
+        or candidate_identity is None
+        or candidate_identity == schedule.credential_identity
+        or not eligibility.get("usable")
+    ):
+        return False
+    schedule.last_result_class = None
+    schedule.last_error_class = None
+    schedule.last_error_message = None
+    schedule.terminal_refresh_error_class = None
+    schedule.terminal_refresh_identity = None
+    schedule.credential_identity = candidate_identity
+    schedule.credential_health = _redacted_summary_field(
+        eligibility.get("credential_health")
+    )
+    schedule.usable = bool(eligibility.get("usable"))
+    return True
+
+
 def _oauth_refresh_terminal_blocked(
     schedule: OAuthRefreshScheduleState,
     eligibility: Mapping[str, Any],
@@ -13103,16 +13150,34 @@ def _record_oauth_refresh_schedule_outcome(
     attempt_interval_seconds: float,
     buffer_seconds: Optional[float],
     threshold_seconds: Optional[float],
+    preserve_failure_when_not_due: bool = False,
+    clear_failure_on_usable_identity_change: bool = False,
 ) -> tuple[str, Dict[str, Any]]:
     operation_error_class = _redacted_summary_field(
         operation_summary.get("error_class")
+    )
+    operation_identity = _oauth_refresh_identity(operation_summary)
+    if (
+        clear_failure_on_usable_identity_change
+        and not operation_error_class
+    ):
+        _clear_oauth_refresh_failure_on_usable_identity_change(schedule, final)
+    prior_failure_active = (
+        preserve_failure_when_not_due
+        and _oauth_refresh_failure_remains_authoritative(schedule)
+    )
+    prior_result_class = (
+        "refresh_failed"
+        if prior_failure_active
+        else schedule.last_result_class
     )
     result_class = _oauth_refresh_result_class(
         final,
         wall_now=wall_now,
         actual_attempt_count=actual_attempt_count,
         operation_error_class=operation_error_class,
-        prior_result_class=schedule.last_result_class if not should_call else None,
+        prior_result_class=prior_result_class if not should_call else None,
+        preserve_failure_when_not_due=preserve_failure_when_not_due,
     )
     effective_health = _effective_oauth_credential_health(
         final,
@@ -13124,7 +13189,26 @@ def _record_oauth_refresh_schedule_outcome(
     schedule.next_refresh_check_at = final.get("next_refresh_check_at")
     schedule.expires_at = final.get("expires_at")
     schedule.last_result_class = result_class
-    recorded_identity = _oauth_refresh_identity(final) or _oauth_refresh_identity(pre)
+    if (
+        preserve_failure_when_not_due
+        and operation_error_class
+        and operation_identity is not None
+    ):
+        recorded_identity = operation_identity
+    elif (
+        prior_failure_active
+        and result_class == "refresh_failed"
+        and actual_attempt_count == 0
+    ):
+        recorded_identity = (
+            schedule.credential_identity
+            or _oauth_refresh_identity(final)
+            or _oauth_refresh_identity(pre)
+        )
+    else:
+        recorded_identity = _oauth_refresh_identity(final) or _oauth_refresh_identity(
+            pre
+        )
     if recorded_identity is not None:
         schedule.credential_identity = recorded_identity
     if operation_error_class:
@@ -13133,7 +13217,12 @@ def _record_oauth_refresh_schedule_outcome(
             operation_summary.get("error_message")
         )
         terminal_error = _oauth_terminal_refresh_error_class(operation_error_class)
-        stored_identity = current_identity or _oauth_refresh_identity(final)
+        if preserve_failure_when_not_due:
+            stored_identity = (
+                operation_identity or recorded_identity or current_identity
+            )
+        else:
+            stored_identity = current_identity or _oauth_refresh_identity(final)
         if terminal_error and stored_identity is not None:
             schedule.terminal_refresh_error_class = terminal_error
             schedule.terminal_refresh_identity = stored_identity
@@ -13158,6 +13247,11 @@ def _record_oauth_refresh_schedule_outcome(
         threshold_seconds=threshold_seconds,
         credential_health=effective_health,
         terminal_refresh_blocked=terminal_blocked,
+        resolved_credential_identity=(
+            schedule.credential_identity
+            if preserve_failure_when_not_due
+            else None
+        ),
     )
     evidence["helper_called"] = should_call
     return result_class, evidence
@@ -13178,6 +13272,8 @@ def _run_oauth_refresh_schedule(
     buffer_seconds: Optional[float] = None,
     threshold_seconds: Optional[float] = None,
     eligibility_inspector_kwargs: Optional[Mapping[str, Any]] = None,
+    preserve_failure_when_not_due: bool = False,
+    clear_failure_on_usable_identity_change: bool = False,
 ) -> tuple[
     Dict[str, Any],
     Dict[str, Any],
@@ -13191,12 +13287,24 @@ def _run_oauth_refresh_schedule(
         inspector_kwargs=eligibility_inspector_kwargs,
         fallback_poll_interval_seconds=eligibility_cadence_seconds,
     )
+    current_identity = _oauth_refresh_identity(pre)
+    if clear_failure_on_usable_identity_change:
+        _clear_oauth_refresh_failure_on_usable_identity_change(schedule, pre)
+    prior_failure_active = (
+        preserve_failure_when_not_due
+        and _oauth_refresh_failure_remains_authoritative(schedule)
+    )
     pre_result_class = _oauth_refresh_result_class(
         pre,
         wall_now=wall_now,
         actual_attempt_count=0,
         operation_error_class=None,
-        prior_result_class=schedule.last_result_class,
+        prior_result_class=(
+            "refresh_failed"
+            if prior_failure_active
+            else schedule.last_result_class
+        ),
+        preserve_failure_when_not_due=preserve_failure_when_not_due,
     )
     actual_attempt_count = 0
     operation_summary: Mapping[str, Any] = {}
@@ -13213,14 +13321,17 @@ def _run_oauth_refresh_schedule(
         now_monotonic=now_monotonic,
         attempt_interval_seconds=effective_attempt_interval_seconds,
     )
-    current_identity = _oauth_refresh_identity(pre)
     if (
         current_identity is not None
         and schedule.terminal_refresh_identity is not None
         and current_identity != schedule.terminal_refresh_identity
     ):
-        schedule.terminal_refresh_error_class = None
-        schedule.terminal_refresh_identity = None
+        if (
+            not clear_failure_on_usable_identity_change
+            or bool(pre.get("usable"))
+        ):
+            schedule.terminal_refresh_error_class = None
+            schedule.terminal_refresh_identity = None
     terminal_blocked = _oauth_refresh_terminal_blocked(schedule, pre)
 
     def on_token_endpoint_attempt() -> None:
@@ -13283,6 +13394,10 @@ def _run_oauth_refresh_schedule(
         attempt_interval_seconds=attempt_interval_seconds,
         buffer_seconds=buffer_seconds,
         threshold_seconds=threshold_seconds,
+        preserve_failure_when_not_due=preserve_failure_when_not_due,
+        clear_failure_on_usable_identity_change=(
+            clear_failure_on_usable_identity_change
+        ),
     )
     return dict(final), dict(operation_summary), post, evidence, should_call
 
@@ -13627,6 +13742,8 @@ def _run_xai_oauth_refresh_task(
         attempt_interval_seconds=config.xai_oauth_refresh_interval_seconds,
         eligibility_cadence_seconds=config.interval_seconds,
         buffer_seconds=config.xai_oauth_refresh_buffer_seconds,
+        preserve_failure_when_not_due=True,
+        clear_failure_on_usable_identity_change=True,
     )
 
     event = {

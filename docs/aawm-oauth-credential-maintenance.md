@@ -144,13 +144,14 @@ statuses, other HTTP failures, malformed responses, and local refresh failures
 remain bounded and retryable. Provider response bodies and descriptions are not
 retained in refresh summaries or observations.
 
-A failed managed xAI refresh remains authoritative through a passive local-file
-inspection of that same credential generation. The passive inspection records
-local usability separately and cannot manufacture a refresh or token-endpoint
-success timestamp. If it observes a different identity, the sidecar reinspects
-the local file once before using that result. Only a confirmed different usable
-generation clears failed-refresh state and terminal suppression; an unusable or
-stale passive snapshot does not.
+A failed managed xAI refresh remains authoritative through later not-due
+scheduler cycles and a passive local-file inspection of that same credential
+generation. The passive inspection records local usability separately and
+cannot manufacture a refresh or token-endpoint success timestamp. If it
+observes a different identity, the sidecar reinspects the local file once before
+using that result. Only a successful actual refresh or a confirmed different
+usable generation clears failed-refresh state and terminal suppression; an
+unusable or stale passive snapshot does not.
 
 ## Portable default paths
 
