@@ -190,11 +190,10 @@ def _parse_sse_block(
         for index, raw_line in enumerate(lines)
         if _line_event_type(raw_line) is not None
     ]
-    relevant_lines = (
-        lines[event_line_indexes[-1] :]
-        if event_line_indexes
-        else lines
-    )
+    # Validate every field in the complete SSE block before selecting a
+    # terminal.  Looking only at the last event line can hide a malformed
+    # partial event that precedes a valid terminal in the same block.
+    relevant_lines = lines
     event_type = (
         _line_event_type(lines[event_line_indexes[-1]])
         if event_line_indexes
@@ -232,7 +231,7 @@ def _parse_sse_block(
                 malformed = True
             if event_type is None and isinstance(payload_type, str):
                 event_type = payload_type.strip() or None
-        elif decoded_payload is not None:
+        else:
             malformed = True
     elif saw_data_line and not saw_done:
         malformed = True
