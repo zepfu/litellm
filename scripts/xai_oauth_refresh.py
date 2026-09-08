@@ -33,13 +33,16 @@ from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
 )
 from litellm.secret_managers.xai_oauth_credentials import (
+    DEFAULT_XAI_OAUTH_AUTH_FILE as _FOUNDATION_DEFAULT_XAI_OAUTH_AUTH_FILE,
+    DEFAULT_XAI_OAUTH_SCOPE as _FOUNDATION_DEFAULT_XAI_OAUTH_SCOPE,
+    resolve_xai_oauth_credentials,
     select_xai_oauth_credential_record,
 )
 
 # Portable ~ defaults (expanded via Path.expanduser at use sites).
-DEFAULT_XAI_OAUTH_AUTH_FILE = "~/.litellm/xai/oauth-auth.json"
+DEFAULT_XAI_OAUTH_AUTH_FILE = _FOUNDATION_DEFAULT_XAI_OAUTH_AUTH_FILE
 DEFAULT_XAI_OAUTH_LOCK_FILE = "~/.litellm/xai/oauth-auth.json.lock"
-DEFAULT_XAI_OAUTH_SCOPE = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
+DEFAULT_XAI_OAUTH_SCOPE = _FOUNDATION_DEFAULT_XAI_OAUTH_SCOPE
 DEFAULT_XAI_OAUTH_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
 DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS = 300
 DEFAULT_XAI_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
@@ -169,6 +172,9 @@ class XaiOAuthRefreshSummary:
     refresh_threshold_seconds: Optional[float] = None
     refresh_threshold_source: Optional[str] = None
     refresh_threshold_degraded: bool = False
+    credential_identity: Optional[str] = None
+    auth_file_source: Optional[str] = None
+    scope_source: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -184,6 +190,9 @@ class XaiOAuthRefreshSummary:
             "refresh_threshold_seconds": self.refresh_threshold_seconds,
             "refresh_threshold_source": self.refresh_threshold_source,
             "refresh_threshold_degraded": self.refresh_threshold_degraded,
+            "credential_identity": self.credential_identity,
+            "auth_file_source": self.auth_file_source,
+            "scope_source": self.scope_source,
         }
 
 
@@ -194,8 +203,16 @@ def inspect_xai_oauth_credential_health(
     resolved_auth_file = Path(auth_file).expanduser()
     resolved_scope = _resolve_scope(scope)
     try:
+        resolution = resolve_xai_oauth_credentials(
+            auth_file,
+            scope,
+            value_getter=os.getenv,
+        )
+        resolved_auth_file = resolution.auth_file
+        resolved_scope = resolution.scope
         credential = _select_credential_record(
-            _read_credential_payload(resolved_auth_file), resolved_scope
+            _read_credential_payload(resolution.canonical_auth_file),
+            resolved_scope,
         )
         if not _looks_like_credential_record(credential):
             raise ValueError("xAI OAuth credential has no usable access credential.")
@@ -207,6 +224,9 @@ def inspect_xai_oauth_credential_health(
                 "degraded",
                 error_class="CredentialExpiryUnavailable",
                 error_message="xAI OAuth credential expires_at is missing or invalid.",
+                credential_identity=resolution.credential_identity,
+                auth_file_source=resolution.auth_file_source,
+                scope_source=resolution.scope_source,
             )
         if expires_at <= datetime.now(timezone.utc):
             return _xai_health_summary(
@@ -216,9 +236,18 @@ def inspect_xai_oauth_credential_health(
                 expires_at,
                 error_class="CredentialExpiredError",
                 error_message="xAI OAuth credential is expired.",
+                credential_identity=resolution.credential_identity,
+                auth_file_source=resolution.auth_file_source,
+                scope_source=resolution.scope_source,
             )
         return _xai_health_summary(
-            resolved_auth_file, resolved_scope, "fresh", expires_at
+            resolved_auth_file,
+            resolved_scope,
+            "fresh",
+            expires_at,
+            credential_identity=resolution.credential_identity,
+            auth_file_source=resolution.auth_file_source,
+            scope_source=resolution.scope_source,
         )
     except Exception as exc:
         return _xai_health_summary(
@@ -237,6 +266,9 @@ def _xai_health_summary(
     expires_at: Optional[datetime] = None,
     error_class: Optional[str] = None,
     error_message: Optional[str] = None,
+    credential_identity: Optional[str] = None,
+    auth_file_source: Optional[str] = None,
+    scope_source: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "attempted": True,
@@ -248,6 +280,9 @@ def _xai_health_summary(
         "expires_at": _format_expires_at(expires_at),
         "error_class": error_class,
         "error_message": error_message,
+        "credential_identity": credential_identity,
+        "auth_file_source": auth_file_source,
+        "scope_source": scope_source,
     }
 
 
@@ -280,18 +315,28 @@ def refresh_xai_oauth_auth_file(
     resolved_auth_file = Path(auth_file).expanduser()
     resolved_scope = _resolve_scope(scope)
     resolved_buffer_seconds = _resolve_buffer_seconds(buffer_seconds)
-    resolved_lock_file = (
-        Path(lock_file).expanduser()
-        if lock_file is not None
-        else resolved_auth_file.with_name(f"{resolved_auth_file.name}.lock")
-    )
+    resolution = None
+    credential: Optional[MutableMapping[str, Any]] = None
 
     try:
+        resolution = resolve_xai_oauth_credentials(
+            auth_file,
+            scope,
+            value_getter=os.getenv,
+        )
+        resolved_auth_file = resolution.auth_file
+        resolved_scope = resolution.scope
+        resolved_read_auth_file = resolution.canonical_auth_file
+        resolved_lock_file = (
+            Path(lock_file).expanduser()
+            if lock_file is not None
+            else resolved_auth_file.with_name(f"{resolved_auth_file.name}.lock")
+        )
         with _credential_file_lock(resolved_lock_file):
-            raw_payload = _read_credential_payload(resolved_auth_file)
+            raw_payload = _read_credential_payload(resolved_read_auth_file)
             credential = _select_credential_record(raw_payload, resolved_scope)
-            threshold, threshold_source, threshold_degraded = (
-                _credential_refresh_threshold_metadata(credential)
+            threshold, threshold_source, threshold_degraded = _credential_refresh_threshold_metadata(
+                credential
             )
             current_expires_at = _format_expires_at(
                 _credential_expires_at(credential)
@@ -312,6 +357,9 @@ def refresh_xai_oauth_auth_file(
                     refresh_threshold_seconds=threshold,
                     refresh_threshold_source=threshold_source,
                     refresh_threshold_degraded=threshold_degraded,
+                    credential_identity=resolution.credential_identity,
+                    auth_file_source=resolution.auth_file_source,
+                    scope_source=resolution.scope_source,
                 ).as_dict()
 
             refreshed = _refresh_credential_record(
@@ -340,15 +388,18 @@ def refresh_xai_oauth_auth_file(
                 refresh_threshold_seconds=threshold,
                 refresh_threshold_source=threshold_source,
                 refresh_threshold_degraded=threshold_degraded,
+                credential_identity=resolution.credential_identity,
+                auth_file_source=resolution.auth_file_source,
+                scope_source=resolution.scope_source,
             ).as_dict()
     except Exception as exc:
         threshold: Optional[float] = None
         threshold_source: Optional[str] = None
         threshold_degraded = False
-        if "credential" in locals():
+        if credential is not None:
             try:
-                threshold, threshold_source, threshold_degraded = (
-                    _credential_refresh_threshold_metadata(credential)
+                threshold, threshold_source, threshold_degraded = _credential_refresh_threshold_metadata(
+                    credential
                 )
             except Exception:
                 pass
@@ -364,6 +415,13 @@ def refresh_xai_oauth_auth_file(
             refresh_threshold_seconds=threshold,
             refresh_threshold_source=threshold_source,
             refresh_threshold_degraded=threshold_degraded,
+            credential_identity=(
+                resolution.credential_identity if resolution is not None else None
+            ),
+            auth_file_source=(
+                resolution.auth_file_source if resolution is not None else None
+            ),
+            scope_source=resolution.scope_source if resolution is not None else None,
         ).as_dict()
 
 
@@ -376,11 +434,18 @@ def inspect_xai_oauth_refresh_eligibility(
     scope: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Inspect managed xAI OAuth refresh eligibility without side effects."""
-    resolved_auth_file = Path(auth_file).expanduser()
     observed_at = _resolve_wall_now(now)
     resolved_scope = _resolve_scope(scope)
+    resolution = None
+    credential: Optional[MutableMapping[str, Any]] = None
     try:
-        payload = _read_credential_payload(resolved_auth_file)
+        resolution = resolve_xai_oauth_credentials(
+            auth_file,
+            scope,
+            value_getter=os.getenv,
+        )
+        resolved_scope = resolution.scope
+        payload = _read_credential_payload(resolution.canonical_auth_file)
         credential = _select_credential_record(payload, resolved_scope)
         if not _looks_like_credential_record(credential):
             raise ValueError("xAI OAuth credential has no usable access credential.")
@@ -404,6 +469,9 @@ def inspect_xai_oauth_refresh_eligibility(
                 usable=usable,
                 error_class="CredentialExpiryUnavailable",
                 error_message="xAI OAuth credential expires_at is missing or invalid.",
+                credential_identity=resolution.credential_identity,
+                auth_file_source=resolution.auth_file_source,
+                scope_source=resolution.scope_source,
                 refresh_threshold_seconds=threshold_seconds,
                 refresh_threshold_source=threshold_source,
                 refresh_threshold_degraded=threshold_degraded,
@@ -421,6 +489,9 @@ def inspect_xai_oauth_refresh_eligibility(
             eligible=observed_at >= refresh_due_at,
             credential_health="expired" if expires_at <= observed_at else "fresh",
             usable=usable and expires_at > observed_at,
+            credential_identity=resolution.credential_identity,
+            auth_file_source=resolution.auth_file_source,
+            scope_source=resolution.scope_source,
             refresh_threshold_seconds=threshold_seconds,
             refresh_threshold_source=threshold_source,
             refresh_threshold_degraded=threshold_degraded,
@@ -437,6 +508,13 @@ def inspect_xai_oauth_refresh_eligibility(
             usable=False,
             error_class=exc.__class__.__name__,
             error_message=_sanitize_error_message(str(exc)),
+            credential_identity=(
+                resolution.credential_identity if resolution is not None else None
+            ),
+            auth_file_source=(
+                resolution.auth_file_source if resolution is not None else None
+            ),
+            scope_source=resolution.scope_source if resolution is not None else None,
             refresh_threshold_seconds=float(DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS),
             refresh_threshold_source="fallback",
             refresh_threshold_degraded=True,
@@ -454,6 +532,9 @@ def _eligibility_summary(
     usable: bool,
     error_class: Optional[str] = None,
     error_message: Optional[str] = None,
+    credential_identity: Optional[str] = None,
+    auth_file_source: Optional[str] = None,
+    scope_source: Optional[str] = None,
     refresh_threshold_seconds: Optional[float] = None,
     refresh_threshold_source: Optional[str] = None,
     refresh_threshold_degraded: bool = False,
@@ -468,6 +549,9 @@ def _eligibility_summary(
         "usable": usable,
         "error_class": error_class,
         "error_message": error_message,
+        "credential_identity": credential_identity,
+        "auth_file_source": auth_file_source,
+        "scope_source": scope_source,
         "refresh_threshold_seconds": refresh_threshold_seconds,
         "refresh_threshold_source": refresh_threshold_source,
         "refresh_threshold_degraded": refresh_threshold_degraded,

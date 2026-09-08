@@ -533,6 +533,14 @@ Managed preflight uses the same exact-scope selector as the request and refresh
 paths. It rejects missing scopes in multi-record documents and does not select
 records by JSON key order; only an unambiguous legacy flat record is accepted.
 
+Managed xAI request, refresh, health, and eligibility paths also share one
+read-only file/scope resolver. It checks every supplied path and scope value for
+agreement before selecting the documented precedence winner. A resolved
+`credential_identity` is a nonsecret hash of the canonical auth-file target and
+exact scope only; it is stable across token rotation and does not contain raw
+paths, credential fields, or filesystem metadata. Configuration conflicts return
+sanitized errors without selecting an identity or contacting the provider.
+
 Combined credential/process health requires **both** credential records to have:
 
 - a current access credential (`key` or `access_token`)
