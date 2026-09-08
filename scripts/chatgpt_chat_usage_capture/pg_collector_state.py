@@ -80,7 +80,7 @@ STATE_PENDING_KEYS = {
     "dueAt",
     "jitterMs",
 }
-STATE_CHECKPOINT_KEYS = {
+STATE_DISCOVERY_CHECKPOINT_KEYS = {
     "stateVersion",
     "accountId",
     "scope",
@@ -101,6 +101,16 @@ STATE_CHECKPOINT_KEYS = {
     "olderHistoryAudit",
     "updatedAt",
 }
+STATE_CHECKPOINT_KEYS = STATE_DISCOVERY_CHECKPOINT_KEYS | {
+    "collectorAccountId",
+    "stateVersionCounter",
+    "discovery",
+    "accountState",
+    "queueCoverage",
+    "nextCursor",
+    "hasMore",
+}
+STATE_DISCOVERY_SCOPES = {"active", "archived"}
 STATE_ACCOUNT_KEYS = {
     "status",
     "reason",
@@ -275,6 +285,7 @@ STATE_BOOLEAN_KEYS = {
     "missingUpdateTime",
     "timedOut",
     "coverageIncomplete",
+    "hasMore",
 }
 STATE_NUMBER_KEYS = {
     "stateVersion",
@@ -327,6 +338,7 @@ STATE_STRING_KEYS = {
     "lastError",
     "reason",
     "paginationState",
+    "queueCoverage",
     "continuationRevision",
     "surface",
     "origin",
@@ -390,6 +402,7 @@ STATE_ENUM_VALUES = {
     "mode": {"backfill", "incremental", "reconciliation"},
     "kind": {"scheduled", "manual", "coalesced"},
     "coverage": {"complete", "partial", "unknown", "validated_page", "unrecognized"},
+    "queueCoverage": {"complete", "partial"},
     "paginationState": {
         "complete",
         "continuation",
@@ -3736,6 +3749,7 @@ def _state_child_shape(key: str, field_name: str) -> str:
         if (
             "coverage" in field_name.lower()
             or "olderHistoryAudit" in field_name
+            or field_name.endswith(".discovery")
             or field_name == "scheduleTransition"
         ):
             return "mapping"
@@ -3748,6 +3762,7 @@ def _state_child_shape(key: str, field_name: str) -> str:
         "historyCoverage",
         "identity",
         "accountState",
+        "discovery",
         "terminalSummary",
         "candidate",
         "revisit",
@@ -3775,7 +3790,18 @@ def _state_array_item_keys(
 def _validate_state_scalar(field_name: str, key: str, value: Any) -> None:
     """Validate scalar fields with the schema that owns the field."""
     audit_path = "olderHistoryAudit" in field_name
-    if key == "continuation":
+    if key == "nextCursor":
+        _cursor_token(value)
+    elif key == "stateVersionCounter":
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= 2**53 - 1
+        ):
+            raise LedgerError(
+                f"collector state field {field_name}.{key} must be a nonnegative safe integer"
+            )
+    elif key == "continuation":
         if isinstance(value, bool) or not isinstance(value, (str, int)):
             raise LedgerError(
                 f"collector state field {field_name}.{key} must be a cursor or offset"
@@ -3878,6 +3904,8 @@ def _state_allowed_values(field_name: str, key: str) -> Optional[set[str]]:
         return {"pending", "complete"}
     if "coverage" in field_name.lower():
         return {"not_started", "in_progress", "complete", "partial"}
+    if field_name.endswith((".discovery.active", ".discovery.archived")):
+        return {"not_started", "in_progress", "complete", "partial"}
     if "activeTrigger" in field_name or field_name.endswith(".active"):
         return {"active", "claimed", "running", "idle", "cancelled"}
     if field_name == "terminalSummary":
@@ -3891,6 +3919,8 @@ def _is_coverage_object_path(field_name: str) -> bool:
 
 def _nested_state_keys(key: str, field_name: str) -> Optional[set[str]]:
     if key in {"active", "archived"}:
+        if field_name.endswith(".discovery"):
+            return STATE_DISCOVERY_CHECKPOINT_KEYS
         if "olderHistoryAudit" in field_name:
             return STATE_AUDIT_RESULT_KEYS
         if "coverage" in field_name.lower():
@@ -3911,6 +3941,7 @@ def _nested_state_keys(key: str, field_name: str) -> Optional[set[str]]:
         return STATE_SCOPE_KEYS
     return {
         "checkpoint": STATE_CHECKPOINT_KEYS,
+        "discovery": STATE_DISCOVERY_SCOPES,
         "pending": STATE_PENDING_KEYS,
         "range": STATE_RANGE_KEYS,
         "candidateQueue": STATE_CANDIDATE_KEYS,

@@ -16414,8 +16414,18 @@ def _close_chatgpt_usage_bridge(
                 "error_count": len(errors),
             }
         )
-    else:
-        state.chatgpt_usage_bridge_owner = None
+        # Keep the nonadmitting owner alive until its retained children retire.
+        pending_errors = errors
+        retry_delay = 1.0
+        while pending_errors:
+            time.sleep(retry_delay)
+            try:
+                pending_errors = bridge.reap_pending()
+            except Exception as exc:
+                pending_errors = [f"bridge cleanup failed: {type(exc).__name__}"]
+            state.chatgpt_usage_bridge_cleanup_errors = pending_errors
+            retry_delay = min(5.0, retry_delay * 2)
+    state.chatgpt_usage_bridge_owner = None
     return errors
 
 

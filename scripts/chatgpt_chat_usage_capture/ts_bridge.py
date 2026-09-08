@@ -303,6 +303,18 @@ class _RunContext:
     finished: bool = False
     cancelled: bool = False
     cleanup_errors: list[str] = field(default_factory=list)
+    terminal_operation: Optional[BridgeOperationContext] = None
+
+    def terminal(self) -> BridgeOperationContext:
+        if self.terminal_operation is None:
+            self.terminal_operation = self.operation.terminal()
+            cutoff = self.terminal_operation.terminal_deadline_monotonic
+            if cutoff is not None:
+                self.child.terminal_deadline_monotonic = min(
+                    self.child.terminal_deadline_monotonic,
+                    cutoff,
+                )
+        return self.terminal_operation
 
 
 class TsWorkerBridge:
@@ -549,7 +561,9 @@ class TsWorkerBridge:
                     retryable=True,
                 )
         except BaseException as exc:
-            cleanup_operation = operation.terminal()
+            cleanup_operation = (
+                context.terminal() if context is not None else operation.terminal()
+            )
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 control_error = exc
                 control_traceback = exc.__traceback__
@@ -587,7 +601,11 @@ class TsWorkerBridge:
                     result = _with_cleanup_failure(result, [lease_error])
         finally:
             if cleanup_operation is None:
-                cleanup_operation = operation.terminal()
+                cleanup_operation = (
+                    context.terminal()
+                    if context is not None
+                    else operation.terminal()
+                )
             if context is not None:
                 context.cleanup_errors.extend(
                     self._close_tracked_snapshots(
@@ -786,7 +804,17 @@ class TsWorkerBridge:
                     self._write_frame(context.child, response)
                 continue
             response = self._handle_operation(context, message)
-            self._write_frame(context.child, response)
+            terminal_operation = context.terminal_operation
+            self._write_frame(
+                context.child,
+                response,
+                enforce_deadline=terminal_operation is None,
+                deadline_monotonic=(
+                    terminal_operation.deadline_monotonic
+                    if terminal_operation is not None
+                    else None
+                ),
+            )
             if (
                 message.get("operation") == "cancel"
                 and response.get("ok") is not True
@@ -1571,7 +1599,7 @@ class TsWorkerBridge:
             )
         context.operation.cancel_event.set()
         context.cancelled = True
-        terminal_operation = context.operation.terminal()
+        terminal_operation = context.terminal()
         def adopt_cancel(value: Any) -> None:
             context.state_version = int(value.state_version)
             context.finish_outcome = outcome
@@ -1672,7 +1700,7 @@ class TsWorkerBridge:
             "reason": _failure_code(error),
             "coverageIncomplete": True,
         }
-        active_operation = operation or context.operation.terminal()
+        active_operation = operation or context.terminal()
         cleanup_errors = self._close_tracked_snapshots(
             context,
             operation=active_operation,
@@ -1754,7 +1782,7 @@ class TsWorkerBridge:
             or not registration_id
         ):
             return "native history lifecycle registration is invalid"
-        active_operation = operation or context.operation.terminal()
+        active_operation = operation or context.terminal()
         cleanup_failure = getattr(registration, "cleanup_failure", None)
         if cleanup_failure:
             reason = "native history registration retained a cleanup failure"
@@ -1823,7 +1851,7 @@ class TsWorkerBridge:
         operation: Optional[BridgeOperationContext] = None,
     ) -> list[str]:
         errors: list[str] = []
-        active_operation = operation or context.operation.terminal()
+        active_operation = operation or context.terminal()
         for snapshot_id in tuple(context.snapshot_ids):
             closed = False
             try:
@@ -2644,12 +2672,24 @@ def _native_history_capability_is_verified(
         marker = marker.get("status") or marker.get("state")
     if marker not in {"available", "verified", "supported", True}:
         return False
-    return (
-        bool(capabilities.get("indexScopes"))
-        and all(
-            scope in {"active", "archived"}
-            for scope in capabilities.get("indexScopes", ())
+    scopes = capabilities.get("indexScopes", ())
+    if not scopes or any(scope not in {"active", "archived"} for scope in scopes):
+        return False
+    available = {
+        "index": True,
+        "modern_detail": capabilities.get("modernDetail")
+        not in _UNAVAILABLE_CAPABILITY_STATES,
+        "messages": capabilities.get("pagination")
+        not in _UNAVAILABLE_CAPABILITY_STATES,
+    }
+    return any(
+        inventory_available
+        and _manifest_operation_is_available(manifest, operation)
+        and any(
+            _manifest_archive_scope_is_available(manifest, operation, scope)
+            for scope in scopes
         )
+        for operation, inventory_available in available.items()
     )
 
 
