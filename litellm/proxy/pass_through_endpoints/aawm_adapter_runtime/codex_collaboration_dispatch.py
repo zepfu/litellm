@@ -154,9 +154,11 @@ def parse_codex_collaboration_text_frame(value: Any) -> str:
         "text",
     }:
         raise CodexCollaborationDispatchError("unknown_representation")
+    frame_version = decoded.get("cfg047")
     if (
-        type(decoded.get("cfg047")) is not int
-        or decoded.get("cfg047") != COLLABORATION_FRAME_VERSION
+        not isinstance(frame_version, int)
+        or isinstance(frame_version, bool)
+        or frame_version != COLLABORATION_FRAME_VERSION
     ):
         raise CodexCollaborationDispatchError("unknown_representation")
     if decoded.get("encoding") != COLLABORATION_TEXT_ENCODING:
