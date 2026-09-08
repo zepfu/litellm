@@ -249,6 +249,17 @@ LiteLLM clamps it to 6-16. Retries use short exponential backoff with bounded
 jitter, capped near one second, and the delay occurs outside routing locks.
 There is no generic fixed ten-second sleep. Fresh requests and non-continuation
 failures retain the generic proxy retry policy.
+
+### Managed OAuth Credential Rotation
+
+For a provider-returned managed `oa_xai/*` HTTP `401` before response bytes are
+committed, LiteLLM can reread the configured credential and make one retry.
+The reread must produce a new credential generation with the same derived
+non-secret account identity; it does not change accounts or write credentials.
+An unchanged, expired, malformed, or different-account credential is not
+retried, and native `xai/*` Grok OIDC traffic does not use this managed OAuth
+recovery path.
+
 ## Sample Usage - Vision
 
 ```python showLineNumbers title="LiteLLM python sdk usage - Vision"

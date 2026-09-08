@@ -171,6 +171,24 @@ deadline. The canonical lock is the resolved auth-file sibling
 `<auth-file>.lock`; do not retain the portable-default lock for a custom auth
 file, point the lock at the auth file, or use a symlink lock path.
 
+### Read-only xAI request snapshots
+
+Managed xAI OAuth and native Grok OIDC request preparation use immutable
+process-local snapshots keyed by credential family, resolved file, and scope.
+Credential metadata checks and reads run off the request event loop. A changed
+file fingerprint or a snapshot that reaches its route-safety deadline evicts
+the cached snapshot before the next request rebuilds it. Request handling never
+writes, refreshes, or reseeds a credential file.
+
+For a managed xAI provider-returned `401` before response bytes are committed,
+alias routing can make one recovery attempt. It force-rereads the exact
+managed file and scope and accepts the replacement only when its generation
+changed and its derived non-secret account identity is unchanged. Missing,
+malformed, expired, unchanged-generation, or different-account material is
+not retried; the original provider failure follows normal handling. Native
+Grok OIDC uses the snapshot reader but is not eligible for this managed OAuth
+generation retry.
+
 ## Codex ordered account inventory (OPENAI-001)
 
 `LITELLM_CODEX_OAUTH_INVENTORY` is a versioned JSON object whose `accounts`
@@ -566,8 +584,9 @@ maintenance contract.
 Credential refresh is **file-based hot reload**:
 
 - Writers replace the auth JSON (or token file) in place under lock.
-- LiteLLM mounts the host credential directories **read-only** and re-reads them
-  when selecting a candidate or building provider headers.
+- LiteLLM mounts the host credential directories **read-only**. xAI request
+  preparation detects changed credential metadata or a route-safety deadline,
+  invalidates the prior snapshot, and rebuilds it for a subsequent request.
 - Successful sidecar or manual refresh does **not** require restarting the
   LiteLLM proxy container, the provider-status sidecar, or the host CLI for the
   new token to become visible to subsequent requests.
