@@ -78,7 +78,8 @@ def _clean_string(value: Any) -> Optional[str]:
 
 
 def _expand_path(value: str) -> Path:
-    return Path(value).expanduser()
+    expanded_path = Path(value).expanduser()
+    return Path(os.path.abspath(os.path.normpath(os.fspath(expanded_path))))
 
 
 def resolve_xai_oauth_auth_path(
@@ -124,7 +125,7 @@ def resolve_xai_oauth_auth_path(
     if configured_paths:
         selected_path = configured_paths[0][1]
         if any(
-            path.resolve(strict=False) != selected_path.resolve(strict=False)
+            path != selected_path
             for _source, path in configured_paths[1:]
         ):
             sources = ", ".join(source for source, _path in configured_paths)

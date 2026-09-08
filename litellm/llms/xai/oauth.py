@@ -473,7 +473,7 @@ def _snapshot_cache_key(
 ) -> tuple[str, str, str]:
     return (
         credential_family,
-        os.fspath(credential_path.resolve(strict=False)),
+        os.path.abspath(os.path.normpath(os.fspath(credential_path))),
         scope,
     )
 
