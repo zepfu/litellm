@@ -1672,6 +1672,16 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             else None
         )
         if owner_error is not None:
+            if token_affinity is not None:
+                _selection._raise_codex_auto_agent_authenticated_continuation_unavailable(
+                    candidate=dict(token_affinity),
+                    lane_key=token_affinity.get("codex_oauth_lane_key"),
+                    cooldown_seconds=0.0,
+                    alias_model=model or "codex_native",
+                    error_class="session_owner_storage_unavailable",
+                    failure_phase="session_owner_redis_unavailable",
+                    attempted_provider_call=False,
+                )
             _sa.raise_session_owner_redispatch_required(
                 session_identity=session_identity,
                 alias_model=model or "codex_native",
@@ -1707,6 +1717,16 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 request=request,
             )
         if isinstance(owner_record, dict) and owner_state == "reserved":
+            if token_affinity is not None:
+                _selection._raise_codex_auto_agent_authenticated_continuation_unavailable(
+                    candidate=dict(token_affinity),
+                    lane_key=token_affinity.get("codex_oauth_lane_key"),
+                    cooldown_seconds=0.0,
+                    alias_model=model or "codex_native",
+                    error_class="session_owner_competing_reservation",
+                    failure_phase="session_owner_competing_reservation",
+                    attempted_provider_call=False,
+                )
             _sa.raise_session_owner_redispatch_required(
                 session_identity=session_identity,
                 alias_model=model or "codex_native",
@@ -1744,6 +1764,16 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 model=model,
             )
             if owner_affinity is None:
+                if token_affinity is not None:
+                    _selection._raise_codex_auto_agent_authenticated_continuation_unavailable(
+                        candidate=dict(token_affinity),
+                        lane_key=token_affinity.get("codex_oauth_lane_key"),
+                        cooldown_seconds=0.0,
+                        alias_model=model or "codex_native",
+                        error_class="session_owner_owned_record_unusable",
+                        failure_phase="session_owner_owned_record_unusable",
+                        attempted_provider_call=False,
+                    )
                 _sa.raise_session_owner_redispatch_required(
                     session_identity=session_identity,
                     alias_model=model or "codex_native",
@@ -1883,7 +1913,11 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 _selection._build_codex_oauth_terminal_reset_information(states)
             )
             if terminal_reset is not None:
-                detail["terminal_reset"] = terminal_reset
+                redacted_terminal_reset = _redact_codex_oauth_terminal_reset(
+                    terminal_reset
+                )
+                if redacted_terminal_reset is not None:
+                    detail["terminal_reset"] = redacted_terminal_reset
             detail.update(
                 {
                     "selection_reason": "codex_oauth_account_failover",

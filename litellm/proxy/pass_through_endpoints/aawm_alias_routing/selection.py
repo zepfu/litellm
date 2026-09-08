@@ -4696,6 +4696,16 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         wait_for_foreign_reservation=True,
     )
     if session_owner_error is not None:
+        if token_affinity is not None:
+            _raise_codex_auto_agent_authenticated_continuation_unavailable(
+                candidate=dict(token_affinity),
+                lane_key=token_affinity.get("codex_oauth_lane_key"),
+                cooldown_seconds=0.0,
+                alias_model=alias_model,
+                error_class="session_owner_storage_unavailable",
+                failure_phase="session_owner_redis_unavailable",
+                attempted_provider_call=False,
+            )
         sa.raise_session_owner_redispatch_required(
             session_identity=session_owner_identity,
             alias_model=alias_model,
@@ -4913,6 +4923,16 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 )
             )
             if cursor_effective_error is not None:
+                if token_affinity is not None:
+                    _raise_codex_auto_agent_authenticated_continuation_unavailable(
+                        candidate=dict(token_affinity),
+                        lane_key=token_affinity.get("codex_oauth_lane_key"),
+                        cooldown_seconds=0.0,
+                        alias_model=alias_model,
+                        error_class="session_owner_storage_unavailable",
+                        failure_phase="session_owner_rediscovery_unavailable",
+                        attempted_provider_call=False,
+                    )
                 sa.raise_session_owner_redispatch_required(
                     session_identity=cursor_effective_identity,
                     alias_model=alias_model,
@@ -5057,6 +5077,16 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             }
         )
     elif isinstance(session_owner_record, dict) and sa._record_state(session_owner_record) == "reserved":
+        if token_affinity is not None:
+            _raise_codex_auto_agent_authenticated_continuation_unavailable(
+                candidate=dict(token_affinity),
+                lane_key=token_affinity.get("codex_oauth_lane_key"),
+                cooldown_seconds=0.0,
+                alias_model=alias_model,
+                error_class="session_owner_competing_reservation",
+                failure_phase="session_owner_competing_reservation",
+                attempted_provider_call=False,
+            )
         sa.raise_session_owner_redispatch_required(
             session_identity=session_owner_identity,
             alias_model=alias_model,
@@ -5089,7 +5119,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             affinity_bypassed = True
 
     affinity = _codex_oauth_mod._codex_oauth_resolve_affinity(
-        durable_affinity=affinity,
+        durable_affinity=durable_affinity,
         token_affinity=token_affinity,
         conflict_message=(
             "Codex OAuth continuation affinity state conflicts "
@@ -5223,6 +5253,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                         cooldown_seconds=0.0,
                         alias_model=alias_model,
                         failure_phase="account_bound_owner_unavailable",
+                        attempted_provider_call=False,
                     )
                 _raise_codex_auto_agent_redispatch_required(
                     candidate=pinned_candidate_shape,
@@ -5301,6 +5332,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                         alias_model=alias_model,
                         failure_phase=affinity_state.get("failure_phase")
                         or "affinity_account_cooldown",
+                        attempted_provider_call=False,
                         skipped_candidates=_build_auto_agent_skipped_candidates_from_states(
                             [affinity_state]
                         ),
@@ -5402,6 +5434,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                         affinity_state.get("failure_phase")
                         or "account_bound_owner_unavailable"
                     ),
+                    attempted_provider_call=False,
                     skipped_candidates=_build_auto_agent_skipped_candidates_from_states(
                         [affinity_state]
                     ),
@@ -5442,6 +5475,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     alias_model=alias_model,
                     failure_phase=affinity_state.get("failure_phase")
                     or "affinity_account_cooldown",
+                    attempted_provider_call=False,
                     skipped_candidates=_build_auto_agent_skipped_candidates_from_states(
                         [affinity_state]
                     ),
@@ -5476,6 +5510,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 ),
                 failure_phase=affinity_state.get("failure_phase")
                 or "affinity_account_unavailable",
+                attempted_provider_call=False,
                 skipped_candidates=affinity_skipped,
                 terminal_reset=terminal_reset,
             )
