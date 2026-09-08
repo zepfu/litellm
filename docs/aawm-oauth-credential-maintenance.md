@@ -74,6 +74,28 @@ credentials on the request path. Direct Nous inference reads
 `LITELLM_NOUS_OAUTH_AUTH_FILE`, else `LITELLM_HERMES_AUTH_FILE`, else
 `AAWM_HERMES_AUTH_FILE`, else `~/.hermes/auth.json`.
 
+## Managed xAI egress boundary (XAI-035/XAI-041)
+
+Managed `oa_xai/*` requests retain the `xai_oauth` credential family and the
+`xai_oauth_api` route family through transport, output guards, and egress
+telemetry. Native `xai/*`/Grok OIDC requests remain separate
+(`xai_grok_oidc` and `grok_cli_chat_proxy`); neither family may be substituted
+for the other.
+
+The managed API base must be HTTPS on `api.x.ai`, with no URL credentials,
+fragment, non-default port, or query string. The base may be the host root or
+`/v1`; the final request target is restricted to
+`/v1/chat/completions` or `/v1/responses`. Managed requests send the access
+token only as `Authorization: Bearer ...`. Inbound authorization and duplicate
+`api-key`/`x-api-key` headers are not forwarded, while the generic OpenAI/Azure
+header assembler remains unchanged for providers that require those headers.
+
+Managed xAI transport disables automatic redirect following and rejects a
+`3xx` response before any credential-bearing follow-up request. Egress
+rejections preserve the managed/native family distinction in sanitized
+telemetry; authorization values, access tokens, and full inbound headers are
+never recorded.
+
 ## OAuth refresh deadline contract
 
 Scheduled Grok OIDC, Codex OAuth, managed xAI OAuth, Kimi OAuth, and Nous
