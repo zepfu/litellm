@@ -136,6 +136,14 @@ or refresh publication; migrate it by placing the intended record under the
 configured scope key. Diagnostics identify the selection failure without
 including credential contents.
 
+Managed xAI request and sidecar consumers share one file/scope resolver. Every
+supplied auth-file and scope value must agree before precedence selects a
+source. The nonsecret `credential_identity` is derived only from the canonical
+auth-file target and exact scope, so it remains stable when the token record is
+rotated and does not disclose raw paths, tokens, or file metadata. A
+configuration conflict has no selected identity and fails before credential or
+provider I/O.
+
 ## Managed xAI egress headers
 
 Managed `oa_xai/*` requests send the selected access token only as

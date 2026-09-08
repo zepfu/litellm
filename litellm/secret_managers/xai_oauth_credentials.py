@@ -1,4 +1,4 @@
-"""Shared xAI OAuth credential-record selection.
+"""Shared managed xAI OAuth file and scope resolution.
 
 This module is intentionally side-effect free. Request, refresh, health, and
 preflight callers all use the same exact-scope policy, while refresh callers
@@ -7,8 +7,212 @@ retain ownership of file locking and publication.
 
 from __future__ import annotations
 
+import hashlib
+import os
 from collections.abc import Mapping, MutableMapping
-from typing import Any
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Optional, Sequence
+
+DEFAULT_XAI_OAUTH_AUTH_FILE = "~/.litellm/xai/oauth-auth.json"
+DEFAULT_XAI_OAUTH_SCOPE = (
+    "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
+)
+
+XAI_OAUTH_AUTH_FILE_ENV_VARS = (
+    "LITELLM_XAI_OAUTH_AUTH_FILE",
+    "LITELLM_XAI_OAUTH_MIGRATED_AUTH_FILE",
+)
+XAI_OAUTH_SCOPE_ENV_VARS = (
+    "AAWM_XAI_OAUTH_SCOPE",
+    "LITELLM_XAI_OAUTH_SCOPE",
+)
+
+AuthPathValue = str | os.PathLike[str]
+ValueGetter = Callable[[str], Any]
+
+
+@dataclass(frozen=True)
+class XaiOAuthAuthPathResolution:
+    """The selected configured path and its frozen canonical read target."""
+
+    path: Path
+    canonical_path: Path
+    source: str
+
+
+@dataclass(frozen=True)
+class XaiOAuthScopeResolution:
+    """The selected exact scope and its provenance label."""
+
+    scope: str
+    source: str
+
+
+@dataclass(frozen=True)
+class XaiOAuthCredentialResolution:
+    """The single managed file/scope binding shared by all consumers."""
+
+    auth_file: Path
+    canonical_auth_file: Path
+    auth_file_source: str
+    scope: str
+    scope_source: str
+    credential_identity: str
+
+
+def _clean_string(value: Any) -> Optional[str]:
+    if isinstance(value, os.PathLike):
+        value = os.fspath(value)
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _expand_path(value: str) -> Path:
+    return Path(value).expanduser()
+
+
+def resolve_xai_oauth_auth_path(
+    explicit_auth_file: Optional[AuthPathValue] = None,
+    *,
+    value_getter: Optional[ValueGetter] = None,
+    default_auth_file: AuthPathValue = DEFAULT_XAI_OAUTH_AUTH_FILE,
+) -> XaiOAuthAuthPathResolution:
+    """Resolve one managed auth path and reject conflicting configuration."""
+
+    get_value = value_getter or os.getenv
+    cleaned_default = (
+        _clean_string(default_auth_file) or DEFAULT_XAI_OAUTH_AUTH_FILE
+    )
+    default_path = _expand_path(cleaned_default)
+
+    configured_paths: list[tuple[str, Path, Path]] = []
+
+    def add_candidate(source: str, value: Any) -> None:
+        cleaned = _clean_string(value)
+        if cleaned is None:
+            return
+        path = _expand_path(cleaned)
+        configured_paths.append((source, path, path.resolve(strict=False)))
+
+    # Precedence chooses the source label only after every supplied value
+    # agrees. In particular, an explicit value equal to the default remains
+    # explicit input and participates in conflict detection.
+    add_candidate("AAWM_XAI_OAUTH_AUTH_FILE", get_value("AAWM_XAI_OAUTH_AUTH_FILE"))
+    add_candidate("explicit", explicit_auth_file)
+    for env_name in XAI_OAUTH_AUTH_FILE_ENV_VARS:
+        add_candidate(env_name, get_value(env_name))
+
+    if configured_paths:
+        selected_source, selected_path, selected_canonical = configured_paths[0]
+        if any(
+            canonical_path != selected_canonical
+            for _source, _path, canonical_path in configured_paths[1:]
+        ):
+            sources = ", ".join(source for source, _path, _canonical in configured_paths)
+            raise ValueError(
+                "Conflicting xAI OAuth auth-file configuration sources: "
+                f"{sources}."
+            )
+        return XaiOAuthAuthPathResolution(
+            path=selected_path,
+            canonical_path=selected_canonical,
+            source=selected_source,
+        )
+
+    return XaiOAuthAuthPathResolution(
+        path=default_path,
+        canonical_path=default_path.resolve(strict=False),
+        source="default",
+    )
+
+
+def resolve_xai_oauth_scope(
+    explicit_scope: Optional[str] = None,
+    *,
+    value_getter: Optional[ValueGetter] = None,
+    env_names: Sequence[str] = XAI_OAUTH_SCOPE_ENV_VARS,
+    default_scope: str = DEFAULT_XAI_OAUTH_SCOPE,
+) -> XaiOAuthScopeResolution:
+    """Resolve one exact managed scope and reject conflicting configuration."""
+
+    get_value = value_getter or os.getenv
+    configured_scopes: list[tuple[str, str]] = []
+
+    def add_candidate(source: str, value: Any) -> None:
+        cleaned = _clean_string(value)
+        if cleaned is not None:
+            configured_scopes.append((source, cleaned))
+
+    add_candidate("explicit", explicit_scope)
+    for env_name in env_names:
+        add_candidate(env_name, get_value(env_name))
+
+    if configured_scopes:
+        selected_source, selected_scope = configured_scopes[0]
+        if any(
+            scope_value != selected_scope
+            for _source, scope_value in configured_scopes[1:]
+        ):
+            sources = ", ".join(source for source, _scope in configured_scopes)
+            raise ValueError(
+                "Conflicting xAI OAuth scope configuration sources: "
+                f"{sources}."
+            )
+        return XaiOAuthScopeResolution(
+            scope=selected_scope,
+            source=selected_source,
+        )
+
+    resolved_default = _clean_string(default_scope) or DEFAULT_XAI_OAUTH_SCOPE
+    return XaiOAuthScopeResolution(scope=resolved_default, source="default")
+
+
+def resolve_xai_oauth_credentials(
+    explicit_auth_file: Optional[AuthPathValue] = None,
+    explicit_scope: Optional[str] = None,
+    *,
+    value_getter: Optional[ValueGetter] = None,
+    scope_env_names: Sequence[str] = XAI_OAUTH_SCOPE_ENV_VARS,
+    default_auth_file: AuthPathValue = DEFAULT_XAI_OAUTH_AUTH_FILE,
+    default_scope: str = DEFAULT_XAI_OAUTH_SCOPE,
+) -> XaiOAuthCredentialResolution:
+    """Resolve one immutable managed file/scope binding before file I/O."""
+
+    path_resolution = resolve_xai_oauth_auth_path(
+        explicit_auth_file,
+        value_getter=value_getter,
+        default_auth_file=default_auth_file,
+    )
+    scope_resolution = resolve_xai_oauth_scope(
+        explicit_scope,
+        value_getter=value_getter,
+        env_names=scope_env_names,
+        default_scope=default_scope,
+    )
+    credential_identity = _credential_identity(
+        path_resolution.canonical_path,
+        scope_resolution.scope,
+    )
+    return XaiOAuthCredentialResolution(
+        auth_file=path_resolution.path,
+        canonical_auth_file=path_resolution.canonical_path,
+        auth_file_source=path_resolution.source,
+        scope=scope_resolution.scope,
+        scope_source=scope_resolution.source,
+        credential_identity=credential_identity,
+    )
+
+
+def _credential_identity(canonical_path: Path, scope: str) -> str:
+    """Hash only the canonical managed file and exact scope namespace."""
+
+    identity_input = "\x00".join(
+        ("xai-oauth-file-scope-v1", str(canonical_path), scope)
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(identity_input).hexdigest()}"
 
 
 def looks_like_xai_oauth_credential(value: Mapping[str, Any]) -> bool:

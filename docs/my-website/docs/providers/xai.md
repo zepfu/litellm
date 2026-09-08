@@ -159,6 +159,16 @@ scope before provider or token I/O and never selects a record based on JSON key
 order. An explicitly unambiguous legacy flat record remains supported; mixed
 flat-and-nested documents must be migrated to an exact scope-keyed record.
 
+Managed `oa_xai/*` request and provider-status paths share one file/scope
+resolver. Auth-file precedence is `AAWM_XAI_OAUTH_AUTH_FILE`, an explicit
+configured path, `LITELLM_XAI_OAUTH_AUTH_FILE`,
+`LITELLM_XAI_OAUTH_MIGRATED_AUTH_FILE`, then the portable default. Scope
+precedence is an explicit configured scope, `AAWM_XAI_OAUTH_SCOPE`,
+`LITELLM_XAI_OAUTH_SCOPE`, then the default Grok subscription scope. Conflicting
+configured values fail closed. Resolution metadata uses a nonsecret
+`credential_identity` derived from the canonical file target and exact scope;
+credential contents and raw paths are never included in that identity.
+
 ## Proxy Retry and Quota Behavior
 
 For proxy routes that use Grok, LiteLLM treats these exact upstream responses as
