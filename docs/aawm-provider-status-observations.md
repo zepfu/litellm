@@ -1317,13 +1317,14 @@ usage success does not rewrite banked credit state. Live usage parsing reads
 `rate_limit.primary_window`; a base window of `604800` seconds is normalized as
 the overall seven-day quota family. The recorder does not invent an overall
 five-hour row, while provider-present Spark windows remain distinct
-observations in their own family. Account-scoped observations remain eligible
-through the configured poll interval, but wrong-environment, malformed,
-expired-reset, or genuinely stale evidence is rejected rather than treated as
-fresh quota. When live usage lacks usable windows, response-derived OpenAI
-rate-limit telemetry remains the available quota signal. Account identity
-remains the stable configured account hash; credential material is never
-logged.
+observations in their own family. Fresh-account weekly ranking uses the latest
+available valid observation, including historical values whose reset has since
+passed. Age and `stale` status do not force inventory-priority fallback.
+Wrong-environment, wrong-family, malformed, or missing-value evidence remains
+unusable for comparison. Only current confirmed exhaustion imposes a hard quota
+exclusion; old zero values do not prolong it. Response-derived OpenAI telemetry
+can still supply hard quota exclusions. Account identity remains the stable
+configured account hash; credential material is never logged.
 
 Relevant environment variables:
 
@@ -1331,9 +1332,9 @@ Relevant environment variables:
 - `AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS`: minimum seconds between poll
   attempts (default `600`).
 - `AAWM_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_PCT`: minimum percentage-point
-  pool spread in comparable fresh weekly remaining quota required for fresh
-  OpenAI account dispatches to prefer the highest remaining account (default
-  `10`). Ties and incomparable observations retain inventory order.
+  pool spread in comparable latest-known weekly remaining quota required for
+  fresh OpenAI account dispatches to prefer the highest remaining account
+  (default `10`). Ties and incomparable observations retain inventory order.
 - `AAWM_CODEX_OAUTH_QUOTA_OBSERVATION_ENVIRONMENT`: exact shared Codex quota
   producer scope. When unset, the consumer uses its runtime environment;
   explicitly empty scope disables comparison. Dev and alpha Compose both
@@ -1348,13 +1349,15 @@ Relevant environment variables:
   quota persistence; falls back to the general sidecar DSN when unset.
 
 Fresh account selection freezes one observation view for the entire consulted
-account set, refreshing that set together when hydration is due. Weekly
-comparison requires current reset provenance and the requested quota family;
-accounts may have different reset timestamps. Shared polls reflect account
-usage across dev and alpha, not either process's request counts. Local
-response-derived observations can still supply hard quota exclusions but do
+account set, refreshing that set together when hydration is due. Unchanged
+quota values may be deduplicated across polls; ranking does not require a row
+or timestamp heartbeat every ten minutes. Poll cadence, deduplication and
+storage are unchanged. Weekly comparison retains valid reset provenance and
+the requested quota family without an age cutoff; accounts may have different
+reset timestamps. Shared polls reflect account usage across dev and alpha,
+not either process's request counts. Local response-derived observations do
 not substitute for missing shared weekly comparison evidence. The comparison
-policy and per-attempt audit contract are documented in
+policy, hard-exhaustion bounds and per-attempt audit contract are documented in
 [model management](my-website/docs/proxy/model_management.md#managed-codex-oauth-account-failover).
 
 The detail parser reads `credits[]` with `status`, `reset_type`, `granted_at`,
