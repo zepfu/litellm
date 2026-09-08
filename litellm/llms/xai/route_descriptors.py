@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from types import MappingProxyType
 from typing import Any, Literal, Mapping, Optional
 
@@ -15,6 +16,8 @@ XAI_OAUTH_ROUTE_FAMILY: XAIRouteFamily = "xai_oauth_api"
 XAI_OAUTH_CREDENTIAL_FAMILY: XAICredentialFamily = "xai_oauth"
 GROK_NATIVE_OAUTH_ROUTE_FAMILY: XAIRouteFamily = "grok_cli_chat_proxy"
 GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY: XAICredentialFamily = "xai_grok_oidc"
+XAI_NATIVE_GROK_CONTINUATION_RETRY_CAPABILITY = "native_grok_continuation_retry"
+_XAI_MODEL_CAPABILITIES_KEY = "capabilities"
 
 
 @dataclass(frozen=True)
@@ -26,6 +29,7 @@ class XAIRouteDescriptor:
     route_family: XAIRouteFamily
     credential_family: XAICredentialFamily
     auth_mode: XAIAuthMode
+    capabilities: frozenset[str] = frozenset()
 
 
 def _managed_descriptor(
@@ -41,13 +45,48 @@ def _managed_descriptor(
     )
 
 
-def _native_descriptor(model: str) -> XAIRouteDescriptor:
+def _native_descriptor(
+    model: str,
+    *,
+    capabilities: frozenset[str] = frozenset(),
+) -> XAIRouteDescriptor:
     return XAIRouteDescriptor(
         public_model=model,
         upstream_model=model,
         route_family=GROK_NATIVE_OAUTH_ROUTE_FAMILY,
         credential_family=GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
         auth_mode="grok_oidc",
+        capabilities=capabilities,
+    )
+
+
+@lru_cache(maxsize=128)
+def _get_xai_model_capabilities(model: str) -> frozenset[str]:
+    """Read xAI model capabilities from the canonical model metadata."""
+
+    try:
+        from litellm.utils import get_model_info
+
+        model_info = get_model_info(
+            model=model,
+            custom_llm_provider="xai",
+        )
+    except Exception:
+        return frozenset()
+
+    provider_specific_entry = model_info.get("provider_specific_entry")
+    if not isinstance(provider_specific_entry, Mapping):
+        return frozenset()
+    provider_entry = provider_specific_entry.get("xai")
+    if not isinstance(provider_entry, Mapping):
+        return frozenset()
+    raw_capabilities = provider_entry.get(_XAI_MODEL_CAPABILITIES_KEY)
+    if not isinstance(raw_capabilities, (list, tuple, set, frozenset)):
+        return frozenset()
+    return frozenset(
+        str(capability).strip()
+        for capability in raw_capabilities
+        if str(capability).strip()
     )
 
 
@@ -119,10 +158,24 @@ def get_grok_native_route_descriptor(model: Any) -> Optional[XAIRouteDescriptor]
         native_model = candidate[len("xai/") :].strip()
         if not native_model:
             return None
-        return GROK_NATIVE_ROUTE_DESCRIPTORS.get(native_model) or _native_descriptor(
-            native_model
+        return _native_descriptor(
+            native_model,
+            capabilities=_get_xai_model_capabilities(native_model),
         )
-    return GROK_NATIVE_ROUTE_DESCRIPTORS.get(candidate)
+    descriptor = GROK_NATIVE_ROUTE_DESCRIPTORS.get(candidate)
+    if descriptor is None:
+        return None
+    return _native_descriptor(
+        candidate,
+        capabilities=_get_xai_model_capabilities(candidate),
+    )
+
+
+def has_grok_native_route_capability(model: Any, capability: str) -> bool:
+    """Return whether a native Grok model explicitly declares ``capability``."""
+
+    descriptor = get_grok_native_route_descriptor(model)
+    return descriptor is not None and capability in descriptor.capabilities
 
 
 def get_xai_route_descriptor(model: Any) -> Optional[XAIRouteDescriptor]:
