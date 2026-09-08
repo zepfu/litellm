@@ -159,6 +159,21 @@ scope before provider or token I/O and never selects a record based on JSON key
 order. An explicitly unambiguous legacy flat record remains supported; mixed
 flat-and-nested documents must be migrated to an exact scope-keyed record.
 
+## Proxy Retry and Quota Behavior
+
+For proxy routes that use Grok, LiteLLM treats these exact upstream responses as
+account quota exhaustion:
+
+- HTTP 402 with the xAI/Grok usage-balance exhaustion response.
+- HTTP 403 with the recognized personal/team spending-limit response.
+
+The proxy publishes the Grok account-quota lane cooldown once, advances through
+the replay-safe fallback policy without sleeping, and does not retry the
+exhausted account. Fresh requests can advance immediately; continuations retain
+their account/session-affinity safety rule. Generic 403 responses, HTTP 429,
+and transient 5xx responses keep their existing classifications and retry
+behavior.
+
 ## Responses API Image Retention
 
 For xAI Responses requests containing `input_image` or `image_url` content,

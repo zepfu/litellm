@@ -22,10 +22,13 @@ Integration seams (resolved via install() rebinding to host globals):
 
 from __future__ import annotations
 
+from inspect import isawaitable
 from typing import Any, Optional
 
 from types import FunctionType
 from typing import TYPE_CHECKING
+
+from litellm._logging import verbose_proxy_logger
 
 if TYPE_CHECKING:
     # Host-global functions (bound via install())
@@ -59,6 +62,18 @@ _HOST_FUNCTION_NAMES = (
 )
 
 
+async def _close_stream_resource(resource: Any, message: str) -> None:
+    close = getattr(resource, "aclose", None)
+    if not callable(close):
+        return
+    try:
+        result = close()
+        if isawaitable(result):
+            await result
+    except BaseException:
+        verbose_proxy_logger.debug(message, exc_info=True)
+
+
 def install(host_globals: dict) -> None:
     """Rebind moved functions to host_globals for live lookup.
 
@@ -87,6 +102,7 @@ def install(host_globals: dict) -> None:
         host_globals[_name] = _rebound
     # Pure local helper used by rebound OPENAI-007 identity keying.
     host_globals["_function_call_identity_token"] = _mod["_function_call_identity_token"]
+    host_globals["_close_stream_resource"] = _close_stream_resource
 
 
 # -- Extracted functions -------------------------------------------------
@@ -433,6 +449,7 @@ async def _collect_responses_response_from_stream(
     key_by_output_index: dict[int, str] = {}
     terminal_response_dict: Optional[dict[str, Any]] = None
     event_iterator = _iterate_responses_sse_events(response.body_iterator)
+
     try:
         async for event in event_iterator:
             # RR-054 #27: stream events are plain dicts (or attr objects).
@@ -483,12 +500,16 @@ async def _collect_responses_response_from_stream(
                 if isinstance(response_dict, dict):
                     terminal_response_dict = response_dict
     finally:
-        if terminal_response_dict is None:
-            await event_iterator.aclose()
-            body_iterator = getattr(response, "body_iterator", None)
-            aclose = getattr(body_iterator, "aclose", None)
-            if callable(aclose):
-                await aclose()
+        await _close_stream_resource(
+            event_iterator,
+            "Failed to close Responses stream event iterator",
+        )
+        body_iterator = getattr(response, "body_iterator", None)
+        if body_iterator is not event_iterator:
+            await _close_stream_resource(
+                body_iterator,
+                "Failed to close Responses stream body iterator",
+            )
     if terminal_response_dict is not None:
         return _finalize_collected_responses_stream_response(
             response_dict=terminal_response_dict,

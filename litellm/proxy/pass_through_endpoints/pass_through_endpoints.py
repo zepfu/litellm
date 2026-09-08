@@ -177,6 +177,19 @@ from .aawm_alias_routing.pre_commit_retry import (
     await_with_client_disconnect,
     get_or_create_openai_alpha_capacity_retry_coordinator,
 )
+from .aawm_adapter_runtime.provider_call_ledger import (
+    ProviderCallLedgerExhausted,
+    ProviderCallReplayBlocked,
+    close_active_upstream_response,
+    current_candidate_context,
+    ensure_openai_wire_replay_allowed,
+    get_or_create_openai_provider_call_ledger,
+    get_request_provider_call_ledger,
+    publish_reservation_metadata,
+    record_transport_connection_failure,
+    register_active_upstream_response,
+    clear_active_upstream_response,
+)
 from .aawm_alias_routing.durable import get_aawm_alias_routing_state_namespace
 from .success_handler import PassThroughEndpointLogging
 
@@ -1571,6 +1584,11 @@ def _is_passthrough_pre_first_byte_hidden_retryable(
     url: Optional[httpx.URL] = None,
     custom_llm_provider: Optional[str] = None,
 ) -> bool:
+    if (
+        getattr(exc, "aawm_call_ledger_exhausted", False)
+        or getattr(exc, "aawm_openai_wire_replay_blocked", False)
+    ):
+        return False
     classified_status_code = status_code
     if (
         classified_status_code is None
@@ -1704,6 +1722,11 @@ def _is_passthrough_retryable(
     status_code: Optional[int],
     metadata: dict,
 ) -> bool:
+    if (
+        getattr(exc, "aawm_call_ledger_exhausted", False)
+        or getattr(exc, "aawm_openai_wire_replay_blocked", False)
+    ):
+        return False
     if _is_passthrough_rate_limit_retryable(status_code=status_code, metadata=metadata):
         return True
 
@@ -1755,6 +1778,8 @@ def _record_passthrough_hidden_retry_metadata(
     wait_seconds: float,
     final_outcome: Optional[str] = None,
     failure_classification: Optional[str] = None,
+    request: Optional[Request] = None,
+    logical_provider_call_start: Optional[int] = None,
 ) -> None:
     if not isinstance(kwargs, dict):
         return
@@ -1770,14 +1795,39 @@ def _record_passthrough_hidden_retry_metadata(
         "max_attempts": max_attempts,
         "failure_class": failure_class,
         "wait_seconds": round(wait_seconds, 3),
+        "attempt_kind": "logical_provider_send_retry",
     }
     if status_code is not None:
         attempt_record["status_code"] = status_code
     if failure_classification is not None:
         attempt_record["failure_classification"] = failure_classification
+
+    logical_provider_send_count: Optional[int] = None
+    if request is not None and logical_provider_call_start is not None:
+        request_ledger = get_request_provider_call_ledger(request)
+        if request_ledger is not None:
+            logical_provider_send_count = max(
+                0,
+                request_ledger.logical_provider_calls
+                - logical_provider_call_start,
+            )
+            attempt_record["logical_provider_send_count"] = (
+                logical_provider_send_count
+            )
     attempts.append(attempt_record)
 
-    metadata["aawm_passthrough_hidden_retry_count"] = len(attempts)
+    if logical_provider_send_count is not None:
+        retry_count = max(0, logical_provider_send_count - 1)
+    else:
+        retry_count = sum(
+            1
+            for record in attempts
+            if isinstance(record, dict)
+            and str(record.get("failure_class") or "").strip().lower()
+            != "success"
+        )
+    metadata["aawm_passthrough_hidden_retry_count"] = retry_count
+    metadata["aawm_passthrough_hidden_logical_retry_count"] = retry_count
     if final_outcome is not None:
         metadata["aawm_passthrough_hidden_retry_final_outcome"] = final_outcome
     if failure_classification is not None:
@@ -1838,8 +1888,25 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
     start_monotonic = time.monotonic()
     attempt_number = 0
     last_capacity_exception: Optional[Exception] = None
+    logical_provider_call_start: Optional[int] = None
+    if request is not None:
+        request_ledger = get_request_provider_call_ledger(request)
+        if request_ledger is not None:
+            logical_provider_call_start = request_ledger.logical_provider_calls
     while True:
         attempt_number += 1
+        if request is not None:
+            request_state = getattr(request, "state", None)
+            if request_state is not None:
+                setattr(
+                    request_state,
+                    "aawm_openai_send_reason",
+                    (
+                        f"{operation_name}:initial_logical_send"
+                        if attempt_number == 1
+                        else f"{operation_name}:hidden_logical_retry"
+                    ),
+                )
         try:
             timeout_seconds: Optional[float] = None
             if budget_seconds > 0:
@@ -1912,6 +1979,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     failure_class="success",
                     wait_seconds=0.0,
                     final_outcome="success_after_retry",
+                    request=request,
+                    logical_provider_call_start=logical_provider_call_start,
                 )
             return result
         except Exception as exc:
@@ -1935,6 +2004,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         else "failed_without_retry"
                     ),
                     failure_classification=failure_classification,
+                    request=request,
+                    logical_provider_call_start=logical_provider_call_start,
                 )
                 _mark_passthrough_hidden_retry_budget_exhausted(
                     kwargs,
@@ -2043,6 +2114,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         wait_seconds=0.0,
                         final_outcome="failed_after_retry",
                         failure_classification=failure_classification,
+                        request=request,
+                        logical_provider_call_start=logical_provider_call_start,
                     )
                     _mark_passthrough_hidden_retry_budget_exhausted(
                         kwargs,
@@ -2089,6 +2162,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         else "failed_without_retry"
                     ),
                     failure_classification=failure_classification,
+                    request=request,
+                    logical_provider_call_start=logical_provider_call_start,
                 )
                 raise
 
@@ -2127,6 +2202,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         else "failed_without_retry"
                     ),
                     failure_classification=failure_classification,
+                    request=request,
+                    logical_provider_call_start=logical_provider_call_start,
                 )
                 _mark_passthrough_hidden_retry_budget_exhausted(
                     kwargs,
@@ -2153,6 +2230,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 failure_class=failure_class,
                 wait_seconds=wait_seconds,
                 failure_classification=failure_classification,
+                request=request,
+                logical_provider_call_start=logical_provider_call_start,
             )
             verbose_proxy_logger.info(
                 "Pass-through %s hidden retry attempt %s/%s after %s; sleeping %.1fs",
@@ -3814,6 +3893,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         headers: dict,
         requested_query_params: Optional[dict] = None,
         custom_body: Optional[dict] = None,
+        send_request_fn: Optional[
+            Callable[[httpx.Request, bool], Awaitable[httpx.Response]]
+        ] = None,
     ) -> httpx.Response:
         """
         Make a non-streaming HTTP request
@@ -3821,23 +3903,42 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         If request is GET, don't include a JSON body
         """
         if request.method == "GET":
-            response = await async_client.request(
-                method=request.method,
-                url=url,
-                headers=headers,
-                params=requested_query_params,
-            )
+            if send_request_fn is not None:
+                req = async_client.build_request(
+                    method=request.method,
+                    url=url,
+                    headers=headers,
+                    params=requested_query_params,
+                )
+                response = await send_request_fn(req, False)
+            else:
+                response = await async_client.request(
+                    method=request.method,
+                    url=url,
+                    headers=headers,
+                    params=requested_query_params,
+                )
         else:
             json_headers, _removed_content_type = _headers_for_json_passthrough_egress(
                 headers
             )
-            response = await async_client.request(
-                method=request.method,
-                url=url,
-                headers=json_headers,
-                params=requested_query_params,
-                json=custom_body,
-            )
+            if send_request_fn is not None:
+                req = async_client.build_request(
+                    method=request.method,
+                    url=url,
+                    headers=json_headers,
+                    params=requested_query_params,
+                    json=custom_body,
+                )
+                response = await send_request_fn(req, False)
+            else:
+                response = await async_client.request(
+                    method=request.method,
+                    url=url,
+                    headers=json_headers,
+                    params=requested_query_params,
+                    json=custom_body,
+                )
         return response
 
     @staticmethod
@@ -3850,6 +3951,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         _parsed_body: Optional[dict] = None,
         raw_body: Optional[bytes] = None,
         prefer_stream_for_unknown_content: bool = False,
+        send_request_fn: Optional[
+            Callable[[httpx.Request, bool], Awaitable[httpx.Response]]
+        ] = None,
     ) -> httpx.Response:
         """
         Handle non-streaming HTTP requests
@@ -3861,14 +3965,35 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         buffering the body (enables SSE handoff without full-body buffer).
         """
         if request.method == "GET":
-            response = await async_client.request(
-                method=request.method,
-                url=url,
-                headers=headers,
-                params=requested_query_params,
-            )
+            if send_request_fn is not None:
+                req = async_client.build_request(
+                    method=request.method,
+                    url=url,
+                    headers=headers,
+                    params=requested_query_params,
+                )
+                response = await send_request_fn(req, False)
+            else:
+                response = await async_client.request(
+                    method=request.method,
+                    url=url,
+                    headers=headers,
+                    params=requested_query_params,
+                )
         elif raw_body is not None:
-            if prefer_stream_for_unknown_content:
+            if send_request_fn is not None:
+                req = async_client.build_request(
+                    method=request.method,
+                    url=url,
+                    headers=headers,
+                    params=requested_query_params,
+                    content=raw_body,
+                )
+                response = await send_request_fn(
+                    req,
+                    prefer_stream_for_unknown_content,
+                )
+            elif prefer_stream_for_unknown_content:
                 req = async_client.build_request(
                     method=request.method,
                     url=url,
@@ -3898,13 +4023,26 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 headers=headers,
                 requested_query_params=requested_query_params,
                 prefer_stream_for_unknown_content=prefer_stream_for_unknown_content,
+                send_request_fn=send_request_fn,
             )
         else:
             # Generic httpx method
             json_headers, _removed_content_type = _headers_for_json_passthrough_egress(
                 headers
             )
-            if prefer_stream_for_unknown_content:
+            if send_request_fn is not None:
+                req = async_client.build_request(
+                    method=request.method,
+                    url=url,
+                    headers=json_headers,
+                    params=requested_query_params,
+                    json=_parsed_body,
+                )
+                response = await send_request_fn(
+                    req,
+                    prefer_stream_for_unknown_content,
+                )
+            elif prefer_stream_for_unknown_content:
                 req = async_client.build_request(
                     method=request.method,
                     url=url,
@@ -3944,6 +4082,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         headers: dict,
         requested_query_params: Optional[dict] = None,
         prefer_stream_for_unknown_content: bool = False,
+        send_request_fn: Optional[
+            Callable[[httpx.Request, bool], Awaitable[httpx.Response]]
+        ] = None,
     ) -> httpx.Response:
         """Process multipart/form-data requests, handling both files and form fields.
 
@@ -3970,6 +4111,19 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         headers_copy = headers.copy()
         headers_copy.pop("content-type", None)
 
+        if send_request_fn is not None:
+            req = async_client.build_request(
+                method=request.method,
+                url=url,
+                headers=headers_copy,
+                params=requested_query_params,
+                files=files,
+                data=form_data_dict,
+            )
+            return await send_request_fn(
+                req,
+                prefer_stream_for_unknown_content,
+            )
         if prefer_stream_for_unknown_content:
             req = async_client.build_request(
                 method=request.method,
@@ -4592,6 +4746,43 @@ async def pass_through_request(  # noqa: PLR0915
         for status_code in (retryable_upstream_status_codes or [])
         if isinstance(status_code, int)
     }
+    openai_call_ledger = None
+
+    def _publish_openai_send_telemetry() -> None:
+        request_state = getattr(request, "state", None)
+        if request_state is None:
+            return
+        if openai_call_ledger is not None:
+            ledger_snapshot = openai_call_ledger.snapshot()
+            setattr(
+                request_state,
+                "aawm_openai_send_ledger_snapshot",
+                ledger_snapshot,
+            )
+            setattr(
+                request_state,
+                "aawm_openai_logical_provider_calls",
+                ledger_snapshot["logical_provider_calls"],
+            )
+            setattr(
+                request_state,
+                "aawm_openai_transport_connection_failures",
+                ledger_snapshot["transport_connection_failures"],
+            )
+        retry_metadata = _ensure_passthrough_metadata(kwargs)
+        setattr(
+            request_state,
+            "aawm_passthrough_hidden_retry_count",
+            retry_metadata.get("aawm_passthrough_hidden_retry_count", 0),
+        )
+        setattr(
+            request_state,
+            "aawm_passthrough_hidden_logical_retry_count",
+            retry_metadata.get(
+                "aawm_passthrough_hidden_logical_retry_count",
+                retry_metadata.get("aawm_passthrough_hidden_retry_count", 0),
+            ),
+        )
 
     #########################################################
     try:
@@ -5026,6 +5217,64 @@ async def pass_through_request(  # noqa: PLR0915
             if watermark_input_audit is not None:
                 _watermark_metadata["watermark_input_audit"] = watermark_input_audit
 
+        openai_call_ledger = get_or_create_openai_provider_call_ledger(
+            request,
+            custom_llm_provider=custom_llm_provider,
+            target=url,
+        )
+        openai_send_request_fn: Optional[
+            Callable[[httpx.Request, bool], Awaitable[httpx.Response]]
+        ] = None
+        if openai_call_ledger is not None:
+
+            async def _send_prepared_openai_request(
+                prepared_request: httpx.Request,
+                send_stream: bool,
+            ) -> httpx.Response:
+                ensure_openai_wire_replay_allowed(
+                    request,
+                    ledger=openai_call_ledger,
+                )
+                await close_active_upstream_response(request)
+                ensure_openai_wire_replay_allowed(
+                    request,
+                    ledger=openai_call_ledger,
+                )
+                request_state = getattr(request, "state", None)
+                reason = (
+                    getattr(
+                        request_state,
+                        "aawm_openai_send_reason",
+                        None,
+                    )
+                    if request_state is not None
+                    else None
+                )
+                reservation = openai_call_ledger.reserve(
+                    target=prepared_request.url,
+                    reason=reason or "passthrough_provider_request",
+                    candidate_context=current_candidate_context(request),
+                    prior_response_closed=True,
+                )
+                publish_reservation_metadata(
+                    request,
+                    reservation=reservation,
+                    metadata=passthrough_metadata,
+                )
+                try:
+                    response = await async_client.send(
+                        prepared_request,
+                        stream=send_stream,
+                        follow_redirects=False,
+                    )
+                except (httpx.ConnectError, httpx.ConnectTimeout):
+                    record_transport_connection_failure(request)
+                    raise
+                register_active_upstream_response(request, response)
+                return response
+
+            openai_send_request_fn = _send_prepared_openai_request
+
         if stream:
             await _aawm_session_owner_pre_send_guard(
                 request=request,
@@ -5088,6 +5337,7 @@ async def pass_through_request(  # noqa: PLR0915
                             upstream_url=str(url) if url is not None else None,
                         ),
                         namespace=get_aawm_alias_routing_state_namespace(),
+                        account_context=current_candidate_context(request),
                     )
                 )
 
@@ -5121,11 +5371,16 @@ async def pass_through_request(  # noqa: PLR0915
                     params=requested_query_params,
                     headers=stream_headers,
                 )
-                response = await async_client.send(req, stream=stream)
+                if openai_send_request_fn is not None:
+                    response = await openai_send_request_fn(req, stream)
+                else:
+                    response = await async_client.send(req, stream=stream)
                 try:
                     response.raise_for_status()
                 except httpx.HTTPStatusError as e:
                     error_content = await e.response.aread()
+                    await e.response.aclose()
+                    clear_active_upstream_response(request, response=e.response)
                     _capture_passthrough_error_shape(
                         mode="stream_error",
                         provider=custom_llm_provider or endpoint_type.value,
@@ -5159,6 +5414,7 @@ async def pass_through_request(  # noqa: PLR0915
                     )
                     if pre_commit_failure is not None:
                         await response.aclose()
+                        clear_active_upstream_response(request, response=response)
                         raise pre_commit_failure
                 return response, req
 
@@ -5261,6 +5517,7 @@ async def pass_through_request(  # noqa: PLR0915
                 ),
                 status_code=response.status_code,
             )
+            _publish_openai_send_telemetry()
             return bind_output_guard_to_streaming_response(
                 bind_deferred_success_holder(
                     stream_response,
@@ -5304,6 +5561,7 @@ async def pass_through_request(  # noqa: PLR0915
                         upstream_url=str(url) if url is not None else None,
                     ),
                     namespace=get_aawm_alias_routing_state_namespace(),
+                    account_context=current_candidate_context(request),
                 )
             )
 
@@ -5341,6 +5599,7 @@ async def pass_through_request(  # noqa: PLR0915
                     _parsed_body=provider_bound_body,
                     raw_body=raw_body,
                     prefer_stream_for_unknown_content=True,
+                    send_request_fn=openai_send_request_fn,
                 )
             )
             if _is_streaming_response(response) is True:
@@ -5348,6 +5607,8 @@ async def pass_through_request(  # noqa: PLR0915
                     response.raise_for_status()
                 except httpx.HTTPStatusError as e:
                     error_content = await e.response.aread()
+                    await e.response.aclose()
+                    clear_active_upstream_response(request, response=e.response)
                     _capture_passthrough_error_shape(
                         mode="stream_error",
                         provider=custom_llm_provider or endpoint_type.value,
@@ -5382,6 +5643,7 @@ async def pass_through_request(  # noqa: PLR0915
                     )
                     if pre_commit_failure is not None:
                         await response.aclose()
+                        clear_active_upstream_response(request, response=response)
                         raise pre_commit_failure
                 return response
 
@@ -5391,6 +5653,8 @@ async def pass_through_request(  # noqa: PLR0915
                 # prefer_stream_for_unknown_content uses stream=True for non-GET,
                 # so non-SSE error bodies must be drained with aread() (RR-056 #6).
                 error_content = await e.response.aread()
+                await e.response.aclose()
+                clear_active_upstream_response(request, response=e.response)
                 try:
                     error_text = error_content.decode("utf-8", errors="replace")
                 except Exception:
@@ -5498,6 +5762,7 @@ async def pass_through_request(  # noqa: PLR0915
                 ),
                 status_code=response.status_code,
             )
+            _publish_openai_send_telemetry()
             return bind_output_guard_to_streaming_response(
                 bind_deferred_success_holder(
                     stream_response,
@@ -5673,6 +5938,15 @@ async def pass_through_request(  # noqa: PLR0915
             span_metadata={"stage": "post_response_finalize", "stream": False},
         )
         duration_metadata = _ensure_passthrough_metadata(kwargs)
+        request.state.aawm_passthrough_hidden_retry_count = (
+            duration_metadata.get("aawm_passthrough_hidden_retry_count", 0)
+        )
+        request.state.aawm_passthrough_hidden_logical_retry_count = (
+            duration_metadata.get(
+                "aawm_passthrough_hidden_logical_retry_count",
+                duration_metadata.get("aawm_passthrough_hidden_retry_count", 0),
+            )
+        )
         if duration_metadata:
             duration_metadata["aawm_total_proxy_overhead_ms"] = round(
                 local_prepare_ms + local_finalize_ms, 3
@@ -5713,6 +5987,7 @@ async def pass_through_request(  # noqa: PLR0915
                 "Failed to publish session-transfer completed phase",
                 exc_info=True,
             )
+        _publish_openai_send_telemetry()
         response_to_return = Response(
             content=content,
             status_code=response.status_code,
@@ -5725,6 +6000,9 @@ async def pass_through_request(  # noqa: PLR0915
             deferred_success_holder,
         )
     except Exception as e:
+        _publish_openai_send_telemetry()
+        if not getattr(e, "aawm_openai_wire_replay_blocked", False):
+            await close_active_upstream_response(request)
         custom_headers = ProxyBaseLLMRequestProcessing.get_custom_headers(
             user_api_key_dict=user_api_key_dict,
             call_id=litellm_call_id,
@@ -5967,6 +6245,18 @@ async def pass_through_request(  # noqa: PLR0915
             )
         elif suppress_terminal_failure_traceback:
             hidden_retry_metadata = _ensure_passthrough_metadata(kwargs)
+            request.state.aawm_passthrough_hidden_retry_count = (
+                hidden_retry_metadata.get("aawm_passthrough_hidden_retry_count", 0)
+            )
+            request.state.aawm_passthrough_hidden_logical_retry_count = (
+                hidden_retry_metadata.get(
+                    "aawm_passthrough_hidden_logical_retry_count",
+                    hidden_retry_metadata.get(
+                        "aawm_passthrough_hidden_retry_count",
+                        0,
+                    ),
+                )
+            )
             hidden_retry_failure_classification = hidden_retry_metadata.get(
                 "aawm_passthrough_hidden_retry_failure_classification"
             )
@@ -5982,18 +6272,29 @@ async def pass_through_request(  # noqa: PLR0915
                 "hidden_retry_count": hidden_retry_metadata.get(
                     "aawm_passthrough_hidden_retry_count"
                 ),
+                "hidden_logical_retry_count": hidden_retry_metadata.get(
+                    "aawm_passthrough_hidden_logical_retry_count",
+                    hidden_retry_metadata.get(
+                        "aawm_passthrough_hidden_retry_count"
+                    ),
+                ),
             }
             verbose_proxy_logger.error(
                 (
                     "Pass through endpoint exhausted hidden retries for upstream failure "
-                    "status=%s error=%s final_outcome=%s retry_count=%s"
+                    "status=%s error=%s final_outcome=%s logical_retry_count=%s"
                 ),
                 status_code,
                 str(e),
                 hidden_retry_metadata.get(
                     "aawm_passthrough_hidden_retry_final_outcome"
                 ),
-                hidden_retry_metadata.get("aawm_passthrough_hidden_retry_count"),
+                hidden_retry_metadata.get(
+                    "aawm_passthrough_hidden_logical_retry_count",
+                    hidden_retry_metadata.get(
+                        "aawm_passthrough_hidden_retry_count"
+                    ),
+                ),
                 extra=terminal_failure_context,
                 exc_info=False,
             )
@@ -6061,6 +6362,8 @@ async def pass_through_request(  # noqa: PLR0915
             not suppress_retryable_failure_logging
             and not suppress_alias_intermediate_safety_policy_denial
             and not _skip_post_call_failure_hook_for_provider_classification
+            and not getattr(e, "aawm_call_ledger_exhausted", False)
+            and not getattr(e, "aawm_openai_wire_replay_blocked", False)
         ):
             try:
                 # Match common_request_processing / auth_exception_handler: callbacks may
@@ -6117,6 +6420,49 @@ async def pass_through_request(  # noqa: PLR0915
                 exc_info=True,
             )
 
+        if isinstance(e, ProviderCallReplayBlocked) or getattr(
+            e,
+            "aawm_openai_wire_replay_blocked",
+            False,
+        ):
+            proxy_exc = ProxyException(
+                message=str(e),
+                type="openai_wire_replay_blocked",
+                param="model",
+                code=status_code or status.HTTP_409_CONFLICT,
+                headers={
+                    **(custom_headers or {}),
+                    **_get_passthrough_terminal_wire_headers(e),
+                },
+            )
+            setattr(proxy_exc, "detail", getattr(e, "detail", None))
+            setattr(
+                proxy_exc,
+                "status_code",
+                status_code or getattr(e, "status_code", status.HTTP_409_CONFLICT),
+            )
+            setattr(proxy_exc, "aawm_openai_wire_replay_blocked", True)
+            setattr(proxy_exc, "attempted_provider_call", False)
+            setattr(proxy_exc, "wire_commitment", getattr(e, "wire_commitment", None))
+            setattr(proxy_exc, "ledger_snapshot", getattr(e, "ledger_snapshot", None))
+            raise proxy_exc
+        if isinstance(e, ProviderCallLedgerExhausted):
+            proxy_exc = ProxyException(
+                message=str(e),
+                type="provider_call_ledger_exhausted",
+                param="model",
+                code=status_code or status.HTTP_503_SERVICE_UNAVAILABLE,
+                headers={
+                    **(custom_headers or {}),
+                    **_get_passthrough_terminal_wire_headers(e),
+                },
+            )
+            setattr(proxy_exc, "detail", e.detail)
+            setattr(proxy_exc, "status_code", status_code or e.status_code)
+            setattr(proxy_exc, "aawm_call_ledger_exhausted", True)
+            setattr(proxy_exc, "attempted_provider_call", False)
+            setattr(proxy_exc, "ledger_snapshot", e.ledger_snapshot)
+            raise proxy_exc
         if isinstance(e, HTTPException):
             proxy_exc = ProxyException(
                 message=getattr(e, "message", str(getattr(e, "detail", str(e)))),
