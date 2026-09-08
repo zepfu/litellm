@@ -33,7 +33,8 @@ from litellm.secret_managers.main import get_secret_str
 from litellm.secret_managers.xai_oauth_credentials import (
     DEFAULT_XAI_OAUTH_AUTH_FILE,
     DEFAULT_XAI_OAUTH_SCOPE,
-    evaluate_xai_oauth_credential_lifecycle,
+    credential_identity,
+    resolve_xai_oauth_credentials,
     resolve_xai_oauth_auth_path,
     resolve_xai_oauth_scope,
     select_xai_oauth_credential_record,
@@ -172,6 +173,7 @@ async def prepare_oa_xai_request(data: Dict[str, Any]) -> bool:
     data["model"] = upstream_model
     data["api_base"] = get_secret_str("LITELLM_XAI_OAUTH_API_BASE") or XAI_API_BASE
     data["api_key"] = await get_xai_oauth_access_token()
+    request_credential_identity = _get_xai_oauth_request_identity()
     data["custom_llm_provider"] = "xai"
     decoded_previous_response_id = _decode_previous_response_id_in_place(data)
     removed_input_items = _drop_xai_unsupported_input_items_in_place(data)
@@ -189,6 +191,12 @@ async def prepare_oa_xai_request(data: Dict[str, Any]) -> bool:
         build_oa_xai_metadata(public_model, upstream_model),
         authoritative=True,
     )
+    if request_credential_identity is not None:
+        _merge_metadata(
+            litellm_metadata,
+            {"credential_identity": request_credential_identity},
+            authoritative=True,
+        )
     if decoded_previous_response_id:
         _merge_metadata(
             litellm_metadata,
@@ -303,8 +311,8 @@ def _merge_metadata(
 
 
 async def get_xai_oauth_access_token() -> str:
-    path_resolution = resolve_xai_oauth_auth_path(value_getter=get_secret_str)
-    if path_resolution.source == "default":
+    resolution = resolve_xai_oauth_credentials(value_getter=get_secret_str)
+    if resolution.auth_file_source == "default":
         raise ValueError(
             "xAI OAuth-managed models require an explicit managed auth-file "
             "configuration (AAWM_XAI_OAUTH_AUTH_FILE or "
@@ -314,8 +322,8 @@ async def get_xai_oauth_access_token() -> str:
             "calling oa_xai/*."
         )
 
-    credential_path = path_resolution.path
-    scope = resolve_xai_oauth_scope(value_getter=get_secret_str).scope
+    credential_path = resolution.auth_file
+    scope = resolution.scope
     lock_key = f"xai-oauth-read:{credential_path}:{scope}"
     lock = _refresh_locks.setdefault(lock_key, asyncio.Lock())
     async with lock:
@@ -323,6 +331,28 @@ async def get_xai_oauth_access_token() -> str:
             credential_path=credential_path,
             scope=scope,
         )
+
+
+def _get_xai_oauth_request_identity() -> Optional[str]:
+    """Read the same managed record identity used by sidecar evidence."""
+
+    try:
+        resolution = resolve_xai_oauth_credentials(value_getter=get_secret_str)
+        if resolution.auth_file_source == "default":
+            return None
+        credential = _select_credential_record(
+            _read_credential_payload(resolution.auth_file),
+            resolution.scope,
+        )
+        return credential_identity(
+            resolution.auth_file,
+            credential,
+            scope=resolution.scope,
+        )
+    except (OSError, TypeError, ValueError):
+        # Token access remains authoritative; metadata must not turn a
+        # successful request into a failure during an atomic sidecar update.
+        return None
 
 
 async def get_grok_native_oauth_access_token() -> str:
@@ -428,10 +458,10 @@ def _get_xai_oauth_access_token_read_only(
 
 
 def default_litellm_xai_oauth_auth_path() -> Path:
-    configured = get_secret_str("LITELLM_XAI_OAUTH_MIGRATED_AUTH_FILE")
-    if isinstance(configured, str) and configured.strip():
-        return Path(configured.strip()).expanduser()
-    return Path(_DEFAULT_LITELLM_XAI_OAUTH_AUTH_PATH).expanduser()
+    return resolve_xai_oauth_auth_path(
+        value_getter=get_secret_str,
+        default_auth_file=_DEFAULT_LITELLM_XAI_OAUTH_AUTH_PATH,
+    ).path
 
 
 def default_grok_xai_oauth_auth_path() -> Path:
@@ -469,9 +499,11 @@ def migrate_hermes_xai_oauth_credential(
         source_path,
         description="Hermes auth file",
     )
-    credential_scope = (
-        scope or get_secret_str("LITELLM_XAI_OAUTH_SCOPE") or _DEFAULT_XAI_OAUTH_SCOPE
-    )
+    credential_scope = resolve_xai_oauth_scope(
+        scope,
+        value_getter=get_secret_str,
+        default_scope=_DEFAULT_XAI_OAUTH_SCOPE,
+    ).scope
     credential = _build_litellm_xai_oauth_record_from_hermes(
         hermes_payload,
         scope=credential_scope,
@@ -688,13 +720,11 @@ def _credential_needs_refresh(credential: Mapping[str, Any]) -> bool:
     permanently fresh). Production accessors are read-only and raise a sidecar
     refresh-required error in that case rather than minting a new token here.
     """
+    expires_at = _parse_expires_at(credential.get("expires_at"))
+    if expires_at is None:
+        return True
     buffer_seconds = _refresh_buffer_seconds()
-    lifecycle = evaluate_xai_oauth_credential_lifecycle(
-        credential,
-        route_safety_buffer_seconds=buffer_seconds,
-        refresh_min_seconds=buffer_seconds,
-    )
-    return not bool(lifecycle["route_usable"])
+    return datetime.now(timezone.utc) >= expires_at - timedelta(seconds=buffer_seconds)
 
 
 def _parse_expires_at(value: Any) -> Optional[datetime]:
