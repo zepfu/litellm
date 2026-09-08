@@ -151,6 +151,19 @@ observability, routing, authentication, and session metadata remain in the
 separate `litellm_metadata` structure and are never merged into caller
 top-level `metadata`.
 
+## Rate-limit handling
+
+For an xAI provider `429`, LiteLLM uses a valid `Retry-After` value first.
+Otherwise it uses the request or token reset header for the exhausted
+dimension. If the response does not identify the exhausted dimension and both
+dimension-specific values are valid, LiteLLM waits for the later reset.
+Bounded generic reset headers are used only when no dimension-specific reset
+is available.
+
+Reset values may be bounded durations, epoch timestamps, ISO timestamps, or
+HTTP-date values. Malformed, expired, non-finite, and unreasonably future
+values are ignored instead of creating a durable cooldown.
+
 ## OAuth Credential Scope Selection
 
 Managed xAI OAuth and native Grok OIDC credential files must contain the exact
@@ -168,6 +181,13 @@ precedence is an explicit configured scope, `AAWM_XAI_OAUTH_SCOPE`,
 configured values fail closed. Resolution metadata uses a nonsecret
 `credential_identity` derived from the canonical file target and exact scope;
 credential contents and raw paths are never included in that identity.
+
+Managed xAI refreshes derive their default advisory lock from the canonical
+resolved auth file, using the file's `.lock` sibling. Different custom auth
+files use independent locks, while aliases for one file coordinate on one
+lock. Set `AAWM_XAI_OAUTH_LOCK_FILE` or `--xai-oauth-lock-file` only to an
+alias of that canonical sibling; arbitrary paths, lock symlinks, and auth-file
+lock collisions fail closed.
 
 ## Proxy Retry and Quota Behavior
 
