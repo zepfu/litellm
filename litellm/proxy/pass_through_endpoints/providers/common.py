@@ -30,6 +30,8 @@ def _raise_candidate_unavailable(
     message: str,
     error_type: str,
     status_code: int,
+    failure_phase: Optional[str] = None,
+    attempted_provider_call: Optional[bool] = None,
 ) -> Never:
     proxy_exc = ProxyException(
         message=message,
@@ -37,15 +39,22 @@ def _raise_candidate_unavailable(
         param="model",
         code=status_code,
     )
+    detail: dict[str, Any] = {
+        "error": {
+            "message": proxy_exc.message,
+            "code": "aawm_codex_auto_agent_candidate_unavailable",
+        }
+    }
+    if failure_phase is not None:
+        setattr(proxy_exc, "failure_phase", failure_phase)
+        detail["failure_phase"] = failure_phase
+    if attempted_provider_call is not None:
+        setattr(proxy_exc, "attempted_provider_call", attempted_provider_call)
+        detail["attempted_provider_call"] = attempted_provider_call
     setattr(
         proxy_exc,
         "detail",
-        {
-            "error": {
-                "message": proxy_exc.message,
-                "code": "aawm_codex_auto_agent_candidate_unavailable",
-            }
-        },
+        detail,
     )
     raise proxy_exc from exc
 
@@ -326,9 +335,15 @@ def _grok_native_candidate_unavailable_detail(
     return detail_text
 
 
-def _xai_oauth_candidate_unavailable_detail(
-    exc: Exception,
-) -> Optional[str]:
+_XAI_OAUTH_CREDENTIAL_READINESS_MARKERS = (
+    "xai oauth credential",
+    "xai oauth-managed",
+    "managed xai oauth",
+    "litellm_xai_oauth_auth_file",
+)
+
+
+def _xai_oauth_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
     detail = getattr(exc, "detail", None)
     if isinstance(detail, (dict, list)):
         detail_text = json.dumps(detail, sort_keys=True, default=str)
@@ -343,21 +358,31 @@ def _xai_oauth_candidate_unavailable_detail(
         return detail_text
     if not any(
         marker in normalized
-        for marker in (
-            "xai oauth credential",
-            "xai oauth-managed",
-            "managed xai oauth",
-            "litellm_xai_oauth_auth_file",
-        )
+        for marker in _XAI_OAUTH_CREDENTIAL_READINESS_MARKERS
     ):
         return None
     return detail_text
+
+
+def _is_xai_oauth_credential_readiness_failure(exc: Exception) -> bool:
+    """Return whether a managed xAI failure is local credential readiness."""
+    if getattr(exc, "_aawm_provider_returned", False) is True:
+        return False
+    detail = _xai_oauth_candidate_unavailable_detail(exc)
+    if detail is None:
+        return False
+    normalized = detail.lower()
+    return any(
+        marker in normalized
+        for marker in _XAI_OAUTH_CREDENTIAL_READINESS_MARKERS
+    )
 
 
 def _raise_xai_oauth_auto_agent_candidate_unavailable(
     exc: Exception,
 ) -> Never:
     detail = _xai_oauth_candidate_unavailable_detail(exc) or str(exc)
+    credential_readiness_failure = _is_xai_oauth_credential_readiness_failure(exc)
     _raise_candidate_unavailable(
         exc,
         message=(
@@ -366,6 +391,12 @@ def _raise_xai_oauth_auto_agent_candidate_unavailable(
         ),
         error_type="rate_limit_error",
         status_code=429,
+        failure_phase=(
+            "credential_readiness" if credential_readiness_failure else None
+        ),
+        attempted_provider_call=(
+            False if credential_readiness_failure else None
+        ),
     )
 
 
