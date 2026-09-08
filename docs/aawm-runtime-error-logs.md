@@ -1144,7 +1144,8 @@ without a generic traceback, and it stays visible to the client.
 
 This sanitation is driven by explicit ``encrypted_content`` fields and typed
 ``type=encrypted_content`` parts. LiteLLM does not infer that an ordinary
-string ``output`` is ciphertext, so plaintext tool output remains unchanged.
+string ``output`` is ciphertext, so plaintext tool output, including empty or
+whitespace-only strings, remains unchanged.
 The ``call_id`` and input-item ordering are preserved, as are supported
 structured outputs using ``input_text``, ``input_image``, or ``input_file``.
 The exact serialized request body rejected in the incident was not captured;

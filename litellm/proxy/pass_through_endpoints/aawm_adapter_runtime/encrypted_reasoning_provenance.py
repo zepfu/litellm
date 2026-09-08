@@ -487,7 +487,8 @@ def _item_has_encrypted_function_output(item: Any) -> bool:
 
 def _function_call_output_part_is_plaintext(value: Any) -> bool:
     if isinstance(value, str):
-        return bool(value.strip())
+        # Responses text is valid even when it is empty or whitespace-only.
+        return True
     if isinstance(value, Mapping):
         if str(value.get("type") or "").strip() == _NESTED_ENCRYPTED_CONTENT_PART_TYPE:
             return False
