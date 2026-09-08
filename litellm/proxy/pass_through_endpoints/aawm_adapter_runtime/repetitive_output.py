@@ -707,9 +707,9 @@ async def _iterate_responses_sse_with_repetitive_output_guard(  # noqa: PLR0915
     async def _close_resource(resource: Any, message: str) -> None:
         await _close_stream_resource(resource, message)
 
-    async def _close_stream_resources() -> None:
+    async def _close_stream_resources(*, close_sse_iterator: bool = True) -> None:
         nonlocal closed_body_iterator, closed_inherited_resources, closed_sse_iterator
-        if not closed_sse_iterator:
+        if close_sse_iterator and not closed_sse_iterator:
             closed_sse_iterator = True
             await _close_resource(
                 sse_iter,
@@ -749,7 +749,9 @@ async def _iterate_responses_sse_with_repetitive_output_guard(  # noqa: PLR0915
                     break
             if match is not None:
                 visible_delta_forwarded = yielded_visible
-                await _close_stream_resources()
+                # The SSE iterator is executing this loop; defer its close to
+                # the generator finally block to avoid closing it while running.
+                await _close_stream_resources(close_sse_iterator=False)
                 if visible_delta_forwarded:
                     verbose_proxy_logger.warning(
                         "CFG-025 aborted repetitive Responses stream policy=%s "
