@@ -182,10 +182,14 @@ from .aawm_alias_routing.pre_commit_retry import (
 )
 from .aawm_adapter_runtime.provider_call_ledger import (
     ProviderCallLedgerExhausted,
+    ProviderCallReplayBlocked,
     close_active_upstream_response,
     current_candidate_context,
+    ensure_openai_wire_replay_allowed,
     get_or_create_openai_provider_call_ledger,
+    get_request_provider_call_ledger_snapshot,
     publish_reservation_metadata,
+    publish_wire_commitment_snapshot,
     record_transport_connection_attempt,
     register_active_upstream_response,
     clear_active_upstream_response,
@@ -1584,7 +1588,10 @@ def _is_passthrough_pre_first_byte_hidden_retryable(
     url: Optional[httpx.URL] = None,
     custom_llm_provider: Optional[str] = None,
 ) -> bool:
-    if getattr(exc, "aawm_call_ledger_exhausted", False):
+    if (
+        getattr(exc, "aawm_call_ledger_exhausted", False)
+        or getattr(exc, "aawm_openai_wire_replay_blocked", False)
+    ):
         return False
     classified_status_code = status_code
     if (
@@ -1719,7 +1726,10 @@ def _is_passthrough_retryable(
     status_code: Optional[int],
     metadata: dict,
 ) -> bool:
-    if getattr(exc, "aawm_call_ledger_exhausted", False):
+    if (
+        getattr(exc, "aawm_call_ledger_exhausted", False)
+        or getattr(exc, "aawm_openai_wire_replay_blocked", False)
+    ):
         return False
     if _is_passthrough_rate_limit_retryable(status_code=status_code, metadata=metadata):
         return True
@@ -4581,16 +4591,21 @@ async def _finalize_native_openai_responses_owner_wire_disposition(
         state = getattr(request, "state", None)
         if state is not None:
             try:
+                commitment = {
+                    "commitment": "done",
+                    "disposition": disposition.value,
+                    "terminal_wire_committed": True,
+                    "done_wire_committed": True,
+                    "finalized": False,
+                }
                 setattr(
                     state,
                     "_aawm_openai_responses_wire_commitment",
-                    {
-                        "commitment": "done",
-                        "disposition": disposition.value,
-                        "terminal_wire_committed": True,
-                        "done_wire_committed": True,
-                        "finalized": False,
-                    },
+                    commitment,
+                )
+                publish_wire_commitment_snapshot(
+                    request,
+                    commitment=commitment,
                 )
             except Exception:
                 pass
@@ -4691,6 +4706,10 @@ async def _finalize_native_openai_responses_owner_wire_disposition(
                     state,
                     "_aawm_openai_responses_wire_commitment",
                     commitment,
+                )
+                publish_wire_commitment_snapshot(
+                    request,
+                    commitment=commitment,
                 )
             except Exception:
                 pass
@@ -5307,7 +5326,15 @@ async def pass_through_request(  # noqa: PLR0915
                 prepared_request: httpx.Request,
                 send_stream: bool,
             ) -> httpx.Response:
+                ensure_openai_wire_replay_allowed(
+                    request,
+                    ledger=openai_call_ledger,
+                )
                 await close_active_upstream_response(request)
+                ensure_openai_wire_replay_allowed(
+                    request,
+                    ledger=openai_call_ledger,
+                )
                 request_state = getattr(request, "state", None)
                 reason = (
                     getattr(
@@ -5348,7 +5375,10 @@ async def pass_through_request(  # noqa: PLR0915
             if request_state is None:
                 return
             if openai_call_ledger is not None:
-                ledger_snapshot = openai_call_ledger.snapshot()
+                ledger_snapshot = (
+                    get_request_provider_call_ledger_snapshot(request)
+                    or openai_call_ledger.snapshot()
+                )
                 setattr(
                     request_state,
                     "aawm_openai_send_ledger_snapshot",
@@ -6512,6 +6542,7 @@ async def pass_through_request(  # noqa: PLR0915
             and not suppress_alias_intermediate_safety_policy_denial
             and not _skip_post_call_failure_hook_for_provider_classification
             and not getattr(e, "aawm_call_ledger_exhausted", False)
+            and not getattr(e, "aawm_openai_wire_replay_blocked", False)
         ):
             try:
                 # Match common_request_processing / auth_exception_handler: callbacks may
@@ -6568,6 +6599,33 @@ async def pass_through_request(  # noqa: PLR0915
                 exc_info=True,
             )
 
+        if isinstance(e, ProviderCallReplayBlocked) or getattr(
+            e,
+            "aawm_openai_wire_replay_blocked",
+            False,
+        ):
+            proxy_exc = ProxyException(
+                message=str(e),
+                type="openai_wire_replay_blocked",
+                param="model",
+                code=status_code or status.HTTP_409_CONFLICT,
+                headers={
+                    **(custom_headers or {}),
+                    **_get_passthrough_terminal_wire_headers(e),
+                },
+            )
+            setattr(proxy_exc, "detail", getattr(e, "detail", None))
+            setattr(
+                proxy_exc,
+                "status_code",
+                status_code
+                or getattr(e, "status_code", status.HTTP_409_CONFLICT),
+            )
+            setattr(proxy_exc, "aawm_openai_wire_replay_blocked", True)
+            setattr(proxy_exc, "attempted_provider_call", False)
+            setattr(proxy_exc, "wire_commitment", getattr(e, "wire_commitment", None))
+            setattr(proxy_exc, "ledger_snapshot", getattr(e, "ledger_snapshot", None))
+            raise proxy_exc
         if isinstance(e, ProviderCallLedgerExhausted):
             proxy_exc = ProxyException(
                 message=str(e),
