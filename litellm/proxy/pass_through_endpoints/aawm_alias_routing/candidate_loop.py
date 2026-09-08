@@ -119,6 +119,44 @@ def _request_endpoint_path(request: Any) -> Optional[str]:
     return path if isinstance(path, str) else None
 
 
+def _is_native_openai_responses_candidate(
+    *,
+    request: Any,
+    candidate: Mapping[str, Any],
+) -> bool:
+    endpoint = (_request_endpoint_path(request) or "").lower()
+    return (
+        str(candidate.get("provider") or "").strip().lower() == "openai"
+        and str(candidate.get("route_family") or "").strip().lower()
+        == "codex_responses"
+        and "responses" in endpoint
+    )
+
+
+def _stage_native_openai_responses_affinity_commitment(
+    *,
+    request: Any,
+    session_key: Optional[str],
+    candidate: Mapping[str, Any],
+    setter: Any,
+) -> None:
+    state = getattr(request, "state", None)
+    if state is None:
+        return
+    try:
+        setattr(
+            state,
+            "_aawm_native_openai_responses_affinity_commitment",
+            {
+                "session_key": session_key,
+                "candidate": dict(candidate),
+                "setter": setter,
+            },
+        )
+    except Exception:
+        return
+
+
 def _store_attempt_failure_state(
     attempt_record: dict[str, Any],
     exc: Any,
@@ -2277,10 +2315,21 @@ async def handle_alias_route(  # noqa: PLR0915
                                 canonical_aliases=(codex_failure_evidence_alias,),
                                 cooldown_keys=(selection["cooldown_key"],),
                             )
-                        await set_session_affinity_fn(
-                            selection.get("session_key"),
-                            candidate,
-                        )
+                        if _is_native_openai_responses_candidate(
+                            request=request,
+                            candidate=candidate,
+                        ):
+                            _stage_native_openai_responses_affinity_commitment(
+                                request=request,
+                                session_key=selection.get("session_key"),
+                                candidate=candidate,
+                                setter=set_session_affinity_fn,
+                            )
+                        else:
+                            await set_session_affinity_fn(
+                                selection.get("session_key"),
+                                candidate,
+                            )
                         assert response is not None
                         attempt_record["attempted_provider_call"] = (
                             attempted_provider_call

@@ -25,6 +25,20 @@ Standard passthrough endpoint that may conflict with LiteLLM's native implementa
 
 **Note:** Some endpoints like `/openai/v1/responses` will be routed to LiteLLM's native implementation instead of OpenAI.
 
+## Responses streaming lifecycle
+
+Native OpenAI Responses streaming requires an authoritative terminal event:
+`response.completed`, `response.failed`, or `response.incomplete`. LiteLLM
+forwards the first valid terminal, emits exactly one `data: [DONE]`, and
+discards incomplete trailing frames. A stream that ends without a valid
+terminal is completed on the wire as `response.incomplete`; it is not treated
+as a successful response.
+
+For managed alias routing, the session-owner reservation and legacy session
+affinity remain request-scoped while the stream is active. A completed terminal
+can promote the owner and commit affinity. Failed, incomplete, cancelled, or
+disconnected streams release the reservation and do not write new affinity.
+
 ## When to use this?
 
 - For 90% of your use cases, you should use the [native LiteLLM OpenAI Integration](https://docs.litellm.ai/docs/providers/openai) (`/chat/completions`, `/embeddings`, `/completions`, `/images`, `/batches`, etc.)
