@@ -36,3 +36,9 @@ rows proven outside the requested half-open window.
 Open-ended interval evidence is still unknown when it cannot prove inclusion, but
 a one-sided bound that independently proves an attempt is outside the window is
 classified as out and omitted.
+
+Quarantine warnings are retained ahead of the ordinary warning cap, so late
+resolver or future-timestamp evidence cannot be hidden by earlier diagnostics.
+An explicit `unknown` quarantine state remains unknown until stronger evidence
+is available. Nullable upstream timestamps remain null; they do not imply an
+incomplete projection.

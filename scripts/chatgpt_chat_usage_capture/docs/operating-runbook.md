@@ -12,8 +12,12 @@ Initialize the ledger, inspect capabilities, then backfill or refresh through th
   they are written. The `items`, `messages`, and `mapping` collections are
   recursively content-sanitized and bounded; unknown fields remain limited to
   structural counts and provenance. Projection truncation downgrades coverage
-  and cannot establish page exhaustion. Unsupported transfer versions are
-  retained as evidence but marked unrecognized.
+  and cannot establish page exhaustion. Upstream truncation reasons and
+  incompleteness are preserved when local traversal adds no new truncation.
+  Unsupported transfer versions are retained as evidence but marked
+  unrecognized.
+- Coverage-gap and alias-collision writes validate the complete scope/context
+  envelope, including dynamic mapping keys, before any database mutation.
 - Missing or contradictory detail pagination, including an unknown HTTP 200 shape, records an open coverage gap, keeps the conversation pending, and prevents the run watermark from advancing.
 
 Dashboard cards show three policy buckets. Unknown remaining is the string Unknown, never zero.

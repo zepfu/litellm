@@ -142,6 +142,12 @@ _OBSERVATION_KEY_ALIASES = {
     "quarantineWarning": "quarantine_warning",
     "quarantineWarnings": "quarantine_warnings",
     "quarantineReason": "quarantine_reason",
+    "projectionTruncated": "projection_truncated",
+    "projectionTruncations": "projection_truncations",
+    "truncationReasons": "projection_truncations",
+    "truncation_reasons": "projection_truncations",
+    "projectionIncomplete": "projection_incomplete",
+    "incomplete": "projection_incomplete",
     "evidenceId": "evidence_id",
     "unknownFields": "unknown_fields",
 }
@@ -237,6 +243,7 @@ _OBSERVATION_FIELDS = frozenset(
         "projection_error",
         "projection_truncated",
         "projection_truncations",
+        "projection_incomplete",
     }
 )
 _OBSERVATION_TOKEN_FIELDS = frozenset(
@@ -295,6 +302,8 @@ _OBSERVATION_TOKEN_FIELDS = frozenset(
         "transfer_version",
         "projection_status",
         "projection_error",
+        "projection_truncated",
+        "projection_incomplete",
     }
 )
 _OBSERVATION_TIMESTAMP_FIELDS = frozenset(
@@ -321,6 +330,7 @@ _OBSERVATION_BOOLEAN_FIELDS = frozenset(
         "imported",
         "copied",
         "future_timestamp_quarantined",
+        "projection_incomplete",
     }
 )
 _OBSERVATION_NUMBER_FIELDS = frozenset({"offset", "limit", "total", "weight", "timestamp_"})
@@ -446,6 +456,7 @@ _PAGE_FIELDS = frozenset(
         "projection_error",
         "projection_truncated",
         "projection_truncations",
+        "projection_incomplete",
     }
 )
 
@@ -1870,8 +1881,19 @@ class PgLedgerPage:
         safe_state = _enum_token(state, _ALLOWED_GAP_STATES, "unknown")
         safe_details = _coverage_details_envelope(details)
         safe_seen_at = _utc_datetime(seen_at, "seen_at")
+        self.ledger.assert_safe_record(
+            _coverage_write_envelope(
+                safe_scope,
+                scope_key_value=scope_key(safe_scope),
+                source_kind=safe_source_kind,
+                source_id=safe_source_id,
+                reason=safe_reason,
+                state=safe_state,
+                details=safe_details,
+                seen_at=safe_seen_at,
+            )
+        )
         binding = self.bind_scope(safe_scope, seen_at=safe_seen_at)
-        self.ledger.assert_safe_record(safe_details)
         gap_id = stable_id(binding.scope_key, safe_source_kind, safe_source_id, safe_reason)
         with self.conn.cursor() as cur:
             _lock_scope(cur, binding.scope_key)
@@ -1926,6 +1948,18 @@ class PgLedgerPage:
         safe_source_kind = _required_token(source_kind, "source_kind")
         safe_source_id = _required_token(source_id, "source_id")
         safe_seen_at = _utc_datetime(seen_at, "seen_at")
+        self.ledger.assert_safe_record(
+            _coverage_write_envelope(
+                safe_scope,
+                scope_key_value=scope_key(safe_scope),
+                source_kind=safe_source_kind,
+                source_id=safe_source_id,
+                reason="coverage_gap_resolution",
+                state="resolved",
+                details=None,
+                seen_at=safe_seen_at,
+            )
+        )
         binding = self.bind_scope(safe_scope, seen_at=safe_seen_at)
         with self.conn.cursor() as cur:
             _lock_scope(cur, binding.scope_key)
@@ -2606,8 +2640,19 @@ def _record_identity_gap(
     safe_source_id = _required_token(source_id, "source_id")
     safe_reason = _required_token(reason, "reason")
     safe_details = _coverage_details_envelope(details)
-    page.ledger.assert_safe_record(safe_details)
     safe_seen_at = _utc_datetime(seen_at, "seen_at")
+    page.ledger.assert_safe_record(
+        _coverage_write_envelope(
+            safe_scope,
+            scope_key_value=scope_key_value,
+            source_kind="attempt_identity",
+            source_id=safe_source_id,
+            reason=safe_reason,
+            state="open",
+            details=safe_details,
+            seen_at=safe_seen_at,
+        )
+    )
     gap_id = stable_id(scope_key_value, "attempt_identity", safe_source_id, safe_reason)
     cur.execute(
         """
@@ -2891,7 +2936,18 @@ def _record_alias_collision(
             ],
         }
     )
-    ledger.assert_safe_record(details)
+    ledger.assert_safe_record(
+        _coverage_write_envelope(
+            safe_scope,
+            scope_key_value=key,
+            source_kind="attempt_alias",
+            source_id=source_id,
+            reason="alias_collision",
+            state="open",
+            details=details,
+            seen_at=safe_seen_at,
+        )
+    )
     cur.execute(
         """
         INSERT INTO public.chatgpt_usage_coverage_gaps (
@@ -3081,7 +3137,7 @@ def _attempt_payload(
     attempt_id: Optional[str] = None,
     quarantine_reason: Optional[str] = None,
 ) -> dict[str, Any]:
-    warnings = list(_safe_tokens(attempt.warnings))
+    warnings = list(_safe_warning_tokens(attempt.warnings))
     normalized_quarantine = _normalize_quarantine(attempt.quarantine)
     for warning in normalized_quarantine["warnings"]:
         if warning not in warnings:
@@ -3090,7 +3146,7 @@ def _attempt_payload(
         quarantine_warning = f"quarantine:{quarantine_reason}"
         if quarantine_warning not in warnings:
             warnings.append(quarantine_warning)
-    warnings = sorted(warnings)
+    warnings = _safe_warning_tokens(warnings)
     return {
         "transferSchemaVersion": TRANSFER_SCHEMA_VERSION,
         "attemptId": attempt_id or attempt.attempt_id,
@@ -3116,7 +3172,7 @@ def _attempt_payload(
         "origin": attempt.origin,
         "aliases": [list(alias) for alias in sorted(aliases)],
         "evidenceMessageIds": sorted(attempt.evidence_message_ids),
-        "warnings": sorted(warnings),
+        "warnings": warnings,
         "quarantine": _quarantine_envelope(warnings, normalized_quarantine),
     }
 
@@ -3249,7 +3305,7 @@ def _normalize_attempt(
             token for token in (_optional_token(value) for value in attempt.evidence_message_ids) if token is not None
         ),
         revision=revision,
-        warnings=tuple(_safe_tokens(attempt.warnings)),
+        warnings=tuple(_safe_warning_tokens(attempt.warnings)),
         quarantine=_normalize_quarantine(attempt.quarantine),
     )
 
@@ -3305,6 +3361,36 @@ def _safe_tokens(values: Iterable[Any], *, limit: int = 64) -> list[str]:
         if len(out) >= limit:
             break
     return out
+
+
+def _is_quarantine_warning(value: str) -> bool:
+    normalized = value.lower().replace("-", "_")
+    return (
+        normalized == "future_timestamp_quarantined"
+        or normalized.startswith("future_timestamp")
+        or normalized.startswith("quarantine:")
+    )
+
+
+def _safe_warning_tokens(values: Iterable[Any], *, limit: int = 64) -> list[str]:
+    """Retain safety warnings before applying the ordinary warning cap."""
+    if isinstance(values, (str, bytes, bytearray)):
+        return []
+    ordinary: list[str] = []
+    safety: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        token = _optional_token(value)
+        if token is None or token in seen:
+            continue
+        seen.add(token)
+        if _is_quarantine_warning(token):
+            safety.append(token)
+        elif len(ordinary) < limit:
+            ordinary.append(token)
+    if len(safety) >= limit:
+        return sorted(safety[:limit])
+    return sorted(safety + ordinary[: limit - len(safety)])
 
 
 def _sanitize_aliases(
@@ -3418,16 +3504,25 @@ def _record_observation_collection_counts(projected: dict[str, Any]) -> None:
 
 
 def _apply_observation_quarantine(projected: dict[str, Any]) -> None:
-    if projected.get("future_timestamp_quarantined") is True:
-        projected["quarantine_state"] = "quarantined"
-        projected["quarantine"] = _quarantine_envelope(
-            ["future_timestamp_quarantined"],
-            projected.get("quarantine") if isinstance(projected.get("quarantine"), Mapping) else None,
-        )
-        return
     quarantine = projected.get("quarantine")
-    if isinstance(quarantine, Mapping) and quarantine.get("state") in {"quarantined", "unknown"}:
-        projected["quarantine_state"] = quarantine["state"]
+    safety_warnings: list[str] = []
+    for warning_key in ("warnings", "quarantine_warnings"):
+        warning_values = projected.get(warning_key)
+        if isinstance(warning_values, list):
+            safety_warnings.extend(
+                warning
+                for warning in warning_values
+                if isinstance(warning, str) and _is_quarantine_warning(warning)
+            )
+    future_timestamp_quarantined = projected.get("future_timestamp_quarantined") is True
+    if future_timestamp_quarantined or safety_warnings or isinstance(quarantine, Mapping):
+        envelope = _quarantine_envelope(
+            safety_warnings,
+            quarantine if isinstance(quarantine, Mapping) else None,
+            future_timestamp_quarantined=future_timestamp_quarantined,
+        )
+        projected["quarantine"] = envelope
+        projected["quarantine_state"] = envelope["state"]
 
 
 def _apply_transfer_version_status(projected: dict[str, Any]) -> None:
@@ -3443,24 +3538,37 @@ def _apply_projection_status(
     projected: dict[str, Any],
     state: _ObservationProjectionState,
 ) -> None:
-    if state.truncations:
+    upstream_truncated = projected.get("projection_truncated") is True
+    upstream_incomplete = projected.get("projection_incomplete") is True
+    upstream_reasons = projected.get("projection_truncations")
+    if not isinstance(upstream_reasons, list):
+        upstream_reasons = []
+    truncations = list(upstream_reasons)
+    for truncation in state.truncations:
+        if truncation not in truncations:
+            truncations.append(truncation)
+    has_truncation = upstream_truncated or bool(truncations)
+    if has_truncation:
         projected["projection_truncated"] = True
-        projected["projection_truncations"] = state.truncations[:_OBSERVATION_MAX_FIELDS]
+        projected["projection_truncations"] = truncations[:_OBSERVATION_MAX_FIELDS]
         if projected.get("coverage") != "unrecognized":
             projected["coverage"] = "partial"
         if projected.get("exhausted") is True:
             projected["exhausted"] = False
         projected.setdefault("projection_status", "partial")
-    else:
+    elif "projection_truncated" not in projected:
         projected["projection_truncated"] = False
+    if "projection_truncations" not in projected:
         projected["projection_truncations"] = []
+    if state.incomplete or upstream_incomplete:
+        projected["projection_incomplete"] = True
     if state.invalid:
         projected["coverage"] = "unrecognized"
         projected["projection_status"] = "unrecognized"
-    elif state.incomplete and projected.get("coverage") != "unrecognized":
+    elif (state.incomplete or upstream_incomplete) and projected.get("coverage") != "unrecognized":
         projected["coverage"] = "partial"
         projected.setdefault("projection_status", "partial")
-    elif state.truncations and projected.get("projection_status") != "unsupported_transfer_version":
+    elif has_truncation and projected.get("projection_status") != "unsupported_transfer_version":
         projected["projection_status"] = "partial"
 
 
@@ -3515,6 +3623,7 @@ def _project_observation_field(
             state=projection_state,
             path=path,
             limit=64,
+            prioritize_safety=True,
         )
     if key == "provenance":
         if not isinstance(value, Mapping):
@@ -3560,7 +3669,15 @@ def _project_observation_field(
     if key == "transfer_schema_version":
         return TRANSFER_SCHEMA_VERSION
     if key == "projection_truncated":
-        return value if isinstance(value, bool) else _DROP
+        if isinstance(value, bool):
+            return value
+        projection_state.mark_incomplete()
+        return _DROP
+    if key == "projection_incomplete":
+        if isinstance(value, bool):
+            return value
+        projection_state.mark_incomplete()
+        return _DROP
     if key == "projection_truncations":
         return _bounded_projection_truncations(value, state=projection_state, path=path)
     if key in _OBSERVATION_TOKEN_FIELDS:
@@ -3857,6 +3974,7 @@ def _bounded_token_sequence(
     state: _ObservationProjectionState,
     path: str,
     limit: int,
+    prioritize_safety: bool = False,
 ) -> Any:
     if value is None:
         return None
@@ -3864,6 +3982,20 @@ def _bounded_token_sequence(
         state.mark_incomplete()
         return _DROP
     source_count = _safe_len(value)
+    if prioritize_safety:
+        for item in value:
+            if item is not None and _optional_token(item) is None:
+                state.mark_incomplete()
+        projected = _safe_warning_tokens(value, limit=limit)
+        if source_count is not None and source_count > limit:
+            state.mark_truncated(
+                path=path,
+                reason="max_items",
+                retained_count=len(projected),
+                source_count=source_count,
+                source_count_lower_bound=False,
+            )
+        return projected
     out: list[str] = []
     for index, item in enumerate(value):
         if index >= limit:
@@ -3979,23 +4111,28 @@ def _quarantine_envelope(
     normalized = _normalize_quarantine(quarantine)
     safe_warnings = [
         warning
-        for warning in _safe_tokens(warnings, limit=64)
-        if warning == "future_timestamp_quarantined" or warning.startswith("quarantine:")
+        for warning in _safe_warning_tokens(warnings, limit=64)
+        if _is_quarantine_warning(warning)
     ]
     if future_timestamp_quarantined and "future_timestamp_quarantined" not in safe_warnings:
         safe_warnings.append("future_timestamp_quarantined")
-    merged_warnings = list(normalized["warnings"])
-    for warning in safe_warnings:
-        if warning not in merged_warnings:
-            merged_warnings.append(warning)
-    state = "quarantined" if (
-        normalized["state"] == "quarantined"
-        or normalized["timestamps"]
-        or merged_warnings
-    ) else "clear"
+    merged_warnings = _safe_warning_tokens(
+        [*normalized["warnings"], *safe_warnings],
+        limit=64,
+    )
+    if normalized["state"] == "unknown" and not (
+        normalized["timestamps"] or merged_warnings
+    ):
+        state = "unknown"
+    else:
+        state = "quarantined" if (
+            normalized["state"] == "quarantined"
+            or normalized["timestamps"]
+            or merged_warnings
+        ) else "clear"
     return {
         "state": state,
-        "warnings": sorted(merged_warnings)[:64],
+        "warnings": merged_warnings,
         "timestamps": list(normalized["timestamps"]),
     }
 
@@ -4009,7 +4146,7 @@ def _quarantine_value(value: Any) -> Any:
         token = _quarantine_state_token(value)
         if token is None:
             return _DROP
-        return _quarantine_envelope([] if token == "clear" else [f"quarantine:{token}"])
+        return _quarantine_envelope([], {"state": token})
     if isinstance(value, Mapping):
         return _quarantine_envelope([], value)
     return _DROP
@@ -4020,7 +4157,7 @@ def _normalize_quarantine(value: Any) -> dict[str, Any]:
         return {"state": "clear", "warnings": [], "timestamps": []}
     state = _quarantine_state_token(value.get("state")) or "unknown"
     raw_warnings = value.get("warnings", value.get("reasons", []))
-    warnings = _safe_tokens(
+    warnings = _safe_warning_tokens(
         raw_warnings
         if isinstance(raw_warnings, Sequence) and not isinstance(raw_warnings, (str, bytes, bytearray))
         else []
@@ -4038,7 +4175,12 @@ def _normalize_quarantine(value: Any) -> dict[str, Any]:
                 continue
             timestamp_value = _safe_timestamp(item.get("value"))
             observed_at = _safe_timestamp(item.get("observedAt", item.get("observed_at")))
-            if timestamp_value is _DROP or observed_at is _DROP:
+            if (
+                timestamp_value is _DROP
+                or observed_at is _DROP
+                or timestamp_value is None
+                or observed_at is None
+            ):
                 continue
             evidence: dict[str, Any] = {
                 "field": field,
@@ -4060,14 +4202,16 @@ def _normalize_quarantine(value: Any) -> dict[str, Any]:
         normalized_state = "clear"
     return {
         "state": normalized_state,
-        "warnings": sorted(warnings)[:64],
+        "warnings": warnings,
         "timestamps": timestamps,
     }
 
 
 def _coverage_details_envelope(details: Optional[Mapping[str, Any]]) -> dict[str, Any]:
     if details is None:
-        return {"transfer_schema_version": TRANSFER_SCHEMA_VERSION}
+        projected = {"transfer_schema_version": TRANSFER_SCHEMA_VERSION}
+        assert_no_secrets(projected)
+        return projected
     if not isinstance(details, Mapping):
         raise LedgerError("coverage details must be a mapping")
     projected = _observation_envelope(details)
@@ -4078,7 +4222,43 @@ def _coverage_details_envelope(details: Optional[Mapping[str, Any]]) -> dict[str
     if alias:
         projected["alias"] = alias
     projected["transfer_schema_version"] = TRANSFER_SCHEMA_VERSION
+    assert_no_secrets(projected)
     return projected
+
+
+def _coverage_write_envelope(
+    scope: LedgerScope,
+    *,
+    scope_key_value: str,
+    source_kind: str,
+    source_id: str,
+    reason: str,
+    state: str,
+    details: Optional[Mapping[str, Any]],
+    seen_at: datetime,
+) -> dict[str, Any]:
+    safe_scope = _normalize_scope(scope)
+    safe_scope_key = _required_token(scope_key_value, "scope_key")
+    safe_source_kind = _required_token(source_kind, "source_kind")
+    safe_source_id = _required_token(source_id, "source_id")
+    safe_reason = _required_token(reason, "reason")
+    safe_state = _enum_token(state, _ALLOWED_GAP_STATES, "unknown")
+    safe_seen_at = _utc_datetime(seen_at, "seen_at")
+    safe_details = _coverage_details_envelope(details)
+    envelope = {
+        "scope": _scope_payload(safe_scope),
+        "scope_key": safe_scope_key,
+        "context": {
+            "source_kind": safe_source_kind,
+            "source_id": safe_source_id,
+            "reason": safe_reason,
+            "state": safe_state,
+            "seen_at": isoformat_utc(safe_seen_at),
+        },
+        "details": safe_details,
+    }
+    assert_no_secrets(envelope)
+    return envelope
 
 
 def _coverage_participants(value: Any) -> list[dict[str, str]]:
@@ -4124,6 +4304,8 @@ def _safe_number(value: Any) -> Any:
 
 
 def _safe_timestamp(value: Any) -> Any:
+    if value is None:
+        return None
     if isinstance(value, bool):
         return _DROP
     try:
