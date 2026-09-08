@@ -151,6 +151,13 @@ observability, routing, authentication, and session metadata remain in the
 separate `litellm_metadata` structure and are never merged into caller
 top-level `metadata`.
 
+## Responses API Image Retention
+
+For xAI Responses requests containing `input_image` or `image_url` content,
+LiteLLM sends `store=false` automatically. This applies to URL and base64
+image forms on both native xAI and managed xAI OAuth routes. Text-only
+requests preserve the caller's explicit `store` value or the provider default.
+
 ## Sample Usage - Vision
 
 ```python showLineNumbers title="LiteLLM python sdk usage - Vision"

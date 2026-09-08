@@ -18,6 +18,36 @@ else:
     LiteLLMLoggingObj = Any
 
 
+def _contains_xai_image_input(value: Any) -> bool:
+    """Detect supported Responses image input without scanning prompt text."""
+    if isinstance(value, list):
+        return any(_contains_xai_image_input(item) for item in value)
+    if not isinstance(value, dict):
+        return False
+
+    item_type = value.get("type")
+    if isinstance(item_type, str) and item_type.strip().lower() in {
+        "input_image",
+        "image_url",
+    }:
+        return True
+
+    image_url = value.get("image_url")
+    if isinstance(image_url, str):
+        return bool(image_url.strip())
+    if isinstance(image_url, dict):
+        return any(
+            isinstance(image_url.get(key), str) and image_url[key].strip()
+            for key in ("url", "data", "base64")
+        )
+
+    return any(
+        _contains_xai_image_input(value.get(key))
+        for key in ("input", "content", "items")
+        if key in value
+    )
+
+
 def _is_exact_new_task_empty_payload_envelope(text: str) -> bool:
     """True for the exact empty Codex ``NEW_TASK`` spawn envelope."""
     if not text.endswith("\n"):
@@ -122,7 +152,7 @@ class XAIResponsesAPIConfig(OpenAIResponsesAPIConfig):
     - Does not support the 'instructions' parameter
     - Treats top-level 'metadata' as unsupported and compatibility-only
     - Requires code_interpreter tools to have 'container' field removed
-    - Recommends store=false when sending images
+    - Sets store=false automatically when sending images
 
     Reference: https://docs.x.ai/docs/api-reference#create-new-response
     """
@@ -150,6 +180,25 @@ class XAIResponsesAPIConfig(OpenAIResponsesAPIConfig):
             supported_params.remove("metadata")
 
         return supported_params
+
+    def transform_responses_api_request(
+        self,
+        model: str,
+        input: Any,
+        response_api_optional_request_params: Dict,
+        litellm_params: GenericLiteLLMParams,
+        headers: dict,
+    ) -> Dict:
+        transformed_request = super().transform_responses_api_request(
+            model=model,
+            input=input,
+            response_api_optional_request_params=response_api_optional_request_params,
+            litellm_params=litellm_params,
+            headers=headers,
+        )
+        if _contains_xai_image_input(transformed_request.get("input")):
+            transformed_request["store"] = False
+        return transformed_request
 
     def _transform_web_search_tool(
         self, tool: Dict[str, Any]
@@ -248,7 +297,7 @@ class XAIResponsesAPIConfig(OpenAIResponsesAPIConfig):
         2. Transforms code_interpreter tools to remove 'container' field
         3. Transforms web_search tools to XAI format (removes search_context_size, adds filters)
         4. Transforms x_search tools to XAI format
-        5. Sets store=false when images are detected (recommended by XAI)
+        5. Sets store=false when images are detected
         """
         params = dict(response_api_optional_params)
 
@@ -271,6 +320,9 @@ class XAIResponsesAPIConfig(OpenAIResponsesAPIConfig):
                     "XAI Responses API does not support parameter 'metadata'; "
                     "retaining it because drop_params=False."
                 )
+
+        if _contains_xai_image_input(params.get("input")):
+            params["store"] = False
 
         # Transform tools
         if "tools" in params and params["tools"]:
