@@ -2660,6 +2660,13 @@ client-hosted tool. Invalid or ambiguous arguments fail closed as a retryable
 malformed candidate response so the alias can continue rather than exposing an
 unusable function call to Codex.
 
+Native Grok and managed `oa_xai` Responses alias streams reuse the bounded
+literal-tool marker detector used by direct Grok. If the initial peek contains
+`Tool label:` text, LiteLLM drains only within the existing 5,000-chunk and
+8-MiB bounds before repairing the completed payload or rejecting it as malformed
+tool-call text. Marker-free pending streams remain lazy and preserve first-byte
+behavior.
+
 OpenRouter completion-adapter candidates classify provider-wrapped 400 responses
 with `metadata.provider_name` and `metadata.raw=ERROR` as terminal candidate
 failures. Alias probes cool down only that OpenRouter candidate, record
