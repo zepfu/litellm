@@ -94,6 +94,25 @@ LiteLLM-owned second grant. A configured managed `kimi_code` route consumes the
 same credential read-only; possessing the file or naming an alias does not
 enable routing or transport by itself.
 
+### Managed xAI failure classification and generation recovery
+
+Managed xAI refresh reports only sanitized, stable error classes. The only
+terminal classes are the exact JSON `error` values `invalid_grant` and
+`refresh_token_reused` from an HTTP `400` token-endpoint response. They suppress
+another token-endpoint attempt only while the nonsecret `credential_identity`
+remains the same. Transport failures, timeouts, DNS failures, retryable HTTP
+statuses, other HTTP failures, malformed responses, and local refresh failures
+remain bounded and retryable. Provider response bodies and descriptions are not
+retained in refresh summaries or observations.
+
+A failed managed xAI refresh remains authoritative through a passive local-file
+inspection of that same credential generation. The passive inspection records
+local usability separately and cannot manufacture a refresh or token-endpoint
+success timestamp. If it observes a different identity, the sidecar reinspects
+the local file once before using that result. Only a confirmed different usable
+generation clears failed-refresh state and terminal suppression; an unusable or
+stale passive snapshot does not.
+
 ## Portable default paths
 
 Refresh scripts with built-in auth-file defaults and the in-package xAI OAuth

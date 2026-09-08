@@ -1682,6 +1682,7 @@ class OAuthRefreshScheduleState:
     last_error_message: Optional[str] = None
     credential_health: Optional[str] = None
     usable: Optional[bool] = None
+    credential_identity: Optional[str] = None
     actual_attempt_count: int = 0
     terminal_refresh_error_class: Optional[str] = None
     terminal_refresh_identity: Optional[str] = None
@@ -4164,6 +4165,191 @@ def _build_passive_provider_auth_observation(
             ),
         },
     }
+
+
+def _xai_refresh_failure_remains_authoritative(
+    schedule: OAuthRefreshScheduleState,
+) -> bool:
+    return bool(
+        schedule.last_result_class == "refresh_failed"
+        or schedule.last_error_class
+        or schedule.terminal_refresh_error_class
+    )
+
+
+def _xai_passive_health_status(summary: Mapping[str, Any]) -> Optional[str]:
+    value = _redacted_summary_field(
+        summary.get("health_status") or summary.get("credential_health")
+    )
+    if value in {"fresh", "degraded", "malformed", "expired"}:
+        return value
+    return None
+
+
+def _project_xai_oauth_passive_health_event(
+    schedule: OAuthRefreshScheduleState,
+    summary: Mapping[str, Any],
+    *,
+    reinspect: Callable[[], Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Keep passive xAI usability separate from refresh-outcome authority."""
+    passive_summary = dict(summary)
+    scheduled_identity = schedule.credential_identity
+    initial_identity = _oauth_refresh_identity(passive_summary)
+    reinspection_performed = False
+    stale_snapshot_rejected = False
+
+    if (
+        scheduled_identity is not None
+        and initial_identity is not None
+        and initial_identity != scheduled_identity
+    ):
+        reinspection_performed = True
+        try:
+            passive_summary = dict(reinspect())
+        except Exception:
+            passive_summary = {
+                "attempted": True,
+                "health_status": "malformed",
+                "usable": False,
+                "error_class": "passive_reinspection_error",
+                "error_message": "xAI OAuth passive health reinspection failed.",
+            }
+        stale_snapshot_rejected = (
+            _oauth_refresh_identity(passive_summary) != initial_identity
+        )
+
+    passive_identity = _oauth_refresh_identity(passive_summary)
+    passive_health = _xai_passive_health_status(passive_summary)
+    passive_usable = bool(passive_summary.get("usable"))
+    had_authoritative_failure = _xai_refresh_failure_remains_authoritative(schedule)
+    confirmed_new_usable_generation = bool(
+        reinspection_performed
+        and scheduled_identity is not None
+        and passive_identity is not None
+        and passive_identity != scheduled_identity
+        and passive_usable
+    )
+
+    event = dict(passive_summary)
+    event.update(
+        {
+            "passive_credential_health": passive_health,
+            "passive_usable": passive_usable,
+            "passive_credential_identity": passive_identity,
+            "passive_error_class": _redacted_summary_field(
+                passive_summary.get("error_class")
+            ),
+            "passive_error_message": _redacted_failure_message(
+                passive_summary.get("error_message")
+            ),
+            "passive_reinspection_performed": reinspection_performed,
+            "passive_snapshot_stale": stale_snapshot_rejected,
+            "scheduler_generation_replaced": False,
+        }
+    )
+
+    if had_authoritative_failure and confirmed_new_usable_generation:
+        schedule.last_result_class = None
+        schedule.last_error_class = None
+        schedule.last_error_message = None
+        schedule.terminal_refresh_error_class = None
+        schedule.terminal_refresh_identity = None
+        schedule.credential_identity = passive_identity
+        schedule.credential_health = passive_health
+        schedule.usable = passive_usable
+        event["scheduler_generation_replaced"] = True
+        event["refresh_result_class"] = "generation_replaced"
+        event["scheduler_error_class"] = None
+        event["scheduler_error_message"] = None
+        event["last_result_class"] = None
+        event["terminal_refresh_blocked"] = False
+        event["terminal_refresh_error_class"] = None
+        return event
+
+    if had_authoritative_failure:
+        scheduler_health = schedule.credential_health
+        if scheduler_health not in {"degraded", "malformed", "expired"}:
+            scheduler_health = "degraded"
+        event.update(
+            {
+                "health_status": scheduler_health,
+                "credential_health": scheduler_health,
+                "usable": schedule.usable,
+                "credential_identity": schedule.credential_identity,
+                "error_class": schedule.last_error_class,
+                "error_message": schedule.last_error_message,
+                "refresh_result_class": schedule.last_result_class
+                or "refresh_failed",
+                "scheduler_error_class": schedule.last_error_class,
+                "scheduler_error_message": schedule.last_error_message,
+                "last_result_class": schedule.last_result_class,
+                "terminal_refresh_blocked": bool(
+                    schedule.terminal_refresh_error_class
+                    and schedule.terminal_refresh_identity
+                    and schedule.terminal_refresh_identity
+                    == schedule.credential_identity
+                ),
+                "terminal_refresh_error_class": (
+                    schedule.terminal_refresh_error_class
+                ),
+            }
+        )
+        return event
+
+    event.update(
+        {
+            "scheduler_error_class": schedule.last_error_class,
+            "scheduler_error_message": schedule.last_error_message,
+            "last_result_class": schedule.last_result_class,
+            "terminal_refresh_blocked": False,
+            "terminal_refresh_error_class": schedule.terminal_refresh_error_class,
+        }
+    )
+    return event
+
+
+def _build_xai_oauth_passive_auth_observation(
+    config: ProviderStatusLoopConfig,
+    event: Mapping[str, Any],
+) -> Dict[str, Any]:
+    observation = _build_passive_provider_auth_observation(
+        config,
+        event,
+        provider="xai",
+        auth_family="xai_oauth",
+        auth_file=config.xai_oauth_auth_file,
+        auth_file_source=config.xai_oauth_auth_file_source,
+        credential_scope=event.get("scope") or config.xai_oauth_scope,
+    )
+    observation["last_success_at"] = None
+    observation["metadata"].update(_oauth_refresh_observation_metadata(event))
+    observation["metadata"].update(
+        {
+            "passive_credential_health": _redacted_summary_field(
+                event.get("passive_credential_health")
+            ),
+            "passive_usable": event.get("passive_usable"),
+            "passive_credential_identity": _redacted_summary_field(
+                event.get("passive_credential_identity")
+            ),
+            "passive_error_class": _redacted_summary_field(
+                event.get("passive_error_class")
+            ),
+            "passive_error_message": _redacted_failure_message(
+                event.get("passive_error_message")
+            ),
+            "passive_reinspection_performed": bool(
+                event.get("passive_reinspection_performed")
+            ),
+            "passive_snapshot_stale": bool(event.get("passive_snapshot_stale")),
+            "scheduler_generation_replaced": bool(
+                event.get("scheduler_generation_replaced")
+            ),
+            "passive_never_advances_success_time": True,
+        }
+    )
+    return observation
 
 
 def _persist_passive_provider_auth_observation(
@@ -12364,7 +12550,8 @@ def _oauth_refresh_schedule_evidence(
         "refresh_buffer_seconds": buffer_seconds,
         "refresh_threshold_seconds": effective_threshold_seconds,
         "credential_identity": final.get("credential_identity")
-        or pre.get("credential_identity"),
+        or pre.get("credential_identity")
+        or schedule.credential_identity,
         "credential_health": credential_health
         if credential_health is not None
         else final.get("credential_health"),
@@ -12454,6 +12641,9 @@ def _record_oauth_refresh_schedule_outcome(
     schedule.next_refresh_check_at = final.get("next_refresh_check_at")
     schedule.expires_at = final.get("expires_at")
     schedule.last_result_class = result_class
+    recorded_identity = _oauth_refresh_identity(final) or _oauth_refresh_identity(pre)
+    if recorded_identity is not None:
+        schedule.credential_identity = recorded_identity
     if operation_error_class:
         schedule.last_error_class = operation_error_class
         schedule.last_error_message = _redacted_failure_message(
@@ -13393,6 +13583,12 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
                     "error_class": exc.__class__.__name__,
                     "error_message": _redacted_failure_message(str(exc)),
                 }
+            if event_name == "xai_oauth_passive_health_inspection":
+                summary = _project_xai_oauth_passive_health_event(
+                    state.xai_oauth_refresh_schedule,
+                    summary,
+                    reinspect=lambda: inspector(*inspector_args, **inspector_kwargs),
+                )
             event = {
                 "event": event_name,
                 "source_task": "provider_auth_health_poll",
@@ -13400,15 +13596,21 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
                 "environment": config.environment,
                 **{key: value for key, value in summary.items() if key != "auth_file"},
             }
-            observation = _build_passive_provider_auth_observation(
-                config,
-                event,
-                provider=provider,
-                auth_family=auth_family,
-                auth_file=auth_file,
-                auth_file_source=auth_file_source,
-                credential_scope=summary.get(scope_field),
-            )
+            if event_name == "xai_oauth_passive_health_inspection":
+                observation = _build_xai_oauth_passive_auth_observation(
+                    config,
+                    event,
+                )
+            else:
+                observation = _build_passive_provider_auth_observation(
+                    config,
+                    event,
+                    provider=provider,
+                    auth_family=auth_family,
+                    auth_file=auth_file,
+                    auth_file_source=auth_file_source,
+                    credential_scope=summary.get(scope_field),
+                )
             persisted, inserted_count, skip_error_class, skip_reason = (
                 _persist_passive_provider_auth_observation(config, observation)
             )
