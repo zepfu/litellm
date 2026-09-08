@@ -101,6 +101,7 @@ EXPECTED_SEAM_DISPOSITION = {
     "_sanitize_xai_responses_request_body_in_place": (
         "runtime._sanitize_xai_responses_request_body_in_place"
     ),
+    "bind_xai_oauth_snapshot": "runtime.bind_xai_oauth_snapshot",
 }
 
 
