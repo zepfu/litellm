@@ -172,6 +172,31 @@ def _selected_account_matches_candidate(
     )
 
 
+def _xai_oauth_snapshot_matches_selected_account(
+    snapshot: Any,
+    selected: XaiOAuthSelectedAccount,
+) -> bool:
+    """Return whether a request snapshot is trusted for the selected record."""
+
+    if (
+        getattr(snapshot, "credential_family", None) != "xai_oauth"
+        or getattr(snapshot, "auth_file", None) != selected.record.auth_path
+        or getattr(snapshot, "scope", None) != selected.record.scope
+    ):
+        return False
+    expected_identity = _clean_string(
+        getattr(selected.record, "expected_account_identity", None)
+    )
+    snapshot_identity = _clean_string(
+        getattr(snapshot, "account_identity", None)
+    )
+    return (
+        expected_identity is not None
+        and snapshot_identity is not None
+        and snapshot_identity == expected_identity
+    )
+
+
 def preserve_xai_oauth_candidate_context(
     request: Any,
     candidate: Mapping[str, Any],
@@ -273,8 +298,32 @@ def bind_xai_oauth_candidate_to_request(
                 detail="Selected xAI OAuth account identity is invalid.",
             )
         if snapshot is not None:
-            from litellm.llms.xai.oauth import bind_xai_oauth_snapshot_to_request
+            from litellm.llms.xai.oauth import (
+                bind_xai_oauth_snapshot_to_request,
+                get_xai_oauth_snapshot_from_request,
+            )
 
+            current_snapshot = get_xai_oauth_snapshot_from_request(request)
+            if _xai_oauth_snapshot_matches_selected_account(
+                current_snapshot,
+                selected,
+            ):
+                current_generation = getattr(
+                    current_snapshot,
+                    "generation_metadata",
+                    None,
+                )
+                selected_generation = getattr(
+                    snapshot,
+                    "generation_metadata",
+                    None,
+                )
+                if (
+                    isinstance(current_generation, tuple)
+                    and isinstance(selected_generation, tuple)
+                    and current_generation >= selected_generation
+                ):
+                    snapshot = current_snapshot
             bind_xai_oauth_snapshot_to_request(request, snapshot)
     else:
         selected = _candidate_selected_account(candidate)
