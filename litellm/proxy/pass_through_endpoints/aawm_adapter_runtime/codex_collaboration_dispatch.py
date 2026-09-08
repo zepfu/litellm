@@ -639,18 +639,22 @@ def _normalize_agent_message_item(item: dict[str, Any]) -> tuple[dict[str, Any],
         for part in content:
             if not isinstance(part, dict):
                 continue
-            if part.get("type") not in {"input_text", "text"}:
-                continue
             text = part.get("text")
-            if isinstance(text, str) and text.startswith("Message Type: "):
+            if not isinstance(text, str) or not text.startswith("Message Type: "):
+                continue
+            if part.get("type") not in {"input_text", "text"}:
                 raise CodexCollaborationDispatchError("invalid_envelope")
+            raise CodexCollaborationDispatchError("invalid_envelope")
 
     if len(content) == 1 and isinstance(content[0], dict):
         visible_part = content[0]
+        visible_text = visible_part.get("text")
+        if isinstance(visible_text, str) and visible_text.startswith("Message Type: "):
+            if visible_part.get("type") not in {"input_text", "text"}:
+                raise CodexCollaborationDispatchError("invalid_envelope")
         if visible_part.get("type") in {"input_text", "text"}:
             if set(visible_part) != {"type", "text"}:
                 raise CodexCollaborationDispatchError("invalid_envelope")
-            visible_text = visible_part.get("text")
             if isinstance(visible_text, str) and _is_opaque_representation(
                 visible_text
             ):
