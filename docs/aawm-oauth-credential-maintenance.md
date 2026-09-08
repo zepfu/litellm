@@ -153,6 +153,24 @@ metadata distinguishes provider-call ordinal from account-traversal ordinal;
 rate observations use inventory-derived account and scope identities and reject
 inbound replacements.
 
+### Managed xAI direct continuation ownership
+
+Direct managed xAI Responses traffic with `previous_response_id` or other
+provider-owned continuation state may proceed only when server state proves
+both the canonical session and the exact continuation/account association. A
+durable session-owner record containing provider, route, and account
+attributes is not sufficient: it does not bind the submitted response ID. If
+that association is missing, conflicting, or otherwise unproven, LiteLLM
+returns a structured non-failover `409` before primary inventory selection,
+credential snapshot loading, or provider I/O.
+
+This path does not trust inbound account metadata, create a response-to-account
+store, strip the continuation identifier, or fall back to the configured
+primary account. Alias and candidate dispatch may preserve a validated
+server-bound account already attached to the current request; that binding is
+not inferred from client metadata. Requests without provider-owned continuation
+state use normal server-owned selection and remain unchanged.
+
 ## OAuth refresh deadline contract
 
 Scheduled Grok OIDC, Codex OAuth, managed xAI OAuth, Kimi OAuth, and Nous
