@@ -64,9 +64,11 @@ observations, expose
 observations agree. Conflicting recorded/resolved models additionally expose
 `terminal_model_conflict`; message IDs never decide the final model.
 
-The `src/counting/index.ts` pure barrel referenced by the component provenance
-is intentionally not staged until the bounded-worker bridge contract is
-independently accepted. The staged pure modules deliberately define no transport
-protocol and connect no live runtime. No `ledger/store.ts`, SQLite package
-dependency, scheduler store, old standalone CLI, dashboard/API entrypoint,
-obsolete browser launch, or test source was restored.
+The preserved `src/counting/index.ts` pure barrel is the exact f328 module
+surface. `src/counting/report.ts` is staged as a direct module dependency for
+the accepted report contract and is not exported through this barrel until a
+combined review accepts that export delta. The staged pure modules
+deliberately define no transport protocol and connect no live runtime. No
+`ledger/store.ts`, SQLite package dependency, scheduler durable store, old
+standalone CLI, dashboard/API entrypoint, obsolete browser launch, or test
+source was restored.
