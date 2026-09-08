@@ -1601,6 +1601,11 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                 responses_api_request=self.responses_api_request,
             )
 
+            if self._cached_reasoning_item_id:
+                for item in responses_api_response.output:
+                    if getattr(item, "type", None) == "reasoning":
+                        item.id = self._cached_reasoning_item_id
+
             # Use the cached response ID to ensure consistency across all events
             if self._cached_response_id:
                 responses_api_response.id = self._cached_response_id

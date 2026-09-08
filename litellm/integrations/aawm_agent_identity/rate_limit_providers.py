@@ -717,6 +717,8 @@ def _looks_like_xai_oauth_rate_limit_context(context: Dict[str, Any]) -> bool:
     metadata = context.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
+    if _looks_like_xai_grok_oidc_rate_limit_context(context):
+        return False
     credential_family = str(metadata.get("credential_family") or "").lower()
     route_family = str(
         metadata.get("passthrough_route_family") or metadata.get("route_family") or context.get("route_family") or ""
@@ -731,6 +733,27 @@ def _looks_like_xai_oauth_rate_limit_context(context: Dict[str, Any]) -> bool:
         or model.startswith("oa_xai/")
         or request_model.startswith("oa_xai/")
     )
+
+
+def _looks_like_xai_grok_oidc_rate_limit_context(context: Dict[str, Any]) -> bool:
+    metadata = context.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    credential_family = str(metadata.get("credential_family") or "").lower()
+    if credential_family:
+        return credential_family == "xai_grok_oidc"
+    route_family = str(
+        metadata.get("passthrough_route_family")
+        or metadata.get("route_family")
+        or context.get("route_family")
+        or ""
+    ).lower()
+    if route_family:
+        if "xai_oauth" in route_family:
+            return False
+        if "grok_cli" in route_family or route_family in {"grok-build", "grok_build"}:
+            return True
+    return metadata.get("grok_native_oauth_managed") is True
 
 
 def _extract_xai_oauth_account_hash(metadata: Dict[str, Any]) -> Optional[str]:
@@ -750,6 +773,18 @@ def _extract_xai_oauth_account_hash(metadata: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _extract_xai_grok_oidc_account_hash(metadata: Dict[str, Any]) -> Optional[str]:
+    for key in ("xai_grok_oidc_account_hash", "grok_oidc_account_hash"):
+        value = _clean_non_empty_string(metadata.get(key))
+        if value:
+            return value
+    for key in ("xai_grok_oidc_account_id", "grok_oidc_account_id"):
+        value = _clean_non_empty_string(metadata.get(key))
+        if value:
+            return _short_hash(value.encode("utf-8"))
+    return None
+
+
 def _xai_oauth_header_remaining_pct(
     total: Optional[int],
     remaining: Optional[int],
@@ -759,27 +794,13 @@ def _xai_oauth_header_remaining_pct(
     return round(max(0.0, min(100.0, (remaining / total) * 100.0)), 3)
 
 
-def _next_utc_month_start(value: Any) -> Optional[datetime]:
-    observed_dt = _normalize_datetime(value)
-    if observed_dt is None:
-        return None
-    observed_dt = observed_dt.astimezone(timezone.utc)
-    if observed_dt.month == 12:
-        return datetime(observed_dt.year + 1, 1, 1, tzinfo=timezone.utc)
-    return datetime(observed_dt.year, observed_dt.month + 1, 1, tzinfo=timezone.utc)
-
-
-def _is_xai_oauth_subscription_quota_context(metadata: Dict[str, Any]) -> bool:
-    quota_family = str(metadata.get("xai_quota_family") or metadata.get("shared_quota_family") or "").strip().lower()
-    return quota_family == "xai_grok_subscription" or metadata.get("grok_subscription_quota_shared") is True
-
-
 def _extract_xai_oauth_billing_period_end(
     *,
     candidate: Dict[str, Any],
     metadata: Dict[str, Any],
     observed_at: Any,
 ) -> Tuple[Optional[datetime], Optional[str]]:
+    del observed_at
     for source, value in (
         ("payload_billing_period_end", candidate.get("billingPeriodEnd")),
         (
@@ -796,41 +817,123 @@ def _extract_xai_oauth_billing_period_end(
         if parsed is not None:
             return parsed, source
 
-    if _is_xai_oauth_subscription_quota_context(metadata):
-        fallback = _next_utc_month_start(observed_at)
-        if fallback is not None:
-            return fallback, "xai_grok_subscription_month_boundary"
-
     return None, None
 
 
-def _extract_xai_oauth_header_rate_limit_observations(
+def _select_xai_header_rate_limit_candidates(
+    kwargs: Dict[str, Any],
+    result: Any,
+    metadata: Dict[str, Any],
+    source_name: str,
+    native: bool,
+) -> Tuple[List[Dict[str, Any]], Set[str]]:
+    candidate_roots = _rate_limit_candidate_roots(kwargs, result)
+    accepted_sources = {source_name}
+    if not native:
+        return _iter_rate_limit_dicts(*candidate_roots), accepted_sources
+
+    accepted_sources.add("xai_oauth_response_headers")
+
+    def _has_xai_rate_limit_header(candidate: Dict[str, Any]) -> bool:
+        return any(
+            isinstance(key, str)
+            and (
+                key.lower().startswith("x-ratelimit-")
+                or key.lower() == "retry-after"
+            )
+            for key in candidate
+        )
+
+    def _mark_canonical_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
+        if str(candidate.get("source") or "").lower() == source_name:
+            return candidate
+        marked_candidate = dict(candidate)
+        marked_candidate["source"] = source_name
+        return marked_candidate
+
+    canonical_candidates = [
+        _mark_canonical_candidate(candidate)
+        for candidate in _iter_rate_limit_dicts(metadata.get(source_name))
+        if _has_xai_rate_limit_header(candidate)
+    ]
+    if canonical_candidates:
+        return canonical_candidates, {source_name}
+
+    candidates = _iter_rate_limit_dicts(*candidate_roots)
+    canonical_candidates = [
+        _mark_canonical_candidate(candidate)
+        for candidate in candidates
+        if str(candidate.get("source") or "").lower() == source_name
+        and _has_xai_rate_limit_header(candidate)
+    ]
+    if canonical_candidates:
+        return canonical_candidates, {source_name}
+    return candidates, accepted_sources
+
+
+def _extract_xai_header_rate_limit_observations(
     kwargs: Dict[str, Any],
     result: Any,
     observed_at: Any,
+    *,
+    native: bool,
 ) -> List[Dict[str, Any]]:
+    source_name = "xai_grok_oidc_response_headers" if native else "xai_oauth_response_headers"
     context = _build_rate_limit_context(
         kwargs,
         result,
         observed_at,
-        "xai_oauth_response_headers",
+        source_name,
     )
-    if context.get("provider") != "xai" or not _looks_like_xai_oauth_rate_limit_context(context):
+    if context.get("provider") != "xai":
+        return []
+    if native:
+        if not _looks_like_xai_grok_oidc_rate_limit_context(context):
+            return []
+    elif not _looks_like_xai_oauth_rate_limit_context(context):
         return []
     raw_metadata = context.get("metadata")
     metadata: Dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
-    account_hash = _extract_xai_oauth_account_hash(metadata)
-    model = _clean_non_empty_string(metadata.get("xai_oauth_public_model")) or (
-        _clean_non_empty_string(context.get("model")) if context.get("model") != "unknown" else None
+    account_hash = (
+        _extract_xai_grok_oidc_account_hash(metadata)
+        if native
+        else _extract_xai_oauth_account_hash(metadata)
     )
+    model = (
+        (
+            _clean_non_empty_string(metadata.get("grok_model_override"))
+            or _clean_non_empty_string(metadata.get("model_group"))
+        )
+        if native
+        else _clean_non_empty_string(metadata.get("xai_oauth_public_model"))
+    ) or (
+        _clean_non_empty_string(context.get("model"))
+        if context.get("model") != "unknown"
+        else None
+    )
+    billing_period_sources = {
+        "payload_billing_period_end",
+        "payload_config_billing_period_end",
+        "metadata_billing_period_end",
+        "metadata_xai_oauth_billing_period_end",
+    }
     observations: List[Dict[str, Any]] = []
-    for candidate in _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result)):
+    candidates, accepted_sources = _select_xai_header_rate_limit_candidates(
+        kwargs,
+        result,
+        metadata,
+        source_name,
+        native,
+    )
+    for candidate in candidates:
         lower_headers = _rate_limit_header_map(candidate)
         source = str(candidate.get("source") or "").lower()
         has_xai_header = any(
             isinstance(key, str) and key.lower().startswith("x-ratelimit-") for key in list(candidate.keys())
         )
-        if not has_xai_header and source != "xai_oauth_response_headers":
+        if source and source not in accepted_sources:
+            continue
+        if not has_xai_header and source not in accepted_sources:
             continue
 
         for limit_scope, total_key, remaining_key, reset_keys in (
@@ -894,23 +997,20 @@ def _extract_xai_oauth_header_rate_limit_observations(
                 _finalize_rate_limit_observation(
                     {
                         "observed_at": context["observed_at"],
-                        "source": "xai_oauth_response_headers",
+                        "source": source_name,
                         "provider": "xai",
-                        "client_family": "xai_oauth",
+                        "client_family": "grok-build" if native else "xai_oauth",
                         "account_hash": account_hash,
-                        "limit_id": f"xai_oauth_{limit_scope}",
-                        "limit_name": f"xAI OAuth {limit_scope} rate limit",
+                        "limit_id": f"{'xai_grok_oidc' if native else 'xai_oauth'}_{limit_scope}",
+                        "limit_name": (
+                            f"xAI Grok OIDC {limit_scope} rate limit"
+                            if native
+                            else f"xAI OAuth {limit_scope} rate limit"
+                        ),
                         "limit_scope": limit_scope,
                         "quota_period": (
                             "monthly"
-                            if reset_source
-                            in {
-                                "payload_billing_period_end",
-                                "payload_config_billing_period_end",
-                                "metadata_billing_period_end",
-                                "metadata_xai_oauth_billing_period_end",
-                                "xai_grok_subscription_month_boundary",
-                            }
+                            if reset_source in billing_period_sources
                             else None
                         ),
                         "quota_type": limit_scope,
@@ -920,14 +1020,7 @@ def _extract_xai_oauth_header_rate_limit_observations(
                         "quota_used": float(used) if used is not None else None,
                         "quota_remaining": (float(remaining) if remaining is not None else None),
                         "billing_period_end_at": provider_resets_at
-                        if reset_source
-                        in {
-                            "payload_billing_period_end",
-                            "payload_config_billing_period_end",
-                            "metadata_billing_period_end",
-                            "metadata_xai_oauth_billing_period_end",
-                            "xai_grok_subscription_month_boundary",
-                        }
+                        if reset_source in billing_period_sources
                         else None,
                         "used_percentage": used_percentage,
                         "remaining_requests": remaining,
@@ -954,11 +1047,17 @@ def _extract_xai_oauth_header_rate_limit_observations(
                                 or metadata.get("xai_oauth_billing_period_end")
                                 or metadata.get("billingPeriodEnd")
                             ),
-                            "quota_unit": f"xai_oauth_{limit_scope}",
+                            "quota_unit": f"{'xai_grok_oidc' if native else 'xai_oauth'}_{limit_scope}",
                             "quota_unit_interpretation": limit_scope,
                         },
                         "evidence": {
-                            "signals": ["xai_oauth_response_rate_limit_headers"],
+                            "signals": [
+                                (
+                                    "xai_grok_oidc_response_rate_limit_headers"
+                                    if native
+                                    else "xai_oauth_response_rate_limit_headers"
+                                )
+                            ],
                             "provider_fields": [
                                 total_key,
                                 remaining_key,
@@ -974,6 +1073,32 @@ def _extract_xai_oauth_header_rate_limit_observations(
                 )
             )
     return _dedupe_rate_limit_observations(observations)
+
+
+def _extract_xai_oauth_header_rate_limit_observations(
+    kwargs: Dict[str, Any],
+    result: Any,
+    observed_at: Any,
+) -> List[Dict[str, Any]]:
+    return _extract_xai_header_rate_limit_observations(
+        kwargs,
+        result,
+        observed_at,
+        native=False,
+    )
+
+
+def _extract_xai_grok_oidc_header_rate_limit_observations(
+    kwargs: Dict[str, Any],
+    result: Any,
+    observed_at: Any,
+) -> List[Dict[str, Any]]:
+    return _extract_xai_header_rate_limit_observations(
+        kwargs,
+        result,
+        observed_at,
+        native=True,
+    )
 
 
 def _grok_billing_quota_value(value: Any) -> Optional[float]:
@@ -1469,6 +1594,7 @@ def _build_rate_limit_observations(
     observations.extend(_extract_codex_usage_limit_error_observations(kwargs, result, observed_at))
     observations.extend(_extract_anthropic_header_rate_limit_observations(kwargs, result, observed_at))
     observations.extend(_extract_xai_oauth_header_rate_limit_observations(kwargs, result, observed_at))
+    observations.extend(_extract_xai_grok_oidc_header_rate_limit_observations(kwargs, result, observed_at))
     observations.extend(_extract_grok_billing_observations(kwargs, result, observed_at))
     observations.extend(_extract_openrouter_free_error_observations(kwargs, result, observed_at))
     return _dedupe_rate_limit_observations(observations)
@@ -1494,12 +1620,15 @@ _HOST_FUNCTION_NAMES = (
     "_first_quota_number",
     "_first_quota_float",
     "_looks_like_xai_oauth_rate_limit_context",
+    "_looks_like_xai_grok_oidc_rate_limit_context",
     "_extract_xai_oauth_account_hash",
+    "_extract_xai_grok_oidc_account_hash",
     "_xai_oauth_header_remaining_pct",
-    "_next_utc_month_start",
-    "_is_xai_oauth_subscription_quota_context",
     "_extract_xai_oauth_billing_period_end",
+    "_select_xai_header_rate_limit_candidates",
+    "_extract_xai_header_rate_limit_observations",
     "_extract_xai_oauth_header_rate_limit_observations",
+    "_extract_xai_grok_oidc_header_rate_limit_observations",
     "_grok_billing_quota_value",
     "_grok_billing_current_period",
     "_grok_billing_is_weekly_period",

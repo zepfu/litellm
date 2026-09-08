@@ -1947,16 +1947,24 @@ class AliasRoutingStateManager:
             observed_at = self._quota_observation_timestamp(
                 observation.get("observed_at")
             )
+            codex_poll = (
+                provider == "openai"
+                and observation.get("source") == "codex_quota_poll"
+            )
             try:
-                remaining_pct = float(remaining)
+                remaining_pct: Optional[float] = float(remaining)
             except (TypeError, ValueError):
-                continue
+                remaining_pct = None
+            if remaining_pct is not None and (
+                not math.isfinite(remaining_pct)
+                or not 0 <= remaining_pct <= 100
+                or (codex_poll and isinstance(remaining, bool))
+            ):
+                remaining_pct = None
             if (
                 not provider
                 or observed_at is None
-                or not math.isfinite(remaining_pct)
-                or remaining_pct < 0
-                or remaining_pct > 100
+                or (remaining_pct is None and not codex_poll)
             ):
                 continue
             model = str(observation.get("model") or "").strip()
@@ -2069,7 +2077,8 @@ class AliasRoutingStateManager:
         fresh = [
             (key, observation)
             for key, observation in observations
-            if 0 <= now - observation["observed_at"] <= max_age_seconds
+            if observation.get("remaining_pct") is not None
+            and 0 <= now - observation["observed_at"] <= max_age_seconds
             and (
                 observation.get("expected_reset_at") is None
                 or observation["expected_reset_at"] > now

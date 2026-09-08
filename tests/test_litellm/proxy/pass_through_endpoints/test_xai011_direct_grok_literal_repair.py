@@ -79,7 +79,6 @@ def _search_replace_literal_blocks() -> tuple[str, list[str], list[dict[str, str
     blocks = [preface]
     for call_id, payload in zip(call_ids, payloads):
         blocks.append(
-            "[Context note - prior assistant step; not an executable tool invocation]\n"
             "Tool label: search_replace\n"
             f"Correlation ref: {call_id}\n"
             f"Input payload: {json.dumps(payload, ensure_ascii=False)}"

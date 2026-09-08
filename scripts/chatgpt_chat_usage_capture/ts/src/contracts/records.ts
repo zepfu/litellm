@@ -1,5 +1,5 @@
 /**
- * Stage-1 normalized records for the ChatGPT ordinary Chat usage collector.
+ * Shared normalized records for the ChatGPT ordinary Chat usage collector.
  *
  * These interfaces are the single source of truth for the evidence contract
  * shared by the browser boundary, the ChatGPT route adapter, and Stage-2+
@@ -27,6 +27,14 @@ export type Coverage = "validated_page" | "partial" | "unrecognized";
 
 export type CoverageLevel = "complete" | "partial" | "unknown";
 
+export type PaginationState =
+  | "complete"
+  | "continuation"
+  | "contradictory"
+  | "unknown"
+  | "repeated_cursor"
+  | "budget_exhausted";
+
 export type AuthState =
   | "unconfigured"
   | "ready"
@@ -43,6 +51,8 @@ export interface AdaptedPage<T> {
   continuation: string | number | null;
   /** True only when the adapter proved the index/detail is exhausted. */
   exhausted: boolean;
+  /** Explicit interpretation of the page's pagination controls. */
+  paginationState: PaginationState;
   schemaVersion: string;
   coverage: Coverage;
   warnings: string[];
@@ -68,7 +78,10 @@ export interface ConversationDetailProjection {
   updatedAt: string | null;
   currentNode: string | null;
   surface: Surface;
+  detailRoute: "modern" | "legacy";
   messages: MessageRecord[];
+  continuation: string | null;
+  paginationState: PaginationState;
   coverage: Coverage;
   warnings: string[];
 }

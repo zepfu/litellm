@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -61,6 +62,14 @@ from litellm.integrations.aawm_passthrough_shape_capture import (
 )
 
 _capture_passthrough_error_shape = capture_passthrough_shape
+from litellm.llms.xai.route_descriptors import (
+    GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+    GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+    XAI_OAUTH_CREDENTIAL_FAMILY,
+    XAI_OAUTH_ROUTE_FAMILY,
+    get_xai_target_route_family,
+    validate_xai_oauth_api_target,
+)
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.llms.custom_httpx.http_handler import get_async_httpx_client
@@ -148,6 +157,18 @@ from .aawm_adapter_runtime.repetitive_output import (
     maybe_reject_passthrough_responses_body,
     maybe_wrap_passthrough_responses_stream,
 )
+from .aawm_adapter_runtime.openai_responses_wire import (
+    OpenAIResponsesBufferedResponse,
+    OpenAIResponsesStreamingResponse,
+    OpenAIResponsesWireDisposition,
+    OpenAIResponsesWireState,
+    OpenAIResponsesWireTrace,
+    bind_openai_responses_wire_trace_to_request,
+    wrap_openai_responses_stream,
+)
+from .aawm_adapter_runtime.openai_responses_body import (
+    get_bound_openai_responses_wire_body,
+)
 from .aawm_text_watermark.config import load_text_watermark_config
 from .aawm_text_watermark.response_hooks import (
     maybe_apply_passthrough_watermark_response,
@@ -187,6 +208,7 @@ from .aawm_adapter_runtime.provider_call_ledger import (
     get_request_provider_call_ledger,
     get_request_provider_call_ledger_snapshot,
     publish_reservation_metadata,
+    publish_wire_commitment_snapshot,
     record_transport_connection_attempt,
     register_active_upstream_response,
     clear_active_upstream_response,
@@ -235,6 +257,19 @@ _AAWM_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS = (
 )
 _DEFAULT_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS = 600.0
 _AAWM_PASSTHROUGH_STREAM_TIMEOUT_DEFAULT_SOURCE = "compatibility_default"
+_MANAGED_XAI_OAUTH_BLOCKED_PASSTHROUGH_HEADERS = (
+    "authorization",
+    "api-key",
+    "x-api-key",
+)
+
+
+def _is_xai_egress_credential_family(value: Optional[str]) -> bool:
+    return str(value or "").strip().casefold() in {
+        "xai",
+        XAI_OAUTH_CREDENTIAL_FAMILY,
+        GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+    }
 
 
 @dataclass(frozen=True)
@@ -296,15 +331,27 @@ def _is_openai_responses_function_name_target(
     url: httpx.URL,
     custom_llm_provider: Optional[str],
 ) -> bool:
+    path = str(url.path or "").lower().rstrip("/")
+    if not (
+        path == "responses"
+        or path.endswith("/responses")
+        or "/responses/" in path
+    ):
+        return False
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+        is_openai_responses_egress,
+    )
+
     provider = (
         custom_llm_provider.value
         if isinstance(custom_llm_provider, litellm.LlmProviders)
         else custom_llm_provider
     )
-    if str(provider or "").lower() != litellm.LlmProviders.OPENAI.value:
-        return False
-    path = str(url.path or "").lower().rstrip("/")
-    return path.endswith("/responses") or "/responses/" in path
+    return is_openai_responses_egress(
+        custom_llm_provider=provider,
+        url_path=path,
+        url=url,
+    )
 
 
 def _record_responses_function_name_diagnostics(
@@ -1251,6 +1298,81 @@ def _ensure_passthrough_metadata(kwargs: Optional[dict]) -> Dict[str, Any]:
     return metadata
 
 
+_XAI_OAUTH_SEND_AUTH_SHAPE_FIELDS = (
+    "xai_oauth_send_bearer_authorization_present",
+    "xai_oauth_send_api_key_absent",
+    "xai_oauth_send_x_api_key_absent",
+)
+_XAI_OAUTH_SEND_AUTH_SHAPE_STATE_FIELD = "_aawm_xai_oauth_send_auth_shape"
+
+
+def _record_xai_oauth_send_auth_shape(
+    *,
+    request: Request,
+    prepared_request: httpx.Request,
+    managed_xai_oauth_request: bool,
+) -> dict[str, bool]:
+    """Record only the managed xAI outbound authentication header shape."""
+    if not managed_xai_oauth_request:
+        return {}
+
+    authorization = prepared_request.headers.get("authorization")
+    bearer_authorization_present = (
+        isinstance(authorization, str)
+        and authorization.strip().lower().startswith("bearer ")
+        and bool(authorization.strip()[len("bearer ") :].strip())
+    )
+    header_names = {str(key).lower() for key in prepared_request.headers}
+    observation = {
+        "xai_oauth_send_bearer_authorization_present": (
+            bearer_authorization_present
+        ),
+        "xai_oauth_send_api_key_absent": "api-key" not in header_names,
+        "xai_oauth_send_x_api_key_absent": "x-api-key" not in header_names,
+    }
+
+    request_state = getattr(request, "state", None)
+    if request_state is not None:
+        setattr(
+            request_state,
+            _XAI_OAUTH_SEND_AUTH_SHAPE_STATE_FIELD,
+            dict(observation),
+        )
+
+    verbose_proxy_logger.info(
+        "Managed xAI OAuth actual-send auth shape: "
+        "bearer_authorization_present=%s api_key_absent=%s x_api_key_absent=%s",
+        observation["xai_oauth_send_bearer_authorization_present"],
+        observation["xai_oauth_send_api_key_absent"],
+        observation["xai_oauth_send_x_api_key_absent"],
+    )
+    return observation
+
+
+def _xai_oauth_send_auth_shape_metadata(
+    request: Request,
+) -> dict[str, bool]:
+    request_state = getattr(request, "state", None)
+    observation = (
+        getattr(request_state, _XAI_OAUTH_SEND_AUTH_SHAPE_STATE_FIELD, None)
+        if request_state is not None
+        else None
+    )
+    if not isinstance(observation, dict):
+        return {}
+    return {
+        key: observation[key]
+        for key in _XAI_OAUTH_SEND_AUTH_SHAPE_FIELDS
+        if isinstance(observation.get(key), bool)
+    }
+
+
+def _clear_xai_oauth_send_auth_shape(request: Request) -> None:
+    request_state = getattr(request, "state", None)
+    if request_state is not None:
+        setattr(request_state, _XAI_OAUTH_SEND_AUTH_SHAPE_STATE_FIELD, None)
+
+
 def _watermark_endpoint_from_path(*parts: Any) -> str:
     combined = " ".join(
         str(part or "") for part in parts if part is not None
@@ -1272,6 +1394,165 @@ def _get_runtime_text_watermark_config() -> Any:
     except Exception:
         payload = None
     return load_text_watermark_config(payload)
+
+
+async def _consume_native_responses_stream_prefix(
+    source: Any,
+) -> List[Any]:
+    """Read one wrapped chunk so pre-header policy failures can surface."""
+
+    consumed_chunks: List[Any] = []
+    try:
+        consumed_chunks.append(await source.__anext__())
+    except StopAsyncIteration:
+        pass
+    return consumed_chunks
+
+
+class _PrefixedNativeResponsesAsyncIterator:
+    """Replay prefetched chunks while retaining source cleanup ownership."""
+
+    def __init__(self, source: Any, consumed_chunks: List[Any]) -> None:
+        self._source = source
+        self._consumed_chunks = list(consumed_chunks)
+        self._consumed_index = 0
+        self._closed = False
+
+    def __aiter__(self) -> "_PrefixedNativeResponsesAsyncIterator":
+        return self
+
+    def prepend(self, consumed_chunks: List[Any]) -> None:
+        if not consumed_chunks:
+            return
+        remaining = self._consumed_chunks[self._consumed_index :]
+        self._consumed_chunks = list(consumed_chunks) + remaining
+        self._consumed_index = 0
+
+    async def __anext__(self) -> Any:
+        if self._consumed_index < len(self._consumed_chunks):
+            chunk = self._consumed_chunks[self._consumed_index]
+            self._consumed_index += 1
+            return chunk
+        return await self._source.__anext__()
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        close = getattr(self._source, "aclose", None)
+        if callable(close):
+            await close()
+
+
+def _replay_native_responses_stream_prefix(
+    source: Any,
+    consumed_chunks: List[Any],
+) -> AsyncIterator[Any]:
+    return _PrefixedNativeResponsesAsyncIterator(source, consumed_chunks)
+
+
+def _build_native_responses_wrapper_failure_body(
+    *,
+    wire_trace: OpenAIResponsesWireTrace,
+    wrapper_setup_failure: BaseException,
+) -> Tuple[bytes, int]:
+    """Build one failed terminal while retaining marked policy causes."""
+
+    policy_failure_recorded = wire_trace.record_policy_failure_from_exception(
+        wrapper_setup_failure
+    )
+    failure_metadata = {
+        key: wire_trace.metadata.get(key)
+        for key in (
+            "policy_failure_kind",
+            "policy_failure_code",
+            "policy_failure_class",
+        )
+        if wire_trace.metadata.get(key) is not None
+    }
+    failure_code = (
+        failure_metadata.get("policy_failure_code")
+        or "aawm_stream_wrapper_setup_failed"
+    )
+    failure_type = (
+        failure_metadata.get("policy_failure_class")
+        or failure_metadata.get("policy_failure_kind")
+        or type(wrapper_setup_failure).__name__
+    )
+    failure_message = (
+        (
+            "OpenAI Responses output policy rejected the "
+            f"delivered stream: {failure_code}"
+        )
+        if policy_failure_recorded
+        else str(wrapper_setup_failure)
+    )
+    terminal_payload = {
+        "type": "response.failed",
+        "response": {
+            "object": "response",
+            "status": "failed",
+            "error": {
+                "type": failure_type,
+                "code": failure_code,
+                "message": failure_message,
+                "param": None,
+            },
+            "metadata": failure_metadata,
+        },
+    }
+    wire_trace.terminal_event_type = "response.failed"
+    wire_trace.terminal_selected = True
+    wire_trace.disposition = OpenAIResponsesWireDisposition.FAILED
+    wire_trace.state = OpenAIResponsesWireState.TERMINAL_SELECTED
+    wire_trace._done_body = b"data: [DONE]\n\n"
+    wire_trace.metadata["aawm_stream_wrapper_setup_failed"] = type(
+        wrapper_setup_failure
+    ).__name__
+    status_code = status.HTTP_502_BAD_GATEWAY
+    if policy_failure_recorded:
+        marked_status_code = getattr(wrapper_setup_failure, "status_code", None)
+        if isinstance(marked_status_code, int) and 100 <= marked_status_code <= 599:
+            status_code = marked_status_code
+    return (
+        b"event: response.failed\ndata: "
+        + json.dumps(terminal_payload, separators=(",", ":")).encode("utf-8")
+        + b"\n\ndata: [DONE]\n\n",
+        status_code,
+    )
+
+
+def _is_passthrough_output_policy_exception(exc: BaseException) -> bool:
+    marker = getattr(exc, "_aawm_policy_failure", None)
+    if isinstance(marker, dict):
+        return True
+    detail = getattr(exc, "detail", None)
+    if not isinstance(detail, dict):
+        return False
+    metadata = detail.get("metadata")
+    if isinstance(metadata, dict) and (
+        metadata.get("failure_kind")
+        or metadata.get("policy_failure_kind")
+        or metadata.get("policy_failure_code")
+    ):
+        return True
+    error = detail.get("error")
+    return isinstance(error, dict) and str(
+        error.get("code") or ""
+    ).startswith("aawm_")
+
+
+def _serialize_passthrough_policy_exception(exc: BaseException) -> bytes:
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, (dict, list)):
+        payload: Any = detail
+    else:
+        payload = {"error": {"message": str(detail or exc)}}
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _set_passthrough_stream_timeout_metadata(
@@ -3625,6 +3906,48 @@ async def chat_completion_pass_through_endpoint(  # noqa: PLR0915
 
 class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
     @staticmethod
+    def _is_managed_xai_oauth_egress(
+        credential_family: Optional[str],
+    ) -> bool:
+        return (
+            str(credential_family or "").strip().casefold()
+            == XAI_OAUTH_CREDENTIAL_FAMILY
+        )
+
+    @staticmethod
+    def _is_exact_xai_egress_credential_family(
+        credential_family: Optional[str],
+    ) -> bool:
+        return str(credential_family or "").strip().casefold() in {
+            XAI_OAUTH_CREDENTIAL_FAMILY,
+            GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+        }
+
+    @staticmethod
+    def _sanitize_egress_guard_target(url: Union[str, httpx.URL]) -> str:
+        try:
+            parsed_url = urlparse(str(url))
+            hostname = parsed_url.hostname
+            path = parsed_url.path or "/"
+        except (TypeError, ValueError):
+            return "unknown-target"
+        if not hostname:
+            return "unknown-target"
+        return f"{hostname}{path}"
+
+    @staticmethod
+    def _sanitize_egress_guard_detail(
+        detail: str,
+        *,
+        url: Union[str, httpx.URL],
+        safe_target: str,
+    ) -> str:
+        raw_target = str(url)
+        if raw_target and raw_target in detail:
+            return detail.replace(raw_target, safe_target)
+        return detail
+
+    @staticmethod
     def _raise_egress_guard_block(
         *,
         detail: str,
@@ -3633,22 +3956,30 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         target_family: Optional[str],
         marker_families: Optional[set[str]] = None,
     ) -> None:
+        safe_target = HttpPassThroughEndpointHelpers._sanitize_egress_guard_target(
+            url
+        )
+        safe_detail = HttpPassThroughEndpointHelpers._sanitize_egress_guard_detail(
+            detail,
+            url=url,
+            safe_target=safe_target,
+        )
         alert_state = trigger_egress_guard_alert(
-            reason=detail,
-            target=str(url),
+            reason=safe_detail,
+            target=safe_target,
             credential_family=credential_family,
             target_family=target_family,
         )
         verbose_proxy_logger.critical(
             "Egress guard blocked passthrough request: detail=%s target=%s credential_family=%s target_family=%s marker_families=%s trigger_count=%s",
-            detail,
-            str(url),
+            safe_detail,
+            safe_target,
             credential_family,
             target_family,
             sorted(marker_families) if marker_families else [],
             alert_state.get("trigger_count"),
         )
-        raise HTTPException(status_code=500, detail=detail)
+        raise HTTPException(status_code=500, detail=safe_detail)
 
     @staticmethod
     def get_target_provider_family(url: Union[str, httpx.URL]) -> str:
@@ -3748,26 +4079,112 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         credential_family: Optional[str] = None,
         expected_target_family: Optional[str] = None,
     ) -> None:
+        normalized_credential_family = str(
+            credential_family or ""
+        ).strip().casefold()
+        xai_target_route_family = get_xai_target_route_family(url)
+        managed_xai_oauth_egress = (
+            HttpPassThroughEndpointHelpers._is_managed_xai_oauth_egress(
+                credential_family
+            )
+        )
+        if managed_xai_oauth_egress:
+            try:
+                validate_xai_oauth_api_target(url)
+            except ValueError as exc:
+                HttpPassThroughEndpointHelpers._raise_egress_guard_block(
+                    detail=f"Blocked managed xAI OAuth egress: {exc}",
+                    url=url,
+                    credential_family=credential_family,
+                    target_family=(
+                        xai_target_route_family
+                        or HttpPassThroughEndpointHelpers.get_target_provider_family(
+                            url
+                        )
+                    ),
+                )
+
         target_family = HttpPassThroughEndpointHelpers.get_target_provider_family(url)
+        telemetry_target_family = (
+            xai_target_route_family or target_family
+        )
+        exact_xai_expected_family = expected_target_family in {
+            XAI_OAUTH_ROUTE_FAMILY,
+            GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+        }
+        exact_xai_credential_family = (
+            HttpPassThroughEndpointHelpers._is_exact_xai_egress_credential_family(
+                credential_family
+            )
+        )
+        if exact_xai_expected_family or exact_xai_credential_family:
+            try:
+                url_scheme = urlparse(str(url)).scheme.casefold()
+            except ValueError:
+                url_scheme = ""
+            if url_scheme != "https":
+                HttpPassThroughEndpointHelpers._raise_egress_guard_block(
+                    detail="Blocked exact xAI egress: HTTPS is required.",
+                    url=url,
+                    credential_family=credential_family,
+                    target_family=telemetry_target_family,
+                )
         if (
             expected_target_family is not None
-            and target_family != "generic"
-            and target_family != expected_target_family
+            and (
+                (
+                    exact_xai_expected_family
+                    and (
+                        (
+                            xai_target_route_family is not None
+                            and xai_target_route_family != expected_target_family
+                        )
+                        or (
+                            xai_target_route_family is None
+                            and target_family != "generic"
+                        )
+                    )
+                )
+                or (
+                    not exact_xai_expected_family
+                    and target_family != "generic"
+                    and target_family != expected_target_family
+                )
+            )
         ):
             HttpPassThroughEndpointHelpers._raise_egress_guard_block(
                 detail=(
                     f"Blocked passthrough egress: expected target family "
-                    f"{expected_target_family}, got {target_family}."
+                    f"{expected_target_family}, got {telemetry_target_family}."
                 ),
                 url=url,
                 credential_family=credential_family,
-                target_family=target_family,
+                target_family=telemetry_target_family,
             )
 
+        if normalized_credential_family == GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY and (
+            xai_target_route_family == XAI_OAUTH_ROUTE_FAMILY
+        ):
+            HttpPassThroughEndpointHelpers._raise_egress_guard_block(
+                detail=(
+                    "Blocked native Grok OIDC egress: managed xAI OAuth "
+                    "API target is not an allowed native target."
+                ),
+                url=url,
+                credential_family=credential_family,
+                target_family=telemetry_target_family,
+            )
+
+        credential_target_family = (
+            "xai"
+            if _is_xai_egress_credential_family(credential_family)
+            else credential_family
+        )
         if (
-            credential_family is not None
+            credential_target_family is not None
+            and not exact_xai_credential_family
             and target_family != "generic"
-            and target_family != credential_family
+            and target_family != credential_target_family
         ):
             HttpPassThroughEndpointHelpers._raise_egress_guard_block(
                 detail=(
@@ -3799,6 +4216,58 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 target_family=target_family,
                 marker_families=cross_provider_markers,
             )
+
+    @staticmethod
+    def validate_prepared_request_egress(
+        *,
+        prepared_request: httpx.Request,
+        credential_family: Optional[str],
+        expected_target_family: Optional[str],
+    ) -> None:
+        """Validate the exact URL and headers that httpx is about to send."""
+
+        HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+            url=prepared_request.url,
+            headers=dict(prepared_request.headers),
+            credential_family=credential_family,
+            expected_target_family=expected_target_family,
+        )
+
+    @staticmethod
+    async def reject_managed_xai_redirect_response(
+        *,
+        response: httpx.Response,
+        url: Union[str, httpx.URL],
+        credential_family: Optional[str],
+        expected_target_family: Optional[str],
+    ) -> None:
+        """Reject 3xx responses before any credential-bearing follow-up."""
+        if not (
+            HttpPassThroughEndpointHelpers._is_managed_xai_oauth_egress(
+                credential_family
+            )
+            and 300 <= response.status_code < 400
+        ):
+            return
+        try:
+            await response.aclose()
+        except Exception:  # noqa: BLE001
+            verbose_proxy_logger.debug(
+                "Failed to close rejected managed xAI redirect response",
+                exc_info=True,
+            )
+        HttpPassThroughEndpointHelpers._raise_egress_guard_block(
+            detail=(
+                "Blocked managed xAI OAuth redirect response before "
+                "follow-up request."
+            ),
+            url=url,
+            credential_family=credential_family,
+            target_family=(
+                expected_target_family
+                or HttpPassThroughEndpointHelpers.get_target_provider_family(url)
+            ),
+        )
 
     @staticmethod
     def get_masked_passthrough_headers(headers: Optional[dict]) -> dict:
@@ -3956,6 +4425,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         headers: dict,
         requested_query_params: Optional[dict] = None,
         custom_body: Optional[dict] = None,
+        follow_redirects: Optional[bool] = None,
+        validate_request_fn: Optional[Callable[[httpx.Request], None]] = None,
         send_request_fn: Optional[
             Callable[[httpx.Request, bool], Awaitable[httpx.Response]]
         ] = None,
@@ -3975,12 +4446,28 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 )
                 response = await send_request_fn(req, False)
             else:
-                response = await async_client.request(
-                    method=request.method,
-                    url=url,
-                    headers=headers,
-                    params=requested_query_params,
-                )
+                if validate_request_fn is not None:
+                    req = async_client.build_request(
+                        method=request.method,
+                        url=url,
+                        headers=headers,
+                        params=requested_query_params,
+                    )
+                    validate_request_fn(req)
+                    send_kwargs: dict[str, Any] = {"stream": False}
+                    if follow_redirects is not None:
+                        send_kwargs["follow_redirects"] = follow_redirects
+                    response = await async_client.send(req, **send_kwargs)
+                else:
+                    request_kwargs: dict[str, Any] = {
+                        "method": request.method,
+                        "url": url,
+                        "headers": headers,
+                        "params": requested_query_params,
+                    }
+                    if follow_redirects is not None:
+                        request_kwargs["follow_redirects"] = follow_redirects
+                    response = await async_client.request(**request_kwargs)
         else:
             json_headers, _removed_content_type = _headers_for_json_passthrough_egress(
                 headers
@@ -3995,17 +4482,34 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 )
                 response = await send_request_fn(req, False)
             else:
-                response = await async_client.request(
-                    method=request.method,
-                    url=url,
-                    headers=json_headers,
-                    params=requested_query_params,
-                    json=custom_body,
-                )
+                if validate_request_fn is not None:
+                    req = async_client.build_request(
+                        method=request.method,
+                        url=url,
+                        headers=json_headers,
+                        params=requested_query_params,
+                        json=custom_body,
+                    )
+                    validate_request_fn(req)
+                    send_kwargs = {"stream": False}
+                    if follow_redirects is not None:
+                        send_kwargs["follow_redirects"] = follow_redirects
+                    response = await async_client.send(req, **send_kwargs)
+                else:
+                    request_kwargs = {
+                        "method": request.method,
+                        "url": url,
+                        "headers": json_headers,
+                        "params": requested_query_params,
+                        "json": custom_body,
+                    }
+                    if follow_redirects is not None:
+                        request_kwargs["follow_redirects"] = follow_redirects
+                    response = await async_client.request(**request_kwargs)
         return response
 
     @staticmethod
-    async def non_streaming_http_request_handler(
+    async def non_streaming_http_request_handler(  # noqa: PLR0915
         request: Request,
         async_client: httpx.AsyncClient,
         url: httpx.URL,
@@ -4014,6 +4518,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         _parsed_body: Optional[dict] = None,
         raw_body: Optional[bytes] = None,
         prefer_stream_for_unknown_content: bool = False,
+        follow_redirects: Optional[bool] = None,
+        validate_request_fn: Optional[Callable[[httpx.Request], None]] = None,
         send_request_fn: Optional[
             Callable[[httpx.Request, bool], Awaitable[httpx.Response]]
         ] = None,
@@ -4037,12 +4543,28 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 )
                 response = await send_request_fn(req, False)
             else:
-                response = await async_client.request(
-                    method=request.method,
-                    url=url,
-                    headers=headers,
-                    params=requested_query_params,
-                )
+                if validate_request_fn is not None:
+                    req = async_client.build_request(
+                        method=request.method,
+                        url=url,
+                        headers=headers,
+                        params=requested_query_params,
+                    )
+                    validate_request_fn(req)
+                    send_kwargs: dict[str, Any] = {"stream": False}
+                    if follow_redirects is not None:
+                        send_kwargs["follow_redirects"] = follow_redirects
+                    response = await async_client.send(req, **send_kwargs)
+                else:
+                    request_kwargs: dict[str, Any] = {
+                        "method": request.method,
+                        "url": url,
+                        "headers": headers,
+                        "params": requested_query_params,
+                    }
+                    if follow_redirects is not None:
+                        request_kwargs["follow_redirects"] = follow_redirects
+                    response = await async_client.request(**request_kwargs)
         elif raw_body is not None:
             if send_request_fn is not None:
                 req = async_client.build_request(
@@ -4064,15 +4586,37 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                     params=requested_query_params,
                     content=raw_body,
                 )
-                response = await async_client.send(req, stream=True)
+                if validate_request_fn is not None:
+                    validate_request_fn(req)
+                send_kwargs: dict[str, Any] = {"stream": True}
+                if follow_redirects is not None:
+                    send_kwargs["follow_redirects"] = follow_redirects
+                response = await async_client.send(req, **send_kwargs)
             else:
-                response = await async_client.request(
-                    method=request.method,
-                    url=url,
-                    headers=headers,
-                    params=requested_query_params,
-                    content=raw_body,
-                )
+                if validate_request_fn is not None:
+                    req = async_client.build_request(
+                        method=request.method,
+                        url=url,
+                        headers=headers,
+                        params=requested_query_params,
+                        content=raw_body,
+                    )
+                    validate_request_fn(req)
+                    send_kwargs = {"stream": False}
+                    if follow_redirects is not None:
+                        send_kwargs["follow_redirects"] = follow_redirects
+                    response = await async_client.send(req, **send_kwargs)
+                else:
+                    request_kwargs = {
+                        "method": request.method,
+                        "url": url,
+                        "headers": headers,
+                        "params": requested_query_params,
+                        "content": raw_body,
+                    }
+                    if follow_redirects is not None:
+                        request_kwargs["follow_redirects"] = follow_redirects
+                    response = await async_client.request(**request_kwargs)
         elif (
             HttpPassThroughEndpointHelpers.is_multipart(request) is True
             and not _parsed_body
@@ -4086,6 +4630,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 headers=headers,
                 requested_query_params=requested_query_params,
                 prefer_stream_for_unknown_content=prefer_stream_for_unknown_content,
+                follow_redirects=follow_redirects,
+                validate_request_fn=validate_request_fn,
                 send_request_fn=send_request_fn,
             )
         else:
@@ -4113,15 +4659,37 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                     params=requested_query_params,
                     json=_parsed_body,
                 )
-                response = await async_client.send(req, stream=True)
+                if validate_request_fn is not None:
+                    validate_request_fn(req)
+                send_kwargs = {"stream": True}
+                if follow_redirects is not None:
+                    send_kwargs["follow_redirects"] = follow_redirects
+                response = await async_client.send(req, **send_kwargs)
             else:
-                response = await async_client.request(
-                    method=request.method,
-                    url=url,
-                    headers=json_headers,
-                    params=requested_query_params,
-                    json=_parsed_body,
-                )
+                if validate_request_fn is not None:
+                    req = async_client.build_request(
+                        method=request.method,
+                        url=url,
+                        headers=json_headers,
+                        params=requested_query_params,
+                        json=_parsed_body,
+                    )
+                    validate_request_fn(req)
+                    send_kwargs = {"stream": False}
+                    if follow_redirects is not None:
+                        send_kwargs["follow_redirects"] = follow_redirects
+                    response = await async_client.send(req, **send_kwargs)
+                else:
+                    request_kwargs = {
+                        "method": request.method,
+                        "url": url,
+                        "headers": json_headers,
+                        "params": requested_query_params,
+                        "json": _parsed_body,
+                    }
+                    if follow_redirects is not None:
+                        request_kwargs["follow_redirects"] = follow_redirects
+                    response = await async_client.request(**request_kwargs)
         return response
 
     @staticmethod
@@ -4145,6 +4713,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         headers: dict,
         requested_query_params: Optional[dict] = None,
         prefer_stream_for_unknown_content: bool = False,
+        follow_redirects: Optional[bool] = None,
+        validate_request_fn: Optional[Callable[[httpx.Request], None]] = None,
         send_request_fn: Optional[
             Callable[[httpx.Request, bool], Awaitable[httpx.Response]]
         ] = None,
@@ -4196,16 +4766,39 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 files=files,
                 data=form_data_dict,
             )
-            return await async_client.send(req, stream=True)
+            if validate_request_fn is not None:
+                validate_request_fn(req)
+            send_kwargs: dict[str, Any] = {"stream": True}
+            if follow_redirects is not None:
+                send_kwargs["follow_redirects"] = follow_redirects
+            return await async_client.send(req, **send_kwargs)
 
-        response = await async_client.request(
-            method=request.method,
-            url=url,
-            headers=headers_copy,
-            params=requested_query_params,
-            files=files,
-            data=form_data_dict,
-        )
+        if validate_request_fn is not None:
+            req = async_client.build_request(
+                method=request.method,
+                url=url,
+                headers=headers_copy,
+                params=requested_query_params,
+                files=files,
+                data=form_data_dict,
+            )
+            validate_request_fn(req)
+            send_kwargs = {"stream": False}
+            if follow_redirects is not None:
+                send_kwargs["follow_redirects"] = follow_redirects
+            response = await async_client.send(req, **send_kwargs)
+        else:
+            request_kwargs: dict[str, Any] = {
+                "method": request.method,
+                "url": url,
+                "headers": headers_copy,
+                "params": requested_query_params,
+                "files": files,
+                "data": form_data_dict,
+            }
+            if follow_redirects is not None:
+                request_kwargs["follow_redirects"] = follow_redirects
+            response = await async_client.request(**request_kwargs)
         return response
 
     @staticmethod
@@ -4216,11 +4809,19 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         logging_obj: LiteLLMLoggingObj,
         _parsed_body: Optional[dict] = None,
         litellm_call_id: Optional[str] = None,
+        compiled_wire_body: Any = None,
     ) -> dict:
         """
         Filter out litellm params from the request body
         """
         _parsed_body = _parsed_body or {}
+        compiled_wire_body = compiled_wire_body or get_bound_openai_responses_wire_body(
+            request,
+            _parsed_body,
+        )
+        compiled_provider_body = getattr(compiled_wire_body, "body", None)
+        if not isinstance(compiled_provider_body, dict):
+            compiled_provider_body = None
         # all_litellm_params / get_end_user_id_from_request_body: module-scope (RR-056 #8).
         working_body, _provider_body = _detach_passthrough_body_for_kwargs(_parsed_body)
 
@@ -4291,8 +4892,13 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 "proxy_server_request": {
                     "url": str(request.url),
                     "method": request.method,
-                    "body": _shallow_copy_request_dict(working_body),
+                    "body": (
+                        compiled_provider_body
+                        if compiled_provider_body is not None
+                        else _shallow_copy_request_dict(working_body)
+                    ),
                     "headers": request_headers or {},
+                    "_request": request,
                 },
             },
             "call_type": "pass_through_endpoint",
@@ -4421,21 +5027,8 @@ def _aawm_apply_openai_encrypted_reasoning_pre_send(
         guard_openai_encrypted_reasoning_egress,
         is_openai_responses_egress,
         merge_encrypted_reasoning_disposition_into_request_body,
-        should_strip_encrypted_function_output_without_plaintext,
         strip_route_identity_from_request_body,
     )
-
-    def _strip_identity_in_place(body: Optional[dict]) -> None:
-        if not isinstance(body, dict):
-            return
-        stripped = strip_route_identity_from_request_body(body)
-        if stripped is body or not isinstance(stripped, dict):
-            return
-        body.clear()
-        body.update(stripped)
-
-    _strip_identity_in_place(parsed_body)
-    _strip_identity_in_place(provider_bound_body)
 
     path = str(getattr(url, "path", "") or "")
     if not is_openai_responses_egress(
@@ -4445,6 +5038,16 @@ def _aawm_apply_openai_encrypted_reasoning_pre_send(
         url_path=path,
         url=url,
     ):
+        # OpenAI compilation owns its cleanup; direct routes still need the
+        # protocol-owned identity sidecars removed without traversing user data.
+        for body in (parsed_body, provider_bound_body):
+            if not isinstance(body, dict):
+                continue
+            stripped = strip_route_identity_from_request_body(
+                body, protocol_owned_only=True
+            )
+            body.clear()
+            body.update(stripped)
         return
 
     # Final serialized JSON for both stream and non-stream send paths.
@@ -4461,35 +5064,42 @@ def _aawm_apply_openai_encrypted_reasoning_pre_send(
     session_identity = sa.resolve_canonical_session_identity(
         request, identity_source
     )
-    try:
-        prepared, disposition = guard_openai_encrypted_reasoning_egress(
-            send_body,
-            session_identity=session_identity,
-            target_provider="openai",
-            target_route_family=egress_credential_family or expected_target_family,
-            failure_phase="encrypted_reasoning_openai_pre_send",
-            strip_function_output_ciphertext_without_plaintext=(
-                should_strip_encrypted_function_output_without_plaintext(
-                    url=url,
-                    egress_credential_family=egress_credential_family,
-                    custom_llm_provider=custom_llm_provider,
-                    request_body=identity_source,
-                )
-            ),
-        )
-    except HTTPException as exc:
-        _emit_openai_encrypted_reasoning_redispatch_terminal_error(
-            exc,
-            marker=getattr(request, "state", None),
-            correlation_id=session_identity,
-        )
-        raise
+
+    compiled_wire_body = get_bound_openai_responses_wire_body(
+        request, send_body
+    )
+    if compiled_wire_body is not None:
+        # The canonical compiler already ran this gate on the exact body that
+        # will be serialized. Keep this transport hook as the final gate, but
+        # reuse its immutable disposition instead of applying the guard twice.
+        prepared = send_body
+        disposition = dict(compiled_wire_body.encrypted_reasoning_disposition)
+    else:
+        try:
+            prepared, disposition = guard_openai_encrypted_reasoning_egress(
+                send_body,
+                session_identity=session_identity,
+                target_provider="openai",
+                target_route_family=egress_credential_family or expected_target_family,
+                failure_phase="encrypted_reasoning_openai_pre_send",
+            )
+        except HTTPException as exc:
+            _emit_openai_encrypted_reasoning_redispatch_terminal_error(
+                exc,
+                marker=getattr(request, "state", None),
+                correlation_id=session_identity,
+            )
+            raise
 
     # Synchronize the prepared body into the live send body used by httpx.
     # ``prepare`` returns a new dict when items change; a top-level shallow
     # provider_bound_body copy would otherwise keep the original input list
     # (and shared item dicts) including function_call_output ciphertext.
-    if isinstance(prepared, dict) and isinstance(send_body, dict):
+    if (
+        compiled_wire_body is None
+        and isinstance(prepared, dict)
+        and isinstance(send_body, dict)
+    ):
         for key, value in prepared.items():
             if key == "litellm_metadata":
                 continue
@@ -4505,7 +5115,7 @@ def _aawm_apply_openai_encrypted_reasoning_pre_send(
 
     # Disposition/observability only — do not reintroduce litellm_metadata onto
     # the stripped provider-bound send body.
-    if isinstance(parsed_body, dict):
+    if isinstance(parsed_body, dict) and compiled_wire_body is None:
         merged = merge_encrypted_reasoning_disposition_into_request_body(
             parsed_body, disposition
         )
@@ -4585,7 +5195,7 @@ async def _aawm_session_owner_pre_send_guard(
         lease = sa.get_request_session_owner_lease(request)
         if lease is not None and lease.held_reservation and not lease.promoted:
             if (
-                (egress_credential_family or "").casefold() == "xai"
+                _is_xai_egress_credential_family(egress_credential_family)
                 and not defer_session_owner_promotion
             ):
                 sa.raise_session_owner_redispatch_required(
@@ -4677,6 +5287,19 @@ async def _aawm_session_owner_on_upstream_result(
     if defer_session_owner_promotion:
         return
     sa = _session_affinity_mod()
+    if not success:
+        state = getattr(request, "state", None)
+        if state is not None:
+            try:
+                # A failed candidate must not leave its staged legacy affinity
+                # attached to a later candidate in the same alias request.
+                setattr(
+                    state,
+                    "_aawm_native_openai_responses_affinity_commitment",
+                    None,
+                )
+            except Exception:
+                pass
     if success:
         await sa.finalize_request_session_owner_lease(
             request,
@@ -4689,6 +5312,210 @@ async def _aawm_session_owner_on_upstream_result(
             exc=RuntimeError("upstream_failed"),
             failure_phase="session_owner_pass_through_release",
         )
+
+
+# Keep ownership and legacy-affinity finalization ordered at the wire boundary.
+async def _finalize_native_openai_responses_owner_wire_disposition(  # noqa: PLR0915
+    *,
+    request: Request,
+    disposition: OpenAIResponsesWireDisposition,
+    trace: Optional[OpenAIResponsesWireTrace] = None,
+) -> None:
+    """Finalize native OpenAI ownership without failing delivered output."""
+
+    sa = _session_affinity_mod()
+    result = None
+    owner_finalized = disposition is not OpenAIResponsesWireDisposition.COMPLETED
+    if trace is None:
+        state = getattr(request, "state", None)
+        if state is not None:
+            try:
+                commitment = {
+                    "commitment": "done",
+                    "disposition": disposition.value,
+                    "terminal_wire_committed": True,
+                    "done_wire_committed": True,
+                    "finalized": False,
+                }
+                setattr(
+                    state,
+                    "_aawm_openai_responses_wire_commitment",
+                    commitment,
+                )
+                publish_wire_commitment_snapshot(
+                    request,
+                    commitment=commitment,
+                )
+            except Exception:
+                pass
+    try:
+        lease = sa.get_request_session_owner_lease(request)
+        result = await sa.finalize_session_owner_lease_on_wire_disposition(
+            request,
+            disposition=disposition.value,
+        )
+        outcome = getattr(getattr(result, "outcome", None), "value", None)
+        if trace is not None:
+            trace.metadata["session_owner_wire_disposition"] = disposition.value
+            if outcome is not None:
+                trace.metadata["session_owner_wire_outcome"] = outcome
+
+        expected_outcomes = (
+            {"promoted", "already_owned"}
+            if disposition is OpenAIResponsesWireDisposition.COMPLETED
+            else {"released", "not_held", "already_owned"}
+        )
+        owner_finalized = (
+            disposition is not OpenAIResponsesWireDisposition.COMPLETED
+            or (
+                result is not None
+                and outcome in expected_outcomes
+            )
+        )
+        if (
+            disposition is OpenAIResponsesWireDisposition.COMPLETED
+            and result is None
+            and (
+                lease is None
+                or getattr(lease, "promoted", False)
+                or (
+                    not getattr(lease, "held_reservation", False)
+                    and getattr(lease, "decision", None)
+                    == sa.SessionOwnerGuardDecision.COMPATIBLE_OWNER.value
+                )
+            )
+        ):
+            # Compatible durable owners intentionally have no request-local
+            # reservation to promote. Treat that no-op as an established owner
+            # so legacy affinity is not discarded as a false finalization error.
+            owner_finalized = True
+        if result is not None and outcome not in expected_outcomes:
+            verbose_proxy_logger.warning(
+                "Native OpenAI Responses owner finalization returned outcome=%s "
+                "for disposition=%s; releasing reservation",
+                outcome,
+                disposition.value,
+            )
+            lease = sa.get_request_session_owner_lease(request)
+            fallback = await sa.finalize_session_owner_lease_on_failure(lease)
+            fallback_outcome = getattr(
+                getattr(fallback, "outcome", None),
+                "value",
+                None,
+            )
+            if trace is not None and fallback_outcome is not None:
+                trace.metadata["session_owner_wire_fallback_outcome"] = (
+                    fallback_outcome
+                )
+            owner_finalized = False
+        await _finalize_native_openai_responses_legacy_affinity(
+            request=request,
+            disposition=disposition,
+            trace=trace,
+            owner_finalized=owner_finalized,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if trace is not None:
+            trace.metadata["session_owner_wire_callback_error"] = type(exc).__name__
+        verbose_proxy_logger.exception(
+            "Native OpenAI Responses owner finalization failed after wire "
+            "disposition=%s; releasing reservation",
+            disposition.value,
+        )
+        try:
+            lease = sa.get_request_session_owner_lease(request)
+            fallback = await sa.finalize_session_owner_lease_on_failure(lease)
+            fallback_outcome = getattr(
+                getattr(fallback, "outcome", None),
+                "value",
+                None,
+            )
+            if trace is not None and fallback_outcome is not None:
+                trace.metadata["session_owner_wire_fallback_outcome"] = (
+                    fallback_outcome
+                )
+        except Exception as fallback_exc:  # noqa: BLE001
+            if trace is not None:
+                trace.metadata["session_owner_wire_release_error"] = type(
+                    fallback_exc
+                ).__name__
+            verbose_proxy_logger.exception(
+                "Native OpenAI Responses owner release failed after "
+                "wire-finalization error"
+            )
+        await _finalize_native_openai_responses_legacy_affinity(
+            request=request,
+            disposition=disposition,
+            trace=trace,
+            owner_finalized=False,
+        )
+    if trace is None:
+        state = getattr(request, "state", None)
+        commitment = getattr(
+            state,
+            "_aawm_openai_responses_wire_commitment",
+            None,
+        )
+        if isinstance(commitment, dict):
+            commitment["finalized"] = True
+            try:
+                setattr(
+                    state,
+                    "_aawm_openai_responses_wire_commitment",
+                    commitment,
+                )
+                publish_wire_commitment_snapshot(
+                    request,
+                    commitment=commitment,
+                )
+            except Exception:
+                pass
+
+
+async def _finalize_native_openai_responses_legacy_affinity(
+    *,
+    request: Request,
+    disposition: OpenAIResponsesWireDisposition,
+    trace: Optional[OpenAIResponsesWireTrace],
+    owner_finalized: bool,
+) -> None:
+    """Commit staged legacy alias affinity only after completed wire output."""
+
+    state = getattr(request, "state", None)
+    pending = getattr(
+        state,
+        "_aawm_native_openai_responses_affinity_commitment",
+        None,
+    )
+    if not isinstance(pending, dict):
+        return
+    try:
+        if (
+            disposition is OpenAIResponsesWireDisposition.COMPLETED
+            and owner_finalized
+            and callable(pending.get("setter"))
+        ):
+            await pending["setter"](
+                pending.get("session_key"),
+                pending.get("candidate") or {},
+            )
+            if trace is not None:
+                trace.metadata["legacy_affinity_wire_commitment"] = "committed"
+        elif trace is not None:
+            trace.metadata["legacy_affinity_wire_commitment"] = "discarded"
+    except Exception as exc:  # noqa: BLE001
+        if trace is not None:
+            trace.metadata["legacy_affinity_wire_commitment_error"] = type(
+                exc
+            ).__name__
+        verbose_proxy_logger.exception(
+            "Native OpenAI Responses legacy affinity finalization failed"
+        )
+    finally:
+        try:
+            setattr(state, "_aawm_native_openai_responses_affinity_commitment", None)
+        except Exception:
+            pass
 
 
 async def _aawm_run_with_session_owner_lease_renewal(
@@ -4780,6 +5607,7 @@ async def pass_through_request(  # noqa: PLR0915
     guardrails_config: Optional[dict] = None,
     egress_credential_family: Optional[str] = None,
     expected_target_family: Optional[str] = None,
+    managed_xai_oauth_request: bool = False,
     allowed_forward_headers: Optional[list[str]] = None,
     allowed_pass_through_prefixed_headers: Optional[list[str]] = None,
     blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
@@ -4788,6 +5616,7 @@ async def pass_through_request(  # noqa: PLR0915
     defer_session_owner_promotion: bool = False,
     raw_body_passthrough: bool = False,
     passthrough_logging_metadata: Optional[dict[str, Any]] = None,
+    responses_wire_owned: bool = False,
 ):
     """
     Pass through endpoint handler, makes the httpx request for pass-through endpoints and ensures logging hooks are called
@@ -4808,12 +5637,15 @@ async def pass_through_request(  # noqa: PLR0915
         guardrails_config: Optional field - guardrails configuration for passthrough endpoint
         egress_credential_family: Optional provider family for sensitive local/client credentials
         expected_target_family: Optional provider family expected for the final egress target
+        managed_xai_oauth_request: Whether the route owner resolved a managed xAI OAuth request.
         retryable_upstream_status_codes: Optional upstream status codes that will be retried by the
             caller, so generic passthrough failure logging should be deferred to the adapter layer
         caller_managed_hidden_retry: When true, disables shared pre-first-byte hidden retries so
             adapter/candidate-rotation callers do not double-retry upstream failures
         defer_session_owner_promotion: When true, the caller owns lease
             promotion after validating the complete candidate response.
+        responses_wire_owned: Mark an xAI Responses stream for the shared
+            final-wire lifecycle coordinator owned by the caller.
         raw_body_passthrough: Forward the original request body as bytes while
             using a small synthetic body for logging. This is intended for
             native binary/protobuf side-channel endpoints.
@@ -4843,6 +5675,8 @@ async def pass_through_request(  # noqa: PLR0915
     error_log_context: Optional[Dict[str, Any]] = None
     raw_body: Optional[bytes] = None
     responses_function_name_rewrite: Optional[ResponsesFunctionNameRewrite] = None
+    compiled_wire_body: Any = None
+    client_metadata: Optional[dict[str, Any]] = None
     _transfer_identity: Optional[dict[str, Any]] = None
     deferred_success_holder = (
         DeferredPassthroughSuccess()
@@ -4908,6 +5742,7 @@ async def pass_through_request(  # noqa: PLR0915
     #########################################################
     try:
         start_time = datetime.now()
+        _clear_xai_oauth_send_auth_shape(request)
         # Register before session-owner 409 / candidate selection so native
         # uvicorn ACCESS on /openai_passthrough/responses is replaced even
         # when the request never reaches emit_aawm_route_access_log.
@@ -4917,13 +5752,47 @@ async def pass_through_request(  # noqa: PLR0915
         ):
             register_aawm_route_rollup_access_log_replacement(request)
         url = httpx.URL(target)
+        managed_xai_oauth_egress = (
+            HttpPassThroughEndpointHelpers._is_managed_xai_oauth_egress(
+                egress_credential_family
+            )
+        )
+        managed_xai_oauth_request = (
+            managed_xai_oauth_request or managed_xai_oauth_egress
+        )
+        validate_prepared_request_fn: Optional[
+            Callable[[httpx.Request], None]
+        ] = None
+        if (
+            HttpPassThroughEndpointHelpers._is_exact_xai_egress_credential_family(
+                egress_credential_family
+            )
+            or expected_target_family
+            in {XAI_OAUTH_ROUTE_FAMILY, GROK_NATIVE_OAUTH_ROUTE_FAMILY}
+        ):
+
+            def _validate_prepared_request(prepared_request: httpx.Request) -> None:
+                HttpPassThroughEndpointHelpers.validate_prepared_request_egress(
+                    prepared_request=prepared_request,
+                    credential_family=egress_credential_family,
+                    expected_target_family=expected_target_family,
+                )
+
+            validate_prepared_request_fn = _validate_prepared_request
+        effective_blocked_pass_through_prefixed_headers = list(
+            blocked_pass_through_prefixed_headers or []
+        )
+        if managed_xai_oauth_egress:
+            effective_blocked_pass_through_prefixed_headers.extend(
+                _MANAGED_XAI_OAUTH_BLOCKED_PASSTHROUGH_HEADERS
+            )
         headers = HttpPassThroughEndpointHelpers.forward_headers_from_request(
             request_headers=_safe_get_request_headers(request).copy(),
             headers=headers,
             forward_headers=forward_headers,
             allowed_forward_headers=allowed_forward_headers,
             allowed_pass_through_prefixed_headers=allowed_pass_through_prefixed_headers,
-            blocked_pass_through_prefixed_headers=blocked_pass_through_prefixed_headers,
+            blocked_pass_through_prefixed_headers=effective_blocked_pass_through_prefixed_headers,
         )
 
         # Apply default query parameters if provided, regardless of merge_query_params setting
@@ -4952,15 +5821,51 @@ async def pass_through_request(  # noqa: PLR0915
         endpoint_type: EndpointType = HttpPassThroughEndpointHelpers.get_endpoint_type(
             str(url)
         )
+        is_native_openai_responses_route = (
+            PassThroughStreamingHandler._is_openai_responses_stream(
+                endpoint_type=endpoint_type,
+                url_route=str(url),
+                custom_llm_provider=custom_llm_provider,
+            )
+        )
+        is_xai_responses_wire_owned_route = (
+            responses_wire_owned
+            and PassThroughStreamingHandler._is_xai_responses_route(
+                endpoint_type=endpoint_type,
+                url_route=str(url),
+                custom_llm_provider=custom_llm_provider,
+            )
+        )
+        if is_native_openai_responses_route:
+            # Native success consumers run only from the delivered wire snapshot.
+            deferred_success_holder = None
 
         # Skip body parsing for multipart requests - make_multipart_http_request will handle it
         # But if custom_body is provided (e.g., JSON parsed despite multipart content-type), use it
         is_multipart = (
-            HttpPassThroughEndpointHelpers.is_multipart(request) and not custom_body
+            HttpPassThroughEndpointHelpers.is_multipart(request)
+            and custom_body is None
         )
 
-        if custom_body:
-            _parsed_body = _copy_custom_body_for_passthrough(custom_body)
+        if custom_body is not None:
+            compiled_wire_body = get_bound_openai_responses_wire_body(
+                request,
+                custom_body,
+            )
+            observability_body = (
+                getattr(compiled_wire_body, "observability_body", None)
+                if compiled_wire_body is not None
+                else None
+            )
+            _parsed_body = (
+                copy.deepcopy(observability_body)
+                if isinstance(observability_body, dict)
+                else (
+                    copy.deepcopy(custom_body)
+                    if compiled_wire_body is not None
+                    else _copy_custom_body_for_passthrough(custom_body)
+                )
+            )
         elif is_multipart:
             # Don't parse multipart body here - it will be handled by make_multipart_http_request
             _parsed_body = {}
@@ -4979,6 +5884,13 @@ async def pass_through_request(  # noqa: PLR0915
                 passthrough_logging_metadata=passthrough_logging_metadata,
             )
         )
+        if isinstance(_parsed_body, dict):
+            parsed_metadata = _parsed_body.get("metadata")
+            client_metadata = (
+                copy.deepcopy(parsed_metadata)
+                if isinstance(parsed_metadata, dict)
+                else {}
+            )
         # OpenAI function tool schema normalization is only relevant for OpenAI-like
         # targets (RR-056 #9). Skip expensive recursive walks for other providers.
         _should_normalize_openai_tools = _should_normalize_openai_function_tool_schemas(
@@ -5098,6 +6010,61 @@ async def pass_through_request(  # noqa: PLR0915
                     invalid_openai_tool_schemas[:10],
                 )
 
+        # Compile only after schema normalization, guardrail metadata, and the
+        # pre-call hook have finished mutating the observability body. The
+        # resulting immutable payload is the object handed to HTTPX.
+        if (
+            isinstance(_parsed_body, dict)
+            and _is_openai_responses_function_name_target(
+                url=url,
+                custom_llm_provider=custom_llm_provider,
+            )
+        ):
+            from .aawm_adapter_runtime.openai_responses_body import (
+                bind_openai_responses_wire_body,
+                compile_openai_responses_wire_body,
+            )
+            from .aawm_request_policy.codex_tool_policy import (
+                _drop_unsupported_codex_request_params_from_request_body,
+            )
+
+            body_stream = (
+                bool(_parsed_body["stream"])
+                if "stream" in _parsed_body
+                else (bool(stream) if stream is not None else None)
+            )
+            body_store = (
+                _parsed_body.get("store")
+                if isinstance(_parsed_body.get("store"), bool)
+                else None
+            )
+            session_identity = _session_affinity_mod().resolve_canonical_session_identity(
+                request,
+                _parsed_body,
+            )
+            compiled_wire_body = compile_openai_responses_wire_body(
+                _parsed_body,
+                request=request,
+                resolved_model=(
+                    _parsed_body.get("model")
+                    if isinstance(_parsed_body.get("model"), str)
+                    else None
+                ),
+                client_stream=body_stream,
+                store=body_store,
+                url=url,
+                egress_credential_family=egress_credential_family or "openai",
+                custom_llm_provider=custom_llm_provider,
+                expected_target_family=expected_target_family or "openai",
+                endpoint=str(url),
+                session_identity=session_identity,
+                client_metadata=client_metadata,
+                drop_codex_request_params_fn=(
+                    _drop_unsupported_codex_request_params_from_request_body
+                ),
+            )
+            bind_openai_responses_wire_body(request, compiled_wire_body)
+
         stream_read_timeout_policy = _resolve_aawm_passthrough_stream_read_timeout_policy()
         async_client_obj = get_async_httpx_client(
             llm_provider=httpxSpecialProvider.PassThroughEndpoint,
@@ -5119,6 +6086,7 @@ async def pass_through_request(  # noqa: PLR0915
             litellm_call_id=litellm_call_id,
             request=request,
             logging_obj=logging_obj,
+            compiled_wire_body=compiled_wire_body,
         )
         _set_passthrough_stream_timeout_metadata(
             kwargs=kwargs,
@@ -5127,7 +6095,15 @@ async def pass_through_request(  # noqa: PLR0915
         provider_bound_body = _provider_bound_body_from_kwargs(kwargs)
         if provider_bound_body is None:
             provider_bound_body = _parsed_body if isinstance(_parsed_body, dict) else {}
-        if _is_openai_responses_function_name_target(
+        compiled_wire_body = (
+            get_bound_openai_responses_wire_body(request, provider_bound_body)
+            or compiled_wire_body
+        )
+        if compiled_wire_body is not None:
+            responses_function_name_rewrite = (
+                compiled_wire_body.function_name_rewrite
+            )
+        elif _is_openai_responses_function_name_target(
             url=url,
             custom_llm_provider=custom_llm_provider,
         ):
@@ -5302,7 +6278,7 @@ async def pass_through_request(  # noqa: PLR0915
             raw_body=raw_body,
             provider_bound_body=provider_bound_body,
         )
-        if isinstance(provider_bound_body, dict):
+        if isinstance(provider_bound_body, dict) and compiled_wire_body is None:
             _watermark_metadata = _ensure_passthrough_metadata(kwargs)
             _litellm_metadata = provider_bound_body.get("litellm_metadata")
             if not isinstance(_litellm_metadata, dict):
@@ -5383,10 +6359,24 @@ async def pass_through_request(  # noqa: PLR0915
                     metadata=passthrough_metadata,
                 )
                 try:
+                    if managed_xai_oauth_request:
+                        _record_xai_oauth_send_auth_shape(
+                            request=request,
+                            prepared_request=prepared_request,
+                            managed_xai_oauth_request=True,
+                        )
+                    if validate_prepared_request_fn is not None:
+                        validate_prepared_request_fn(prepared_request)
                     response = await async_client.send(
                         prepared_request,
                         stream=send_stream,
                         follow_redirects=False,
+                    )
+                    await HttpPassThroughEndpointHelpers.reject_managed_xai_redirect_response(
+                        response=response,
+                        url=url,
+                        credential_family=egress_credential_family,
+                        expected_target_family=expected_target_family,
                     )
                 except (httpx.ConnectError, httpx.ConnectTimeout):
                     record_transport_connection_attempt(request)
@@ -5395,6 +6385,34 @@ async def pass_through_request(  # noqa: PLR0915
                 return response
 
             openai_send_request_fn = _send_prepared_openai_request
+
+        send_request_fn = openai_send_request_fn
+        if managed_xai_oauth_request and send_request_fn is None:
+            async def _send_managed_xai_request(
+                prepared_request: httpx.Request,
+                send_stream: bool,
+            ) -> httpx.Response:
+                if validate_prepared_request_fn is not None:
+                    validate_prepared_request_fn(prepared_request)
+                _record_xai_oauth_send_auth_shape(
+                    request=request,
+                    prepared_request=prepared_request,
+                    managed_xai_oauth_request=True,
+                )
+                response = await async_client.send(
+                    prepared_request,
+                    stream=send_stream,
+                    follow_redirects=False,
+                )
+                await HttpPassThroughEndpointHelpers.reject_managed_xai_redirect_response(
+                    response=response,
+                    url=url,
+                    credential_family=egress_credential_family,
+                    expected_target_family=expected_target_family,
+                )
+                return response
+
+            send_request_fn = _send_managed_xai_request
 
         if stream:
             await _aawm_session_owner_pre_send_guard(
@@ -5500,10 +6518,21 @@ async def pass_through_request(  # noqa: PLR0915
                     params=requested_query_params,
                     headers=stream_headers,
                 )
-                if openai_send_request_fn is not None:
-                    response = await openai_send_request_fn(req, stream)
+                if send_request_fn is not None:
+                    response = await send_request_fn(req, stream)
                 else:
-                    response = await async_client.send(req, stream=stream)
+                    if validate_prepared_request_fn is not None:
+                        validate_prepared_request_fn(req)
+                    send_kwargs: dict[str, Any] = {"stream": stream}
+                    if managed_xai_oauth_egress:
+                        send_kwargs["follow_redirects"] = False
+                    response = await async_client.send(req, **send_kwargs)
+                await HttpPassThroughEndpointHelpers.reject_managed_xai_redirect_response(
+                    response=response,
+                    url=url,
+                    credential_family=egress_credential_family,
+                    expected_target_family=expected_target_family,
+                )
                 try:
                     response.raise_for_status()
                 except httpx.HTTPStatusError as e:
@@ -5520,12 +6549,21 @@ async def pass_through_request(  # noqa: PLR0915
                         upstream_request=getattr(e.response, "request", None) or req,
                         response_content=error_content,
                         litellm_call_id=litellm_call_id,
-                        extra_metadata={"stream": True},
+                        extra_metadata={
+                            "stream": True,
+                            **_xai_oauth_send_auth_shape_metadata(
+                                request
+                            ),
+                        },
                     )
                     raise _build_http_exception_from_upstream_status_error(
                         e,
                         error_content,
                     ) from e
+                if is_xai_responses_wire_owned_route:
+                    extensions = getattr(response, "extensions", None)
+                    if isinstance(extensions, dict):
+                        extensions["aawm_responses_wire_owned"] = True
                 if PassThroughStreamingHandler._is_openai_responses_stream(
                     endpoint_type=endpoint_type,
                     url_route=str(url),
@@ -5582,6 +6620,10 @@ async def pass_through_request(  # noqa: PLR0915
             status_ok = bool(
                 getattr(response, "status_code", 500) < 300
             )
+            if status_ok and is_native_openai_responses_route:
+                _session_affinity_mod().defer_session_owner_lease_until_wire_terminal(
+                    request
+                )
             await _aawm_session_owner_on_upstream_result(
                 request=request,
                 success=status_ok,
@@ -5600,6 +6642,14 @@ async def pass_through_request(  # noqa: PLR0915
                 span_metadata={"stage": "upstream_wait", "stream": True},
             )
 
+            wire_trace = (
+                OpenAIResponsesWireTrace()
+                if is_native_openai_responses_route
+                else None
+            )
+            stream_bookkeeping_state: Optional[Dict[str, Any]] = (
+                {} if is_native_openai_responses_route else None
+            )
             processed_chunks = PassThroughStreamingHandler.chunk_processor(
                 response=response,
                 request_body=_parsed_body,
@@ -5616,6 +6666,8 @@ async def pass_through_request(  # noqa: PLR0915
                 local_prepare_ms=local_prepare_ms,
                 error_log_context=error_log_context,
                 deferred_success_holder=deferred_success_holder,
+                openai_wire_trace=wire_trace,
+                openai_stream_bookkeeping_state=stream_bookkeeping_state,
             )
             if (
                 responses_function_name_rewrite is not None
@@ -5625,27 +6677,200 @@ async def pass_through_request(  # noqa: PLR0915
                     processed_chunks,
                     responses_function_name_rewrite,
                 )
-            processed_chunks = maybe_wrap_passthrough_responses_stream(
-                processed_chunks,
-                request_context=output_guard_request_context,
-                upstream_response=response,
+            wrapper_cleanup_source = processed_chunks
+            wrapper_setup_failure: Optional[BaseException] = None
+            native_wire_stream_installed = False
+            native_wire_bookkeeping_registered = False
+            if is_native_openai_responses_route:
+                async def _on_native_wire_disposition(
+                    disposition: OpenAIResponsesWireDisposition,
+                    trace: OpenAIResponsesWireTrace,
+                ) -> None:
+                    await _finalize_native_openai_responses_owner_wire_disposition(
+                        request=request,
+                        disposition=disposition,
+                        trace=trace,
+                    )
+
+                async def _run_post_delivery_bookkeeping(
+                    delivered_snapshot: Dict[str, Any],
+                ) -> None:
+                    callback = stream_bookkeeping_state.get("finalize_callback")
+                    if callback is not None:
+                        await callback(delivered_snapshot)
+                        return
+                    await PassThroughStreamingHandler._finalize_unstarted_native_stream(
+                        delivered_snapshot=delivered_snapshot,
+                        response=response,
+                        request_body=_parsed_body,
+                        litellm_logging_obj=logging_obj,
+                        endpoint_type=endpoint_type,
+                        start_time=start_time,
+                        passthrough_success_handler_obj=(
+                            pass_through_endpoint_logging
+                        ),
+                        url_route=str(url),
+                        passthrough_logging_payload=passthrough_logging_payload,
+                        custom_llm_provider=custom_llm_provider,
+                        success_handler_kwargs=kwargs,
+                        local_prepare_ms=local_prepare_ms,
+                        error_log_context=error_log_context,
+                        upstream_prefix_bytes=getattr(response, "_prefix", None),
+                    )
+
+                try:
+                    processed_chunks = maybe_wrap_passthrough_responses_stream(
+                        processed_chunks,
+                        request_context=output_guard_request_context,
+                        upstream_response=response,
+                    )
+                    wrapper_cleanup_source = processed_chunks
+                    processed_chunks = (
+                        maybe_wrap_passthrough_watermark_responses_stream(
+                            processed_chunks,
+                            config=_get_runtime_text_watermark_config(),
+                            success_handler_kwargs=kwargs,
+                            endpoint=_watermark_endpoint_from_path(
+                                url,
+                                getattr(getattr(request, "url", None), "path", None),
+                            ),
+                        )
+                    )
+                    wrapper_cleanup_source = processed_chunks
+                    prefixed_source = _PrefixedNativeResponsesAsyncIterator(
+                        processed_chunks,
+                        [],
+                    )
+                    processed_chunks, wire_trace = wrap_openai_responses_stream(
+                        prefixed_source,
+                        upstream_response=response,
+                        on_disposition=_on_native_wire_disposition,
+                        trace=wire_trace,
+                        model=(
+                            str(provider_bound_body.get("model"))
+                            if isinstance(provider_bound_body, dict)
+                            and provider_bound_body.get("model") is not None
+                            else None
+                        ),
+                    )
+                    native_wire_stream_installed = True
+                    bind_openai_responses_wire_trace_to_request(
+                        request,
+                        wire_trace,
+                    )
+                    if stream_bookkeeping_state is not None:
+                        wire_trace.register_post_finalization_callback(
+                            _run_post_delivery_bookkeeping
+                        )
+                        native_wire_bookkeeping_registered = True
+                    consumed_chunks = await await_with_client_disconnect(
+                        lambda source=wrapper_cleanup_source: (
+                            _consume_native_responses_stream_prefix(source)
+                        ),
+                        request=request,
+                    )
+                    prefixed_source.prepend(consumed_chunks)
+                except asyncio.CancelledError as exc:
+                    if native_wire_stream_installed:
+                        disposition = (
+                            OpenAIResponsesWireDisposition.DISCONNECTED
+                            if isinstance(exc, ClientDisconnectedCancellation)
+                            else OpenAIResponsesWireDisposition.CANCELLED
+                        )
+                        try:
+                            await wire_trace.finalize_prefetch_abort(disposition)
+                        except BaseException as cleanup_exc:  # noqa: BLE001
+                            wire_trace.metadata[
+                                "prefetch_cleanup_error"
+                            ] = type(cleanup_exc).__name__
+                    raise
+                except httpx.ReadTimeout:
+                    if native_wire_stream_installed:
+                        try:
+                            await wire_trace.finalize_prefetch_abort(
+                                OpenAIResponsesWireDisposition.FAILED
+                            )
+                        except BaseException as cleanup_exc:  # noqa: BLE001
+                            wire_trace.metadata[
+                                "prefetch_cleanup_error"
+                            ] = type(cleanup_exc).__name__
+                    raise
+                except BaseException as exc:
+                    wrapper_setup_failure = exc
+                    processed_chunks = iter(())
+            else:
+                processed_chunks = maybe_wrap_passthrough_responses_stream(
+                    processed_chunks,
+                    request_context=output_guard_request_context,
+                    upstream_response=response,
+                )
+                processed_chunks = maybe_wrap_passthrough_watermark_responses_stream(
+                    processed_chunks,
+                    config=_get_runtime_text_watermark_config(),
+                    success_handler_kwargs=kwargs,
+                    endpoint=_watermark_endpoint_from_path(
+                        url, getattr(getattr(request, "url", None), "path", None)
+                    ),
+                )
+            response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
+                headers=response.headers,
+                litellm_call_id=litellm_call_id,
             )
-            processed_chunks = maybe_wrap_passthrough_watermark_responses_stream(
-                processed_chunks,
-                config=_get_runtime_text_watermark_config(),
-                success_handler_kwargs=kwargs,
-                endpoint=_watermark_endpoint_from_path(
-                    url, getattr(getattr(request, "url", None), "path", None)
-                ),
-            )
-            stream_response = StreamingResponse(
-                processed_chunks,
-                headers=HttpPassThroughEndpointHelpers.get_response_headers(
-                    headers=response.headers,
-                    litellm_call_id=litellm_call_id,
-                ),
-                status_code=response.status_code,
-            )
+            if is_native_openai_responses_route:
+                if not native_wire_stream_installed:
+                    processed_chunks, wire_trace = wrap_openai_responses_stream(
+                        wrapper_cleanup_source,
+                        upstream_response=response,
+                        on_disposition=_on_native_wire_disposition,
+                        trace=wire_trace,
+                        model=(
+                            str(provider_bound_body.get("model"))
+                            if isinstance(provider_bound_body, dict)
+                            and provider_bound_body.get("model") is not None
+                            else None
+                        ),
+                    )
+                    bind_openai_responses_wire_trace_to_request(
+                        request,
+                        wire_trace,
+                    )
+                if (
+                    stream_bookkeeping_state is not None
+                    and not native_wire_bookkeeping_registered
+                ):
+                    wire_trace.register_post_finalization_callback(
+                        _run_post_delivery_bookkeeping
+                    )
+                if wrapper_setup_failure is not None:
+                    failure_body, failure_status_code = (
+                        _build_native_responses_wrapper_failure_body(
+                            wire_trace=wire_trace,
+                            wrapper_setup_failure=wrapper_setup_failure,
+                        )
+                    )
+                    stream_response = OpenAIResponsesBufferedResponse(
+                        content=failure_body,
+                        wire_trace=wire_trace,
+                        disposition=OpenAIResponsesWireDisposition.FAILED,
+                        on_disposition=_on_native_wire_disposition,
+                        status_code=failure_status_code,
+                        headers=response_headers,
+                    )
+                else:
+                    stream_response = OpenAIResponsesStreamingResponse(
+                        processed_chunks,
+                        wire_trace=wire_trace,
+                        on_disposition=_on_native_wire_disposition,
+                        headers=response_headers,
+                        status_code=response.status_code,
+                    )
+            else:
+                stream_response = StreamingResponse(
+                    processed_chunks,
+                    headers=response_headers,
+                    status_code=response.status_code,
+                )
+            setattr(stream_response, "_aawm_upstream_response", response)
             _publish_openai_send_telemetry()
             return bind_output_guard_to_streaming_response(
                 bind_deferred_success_holder(
@@ -5736,9 +6961,23 @@ async def pass_through_request(  # noqa: PLR0915
                     _parsed_body=provider_bound_body,
                     raw_body=raw_body,
                     prefer_stream_for_unknown_content=True,
-                    send_request_fn=openai_send_request_fn,
+                    follow_redirects=(
+                        False if managed_xai_oauth_egress else None
+                    ),
+                    validate_request_fn=validate_prepared_request_fn,
+                    send_request_fn=send_request_fn,
                 )
             )
+            await HttpPassThroughEndpointHelpers.reject_managed_xai_redirect_response(
+                response=response,
+                url=url,
+                credential_family=egress_credential_family,
+                expected_target_family=expected_target_family,
+            )
+            if is_xai_responses_wire_owned_route:
+                extensions = getattr(response, "extensions", None)
+                if isinstance(extensions, dict):
+                    extensions["aawm_responses_wire_owned"] = True
             if _is_streaming_response(response) is True:
                 try:
                     response.raise_for_status()
@@ -5756,7 +6995,12 @@ async def pass_through_request(  # noqa: PLR0915
                         upstream_request=getattr(e.response, "request", None),
                         response_content=error_content,
                         litellm_call_id=litellm_call_id,
-                        extra_metadata={"stream": True},
+                        extra_metadata={
+                            "stream": True,
+                            **_xai_oauth_send_auth_shape_metadata(
+                                request
+                            ),
+                        },
                     )
                     raise _build_http_exception_from_upstream_status_error(
                         e,
@@ -5806,7 +7050,12 @@ async def pass_through_request(  # noqa: PLR0915
                     upstream_request=getattr(e.response, "request", None),
                     response_content=error_content,
                     litellm_call_id=litellm_call_id,
-                    extra_metadata={"stream": False},
+                    extra_metadata={
+                        "stream": False,
+                        **_xai_oauth_send_auth_shape_metadata(
+                            request
+                        ),
+                    },
                 )
                 raise _build_http_exception_from_upstream_status_error(
                     e,
@@ -5836,6 +7085,10 @@ async def pass_through_request(  # noqa: PLR0915
             )
             raise
         status_ok = bool(getattr(response, "status_code", 500) < 300)
+        if status_ok and is_native_openai_responses_route:
+            _session_affinity_mod().defer_session_owner_lease_until_wire_terminal(
+                request
+            )
         await _aawm_session_owner_on_upstream_result(
             request=request,
             success=status_ok,
@@ -5853,6 +7106,14 @@ async def pass_through_request(  # noqa: PLR0915
         verbose_proxy_logger.debug("response.headers= %s", response.headers)
 
         if _is_streaming_response(response) is True:
+            wire_trace = (
+                OpenAIResponsesWireTrace()
+                if is_native_openai_responses_route
+                else None
+            )
+            stream_bookkeeping_state: Optional[Dict[str, Any]] = (
+                {} if is_native_openai_responses_route else None
+            )
             processed_chunks = PassThroughStreamingHandler.chunk_processor(
                 response=response,
                 request_body=_parsed_body,
@@ -5869,6 +7130,8 @@ async def pass_through_request(  # noqa: PLR0915
                 local_prepare_ms=local_prepare_ms,
                 error_log_context=error_log_context,
                 deferred_success_holder=deferred_success_holder,
+                openai_wire_trace=wire_trace,
+                openai_stream_bookkeeping_state=stream_bookkeeping_state,
             )
             if (
                 responses_function_name_rewrite is not None
@@ -5878,27 +7141,200 @@ async def pass_through_request(  # noqa: PLR0915
                     processed_chunks,
                     responses_function_name_rewrite,
                 )
-            processed_chunks = maybe_wrap_passthrough_responses_stream(
-                processed_chunks,
-                request_context=output_guard_request_context,
-                upstream_response=response,
+            wrapper_cleanup_source = processed_chunks
+            wrapper_setup_failure: Optional[BaseException] = None
+            native_wire_stream_installed = False
+            native_wire_bookkeeping_registered = False
+            if is_native_openai_responses_route:
+                async def _on_native_wire_disposition(
+                    disposition: OpenAIResponsesWireDisposition,
+                    trace: OpenAIResponsesWireTrace,
+                ) -> None:
+                    await _finalize_native_openai_responses_owner_wire_disposition(
+                        request=request,
+                        disposition=disposition,
+                        trace=trace,
+                    )
+
+                async def _run_post_delivery_bookkeeping(
+                    delivered_snapshot: Dict[str, Any],
+                ) -> None:
+                    callback = stream_bookkeeping_state.get("finalize_callback")
+                    if callback is not None:
+                        await callback(delivered_snapshot)
+                        return
+                    await PassThroughStreamingHandler._finalize_unstarted_native_stream(
+                        delivered_snapshot=delivered_snapshot,
+                        response=response,
+                        request_body=_parsed_body,
+                        litellm_logging_obj=logging_obj,
+                        endpoint_type=endpoint_type,
+                        start_time=start_time,
+                        passthrough_success_handler_obj=(
+                            pass_through_endpoint_logging
+                        ),
+                        url_route=str(url),
+                        passthrough_logging_payload=passthrough_logging_payload,
+                        custom_llm_provider=custom_llm_provider,
+                        success_handler_kwargs=kwargs,
+                        local_prepare_ms=local_prepare_ms,
+                        error_log_context=error_log_context,
+                        upstream_prefix_bytes=getattr(response, "_prefix", None),
+                    )
+
+                try:
+                    processed_chunks = maybe_wrap_passthrough_responses_stream(
+                        processed_chunks,
+                        request_context=output_guard_request_context,
+                        upstream_response=response,
+                    )
+                    wrapper_cleanup_source = processed_chunks
+                    processed_chunks = (
+                        maybe_wrap_passthrough_watermark_responses_stream(
+                            processed_chunks,
+                            config=_get_runtime_text_watermark_config(),
+                            success_handler_kwargs=kwargs,
+                            endpoint=_watermark_endpoint_from_path(
+                                url,
+                                getattr(getattr(request, "url", None), "path", None),
+                            ),
+                        )
+                    )
+                    wrapper_cleanup_source = processed_chunks
+                    prefixed_source = _PrefixedNativeResponsesAsyncIterator(
+                        processed_chunks,
+                        [],
+                    )
+                    processed_chunks, wire_trace = wrap_openai_responses_stream(
+                        prefixed_source,
+                        upstream_response=response,
+                        on_disposition=_on_native_wire_disposition,
+                        trace=wire_trace,
+                        model=(
+                            str(provider_bound_body.get("model"))
+                            if isinstance(provider_bound_body, dict)
+                            and provider_bound_body.get("model") is not None
+                            else None
+                        ),
+                    )
+                    native_wire_stream_installed = True
+                    bind_openai_responses_wire_trace_to_request(
+                        request,
+                        wire_trace,
+                    )
+                    if stream_bookkeeping_state is not None:
+                        wire_trace.register_post_finalization_callback(
+                            _run_post_delivery_bookkeeping
+                        )
+                        native_wire_bookkeeping_registered = True
+                    consumed_chunks = await await_with_client_disconnect(
+                        lambda source=wrapper_cleanup_source: (
+                            _consume_native_responses_stream_prefix(source)
+                        ),
+                        request=request,
+                    )
+                    prefixed_source.prepend(consumed_chunks)
+                except asyncio.CancelledError as exc:
+                    if native_wire_stream_installed:
+                        disposition = (
+                            OpenAIResponsesWireDisposition.DISCONNECTED
+                            if isinstance(exc, ClientDisconnectedCancellation)
+                            else OpenAIResponsesWireDisposition.CANCELLED
+                        )
+                        try:
+                            await wire_trace.finalize_prefetch_abort(disposition)
+                        except BaseException as cleanup_exc:  # noqa: BLE001
+                            wire_trace.metadata[
+                                "prefetch_cleanup_error"
+                            ] = type(cleanup_exc).__name__
+                    raise
+                except httpx.ReadTimeout:
+                    if native_wire_stream_installed:
+                        try:
+                            await wire_trace.finalize_prefetch_abort(
+                                OpenAIResponsesWireDisposition.FAILED
+                            )
+                        except BaseException as cleanup_exc:  # noqa: BLE001
+                            wire_trace.metadata[
+                                "prefetch_cleanup_error"
+                            ] = type(cleanup_exc).__name__
+                    raise
+                except BaseException as exc:
+                    wrapper_setup_failure = exc
+                    processed_chunks = iter(())
+            else:
+                processed_chunks = maybe_wrap_passthrough_responses_stream(
+                    processed_chunks,
+                    request_context=output_guard_request_context,
+                    upstream_response=response,
+                )
+                processed_chunks = maybe_wrap_passthrough_watermark_responses_stream(
+                    processed_chunks,
+                    config=_get_runtime_text_watermark_config(),
+                    success_handler_kwargs=kwargs,
+                    endpoint=_watermark_endpoint_from_path(
+                        url, getattr(getattr(request, "url", None), "path", None)
+                    ),
+                )
+            response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
+                headers=response.headers,
+                litellm_call_id=litellm_call_id,
             )
-            processed_chunks = maybe_wrap_passthrough_watermark_responses_stream(
-                processed_chunks,
-                config=_get_runtime_text_watermark_config(),
-                success_handler_kwargs=kwargs,
-                endpoint=_watermark_endpoint_from_path(
-                    url, getattr(getattr(request, "url", None), "path", None)
-                ),
-            )
-            stream_response = StreamingResponse(
-                processed_chunks,
-                headers=HttpPassThroughEndpointHelpers.get_response_headers(
-                    headers=response.headers,
-                    litellm_call_id=litellm_call_id,
-                ),
-                status_code=response.status_code,
-            )
+            if is_native_openai_responses_route:
+                if not native_wire_stream_installed:
+                    processed_chunks, wire_trace = wrap_openai_responses_stream(
+                        wrapper_cleanup_source,
+                        upstream_response=response,
+                        on_disposition=_on_native_wire_disposition,
+                        trace=wire_trace,
+                        model=(
+                            str(provider_bound_body.get("model"))
+                            if isinstance(provider_bound_body, dict)
+                            and provider_bound_body.get("model") is not None
+                            else None
+                        ),
+                    )
+                    bind_openai_responses_wire_trace_to_request(
+                        request,
+                        wire_trace,
+                    )
+                if (
+                    stream_bookkeeping_state is not None
+                    and not native_wire_bookkeeping_registered
+                ):
+                    wire_trace.register_post_finalization_callback(
+                        _run_post_delivery_bookkeeping
+                    )
+                if wrapper_setup_failure is not None:
+                    failure_body, failure_status_code = (
+                        _build_native_responses_wrapper_failure_body(
+                            wire_trace=wire_trace,
+                            wrapper_setup_failure=wrapper_setup_failure,
+                        )
+                    )
+                    stream_response = OpenAIResponsesBufferedResponse(
+                        content=failure_body,
+                        wire_trace=wire_trace,
+                        disposition=OpenAIResponsesWireDisposition.FAILED,
+                        on_disposition=_on_native_wire_disposition,
+                        status_code=failure_status_code,
+                        headers=response_headers,
+                    )
+                else:
+                    stream_response = OpenAIResponsesStreamingResponse(
+                        processed_chunks,
+                        wire_trace=wire_trace,
+                        on_disposition=_on_native_wire_disposition,
+                        headers=response_headers,
+                        status_code=response.status_code,
+                    )
+            else:
+                stream_response = StreamingResponse(
+                    processed_chunks,
+                    headers=response_headers,
+                    status_code=response.status_code,
+                )
+            setattr(stream_response, "_aawm_upstream_response", response)
             _publish_openai_send_telemetry()
             return bind_output_guard_to_streaming_response(
                 bind_deferred_success_holder(
@@ -5988,21 +7424,50 @@ async def pass_through_request(  # noqa: PLR0915
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ).encode("utf-8")
+        provider_response_body = response_body
+        # Preserve the provider payload before any output-policy evaluation.
+        passthrough_logging_payload["response_body"] = provider_response_body
+        output_policy_rejection: Optional[HTTPException] = None
         if isinstance(response_body, dict):
-            maybe_reject_passthrough_responses_body(
-                response_body,
-                request_context=output_guard_request_context,
-            )
-            response_body, content = maybe_apply_passthrough_watermark_response(
-                response_body,
-                content=content,
-                config=_get_runtime_text_watermark_config(),
-                success_handler_kwargs=kwargs,
-                endpoint=_watermark_endpoint_from_path(
-                    url, getattr(getattr(request, "url", None), "path", None)
-                ),
-            )
-        passthrough_logging_payload["response_body"] = response_body
+            try:
+                maybe_reject_passthrough_responses_body(
+                    response_body,
+                    request_context=output_guard_request_context,
+                )
+                response_body, content = maybe_apply_passthrough_watermark_response(
+                    response_body,
+                    content=content,
+                    config=_get_runtime_text_watermark_config(),
+                    success_handler_kwargs=kwargs,
+                    endpoint=_watermark_endpoint_from_path(
+                        url, getattr(getattr(request, "url", None), "path", None)
+                    ),
+                )
+            except Exception as policy_exc:
+                if not (
+                    is_native_openai_responses_route
+                    and _is_passthrough_output_policy_exception(policy_exc)
+                ):
+                    raise
+                output_policy_rejection = (
+                    policy_exc
+                    if isinstance(policy_exc, HTTPException)
+                    else HTTPException(
+                        status_code=status.HTTP_502_BAD_GATEWAY,
+                        detail=getattr(policy_exc, "detail", str(policy_exc)),
+                    )
+                )
+                response_body = provider_response_body
+                content = _serialize_passthrough_policy_exception(
+                    output_policy_rejection
+                )
+
+        logging_response_body = (
+            provider_response_body
+            if output_policy_rejection is not None
+            else response_body
+        )
+        passthrough_logging_payload["response_body"] = logging_response_body
         capture_passthrough_shape(
             mode="nonstream",
             provider=custom_llm_provider or endpoint_type.value,
@@ -6011,13 +7476,25 @@ async def pass_through_request(  # noqa: PLR0915
             request_body=_parsed_body,
             response=response,
             upstream_request=getattr(response, "request", None),
-            response_body=response_body,
-            response_content=content,
+            response_body=logging_response_body,
+            response_content=(
+                content
+                if output_policy_rejection is None
+                else json.dumps(
+                    provider_response_body,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                if isinstance(provider_response_body, dict)
+                else content
+            ),
             litellm_call_id=litellm_call_id,
-            extra_metadata={"stream": False},
+            extra_metadata={
+                "stream": False,
+                **_xai_oauth_send_auth_shape_metadata(request),
+            },
         )
         end_time = datetime.now()
-
         async def _finalize_deferred_success() -> None:
             asyncio.create_task(
                 pass_through_endpoint_logging.pass_through_async_success_handler(
@@ -6050,7 +7527,10 @@ async def pass_through_request(  # noqa: PLR0915
                     exc_info=True,
                 )
 
-        if not defer_session_owner_promotion:
+        if (
+            not defer_session_owner_promotion
+            and not is_native_openai_responses_route
+        ):
             asyncio.create_task(
                 pass_through_endpoint_logging.pass_through_async_success_handler(
                     httpx_response=response,
@@ -6117,6 +7597,7 @@ async def pass_through_request(  # noqa: PLR0915
                 not defer_session_owner_promotion
                 and not stream
                 and _transfer_identity
+                and not is_native_openai_responses_route
             ):
                 await publish_transfer_terminal(_transfer_identity, "completed")
         except Exception:
@@ -6125,21 +7606,145 @@ async def pass_through_request(  # noqa: PLR0915
                 exc_info=True,
             )
         _publish_openai_send_telemetry()
-        response_to_return = Response(
-            content=content,
-            status_code=response.status_code,
-            headers=response_headers,
-        )
+        if is_native_openai_responses_route:
+            if output_policy_rejection is not None:
+                disposition = OpenAIResponsesWireDisposition.FAILED
+            else:
+                response_status = (
+                    response_body.get("status")
+                    if isinstance(response_body, dict)
+                    else None
+                )
+                if str(response_status or "").lower() == "completed":
+                    disposition = OpenAIResponsesWireDisposition.COMPLETED
+                elif str(response_status or "").lower() == "failed":
+                    disposition = OpenAIResponsesWireDisposition.FAILED
+                else:
+                    disposition = OpenAIResponsesWireDisposition.INCOMPLETE
+
+            wire_trace = OpenAIResponsesWireTrace()
+            if output_policy_rejection is not None:
+                wire_trace.record_policy_failure_from_exception(
+                    output_policy_rejection
+                )
+            wire_trace.metadata["buffered_response_disposition"] = disposition.value
+
+            async def _on_native_wire_disposition(
+                final_disposition: OpenAIResponsesWireDisposition,
+                trace: OpenAIResponsesWireTrace,
+            ) -> None:
+                await _finalize_native_openai_responses_owner_wire_disposition(
+                    request=request,
+                    disposition=final_disposition,
+                    trace=trace,
+                )
+
+            async def _on_native_wire_delivered(
+                delivered_snapshot: Dict[str, Any],
+            ) -> None:
+                metadata = _ensure_passthrough_metadata(kwargs)
+                metadata["aawm_delivered_wire_disposition"] = dict(
+                    delivered_snapshot
+                )
+                delivered_disposition = str(
+                    delivered_snapshot.get("disposition") or ""
+                ).strip().lower()
+                metadata["aawm_delivered_disposition"] = delivered_disposition
+                transfer_phase = {
+                    "completed": "completed",
+                    "failed": "failed",
+                    "incomplete": "failed",
+                    "cancelled": "cancelled",
+                    "disconnected": "disconnected",
+                }.get(delivered_disposition, "failed")
+                if _transfer_identity:
+                    try:
+                        from litellm.proxy.aawm_session_transfer.hooks import (
+                            publish_transfer_terminal,
+                        )
+
+                        await publish_transfer_terminal(
+                            _transfer_identity,
+                            transfer_phase,
+                        )
+                    except Exception:
+                        verbose_proxy_logger.debug(
+                            "Failed to publish delivered session-transfer phase",
+                            exc_info=True,
+                        )
+                await pass_through_endpoint_logging.pass_through_async_success_handler(
+                    httpx_response=response,
+                    response_body=response_body,
+                    url_route=str(url),
+                    result="",
+                    start_time=start_time,
+                    end_time=end_time,
+                    logging_obj=logging_obj,
+                    cache_hit=False,
+                    request_body=_parsed_body,
+                    custom_llm_provider=custom_llm_provider,
+                    **kwargs,
+                )
+
+            wire_trace.register_post_finalization_callback(
+                _on_native_wire_delivered
+            )
+            bind_openai_responses_wire_trace_to_request(request, wire_trace)
+            response_to_return = OpenAIResponsesBufferedResponse(
+                content=content,
+                wire_trace=wire_trace,
+                disposition=disposition,
+                on_disposition=_on_native_wire_disposition,
+                status_code=(
+                    output_policy_rejection.status_code
+                    if output_policy_rejection is not None
+                    else response.status_code
+                ),
+                headers=response_headers,
+            )
+        else:
+            response_to_return = Response(
+                content=content,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
         if deferred_success_holder is not None:
             deferred_success_holder.set_finalizer(_finalize_deferred_success)
         return bind_deferred_success_holder(
             response_to_return,
             deferred_success_holder,
         )
+    except asyncio.CancelledError:
+        try:
+            await _aawm_session_owner_on_upstream_result(
+                request=request,
+                success=False,
+                defer_session_owner_promotion=defer_session_owner_promotion,
+            )
+        except Exception:
+            verbose_proxy_logger.debug(
+                "Failed to release session-owner lease after pass-through "
+                "cancellation",
+                exc_info=True,
+            )
+        raise
     except Exception as e:
         _publish_openai_send_telemetry()
-        if not getattr(e, "aawm_openai_wire_replay_blocked", False):
+        replay_blocked = getattr(e, "aawm_openai_wire_replay_blocked", False)
+        if not replay_blocked:
             await close_active_upstream_response(request)
+            try:
+                await _aawm_session_owner_on_upstream_result(
+                    request=request,
+                    success=False,
+                    defer_session_owner_promotion=defer_session_owner_promotion,
+                )
+            except Exception:
+                verbose_proxy_logger.debug(
+                    "Failed to release session-owner lease on pass-through "
+                    "exception",
+                    exc_info=True,
+                )
         custom_headers = ProxyBaseLLMRequestProcessing.get_custom_headers(
             user_api_key_dict=user_api_key_dict,
             call_id=litellm_call_id,
@@ -6748,6 +8353,7 @@ def create_pass_through_route(
     guardrails: Optional[Dict[str, Any]] = None,
     egress_credential_family: Optional[str] = None,
     expected_target_family: Optional[str] = None,
+    managed_xai_oauth_request: bool = False,
     allowed_forward_headers: Optional[list[str]] = None,
     allowed_pass_through_prefixed_headers: Optional[list[str]] = None,
     blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
@@ -6832,6 +8438,7 @@ def create_pass_through_route(
                 "guardrails": None,
                 "egress_credential_family": egress_credential_family,
                 "expected_target_family": expected_target_family,
+                "managed_xai_oauth_request": managed_xai_oauth_request,
                 "allowed_forward_headers": allowed_forward_headers,
                 "allowed_pass_through_prefixed_headers": allowed_pass_through_prefixed_headers,
                 "blocked_pass_through_prefixed_headers": blocked_pass_through_prefixed_headers,
@@ -6861,6 +8468,7 @@ def create_pass_through_route(
             param_expected_target_family = target_params.get(
                 "expected_target_family", expected_target_family
             )
+            param_managed_xai_oauth_request = managed_xai_oauth_request
             param_allowed_forward_headers = target_params.get(
                 "allowed_forward_headers", allowed_forward_headers
             )
@@ -6924,6 +8532,7 @@ def create_pass_through_route(
                 expected_target_family=cast(
                     Optional[str], param_expected_target_family
                 ),
+                managed_xai_oauth_request=bool(param_managed_xai_oauth_request),
                 allowed_forward_headers=cast(
                     Optional[list[str]], param_allowed_forward_headers
                 ),

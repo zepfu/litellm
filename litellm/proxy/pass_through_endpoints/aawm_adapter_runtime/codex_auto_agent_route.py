@@ -18,6 +18,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
+from litellm.proxy.common_utils.http_parsing_utils import (
+    _safe_set_request_parsed_body,
+)
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+    restore_codex_agent_message_payloads_for_openai_egress,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
     AliasRouteServices,
     CooldownPublicationPlan,
@@ -90,11 +96,15 @@ async def handle_codex_auto_agent_alias_route(
     forward_headers: bool,
     canonical_alias: str,
 ) -> "Response":
-    """Handle a Codex auto-agent alias route request.
+    """Normalize child tasks before ownership classification and alias routing."""
+    # Ordinary child task text is not provider-owned encrypted state.
+    normalized_body = restore_codex_agent_message_payloads_for_openai_egress(
+        prepared_request_body
+    )
+    if normalized_body is not prepared_request_body:
+        prepared_request_body = normalized_body
+        _safe_set_request_parsed_body(request, prepared_request_body)
 
-    Exact behavioral equivalent of the god-module
-    ``_handle_codex_auto_agent_alias_route`` (lines 8915-8977).
-    """
     alias_model = canonical_alias
     client_product_label = runtime.extract_client_product_label_fn(
         request, prepared_request_body

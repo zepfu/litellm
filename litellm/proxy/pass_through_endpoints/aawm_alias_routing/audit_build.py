@@ -209,6 +209,7 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
     event_type: str,
     candidate_status: str,
     attempt_number: Optional[int] = None,
+    attempt_record_index: Optional[int] = None,
     selected: bool = False,
     skipped: bool = False,
     selection_reason: Optional[str] = None,
@@ -283,6 +284,7 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
         "lane_key": lane_key,
         "cooldown_key": cooldown_key,
         "attempt_number": attempt_number,
+        "attempt_record_index": attempt_record_index,
         "event_type": event_type,
         "selection_reason": selection_reason,
         "candidate_status": candidate_status,
@@ -352,6 +354,8 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
     for field in (
         "quota_snapshot_age_seconds",
         "quota_windows",
+        "quota_balancing",
+        "selection_diagnostics",
         "failover_ordinal",
         "prior_account_outcome",
         "terminal_reset",
@@ -360,7 +364,12 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
         "candidate_semantic_ineligibility_remaining_seconds",
     ):
         value = candidate.get(field)
-        if value is None:
+        attempt_local = field in {
+            "quota_balancing", "selection_diagnostics", "quota_snapshot_age_seconds",
+            "quota_windows", "failover_ordinal", "prior_account_outcome",
+            "terminal_reset",
+        }
+        if value is None and not attempt_local:
             value = selection.get(field)
         if value is not None:
             if field == "candidate_semantic_ineligibility_remaining_seconds":
@@ -430,7 +439,7 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
     return {key: value for key, value in event.items() if value is not None}
 
 
-def _build_auto_agent_alias_audit_events(
+def _build_auto_agent_alias_audit_events(  # noqa: PLR0915
     *,
     alias_family: str,
     alias_model: str,
@@ -440,10 +449,25 @@ def _build_auto_agent_alias_audit_events(
     attempts: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
+
+    def _identity(candidate: Mapping[str, Any]) -> tuple[str, str, str]:
+        return tuple(
+            str(candidate.get(field) or "")
+            for field in ("provider", "model", "route_family")
+        )
+
+    terminal_skipped_attempt_identities = {
+        _identity(attempt)
+        for attempt in attempts
+        if isinstance(attempt, dict)
+        and attempt.get("terminal_disposition") == "skipped"
+    }
     skipped_candidates = selection.get("skipped")
     if isinstance(skipped_candidates, list):
         for skipped_candidate in skipped_candidates:
             if not isinstance(skipped_candidate, dict):
+                continue
+            if _identity(skipped_candidate) in terminal_skipped_attempt_identities:
                 continue
             reason = str(skipped_candidate.get("reason") or "cooldown")
             event_type = (
@@ -479,17 +503,31 @@ def _build_auto_agent_alias_audit_events(
 
     audit_attempts = attempts
     if not audit_attempts and isinstance(selection.get("candidate"), dict):
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_quota_balance import (
+            snapshot_selection,
+        )
+
         audit_attempts = [
-            _codex_auto_agent_candidate_public_shape(
-                selection["candidate"],
-                lane_key=selection.get("lane_key"),
-                reason=selection.get("selection_reason"),
-            )
+            {
+                **_codex_auto_agent_candidate_public_shape(
+                    selection["candidate"],
+                    lane_key=selection.get("lane_key"),
+                    reason=selection.get("selection_reason"),
+                ),
+                **snapshot_selection(selection),
+            }
         ]
 
-    for index, attempt in enumerate(audit_attempts, start=1):
+    provider_attempt_number = 0
+    for attempt_record_index, attempt in enumerate(audit_attempts):
         if not isinstance(attempt, dict):
             continue
+        provider_attempt = (
+            attempt.get("terminal_disposition") != "skipped"
+            and attempt.get("attempted_provider_call") is not False
+        )
+        if provider_attempt:
+            provider_attempt_number += 1
         status = str(attempt.get("status") or "").strip()
         failure_class = attempt.get("error_class")
         if _candidate_schema_rejection(attempt) is not None:
@@ -501,12 +539,52 @@ def _build_auto_agent_alias_audit_events(
             "terminal_in_flight_cooldown_set",
             "terminal_in_flight_token_invalidated",
         }
-        if redispatch_required:
+        terminal_skipped = attempt.get("terminal_disposition") == "skipped"
+        if terminal_skipped:
+            skip_reason = str(
+                attempt.get("skip_reason")
+                or attempt.get("reason")
+                or "unavailable"
+            )
+            event_type = (
+                "candidate_skipped_provider_degraded"
+                if skip_reason == "auth_degraded"
+                else "candidate_skipped_cooldown"
+            )
+            if (
+                skip_reason == "candidate_ineligible"
+                and attempt.get("candidate_semantic_ineligibility_reason")
+                is not None
+            ):
+                event_type = "candidate_skipped_semantic_ineligible"
+            candidate_status = f"skipped_{skip_reason}"
+            selected = False
+            skipped = True
+            selection_reason = skip_reason
+        elif redispatch_required:
             event_type = "redispatch_required"
+            candidate_status = status or "selected"
+            selected = True
+            skipped = False
+            selection_reason = (
+                attempt.get("reason") or selection.get("selection_reason")
+            )
         elif failure_class or status == "cooldown_set":
             event_type = "candidate_retryable_failure"
+            candidate_status = status or "selected"
+            selected = True
+            skipped = False
+            selection_reason = (
+                attempt.get("reason") or selection.get("selection_reason")
+            )
         else:
             event_type = "candidate_selected"
+            candidate_status = status or "selected"
+            selected = True
+            skipped = False
+            selection_reason = (
+                attempt.get("reason") or selection.get("selection_reason")
+            )
         events.append(
             _build_auto_agent_alias_audit_event(
                 alias_family=alias_family,
@@ -516,16 +594,19 @@ def _build_auto_agent_alias_audit_events(
                 selection=selection,
                 candidate=attempt,
                 event_type=event_type,
-                candidate_status=status or "selected",
-                attempt_number=index,
-                selected=True,
-                skipped=False,
-                selection_reason=attempt.get("reason") or selection.get("selection_reason"),
+                candidate_status=candidate_status,
+                attempt_number=(
+                    provider_attempt_number if provider_attempt else None
+                ),
+                attempt_record_index=attempt_record_index,
+                selected=selected,
+                skipped=skipped,
+                selection_reason=selection_reason,
                 lane_key=attempt.get("lane_key") or selection.get("lane_key"),
                 # RR-054 #51: attach the attempt's own cooldown key (fall back to selection).
                 cooldown_key=(
                     attempt.get("cooldown_key") or selection.get("cooldown_key")
-                    if index == len(audit_attempts)
+                    if attempt_record_index == len(audit_attempts) - 1
                     else attempt.get("cooldown_key")
                 ),
                 cooldown_seconds=attempt.get("cooldown_seconds"),
@@ -538,7 +619,11 @@ def _build_auto_agent_alias_audit_events(
                 source_error=attempt.get("source_error"),
                 retry_after_seconds=attempt.get("retry_after_seconds"),
                 failure_phase=attempt.get("failure_phase"),
-                attempted_provider_call=attempt.get("attempted_provider_call"),
+                attempted_provider_call=(
+                    False
+                    if terminal_skipped
+                    else attempt.get("attempted_provider_call")
+                ),
                 redispatch_required=redispatch_required,
             )
         )

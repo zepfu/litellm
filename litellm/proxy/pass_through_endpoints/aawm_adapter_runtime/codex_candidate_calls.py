@@ -20,6 +20,12 @@ from dataclasses import dataclass
 from types import FunctionType
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
+from litellm.llms.xai.route_descriptors import (
+    GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+    GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+    XAI_OAUTH_CREDENTIAL_FAMILY,
+    XAI_OAUTH_ROUTE_FAMILY,
+)
 from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
     load_text_watermark_config,
 )
@@ -45,6 +51,8 @@ _CURSOR_TOOL_CONTINUATION_CUE_MARKER = "_cursor_tool_continuation_cue"
 _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER = (
     "_cursor_session_continuation_failure"
 )
+_CURSOR_RETAINED_TRANSPORT_FAILURE_MARKER = "_cursor_retained_transport_failure"
+_CURSOR_CONTINUATION_EVIDENCE_FIELD = "cursor_continuation_evidence"
 _CURSOR_REPLAY_STATE_FIELD = "_cursor_replay_state"
 _CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD = "cursor_sanitized_proto_structure"
 _CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD = (
@@ -553,6 +561,9 @@ def _store_cursor_replay_state(
     messages: list[dict[str, Any]],
     tools: list[Any],
     retained_session: Any = None,
+    owner_scope: Optional[tuple[str, str]] = None,
+    pending_call_ids: Optional[list[str]] = None,
+    continuation_outcome: Optional[str] = None,
 ) -> None:
     now = time.monotonic()
     _prune_cursor_replay_registry(now)
@@ -564,6 +575,9 @@ def _store_cursor_replay_state(
         "messages": copy.deepcopy(messages),
         "tools": copy.deepcopy(tools),
         "retained_session": retained_session,
+        "owner_scope": owner_scope,
+        "pending_call_ids": list(pending_call_ids or []),
+        "continuation_outcome": continuation_outcome,
     }
     _CURSOR_REPLAY_REGISTRY[response_id] = state
     _schedule_cursor_replay_expiry(response_id, state)
@@ -571,6 +585,33 @@ def _store_cursor_replay_state(
     while len(_CURSOR_REPLAY_REGISTRY) > _CURSOR_REPLAY_MAX_SIZE:
         _evicted_id, evicted_state = _CURSOR_REPLAY_REGISTRY.popitem(last=False)
         _dispose_cursor_replay_state(evicted_state)
+
+
+def _record_cursor_replay_outcome(
+    response_id: str,
+    state: dict[str, Any],
+    outcome: str,
+) -> None:
+    # Reuse the registry's existing lifetime/count bounds without retaining the
+    # socket. An unavailable claimed or consumed generation is not replay loss.
+    _store_cursor_replay_state(
+        response_id,
+        messages=state["messages"],
+        tools=state["tools"],
+        owner_scope=state.get("owner_scope"),
+        pending_call_ids=state.get("pending_call_ids"),
+        continuation_outcome=outcome,
+    )
+
+
+def _reject_cursor_replay_outcome(state: dict[str, Any]) -> None:
+    from litellm.llms.cursor_agent.connect import CursorConnectError
+
+    if state.get("continuation_outcome") is not None:
+        raise CursorConnectError(
+            "Cursor Agent continuation generation is already claimed or consumed.",
+            status_code=409,
+        )
 
 
 def _peek_cursor_replay_state(response_id: str) -> dict[str, Any]:
@@ -594,6 +635,7 @@ def _peek_cursor_replay_state(response_id: str) -> dict[str, Any]:
         )
     _prune_cursor_replay_registry(now)
     _CURSOR_REPLAY_REGISTRY.move_to_end(response_id)
+    _reject_cursor_replay_outcome(state)
     return state
 
 
@@ -629,6 +671,7 @@ def _cursor_replay_state_snapshot(
             "messages": copy.deepcopy(state.get("messages")),
             "tools": copy.deepcopy(state.get("tools")),
             "retained_session": state.get("retained_session"),
+            "continuation_outcome": state.get("continuation_outcome"),
         }
     except Exception:  # noqa: BLE001
         return None
@@ -671,6 +714,64 @@ def _cursor_replay_failure_is_transient(
     if status_code in _CURSOR_REPLAY_PRESERVED_STATUS_CODES:
         return True
     return transport_failure and status_code is None
+
+
+def _mark_cursor_retained_transport_failure(
+    exc: Exception,
+    *,
+    session: Any,
+    replay_state: dict[str, Any],
+    full_history: bool,
+) -> None:
+    from h2.exceptions import H2Error
+    from httpx import TransportError
+
+    from litellm.llms.cursor_agent.connect import (
+        CursorConnectError,
+        CursorConnectProtocolError,
+    )
+
+    is_transport_loss = (
+        isinstance(exc, (OSError, TransportError, H2Error))
+        or (
+            isinstance(exc, CursorConnectError)
+            and not isinstance(exc, CursorConnectProtocolError)
+            and (
+                getattr(exc, "status_code", None) in {408, 500, 502, 503, 504, 529}
+                or str(exc)
+                == "Cursor Agent retained continuation session is closed."
+            )
+        )
+    )
+    if not is_transport_loss:
+        return
+    evidence = getattr(session, "continuation_evidence", None)
+    evidence = evidence if isinstance(evidence, Mapping) else {}
+    setattr(
+        exc,
+        _CURSOR_CONTINUATION_EVIDENCE_FIELD,
+        {
+            "continuation_invoked": True,
+            "result_bytes_written": (
+                evidence.get("result_bytes_written")
+                if isinstance(evidence.get("result_bytes_written"), bool)
+                else None
+            ),
+            "provider_progress_observed": (
+                evidence.get("provider_progress_observed")
+                if isinstance(evidence.get("provider_progress_observed"), bool)
+                else None
+            ),
+        },
+    )
+    if not full_history:
+        snapshot = _cursor_replay_state_snapshot(replay_state)
+        if snapshot is None:
+            return
+        snapshot["retained_session"] = None
+        snapshot["continuation_outcome"] = None
+        setattr(exc, _CURSOR_REPLAY_STATE_FIELD, snapshot)
+    setattr(exc, _CURSOR_RETAINED_TRANSPORT_FAILURE_MARKER, True)
 
 
 def _clear_cursor_replay_registry() -> None:
@@ -864,6 +965,8 @@ _HOST_FUNCTION_NAMES = (
     "_perform_codex_auto_agent_grok_native_responses_request",
     "_perform_codex_auto_agent_oa_xai_responses_request",
     "_maybe_wrap_xai_passthrough_responses_stream",
+    "_bind_xai_responses_wire_stream",
+    "_abort_xai_responses_prefetch",
     "_bind_responses_stream_timeout_terminalizer",
     "_validate_codex_auto_agent_openrouter_responses_stream",
     "_perform_codex_auto_agent_openrouter_responses_request",
@@ -938,9 +1041,11 @@ def install(
     production facade.
     """
     _mod = globals()
+    host_globals.setdefault("asyncio", asyncio)
     host_globals.setdefault("_emit_aawm_terminal_error", _emit_aawm_terminal_error)
     for _name in (
         "_perform_codex_auto_agent_cursor_agent_request",
+        "_refine_codex_collaboration_wait_timeout_schema",
         "_raise_cursor_agent_alias_error",
         "_raise_codex_auto_agent_missing_credential_preflight",
         "_load_codex_auto_agent_opencode_zen_api_key",
@@ -1039,6 +1144,7 @@ def _maybe_wrap_xai_passthrough_responses_stream(
     request_body: dict[str, Any],
     route_family: str,
     resolved_model: Any = None,
+    egress_credential_family: str = XAI_OAUTH_CREDENTIAL_FAMILY,
 ) -> Response:
     """Live-forward CFG-025 wrap for xAI alias Responses SSE."""
     from fastapi.responses import StreamingResponse
@@ -1052,11 +1158,19 @@ def _maybe_wrap_xai_passthrough_responses_stream(
 
     if not isinstance(response, StreamingResponse):
         return response
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.payload_validation import (
+        prepare_responses_prefetch_lifecycle,
+    )
+
+    prepare_responses_prefetch_lifecycle(
+        response,
+        create_wire_trace=True,
+    )
     request_context = output_guard_context_from_passthrough(
         ingress_path=str(getattr(getattr(request, "url", None), "path", "") or ""),
         method=str(getattr(request, "method", None) or "POST"),
         custom_llm_provider=litellm.LlmProviders.XAI.value,
-        egress_credential_family="xai",
+        egress_credential_family=egress_credential_family,
         route_family=route_family,
         resolved_model=resolved_model,
         request_body=request_body,
@@ -1081,6 +1195,128 @@ def _maybe_wrap_xai_passthrough_responses_stream(
         source_response=response,
         request_context=request_context,
     )
+
+
+def _bind_xai_responses_wire_stream(
+    response: StreamingResponse,
+    *,
+    request: Request,
+    adapter_model: str,
+) -> StreamingResponse:
+    """Bind xAI Responses to the shared ASGI-aware final-wire coordinator."""
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        OpenAIResponsesStreamingResponse,
+        bind_openai_responses_wire_trace_to_request,
+        wrap_openai_responses_stream,
+    )
+
+    if getattr(response, "_aawm_responses_wire_coordinator_installed", False):
+        return response
+
+    source = getattr(response, "body_iterator", None)
+    if source is None:
+        return response
+    upstream_response = getattr(response, "_aawm_upstream_response", None)
+    if upstream_response is None:
+        upstream_response = response
+    original_pre_terminal_validation = getattr(
+        response,
+        "_aawm_responses_pre_terminal_validation",
+        None,
+    )
+    if not callable(original_pre_terminal_validation):
+        original_pre_terminal_validation = None
+    on_disposition = getattr(response, "_on_disposition", None)
+    trace = getattr(response, "wire_trace", None)
+    response_holder: dict[str, Any] = {}
+
+    async def _pre_terminal_validation(
+        block: bytes,
+        event_type: str,
+        payload: Optional[dict[str, Any]],
+        disposition: Any,
+    ) -> None:
+        if original_pre_terminal_validation is not None:
+            await original_pre_terminal_validation(
+                block,
+                event_type,
+                payload,
+                disposition,
+            )
+        final_response = response_holder.get("response")
+        state = getattr(response, "_aawm_responses_validation_state", None)
+        if final_response is not None and isinstance(state, dict):
+            setattr(final_response, "_aawm_responses_validation_state", state)
+            setattr(
+                final_response,
+                "_aawm_responses_validation_complete",
+                bool(state.get("complete")),
+            )
+            setattr(
+                final_response,
+                "_aawm_responses_validation_valid",
+                bool(state.get("valid")),
+            )
+
+    processed_chunks, wire_trace = wrap_openai_responses_stream(
+        source,
+        upstream_response=upstream_response,
+        on_disposition=on_disposition
+        if callable(on_disposition)
+        else None,
+        pre_terminal_validation=(
+            _pre_terminal_validation
+            if original_pre_terminal_validation is not None
+            else None
+        ),
+        trace=trace,
+        model=adapter_model,
+    )
+    background_owner = getattr(
+        response,
+        "_aawm_responses_background_owner",
+        None,
+    )
+    wire_trace.register_background_owner(background_owner)
+    bind_openai_responses_wire_trace_to_request(request, wire_trace)
+    wire_response = OpenAIResponsesStreamingResponse(
+        processed_chunks,
+        wire_trace=wire_trace,
+        on_disposition=on_disposition
+        if callable(on_disposition)
+        else None,
+        headers=dict(response.headers),
+        status_code=response.status_code,
+        media_type=response.media_type or "text/event-stream",
+        background=getattr(response, "background", None),
+    )
+    for name, value in vars(response).items():
+        if name.startswith("_aawm_") or name == "_on_disposition":
+            setattr(wire_response, name, value)
+    wire_response.wire_trace = wire_trace
+    response_holder["response"] = wire_response
+    setattr(
+        wire_response,
+        "_aawm_responses_wire_coordinator_installed",
+        True,
+    )
+    return wire_response
+
+
+async def _abort_xai_responses_prefetch(
+    response: Any,
+    disposition: Any,
+) -> None:
+    """Join the response-local pre-ASGI abort owner when validation fails."""
+    abort_owner = getattr(response, "_aawm_responses_prefetch_abort", None)
+    if not callable(abort_owner):
+        return
+    try:
+        await abort_owner(disposition)
+    except BaseException:
+        # Preserve the original validation/cancellation cause. The owner
+        # shields and records cleanup/background failures independently.
+        return
 
 
 # ── CFG-004: encrypted reasoning detection ─────────────────────────
@@ -1167,19 +1403,24 @@ async def _perform_codex_auto_agent_alias_candidate_request(
 
     _bind_codex_oauth_candidate_to_request(request, candidate)
     if isinstance(candidate_body, dict):
-        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
-            strip_route_identity_from_request_body,
-        )
+        # Native OpenAI candidates are compiled below. Other adapter routes
+        # still need the protocol-owned sidecar removal before their provider
+        # translators run, but must not recursively inspect user/tool data.
+        if str(candidate.get("provider") or "").strip().lower() != "openai":
+            from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_body import (
+                sanitize_wire_envelope,
+            )
 
-        stripped_candidate_body = strip_route_identity_from_request_body(
-            candidate_body
-        )
-        if (
-            stripped_candidate_body is not candidate_body
-            and isinstance(stripped_candidate_body, dict)
-        ):
-            candidate_body.clear()
-            candidate_body.update(stripped_candidate_body)
+            sanitized_candidate_body, _ = sanitize_wire_envelope(
+                candidate_body,
+                preserve_top_level_keys=("litellm_metadata",),
+            )
+            if (
+                sanitized_candidate_body is not candidate_body
+                and isinstance(sanitized_candidate_body, dict)
+            ):
+                candidate_body.clear()
+                candidate_body.update(sanitized_candidate_body)
     adapter_model = candidate["model"]
     cohere_provider = globals().get("_CODEX_AUTO_AGENT_COHERE_PROVIDER", "cohere")
     zai_coding_plan_provider = globals().get(
@@ -1223,6 +1464,12 @@ async def _perform_codex_auto_agent_alias_candidate_request(
             user_api_key_dict=user_api_key_dict,
             request_body=candidate_body,
         )
+
+    from functools import partial
+
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.alias_candidate_dispatch import (
+        _reject_xai_alias_route_family,
+    )
 
     async def _opencode() -> Response:
         return await _handle_codex_opencode_zen_adapter_route(
@@ -1402,8 +1649,15 @@ async def _perform_codex_auto_agent_alias_candidate_request(
             },
             _CODEX_AUTO_AGENT_XAI_PROVIDER: {
                 "codex_xai_oauth_responses_adapter": _xai_oauth,
-                "*": _grok_native,
+                "codex_grok_native_responses_adapter": _grok_native,
             },
+        },
+        unsupported_route_family_handlers={
+            _CODEX_AUTO_AGENT_XAI_PROVIDER: partial(
+                _reject_xai_alias_route_family,
+                candidate=candidate,
+                ingress="codex",
+            ),
         },
         default_handler=_native,
     )
@@ -1522,7 +1776,7 @@ def _cursor_function_call_message(
             item=item,
         )
     function_calls[call_id] = name
-    return {
+    message: dict[str, Any] = {
         "role": "assistant",
         "content": _cursor_response_content_text(item.get("content")),
         "tool_calls": [
@@ -1536,6 +1790,10 @@ def _cursor_function_call_message(
             }
         ],
     }
+    namespace = item.get("namespace", function.get("namespace"))
+    if namespace is not None:
+        message["tool_calls"][0]["namespace"] = namespace
+    return message
 
 
 def _validate_cursor_returned_tool_calls(tool_calls: list[Any]) -> None:
@@ -1594,6 +1852,33 @@ def _cursor_message_input_item(
     function_calls: dict[str, str],
 ) -> Optional[dict[str, Any]]:
     item_type = str(item.get("type") or "")
+    if item_type == "agent_message":
+        content = item.get("content")
+        if (
+            set(item) - {
+                "type", "id", "author", "recipient", "content",
+                "internal_chat_message_metadata_passthrough",
+            }
+            or any(
+                not isinstance(item.get(key), str) or not item[key].strip()
+                for key in ("author", "recipient")
+            )
+            or not isinstance(content, list)
+            or not content
+            or any(
+                not isinstance(part, dict)
+                or set(part) != {"type", "text"}
+                or part.get("type") != "input_text"
+                or not isinstance(part.get("text"), str)
+                for part in content
+            )
+        ):
+            return None
+        text = "\n".join(part["text"] for part in content)
+        if not text.strip():
+            return None
+        # Project only the Cursor chat view; keep the stock input item intact.
+        return {"role": "user", "content": text}
     if item_type == "input_text":
         return {
             "role": "user",
@@ -1645,6 +1930,110 @@ def _cursor_function_call_outputs(
             output = item.get("content")
         outputs.append((call_id, _cursor_response_content_text(output)))
     return outputs
+
+
+def _cursor_retained_owner_scope(request: Any) -> Optional[tuple[str, str]]:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity import (
+        get_request_session_owner_lease,
+    )
+
+    lease = get_request_session_owner_lease(request)
+    if (
+        lease is None
+        or lease.released
+        or not lease.cache_key
+        or not lease.owner_id
+    ):
+        return None
+    return lease.cache_key, lease.owner_id
+
+
+def _find_cursor_full_history_retained_state(
+    request_body: dict[str, Any],
+    *,
+    owner_scope: Optional[tuple[str, str]],
+) -> Optional[tuple[str, dict[str, Any], list[tuple[str, str]]]]:
+    from litellm.llms.cursor_agent.connect import CursorConnectError
+
+    if owner_scope is None:
+        return None
+    _prune_cursor_replay_registry()
+    states = [
+        (response_id, state)
+        for response_id, state in _CURSOR_REPLAY_REGISTRY.items()
+        if state.get("owner_scope") == owner_scope
+        and (
+            state.get("retained_session") is not None
+            or state.get("continuation_outcome") is not None
+        )
+    ]
+    if not states:
+        return None
+
+    input_items = request_body.get("input")
+    if not isinstance(input_items, list):
+        raise CursorConnectError(
+            "Cursor Agent retained continuation requires valid complete tool history.",
+            status_code=409,
+        )
+    # Live continuation validates the trusted prefix, not the single-pair
+    # grammar used to authorize a provider-neutral fallback.
+    for item in input_items:
+        item_type = item.get("type") if isinstance(item, Mapping) else None
+        if item_type == "message":
+            validated = _cursor_replay_stock_codex_message_item(
+                item, allow_missing_metadata=True
+            )
+        elif item_type == "function_call":
+            validated = _cursor_replay_stock_codex_function_call_item(
+                item, allow_missing_metadata=True
+            )
+        elif item_type == "function_call_output":
+            validated = _cursor_replay_function_call_output_items(
+                {"input": [item]}, allow_missing_metadata=True
+            )
+        else:
+            validated = None
+        if validated is None or validated.rejection is not None:
+            raise CursorConnectError(
+                "Cursor Agent retained continuation requires valid complete tool history.",
+                status_code=409,
+            )
+    messages = _responses_input_to_cursor_messages(request_body)
+    if messages and messages[-1].get(_CURSOR_TOOL_CONTINUATION_CUE_MARKER):
+        messages.pop()
+    matches = []
+    for response_id, state in states:
+        pending_ids = set(state.get("pending_call_ids") or [])
+        prior = state.get("messages")
+        if not pending_ids or not isinstance(prior, list):
+            continue
+        if messages[:len(prior)] != prior:
+            continue
+        tail = messages[len(prior):]
+        if (
+            len(tail) != len(pending_ids)
+            or any(message.get("role") != "tool" for message in tail)
+            or {message.get("tool_call_id") for message in tail} != pending_ids
+            or (
+                isinstance(request_body.get("tools"), list)
+                and request_body["tools"] != state.get("tools")
+            )
+        ):
+            continue
+        outputs = [
+            (message["tool_call_id"], message["content"])
+            for message in tail
+        ]
+        matches.append((response_id, state, outputs))
+    if len(matches) != 1:
+        raise CursorConnectError(
+            "Cursor Agent retained continuation does not uniquely match its "
+            "guarded owner, unchanged assignment, tools, and pending calls.",
+            status_code=409,
+        )
+    _reject_cursor_replay_outcome(matches[0][1])
+    return matches[0]
 
 
 def _cursor_replay_function_call_output_items(
@@ -2879,6 +3268,27 @@ def _cursor_replay_build_stored_history_input(
             "fresh_body_copy",
             "replayed_input_container",
         )
+    # The shared chat converter predates namespace tools. Restore the qualified
+    # identity from the validated stored calls without changing that converter.
+    namespaces = {
+        call.get("id"): call["namespace"]
+        for message in messages
+        for call in message.get("tool_calls") or []
+        if isinstance(call, dict) and "namespace" in call
+    }
+    if any(
+        not isinstance(namespace, str)
+        or not namespace
+        or namespace != namespace.strip()
+        for namespace in namespaces.values()
+    ):
+        return _cursor_replay_rejected(
+            "fresh_body_copy",
+            "function_namespace",
+        )
+    for item in replayed_input:
+        if item.get("type") == "function_call" and item.get("call_id") in namespaces:
+            item["namespace"] = namespaces[item["call_id"]]
 
     # Stored history can end with an unresolved call because the current
     # request carries its outputs. Merge those outputs before the sole
@@ -2952,10 +3362,17 @@ def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
                 )
         elif (
             previous_response_id is None
-            and getattr(
-                continuation_exc,
-                _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
-                False,
+            and (
+                getattr(
+                    continuation_exc,
+                    _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
+                    False,
+                )
+                or getattr(
+                    continuation_exc,
+                    _CURSOR_RETAINED_TRANSPORT_FAILURE_MARKER,
+                    False,
+                )
             )
         ):
             full_history_result = _cursor_replay_stock_codex_full_history_input(
@@ -2983,6 +3400,11 @@ def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
             return _cursor_replay_build_rejected(
                 "fresh_body_copy",
                 "retained_session_present",
+            )
+        if replay_state.get("continuation_outcome") is not None:
+            return _cursor_replay_build_rejected(
+                "fresh_body_copy",
+                "missing_replay_state",
             )
 
         stored_history_result = _cursor_replay_build_stored_history_input(
@@ -3319,6 +3741,44 @@ def _validate_cursor_result_and_consume_replay_state(
         )
 
 
+def _refine_codex_collaboration_wait_timeout_schema(
+    request_body: dict[str, Any],
+    *,
+    adapter_model: str,
+) -> None:
+    """Refine a derived build/restoration body, never canonical replay input."""
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.tool_call_restore import (
+        _advertised_namespace_tool_argument_schemas,
+        _advertised_namespace_tool_function_adapter_map,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_request_policy.codex_tool_policy import (
+        _catalog_namespace_adapter_key,
+        _namespace_child_name_allowed,
+    )
+
+    namespace_by_name = _advertised_namespace_tool_function_adapter_map(
+        request_body,
+        adapter_model=adapter_model,
+    )
+    argument_schemas = _advertised_namespace_tool_argument_schemas(request_body)
+    for tool_name, namespace in namespace_by_name.items():
+        if (
+            _catalog_namespace_adapter_key(namespace) != "collaboration"
+            or not _namespace_child_name_allowed(tool_name, {"wait_agent"})
+        ):
+            continue
+        wait_schema = argument_schemas.get(tool_name, {})
+        wait_properties = wait_schema.get("properties")
+        if isinstance(wait_properties, dict):
+            timeout_schema = wait_properties.get("timeout_ms")
+            if (
+                isinstance(timeout_schema, dict)
+                and timeout_schema.get("type") == "number"
+            ):
+                # Stock Codex advertises number but deserializes this field as i64.
+                timeout_schema["type"] = "integer"
+
+
 async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
     *,
     endpoint: str,
@@ -3359,14 +3819,10 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         _record_adapted_completed_route_rollup_turn,
     )
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.tool_call_restore import (
-        _advertised_namespace_tool_argument_schemas,
-        _advertised_namespace_tool_function_adapter_map,
         _restore_adapted_namespace_tool_calls_in_response_body,
     )
     from litellm.proxy.pass_through_endpoints.aawm_request_policy.codex_tool_policy import (
         _adapt_codex_namespace_tools_to_functions_from_request_body,
-        _catalog_namespace_adapter_key,
-        _namespace_child_name_allowed,
     )
 
     if candidate.get("route_family") != "codex_cursor_agent_aiserver_adapter":
@@ -3410,9 +3866,26 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             item={input_continuation_key: True},
         )
     replay_state: Optional[dict[str, Any]] = None
+    owner_scope = _cursor_retained_owner_scope(request)
+    cursor_tool_outputs = _cursor_function_call_outputs(request_body)
+    full_history_continuation = False
     previous_response_id = request_body.get("previous_response_id")
     if isinstance(previous_response_id, str) and previous_response_id:
         replay_state = _peek_cursor_replay_state(previous_response_id)
+        stored_scope = replay_state.get("owner_scope")
+        if stored_scope is not None and stored_scope != owner_scope:
+            raise CursorConnectError(
+                "Cursor Agent retained continuation owner does not match.",
+                status_code=409,
+            )
+    elif previous_response_id is None and cursor_tool_outputs:
+        matched = _find_cursor_full_history_retained_state(
+            request_body,
+            owner_scope=owner_scope,
+        )
+        if matched is not None:
+            previous_response_id, replay_state, cursor_tool_outputs = matched
+            full_history_continuation = True
     stored_messages = (
         replay_state.get("messages")
         if isinstance(replay_state, dict)
@@ -3444,36 +3917,16 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         and isinstance(request_tools, list)
     ):
         restoration_request_body["tools"] = copy.deepcopy(request_tools)
-    namespace_by_name = _advertised_namespace_tool_function_adapter_map(
+    _refine_codex_collaboration_wait_timeout_schema(
         restoration_request_body,
         adapter_model=adapter_model,
     )
-    argument_schemas = _advertised_namespace_tool_argument_schemas(
-        restoration_request_body
-    )
-    for tool_name, namespace in namespace_by_name.items():
-        if (
-            _catalog_namespace_adapter_key(namespace) != "collaboration"
-            or not _namespace_child_name_allowed(tool_name, {"wait_agent"})
-        ):
-            continue
-        wait_schema = argument_schemas.get(tool_name, {})
-        wait_properties = wait_schema.get("properties")
-        if isinstance(wait_properties, dict):
-            timeout_schema = wait_properties.get("timeout_ms")
-            if (
-                isinstance(timeout_schema, dict)
-                and timeout_schema.get("type") == "number"
-            ):
-                # Stock Codex advertises number but deserializes this field as i64.
-                timeout_schema["type"] = "integer"
 
     retained_session = (
         replay_state.get("retained_session")
         if isinstance(replay_state, dict)
         else None
     )
-    cursor_tool_outputs = _cursor_function_call_outputs(request_body)
     if cursor_tool_outputs and retained_session is None:
         _raise_cursor_session_continuation_unavailable(
             previous_response_id=(
@@ -3490,6 +3943,7 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             replay_state.get("messages")
             if isinstance(replay_state, dict)
             and isinstance(replay_state.get("messages"), list)
+            and not full_history_continuation
             else None
         ),
     )
@@ -3500,6 +3954,7 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             expected_state=replay_state,
             close_retained_session=False,
         )
+        _record_cursor_replay_outcome(previous_response_id, replay_state, "claimed")
         try:
             result = await retained_session.continue_with_tool_outputs(
                 cursor_tool_outputs
@@ -3509,23 +3964,43 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
                 previous_response_id=None,
                 replay_state=None,
             )
-        except Exception:
+        except Exception as exc:
             await retained_session.aclose()
-            raise
-
-        try:
-            replay_messages = _cursor_messages_with_result_tool_calls(
-                messages,
-                result.tool_calls,
-                result.text,
+            _record_cursor_replay_outcome(
+                previous_response_id, replay_state, "consumed"
             )
-        except _CursorPostEgressOutputError as exc:
-            _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
+            _mark_cursor_retained_transport_failure(
+                exc,
+                session=retained_session,
+                replay_state=replay_state,
+                full_history=full_history_continuation,
+            )
+            raise
+        _record_cursor_replay_outcome(
+            previous_response_id, replay_state, "consumed"
+        )
+
         model = str(candidate.get("model") or request_body.get("model") or "")
         response_body = _cursor_responses_response_body(
             model=model,
             result=result,
         )
+        response_body, _ = _restore_adapted_namespace_tool_calls_in_response_body(
+            response_body,
+            request_body=restoration_request_body,
+            adapter_model=adapter_model,
+        )
+        try:
+            replay_messages = _cursor_messages_with_result_tool_calls(
+                messages,
+                [
+                    item for item in response_body["output"]
+                    if item.get("type") == "function_call"
+                ],
+                result.text,
+            )
+        except _CursorPostEgressOutputError as exc:
+            _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
         if result.tool_calls:
             next_session = result.retained_session
             _store_cursor_replay_state(
@@ -3533,16 +4008,13 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
                 messages=replay_messages,
                 tools=request_tools if isinstance(request_tools, list) else [],
                 retained_session=next_session,
+                owner_scope=owner_scope,
+                pending_call_ids=[call["call_id"] for call in result.tool_calls],
             )
             if next_session is None:
                 await retained_session.aclose()
         else:
             await retained_session.aclose()
-        response_body, _ = _restore_adapted_namespace_tool_calls_in_response_body(
-            response_body,
-            request_body=restoration_request_body,
-            adapter_model=adapter_model,
-        )
         _record_adapted_completed_route_rollup_turn(
             rollup_kwargs,
             adapter_label="Cursor Agent",
@@ -3637,11 +4109,19 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         response_body = _cursor_responses_response_body(model=model, result=result)
     except _CursorPostEgressOutputError as exc:
         _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
+    response_body, _ = _restore_adapted_namespace_tool_calls_in_response_body(
+        response_body,
+        request_body=restoration_request_body,
+        adapter_model=adapter_model,
+    )
     if result.tool_calls:
         try:
             replay_messages = _cursor_messages_with_result_tool_calls(
                 messages,
-                result.tool_calls,
+                [
+                    item for item in response_body["output"]
+                    if item.get("type") == "function_call"
+                ],
                 result.text,
             )
         except _CursorPostEgressOutputError as exc:
@@ -3651,12 +4131,9 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             messages=replay_messages,
             tools=request_tools if isinstance(request_tools, list) else [],
             retained_session=result.retained_session,
+            owner_scope=owner_scope,
+            pending_call_ids=[call["call_id"] for call in result.tool_calls],
         )
-    response_body, _ = _restore_adapted_namespace_tool_calls_in_response_body(
-        response_body,
-        request_body=restoration_request_body,
-        adapter_model=adapter_model,
-    )
     _record_adapted_completed_route_rollup_turn(
         rollup_kwargs,
         adapter_label="Cursor Agent",
@@ -3867,6 +4344,37 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
 
     attempted_provider_call: Optional[bool] = None
     ineligibility_summary = ""
+    if getattr(exc, _CURSOR_RETAINED_TRANSPORT_FAILURE_MARKER, False):
+        proxy_exc = ProxyException(
+            message=message,
+            type="upstream_error",
+            param="model",
+            code=status_code,
+        )
+        evidence = getattr(exc, _CURSOR_CONTINUATION_EVIDENCE_FIELD, {})
+        setattr(proxy_exc, "status_code", status_code)
+        setattr(proxy_exc, "candidate_status", "retryable")
+        setattr(proxy_exc, "failure_phase", "cursor_retained_transport")
+        # Unknown write status consumes the attempt budget conservatively.
+        setattr(
+            proxy_exc,
+            "attempted_provider_call",
+            evidence.get("result_bytes_written") is not False,
+        )
+        setattr(proxy_exc, _CURSOR_RETAINED_TRANSPORT_FAILURE_MARKER, True)
+        setattr(proxy_exc, _CURSOR_CONTINUATION_EVIDENCE_FIELD, dict(evidence))
+        replay_state = getattr(exc, _CURSOR_REPLAY_STATE_FIELD, None)
+        if isinstance(replay_state, dict):
+            setattr(proxy_exc, _CURSOR_REPLAY_STATE_FIELD, replay_state)
+        _set_mapped_detail(
+            proxy_exc,
+            {
+                "message": message,
+                "code": "cursor_retained_transport_unavailable",
+                _CURSOR_CONTINUATION_EVIDENCE_FIELD: dict(evidence),
+            },
+        )
+        raise proxy_exc from exc
     if getattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, False):
         detail_message = (
             "Cursor Agent candidate is ineligible: the requested tool-output "
@@ -4727,37 +5235,12 @@ async def _perform_codex_auto_agent_native_openai_request(
     request_body: dict[str, Any],
     custom_headers: Optional[dict[str, str]] = None,
 ) -> Response:
-    # OPENAI-007: legacy history may collapse provider tool ids into item id.
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.direct_openai_function_call_history import (
-        normalize_direct_openai_legacy_function_call_history_ids,
-    )
-
-    request_body = normalize_direct_openai_legacy_function_call_history_ids(
-        request_body
-    )
-    # Ingress drop keys off the caller/alias model id. Alias names such as
-    # ``work`` / ``expert`` / ``sota`` are not cost-map keys, so Ohmypi
-    # ``max_output_tokens`` survives until this resolved Codex candidate.
-    (
-        request_body,
-        _codex_unsupported_request_params,
-    ) = _drop_unsupported_codex_request_params_from_request_body(request_body)
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
-        guard_openai_encrypted_reasoning_egress,
-    )
-
-    request_body, _encrypted_reasoning_disposition = (
-        guard_openai_encrypted_reasoning_egress(
-            request_body,
-            url=target_url,
-        )
-    )
-    request_body = {
-        **request_body,
-        "store": False,
-        "stream": True,
-    }
-    is_streaming_request = bool(request_body.get("stream"))
+    # Managed Codex Responses egress is always streamed and unpersisted,
+    # including nested alias candidates that bypass direct-route shaping.
+    request_body = dict(request_body)
+    request_body["stream"] = True
+    request_body["store"] = False
+    is_streaming_request = True
     # The candidate loop attaches this coordinator only for eligible alpha
     # OpenAI capacity-retry requests. Preserve stock hidden transport retries
     # for every native OpenAI request without that shared owner.
@@ -4824,7 +5307,11 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
     request_body: dict[str, Any],
 ) -> Response:
     canonical_request_body = copy.deepcopy(request_body)
-    adapted_request_body = copy.deepcopy(request_body)
+    _refine_codex_collaboration_wait_timeout_schema(
+        canonical_request_body,
+        adapter_model=str(request_body.get("model") or ""),
+    )
+    adapted_request_body = copy.deepcopy(canonical_request_body)
     (
         adapted_request_body,
         _adapted_custom_tools,
@@ -4886,40 +5373,86 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
             stream=bool(grok_prepared_body.get("stream")),
             custom_body=grok_prepared_body,
             custom_llm_provider=litellm.LlmProviders.XAI.value,
-            egress_credential_family="xai",
-            expected_target_family="xai",
+            egress_credential_family=GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+            expected_target_family=GROK_NATIVE_OAUTH_ROUTE_FAMILY,
             retryable_upstream_status_codes=[
                 429,
                 *_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES,
             ],
             caller_managed_hidden_retry=True,
             defer_session_owner_promotion=True,
+            responses_wire_owned=True,
         )
     except Exception as exc:
         if _grok_native_candidate_unavailable_detail(exc) is not None:
             _raise_grok_native_auto_agent_candidate_unavailable(exc)
         raise
-    response = _maybe_wrap_xai_passthrough_responses_stream(
-        response,
-        request=request,
-        request_body=canonical_request_body,
-        route_family="codex_auto_agent_grok_native_responses",
-        resolved_model=grok_prepared_body.get("model") or request_body.get("model"),
+    grok_adapter_model = str(
+        grok_prepared_body.get("model") or request_body.get("model") or "unknown-model"
     )
-    validated_response = await _validate_codex_auto_agent_responses_payload(
-        response,
-        adapter_model=str(grok_prepared_body.get("model") or request_body.get("model") or "unknown-model"),
+    grok_intake_context = _build_malformed_tool_call_intake_context(
+        request,
+        canonical_request_body,
         adapter="codex_auto_agent_grok_native_responses",
-        adapter_label="Grok native",
-        intake_context=_build_malformed_tool_call_intake_context(
-            request,
-            canonical_request_body,
-            adapter="codex_auto_agent_grok_native_responses",
-            upstream_url=str(updated_url),
-            provider="grok",
-        ),
-        request_body=canonical_request_body,
+        upstream_url=str(updated_url),
+        provider="grok",
     )
+    grok_rollup_kwargs = _build_adapted_route_rollup_kwargs(
+        (
+            grok_prepared_body.get("litellm_metadata")
+            if isinstance(grok_prepared_body.get("litellm_metadata"), dict)
+            else {}
+        )
+    )
+    if isinstance(response, StreamingResponse):
+        response = _bind_responses_stream_timeout_terminalizer(
+            response,
+            adapter_model=grok_adapter_model,
+            adapter_label="Grok native",
+            provider="grok",
+            intake_context=grok_intake_context,
+            rollup_kwargs=grok_rollup_kwargs,
+        )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        OpenAIResponsesWireDisposition,
+    )
+
+    try:
+        response = _maybe_wrap_xai_passthrough_responses_stream(
+            response,
+            request=request,
+            request_body=canonical_request_body,
+            route_family="codex_auto_agent_grok_native_responses",
+            resolved_model=grok_prepared_body.get("model")
+            or request_body.get("model"),
+            egress_credential_family=GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+        )
+        validated_response = await _validate_codex_auto_agent_responses_payload(
+            response,
+            adapter_model=grok_adapter_model,
+            adapter="codex_auto_agent_grok_native_responses",
+            adapter_label="Grok native",
+            intake_context=grok_intake_context,
+            request_body=canonical_request_body,
+        )
+        if isinstance(validated_response, StreamingResponse):
+            validated_response = _bind_xai_responses_wire_stream(
+                validated_response,
+                request=request,
+                adapter_model=grok_adapter_model,
+            )
+    except asyncio.CancelledError:
+        await _abort_xai_responses_prefetch(
+            response,
+            OpenAIResponsesWireDisposition.CANCELLED,
+        )
+        raise
+    except BaseException:
+        await _abort_xai_responses_prefetch(
+            response,
+            OpenAIResponsesWireDisposition.FAILED,
+        )
+        raise
     if getattr(validated_response, "body_iterator", None) is not None:
         setattr(validated_response, "_aawm_session_owner_promotion_deferred", True)
     return validated_response
@@ -4933,10 +5466,16 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
     request_body: dict[str, Any],
 ) -> Response:
     canonical_request_body = copy.deepcopy(request_body)
+    _refine_codex_collaboration_wait_timeout_schema(
+        canonical_request_body,
+        adapter_model=str(request_body.get("model") or ""),
+    )
     (
         adapted_request_body,
         _adapted_custom_tools,
-    ) = _adapt_codex_custom_tools_to_functions_from_request_body(request_body)
+    ) = _adapt_codex_custom_tools_to_functions_from_request_body(
+        copy.deepcopy(canonical_request_body)
+    )
     (
         adapted_request_body,
         _adapted_namespace_tools,
@@ -4952,6 +5491,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
     try:
         oa_xai_context = await BaseOpenAIPassThroughHandler._prepare_openai_oa_xai_context(
             endpoint=endpoint,
+            request=request,
             request_body=adapted_request_body,
         )
     except Exception as exc:
@@ -4977,8 +5517,9 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             stream=bool(oa_xai_prepared_body.get("stream")),
             custom_body=oa_xai_prepared_body,
             custom_llm_provider=litellm.LlmProviders.XAI.value,
-            egress_credential_family="xai",
-            expected_target_family="xai",
+            egress_credential_family=XAI_OAUTH_CREDENTIAL_FAMILY,
+            expected_target_family=XAI_OAUTH_ROUTE_FAMILY,
+            managed_xai_oauth_request=True,
             blocked_pass_through_prefixed_headers=[
                 "authorization",
                 "api-key",
@@ -4990,33 +5531,80 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             ],
             caller_managed_hidden_retry=True,
             defer_session_owner_promotion=True,
+            responses_wire_owned=True,
         )
     except Exception as exc:
         if _xai_oauth_candidate_unavailable_detail(exc) is not None:
             _raise_xai_oauth_auto_agent_candidate_unavailable(exc)
         raise
-    response = _maybe_wrap_xai_passthrough_responses_stream(
-        response,
-        request=request,
-        request_body=canonical_request_body,
-        route_family="codex_auto_agent_xai_oauth_responses",
-        resolved_model=oa_xai_prepared_body.get("model")
-        or canonical_request_body.get("model"),
+    xai_adapter_model = str(
+        oa_xai_prepared_body.get("model")
+        or canonical_request_body.get("model")
+        or "unknown-model"
     )
-    validated_response = await _validate_codex_auto_agent_responses_payload(
-        response,
-        adapter_model=str(oa_xai_prepared_body.get("model") or canonical_request_body.get("model") or "unknown-model"),
+    xai_intake_context = _build_malformed_tool_call_intake_context(
+        request,
+        canonical_request_body,
         adapter="codex_auto_agent_xai_oauth_responses",
-        adapter_label="xAI OAuth",
-        intake_context=_build_malformed_tool_call_intake_context(
-            request,
-            canonical_request_body,
-            adapter="codex_auto_agent_xai_oauth_responses",
-            upstream_url=str(updated_url),
-            provider="xai",
-        ),
-        request_body=canonical_request_body,
+        upstream_url=str(updated_url),
+        provider="xai",
     )
+    xai_rollup_kwargs = _build_adapted_route_rollup_kwargs(
+        (
+            oa_xai_prepared_body.get("litellm_metadata")
+            if isinstance(oa_xai_prepared_body.get("litellm_metadata"), dict)
+            else {}
+        )
+    )
+    if isinstance(response, StreamingResponse):
+        response = _bind_responses_stream_timeout_terminalizer(
+            response,
+            adapter_model=xai_adapter_model,
+            adapter_label="xAI OAuth",
+            provider="xai",
+            intake_context=xai_intake_context,
+            rollup_kwargs=xai_rollup_kwargs,
+        )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        OpenAIResponsesWireDisposition,
+    )
+
+    try:
+        response = _maybe_wrap_xai_passthrough_responses_stream(
+            response,
+            request=request,
+            request_body=canonical_request_body,
+            route_family="codex_auto_agent_xai_oauth_responses",
+            resolved_model=oa_xai_prepared_body.get("model")
+            or canonical_request_body.get("model"),
+            egress_credential_family=XAI_OAUTH_CREDENTIAL_FAMILY,
+        )
+        validated_response = await _validate_codex_auto_agent_responses_payload(
+            response,
+            adapter_model=xai_adapter_model,
+            adapter="codex_auto_agent_xai_oauth_responses",
+            adapter_label="xAI OAuth",
+            intake_context=xai_intake_context,
+            request_body=canonical_request_body,
+        )
+        if isinstance(validated_response, StreamingResponse):
+            validated_response = _bind_xai_responses_wire_stream(
+                validated_response,
+                request=request,
+                adapter_model=xai_adapter_model,
+            )
+    except asyncio.CancelledError:
+        await _abort_xai_responses_prefetch(
+            response,
+            OpenAIResponsesWireDisposition.CANCELLED,
+        )
+        raise
+    except BaseException:
+        await _abort_xai_responses_prefetch(
+            response,
+            OpenAIResponsesWireDisposition.FAILED,
+        )
+        raise
     if getattr(validated_response, "body_iterator", None) is not None:
         setattr(validated_response, "_aawm_session_owner_promotion_deferred", True)
     return validated_response
@@ -6002,6 +6590,27 @@ async def _perform_codex_zai_coding_plan_adapter_call(
 
     _ = config
     _annotate_request_scope_for_adapted_access_log(request, httpx.URL(str(target_url)))
+    _watermark_intake = None
+    try:
+        _watermark_intake = getattr(
+            getattr(request, "state", None), "watermark_intake", None
+        )
+    except Exception:
+        _watermark_intake = None
+    _watermark_metadata = (
+        litellm_metadata if isinstance(litellm_metadata, dict) else {}
+    )
+    _watermark_egress = apply_request_watermark_egress(
+        body=completion_kwargs,
+        intake=_watermark_intake,
+        config=_get_runtime_text_watermark_config(),
+        endpoint=_watermark_endpoint_from_path("chat/completions", target_url),
+        direction="request",
+        metadata=_watermark_metadata,
+        litellm_metadata=_watermark_metadata,
+    )
+    if isinstance(getattr(_watermark_egress, "body", None), dict):
+        completion_kwargs = _watermark_egress.body
     completion_response = await litellm.acompletion(
         **completion_kwargs,
         api_key=api_key,
@@ -7178,6 +7787,18 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
         "api_base": "https://inference-api.nousresearch.com/v1",
         "litellm_metadata": litellm_metadata,
     }
+    _watermark_metadata = litellm_metadata if isinstance(litellm_metadata, dict) else {}
+    _watermark_egress = apply_request_watermark_egress(
+        body=completion_call_kwargs,
+        intake=getattr(getattr(request, "state", None), "watermark_intake", None),
+        config=_get_runtime_text_watermark_config(),
+        endpoint=_watermark_endpoint_from_path("chat/completions", target_url),
+        direction="request",
+        metadata=_watermark_metadata,
+        litellm_metadata=_watermark_metadata,
+    )
+    if isinstance(getattr(_watermark_egress, "body", None), dict):
+        completion_call_kwargs = _watermark_egress.body
     try:
         completion_response = await litellm.acompletion(**completion_call_kwargs)
     except Exception as exc:
@@ -7257,16 +7878,19 @@ async def _perform_codex_auto_agent_openrouter_completion_request(  # noqa: PLR0
         )
 
     if isinstance(request_body, dict):
-        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
-            strip_route_identity_from_request_body,
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_body import (
+            sanitize_wire_envelope,
         )
 
-        stripped_request_body = strip_route_identity_from_request_body(request_body)
-        if stripped_request_body is not request_body and isinstance(
-            stripped_request_body, dict
+        sanitized_request_body, _ = sanitize_wire_envelope(
+            request_body,
+            preserve_top_level_keys=("litellm_metadata",),
+        )
+        if sanitized_request_body is not request_body and isinstance(
+            sanitized_request_body, dict
         ):
             request_body.clear()
-            request_body.update(stripped_request_body)
+            request_body.update(sanitized_request_body)
     requested_model = request_body.get("model")
     upstream_adapter_model = _get_openrouter_completion_adapter_upstream_model(adapter_model) or adapter_model
     route_family = "codex_openrouter_completion_adapter"

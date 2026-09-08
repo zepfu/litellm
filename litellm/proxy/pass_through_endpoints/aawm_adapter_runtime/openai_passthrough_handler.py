@@ -33,6 +33,12 @@ from typing import (
 import httpx
 
 import litellm
+from litellm.llms.xai.route_descriptors import (
+    GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+    GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+    XAI_OAUTH_CREDENTIAL_FAMILY,
+    XAI_OAUTH_ROUTE_FAMILY,
+)
 from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
     load_text_watermark_config,
 )
@@ -310,6 +316,7 @@ class BaseOpenAIPassThroughHandler:
     async def _prepare_openai_oa_xai_context(
         *,
         endpoint: str,
+        request: "Request",
         request_body: dict[str, Any],
     ) -> Optional[tuple[str, str, dict[str, Any], str]]:
         rt = BaseOpenAIPassThroughHandler._get_runtime()
@@ -319,6 +326,7 @@ class BaseOpenAIPassThroughHandler:
             oa_xai_api_key,
         ) = await rt.prepare_oa_xai_passthrough_request_fn(
             request_body,
+            request=request,
             sanitize_responses_request=rt.is_openai_responses_endpoint_fn(
                 endpoint
             ),
@@ -595,6 +603,7 @@ class BaseOpenAIPassThroughHandler:
             oa_xai_context = (
                 await BaseOpenAIPassThroughHandler._prepare_openai_oa_xai_context(
                     endpoint=endpoint,
+                    request=request,
                     request_body=prepared_request_body,
                 )
             )
@@ -608,9 +617,9 @@ class BaseOpenAIPassThroughHandler:
                 ) = oa_xai_context
                 custom_llm_provider = litellm.LlmProviders.XAI
                 forward_headers = False
-                egress_credential_family = "xai"
+                egress_credential_family = XAI_OAUTH_CREDENTIAL_FAMILY
                 managed_xai_oauth_request = True
-                expected_target_family = "xai"
+                expected_target_family = XAI_OAUTH_ROUTE_FAMILY
             elif rt.is_openai_responses_endpoint_fn(endpoint):
                 grok_native_context = await BaseOpenAIPassThroughHandler._prepare_openai_grok_native_oauth_context(
                     endpoint=endpoint,
@@ -630,8 +639,8 @@ class BaseOpenAIPassThroughHandler:
                     api_key = None
                     custom_llm_provider = litellm.LlmProviders.XAI
                     forward_headers = False
-                    egress_credential_family = "xai"
-                    expected_target_family = "xai"
+                    egress_credential_family = GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY
+                    expected_target_family = GROK_NATIVE_OAUTH_ROUTE_FAMILY
                 elif is_codex_responses_request:
                     dispatched_response = await rt.try_dispatch_codex_request_fn(
                         endpoint=endpoint,
@@ -902,31 +911,68 @@ class BaseOpenAIPassThroughHandler:
                 if managed_xai_oauth_request
                 else BaseOpenAIPassThroughHandler._assemble_headers
             )
-            endpoint_func = rt.create_pass_through_route_fn(
-                endpoint=endpoint,
-                target=str(updated_url),
-                custom_headers=assemble_headers(
-                    api_key=api_key, request=request, extra_headers=extra_headers
-                ),
-                _forward_headers=forward_headers,
-                is_streaming_request=is_streaming_request,  # type: ignore
-                custom_llm_provider=custom_llm_provider.value
-                if isinstance(custom_llm_provider, litellm.LlmProviders)
-                else custom_llm_provider,
-                egress_credential_family=egress_credential_family,
-                expected_target_family=expected_target_family,
-                blocked_pass_through_prefixed_headers=(
-                    ["authorization", "api-key", "x-api-key"]
-                    if managed_xai_oauth_request
-                    else None
-                ),
-            )
-            response = await endpoint_func(
-                request,
-                fastapi_response,
-                user_api_key_dict,
-                custom_body=endpoint_custom_body,
-            )
+
+            def _build_endpoint_func(current_api_key: Optional[str]):
+                return rt.create_pass_through_route_fn(
+                    endpoint=endpoint,
+                    target=str(updated_url),
+                    custom_headers=assemble_headers(
+                        api_key=current_api_key,
+                        request=request,
+                        extra_headers=extra_headers,
+                    ),
+                    _forward_headers=forward_headers,
+                    is_streaming_request=is_streaming_request,  # type: ignore
+                    custom_llm_provider=custom_llm_provider.value
+                    if isinstance(custom_llm_provider, litellm.LlmProviders)
+                    else custom_llm_provider,
+                    egress_credential_family=egress_credential_family,
+                    expected_target_family=expected_target_family,
+                    managed_xai_oauth_request=managed_xai_oauth_request,
+                    blocked_pass_through_prefixed_headers=(
+                        ["authorization", "api-key", "x-api-key"]
+                        if managed_xai_oauth_request
+                        else None
+                    ),
+                )
+
+            endpoint_func = _build_endpoint_func(api_key)
+            try:
+                response = await endpoint_func(
+                    request,
+                    fastapi_response,
+                    user_api_key_dict,
+                    custom_body=endpoint_custom_body,
+                )
+            except Exception as exc:
+                refreshed_snapshot = None
+                if canonical_managed_oa_xai_request_body is not None:
+                    from litellm.llms.xai.oauth import (
+                        bind_xai_oauth_snapshot_to_request,
+                        get_xai_oauth_snapshot_from_request,
+                        reread_xai_oauth_snapshot_after_provider_401,
+                    )
+
+                    snapshot = get_xai_oauth_snapshot_from_request(request)
+                    if snapshot is not None:
+                        refreshed_snapshot = (
+                            await reread_xai_oauth_snapshot_after_provider_401(
+                                snapshot,
+                                exc,
+                                api_base=base_target_url,
+                            )
+                        )
+                if refreshed_snapshot is None:
+                    raise
+                bind_xai_oauth_snapshot_to_request(request, refreshed_snapshot)
+                api_key = refreshed_snapshot.access_token
+                endpoint_func = _build_endpoint_func(api_key)
+                response = await endpoint_func(
+                    request,
+                    fastapi_response,
+                    user_api_key_dict,
+                    custom_body=endpoint_custom_body,
+                )
             status_code = getattr(response, "status_code", None)
             if (
                 isinstance(status_code, int)

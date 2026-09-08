@@ -74,6 +74,38 @@ credentials on the request path. Direct Nous inference reads
 `LITELLM_NOUS_OAUTH_AUTH_FILE`, else `LITELLM_HERMES_AUTH_FILE`, else
 `AAWM_HERMES_AUTH_FILE`, else `~/.hermes/auth.json`.
 
+### Native Grok OIDC request snapshots
+
+Native Grok request preparation reads the OIDC credential and client-version
+cache through immutable, process-local snapshots. Descriptor metadata checks,
+file reads, and JSON validation run off the request event loop. Each
+credential/version path has a single-flight validation lock; a file-generation
+change or route-safety expiry invalidates the cached snapshot before a later
+request rebuilds it. Missing, malformed, ambiguous-scope, expired, or
+near-expiry records fail closed. Request handling never refreshes or writes
+these files.
+
+### Managed xAI OAuth request snapshots
+
+Managed xAI request preparation uses an immutable, process-local snapshot
+keyed by credential family, canonical auth-file target, and exact scope.
+Configuration resolution, descriptor metadata checks, file reads, and JSON
+validation run off the request event loop. Concurrent requests share one
+single-flight parse for a credential generation. A change in file identity or
+metadata, or entry into the route-safety expiry buffer, invalidates the cached
+snapshot before a later request rebuilds it. Missing, malformed, ambiguous-
+scope, expired, or near-expiry records fail closed; request handling never
+refreshes or writes the managed credential file.
+
+When managed xAI returns a provider-owned `401` before response commitment,
+alias routing, direct LiteLLM async routes, OpenAI passthrough, and the
+Anthropic compatibility adapters may make one recovery attempt. The retry
+reuses the exact request body and the exact bound file and scope. It is
+allowed only when a forced reread reports a changed trusted generation with
+the same non-secret account identity. An unchanged generation, a second
+`401`, missing or unproven account evidence, or a different account ends
+recovery; native Grok OIDC does not use this policy.
+
 ## OAuth refresh deadline contract
 
 Scheduled Grok OIDC, Codex OAuth, managed xAI OAuth, Kimi OAuth, and Nous
@@ -93,6 +125,28 @@ Kimi Code uses the existing host Kimi CLI credential in place. It is not a
 LiteLLM-owned second grant. A configured managed `kimi_code` route consumes the
 same credential read-only; possessing the file or naming an alias does not
 enable routing or transport by itself.
+
+### Managed xAI failure classification and generation recovery
+
+Managed xAI refresh reports only sanitized, stable error classes. The only
+terminal classes are the exact JSON `error` values `invalid_grant` and
+`refresh_token_reused` from an HTTP `400` token-endpoint response. They suppress
+another token-endpoint attempt only while the stable file/scope
+`credential_identity` remains the same and the nonsecret
+`credential_generation` remains unchanged. Transport failures, timeouts, DNS
+failures, retryable HTTP statuses, other HTTP failures, malformed responses,
+and local refresh failures remain bounded and retryable. Provider response
+bodies and descriptions are not retained in refresh summaries or observations.
+
+A failed managed xAI refresh remains authoritative through later not-due
+scheduler cycles and a passive local-file inspection of that same credential
+generation. The passive inspection records local usability separately and
+cannot manufacture a refresh or token-endpoint success timestamp. If it
+observes a different `credential_generation`, the sidecar reinspects the local
+file once before using that result. It only accepts the replacement when the
+stable `credential_identity` still matches. Only a successful actual refresh or
+a confirmed different usable generation clears failed-refresh state and
+terminal suppression; an unusable or stale passive snapshot does not.
 
 ## Portable default paths
 
@@ -140,17 +194,61 @@ Managed xAI request and sidecar consumers share one file/scope resolver. Every
 supplied auth-file and scope value must agree before precedence selects a
 source. The nonsecret `credential_identity` is derived only from the canonical
 auth-file target and exact scope, so it remains stable when the token record is
-rotated and does not disclose raw paths, tokens, or file metadata. A
-configuration conflict has no selected identity and fails before credential or
-provider I/O.
+rotated and does not disclose raw paths, tokens, or file metadata.
+`credential_generation` is a separate nonsecret digest of the published file
+generation and safe lifecycle metadata; it changes when the managed credential
+record is replaced. A configuration conflict has no selected identity and
+fails before credential or provider I/O.
 
-## Managed xAI egress headers
+### Managed xAI lifecycle states
 
-Managed `oa_xai/*` requests send the selected access token only as
-`Authorization: Bearer ...`. Inbound authorization and duplicate
-`api-key`/`x-api-key` headers are excluded from the managed request, while
-`forward_headers=False` remains in force. The generic OpenAI/Azure header
+Request readiness, refresh eligibility, and passive health use the same
+side-effect-free lifecycle evaluator. It distinguishes `structurally_valid`,
+`access_available`, `refresh_possible`, `expiry_available`, `refresh_due`,
+`route_usable`, and `terminal_unrefreshable`, with named states for malformed,
+access-unavailable, expiry-unavailable, expired, refresh-due, and fresh records.
+The route-safety buffer and proactive refresh threshold are separate controls:
+`refresh_due` does not by itself make a credential unusable for a request.
+Refresh-only records cannot serve requests, access-only records become terminal
+when due, and missing or malformed expiry remains degraded and eligible for
+safe refresh rather than being treated as permanently fresh.
+
+`AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS` is the writer's proactive refresh
+minimum. `LITELLM_XAI_OAUTH_REFRESH_BUFFER_SECONDS` is the consumer
+route-safety buffer shared by request readiness and sidecar health/eligibility.
+They are intentionally independent; helper calls without an explicit writer
+buffer retain the compatibility fallback from the writer setting to the
+consumer setting and then the 300-second default.
+
+Managed xAI refresh writers derive the default lock from that same canonical
+auth-file target, using its `.lock` sibling. This lets unrelated custom auth
+files refresh concurrently while all aliases for one file share one advisory
+lock. `AAWM_XAI_OAUTH_LOCK_FILE` and `--xai-oauth-lock-file` may be supplied
+only as aliases of that canonical sibling; arbitrary lock paths, lock
+symlinks, and auth-file collisions fail closed.
+
+## Managed xAI egress boundary (XAI-035/XAI-041)
+
+Managed `oa_xai/*` requests retain the `xai_oauth` credential family and the
+`xai_oauth_api` route family through transport, output guards, and egress
+telemetry. Native `xai/*`/Grok OIDC requests remain separate
+(`xai_grok_oidc` and `grok_cli_chat_proxy`); neither family may be substituted
+for the other.
+
+The managed API base must be HTTPS on `api.x.ai`, with no URL credentials,
+fragment, non-default port, or query string. The base may be the host root or
+`/v1`; the final request target is restricted to
+`/v1/chat/completions` or `/v1/responses`. Managed requests send the selected
+access token only as `Authorization: Bearer ...`. Inbound authorization and
+duplicate `api-key`/`x-api-key` headers are excluded from the managed request,
+while `forward_headers=False` remains in force. The generic OpenAI/Azure header
 assembler is unchanged for callers that require `api-key`.
+
+Managed xAI transport disables automatic redirect following and rejects a
+`3xx` response before any credential-bearing follow-up request. Egress
+rejections preserve the managed/native family distinction in sanitized
+telemetry; authorization values, access tokens, and full inbound headers are
+never recorded.
 
 ## Codex ordered account inventory (OPENAI-001)
 

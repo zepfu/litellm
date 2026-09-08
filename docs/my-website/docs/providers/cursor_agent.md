@@ -128,6 +128,7 @@ original name, arguments, and call ID.
 For stock `collaboration.wait_agent` and its supported namespace/tool aliases,
 Cursor's build/restoration copies narrow `timeout_ms` from `number` to `integer`
 to match the client's integer parser without changing the advertised names.
+The native Grok and managed xAI Codex fallback routes apply the same correction.
 Finite integral protobuf values are returned as JSON integers; fractional values
 and unrelated numeric arguments are not coerced. Canonical replay tool
 definitions remain unchanged.
@@ -159,10 +160,52 @@ credentials, resume/fork state, selected context, parent state, environment,
 or model parameters. Protocol framing and transport failures remain separate
 upstream errors.
 
+Before Codex alias ownership classification, LiteLLM restores the exact stock
+`NEW_TASK` envelope whose second `encrypted_content` part carries ordinary task
+text. Selection and execution receive the same normalized body, with that text
+visible in the existing `agent_message`. Other envelope shapes, encrypted
+reasoning, and provider-owned continuation state remain subject to the existing
+ownership guards.
+
+At the Cursor boundary, stock `agent_message` items with an author, recipient,
+and entirely plaintext `input_text` content become user messages in the derived
+chat history. The canonical Responses items are not rewritten. Mixed opaque
+content, malformed parts, and unsupported fields fail closed before egress.
+
 ## Continuations and ownership
 
 Ordinary external-tool continuations retain the Cursor session assignment while
-the provider-owned session is live. LiteLLM only permits provider-neutral
+the provider-owned session is live. Generic MCP/function calls (operation field
+11) return their actual output through Cursor's `McpResult` on the same open
+Run. Passive tool-progress notifications do not authorize another execution.
+Each bounded HTTP/2 read is fully consumed before pausing at a tool call, with
+later Connect frames retained in order and data acknowledged once. Received
+terminal or abort evidence prevents continuation result writes. Per-continuation
+transport evidence distinguishes result bytes handed to the writer from
+subsequent provider data; it contains no tool payloads or credentials.
+
+For stock full-history requests without `previous_response_id`, lookup requires
+the existing guarded owner identity, unchanged assignment and tools, and exact
+pending call IDs and qualified namespace/name identities. The trusted history
+prefix may contain earlier completed call/result pairs; only the newly
+completed pending outputs are sent back. Historical outputs are not executed
+again. A mismatched or ambiguous live session fails closed. Claimed and consumed
+generations remain non-replayable within the process-local registry's existing
+600-second/256-entry retention bounds. This is not durable deduplication across
+worker replacement or eviction.
+
+Missing retained state and recoverable failure of one live transport do not
+enter shared cooldown evidence or publication. Socket EOF after complete frames
+but before an accepted terminal is a transport failure; malformed framing and
+protocol messages do not qualify for this recovery. Failed live continuations carry
+separate invocation, result-write and provider-progress evidence; unknown write
+status is counted conservatively, not reported as no egress. Full-history
+recovery retains the existing single trailing call/output-pair grammar.
+Output-only recovery uses a separate snapshot of the stored history with no
+live session pointer. A consumed generation does not authorize another recovery
+attempt merely because its socket has closed.
+
+LiteLLM only permits provider-neutral
 fallback after reconstructing a complete, replay-safe request with the
 original assignment and completed tool history; partial incremental bodies,
 opaque Cursor state, unresolved tool calls, nested Cursor identifiers, and
@@ -181,6 +224,12 @@ has observed a structurally valid terminal response with `status=completed` and
 the response stream has reached its terminal lifecycle. Malformed, incomplete,
 failed, or prematurely closed responses release the pending reservation and do
 not establish durable affinity.
+
+When validation continues lazily after its bounded stream peek, it also rejects
+literal tool-call text before forwarding a successful terminal event. Already
+forwarded text is not replayed as executable calls; buffered-response repair
+remains separate. Rejection retains the existing malformed-tool-call error and
+cleanup path without promoting the pending owner.
 
 ## What this is not
 

@@ -19024,7 +19024,9 @@ def _grok_composer_literal_exec_command_response_payload() -> dict[str, Any]:
         "output": [
             {
                 "type": "message",
+                "id": "msg_grok_literal_tool_label",
                 "role": "assistant",
+                "status": "completed",
                 "content": [{"type": "output_text", "text": literal_text}],
             }
         ],
@@ -19270,7 +19272,7 @@ def test_codex_auto_agent_grok_native_mixed_literal_blocks_fail_closed():
     )
 
 
-def test_codex_auto_agent_grok_native_repairs_d1_439_fresh_tool_label_shape():
+def test_codex_auto_agent_grok_native_rejects_d1_439_non_executable_history():
     request_body = _grok_composer_exec_command_tool_request_body()
     response_body = _d1_439_literal_exec_response_payload()
 
@@ -19282,29 +19284,12 @@ def test_codex_auto_agent_grok_native_repairs_d1_439_fresh_tool_label_shape():
         request_body=request_body,
     )
 
-    assert repaired is not None
-    assert _is_codex_auto_agent_malformed_tool_call_text_output(repaired) is False
-    function_calls = [
-        item for item in repaired["output"] if isinstance(item, dict) and item.get("type") == "function_call"
-    ]
-    assert len(function_calls) == 2
-    assert function_calls[0]["name"] == "exec_command"
-    assert function_calls[0]["call_id"] == ("call-8b0b0b0b-8b95-4154-b622-a2359c41b8b5-composer_call_n9P0Z")
-    assert (
-        "from aawm_tap.domains.agent_context.keys import build_candidate_keys"
-        in (json.loads(function_calls[0]["arguments"])["cmd"])
-    )
-    assert "description" not in json.loads(function_calls[0]["arguments"])
-    assert function_calls[1]["call_id"] == ("call-8b0b0b0b-8b95-4154-b622-a2359c41b8b5-composer_call_3d1u4")
-    assert "sed -n" in json.loads(function_calls[1]["arguments"])["cmd"]
-    assert "description" not in json.loads(function_calls[1]["arguments"])
-    assert "Checking candidate key counts and how `expected_status` applies to dict rejections." in json.dumps(repaired)
-    assert "Context note" not in json.dumps(repaired)
-    assert "Tool label:" not in json.dumps(repaired)
-    assert "Input payload:" not in json.dumps(repaired)
+    assert repaired is None
+    assert response_body == _d1_439_literal_exec_response_payload()
+    assert _is_codex_auto_agent_malformed_tool_call_text_output(response_body) is True
 
 
-def test_codex_auto_agent_grok_native_repairs_d1_472_repeated_context_note_exec_command_blocks():
+def test_codex_auto_agent_grok_native_rejects_d1_472_repeated_non_executable_notes():
     request_body = _grok_composer_exec_command_tool_request_body()
     response_body = _d1_472_repeated_context_note_exec_command_response_payload()
 
@@ -19315,34 +19300,12 @@ def test_codex_auto_agent_grok_native_repairs_d1_472_repeated_context_note_exec_
         request_body=request_body,
     )
 
-    assert repaired is not None
-    assert _is_codex_auto_agent_malformed_tool_call_text_output(repaired) is False
-    rendered_repaired = json.dumps(repaired)
-    assert "Context note" not in rendered_repaired
-    assert "Tool label:" not in rendered_repaired
-    assert "Input payload:" not in rendered_repaired
-    assert "Correlation ref:" not in rendered_repaired
-
-    function_calls = [
-        item for item in repaired["output"] if isinstance(item, dict) and item.get("type") == "function_call"
-    ]
-    assert len(function_calls) == 3
-    assert all(item["name"] == "exec_command" for item in function_calls)
-    call_ids = [item["call_id"] for item in function_calls]
-    assert len(set(call_ids)) == len(call_ids)
-    assert call_ids[0] == ("call-f0c7a3d1-a991-47f5-9b64-7c8acfc0e274-composer_call_0w5Q6")
-    assert call_ids[1].endswith("_repaired_1")
-    assert call_ids[2].endswith("_repaired_2")
-    for item in function_calls:
-        args = json.loads(item["arguments"])
-        assert args["workdir"] == "/home/zepfu/projects/aegis"
-        assert isinstance(args["cmd"], str) and args["cmd"]
-    assert json.loads(function_calls[0]["arguments"])["cmd"] == (
-        "sed -n '220,320p' /home/zepfu/projects/aegis/scripts/criu/checkpointer.sh"
-    )
+    assert repaired is None
+    assert response_body == _d1_472_repeated_context_note_exec_command_response_payload()
+    assert _is_codex_auto_agent_malformed_tool_call_text_output(response_body) is True
 
 
-def test_codex_auto_agent_grok_native_repairs_literal_exec_with_fullwidth_tool_markers():
+def test_codex_auto_agent_grok_native_rejects_non_executable_history_with_fullwidth_markers():
     request_body = _grok_composer_exec_command_tool_request_body()
     response_body = {
         "id": "resp_d1_447_literal_exec",
@@ -19372,25 +19335,8 @@ def test_codex_auto_agent_grok_native_repairs_literal_exec_with_fullwidth_tool_m
         request_body=request_body,
     )
 
-    assert repaired is not None
-    assert _is_codex_auto_agent_malformed_tool_call_text_output(repaired) is False
-    rendered_repaired = json.dumps(repaired)
-    assert "Tool label:" not in rendered_repaired
-    assert "Input payload:" not in rendered_repaired
-    assert "tool▁call" not in rendered_repaired
-    function_calls = [
-        item for item in repaired["output"] if isinstance(item, dict) and item.get("type") == "function_call"
-    ]
-    assert len(function_calls) == 1
-    assert function_calls[0]["name"] == "exec_command"
-    assert function_calls[0]["call_id"] == ("call-cff12460-da48-4a4a-8a3c-8d639975400c-composer_call_3d1u4")
-    assert json.loads(function_calls[0]["arguments"]) == {
-        "cmd": (
-            "cd /tmp/aawm-tap-cd226-clean.Z7HrRj/repo && "
-            "git fetch origin develop 2>&1 && git rev-parse origin/develop"
-        ),
-        "workdir": "/tmp/aawm-tap-cd226-clean.Z7HrRj/repo",
-    }
+    assert repaired is None
+    assert _is_codex_auto_agent_malformed_tool_call_text_output(response_body) is True
 
 
 @pytest.mark.parametrize(

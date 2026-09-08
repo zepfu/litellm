@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, NoReturn, Optional, Protocol
 
+from litellm.llms.xai.route_descriptors import (
+    XAI_OAUTH_CREDENTIAL_FAMILY,
+    XAI_OAUTH_ROUTE_FAMILY,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     adapter_config,
     adapter_driver,
@@ -17,6 +22,7 @@ class PreparePassthroughRequest(Protocol):
         self,
         request_body: Payload,
         *,
+        request: Optional[object] = None,
         sanitize_responses_request: bool = False,
     ) -> Awaitable[tuple[bool, Optional[str], Optional[str]]]: ...
 
@@ -46,6 +52,36 @@ class Runtime:
     provider_target: Any
 
 
+def _prepare_passthrough_request_accepts_request(
+    callback: Callable[..., Any],
+) -> bool:
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return False
+    return "request" in signature.parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
+async def _prepare_passthrough_request(
+    runtime: Runtime,
+    request_body: Payload,
+    *,
+    request: object,
+    sanitize_responses_request: bool = False,
+) -> tuple[bool, Optional[str], Optional[str]]:
+    kwargs: dict[str, Any] = {
+        "sanitize_responses_request": sanitize_responses_request,
+    }
+    if _prepare_passthrough_request_accepts_request(
+        runtime.prepare_passthrough_request
+    ):
+        kwargs["request"] = request
+    return await runtime.prepare_passthrough_request(request_body, **kwargs)
+
+
 async def prepare_responses_route(
     *,
     runtime: Runtime,
@@ -73,8 +109,10 @@ async def prepare_responses_route(
         translated_request_body
     )
     try:
-        prepared, target_base_url, api_key = await runtime.prepare_passthrough_request(
+        prepared, target_base_url, api_key = await _prepare_passthrough_request(
+            runtime,
             translated_request_body,
+            request=request,
             sanitize_responses_request=True,
         )
     except Exception as exc:
@@ -106,6 +144,15 @@ async def prepare_responses_route(
         api_key=api_key,
         request=request,
     )
+    # Managed xAI accepts bearer authorization only. Keep provider-specific
+    # header ownership explicit even when a shared runtime assembles headers.
+    if isinstance(custom_headers, dict):
+        custom_headers = {
+            key: value
+            for key, value in custom_headers.items()
+            if str(key).lower() not in {"authorization", "api-key", "x-api-key"}
+        }
+        custom_headers["authorization"] = f"Bearer {api_key}"
 
     def handle_exception(exc: Exception) -> None:
         if use_alias_candidate_probe and runtime.unavailable_detail(exc) is not None:
@@ -120,8 +167,14 @@ async def prepare_responses_route(
         perform_kwargs={
             "forward_headers": False,
             "custom_llm_provider": runtime.provider,
-            "egress_credential_family": "xai",
-            "expected_target_family": "xai",
+            "egress_credential_family": XAI_OAUTH_CREDENTIAL_FAMILY,
+            "expected_target_family": XAI_OAUTH_ROUTE_FAMILY,
+            "managed_xai_oauth_request": True,
+            "blocked_pass_through_prefixed_headers": [
+                "authorization",
+                "api-key",
+                "x-api-key",
+            ],
         },
         handle_exception=handle_exception,
     )
@@ -147,8 +200,10 @@ async def prepare_completion_route(
         span_name=config.span_name,
         target_endpoint_label=config.target_endpoint_label,
     )
-    prepared, target_base_url, api_key = await runtime.prepare_passthrough_request(
-        prepared_request_body
+    prepared, target_base_url, api_key = await _prepare_passthrough_request(
+        runtime,
+        prepared_request_body,
+        request=request,
     )
     if not prepared or target_base_url is None or api_key is None:
         raise Exception(
@@ -177,5 +232,8 @@ async def prepare_completion_route(
         api_key=api_key,
         api_base=target_base_url,
         client_requested_stream=client_requested_stream,
-        perform_kwargs={"custom_llm_provider": runtime.provider},
+        perform_kwargs={
+            "custom_llm_provider": runtime.provider,
+            "managed_xai_oauth_request": True,
+        },
     )

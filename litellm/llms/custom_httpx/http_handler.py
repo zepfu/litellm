@@ -113,6 +113,28 @@ def _prepare_request_data_and_content(
     return request_data, request_content
 
 
+def _retain_async_client_until_response_close(
+    response: httpx.Response,
+    client: httpx.AsyncClient,
+) -> httpx.Response:
+    """Keep a replacement client alive until its streaming response closes."""
+
+    original_aclose = response.aclose
+    client_closed = False
+
+    async def _close_response_and_client() -> None:
+        nonlocal client_closed
+        try:
+            await original_aclose()
+        finally:
+            if not client_closed:
+                client_closed = True
+                await client.aclose()
+
+    setattr(response, "aclose", _close_response_and_client)
+    return response
+
+
 # Cache for SSL contexts to avoid creating duplicate contexts with the same configuration
 # Key: tuple of (cafile, ssl_security_level, ssl_ecdh_curve)
 # Value: ssl.SSLContext
@@ -443,6 +465,8 @@ class AsyncHTTPHandler:
         logging_obj: Optional[LiteLLMLoggingObject] = None,
         files: Optional[RequestFiles] = None,
         content: Any = None,
+        follow_redirects: Optional[bool] = None,
+        validate_request_fn: Optional[Callable[[httpx.Request], None]] = None,
     ):
         start_time = time.time()
         try:
@@ -465,7 +489,12 @@ class AsyncHTTPHandler:
                 files=files,
                 content=request_content,
             )
-            response = await self.client.send(req, stream=stream)
+            send_kwargs: Dict[str, Any] = {"stream": stream}
+            if follow_redirects is not None:
+                send_kwargs["follow_redirects"] = follow_redirects
+            if validate_request_fn is not None:
+                validate_request_fn(req)
+            response = await self.client.send(req, **send_kwargs)
             response.raise_for_status()
             return response
         except (httpx.RemoteProtocolError, httpx.ConnectError):
@@ -474,7 +503,7 @@ class AsyncHTTPHandler:
                 timeout=timeout, event_hooks=self.event_hooks
             )
             try:
-                return await self.single_connection_post_request(
+                response = await self.single_connection_post_request(
                     url=url,
                     client=new_client,
                     data=data,
@@ -482,9 +511,19 @@ class AsyncHTTPHandler:
                     params=params,
                     headers=headers,
                     stream=stream,
+                    follow_redirects=follow_redirects,
+                    validate_request_fn=validate_request_fn,
                 )
-            finally:
+            except BaseException:
                 await new_client.aclose()
+                raise
+            if stream:
+                return _retain_async_client_until_response_close(
+                    response=response,
+                    client=new_client,
+                )
+            await new_client.aclose()
+            return response
         except httpx.TimeoutException as e:
             end_time = time.time()
             time_delta = round(end_time - start_time, 3)
@@ -709,6 +748,8 @@ class AsyncHTTPHandler:
         headers: Optional[dict] = None,
         stream: bool = False,
         content: Any = None,
+        follow_redirects: Optional[bool] = None,
+        validate_request_fn: Optional[Callable[[httpx.Request], None]] = None,
     ):
         """
         Making POST request for a single connection client.
@@ -721,7 +762,12 @@ class AsyncHTTPHandler:
         req = client.build_request(
             "POST", url, data=request_data, json=json, params=params, headers=headers, content=request_content  # type: ignore
         )
-        response = await client.send(req, stream=stream)
+        send_kwargs: Dict[str, Any] = {"stream": stream}
+        if follow_redirects is not None:
+            send_kwargs["follow_redirects"] = follow_redirects
+        if validate_request_fn is not None:
+            validate_request_fn(req)
+        response = await client.send(req, **send_kwargs)
         response.raise_for_status()
         return response
 
@@ -1021,6 +1067,8 @@ class HTTPHandler:
         files: Optional[Union[dict, RequestFiles]] = None,
         content: Any = None,
         logging_obj: Optional[LiteLLMLoggingObject] = None,
+        follow_redirects: Optional[bool] = None,
+        validate_request_fn: Optional[Callable[[httpx.Request], None]] = None,
     ):
         try:
             # Prepare data/content parameters to prevent httpx DeprecationWarning (memory leak fix)
@@ -1044,7 +1092,12 @@ class HTTPHandler:
                 req = self.client.build_request(
                     "POST", url, data=request_data, json=json, params=params, headers=headers, files=files, content=request_content  # type: ignore
                 )
-            response = self.client.send(req, stream=stream)
+            send_kwargs: Dict[str, Any] = {"stream": stream}
+            if follow_redirects is not None:
+                send_kwargs["follow_redirects"] = follow_redirects
+            if validate_request_fn is not None:
+                validate_request_fn(req)
+            response = self.client.send(req, **send_kwargs)
             response.raise_for_status()
             return response
         except httpx.TimeoutException:

@@ -151,6 +151,63 @@ observability, routing, authentication, and session metadata remain in the
 separate `litellm_metadata` structure and are never merged into caller
 top-level `metadata`.
 
+## Native Grok OIDC request snapshots
+
+Native Grok routes use immutable, validated snapshots for the OIDC credential
+and the installed client-version cache. File metadata checks, reads, and JSON
+validation run off the request event loop, with one in-flight validation per
+credential or version path. Atomic file replacement invalidates the matching
+snapshot on the next request; missing, malformed, ambiguous-scope, expired,
+or near-expiry records fail closed. LiteLLM does not refresh or write native
+credential files during request handling.
+
+## Managed OAuth Credential Snapshots
+
+Managed `oa_xai/*` request preparation uses an immutable, generation-aware
+snapshot of the configured credential file and exact scope. Configuration
+resolution, file metadata checks, reads, and JSON parsing run off the request
+event loop, and concurrent requests share one in-flight validation for the
+same generation. Atomic replacement or route-safety expiry invalidates the
+cached snapshot before a later request rebuilds it. Missing, malformed,
+ambiguous-scope, expired, and near-expiry records fail closed; request handling
+does not refresh or write the managed credential file.
+
+For a provider-owned managed xAI `401` before response bytes are committed,
+LiteLLM may reread the exact bound file and scope and retry once on alias,
+direct async, OpenAI passthrough, or Anthropic compatibility routes. The
+reread must produce a changed trusted generation with the same non-secret
+account identity, and the retry reuses the original request body. Unchanged
+generations, a second `401`, missing or unproven account evidence, and
+different-account material are not retried. Native `xai/*` Grok OIDC traffic
+does not use this managed OAuth recovery.
+
+## Rate-limit handling
+
+For an xAI provider `429`, LiteLLM uses a valid `Retry-After` value first.
+Otherwise it uses the request or token reset header for the exhausted
+dimension. If the response does not identify the exhausted dimension and both
+dimension-specific values are valid, LiteLLM waits for the later reset.
+Bounded generic reset headers are used only when no dimension-specific reset
+is available.
+
+Reset values may be bounded durations, epoch timestamps, ISO timestamps, or
+HTTP-date values. Malformed, expired, non-finite, and unreasonably future
+values are ignored instead of creating a durable cooldown.
+
+Native Grok OIDC and managed xAI OAuth responses keep separate rate-limit
+observation identities. Native headers are captured under
+`xai_grok_oidc_response_headers` and labeled with the `xai_grok_oidc`
+credential family and `grok-build` client family; managed headers use
+`xai_oauth_response_headers` and the `xai_oauth` client family. A legacy
+native observation under the managed key is read only when native metadata
+proves ownership, and authorization or unrelated headers are excluded.
+
+When xAI supplies quota limit or remaining values without provider reset or
+billing-period evidence, LiteLLM leaves the reset time and quota period
+unknown. It does not synthesize a monthly boundary that could drive cooldown,
+availability, rollover, or forecasting. Explicit provider reset and billing
+period evidence remains authoritative.
+
 ## OAuth Credential Scope Selection
 
 Managed xAI OAuth and native Grok OIDC credential files must contain the exact
@@ -168,6 +225,33 @@ precedence is an explicit configured scope, `AAWM_XAI_OAUTH_SCOPE`,
 configured values fail closed. Resolution metadata uses a nonsecret
 `credential_identity` derived from the canonical file target and exact scope;
 credential contents and raw paths are never included in that identity.
+Refresh and passive-health metadata also carries a separate nonsecret
+`credential_generation` digest for the published file generation; token values
+are excluded from both identifiers.
+
+Managed credential lifecycle is evaluated by one side-effect-free policy shared
+by request readiness, refresh eligibility, and passive health. It reports
+structural validity, access availability, expiry availability, refresh
+possibility, refresh due state, route usability, and terminal unrefreshability.
+The route-safety buffer controls whether an access token may be sent; the
+proactive refresh threshold is a separate value derived from issued lifetime
+and the configured minimum. A credential can therefore be `refresh_due` while
+remaining `route_usable`, and refresh-only, access-only, malformed-expiry, and
+expired records receive distinct lifecycle states. Missing or malformed expiry
+never becomes permanently fresh.
+
+`AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS` controls writer-side proactive refresh.
+`LITELLM_XAI_OAUTH_REFRESH_BUFFER_SECONDS` controls the route-safety deadline
+used by request handling and sidecar health/eligibility. These settings are
+independent; an omitted writer buffer retains the compatibility fallback to
+the consumer setting and then the 300-second default.
+
+Managed xAI refreshes derive their default advisory lock from the canonical
+resolved auth file, using the file's `.lock` sibling. Different custom auth
+files use independent locks, while aliases for one file coordinate on one
+lock. Set `AAWM_XAI_OAUTH_LOCK_FILE` or `--xai-oauth-lock-file` only to an
+alias of that canonical sibling; arbitrary paths, lock symlinks, and auth-file
+lock collisions fail closed.
 
 ## Proxy Retry and Quota Behavior
 
@@ -202,6 +286,31 @@ responses. Name collisions use the established deterministic policy; retries
 start from the caller's original tool definitions, so conversions are not
 applied twice.
 
+For stock `collaboration.wait_agent` and its supported namespace/tool aliases,
+native Grok and managed xAI Codex routes narrow `timeout_ms` from `number` to
+`integer` in derived build/restoration schemas to match the client's integer
+parser. Finite integral response values become JSON integers in both JSON and
+SSE output. Fractional values, unrelated numeric arguments, original tool names,
+and the caller's replay definitions remain unchanged.
+
+Native Grok and managed xAI Codex routes repair supported literal tool-call
+text in JSON and fully buffered Responses output. Context notes explicitly
+marked as historical, non-executable data are never converted into calls;
+they remain unchanged for malformed-output validation. Once a stream is being
+forwarded lazily, malformed tool-call text fails closed before its successful
+terminal event and deferred session-owner promotion. LiteLLM does not replay
+already forwarded text as executable calls or buffer an unbounded response
+to repair it.
+
+Codex auto-agent native Grok and managed xAI Responses streams bind the shared
+final-wire coordinator at the final response boundary, after bounded
+output-guard and payload processing but before ASGI delivery. Terminal content
+validation settles before the coordinator emits a terminal event, while
+prefetch rejection/cancellation uses the same once-only cleanup and background
+owner. ASGI delivery, terminal selection, `[DONE]` ordering, and upstream
+closure therefore share one lifecycle. A post-first-byte timeout emits one
+standard terminal failure event and cannot re-enter provider fallback.
+
 ## Responses API Instructions
 
 xAI Responses does not accept OpenAI's top-level `instructions` field. On
@@ -220,6 +329,15 @@ capability and a native Grok route family. Managed `oa_xai/*`, Cursor, Composer,
 Grok Build, and unprofiled future models do not inherit the native policy.
 Malformed native output remains request-local and does not create a durable
 candidate cooldown.
+
+Native `xai/grok-4.6` also declares `native_responses_tool_history`. Its native
+OIDC request projection preserves typed `function_call` and
+`function_call_output` pairs, their order, names, and `call_id` correlation.
+Arguments remain JSON strings; object arguments and outputs are serialized
+without replacing their contents. Output-only item IDs and status fields are
+omitted. Canonical replay remains unchanged. This replaces synthesized
+assistant history notes only on this capability-enabled native route;
+managed OAuth and other models retain their existing compatibility policy.
 
 ## Native Grok Continuation Recovery
 
