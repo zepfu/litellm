@@ -90,6 +90,18 @@ export interface UsageExclusions {
   rejectedBeforeStart: number;
 }
 
+export interface UsageActivityMetric {
+  count: number;
+  completed: number;
+  uncertain: number;
+  excluded: number;
+}
+
+export interface UsageActivity {
+  last24h: UsageActivityMetric;
+  last7d: UsageActivityMetric;
+}
+
 export interface UsageReport {
   snapshotVersion: typeof USAGE_REPORT_SNAPSHOT_VERSION;
   account: string;
@@ -97,6 +109,7 @@ export interface UsageReport {
   modelDimension: UsageModelDimension;
   window: UsageWindow;
   activityOnly: boolean;
+  activity: UsageActivity;
   definite: {
     total: number;
     completed: number;
@@ -130,7 +143,7 @@ export function buildUsageReport(
   const asOfDate = new Date(request.asOf);
   const asOf = asOfDate.toISOString();
   const selected = selectedWindow(request, asOfDate);
-  const quota = buildQuotaEstimate(snapshot);
+  const quota = selected.window.known ? buildQuotaEstimate(snapshot) : null;
 
   const output: UsageReport = {
     snapshotVersion: USAGE_REPORT_SNAPSHOT_VERSION,
@@ -139,14 +152,19 @@ export function buildUsageReport(
     modelDimension: request.modelDimension,
     window: selected.window,
     activityOnly: !selected.window.known,
+    activity: { last24h: createActivityMetric(), last7d: createActivityMetric() },
     definite: {
       total: 0,
       completed: 0,
-      byRequestedFamily: {},
-      byRecordedFinalFamily: {},
-      byResolvedFamily: {},
-      byDimension: {},
-      raw: { requested: {}, recordedFinal: {}, resolved: {} },
+      byRequestedFamily: createCounts(),
+      byRecordedFinalFamily: createCounts(),
+      byResolvedFamily: createCounts(),
+      byDimension: createCounts(),
+      raw: {
+        requested: createCounts(),
+        recordedFinal: createCounts(),
+        resolved: createCounts(),
+      },
       modelMismatches: 0,
     },
     uncertain: {
@@ -255,7 +273,49 @@ export function buildUsageReport(
     }
   }
 
+  addActivityMetrics(output.activity, snapshot.attempts, asOfDate);
   return output;
+}
+
+function createActivityMetric(): UsageActivityMetric {
+  return { count: 0, completed: 0, uncertain: 0, excluded: 0 };
+}
+
+function addActivityMetrics(
+  activity: UsageActivity,
+  attempts: readonly ReconstructedAttempt[],
+  asOf: Date,
+): void {
+  const asOfMs = asOf.getTime();
+  const periods = [
+    { metric: activity.last24h, durationMs: 24 * 60 * 60 * 1000 },
+    { metric: activity.last7d, durationMs: 7 * 24 * 60 * 60 * 1000 },
+  ];
+
+  for (const attempt of attempts) {
+    if (!attempt.generationStarted && !attempt.completedAnswer) {
+      continue;
+    }
+
+    const attemptMs = new Date(attempt.attemptTime ?? "").getTime();
+    if (!Number.isFinite(attemptMs)) {
+      for (const { metric } of periods) {
+        metric.uncertain += 1;
+      }
+      continue;
+    }
+
+    for (const { metric, durationMs } of periods) {
+      if (attemptMs < asOfMs - durationMs || attemptMs > asOfMs) {
+        metric.excluded += 1;
+      } else {
+        metric.count += 1;
+        if (attempt.completedAnswer) {
+          metric.completed += 1;
+        }
+      }
+    }
+  }
 }
 
 function validateSnapshot(snapshot: UsageReportSnapshot): void {
@@ -529,6 +589,10 @@ function incrementKey(
     return;
   }
   target[value] = (target[value] ?? 0) + 1;
+}
+
+function createCounts(): Record<string, number> {
+  return Object.create(null);
 }
 
 function incrementRaw(
