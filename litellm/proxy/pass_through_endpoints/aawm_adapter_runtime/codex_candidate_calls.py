@@ -2539,6 +2539,133 @@ def _cursor_replay_canonicalize_stock_web_search(
     return dict(tool)
 
 
+_CURSOR_REPLAY_NAMESPACE_TOOL_NAMES = {
+    "collaboration": frozenset(
+        {
+            "followup_task",
+            "interrupt_agent",
+            "list_agents",
+            "send_message",
+            "spawn_agent",
+            "wait_agent",
+        }
+    ),
+    "multi_agent_v1": frozenset(
+        {
+            "close_agent",
+            "resume_agent",
+            "send_input",
+            "spawn_agent",
+            "wait_agent",
+        }
+    ),
+}
+_CURSOR_REPLAY_NAMESPACE_NAME_ALIASES = {
+    "functions.collaboration": "collaboration",
+    "functions.multi_agent_v1": "multi_agent_v1",
+}
+_CURSOR_REPLAY_NAMESPACE_CHILD_NAME_ALIASES = {"wait": "wait_agent"}
+_CURSOR_REPLAY_NAMESPACE_ALLOWED_KEYS = frozenset(
+    {"type", "name", "description", "tools"}
+)
+_CURSOR_REPLAY_NAMESPACE_CHILD_ALLOWED_KEYS = frozenset(
+    {
+        "type",
+        "name",
+        "description",
+        "parameters",
+        "strict",
+        "defer_loading",
+    }
+)
+
+
+def _cursor_replay_canonicalize_stock_namespace(
+    tool: Mapping[str, Any],
+    *,
+    tool_adapter: Any,
+) -> Optional[dict[str, Any]]:
+    if set(tool) - _CURSOR_REPLAY_NAMESPACE_ALLOWED_KEYS:
+        return None
+    if tool.get("type") != "namespace":
+        return None
+
+    raw_namespace_name = tool.get("name")
+    if not isinstance(raw_namespace_name, str) or not raw_namespace_name.strip():
+        return None
+    namespace_name = raw_namespace_name.strip()
+    namespace_key = _CURSOR_REPLAY_NAMESPACE_NAME_ALIASES.get(
+        namespace_name,
+        namespace_name,
+    )
+    allowed_child_names = _CURSOR_REPLAY_NAMESPACE_TOOL_NAMES.get(namespace_key)
+    if allowed_child_names is None:
+        return None
+
+    description = tool.get("description")
+    if description is not None and not isinstance(description, str):
+        return None
+
+    children = tool.get("tools")
+    if not isinstance(children, list):
+        return None
+
+    seen_child_names: set[str] = set()
+    for child in children:
+        if not isinstance(child, Mapping):
+            return None
+        if set(child) - _CURSOR_REPLAY_NAMESPACE_CHILD_ALLOWED_KEYS:
+            return None
+        if child.get("type") != "function":
+            return None
+
+        raw_child_name = child.get("name")
+        if not isinstance(raw_child_name, str) or not raw_child_name.strip():
+            return None
+        child_name = raw_child_name.strip()
+        canonical_child_name = _CURSOR_REPLAY_NAMESPACE_CHILD_NAME_ALIASES.get(
+            child_name,
+            child_name,
+        )
+        if canonical_child_name not in allowed_child_names:
+            return None
+        if canonical_child_name in seen_child_names:
+            return None
+        seen_child_names.add(canonical_child_name)
+
+        if "defer_loading" in child and not isinstance(
+            child["defer_loading"],
+            bool,
+        ):
+            return None
+
+        validation_child = dict(child)
+        validation_child["name"] = child_name
+        validation_child.pop("defer_loading", None)
+        validation_child.setdefault("parameters", {})
+        validation_child.setdefault("strict", None)
+        try:
+            validated_child = tool_adapter.validate_python(
+                validation_child,
+                strict=True,
+            )
+            canonical_child = json.loads(tool_adapter.dump_json(validated_child))
+        except Exception:  # noqa: BLE001
+            return None
+        if canonical_child != validation_child:
+            return None
+
+    try:
+        canonical_tool = json.loads(json.dumps(dict(tool)))
+    except Exception:  # noqa: BLE001
+        return None
+    return (
+        canonical_tool
+        if isinstance(canonical_tool, dict) and canonical_tool == dict(tool)
+        else None
+    )
+
+
 def _cursor_replay_provider_neutral_tools(
     replay_tools: Any,
 ) -> _CursorReplayValidationResult:
@@ -2627,7 +2754,19 @@ def _cursor_replay_provider_neutral_tools(
             validation_tool["name"] = name.strip()
             validation_tool.setdefault("parameters", {})
             validation_tool.setdefault("strict", None)
-        if validation_tool.get("type") == "tool_search":
+        if validation_tool.get("type") == "namespace":
+            canonical_tool = _cursor_replay_canonicalize_stock_namespace(
+                validation_tool,
+                tool_adapter=tool_adapter,
+            )
+            if canonical_tool is None:
+                return _cursor_replay_rejected(
+                    "provider_neutral_tools",
+                    "tool_validation",
+                    tool_index=tool_index,
+                    tool=original_tool,
+                )
+        elif validation_tool.get("type") == "tool_search":
             canonical_tool = _cursor_replay_canonicalize_stock_tool_search(
                 validation_tool
             )
