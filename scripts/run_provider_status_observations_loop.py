@@ -398,6 +398,11 @@ DEFAULT_CHATGPT_CONVERSATION_INIT_SOURCE_PATH = (
 )
 DEFAULT_CHATGPT_CONVERSATION_INIT_URL = CHATGPT_CONVERSATION_INIT_DEFAULT_URL
 DEFAULT_CHATGPT_CONVERSATION_INIT_BROWSER_TIMEOUT_SECONDS = 30.0
+DEFAULT_CHATGPT_USAGE_BRIDGE_ENABLED = False
+DEFAULT_CHATGPT_USAGE_BRIDGE_INTERVAL_SECONDS = 600.0
+DEFAULT_CHATGPT_USAGE_BRIDGE_WORKER_SCRIPT = (
+    "/app/scripts/chatgpt_chat_usage_capture/ts/dist/worker/main.js"
+)
 CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV = (
     "AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS"
 )
@@ -1592,6 +1597,16 @@ class ProviderStatusLoopConfig:
     chatgpt_conversation_init_account_bindings: Optional[
         Dict[str, "ChatGPTConversationInitAccountBinding"]
     ] = None
+    chatgpt_usage_bridge_enabled: bool = DEFAULT_CHATGPT_USAGE_BRIDGE_ENABLED
+    chatgpt_usage_bridge_interval_seconds: float = (
+        DEFAULT_CHATGPT_USAGE_BRIDGE_INTERVAL_SECONDS
+    )
+    chatgpt_usage_bridge_node_executable: str = os.getenv(
+        "AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE", "node"
+    )
+    chatgpt_usage_bridge_worker_script: str = (
+        DEFAULT_CHATGPT_USAGE_BRIDGE_WORKER_SCRIPT
+    )
     grok_billing_url: str = DEFAULT_GROK_BILLING_URL
     grok_billing_client_version: Optional[str] = None
     grok_billing_client_version_source: Optional[str] = None
@@ -1698,6 +1713,7 @@ class SidecarTaskState:
     xai_reset_poll_last_attempt_monotonic: Optional[float] = None
     cursor_agent_usage_last_attempt_monotonic: Optional[float] = None
     chatgpt_conversation_init_last_attempt_monotonic: Optional[float] = None
+    chatgpt_usage_bridge_last_attempt_monotonic: Optional[float] = None
     chatgpt_conversation_init_cooldown_until_monotonic_by_session: Dict[
         str, float
     ] = dataclass_field(default_factory=dict)
@@ -3662,6 +3678,57 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "legacy file-only conversation-init polling."
         ),
     )
+    chatgpt_usage_bridge_group = parser.add_mutually_exclusive_group()
+    chatgpt_usage_bridge_group.add_argument(
+        "--chatgpt-usage-bridge-enabled",
+        dest="chatgpt_usage_bridge_enabled",
+        action="store_true",
+        default=_env_bool(
+            "AAWM_CHATGPT_USAGE_BRIDGE_ENABLED",
+            DEFAULT_CHATGPT_USAGE_BRIDGE_ENABLED,
+        ),
+        help=(
+            "Run the bounded ChatGPT usage worker bridge. Disabled by default. "
+            "Defaults to AAWM_CHATGPT_USAGE_BRIDGE_ENABLED or false."
+        ),
+    )
+    chatgpt_usage_bridge_group.add_argument(
+        "--no-chatgpt-usage-bridge",
+        dest="chatgpt_usage_bridge_enabled",
+        action="store_false",
+        help="Disable the ChatGPT usage worker bridge.",
+    )
+    parser.add_argument(
+        "--chatgpt-usage-bridge-interval-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_CHATGPT_USAGE_BRIDGE_INTERVAL_SECONDS",
+            DEFAULT_CHATGPT_USAGE_BRIDGE_INTERVAL_SECONDS,
+        ),
+        help=(
+            "Minimum seconds between ChatGPT usage bridge attempts. Defaults "
+            "to AAWM_CHATGPT_USAGE_BRIDGE_INTERVAL_SECONDS or 600."
+        ),
+    )
+    parser.add_argument(
+        "--chatgpt-usage-bridge-node-executable",
+        default=os.getenv("AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE", "node"),
+        help=(
+            "Node executable for the bounded worker. Defaults to "
+            "AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE or node."
+        ),
+    )
+    parser.add_argument(
+        "--chatgpt-usage-bridge-worker-script",
+        default=os.getenv(
+            "AAWM_CHATGPT_USAGE_BRIDGE_WORKER_SCRIPT",
+            DEFAULT_CHATGPT_USAGE_BRIDGE_WORKER_SCRIPT,
+        ),
+        help=(
+            "Bounded worker JavaScript entrypoint. Defaults to "
+            "AAWM_CHATGPT_USAGE_BRIDGE_WORKER_SCRIPT or the packaged image path."
+        ),
+    )
 
     codex_credit_group = parser.add_mutually_exclusive_group()
     codex_credit_group.add_argument(
@@ -3842,6 +3909,7 @@ def _validate_config_args(args: argparse.Namespace) -> None:
     _validate_xai_reset_poll_config_args(args)
     _validate_cursor_agent_usage_config_args(args)
     _validate_chatgpt_conversation_init_config_args(args)
+    _validate_chatgpt_usage_bridge_config_args(args)
     _validate_observability_anomaly_scan_config_args(args)
     _validate_codex_reset_credit_poll_config_args(args)
 
@@ -4102,6 +4170,19 @@ def _validate_chatgpt_conversation_init_config_args(
         raise SystemExit("--chatgpt-conversation-init-url must not be empty")
 
 
+def _validate_chatgpt_usage_bridge_config_args(
+    args: argparse.Namespace,
+) -> None:
+    if args.chatgpt_usage_bridge_interval_seconds <= 0:
+        raise SystemExit(
+            "--chatgpt-usage-bridge-interval-seconds must be greater than 0"
+        )
+    if not str(args.chatgpt_usage_bridge_node_executable).strip():
+        raise SystemExit("--chatgpt-usage-bridge-node-executable must not be empty")
+    if not str(args.chatgpt_usage_bridge_worker_script).strip():
+        raise SystemExit("--chatgpt-usage-bridge-worker-script must not be empty")
+
+
 def _validate_grok_billing_config_args(args: argparse.Namespace) -> None:
     if args.grok_billing_poll_interval_seconds <= 0:
         raise SystemExit("--grok-billing-poll-interval-seconds must be greater than 0")
@@ -4253,6 +4334,16 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         grok_oidc_http_timeout_seconds=args.grok_oidc_http_timeout_seconds,
         codex_oauth_refresh_enabled=args.codex_oauth_refresh_enabled,
         codex_oauth_inventory=codex_oauth_inventory,
+        chatgpt_usage_bridge_enabled=args.chatgpt_usage_bridge_enabled,
+        chatgpt_usage_bridge_interval_seconds=(
+            args.chatgpt_usage_bridge_interval_seconds
+        ),
+        chatgpt_usage_bridge_node_executable=str(
+            args.chatgpt_usage_bridge_node_executable
+        ).strip(),
+        chatgpt_usage_bridge_worker_script=str(
+            args.chatgpt_usage_bridge_worker_script
+        ).strip(),
         codex_auth_file=resolved_codex_auth_file,
         codex_auth_file_source=resolved_codex_auth_file_source,
         codex_lock_file=args.codex_lock_file,
@@ -16002,6 +16093,135 @@ def _run_observability_anomaly_scan_task(
     }
 
 
+def _run_chatgpt_usage_bridge_task(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+) -> Optional[Dict[str, Any]]:
+    if not config.chatgpt_usage_bridge_enabled:
+        return None
+    last_attempt = state.chatgpt_usage_bridge_last_attempt_monotonic
+    if (
+        last_attempt is not None
+        and now_monotonic - last_attempt
+        < config.chatgpt_usage_bridge_interval_seconds
+    ):
+        return None
+    state.chatgpt_usage_bridge_last_attempt_monotonic = now_monotonic
+    observed_at = datetime.now(timezone.utc)
+    summary: Dict[str, Any] = {
+        "attempted": True,
+        "ok": False,
+        "coverageIncomplete": True,
+        "historyContract": "unavailable",
+        "errorClass": None,
+        "errorMessage": None,
+    }
+    try:
+        from scripts.chatgpt_chat_usage_capture.ts_bridge import (
+            BridgeConfig,
+            TsWorkerBridge,
+        )
+        from scripts.chatgpt_chat_usage_capture.pg_collector_state import (
+            PgCollectorState,
+        )
+        from scripts.chatgpt_chat_usage_capture.pg_ledger import (
+            LedgerScope,
+            PgLedger,
+        )
+
+        raw_bindings = os.getenv(
+            "AAWM_CHATGPT_USAGE_BRIDGE_ACCOUNT_BINDINGS",
+            "",
+        )
+        parsed = json.loads(raw_bindings or "{}")
+        if not isinstance(parsed, dict) or not parsed:
+            raise ValueError(
+                "AAWM_CHATGPT_USAGE_BRIDGE_ACCOUNT_BINDINGS must be a nonempty JSON object"
+            )
+        bindings: Dict[str, Dict[str, str]] = {}
+        for account_id, raw_scope in parsed.items():
+            if not isinstance(account_id, str) or not account_id.strip():
+                raise ValueError("bridge account id must be a nonempty string")
+            if not isinstance(raw_scope, dict):
+                raise ValueError("bridge account scope must be an object")
+            allowed = {
+                "provider",
+                "providerUserId",
+                "workspaceId",
+                "quotaOwnerId",
+                "surface",
+                "profileId",
+            }
+            if set(raw_scope) - allowed:
+                raise ValueError("bridge account scope contains an unsupported field")
+            provider = str(raw_scope.get("provider") or "openai").strip()
+            surface = str(raw_scope.get("surface") or "chat").strip()
+            profile_id = str(raw_scope.get("profileId") or account_id).strip()
+            bindings[account_id] = {
+                "provider": provider,
+                "provider_user_id": str(raw_scope.get("providerUserId") or "") or "unknown",
+                "workspace_id": str(raw_scope.get("workspaceId") or "") or "unknown",
+                "quota_owner_id": str(raw_scope.get("quotaOwnerId") or account_id),
+                "surface": surface,
+                "profile_id": profile_id,
+            }
+        ledger = PgLedger(
+            _resolve_codex_quota_dsn(config),
+            application_name=(
+                f"{probes._provider_status_db_application_name()}-chatgpt-usage-bridge"
+            ),
+            lock_timeout_ms=config.db_lock_timeout_ms,
+            statement_timeout_ms=config.db_statement_timeout_ms,
+        )
+        bridge_state = PgCollectorState(ledger)
+        bridge = TsWorkerBridge(
+            bridge_state,
+            BridgeConfig.from_runtime(
+                node_executable=config.chatgpt_usage_bridge_node_executable,
+                worker_script=config.chatgpt_usage_bridge_worker_script,
+            ),
+        )
+        results = []
+        for account_id, bound_scope in bindings.items():
+            scope = LedgerScope(
+                collector_account_id=account_id,
+                provider=bound_scope["provider"],
+                provider_user_id=bound_scope["provider_user_id"],
+                workspace_id=bound_scope["workspace_id"],
+                quota_owner_id=bound_scope["quota_owner_id"],
+                surface=bound_scope["surface"],
+            )
+            result = bridge.run_once(
+                collector_account_id=account_id,
+                profile_id=bound_scope["profile_id"],
+                scope=scope,
+            )
+            results.append(result)
+        summary["ok"] = all(bool(result.get("ok", True)) for result in results)
+        summary["coverageIncomplete"] = any(
+            bool(result.get("coverageIncomplete", True)) for result in results
+        )
+        summary["historyContract"] = (
+            "unavailable"
+            if any(result.get("historyContract") == "unavailable" for result in results)
+            else "unknown"
+        )
+        summary["accountCount"] = len(results)
+        summary["results"] = results
+    except Exception as exc:
+        summary["ok"] = False
+        summary["errorClass"] = exc.__class__.__name__
+        summary["errorMessage"] = _redacted_failure_message(str(exc))
+    return {
+        "event": "chatgpt_usage_bridge",
+        "observedAt": observed_at.isoformat().replace("+00:00", "Z"),
+        "environment": config.environment,
+        **summary,
+    }
+
+
 SIDECAR_OPTIONAL_POLL_DEADLINE_SECONDS = 0.05
 SIDECAR_OPTIONAL_POLL_MAX_WORKERS = 1
 _SIDECAR_MAX_WAKE_DELAY_SECONDS = 86_400.0
@@ -16066,6 +16286,7 @@ def run_due_sidecar_tasks(
             _run_chatgpt_conversation_init_poll_task,
             "chatgpt_conversation_init_poll",
         ),
+        (_run_chatgpt_usage_bridge_task, "chatgpt_usage_bridge"),
         (_run_alibaba_quota_poll_task, "alibaba_quota_poll"),
         (_run_grok_billing_poll_task, "grok_billing_poll"),
         (_run_xai_reset_poll_task, "xai_reset_poll"),

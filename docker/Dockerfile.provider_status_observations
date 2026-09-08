@@ -22,6 +22,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         iputils-ping \
+        nodejs \
         rsync \
         xauth \
     && rm -rf /var/lib/apt/lists/*
@@ -35,6 +36,15 @@ RUN pip install --no-cache-dir \
 RUN python -m playwright install-deps chromium
 
 COPY scripts/record_provider_status_observations.py /app/scripts/record_provider_status_observations.py
+COPY scripts/apply_chatgpt_usage_ledger_2026_09_08.sql /app/scripts/apply_chatgpt_usage_ledger_2026_09_08.sql
+COPY scripts/chatgpt_chat_usage_capture/__init__.py /app/scripts/chatgpt_chat_usage_capture/__init__.py
+COPY scripts/chatgpt_chat_usage_capture/models.py /app/scripts/chatgpt_chat_usage_capture/models.py
+COPY scripts/chatgpt_chat_usage_capture/privacy.py /app/scripts/chatgpt_chat_usage_capture/privacy.py
+COPY scripts/chatgpt_chat_usage_capture/timeutil.py /app/scripts/chatgpt_chat_usage_capture/timeutil.py
+COPY scripts/chatgpt_chat_usage_capture/pg_ledger.py /app/scripts/chatgpt_chat_usage_capture/pg_ledger.py
+COPY scripts/chatgpt_chat_usage_capture/pg_collector_state.py /app/scripts/chatgpt_chat_usage_capture/pg_collector_state.py
+COPY scripts/chatgpt_chat_usage_capture/ts_bridge.py /app/scripts/chatgpt_chat_usage_capture/ts_bridge.py
+COPY scripts/chatgpt_chat_usage_capture/ts/dist /app/scripts/chatgpt_chat_usage_capture/ts/dist
 COPY scripts/chatgpt_oracle_browser_session.mjs /app/scripts/chatgpt_oracle_browser_session.mjs
 COPY scripts/grok_oidc_refresh.py /app/scripts/grok_oidc_refresh.py
 COPY scripts/codex_oauth_refresh.py /app/scripts/codex_oauth_refresh.py
