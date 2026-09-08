@@ -4419,6 +4419,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
         redirected = event.get("redirectedRequestId")
         history = is_history_url(url)
         blocked = False
+        mutation_block_branch: Optional[str] = None
         if isinstance(init_fetch_id, str) and redirected == init_fetch_id:
             set_boundary("init_request_redirected")
             blocked = True
@@ -4508,6 +4509,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
                 set_boundary("unexpected_document_navigation")
         elif method in {"POST", "PUT", "PATCH", "DELETE"}:
             blocked = True
+            mutation_block_branch = "mutating_method"
             set_boundary("model_or_mutation_blocked")
         elif (
             parsed.netloc == "chatgpt.com"
@@ -4526,7 +4528,45 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             url
         ):
             blocked = True
+            mutation_block_branch = mutation_block_branch or "model_or_mutation_path"
             set_boundary("model_or_mutation_blocked")
+        if (
+            mutation_block_branch is not None
+            and boundary_reason == "model_or_mutation_blocked"
+            and "blocked_request" not in capture
+        ):
+            if parsed.scheme == "https" and parsed.netloc == "chatgpt.com":
+                origin_category = "chatgpt"
+            elif parsed.scheme == "https":
+                origin_category = "other_https"
+            else:
+                origin_category = "other"
+            if is_model_or_mutation_path(parsed.path):
+                route_family = "model_or_mutation"
+            elif parsed.path in _NATIVE_HISTORY_BOOTSTRAP_READ_PATHS:
+                route_family = "bootstrap_read"
+            elif parsed.path.startswith("/backend-api/"):
+                route_family = "other_backend_api"
+            elif parsed.path.startswith("/api/"):
+                route_family = "other_api"
+            else:
+                route_family = "other"
+            resource_type = event.get("resourceType")
+            capture["blocked_request"] = {
+                "branch": mutation_block_branch,
+                "method": (
+                    method
+                    if method in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}
+                    else "other"
+                ),
+                "resource_type": (
+                    resource_type
+                    if resource_type in ("Document", "XHR", "Fetch", "Ping", "Script")
+                    else "other"
+                ),
+                "origin_category": origin_category,
+                "route_family": route_family,
+            }
         if is_stopped():
             blocked = True
         if blocked:
@@ -4625,7 +4665,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             capture["terminal_reason"] = terminal_reason()
         capture["retry_after_seconds"] = retry_after_max
         if isinstance(capture.get("request_id"), str):
-            return _native_history_finalize_observation(
+            result = _native_history_finalize_observation(
                 capture,
                 expected_account_hash=expected_account_hash,
                 page_target_id_matched=True,
@@ -4635,19 +4675,23 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
                 structural=capture.get("structural"),
                 failure_reason=failure_reason,
             )
-        return _native_history_no_route_observation(
-            page_target_id_matched=True,
-            request_count=request_count,
-            history_request_count=history_request_count,
-            failure_reason=(
-                terminal_reason()
-                or boundary_reason
-                or failure_reason
-                or "no_history_observed"
-            ),
-            browser_challenge=browser_challenge,
-            retry_after_seconds=terminal_retry_after(),
-        )
+        else:
+            result = _native_history_no_route_observation(
+                page_target_id_matched=True,
+                request_count=request_count,
+                history_request_count=history_request_count,
+                failure_reason=(
+                    terminal_reason()
+                    or boundary_reason
+                    or failure_reason
+                    or "no_history_observed"
+                ),
+                browser_challenge=browser_challenge,
+                retry_after_seconds=terminal_retry_after(),
+            )
+        if "blocked_request" in capture:
+            result["blocked_request"] = capture["blocked_request"]
+        return result
     try:
         session.on("Fetch.requestPaused", guard_request)
         session.on("Network.requestWillBeSent", request_seen)
