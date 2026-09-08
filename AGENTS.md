@@ -1,381 +1,120 @@
-# INSTRUCTIONS FOR LITELLM
-
-This document provides comprehensive instructions for AI agents working in the LiteLLM repository.
-
-## OVERVIEW
-
-LiteLLM is a unified interface for 100+ LLMs that:
-- Translates inputs to provider-specific completion, embedding, and image generation endpoints
-- Provides consistent OpenAI-format output across all providers
-- Includes retry/fallback logic across multiple deployments (Router)
-- Offers a proxy server (LLM Gateway) with budgets, rate limits, and authentication
-- Supports advanced features like function calling, streaming, caching, and observability
-
-## REPOSITORY STRUCTURE
-
-### Core Components
-- `litellm/` - Main library code
-  - `llms/` - Provider-specific implementations (OpenAI, Anthropic, Azure, etc.)
-  - `proxy/` - Proxy server implementation (LLM Gateway)
-  - `router_utils/` - Load balancing and fallback logic
-  - `types/` - Type definitions and schemas
-  - `integrations/` - Third-party integrations (observability, caching, etc.)
-
-### Key Directories
-- `tests/` - Comprehensive test suites
-- `docs/my-website/` - Documentation website
-- `ui/litellm-dashboard/` - Admin dashboard UI
-- `enterprise/` - Enterprise-specific features
-
-## ORCHESTRATOR PROMPT GUIDANCE
-
-Global `~/.codex/AGENTS.md` rules control authorization, testing scope,
-orchestration, queue handling, and safety. This file adds LiteLLM-specific
-technical requirements. Once LiteLLM implementation is authorized, keeping
-documentation for the affected behavior synchronized is included in that
-authorization; testing scope remains controlled by the global rules.
-
-### Implementation Ownership
-
-Implement LiteLLM-owned behavior in this repository and remain compatible with
-the unmodified stock Codex client. Do not use a Codex fork, source change,
-custom build, or deployment as a LiteLLM solution unless the operator
-explicitly authorizes work in the Codex repository. TODOs, handoffs, and agent
-recommendations do not grant that authorization.
-
-### Anthropic Model Routing TOS Boundary
-
-Anthropic/Claude models may receive traffic only through Claude-native or
-Anthropic-native provider routes using credentials accepted for that native
-route. Never send traffic for a selected Anthropic/Claude model through Codex
-or ChatGPT OAuth, `chatgpt.com/backend-api/codex/responses`, an OpenAI/Codex
-adapter, or any other cross-provider egress path.
-
-This boundary follows the resolved upstream provider and model, not the inbound
-wire format. Claude Code may send Anthropic-shaped requests to aliases that
-select non-Anthropic models through supported adapters; that does not make the
-selected upstream model Anthropic traffic. If the selected upstream model is
-Anthropic/Claude, however, its egress must remain Anthropic-native.
-
-Apply this rule to normal routing, alias candidates, cross-provider fallbacks,
-retries, cooldown recovery, probes, smoke tests, acceptance harnesses, and ad
-hoc diagnostics. If the native Anthropic route or credential is unavailable,
-fail closed with an explicit routing/authentication error and audit evidence.
-Do not reroute the Anthropic model through Codex to recover availability,
-consume a different account entitlement, or make a test pass. Treat any such
-cross-provider Anthropic-model routing as a potential terms-of-service
-violation.
-
-### Investigation Ownership For AAWM Alias Flows
-
-This fork owns the AAWM model aliases and the LiteLLM-side routing,
-system-prompt, tool-advertisement, and observability behavior that shape how
-subagents behave. When investigating `investigate-codex-*.md` files, do not stop
-at "not a LiteLLM implementation defect" if the failure involves a model alias
-or provider route managed here.
-
-Treat each investigation as an input to the whole alias workflow, not just as a
-bug report against the final provider call. The expected question is always:
-what could this fork do to make the next dispatch smoother, clearer, easier to
-debug, or less likely to require operator correction? That includes massaging
-system prompts, changing alias-level injected guidance, adjusting tool
-advertisement/schema shape, or recording better attempt metadata.
-
-For every investigation file, explicitly evaluate whether LiteLLM can improve
-the end-to-end workflow by changing any of:
-
-- alias system prompting or injected instructions, including
-  `Codex auto-agent alias` and sibling tiered aliases;
-- tool advertisement shape, tool descriptions, parameter schema visibility, or
-  tool filtering/patching;
-- read-only task contracts, final-answer contracts, required attestations, and
-  "describe the patch only" behavior;
-- null/empty completion handling, setup-only response detection, unrelated-task
-  drift detection, and retry/fallback classification;
-- session-history, Langfuse, or provider metadata that would make failure modes
-  easier to diagnose;
-- redispatch accounting, capacity/error surfacing, and fallback guidance.
-
-Capacity-only 429/high-demand failures may not be fixable with prompting, but
-they can still reveal gaps in retry telemetry, cooldown policy, redispatch
-threshold handling, or operator-facing failure logs.
-
-### Broad Discovery Subtasks
-
-When delegating broad discovery work to a subagent, put the discovery contract in
-the actual subagent prompt. Do not rely on an unstated scoring rule,
-out-of-band expectation, or repo convention that the subagent cannot see.
-
-Use this for prompts that ask a worker to inspect named files plus broad language
-such as "any recent", "handoff", "contract", "investigate-*", "glob", "similar
-files", or "related docs":
-
-```text
-Discovery inventory required:
-- List the discovery command(s), source list, or transcript evidence you used.
-- List every candidate file/item that matched the requested scope.
-- Mark each candidate as inspected, omitted, or unavailable.
-- For omitted candidates, give the concrete reason.
-- Classify relevant candidates as actionable, stale, context-only, or not
-  relevant.
-- Base conclusions only on inspected candidates and call out any coverage gap.
-```
-
-If the task is intentionally narrow, say that in the delegated prompt, for
-example: `No broad discovery inventory is required; inspect only the named
-files.`
-
-Any later score, eval, or session-history flag for discovery coverage must judge
-only requirements that were communicated in the prompt and candidates visible in
-the transcript or tool output. Do not score an agent against hidden filesystem
-state or an inventory contract that was not included in the session.
-
-## DEVELOPMENT GUIDELINES
-
-### MAKING CODE CHANGES
-
-1. **Provider Implementations**: When adding/modifying LLM providers:
-   - Follow existing patterns in `litellm/llms/{provider}/`
-   - Implement proper transformation classes that inherit from `BaseConfig`
-   - Support both sync and async operations
-   - Handle streaming responses appropriately
-   - Include proper error handling with provider-specific exceptions
-
-2. **Type Safety**: 
-   - Use proper type hints throughout
-   - Update type definitions in `litellm/types/`
-   - Ensure compatibility with both Pydantic v1 and v2
-
-3. **Testing**:
-   - Follow the global testing-scope rules.
-   - Put required focused tests in the appropriate existing `tests/` directory.
-
-### MAKING CODE CHANGES FOR THE UI (IGNORE FOR BACKEND)
-
-1. **Tremor is DEPRECATED, do not use Tremor components in new features/changes**
-   - The only exception is the Tremor Table component and its required Tremor Table sub components.
-
-2. **Use Common Components as much as possible**:
-   - These are usually defined in the `common_components` directory
-   - Use these components as much as possible and avoid building new components unless needed
-
-3. **Testing**:
-   - Apply these conventions only when focused UI tests are required by the
-     global testing-scope rules.
-   - The codebase uses **Vitest** and **React Testing Library**
-   - **Query Priority Order**: Use query methods in this order: `getByRole`, `getByLabelText`, `getByPlaceholderText`, `getByText`, `getByTestId`
-   - **Always use `screen`** instead of destructuring from `render()` (e.g., use `screen.getByText()` not `getByText`)
-   - **Wrap user interactions in `act()`**: Always wrap `fireEvent` calls with `act()` to ensure React state updates are properly handled
-   - **Use `query` methods for absence checks**: Use `queryBy*` methods (not `getBy*`) when expecting an element to NOT be present
-   - **Test names must start with "should"**: All test names should follow the pattern `it("should ...")`
-   - **Mock external dependencies**: Check `setupTests.ts` for global mocks and mock child components/networking calls as needed
-   - **Structure tests properly**:
-     - First test should verify the component renders successfully
-     - Subsequent tests should focus on functionality and user interactions
-     - Use `waitFor` for async operations that aren't already awaited
-   - **Avoid using `querySelector`**: Prefer React Testing Library queries over direct DOM manipulation
-
-### IMPORTANT PATTERNS
-
-1. **Function/Tool Calling**:
-   - LiteLLM standardizes tool calling across providers
-   - OpenAI format is the standard, with transformations for other providers
-   - See `litellm/llms/anthropic/chat/transformation.py` for complex tool handling
-
-2. **Streaming**:
-   - All providers should support streaming where possible
-   - Use consistent chunk formatting across providers
-   - Handle both sync and async streaming
-
-3. **Error Handling**:
-   - Use provider-specific exception classes
-   - Maintain consistent error formats across providers
-   - Include proper retry logic and fallback mechanisms
-
-4. **Configuration**:
-   - Support both environment variables and programmatic configuration
-   - Use `BaseConfig` classes for provider configurations
-   - Allow dynamic parameter passing
-
-## PROXY SERVER (LLM GATEWAY)
-
-The proxy server is a critical component that provides:
-- Authentication and authorization
-- Rate limiting and budget management
-- Load balancing across multiple models/deployments
-- Observability and logging
-- Admin dashboard UI
-- Enterprise features
-
-Key files:
-- `litellm/proxy/proxy_server.py` - Main server implementation
-- `litellm/proxy/auth/` - Authentication logic
-- `litellm/proxy/management_endpoints/` - Admin API endpoints
-
-**Database (proxy)**: Use Prisma model methods (`prisma_client.db.<model>.upsert`, `.find_many`, `.find_unique`, etc.), not raw SQL (`execute_raw`/`query_raw`). See COMMON PITFALLS for details.
-
-## MCP (MODEL CONTEXT PROTOCOL) SUPPORT
-
-LiteLLM supports MCP for agent workflows:
-- MCP server integration for tool calling
-- Transformation between OpenAI and MCP tool formats
-- Support for external MCP servers (Zapier, Jira, Linear, etc.)
-- See `litellm/experimental_mcp_client/` and `litellm/proxy/_experimental/mcp_server/`
-
-## RUNNING SCRIPTS
-
-Use `./.venv/bin/python script.py` to run Python scripts in the project environment (for non-test files).
-
-## GITHUB TEMPLATES
-
-When opening issues or pull requests, follow these templates:
-
-### Bug Reports (`.github/ISSUE_TEMPLATE/bug_report.yml`)
-- Describe what happened vs. expected behavior
-- Include relevant log output
-- Specify LiteLLM version
-- Indicate if you're part of an ML Ops team (helps with prioritization)
-
-### Feature Requests (`.github/ISSUE_TEMPLATE/feature_request.yml`)
-- Clearly describe the feature
-- Explain motivation and use case with concrete examples
-
-### Pull Requests (`.github/pull_request_template.md`)
-- Follow the global testing-scope rules and the current pull-request template
-- Run `make test-unit` only when the authorized test scope or pull-request
-  process requires it
-
-
-## TESTING CONSIDERATIONS
-
-Use the global testing-scope rules to choose the smallest focused test surface.
-Existing provider, proxy, performance, and integration suites are available
-when the authorized change requires them.
-
-## DOCUMENTATION
-
-- Keep current consumer and maintainer documentation synchronized with changed
-  behavior.
-- Update provider documentation when provider behavior changes.
-- Add examples, changelog entries, and release notes only when the affected
-  public contract or publication workflow requires them.
-
-## SECURITY CONSIDERATIONS
-
-- Handle API keys securely
-- Validate all inputs, especially for proxy endpoints
-- Consider rate limiting and abuse prevention
-- Follow security best practices for authentication
-
-## ENTERPRISE FEATURES
-
-- Some features are enterprise-only
-- Check `enterprise/` directory for enterprise-specific code
-- Maintain compatibility between open-source and enterprise versions
-
-## COMMON PITFALLS TO AVOID
-
-1. **Breaking Changes**: LiteLLM has many users - avoid breaking existing APIs
-2. **Provider Specifics**: Each provider has unique quirks - handle them properly
-3. **Rate Limits**: Respect provider rate limits in tests
-4. **Memory Usage**: Be mindful of memory usage in streaming scenarios
-5. **Dependencies**: Keep dependencies minimal and well-justified
-6. **UI/Backend Contract Mismatch**: When adding a new entity type to the UI, always check whether the backend endpoint accepts a single value or an array. Match the UI control accordingly (single-select vs. multi-select) to avoid silently dropping user selections
-7. **Missing Tests for New Entity Types**: When adding a new entity type (e.g., in `EntityUsage`, `UsageViewSelect`), always add corresponding tests in the existing test files and update any icon/component mocks
-8. **Raw SQL in proxy DB code**: Do not use `execute_raw` or `query_raw` for proxy database access. Use Prisma model methods (e.g. `prisma_client.db.litellm_tooltable.upsert()`, `.find_many()`, `.find_unique()`) so behavior stays consistent with the schema, the client stays mockable in tests, and you avoid the pitfalls of hand-written SQL (parameter ordering, type casting, schema drift)
-
-8. **Do not hardcode model-specific flags**: Put model-specific capability flags in `model_prices_and_context_window.json` and read them via `get_model_info` (or existing helpers like `supports_reasoning`). This prevents users from needing to upgrade LiteLLM each time a new model supports a feature.
-
-   **Example of BAD** (hardcoded model checks):
-
-   ```python
-   @staticmethod
-   def _is_effort_supported_model(model: str) -> bool:
-       """Check if the model supports the output_config.effort parameter..."""
-       model_lower = model.lower()
-       if AnthropicConfig._is_claude_4_6_model(model):
-           return True
-       return any(
-           v in model_lower for v in ("opus-4-5", "opus_4_5", "opus-4.5", "opus_4.5")
-       )
-   ```
-
-   **Example of GOOD** (config-driven or helper that reads from config):
-
-   ```python
-   if (
-       "claude-3-7-sonnet" in model
-       or AnthropicConfig._is_claude_4_6_model(model)
-       or supports_reasoning(
-           model=model,
-           custom_llm_provider=self.custom_llm_provider,
-       )
-   ):
-       ...
-   ```
-
-   Using helpers like `supports_reasoning` (which read from `model_prices_and_context_window.json` / `get_model_info`) allows future model updates to "just work" without code changes.
-
-9. **Never close HTTP/SDK clients on cache eviction**: Do not add `close()`, `aclose()`, or `create_task(close_fn())` inside `LLMClientCache._remove_key()` or any cache eviction path. Evicted clients may still be held by in-flight requests; closing them causes `RuntimeError: Cannot send a request, as the client has been closed.` in production after the cache TTL (1 hour) expires. Connection cleanup is handled at shutdown by `close_litellm_async_clients()`. See PR #22247 for the full incident history.
-
-## HELPFUL RESOURCES
-
-- Main documentation: https://docs.litellm.ai/
-- Provider-specific docs in `docs/my-website/docs/providers/`
-- Admin UI for testing proxy features
-
-## WHEN IN DOUBT
-
-- Follow existing patterns in the codebase
-- Check similar provider implementations
-- Follow the global focused-testing requirements
-- Update documentation appropriately
-- Consider backward compatibility impact
-
-## Cursor Cloud specific instructions
-
-This section applies only when the active environment is Cursor Cloud. It does
-not describe the Thoth host or its LiteLLM deployment.
-
-### Environment
-
-- `uv` is installed in `~/.local/bin`.
-- Use the system Python available on the host to create `.venv`.
-- The repo-local virtual environment lives at `.venv/`.
-
-### Running the proxy server
-
-Start the proxy with a config file:
-
-```bash
-./.venv/bin/litellm --config dev_config.yaml --port 4000
-```
-
-The proxy takes ~15-20 seconds to fully start (it runs Prisma migrations on boot). Wait for `/health` to return before sending requests. Without a PostgreSQL `DATABASE_URL`, the proxy connects to a default Neon dev database embedded in the `litellm-proxy-extras` package.
-
-### Running tests
-
-See `CLAUDE.md` and the `Makefile` for standard commands. Key notes:
-
-- `psycopg-binary` must be installed (`./.venv/bin/python -m pip install psycopg-binary`) because the pytest-postgresql plugin requires it and the lock file only includes `psycopg` (no binary).
-- `openapi-core` must be installed (`./.venv/bin/python -m pip install openapi-core`) for the OpenAPI compliance tests in `tests/test_litellm/interactions/`.
-- The `--timeout` pytest flag is NOT available; don't pass it.
-- Unit tests: `./.venv/bin/pytest tests/test_litellm/ -x -vv -n 4`
-- Black `--check` may report pre-existing formatting issues; this does not block test runs.
-- Use `uv venv .venv` followed by `make install-proxy-dev` to create/update `.venv`.
-
-### Lint
-
-```bash
-cd litellm && ../.venv/bin/ruff check .
-```
-
-Ruff is the primary fast linter. For the full lint suite (including mypy, black, circular imports), run `make lint` per `CLAUDE.md`.
-
-### UI Dashboard development
-
-- The UI is at `ui/litellm-dashboard/`. Run `npm run dev` from that directory for the Next.js dev server on port 3000.
-- The proxy at port 4000 serves a **pre-built** static UI from `litellm/proxy/_experimental/out/`. After making UI code changes, you must run `npm run build` in the dashboard directory and copy the output: `cp -r ui/litellm-dashboard/out/* litellm/proxy/_experimental/out/` for the proxy to serve the updated UI.
-- SVGs used as provider logos (loaded via `<img>` tags) must NOT use `fill="currentColor"` — replace with an explicit color like `#000000` or use the `-color` variant from lobehub icons, since CSS color inheritance does not work inside `<img>` elements.
-- Provider logos live in `ui/litellm-dashboard/public/assets/logos/` (source) and `litellm/proxy/_experimental/out/assets/logos/` (pre-built). Both locations must have the file for it to work in dev and proxy-served modes.
-- UI Vitest tests: `cd ui/litellm-dashboard && npx vitest run`
+# LiteLLM Repository Rules
+
+Global `~/.codex/AGENTS.md` governs scope, authorization, testing, orchestration,
+delivery, and cross-repository reporting. This file adds LiteLLM-specific
+requirements. Authorized implementation includes synchronizing documentation
+for the affected behavior; it does not waive global test approval.
+
+## Ownership and Routing
+
+Implement LiteLLM-owned behavior here and preserve compatibility with the
+unmodified stock Codex client. A Codex fork, patch, custom build, or deployment
+requires explicit operator authorization for work in that repository.
+
+Anthropic/Claude models must use Claude-native or Anthropic-native egress with
+credentials accepted for that route. Never route those models through Codex,
+ChatGPT OAuth, an OpenAI/Codex adapter, or another provider's egress. This
+restriction follows the resolved model/provider, not the inbound wire format:
+Claude Code may select non-Anthropic models through supported adapters.
+
+Apply that boundary to aliases, retries, fallbacks, cooldown recovery, and all
+authorized probes or acceptance checks. If native Anthropic credentials or
+routing are unavailable, fail closed with an attributable routing/authentication
+error. Do not substitute Codex egress to recover availability or pass acceptance.
+
+## Spawned-Agent Failure Intake
+
+This fork owns AAWM aliases and their routing, injected instructions, tool
+advertisement/transformation, response handling, and observability. For incoming
+`investigate-codex-*.md` reports, assess these layers rather than closing the
+report merely because the final provider call is not defective.
+
+Apply the global reporting exclusions. Disposition caller prompting/argument
+mistakes and ordinary upstream capacity errors without turning them into
+implementation work. Distinguish those from evidenced defects in LiteLLM's
+injected instructions, tool schemas, retry classification, or response handling.
+
+For qualifying reports, identify the owning layer and smallest useful remedy.
+Consider read-only/final-answer contracts, malformed or missing completions,
+setup-only or wrong-domain output, session-history/Langfuse attribution, and
+redispatch accounting where relevant. Record evidence, disposition, and an
+existing or proposed work-item reference; deduplicate reports of the same defect.
+Intake and reviewer suggestions do not authorize remediation or expand a goal.
+
+## Reusable Tool Failures
+
+Record a LiteLLM-owned reusable tool failure only when it recurs or affects
+multiple workflows. Use `.analysis/tool-failure-[repo]-[YYYYMMDDhhmmss].md`
+with the attempt, failure, proposed owner/change, reuse scope, and why it is
+not a one-off caller error. Do not use this category to bypass dispatch-report
+exclusions or an operator prohibition on investigation artifacts.
+
+## Discovery and Evaluation
+
+For broad delegated alias or investigation discovery, include the inventory
+contract in the prompt: list commands/sources and matching candidates, mark
+each inspected/omitted/unavailable, explain omissions, classify relevance, and
+report coverage gaps. For narrow work, name the exact inputs instead.
+
+Scores, evals, and session-history flags must judge only the communicated
+contract and evidence visible to the agent. Do not penalize agents for hidden
+filesystem state or unstated discovery requirements.
+
+## Backend Constraints
+
+- Use existing `BaseConfig` provider transformations in `litellm/llms/`, typed
+  contracts in `litellm/types/`, provider-specific exceptions, and consistent
+  OpenAI-format output. Preserve affected sync/async and streaming paths,
+  environment/programmatic configuration, and Pydantic v1/v2 compatibility.
+- Put model capability flags in `model_prices_and_context_window.json`; use
+  `get_model_info` or existing capability helpers instead of model-name checks.
+- Use Prisma model methods for proxy database access, not raw
+  `execute_raw`/`query_raw` SQL.
+- Never close HTTP/SDK clients during cache eviction, including inside
+  `LLMClientCache._remove_key()`: in-flight requests may still own them.
+  Keep shutdown cleanup in `close_litellm_async_clients()`.
+- Preserve affected open-source/enterprise interfaces; inspect `enterprise/`
+  when changing a shared contract.
+
+## Dashboard Constraints
+
+- Reuse `ui/litellm-dashboard` common components. Do not introduce Tremor
+  components except its Table and required Table subcomponents.
+- Match UI selection cardinality to backend scalar/array contracts.
+- The proxy serves prebuilt UI from `litellm/proxy/_experimental/out/`.
+  For authorized UI builds, build from `ui/litellm-dashboard/` and synchronize
+  the resulting assets to the served directory.
+- Provider logos live in `ui/litellm-dashboard/public/assets/logos/` and the
+  corresponding served `out/assets/logos/`. SVGs loaded through `<img>` need
+  explicit colors or a color variant, not `fill="currentColor"`.
+- For approved UI tests, use Vitest/React Testing Library, existing setup mocks,
+  `screen`, semantic role/label/text queries, `query*` for absence, `act` for
+  direct interaction updates, and `waitFor` for asynchronous state. Follow
+  existing `should ...` names. Do not mandate render-only tests or new test
+  cases merely because an entity was added; apply global candidate pruning.
+
+## Local Tooling
+
+Use `./.venv/bin/python` for repository Python scripts. Read `CLAUDE.md` and
+`Makefile` for relevant commands, not as authorization to run suites.
+Approved Python tests belong in existing `tests/` locations; UI tests stay
+with the dashboard. Use repository Ruff configuration for scoped lint.
+
+Provider documentation is under `docs/my-website/docs/providers/`. Use existing
+`.github/ISSUE_TEMPLATE/` and pull-request templates when those artifacts are
+requested; template test instructions remain subject to operator approval.
+
+### Cursor Cloud Only
+
+These details do not describe Thoth's deployment. In Cursor Cloud, use the
+repo-local `.venv` and system Python; `uv` is under `~/.local/bin`.
+For an authorized local proxy launch, use
+`./.venv/bin/litellm --config dev_config.yaml --port 4000`; startup runs
+migrations, so confirm the intended `DATABASE_URL` first and await `/health`.
+Do not rely on an embedded/default database target.
+
+For approved checks, follow the current dependency configuration:
+`psycopg-binary` is needed by pytest-postgresql and `openapi-core` by the
+interactions OpenAPI checks. Do not pass unsupported `pytest --timeout`.
+Dependency installation, server startup, and suite commands are not automatic
+setup steps.
