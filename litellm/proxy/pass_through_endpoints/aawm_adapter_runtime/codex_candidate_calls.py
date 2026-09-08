@@ -4939,6 +4939,32 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
         if _grok_native_candidate_unavailable_detail(exc) is not None:
             _raise_grok_native_auto_agent_candidate_unavailable(exc)
         raise
+    grok_adapter_model = str(
+        grok_prepared_body.get("model") or request_body.get("model") or "unknown-model"
+    )
+    grok_intake_context = _build_malformed_tool_call_intake_context(
+        request,
+        canonical_request_body,
+        adapter="codex_auto_agent_grok_native_responses",
+        upstream_url=str(updated_url),
+        provider="grok",
+    )
+    grok_rollup_kwargs = _build_adapted_route_rollup_kwargs(
+        (
+            grok_prepared_body.get("litellm_metadata")
+            if isinstance(grok_prepared_body.get("litellm_metadata"), dict)
+            else {}
+        )
+    )
+    if isinstance(response, StreamingResponse):
+        response = _bind_responses_stream_timeout_terminalizer(
+            response,
+            adapter_model=grok_adapter_model,
+            adapter_label="Grok native",
+            provider="grok",
+            intake_context=grok_intake_context,
+            rollup_kwargs=grok_rollup_kwargs,
+        )
     response = _maybe_wrap_xai_passthrough_responses_stream(
         response,
         request=request,
@@ -4948,16 +4974,10 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
     )
     validated_response = await _validate_codex_auto_agent_responses_payload(
         response,
-        adapter_model=str(grok_prepared_body.get("model") or request_body.get("model") or "unknown-model"),
+        adapter_model=grok_adapter_model,
         adapter="codex_auto_agent_grok_native_responses",
         adapter_label="Grok native",
-        intake_context=_build_malformed_tool_call_intake_context(
-            request,
-            canonical_request_body,
-            adapter="codex_auto_agent_grok_native_responses",
-            upstream_url=str(updated_url),
-            provider="grok",
-        ),
+        intake_context=grok_intake_context,
         request_body=canonical_request_body,
     )
     if getattr(validated_response, "body_iterator", None) is not None:
@@ -5043,6 +5063,34 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         if _xai_oauth_candidate_unavailable_detail(exc) is not None:
             _raise_xai_oauth_auto_agent_candidate_unavailable(exc)
         raise
+    xai_adapter_model = str(
+        oa_xai_prepared_body.get("model")
+        or canonical_request_body.get("model")
+        or "unknown-model"
+    )
+    xai_intake_context = _build_malformed_tool_call_intake_context(
+        request,
+        canonical_request_body,
+        adapter="codex_auto_agent_xai_oauth_responses",
+        upstream_url=str(updated_url),
+        provider="xai",
+    )
+    xai_rollup_kwargs = _build_adapted_route_rollup_kwargs(
+        (
+            oa_xai_prepared_body.get("litellm_metadata")
+            if isinstance(oa_xai_prepared_body.get("litellm_metadata"), dict)
+            else {}
+        )
+    )
+    if isinstance(response, StreamingResponse):
+        response = _bind_responses_stream_timeout_terminalizer(
+            response,
+            adapter_model=xai_adapter_model,
+            adapter_label="xAI OAuth",
+            provider="xai",
+            intake_context=xai_intake_context,
+            rollup_kwargs=xai_rollup_kwargs,
+        )
     response = _maybe_wrap_xai_passthrough_responses_stream(
         response,
         request=request,
@@ -5053,16 +5101,10 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
     )
     validated_response = await _validate_codex_auto_agent_responses_payload(
         response,
-        adapter_model=str(oa_xai_prepared_body.get("model") or canonical_request_body.get("model") or "unknown-model"),
+        adapter_model=xai_adapter_model,
         adapter="codex_auto_agent_xai_oauth_responses",
         adapter_label="xAI OAuth",
-        intake_context=_build_malformed_tool_call_intake_context(
-            request,
-            canonical_request_body,
-            adapter="codex_auto_agent_xai_oauth_responses",
-            upstream_url=str(updated_url),
-            provider="xai",
-        ),
+        intake_context=xai_intake_context,
         request_body=canonical_request_body,
     )
     if getattr(validated_response, "body_iterator", None) is not None:

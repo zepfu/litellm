@@ -302,6 +302,12 @@ terminal event and deferred session-owner promotion. LiteLLM does not replay
 already forwarded text as executable calls or buffer an unbounded response
 to repair it.
 
+Native Grok and managed xAI Responses streams bind the upstream read-timeout
+terminalizer before output-guard wrapping and validation. A post-first-byte
+timeout therefore emits the standard terminal failure event and records the
+route rollup without treating the interrupted stream as a successful
+completion.
+
 ## Responses API Instructions
 
 xAI Responses does not accept OpenAI's top-level `instructions` field. On
