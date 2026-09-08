@@ -76,6 +76,9 @@ from litellm.types.llms.anthropic_messages.anthropic_response import (
     AnthropicMessagesResponse,  # noqa: F401 - Wave 6F facade host binding
 )
 from litellm.llms.xai.oauth import (
+    bind_xai_oauth_snapshot_to_request,
+    get_grok_native_oauth_snapshot,
+    get_xai_oauth_snapshot,
     is_oa_xai_model,
     get_grok_native_oauth_access_token,  # noqa: F401  # compatibility host-global
     normalize_grok_native_oauth_model,
@@ -6786,6 +6789,13 @@ _wave6b_xai_request_prep.configure_xai_request_prep_runtime(
         get_grok_passthrough_target_base=lambda: _get_grok_passthrough_target_base(),
         get_grok_native_oauth_access_token=lambda: (
             get_grok_native_oauth_access_token()
+        ),
+        get_xai_oauth_snapshot=lambda: get_xai_oauth_snapshot(),
+        get_grok_native_oauth_snapshot=lambda: (
+            get_grok_native_oauth_snapshot()
+        ),
+        bind_xai_oauth_snapshot=lambda request, snapshot: (
+            bind_xai_oauth_snapshot_to_request(request, snapshot)
         ),
     )
 )
