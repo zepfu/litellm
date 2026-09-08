@@ -3725,6 +3725,10 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
         if action_key in fetch_actions:
             return
         fetch_actions[action_key] = "fail"
+        if request_id == capture.get("fetch_request_id"):
+            # Network.loadingFailed can be caused by this observer's own
+            # rejection; keep it separate from an upstream transport failure.
+            capture["observer_rejected_fetch_request_id"] = request_id
         if intentional_disposal:
             capture["intentional_disposal_request_id"] = request_id
         try:
@@ -4009,16 +4013,27 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
         record["loading_failed"] = True
         if request_id != capture.get("network_request_id"):
             return
-        if (
-            capture.get("intentional_disposal_request_id") == capture.get(
-                "fetch_request_id"
+        fetch_request_id = capture.get("fetch_request_id")
+        observer_rejected = (
+            isinstance(fetch_request_id, str)
+            and capture.get("observer_rejected_fetch_request_id")
+            == fetch_request_id
+        )
+        if observer_rejected:
+            intentional_disposal = (
+                capture.get("intentional_disposal_request_id")
+                == fetch_request_id
+                and capture.get("response_stream_complete") is True
             )
-            and capture.get("response_stream_complete") is True
-        ):
-            capture["loading_failed_ignored"] = True
-            return
+            if (
+                intentional_disposal
+                or capture.get("body_failure_reason") is not None
+            ):
+                capture["loading_failed_ignored"] = True
+                return
         capture["loading_failed"] = True
-        capture["body_failure_reason"] = "history_response_failed"
+        if capture.get("body_failure_reason") is None:
+            capture["body_failure_reason"] = "history_response_failed"
         capture["network_loading_finished"] = True
 
     def response_read_should_stop() -> bool:
@@ -4080,7 +4095,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             capture["response_bytes"] = response_bytes
         if structural is not None:
             capture["structural"] = structural
-        if body_error is not None:
+        if body_error is not None and capture.get("body_failure_reason") is None:
             capture["body_failure_reason"] = body_error
         capture["finished"] = True
         if (
@@ -4247,7 +4262,10 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
                     ),
                 )
                 apply_network_record(record)
-                if capture.get("loading_failed"):
+                if (
+                    capture.get("loading_failed")
+                    and capture.get("body_failure_reason") is None
+                ):
                     capture["body_failure_reason"] = "history_response_failed"
         elif is_init_url(url):
             if method != "POST":
@@ -4856,6 +4874,7 @@ def _run_oracle_browser_history_observation_in_worker(
             cdp_endpoint,
             page_target_id,
             capture_deadline,
+            deadline,
             expected_account_hash,
             max_response_bytes,
             private_process_group,
@@ -4884,16 +4903,8 @@ def _run_oracle_browser_history_observation_in_worker(
             raise OracleBrowserBoundaryUnavailable(
                 "Oracle browser history observer returned an invalid result."
             )
-        remaining_seconds = _remaining_browser_timeout(capture_deadline)
-        if remaining_seconds <= 0:
-            raise OracleBrowserBoundaryUnavailable(
-                "Oracle browser history observation timed out."
-            )
-        process.join(remaining_seconds)
-        if process.is_alive():
-            raise OracleBrowserBoundaryUnavailable(
-                "Oracle browser history observer cleanup timed out."
-            )
+        # The capture deadline only bounds result delivery. The remaining
+        # operation deadline is reserved for target cleanup below.
         return dict(result)
     finally:
         receiver.close()
@@ -4929,7 +4940,8 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
     sender: Any,
     cdp_endpoint: str,
     page_target_id: str,
-    deadline: float,
+    capture_deadline: float,
+    cleanup_deadline: float,
     expected_account_hash: str,
     max_response_bytes: int,
     private_process_group: Any,
@@ -4944,21 +4956,21 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
     result = None
     successful = False
     try:
-        _raise_if_browser_deadline_expired(deadline)
+        _raise_if_browser_deadline_expired(capture_deadline)
         playwright = _start_playwright_from_factory(None)
-        _raise_if_browser_deadline_expired(deadline)
+        _raise_if_browser_deadline_expired(capture_deadline)
         browser = playwright.chromium.connect_over_cdp(
             cdp_endpoint,
             timeout=_browser_timeout_milliseconds(
-                _remaining_browser_timeout(deadline)
+                _remaining_browser_timeout(capture_deadline)
             ),
         )
-        _raise_if_browser_deadline_expired(deadline)
+        _raise_if_browser_deadline_expired(capture_deadline)
         source_page = _find_existing_chatgpt_page(
             browser,
             page_target_id,
             CHATGPT_NATIVE_HISTORY_HOME_URL,
-            deadline=deadline,
+            deadline=capture_deadline,
         )
         if source_page is None:
             raise OracleBrowserBoundaryUnavailable(
@@ -4973,16 +4985,16 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
             owned_target,
             creation_state,
             creation_url,
-            deadline,
+            capture_deadline,
         )
         result = _observe_native_history_oracle_page(
             owned_page,
             session=owned_page.context.new_cdp_session(owned_page),
             expected_account_hash=expected_account_hash,
-            deadline=deadline,
+            deadline=capture_deadline,
             max_response_bytes=max_response_bytes,
         )
-        _raise_if_browser_deadline_expired(deadline)
+        _raise_if_browser_deadline_expired(capture_deadline)
         successful = True
     except Exception:
         successful = False
@@ -5037,12 +5049,12 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
         if close_failed:
             while (
                 creation_state.value == 3
-                and _remaining_browser_timeout(deadline) > 0
+                and _remaining_browser_timeout(cleanup_deadline) > 0
             ):
                 time.sleep(
                     min(
                         0.01,
-                        max(0.0, _remaining_browser_timeout(deadline)),
+                        max(0.0, _remaining_browser_timeout(cleanup_deadline)),
                     )
                 )
             try:
