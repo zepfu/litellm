@@ -53,6 +53,10 @@ EXPECTED_SYMBOLS_ORDER: tuple[str, ...] = (
     "_build_failed_responses_diagnostic",
     "_raise_codex_auto_agent_malformed_tool_call_text_payload",
     "_raise_codex_auto_agent_failed_responses_payload",
+    "_raise_codex_auto_agent_invalid_responses_shape",
+    "_responses_item_has_valid_content_part",
+    "_responses_output_item_is_structurally_valid",
+    "_is_responses_shaped_body",
     "_raise_responses_adapter_failed_response",
     "_preserve_distinct_function_call_identity_fields",
     "_validate_codex_auto_agent_responses_payload",
@@ -380,6 +384,7 @@ class TestValidateSerializesFunctionCallIdentityRepair:
                 },
                 {
                     "type": "function_call_output",
+                    "id": "fco_identity",
                     "call_id": "leave_me",
                     "output": "x",
                 },
