@@ -169,7 +169,22 @@ def install(host_globals: dict) -> None:
     host_globals["_responses_required_nonempty_strings"] = (
         _responses_required_nonempty_strings
     )
-    host_globals["_responses_body_is_unsuccessful"] = _responses_body_is_unsuccessful
+    _body_status_helper = FunctionType(
+        _responses_body_is_unsuccessful.__code__,
+        host_globals,
+        _responses_body_is_unsuccessful.__name__,
+        _responses_body_is_unsuccessful.__defaults__,
+        _responses_body_is_unsuccessful.__closure__,
+    )
+    _body_status_helper.__kwdefaults__ = _responses_body_is_unsuccessful.__kwdefaults__
+    _body_status_helper.__annotations__ = _responses_body_is_unsuccessful.__annotations__
+    _body_status_helper.__doc__ = _responses_body_is_unsuccessful.__doc__
+    _body_status_helper.__module__ = _responses_body_is_unsuccessful.__module__
+    _body_status_helper.__qualname__ = _responses_body_is_unsuccessful.__qualname__
+    if _responses_body_is_unsuccessful.__dict__:
+        _body_status_helper.__dict__.update(_responses_body_is_unsuccessful.__dict__)
+    _mod["_responses_body_is_unsuccessful"] = _body_status_helper
+    host_globals["_responses_body_is_unsuccessful"] = _body_status_helper
     host_globals["_RESPONSES_VALIDATION_STATE_ATTR"] = (
         _RESPONSES_VALIDATION_STATE_ATTR
     )

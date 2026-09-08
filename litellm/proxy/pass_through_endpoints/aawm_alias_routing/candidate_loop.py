@@ -1523,6 +1523,15 @@ async def handle_alias_route(  # noqa: PLR0915
                 if isinstance(selection_error, dict)
                 else None
             )
+            if (
+                exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+                and (
+                    getattr(exc, "redispatch_required", None) is True
+                    or selection_detail.get("redispatch_required") is True
+                )
+                and selection_error_code not in _IN_FLIGHT_REDISPATCH_ERROR_CODES
+            ):
+                raise
             if _emit_validated_redispatch_terminal_event(
                 exc=exc,
                 request=request,
@@ -1533,15 +1542,6 @@ async def handle_alias_route(  # noqa: PLR0915
                 emit_pre_attempt_terminal_event=(
                     _emit_auto_agent_alias_pre_attempt_terminal_event
                 ),
-            ):
-                raise
-            if (
-                exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS
-                and (
-                    getattr(exc, "redispatch_required", None) is True
-                    or selection_detail.get("redispatch_required") is True
-                )
-                and selection_error_code not in _IN_FLIGHT_REDISPATCH_ERROR_CODES
             ):
                 raise
             if exc.status_code == 429:

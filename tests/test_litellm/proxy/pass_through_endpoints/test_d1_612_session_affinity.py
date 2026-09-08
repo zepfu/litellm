@@ -2813,13 +2813,20 @@ async def test_codex_owned_owner_cooldown_reselects_with_effective_identity(
     activate = MagicMock(wraps=sa.activate_session_owner_redispatch_effective_identity)
     monkeypatch.setattr(sa, "activate_session_owner_redispatch_effective_identity", activate)
 
+    request_body = {
+        "model": "alias",
+        "litellm_metadata": {"redispatch_ordinal": 1},
+        "input": [{"type": "function_call", "name": "inspect"}],
+    }
+    sa.set_validated_cursor_replay(
+        request,
+        body=request_body,
+        stage="test",
+        reason="owned-affinity-effective-identity-reselection",
+    )
     selected = await sel._select_codex_auto_agent_candidate(
         request=request,
-        request_body={
-            "model": "alias",
-            "litellm_metadata": {"redispatch_ordinal": 1},
-            "input": [{"type": "function_call", "name": "inspect"}],
-        },
+        request_body=request_body,
     )
 
     assert selected["selection_reason"] == "first_available"

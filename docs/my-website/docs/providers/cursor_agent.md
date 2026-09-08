@@ -144,6 +144,23 @@ credentials, resume/fork state, selected context, parent state, environment,
 or model parameters. Protocol framing and transport failures remain separate
 upstream errors.
 
+## Continuations and ownership
+
+Ordinary external-tool continuations retain the Cursor session assignment while
+the provider-owned session is live. LiteLLM only permits provider-neutral
+fallback after reconstructing a complete, replay-safe request with the
+original assignment and completed tool history; partial incremental bodies,
+opaque Cursor state, unresolved tool calls, nested Cursor identifiers, and
+ownerless provider state fail closed before egress. A valid replay may then
+traverse native `xai` and managed `oa_xai` candidates without migrating the
+owned Cursor session.
+
+For Responses streams, session ownership is promoted only after the validator
+has observed a structurally valid terminal response with `status=completed` and
+the response stream has reached its terminal lifecycle. Malformed, incomplete,
+failed, or prematurely closed responses release the pending reservation and do
+not establish durable affinity.
+
 ## What this is not
 
 - Cloud Agents `/v0/agents` on `https://api.cursor.com`

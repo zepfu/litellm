@@ -3217,25 +3217,24 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
             complete = state.get("complete") is True
             valid = state.get("valid") is True
             terminal_seen = state.get("terminal_seen") is True
-            if complete and valid and terminal_seen:
+            terminal_status = state.get("terminal_status")
+            if (
+                complete
+                and valid
+                and terminal_seen
+                and terminal_status == "completed"
+            ):
                 return True, ""
             reason = state.get("reason")
+            if complete and valid and terminal_seen:
+                reason = "response validation terminal status was not completed"
             return (
                 False,
                 str(reason)
                 if reason is not None
                 else "response validation did not reach a valid terminal event",
             )
-
-        complete = getattr(
-            response,
-            "_aawm_responses_validation_complete",
-            None,
-        )
-        valid = getattr(response, "_aawm_responses_validation_valid", None)
-        if complete is True and valid is True:
-            return True, ""
-        return False, "response validation did not complete successfully"
+        return False, "response validation state was not available"
 
     def _mutation_error(reason: str) -> SessionOwnerMutationResult:
         return SessionOwnerMutationResult(
