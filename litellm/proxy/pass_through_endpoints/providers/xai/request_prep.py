@@ -787,6 +787,7 @@ async def _get_grok_native_oauth_client_version_async() -> str:
     """Resolve a cached, generation-aware client version off the event loop."""
 
     from litellm.secret_managers.grok_native_version_contract import (
+        GrokNativeVersionError,
         _resolve_cache_path,
         _validate_version_string,
     )
@@ -801,25 +802,8 @@ async def _get_grok_native_oauth_client_version_async() -> str:
         _validate_version_string(legacy)
         return legacy
 
-    cache_path = _resolve_cache_path()
-    observed = await asyncio.to_thread(
-        _stat_grok_native_client_version_file,
-        cache_path,
-    )
-    generation = _grok_native_version_stat_fingerprint(observed)
-    cached = _grok_native_client_version_cache.get(cache_path)
-    if (
-        cached is not None
-        and cached.generation == generation
-        and _grok_native_client_version_snapshot_is_fresh(cached)
-    ):
-        return cached.version
-
-    lock = _grok_native_client_version_locks.setdefault(
-        cache_path,
-        asyncio.Lock(),
-    )
-    async with lock:
+    try:
+        cache_path = _resolve_cache_path()
         observed = await asyncio.to_thread(
             _stat_grok_native_client_version_file,
             cache_path,
@@ -832,17 +816,41 @@ async def _get_grok_native_oauth_client_version_async() -> str:
             and _grok_native_client_version_snapshot_is_fresh(cached)
         ):
             return cached.version
-        _grok_native_client_version_cache.pop(cache_path, None)
-        try:
-            snapshot = await asyncio.to_thread(
-                _resolve_grok_native_client_version_snapshot_sync,
+
+        lock = _grok_native_client_version_locks.setdefault(
+            cache_path,
+            asyncio.Lock(),
+        )
+        async with lock:
+            observed = await asyncio.to_thread(
+                _stat_grok_native_client_version_file,
                 cache_path,
             )
-        except Exception:
+            generation = _grok_native_version_stat_fingerprint(observed)
+            cached = _grok_native_client_version_cache.get(cache_path)
+            if (
+                cached is not None
+                and cached.generation == generation
+                and _grok_native_client_version_snapshot_is_fresh(cached)
+            ):
+                return cached.version
             _grok_native_client_version_cache.pop(cache_path, None)
-            raise
-        _grok_native_client_version_cache[cache_path] = snapshot
-        return snapshot.version
+            try:
+                snapshot = await asyncio.to_thread(
+                    _resolve_grok_native_client_version_snapshot_sync,
+                    cache_path,
+                )
+            except Exception:
+                _grok_native_client_version_cache.pop(cache_path, None)
+                raise
+            _grok_native_client_version_cache[cache_path] = snapshot
+            return snapshot.version
+    except GrokNativeVersionError as exc:
+        raise GrokNativeVersionError(
+            "no valid Grok native client version: set "
+            "LITELLM_XAI_GROK_CLIENT_VERSION or GROK_CLIENT_VERSION, "
+            "or provide a valid cache file at the configured path"
+        ) from exc
 
 
 def _get_grok_native_oauth_session_id(
