@@ -934,6 +934,11 @@ class BaseOpenAIPassThroughHandler:
                             request=request,
                         )
         session_owner_lease = _sa.get_request_session_owner_lease(request)
+        defer_managed_xai_promotion = (
+            managed_xai_oauth_request
+            and canonical_managed_oa_xai_request_body is not None
+            and rt.is_openai_responses_endpoint_fn(endpoint)
+        )
 
         try:
             if grok_native_oauth_request and isinstance(extra_headers, dict):
@@ -968,6 +973,7 @@ class BaseOpenAIPassThroughHandler:
                     egress_credential_family=egress_credential_family,
                     expected_target_family=expected_target_family,
                     managed_xai_oauth_request=managed_xai_oauth_request,
+                    defer_session_owner_promotion=defer_managed_xai_promotion,
                     blocked_pass_through_prefixed_headers=(
                         ["authorization", "api-key", "x-api-key"]
                         if managed_xai_oauth_request
@@ -1027,41 +1033,75 @@ class BaseOpenAIPassThroughHandler:
                 and canonical_managed_oa_xai_request_body is not None
                 and rt.is_openai_responses_endpoint_fn(endpoint)
             ):
+                from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+                    _aawm_run_with_session_owner_lease_renewal,
+                )
+
                 provider_bound_body = (
                     endpoint_custom_body
                     if isinstance(endpoint_custom_body, dict)
                     else {}
                 )
-                response = await rt.validate_codex_auto_agent_responses_payload_fn(
-                    response,
-                    adapter_model=str(
-                        provider_bound_body.get("model")
-                        or canonical_managed_oa_xai_request_body.get("model")
-                        or "unknown-model"
+                response = await _aawm_run_with_session_owner_lease_renewal(
+                    request=request,
+                    operation=lambda: rt.validate_codex_auto_agent_responses_payload_fn(
+                        response,
+                        adapter_model=str(
+                            provider_bound_body.get("model")
+                            or canonical_managed_oa_xai_request_body.get("model")
+                            or "unknown-model"
+                        ),
+                        adapter="direct_managed_xai_responses",
+                        adapter_label="xAI OAuth",
+                        request_body=canonical_managed_oa_xai_request_body,
                     ),
-                    adapter="direct_managed_xai_responses",
-                    adapter_label="xAI OAuth",
-                    request_body=canonical_managed_oa_xai_request_body,
                 )
-        except Exception:
+        except BaseException:
             await _sa.finalize_session_owner_lease_on_failure(session_owner_lease)
             raise
 
         status_code = getattr(response, "status_code", None)
         if isinstance(status_code, int) and 200 <= status_code < 300:
-            promote_result = await _sa.finalize_session_owner_lease_on_success(
-                session_owner_lease,
-                attributes=(
-                    session_owner_lease.attributes
-                    if session_owner_lease is not None
-                    else None
-                ),
-            )
+            if defer_managed_xai_promotion:
+                from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.deferred_success import (
+                    finalize_deferred_success,
+                )
+
+                async def _complete_managed_xai_success() -> None:
+                    await finalize_deferred_success(response)
+
+                if _sa.bind_deferred_session_owner_lease_to_streaming_response(
+                    response,
+                    request=request,
+                    lease=session_owner_lease,
+                    failure_phase="session_owner_direct_managed_xai_stream_promote",
+                    on_success=_complete_managed_xai_success,
+                ):
+                    return response
+            try:
+                promote_result = await _sa.finalize_session_owner_lease_on_success(
+                    session_owner_lease,
+                    attributes=(
+                        session_owner_lease.attributes
+                        if session_owner_lease is not None
+                        else None
+                    ),
+                )
+            except BaseException:
+                if defer_managed_xai_promotion:
+                    await _sa.finalize_session_owner_lease_on_failure(
+                        session_owner_lease
+                    )
+                raise
             if promote_result is not None and promote_result.outcome in {
                 _sa.SessionOwnerMutationOutcome.CONFLICT,
                 _sa.SessionOwnerMutationOutcome.ERROR,
                 _sa.SessionOwnerMutationOutcome.NOT_HELD,
             }:
+                if defer_managed_xai_promotion:
+                    await _sa.finalize_session_owner_lease_on_failure(
+                        session_owner_lease
+                    )
                 _sa.raise_session_owner_redispatch_required(
                     session_identity=(
                         session_owner_lease.session_identity
@@ -1072,6 +1112,8 @@ class BaseOpenAIPassThroughHandler:
                     failure_phase="session_owner_direct_openai_promote",
                     request=request,
                 )
+            if defer_managed_xai_promotion:
+                await _complete_managed_xai_success()
         else:
             await _sa.finalize_session_owner_lease_on_failure(session_owner_lease)
         return response

@@ -182,6 +182,12 @@ present, still distinguish account lanes. Explicit inventory records enforce
 their configured `expected_account_identity` pin. Caller-supplied metadata
 cannot select or replace the server binding.
 
+Direct managed Responses requests reserve the selected record before sending.
+The transport renews that reservation, while the handler retains promotion
+until response validation succeeds. Streams promote only after a validated
+terminal response and complete consumption; failure or cancellation releases
+the reservation. Upstream headers alone do not establish ownership.
+
 For a provider-owned managed xAI `401` before response bytes are committed,
 LiteLLM may reread the exact bound file and scope and retry once on alias,
 direct async, OpenAI passthrough, or Anthropic compatibility routes. The
