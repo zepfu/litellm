@@ -5342,17 +5342,25 @@ def _native_history_process_identity_matches(
     return expected > 0 and _native_history_process_start_time(pid) == expected
 
 
-def _native_history_process_group_member_count(group_id: int) -> Optional[int]:
+def _native_history_process_group_member_count(
+    group_id: int,
+    *,
+    deadline: Optional[float] = None,
+) -> Optional[int]:
     if os.name != "posix" or group_id <= 0:
         return 0
     count = 0
     inspected = 0
     inspection_failed = False
+    if deadline is not None and time.monotonic() >= deadline:
+        return None
     try:
         entries = Path("/proc").iterdir()
         for entry in entries:
             if not entry.name.isdigit():
                 continue
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
             inspected += 1
             if inspected > _NATIVE_HISTORY_MAX_PROCESS_INVENTORY_ENTRIES:
                 return None
@@ -5373,6 +5381,8 @@ def _native_history_process_group_alive(
     group: Any,
     process: Any,
     private_process_start_time: Any,
+    *,
+    deadline: Optional[float] = None,
 ) -> Optional[bool]:
     try:
         group_id = int(getattr(group, "value", group) or 0)
@@ -5389,7 +5399,10 @@ def _native_history_process_group_alive(
         )
     )
     if not identity_matches:
-        member_count = _native_history_process_group_member_count(group_id)
+        member_count = _native_history_process_group_member_count(
+            group_id,
+            deadline=deadline,
+        )
         if member_count == 0:
             return False
         return None
@@ -5467,6 +5480,11 @@ def _native_history_process_reaped(
                 private_process_group,
                 process,
                 private_process_start_time,
+                deadline=(
+                    time.monotonic()
+                    if poll_only
+                    else reap_deadline
+                ),
             ) is False
         try:
             process.join(timeout=0)
@@ -5479,6 +5497,11 @@ def _native_history_process_reaped(
                 private_process_group,
                 process,
                 private_process_start_time,
+                deadline=(
+                    time.monotonic()
+                    if poll_only
+                    else reap_deadline
+                ),
             )
             is False
         )
@@ -5486,25 +5509,29 @@ def _native_history_process_reaped(
     if scope_reaped():
         return True
     now = time.monotonic()
-    if not poll_only and now < term_deadline:
+    if now < term_deadline:
         _signal_native_history_worker(
             process,
             private_process_group,
             private_process_start_time,
             signal.SIGTERM,
         )
+        if poll_only:
+            return scope_reaped()
         try:
             process.join(timeout=max(0.0, term_deadline - time.monotonic()))
         except (AssertionError, OSError):
             return False
         if scope_reaped():
             return True
-    elif poll_only and now < term_deadline:
+    if poll_only:
+        if time.monotonic() < kill_deadline:
+            return scope_reaped()
         _signal_native_history_worker(
             process,
             private_process_group,
             private_process_start_time,
-            signal.SIGTERM,
+            signal.SIGKILL,
         )
         return scope_reaped()
     _signal_native_history_worker(
@@ -5513,8 +5540,6 @@ def _native_history_process_reaped(
         private_process_start_time,
         signal.SIGKILL,
     )
-    if poll_only:
-        return scope_reaped()
     if not poll_only and time.monotonic() < kill_deadline:
         try:
             process.join(timeout=max(0.0, kill_deadline - time.monotonic()))
@@ -6217,6 +6242,7 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
                 private_process_group,
                 process,
                 private_process_start_time,
+                deadline=deadline,
             ) is not False
         ):
             _terminate_oracle_browser_worker(
@@ -6232,6 +6258,7 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
                 private_process_group,
                 process,
                 private_process_start_time,
+                deadline=deadline,
             ) is not False
         ):
             if (
@@ -6262,6 +6289,7 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
                 private_process_group,
                 process,
                 private_process_start_time,
+                deadline=deadline,
             )
             is not False
         ):
@@ -6283,6 +6311,7 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
                 private_process_group,
                 process,
                 private_process_start_time,
+                deadline=deadline,
             )
             is False
             and close_registration is not None

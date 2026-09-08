@@ -804,23 +804,27 @@ Native history capture is admitted only through the live sidecar
 endpoint and anchor binding before registering a history worker, rejects
 borrowed or stale bindings, and retains each worker, exact-target closer, and
 scratch remover until their own process retirement is proven. Descendant
-discovery retains live pidfd identities and role-specific markers installed in
-each native-history worker before Playwright launch; a historical numeric
-parent or process group never authorizes adoption or termination after leader
-identity is lost. Browser-owner signals exclude the role-marked observer and
-closer scopes; those retained pidfds are retired only after exact-target
-safety or private-browser termination is authorized. Incomplete bounded scans
-retain explicit unresolved inventory diagnostics and cannot become a positive
-retirement proof. Cleanup uses one shared absolute operation ceiling:
+discovery retains live pidfd identities, observed parent start times, and
+role-specific markers installed in each native-history worker before Playwright
+launch; a historical numeric parent or process group never authorizes adoption
+or termination after identity is lost. Browser-owner signals exclude the
+role-marked observer and closer scopes; those retained pidfds are retired only
+after exact-target safety or private-browser termination is authorized.
+Inventory phase expiry does not disable later bounded phases, while the final
+inventory cutoff remains a hard ceiling. Incomplete scans retain explicit
+unresolved inventory diagnostics and cannot become a positive retirement proof.
+Cleanup uses one shared absolute operation ceiling:
 target-close, cooperative termination, forced termination, reconciliation,
 reaping, and scratch removal may be shortened by shutdown but never restart a
 deadline or create a recovery allowance. A failed target proof, release
 channel, or final descendant inventory remains an attributable cleanup failure;
 it is never reported as successful history or as an empty conversation set.
-Shutdown captures its cutoff at cancellation (or one-shot shutdown entry),
-closes admission, requests abort for all published owners, and keeps that same
-state servicing retained owners until safety and retirement are proven. The
-stopped event is emitted only after the owner registry is empty.
+Startup and failure cleanup also honor the caller's operation deadline with
+bounded wakeups. Shutdown captures its cutoff at cancellation (or one-shot
+shutdown entry), closes admission, requests abort for all published owners,
+and keeps that same state servicing retained owners after a timed drain failure;
+it creates no new cleanup allowance. The stopped event is emitted only after
+the owner registry is empty.
 
 The sidecar image packages `conversation_init.py`, the owned
 `scripts/chatgpt_oracle_browser_session.mjs` helper, and pinned Playwright with
