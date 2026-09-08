@@ -3001,6 +3001,7 @@ class _ChatGPTOracleBrowserOwner:
         self.browser_inventory_sealed = False
         self.browser_terminal_inventory: Dict[int, int] = {}
         self.inventory_unresolved: Dict[str, str] = {}
+        self.native_scope_inventory: Dict[str, Dict[int, int]] = {}
         self.browser_termination_proven = False
         self.helper_termination_requested = False
         self.cleanup_error: Optional[str] = None
@@ -3332,6 +3333,9 @@ class _ChatGPTOracleBrowserOwner:
         self.inventory_unresolved = unresolved
         browser_pids_after_scan = set(self._browser_process_handles())
         newly_live_browser = False
+        newly_discovered_browser = bool(
+            browser_pids_after_scan - browser_pids_before_scan
+        )
         for pid in browser_pids_after_scan - browser_pids_before_scan:
             handle = self.handles.get(pid)
             if handle is None:
@@ -3349,6 +3353,7 @@ class _ChatGPTOracleBrowserOwner:
             and not self._owned_inventory_is_unresolved()
             and admission_closed
             and producers_exited_before_scan
+            and not newly_discovered_browser
             and not newly_live_browser
         ):
             # Drivers are intentionally excluded from this scope and remain
@@ -3621,6 +3626,16 @@ class _ChatGPTOracleBrowserOwner:
                 self._retain_registered_history_process_handles()
                 self._reconcile_owned_browser_handles(term_deadline)
             handles = self._registration_process_handles(registration_id)
+            if self.browser_discovery_complete and not (
+                self._owned_inventory_is_unresolved()
+            ):
+                self.native_scope_inventory[registration_id] = {
+                    pid: self.known_process_start_times[pid]
+                    for pid in handles
+                    if pid in self.known_process_start_times
+                }
+            else:
+                self.native_scope_inventory.pop(registration_id, None)
             if not handles:
                 # A missing handle set is not retirement proof. Discovery is
                 # deliberately skipped in poll-only servicing, so the owner
@@ -3657,6 +3672,17 @@ class _ChatGPTOracleBrowserOwner:
                     reap_deadline,
                     handles=handles,
                 )
+            scope_inventory = self.native_scope_inventory.get(
+                registration_id,
+                {},
+            )
+            if not scope_inventory or set(handles) != set(scope_inventory):
+                return False
+            if any(
+                self.known_process_start_times.get(pid) != start_time
+                for pid, start_time in scope_inventory.items()
+            ):
+                return False
             return all(
                 bool(select.select([handle], [], [], 0)[0])
                 for handle in handles.values()
