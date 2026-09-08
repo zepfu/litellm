@@ -941,6 +941,7 @@ def install(
     host_globals.setdefault("_emit_aawm_terminal_error", _emit_aawm_terminal_error)
     for _name in (
         "_perform_codex_auto_agent_cursor_agent_request",
+        "_refine_codex_collaboration_wait_timeout_schema",
         "_raise_cursor_agent_alias_error",
         "_raise_codex_auto_agent_missing_credential_preflight",
         "_load_codex_auto_agent_opencode_zen_api_key",
@@ -3346,6 +3347,44 @@ def _validate_cursor_result_and_consume_replay_state(
         )
 
 
+def _refine_codex_collaboration_wait_timeout_schema(
+    request_body: dict[str, Any],
+    *,
+    adapter_model: str,
+) -> None:
+    """Refine a derived build/restoration body, never canonical replay input."""
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.tool_call_restore import (
+        _advertised_namespace_tool_argument_schemas,
+        _advertised_namespace_tool_function_adapter_map,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_request_policy.codex_tool_policy import (
+        _catalog_namespace_adapter_key,
+        _namespace_child_name_allowed,
+    )
+
+    namespace_by_name = _advertised_namespace_tool_function_adapter_map(
+        request_body,
+        adapter_model=adapter_model,
+    )
+    argument_schemas = _advertised_namespace_tool_argument_schemas(request_body)
+    for tool_name, namespace in namespace_by_name.items():
+        if (
+            _catalog_namespace_adapter_key(namespace) != "collaboration"
+            or not _namespace_child_name_allowed(tool_name, {"wait_agent"})
+        ):
+            continue
+        wait_schema = argument_schemas.get(tool_name, {})
+        wait_properties = wait_schema.get("properties")
+        if isinstance(wait_properties, dict):
+            timeout_schema = wait_properties.get("timeout_ms")
+            if (
+                isinstance(timeout_schema, dict)
+                and timeout_schema.get("type") == "number"
+            ):
+                # Stock Codex advertises number but deserializes this field as i64.
+                timeout_schema["type"] = "integer"
+
+
 async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
     *,
     endpoint: str,
@@ -3386,14 +3425,10 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         _record_adapted_completed_route_rollup_turn,
     )
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.tool_call_restore import (
-        _advertised_namespace_tool_argument_schemas,
-        _advertised_namespace_tool_function_adapter_map,
         _restore_adapted_namespace_tool_calls_in_response_body,
     )
     from litellm.proxy.pass_through_endpoints.aawm_request_policy.codex_tool_policy import (
         _adapt_codex_namespace_tools_to_functions_from_request_body,
-        _catalog_namespace_adapter_key,
-        _namespace_child_name_allowed,
     )
 
     if candidate.get("route_family") != "codex_cursor_agent_aiserver_adapter":
@@ -3471,29 +3506,10 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         and isinstance(request_tools, list)
     ):
         restoration_request_body["tools"] = copy.deepcopy(request_tools)
-    namespace_by_name = _advertised_namespace_tool_function_adapter_map(
+    _refine_codex_collaboration_wait_timeout_schema(
         restoration_request_body,
         adapter_model=adapter_model,
     )
-    argument_schemas = _advertised_namespace_tool_argument_schemas(
-        restoration_request_body
-    )
-    for tool_name, namespace in namespace_by_name.items():
-        if (
-            _catalog_namespace_adapter_key(namespace) != "collaboration"
-            or not _namespace_child_name_allowed(tool_name, {"wait_agent"})
-        ):
-            continue
-        wait_schema = argument_schemas.get(tool_name, {})
-        wait_properties = wait_schema.get("properties")
-        if isinstance(wait_properties, dict):
-            timeout_schema = wait_properties.get("timeout_ms")
-            if (
-                isinstance(timeout_schema, dict)
-                and timeout_schema.get("type") == "number"
-            ):
-                # Stock Codex advertises number but deserializes this field as i64.
-                timeout_schema["type"] = "integer"
 
     retained_session = (
         replay_state.get("retained_session")
@@ -4851,7 +4867,11 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
     request_body: dict[str, Any],
 ) -> Response:
     canonical_request_body = copy.deepcopy(request_body)
-    adapted_request_body = copy.deepcopy(request_body)
+    _refine_codex_collaboration_wait_timeout_schema(
+        canonical_request_body,
+        adapter_model=str(request_body.get("model") or ""),
+    )
+    adapted_request_body = copy.deepcopy(canonical_request_body)
     (
         adapted_request_body,
         _adapted_custom_tools,
@@ -4960,10 +4980,16 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
     request_body: dict[str, Any],
 ) -> Response:
     canonical_request_body = copy.deepcopy(request_body)
+    _refine_codex_collaboration_wait_timeout_schema(
+        canonical_request_body,
+        adapter_model=str(request_body.get("model") or ""),
+    )
     (
         adapted_request_body,
         _adapted_custom_tools,
-    ) = _adapt_codex_custom_tools_to_functions_from_request_body(request_body)
+    ) = _adapt_codex_custom_tools_to_functions_from_request_body(
+        copy.deepcopy(canonical_request_body)
+    )
     (
         adapted_request_body,
         _adapted_namespace_tools,
