@@ -31,6 +31,11 @@ from litellm.secret_managers.grok_oidc_auth_path import (
 )
 from litellm.secret_managers.main import get_secret_str
 from litellm.secret_managers.xai_oauth_credentials import (
+    DEFAULT_XAI_OAUTH_AUTH_FILE,
+    DEFAULT_XAI_OAUTH_SCOPE,
+    evaluate_xai_oauth_credential_lifecycle,
+    resolve_xai_oauth_auth_path,
+    resolve_xai_oauth_scope,
     select_xai_oauth_credential_record,
 )
 
@@ -46,12 +51,12 @@ GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY = (
 )
 GROK_NATIVE_OAUTH_CLIENT_NAME = "grok-build"
 
-_DEFAULT_XAI_OAUTH_SCOPE = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
+_DEFAULT_XAI_OAUTH_SCOPE = DEFAULT_XAI_OAUTH_SCOPE
 _DEFAULT_XAI_OAUTH_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
 _DEFAULT_REFRESH_BUFFER_SECONDS = 300
 _DEFAULT_HERMES_XAI_OAUTH_PROVIDER_ID = "xai-oauth"
 _DEFAULT_HERMES_AUTH_PATH = "~/.hermes/auth.json"
-_DEFAULT_LITELLM_XAI_OAUTH_AUTH_PATH = "~/.litellm/xai/oauth-auth.json"
+_DEFAULT_LITELLM_XAI_OAUTH_AUTH_PATH = DEFAULT_XAI_OAUTH_AUTH_FILE
 
 _XAI_RESPONSES_PREVIOUS_RESPONSE_ID_DECODED_METADATA = {
     "xai_responses_previous_response_id_decoded": True,
@@ -298,32 +303,38 @@ def _merge_metadata(
 
 
 async def get_xai_oauth_access_token() -> str:
-    credential_path = get_secret_str("LITELLM_XAI_OAUTH_AUTH_FILE")
-    if not credential_path:
+    path_resolution = resolve_xai_oauth_auth_path(value_getter=get_secret_str)
+    if path_resolution.source == "default":
         raise ValueError(
-            "xAI OAuth-managed models require LITELLM_XAI_OAUTH_AUTH_FILE to "
-            "point at the sidecar-maintained xAI OAuth credential file. Run "
-            "the provider-status sidecar xAI OAuth refresh or reseed/relogin "
-            "the managed credential before calling oa_xai/*."
+            "xAI OAuth-managed models require an explicit managed auth-file "
+            "configuration (AAWM_XAI_OAUTH_AUTH_FILE or "
+            "LITELLM_XAI_OAUTH_AUTH_FILE) pointing at the sidecar-maintained "
+            "xAI OAuth credential file. Run the provider-status sidecar xAI "
+            "OAuth refresh or reseed/relogin the managed credential before "
+            "calling oa_xai/*."
         )
 
-    scope = get_secret_str("LITELLM_XAI_OAUTH_SCOPE") or _DEFAULT_XAI_OAUTH_SCOPE
+    credential_path = path_resolution.path
+    scope = resolve_xai_oauth_scope(value_getter=get_secret_str).scope
     lock_key = f"xai-oauth-read:{credential_path}:{scope}"
     lock = _refresh_locks.setdefault(lock_key, asyncio.Lock())
     async with lock:
         return _get_xai_oauth_access_token_read_only(
-            credential_path=Path(credential_path),
+            credential_path=credential_path,
             scope=scope,
         )
 
 
 async def get_grok_native_oauth_access_token() -> str:
     credential_path = default_grok_xai_oauth_auth_path()
-    scope = (
-        get_secret_str("LITELLM_XAI_GROK_OAUTH_SCOPE")
-        or get_secret_str("LITELLM_XAI_OAUTH_SCOPE")
-        or _DEFAULT_XAI_OAUTH_SCOPE
-    )
+    scope = resolve_xai_oauth_scope(
+        value_getter=get_secret_str,
+        env_names=(
+            "LITELLM_XAI_GROK_OAUTH_SCOPE",
+            "LITELLM_XAI_OAUTH_SCOPE",
+        ),
+        default_scope=_DEFAULT_XAI_OAUTH_SCOPE,
+    ).scope
     lock_key = f"grok-native-read:{credential_path}:{scope}"
     lock = _refresh_locks.setdefault(lock_key, asyncio.Lock())
     async with lock:
@@ -677,11 +688,13 @@ def _credential_needs_refresh(credential: Mapping[str, Any]) -> bool:
     permanently fresh). Production accessors are read-only and raise a sidecar
     refresh-required error in that case rather than minting a new token here.
     """
-    expires_at = _parse_expires_at(credential.get("expires_at"))
-    if expires_at is None:
-        return True
     buffer_seconds = _refresh_buffer_seconds()
-    return datetime.now(timezone.utc) >= expires_at - timedelta(seconds=buffer_seconds)
+    lifecycle = evaluate_xai_oauth_credential_lifecycle(
+        credential,
+        route_safety_buffer_seconds=buffer_seconds,
+        refresh_min_seconds=buffer_seconds,
+    )
+    return not bool(lifecycle["route_usable"])
 
 
 def _parse_expires_at(value: Any) -> Optional[datetime]:

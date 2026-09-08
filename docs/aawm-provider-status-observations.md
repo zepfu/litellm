@@ -108,6 +108,13 @@ token values. Persisted rows use `source_task=provider_auth_health_poll` and
 metadata flags `passive_read_only=true`, `network_calls=false`, and
 `credential_file_mutated=false`.
 
+Managed xAI request, refresh, health, and status consumers share the same
+auth-file and scope resolver. The sidecar records source labels and a
+nonsecret credential-generation identity, but never records the canonical
+filesystem path or token contents. Conflicting configured paths or scopes fail
+closed before any credential or provider I/O; a custom auth file gets its
+canonical sibling lock unless a validated lock override is supplied.
+
 Relevant environment variables:
 
 - `AAWM_PROVIDER_AUTH_HEALTH_POLL_ENABLED`: enables the passive inspection.

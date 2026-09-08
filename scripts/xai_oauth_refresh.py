@@ -33,15 +33,27 @@ from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
 )
 from litellm.secret_managers.xai_oauth_credentials import (
+    DEFAULT_XAI_OAUTH_AUTH_FILE as _FOUNDATION_DEFAULT_XAI_OAUTH_AUTH_FILE,
+    DEFAULT_XAI_OAUTH_LOCK_FILE as _FOUNDATION_DEFAULT_XAI_OAUTH_LOCK_FILE,
+    DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS as _FOUNDATION_DEFAULT_REFRESH_MIN_SECONDS,
+    DEFAULT_XAI_OAUTH_SCOPE as _FOUNDATION_DEFAULT_XAI_OAUTH_SCOPE,
+    DEFAULT_XAI_OAUTH_TOKEN_ENDPOINT as _FOUNDATION_DEFAULT_TOKEN_ENDPOINT,
+    credential_expires_at as _foundation_credential_expires_at,
+    credential_identity as _foundation_credential_identity,
+    evaluate_xai_oauth_credential_lifecycle,
+    issued_lifetime_metadata as _foundation_issued_lifetime_metadata,
+    refresh_threshold_metadata as _foundation_refresh_threshold_metadata,
+    resolve_xai_oauth_lock_path,
+    resolve_xai_oauth_scope,
     select_xai_oauth_credential_record,
 )
 
 # Portable ~ defaults (expanded via Path.expanduser at use sites).
-DEFAULT_XAI_OAUTH_AUTH_FILE = "~/.litellm/xai/oauth-auth.json"
-DEFAULT_XAI_OAUTH_LOCK_FILE = "~/.litellm/xai/oauth-auth.json.lock"
-DEFAULT_XAI_OAUTH_SCOPE = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
-DEFAULT_XAI_OAUTH_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
-DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS = 300
+DEFAULT_XAI_OAUTH_AUTH_FILE = _FOUNDATION_DEFAULT_XAI_OAUTH_AUTH_FILE
+DEFAULT_XAI_OAUTH_LOCK_FILE = _FOUNDATION_DEFAULT_XAI_OAUTH_LOCK_FILE
+DEFAULT_XAI_OAUTH_SCOPE = _FOUNDATION_DEFAULT_XAI_OAUTH_SCOPE
+DEFAULT_XAI_OAUTH_TOKEN_ENDPOINT = _FOUNDATION_DEFAULT_TOKEN_ENDPOINT
+DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS = _FOUNDATION_DEFAULT_REFRESH_MIN_SECONDS
 DEFAULT_XAI_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_XAI_OAUTH_AUTH_FILE_MODE = 0o600
 DEFAULT_XAI_OAUTH_ERROR_MESSAGE_LIMIT = 500
@@ -84,29 +96,14 @@ def _issued_lifetime_metadata(
     Authority order is provider ``expires_in``, validated JWT ``iat``/``exp``,
     then a persisted obtained/refreshed timestamp paired with ``expires_at``.
     """
-    provider_lifetime = _as_finite_number(expires_in)
-    if provider_lifetime is not None and provider_lifetime > 0:
-        return provider_lifetime, "expires_in"
-
-    jwt_claims = _jwt_time_claims(access_token)
-    if jwt_claims is not None:
-        issued_timestamp, expiry_timestamp = jwt_claims
-        return expiry_timestamp - issued_timestamp, "jwt"
-
-    persisted_issued_at = _first_timestamp_seconds(
-        issued_at,
-        obtained_at,
-        refreshed_at,
+    return _foundation_issued_lifetime_metadata(
+        expires_in=expires_in,
+        access_token=access_token,
+        expires_at=expires_at,
+        issued_at=issued_at,
+        obtained_at=obtained_at,
+        refreshed_at=refreshed_at,
     )
-    persisted_expires_at = _timestamp_seconds(expires_at)
-    if (
-        persisted_issued_at is not None
-        and persisted_expires_at is not None
-        and persisted_expires_at > persisted_issued_at
-    ):
-        return persisted_expires_at - persisted_issued_at, "persisted_timestamp"
-
-    return None, "fallback"
 
 
 def _refresh_threshold_seconds(
@@ -169,6 +166,7 @@ class XaiOAuthRefreshSummary:
     refresh_threshold_seconds: Optional[float] = None
     refresh_threshold_source: Optional[str] = None
     refresh_threshold_degraded: bool = False
+    credential_identity: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -184,41 +182,58 @@ class XaiOAuthRefreshSummary:
             "refresh_threshold_seconds": self.refresh_threshold_seconds,
             "refresh_threshold_source": self.refresh_threshold_source,
             "refresh_threshold_degraded": self.refresh_threshold_degraded,
+            "credential_identity": self.credential_identity,
         }
 
 
 def inspect_xai_oauth_credential_health(
-    auth_file: str | Path, *, scope: Optional[str] = None
+    auth_file: str | Path,
+    *,
+    scope: Optional[str] = None,
+    buffer_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Read and classify xAI OAuth state without locks, writes, or HTTP."""
     resolved_auth_file = Path(auth_file).expanduser()
     resolved_scope = _resolve_scope(scope)
+    resolved_buffer_seconds = _resolve_buffer_seconds(buffer_seconds)
     try:
         credential = _select_credential_record(
             _read_credential_payload(resolved_auth_file), resolved_scope
         )
-        if not _looks_like_credential_record(credential):
-            raise ValueError("xAI OAuth credential has no usable access credential.")
-        expires_at = _parse_expires_at(credential.get("expires_at"))
-        if expires_at is None:
-            return _xai_health_summary(
-                resolved_auth_file,
-                resolved_scope,
-                "degraded",
-                error_class="CredentialExpiryUnavailable",
-                error_message="xAI OAuth credential expires_at is missing or invalid.",
+        lifecycle = evaluate_xai_oauth_credential_lifecycle(
+            credential,
+            route_safety_buffer_seconds=resolved_buffer_seconds,
+            refresh_min_seconds=resolved_buffer_seconds,
+        )
+        error_class: Optional[str] = None
+        error_message: Optional[str] = None
+        if not lifecycle["access_available"]:
+            error_class = "CredentialAccessUnavailable"
+            error_message = (
+                "xAI OAuth credential does not contain an access credential."
             )
-        if expires_at <= datetime.now(timezone.utc):
-            return _xai_health_summary(
-                resolved_auth_file,
-                resolved_scope,
-                "expired",
-                expires_at,
-                error_class="CredentialExpiredError",
-                error_message="xAI OAuth credential is expired.",
+        elif not lifecycle["expiry_available"]:
+            error_class = "CredentialExpiryUnavailable"
+            error_message = (
+                "xAI OAuth credential expires_at is missing or invalid."
             )
+        elif lifecycle["expired"]:
+            error_class = "CredentialExpiredError"
+            error_message = "xAI OAuth credential is expired."
         return _xai_health_summary(
-            resolved_auth_file, resolved_scope, "fresh", expires_at
+            resolved_auth_file,
+            resolved_scope,
+            str(lifecycle["credential_health"]),
+            lifecycle.get("expires_at"),
+            error_class=error_class,
+            error_message=error_message,
+            credential_identity=_credential_identity(
+                resolved_auth_file,
+                credential,
+                scope=resolved_scope,
+            ),
+            lifecycle=lifecycle,
+            route_safety_buffer_seconds=resolved_buffer_seconds,
         )
     except Exception as exc:
         return _xai_health_summary(
@@ -227,6 +242,11 @@ def inspect_xai_oauth_credential_health(
             "malformed",
             error_class=exc.__class__.__name__,
             error_message=_sanitize_error_message(str(exc)),
+            credential_identity=_credential_identity(
+                resolved_auth_file,
+                scope=resolved_scope,
+            ),
+            route_safety_buffer_seconds=resolved_buffer_seconds,
         )
 
 
@@ -237,7 +257,11 @@ def _xai_health_summary(
     expires_at: Optional[datetime] = None,
     error_class: Optional[str] = None,
     error_message: Optional[str] = None,
+    credential_identity: Optional[str] = None,
+    lifecycle: Optional[Mapping[str, Any]] = None,
+    route_safety_buffer_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
+    lifecycle = lifecycle or {}
     return {
         "attempted": True,
         "refreshed": False,
@@ -248,6 +272,25 @@ def _xai_health_summary(
         "expires_at": _format_expires_at(expires_at),
         "error_class": error_class,
         "error_message": error_message,
+        "credential_identity": credential_identity,
+        "structurally_valid": lifecycle.get("structurally_valid"),
+        "access_available": lifecycle.get("access_available"),
+        "refresh_possible": lifecycle.get("refresh_possible"),
+        "route_usable": lifecycle.get("route_usable"),
+        "route_unusable": lifecycle.get("route_unusable"),
+        "refresh_due": lifecycle.get("refresh_due"),
+        "terminal_unrefreshable": lifecycle.get("terminal_unrefreshable"),
+        "lifecycle_state": lifecycle.get("state"),
+        "route_unusable_reason": lifecycle.get("route_unusable_reason"),
+        "refresh_due_at": _format_expires_at(lifecycle.get("refresh_due_at")),
+        "route_unusable_at": _format_expires_at(
+            lifecycle.get("route_unusable_at")
+        ),
+        "refresh_threshold_seconds": lifecycle.get("refresh_threshold_seconds"),
+        "refresh_threshold_source": lifecycle.get("refresh_threshold_source"),
+        "refresh_threshold_degraded": lifecycle.get("refresh_threshold_degraded"),
+        "route_safety_buffer_seconds": route_safety_buffer_seconds,
+        "usable": lifecycle.get("route_usable"),
     }
 
 
@@ -280,18 +323,25 @@ def refresh_xai_oauth_auth_file(
     resolved_auth_file = Path(auth_file).expanduser()
     resolved_scope = _resolve_scope(scope)
     resolved_buffer_seconds = _resolve_buffer_seconds(buffer_seconds)
-    resolved_lock_file = (
-        Path(lock_file).expanduser()
-        if lock_file is not None
-        else resolved_auth_file.with_name(f"{resolved_auth_file.name}.lock")
-    )
 
     try:
+        resolved_lock_file = resolve_xai_oauth_lock_path(
+            resolved_auth_file,
+            lock_file,
+        )
         with _credential_file_lock(resolved_lock_file):
             raw_payload = _read_credential_payload(resolved_auth_file)
             credential = _select_credential_record(raw_payload, resolved_scope)
+            identity = _credential_identity(
+                resolved_auth_file,
+                credential,
+                scope=resolved_scope,
+            )
             threshold, threshold_source, threshold_degraded = (
-                _credential_refresh_threshold_metadata(credential)
+                _credential_refresh_threshold_metadata(
+                    credential,
+                    min_seconds=resolved_buffer_seconds,
+                )
             )
             current_expires_at = _format_expires_at(
                 _credential_expires_at(credential)
@@ -312,6 +362,7 @@ def refresh_xai_oauth_auth_file(
                     refresh_threshold_seconds=threshold,
                     refresh_threshold_source=threshold_source,
                     refresh_threshold_degraded=threshold_degraded,
+                    credential_identity=identity,
                 ).as_dict()
 
             refreshed = _refresh_credential_record(
@@ -325,7 +376,10 @@ def refresh_xai_oauth_auth_file(
             _update_credential_record(credential, refreshed)
             _write_credential_payload(resolved_auth_file, raw_payload)
             threshold, threshold_source, threshold_degraded = (
-                _credential_refresh_threshold_metadata(credential)
+                _credential_refresh_threshold_metadata(
+                    credential,
+                    min_seconds=resolved_buffer_seconds,
+                )
             )
             return XaiOAuthRefreshSummary(
                 attempted=True,
@@ -340,6 +394,11 @@ def refresh_xai_oauth_auth_file(
                 refresh_threshold_seconds=threshold,
                 refresh_threshold_source=threshold_source,
                 refresh_threshold_degraded=threshold_degraded,
+                credential_identity=_credential_identity(
+                    resolved_auth_file,
+                    credential,
+                    scope=resolved_scope,
+                ),
             ).as_dict()
     except Exception as exc:
         threshold: Optional[float] = None
@@ -348,7 +407,10 @@ def refresh_xai_oauth_auth_file(
         if "credential" in locals():
             try:
                 threshold, threshold_source, threshold_degraded = (
-                    _credential_refresh_threshold_metadata(credential)
+                    _credential_refresh_threshold_metadata(
+                        credential,
+                        min_seconds=resolved_buffer_seconds,
+                    )
                 )
             except Exception:
                 pass
@@ -364,6 +426,13 @@ def refresh_xai_oauth_auth_file(
             refresh_threshold_seconds=threshold,
             refresh_threshold_source=threshold_source,
             refresh_threshold_degraded=threshold_degraded,
+            credential_identity=(
+                _credential_identity(
+                    resolved_auth_file,
+                    credential if "credential" in locals() else None,
+                    scope=resolved_scope,
+                )
+            ),
         ).as_dict()
 
 
@@ -382,48 +451,50 @@ def inspect_xai_oauth_refresh_eligibility(
     try:
         payload = _read_credential_payload(resolved_auth_file)
         credential = _select_credential_record(payload, resolved_scope)
-        if not _looks_like_credential_record(credential):
-            raise ValueError("xAI OAuth credential has no usable access credential.")
-        threshold_seconds, threshold_source, threshold_degraded = (
-            _credential_refresh_threshold_metadata(credential)
+        lifecycle = evaluate_xai_oauth_credential_lifecycle(
+            credential,
+            now=lambda: observed_at,
+            route_safety_buffer_seconds=max(0, int(buffer_seconds)),
+            refresh_min_seconds=max(0, int(buffer_seconds)),
         )
-        expires_at = _credential_expires_at(credential)
-        usable = bool(
-            _clean_oauth_string(credential.get("key"))
-            or _clean_oauth_string(credential.get("access_token"))
+        expires_at = lifecycle.get("expires_at")
+        refresh_due_at = lifecycle.get("refresh_due_at")
+        next_refresh_check_at = (
+            refresh_due_at
+            if isinstance(refresh_due_at, datetime)
+            and observed_at < refresh_due_at
+            else observed_at
+            + timedelta(seconds=max(1.0, poll_interval_seconds))
         )
-        if expires_at is None:
-            return _eligibility_summary(
-                observed_at=observed_at,
-                expires_at=None,
-                refresh_due_at=None,
-                next_refresh_check_at=observed_at
-                + timedelta(seconds=max(1.0, poll_interval_seconds)),
-                eligible=True,
-                credential_health="degraded",
-                usable=usable,
-                error_class="CredentialExpiryUnavailable",
-                error_message="xAI OAuth credential expires_at is missing or invalid.",
-                refresh_threshold_seconds=threshold_seconds,
-                refresh_threshold_source=threshold_source,
-                refresh_threshold_degraded=threshold_degraded,
+        error_class: Optional[str] = None
+        error_message: Optional[str] = None
+        if not lifecycle["access_available"]:
+            error_class = "CredentialAccessUnavailable"
+            error_message = (
+                "xAI OAuth credential does not contain an access credential."
             )
-        refresh_due_at = expires_at - timedelta(seconds=threshold_seconds)
+        elif not lifecycle["expiry_available"]:
+            error_class = "CredentialExpiryUnavailable"
+            error_message = (
+                "xAI OAuth credential expires_at is missing or invalid."
+            )
         return _eligibility_summary(
             observed_at=observed_at,
             expires_at=expires_at,
             refresh_due_at=refresh_due_at,
-            next_refresh_check_at=(
-                refresh_due_at
-                if observed_at < refresh_due_at
-                else observed_at + timedelta(seconds=max(1.0, poll_interval_seconds))
+            next_refresh_check_at=next_refresh_check_at,
+            eligible=bool(lifecycle["refresh_due"]),
+            credential_health=str(lifecycle["credential_health"]),
+            usable=bool(lifecycle["route_usable"]),
+            error_class=error_class,
+            error_message=error_message,
+            credential_identity=_credential_identity(
+                resolved_auth_file,
+                credential,
+                scope=resolved_scope,
             ),
-            eligible=observed_at >= refresh_due_at,
-            credential_health="expired" if expires_at <= observed_at else "fresh",
-            usable=usable and expires_at > observed_at,
-            refresh_threshold_seconds=threshold_seconds,
-            refresh_threshold_source=threshold_source,
-            refresh_threshold_degraded=threshold_degraded,
+            lifecycle=lifecycle,
+            route_safety_buffer_seconds=max(0, int(buffer_seconds)),
         )
     except Exception as exc:
         return _eligibility_summary(
@@ -440,6 +511,11 @@ def inspect_xai_oauth_refresh_eligibility(
             refresh_threshold_seconds=float(DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS),
             refresh_threshold_source="fallback",
             refresh_threshold_degraded=True,
+            credential_identity=_credential_identity(
+                resolved_auth_file,
+                scope=resolved_scope,
+            ),
+            route_safety_buffer_seconds=max(0, int(buffer_seconds)),
         )
 
 
@@ -454,10 +530,14 @@ def _eligibility_summary(
     usable: bool,
     error_class: Optional[str] = None,
     error_message: Optional[str] = None,
+    credential_identity: Optional[str] = None,
+    lifecycle: Optional[Mapping[str, Any]] = None,
+    route_safety_buffer_seconds: Optional[float] = None,
     refresh_threshold_seconds: Optional[float] = None,
     refresh_threshold_source: Optional[str] = None,
     refresh_threshold_degraded: bool = False,
 ) -> Dict[str, Any]:
+    lifecycle = lifecycle or {}
     return {
         "eligibility_checked_at": _format_expires_at(observed_at),
         "expires_at": _format_expires_at(expires_at),
@@ -468,9 +548,35 @@ def _eligibility_summary(
         "usable": usable,
         "error_class": error_class,
         "error_message": error_message,
-        "refresh_threshold_seconds": refresh_threshold_seconds,
-        "refresh_threshold_source": refresh_threshold_source,
-        "refresh_threshold_degraded": refresh_threshold_degraded,
+        "credential_identity": credential_identity,
+        "structurally_valid": lifecycle.get("structurally_valid"),
+        "access_available": lifecycle.get("access_available"),
+        "refresh_possible": lifecycle.get("refresh_possible"),
+        "route_usable": lifecycle.get("route_usable"),
+        "route_unusable": lifecycle.get("route_unusable"),
+        "refresh_due": lifecycle.get("refresh_due"),
+        "terminal_unrefreshable": lifecycle.get("terminal_unrefreshable"),
+        "lifecycle_state": lifecycle.get("state"),
+        "route_unusable_reason": lifecycle.get("route_unusable_reason"),
+        "route_unusable_at": _format_expires_at(
+            lifecycle.get("route_unusable_at")
+        ),
+        "refresh_threshold_seconds": (
+            lifecycle.get("refresh_threshold_seconds")
+            if lifecycle
+            else refresh_threshold_seconds
+        ),
+        "refresh_threshold_source": (
+            lifecycle.get("refresh_threshold_source")
+            if lifecycle
+            else refresh_threshold_source
+        ),
+        "refresh_threshold_degraded": (
+            lifecycle.get("refresh_threshold_degraded")
+            if lifecycle
+            else refresh_threshold_degraded
+        ),
+        "route_safety_buffer_seconds": route_safety_buffer_seconds,
     }
 
 
@@ -482,14 +588,7 @@ def _resolve_wall_now(now: Optional[Callable[[], datetime]]) -> datetime:
 
 
 def _resolve_scope(scope: Optional[str]) -> str:
-    if isinstance(scope, str) and scope.strip():
-        return scope.strip()
-    env_scope = os.getenv("AAWM_XAI_OAUTH_SCOPE") or os.getenv(
-        "LITELLM_XAI_OAUTH_SCOPE"
-    )
-    if isinstance(env_scope, str) and env_scope.strip():
-        return env_scope.strip()
-    return DEFAULT_XAI_OAUTH_SCOPE
+    return resolve_xai_oauth_scope(scope).scope
 
 
 def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:
@@ -597,13 +696,12 @@ def _credential_needs_refresh(
     own ``expires_in`` and ``access_token``, falling back to the passed
     ``buffer_seconds`` when no lifetime metadata is available.
     """
-    expires_at = _credential_expires_at(credential)
-    if expires_at is None:
-        return True
-    threshold, _source, _degraded = _credential_refresh_threshold_metadata(
-        credential
+    lifecycle = evaluate_xai_oauth_credential_lifecycle(
+        credential,
+        route_safety_buffer_seconds=max(0, int(buffer_seconds)),
+        refresh_min_seconds=max(0, int(buffer_seconds)),
     )
-    return datetime.now(timezone.utc) >= expires_at - timedelta(seconds=threshold)
+    return bool(lifecycle["refresh_due"])
 
 
 def _parse_expires_at(value: Any) -> Optional[datetime]:
@@ -643,42 +741,30 @@ def _format_expires_at(value: Optional[datetime]) -> Optional[str]:
 
 def _credential_refresh_threshold_metadata(
     credential: Mapping[str, Any],
+    *,
+    min_seconds: float = DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS,
 ) -> Tuple[float, str, bool]:
-    return _refresh_threshold_metadata(
-        expires_in=credential.get("expires_in"),
-        access_token=credential.get("access_token") or credential.get("key"),
-        expires_at=_credential_expires_at(credential),
-        issued_at=credential.get("issued_at"),
-        obtained_at=credential.get("obtained_at"),
-        refreshed_at=credential.get("refreshed_at"),
+    return _foundation_refresh_threshold_metadata(
+        credential,
+        min_seconds=min_seconds,
     )
 
 
 def _credential_expires_at(credential: Mapping[str, Any]) -> Optional[datetime]:
-    explicit_expiry = _parse_expires_at(credential.get("expires_at"))
-    if explicit_expiry is not None:
-        return explicit_expiry
+    return _foundation_credential_expires_at(credential)
 
-    jwt_claims = _jwt_time_claims(
-        credential.get("access_token") or credential.get("key")
+
+def _credential_identity(
+    auth_path: Path,
+    credential: Optional[Mapping[str, Any]] = None,
+    *,
+    scope: Optional[str] = None,
+) -> Optional[str]:
+    return _foundation_credential_identity(
+        auth_path,
+        credential,
+        scope=scope,
     )
-    if jwt_claims is not None:
-        try:
-            return datetime.fromtimestamp(jwt_claims[1], tz=timezone.utc)
-        except (OSError, OverflowError, ValueError):
-            return None
-
-    issued_at = _credential_issued_at(credential)
-    lifetime = _as_finite_number(credential.get("expires_in"))
-    if issued_at is not None and lifetime is not None and lifetime > 0:
-        try:
-            return datetime.fromtimestamp(
-                issued_at + lifetime,
-                tz=timezone.utc,
-            )
-        except (OSError, OverflowError, ValueError):
-            return None
-    return None
 
 
 def _credential_issued_at(credential: Mapping[str, Any]) -> Optional[float]:

@@ -34,6 +34,7 @@ from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
 )
 from litellm.secret_managers.xai_oauth_credentials import (
+    resolve_xai_oauth_scope,
     select_xai_oauth_credential_record,
 )
 
@@ -546,14 +547,14 @@ def repair_grok_oidc_auth_file_metadata(
 
 
 def _resolve_scope(scope: Optional[str]) -> str:
-    if isinstance(scope, str) and scope.strip():
-        return scope.strip()
-    env_scope = os.getenv("LITELLM_XAI_GROK_OAUTH_SCOPE") or os.getenv(
-        "LITELLM_XAI_OAUTH_SCOPE"
-    )
-    if isinstance(env_scope, str) and env_scope.strip():
-        return env_scope.strip()
-    return DEFAULT_GROK_OIDC_SCOPE
+    return resolve_xai_oauth_scope(
+        scope,
+        env_names=(
+            "LITELLM_XAI_GROK_OAUTH_SCOPE",
+            "LITELLM_XAI_OAUTH_SCOPE",
+        ),
+        default_scope=DEFAULT_GROK_OIDC_SCOPE,
+    ).scope
 
 
 def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:

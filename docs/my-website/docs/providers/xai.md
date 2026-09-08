@@ -159,6 +159,22 @@ scope before provider or token I/O and never selects a record based on JSON key
 order. An explicitly unambiguous legacy flat record remains supported; mixed
 flat-and-nested documents must be migrated to an exact scope-keyed record.
 
+## Managed OAuth File and Scope Resolution
+
+Managed xAI OAuth request handling and the provider-status sidecar use the same
+read-only resolver. Auth-file precedence is
+`AAWM_XAI_OAUTH_AUTH_FILE`, an explicit non-default sidecar value,
+`LITELLM_XAI_OAUTH_AUTH_FILE`, `LITELLM_XAI_OAUTH_MIGRATED_AUTH_FILE`, then
+`~/.litellm/xai/oauth-auth.json`. Scope precedence is an explicit sidecar
+value, `AAWM_XAI_OAUTH_SCOPE`, `LITELLM_XAI_OAUTH_SCOPE`, then the default
+subscription scope.
+
+When more than one source is configured, all sources must resolve to the same
+path or scope. Conflicting sources fail closed before credential or provider
+I/O. Refresh, request, health, and status records use the same sanitized
+nonsecret credential identity; they do not expose the auth path or token
+contents.
+
 ## Responses API Image Retention
 
 For xAI Responses requests containing `input_image` or `image_url` content,

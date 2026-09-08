@@ -136,6 +136,28 @@ or refresh publication; migrate it by placing the intended record under the
 configured scope key. Diagnostics identify the selection failure without
 including credential contents.
 
+## Managed xAI file and scope precedence (XAI-032)
+
+Production managed xAI requests, sidecar refresh, passive health, and status
+observations share one resolver. Auth-file sources are considered in this
+order:
+
+| Order | Source |
+| --- | --- |
+| 1 | `AAWM_XAI_OAUTH_AUTH_FILE` |
+| 2 | Explicit non-default sidecar/config value |
+| 3 | `LITELLM_XAI_OAUTH_AUTH_FILE` |
+| 4 | `LITELLM_XAI_OAUTH_MIGRATED_AUTH_FILE` |
+| 5 | `~/.litellm/xai/oauth-auth.json` |
+
+Scope sources are explicit sidecar/config value, `AAWM_XAI_OAUTH_SCOPE`,
+`LITELLM_XAI_OAUTH_SCOPE`, then the default xAI subscription scope. If multiple
+sources are present, they must resolve to the same value; a path or scope
+conflict fails closed before credential or provider I/O. The resolver reports
+only source labels. Refresh and request/health/status evidence share a
+nonsecret credential-generation identity and never publish the raw path or
+credential fields.
+
 ## Codex ordered account inventory (OPENAI-001)
 
 `LITELLM_CODEX_OAUTH_INVENTORY` is a versioned JSON object whose `accounts`
