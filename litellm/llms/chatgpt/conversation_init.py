@@ -329,6 +329,10 @@ _NAMED_COLLECTION_IDENTITY_FIELDS = {
     "limits_progress": "feature",
     "model_limits": "model",
 }
+_COLLECTION_STATE_VALUES = frozenset(
+    {"absent_unknown", "empty_unknown", "present", "partial", "malformed"}
+)
+_MAX_COLLECTION_DIAGNOSTIC_COUNT = MAX_PROJECTION_LIST_ITEMS * 4
 _CONVERSATION_INIT_MARKERS = {
     "model_limits",
     "limits_progress",
@@ -1160,6 +1164,68 @@ def _collections_are_wholly_malformed(parsed: Mapping[str, Any]) -> bool:
     return bool(parsed["malformed"]) and not any(
         parsed[key] for key in ("feature_rows", "model_rows", "blocked_rows")
     )
+
+
+def _collection_diagnostics(
+    payload: Any,
+    *,
+    malformed_collection_projection: bool,
+) -> Dict[str, Any]:
+    diagnostics = {
+        "model_limits_state": "absent_unknown",
+        "limits_progress_state": "absent_unknown",
+        "blocked_features_state": "absent_unknown",
+        "malformed_entry_count": 0,
+        "valid_observation_count": 0,
+        "projection_truncated": False,
+        "malformed_collection_projection": bool(
+            malformed_collection_projection
+        ),
+    }
+    if not isinstance(payload, Mapping):
+        return diagnostics
+
+    parsed = _parse_collections(
+        payload,
+        {
+            "malformed_collection_projection": (
+                malformed_collection_projection
+            )
+        },
+    )
+    for field_name in (
+        "model_limits_state",
+        "limits_progress_state",
+        "blocked_features_state",
+    ):
+        state = parsed[field_name]
+        diagnostics[field_name] = (
+            state if state in _COLLECTION_STATE_VALUES else "malformed"
+        )
+    diagnostics["malformed_entry_count"] = min(
+        max(int(parsed["malformed"]), 0),
+        _MAX_COLLECTION_DIAGNOSTIC_COUNT,
+    )
+    diagnostics["projection_truncated"] = parsed["truncated"] is True
+    diagnostics["malformed_collection_projection"] = (
+        parsed["projection_malformed"] is True
+    )
+    if _collections_are_wholly_malformed(parsed):
+        return diagnostics
+    valid_rows = sum(
+        len(parsed[field_name])
+        for field_name in (
+            "feature_rows",
+            "model_rows",
+            "default_model_rows",
+            "blocked_rows",
+        )
+    )
+    diagnostics["valid_observation_count"] = min(
+        valid_rows + 1,
+        _MAX_COLLECTION_DIAGNOSTIC_COUNT,
+    )
+    return diagnostics
 
 
 def build_conversation_init_rate_limit_tuples(
@@ -1995,6 +2061,13 @@ def _normalize_named_collection(
     entries: List[Mapping[str, Any]] = []
     if isinstance(raw, Mapping):
         for key, value in raw.items():
+            normalized_key = _normalize_key(key)
+            if _is_usage_number_field_name(normalized_key) or any(
+                normalized_key == _normalize_key(reset_key)
+                for reset_key in _RESET_KEYS
+            ):
+                malformed += 1
+                continue
             if isinstance(value, Mapping):
                 merged = dict(value)
                 merged.setdefault("_identity", str(key))
@@ -2009,6 +2082,13 @@ def _normalize_named_collection(
             if isinstance(item, Mapping):
                 if len(item) == 1 and _entry_identity(item) is None:
                     key, value = next(iter(item.items()))
+                    normalized_key = _normalize_key(key)
+                    if _is_usage_number_field_name(normalized_key) or any(
+                        normalized_key == _normalize_key(reset_key)
+                        for reset_key in _RESET_KEYS
+                    ):
+                        entries.append(item)
+                        continue
                     identity = _safe_identity(key)
                     if identity is not None and isinstance(value, Mapping):
                         merged = dict(value)
@@ -3651,6 +3731,14 @@ def collect_conversation_init_snapshot(  # noqa: PLR0915 - collector state
         else None
     )
     summary["native_capture_error"] = sanitized.get("native_capture_error")
+    summary.update(
+        _collection_diagnostics(
+            sanitized.get("payload"),
+            malformed_collection_projection=(
+                sanitized.get("malformed_collection_projection") is True
+            ),
+        )
+    )
     persistability_failure_reason = _snapshot_persistability_failure_reason(
         sanitized
     )
@@ -3812,6 +3900,14 @@ def _collect_bound_conversation_init_snapshot(  # noqa: PLR0915 - bound state
         else None
     )
     summary["native_capture_error"] = sanitized.get("native_capture_error")
+    summary.update(
+        _collection_diagnostics(
+            sanitized.get("payload"),
+            malformed_collection_projection=(
+                sanitized.get("malformed_collection_projection") is True
+            ),
+        )
+    )
     summary["account_hash"] = sanitized.get("account_hash")
     summary["account_identity_hashed"] = bool(sanitized.get("account_hash"))
     summary["account_identity_source"] = sanitized.get("account_identity_source")
@@ -4026,6 +4122,13 @@ def _collector_summary(contract: Mapping[str, Any], source_path: str) -> Dict[st
         "native_capture_error": None,
         "browser_challenge": False,
         "retry_after_seconds": None,
+        "model_limits_state": "absent_unknown",
+        "limits_progress_state": "absent_unknown",
+        "blocked_features_state": "absent_unknown",
+        "malformed_entry_count": 0,
+        "valid_observation_count": 0,
+        "projection_truncated": False,
+        "malformed_collection_projection": False,
         "redacted_field_count": 0,
         "source_identity_hash": hash_chatgpt_conversation_init_source_identity(
             source_path

@@ -148,6 +148,10 @@ FALSE_VALUES = {"0", "false", "no", "off"}
 PROVIDER_FAILURE_SUMMARY_LIMIT = 8
 PROVIDER_FAILURE_FIELD_LIMIT = 160
 PROVIDER_FAILURE_MESSAGE_LIMIT = 240
+_CHATGPT_COLLECTION_STATE_VALUES = frozenset(
+    {"absent_unknown", "empty_unknown", "present", "partial", "malformed"}
+)
+_CHATGPT_COLLECTION_DIAGNOSTIC_COUNT_LIMIT = 800
 DEFAULT_GROK_OIDC_LOCK_FILE = "/home/zepfu/.grok/auth.json.lock"
 GROK_SIDECAR_NATIVE_AUTH_FILE_ENV_VARS = GROK_OIDC_AUTH_FILE_ENV_VARS
 DEFAULT_GROK_OIDC_REFRESH_INTERVAL_SECONDS = 300.0
@@ -14192,6 +14196,13 @@ def _new_chatgpt_conversation_init_account_coverage(
         "telemetry_class": None,
         "telemetry_status": None,
         "browser_challenge": False,
+        "model_limits_state": "absent_unknown",
+        "limits_progress_state": "absent_unknown",
+        "blocked_features_state": "absent_unknown",
+        "malformed_entry_count": 0,
+        "valid_observation_count": 0,
+        "projection_truncated": False,
+        "malformed_collection_projection": False,
         "request_body_omitted": None,
         "error_class": None,
         "error_message": None,
@@ -14541,6 +14552,22 @@ def _stamp_chatgpt_conversation_init_account_hash(
     return stamped
 
 
+def _chatgpt_conversation_init_collection_state(value: Any) -> str:
+    if value in _CHATGPT_COLLECTION_STATE_VALUES:
+        return str(value)
+    return "malformed"
+
+
+def _chatgpt_conversation_init_diagnostic_count(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(0, min(count, _CHATGPT_COLLECTION_DIAGNOSTIC_COUNT_LIMIT))
+
+
 def _record_chatgpt_collector_summary(
     coverage: Dict[str, Any],
     collector_summary: Mapping[str, Any],
@@ -14564,6 +14591,24 @@ def _record_chatgpt_collector_summary(
         collector_summary.get("account_identity_verified")
     )
     coverage["verified_account_hash"] = collector_summary.get("account_hash")
+    for field_name in (
+        "model_limits_state",
+        "limits_progress_state",
+        "blocked_features_state",
+    ):
+        coverage[field_name] = _chatgpt_conversation_init_collection_state(
+            collector_summary.get(field_name)
+        )
+    for field_name in ("malformed_entry_count", "valid_observation_count"):
+        coverage[field_name] = _chatgpt_conversation_init_diagnostic_count(
+            collector_summary.get(field_name)
+        )
+    coverage["projection_truncated"] = bool(
+        collector_summary.get("projection_truncated")
+    )
+    coverage["malformed_collection_projection"] = bool(
+        collector_summary.get("malformed_collection_projection")
+    )
     coverage["collector_failure_reason"] = _redacted_summary_field(
         collector_summary.get("failure_reason")
     )
