@@ -50,7 +50,12 @@ def test_should_keep_grok_46_catalog_entries_in_parity() -> None:
 
         assert "xai/grok-4.5" in catalog
         assert "oa_xai/grok-4.5" in catalog
-        assert native == managed
+        # Route-specific capabilities intentionally differ across credentials.
+        assert {
+            key: value
+            for key, value in native.items()
+            if key != "provider_specific_entry"
+        } == managed
         assert native["created"] == 1785974400
         assert native["owned_by"] == "xai"
         assert native["aliases"] == []

@@ -16,6 +16,7 @@ XAI_OAUTH_CREDENTIAL_FAMILY: XAICredentialFamily = "xai_oauth"
 GROK_NATIVE_OAUTH_ROUTE_FAMILY: XAIRouteFamily = "grok_cli_chat_proxy"
 GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY: XAICredentialFamily = "xai_grok_oidc"
 XAI_NATIVE_GROK_CONTINUATION_RETRY_CAPABILITY = "native_grok_continuation_retry"
+XAI_NATIVE_RESPONSES_TOOL_HISTORY_CAPABILITY = "native_responses_tool_history"
 _XAI_MODEL_CAPABILITIES_KEY = "capabilities"
 
 
