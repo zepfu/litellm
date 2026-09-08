@@ -197,6 +197,40 @@ response = litellm.responses(
 )
 ```
 
+## Proxy Retry and Quota Behavior
+
+For proxy routes that use Grok, LiteLLM recognizes exact account-quota
+responses and classifies them as `usage_limit_reached`:
+
+- HTTP 402 with the xAI/Grok usage-balance exhaustion response.
+- HTTP 403 with the recognized personal/team spending-limit response.
+
+The proxy publishes the Grok account-quota lane cooldown once and proceeds
+through the replay-safe fallback policy without sleeping and retrying the
+exhausted account. Fresh requests can advance immediately; continuations keep
+their account/session-affinity safety rule. Generic 403 responses, HTTP 429,
+and transient 5xx responses retain their ordinary classifications and retry
+behavior.
+
+### Native Grok Continuations
+
+Native `xai/grok-4.6` has an explicit
+`native_grok_continuation_retry` capability. The managed OAuth
+`oa_xai/grok-4.6` and Cursor
+`cursor_agent/cursor-grok-4.6-high` lanes use separate route and credential
+families and do not inherit native continuation recovery. Future native models
+must declare this capability before they are eligible; unknown or unprofiled
+models fail closed.
+
+For a continuation with eligible `upstream_transient_internal` failure, the
+native route retries the same candidate with a request-scoped total-attempt
+budget of 8 by default. Set
+`AAWM_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS` to tune the budget;
+LiteLLM clamps it to 6-16. Retries use short exponential backoff with bounded
+jitter, capped near one second, and the delay occurs outside routing locks.
+There is no generic fixed ten-second sleep. Fresh requests and non-continuation
+failures retain the generic proxy retry policy.
+
 ## Sample Usage - Vision
 
 ```python showLineNumbers title="LiteLLM python sdk usage - Vision"
