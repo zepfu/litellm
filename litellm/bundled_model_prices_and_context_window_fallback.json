@@ -10070,6 +10070,16 @@
         "max_output_tokens": 200000,
         "max_tokens": 200000,
         "mode": "chat",
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
         "provider_specific_entry": {
             "cursor_agent": {
                 "aawm_reference_pricing": {
@@ -10114,6 +10124,16 @@
         "max_output_tokens": 200000,
         "max_tokens": 200000,
         "mode": "chat",
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
         "provider_specific_entry": {
             "cursor_agent": {
                 "aawm_reference_pricing": {

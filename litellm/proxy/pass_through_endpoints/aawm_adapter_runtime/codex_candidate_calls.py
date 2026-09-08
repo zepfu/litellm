@@ -133,6 +133,7 @@ _CURSOR_REPLAY_FRESH_DISPATCH_REJECTION_REASONS = frozenset(
         "call_id_shape",
         "call_id_alias_mismatch",
         "function_name",
+        "function_namespace",
         "arguments_not_object",
         "output_container",
         "output_not_string",
@@ -2024,6 +2025,8 @@ def _cursor_replay_stock_codex_function_call_item(
         "call_id",
         metadata_key,
     }
+    if "namespace" in item:
+        expected_item_keys.add("namespace")
     if set(item) != expected_item_keys and not (
         allow_missing_metadata and set(item) == expected_item_keys - {metadata_key}
     ):
@@ -2074,6 +2077,17 @@ def _cursor_replay_stock_codex_function_call_item(
 
     call_id = item.get("call_id")
     name = item.get("name")
+    namespace = item.get("namespace")
+    if "namespace" in item and (
+        not isinstance(namespace, str)
+        or not namespace
+        or namespace != namespace.strip()
+    ):
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "function_namespace",
+            item=item,
+        )
     arguments = item.get("arguments")
     if (
         not isinstance(call_id, str)
@@ -2109,14 +2123,15 @@ def _cursor_replay_stock_codex_function_call_item(
             "arguments_not_object",
             item=item,
         )
-    return _CursorReplayValidationResult(
-        value={
-            "type": "function_call",
-            "call_id": call_id,
-            "name": name,
-            "arguments": arguments,
-        }
-    )
+    canonical_item = {
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+    }
+    if namespace is not None:
+        canonical_item["namespace"] = namespace
+    return _CursorReplayValidationResult(value=canonical_item)
 
 
 def _cursor_replay_stock_codex_full_history_input(  # noqa: PLR0915
@@ -2541,32 +2556,6 @@ def _cursor_replay_canonicalize_stock_web_search(
     return dict(tool)
 
 
-_CURSOR_REPLAY_NAMESPACE_TOOL_NAMES = {
-    "collaboration": frozenset(
-        {
-            "followup_task",
-            "interrupt_agent",
-            "list_agents",
-            "send_message",
-            "spawn_agent",
-            "wait_agent",
-        }
-    ),
-    "multi_agent_v1": frozenset(
-        {
-            "close_agent",
-            "resume_agent",
-            "send_input",
-            "spawn_agent",
-            "wait_agent",
-        }
-    ),
-}
-_CURSOR_REPLAY_NAMESPACE_NAME_ALIASES = {
-    "functions.collaboration": "collaboration",
-    "functions.multi_agent_v1": "multi_agent_v1",
-}
-_CURSOR_REPLAY_NAMESPACE_CHILD_NAME_ALIASES = {"wait": "wait_agent"}
 _CURSOR_REPLAY_NAMESPACE_ALLOWED_KEYS = frozenset(
     {"type", "name", "description", "tools"}
 )
@@ -2587,6 +2576,7 @@ def _cursor_replay_canonicalize_stock_namespace(
     *,
     tool_adapter: Any,
 ) -> Optional[dict[str, Any]]:
+    """Validate function namespaces when the SDK lacks a namespace variant."""
     if set(tool) - _CURSOR_REPLAY_NAMESPACE_ALLOWED_KEYS:
         return None
     if tool.get("type") != "namespace":
@@ -2594,14 +2584,6 @@ def _cursor_replay_canonicalize_stock_namespace(
 
     raw_namespace_name = tool.get("name")
     if not isinstance(raw_namespace_name, str) or not raw_namespace_name.strip():
-        return None
-    namespace_name = raw_namespace_name.strip()
-    namespace_key = _CURSOR_REPLAY_NAMESPACE_NAME_ALIASES.get(
-        namespace_name,
-        namespace_name,
-    )
-    allowed_child_names = _CURSOR_REPLAY_NAMESPACE_TOOL_NAMES.get(namespace_key)
-    if allowed_child_names is None:
         return None
 
     description = tool.get("description")
@@ -2625,15 +2607,9 @@ def _cursor_replay_canonicalize_stock_namespace(
         if not isinstance(raw_child_name, str) or not raw_child_name.strip():
             return None
         child_name = raw_child_name.strip()
-        canonical_child_name = _CURSOR_REPLAY_NAMESPACE_CHILD_NAME_ALIASES.get(
-            child_name,
-            child_name,
-        )
-        if canonical_child_name not in allowed_child_names:
+        if child_name in seen_child_names:
             return None
-        if canonical_child_name in seen_child_names:
-            return None
-        seen_child_names.add(canonical_child_name)
+        seen_child_names.add(child_name)
 
         if "defer_loading" in child and not isinstance(
             child["defer_loading"],
@@ -3382,6 +3358,12 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         _emit_adapted_route_access_log,
         _record_adapted_completed_route_rollup_turn,
     )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.tool_call_restore import (
+        _restore_adapted_namespace_tool_calls_in_response_body,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_request_policy.codex_tool_policy import (
+        _adapt_codex_namespace_tools_to_functions_from_request_body,
+    )
 
     if candidate.get("route_family") != "codex_cursor_agent_aiserver_adapter":
         raise ValueError(
@@ -3451,6 +3433,13 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
     request_tools = request_body.get("tools")
     if not isinstance(request_tools, list) and isinstance(replay_state, dict):
         request_tools = replay_state.get("tools")
+    adapter_model = str(candidate.get("model") or request_body.get("model") or "")
+    restoration_request_body = copy.deepcopy(request_body)
+    if (
+        not isinstance(restoration_request_body.get("tools"), list)
+        and isinstance(request_tools, list)
+    ):
+        restoration_request_body["tools"] = copy.deepcopy(request_tools)
 
     retained_session = (
         replay_state.get("retained_session")
@@ -3522,6 +3511,11 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
                 await retained_session.aclose()
         else:
             await retained_session.aclose()
+        response_body, _ = _restore_adapted_namespace_tool_calls_in_response_body(
+            response_body,
+            request_body=restoration_request_body,
+            adapter_model=adapter_model,
+        )
         _record_adapted_completed_route_rollup_turn(
             rollup_kwargs,
             adapter_label="Cursor Agent",
@@ -3539,8 +3533,16 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             media_type="application/json",
         )
 
-    if isinstance(request_tools, list):
-        optional_params["tools"] = request_tools
+    cursor_build_body = copy.deepcopy(restoration_request_body)
+    cursor_build_body["model"] = adapter_model
+    cursor_build_body, _adapted_namespace_tools = (
+        _adapt_codex_namespace_tools_to_functions_from_request_body(
+            cursor_build_body
+        )
+    )
+    build_tools = cursor_build_body.get("tools")
+    if isinstance(build_tools, list):
+        optional_params["tools"] = build_tools
     for source_names, cursor_name in (
         (("message_id", "messageId"), "message_id"),
         (("conversation_id", "conversationId"), "conversation_id"),
@@ -3604,7 +3606,7 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
     )
     try:
         _validate_cursor_returned_tool_calls(result.tool_calls)
-        model = str(candidate.get("model") or request_body.get("model") or "")
+        model = adapter_model
         response_body = _cursor_responses_response_body(model=model, result=result)
     except _CursorPostEgressOutputError as exc:
         _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
@@ -3623,6 +3625,11 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             tools=request_tools if isinstance(request_tools, list) else [],
             retained_session=result.retained_session,
         )
+    response_body, _ = _restore_adapted_namespace_tool_calls_in_response_body(
+        response_body,
+        request_body=restoration_request_body,
+        adapter_model=adapter_model,
+    )
     _record_adapted_completed_route_rollup_turn(
         rollup_kwargs,
         adapter_label="Cursor Agent",

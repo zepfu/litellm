@@ -117,6 +117,14 @@ auth-refresh evidence.
 
 ## Stock Codex child agents
 
+The Codex adapter advertises configured `collaboration` namespace tools as child
+functions with their input schemas, not as a callable namespace container.
+JSON and SSE responses restore their namespace identity for fresh runs and
+retained-session continuations; replay state preserves the original tool
+definitions. Bounded full-history replay preserves a function call's optional
+namespace as a nonempty string without surrounding whitespace, alongside its
+original name, arguments, and call ID.
+
 Stock Codex child-agent requests arrive from Cursor as ExecServerMessage field
 28 (`SubagentArgs`). LiteLLM bridges the portable fields to the advertised
 `spawn_agent` tool:
@@ -154,6 +162,12 @@ opaque Cursor state, unresolved tool calls, nested Cursor identifiers, and
 ownerless provider state fail closed before egress. A valid replay may then
 traverse native `xai` and managed `oa_xai` candidates without migrating the
 owned Cursor session.
+
+Replay validation preserves function namespaces even when the installed OpenAI
+SDK predates namespace tools. The compatibility path validates the namespace
+shape and each function schema rather than restricting namespace or function
+names to a fixed catalog. Unknown fields, malformed children, and duplicate
+function names fail closed; accepted replay retains the original tool definitions.
 
 For Responses streams, session ownership is promoted only after the validator
 has observed a structurally valid terminal response with `status=completed` and
