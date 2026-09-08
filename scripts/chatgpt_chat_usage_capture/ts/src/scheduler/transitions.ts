@@ -88,7 +88,8 @@ export function claimTrigger(
   validateEpoch(context.at, "at");
   validateNonNegativeInteger(fencingToken, "fencingToken");
   if ((state.authPausedUntil !== null && state.authPausedUntil > context.at) ||
-      (state.retryNotBefore !== null && state.retryNotBefore > context.at)) {
+      (state.retryNotBefore !== null && state.retryNotBefore > context.at) ||
+      (state.serverRetryNotBefore !== null && state.serverRetryNotBefore > context.at)) {
     return null;
   }
   if (state.active !== null) {
@@ -162,6 +163,7 @@ export function completeTrigger(
   let retryNotBefore = state.retryNotBefore;
   let serverRetryNotBefore = state.serverRetryNotBefore;
   let authPausedUntil = state.authPausedUntil;
+  let pending = state.pending;
   if (request.outcome === "success") {
     retryNotBefore = null;
     serverRetryNotBefore = null;
@@ -170,6 +172,14 @@ export function completeTrigger(
   } else {
     failureStreak = Math.min(MAX_FAILURE_STREAK, failureStreak + 1);
     retryNotBefore = context.at + retryBackoffMs(failureStreak);
+    pending = pending ?? {
+      kind: state.active.kind,
+      missedCount: 1,
+      requestedAt: context.at,
+    };
+    if (request.retryAfterMs !== null) {
+      serverRetryNotBefore = request.retryAfterMs;
+    }
   }
   if (request.outcome === "authentication") {
     authPausedUntil = Number.MAX_SAFE_INTEGER;
@@ -185,6 +195,7 @@ export function completeTrigger(
       serverRetryNotBefore,
       failureStreak,
       authPausedUntil,
+      pending,
       lastCompletedAt: context.at,
     },
   };
