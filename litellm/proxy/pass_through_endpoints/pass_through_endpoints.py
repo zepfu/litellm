@@ -4654,6 +4654,53 @@ async def _aawm_run_with_session_owner_lease_renewal(
         )
 
 
+def _bind_grok_native_oauth_owner_session_header_after_owner_guard(
+    *,
+    request: Request,
+    headers: Dict[str, Any],
+    url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+    egress_credential_family: Optional[str],
+    expected_target_family: Optional[str],
+) -> Dict[str, Any]:
+    """Bind raw Grok egress headers after the request owner is authoritative."""
+
+    provider_families = {
+        str(value).casefold()
+        for value in (
+            custom_llm_provider,
+            egress_credential_family,
+            expected_target_family,
+        )
+        if value is not None
+    }
+    if "xai" not in provider_families:
+        return headers
+
+    request_path = str(getattr(getattr(request, "url", None), "path", "") or "")
+    target_host = str(getattr(url, "host", "") or "").casefold()
+    is_grok_route = request_path == "/grok" or request_path.startswith(
+        "/grok/"
+    )
+    is_grok_target = target_host == "cli-chat-proxy.grok.com" or target_host.endswith(
+        ".grok.com"
+    )
+    if not (is_grok_route or is_grok_target):
+        return headers
+
+    # Header forwarding is intentionally resolved before the owner guard. The
+    # provider helper is called only after that guard so caller session B cannot
+    # survive when the server reserved owner A.
+    from litellm.proxy.pass_through_endpoints.providers.xai.request_prep import (
+        _bind_grok_native_oauth_owner_session_header,
+    )
+
+    return _bind_grok_native_oauth_owner_session_header(
+        headers,
+        request=request,
+    )
+
+
 async def pass_through_request(  # noqa: PLR0915
     request: Request,
     target: str,
@@ -5290,6 +5337,14 @@ async def pass_through_request(  # noqa: PLR0915
                 ),
                 defer_session_owner_promotion=defer_session_owner_promotion,
             )
+            headers = _bind_grok_native_oauth_owner_session_header_after_owner_guard(
+                request=request,
+                headers=headers,
+                url=url,
+                custom_llm_provider=custom_llm_provider,
+                egress_credential_family=egress_credential_family,
+                expected_target_family=expected_target_family,
+            )
             upstream_wait_started_at = datetime.now()
             try:
                 from litellm.proxy.aawm_session_transfer.hooks import (
@@ -5539,6 +5594,14 @@ async def pass_through_request(  # noqa: PLR0915
                 else None
             ),
             defer_session_owner_promotion=defer_session_owner_promotion,
+        )
+        headers = _bind_grok_native_oauth_owner_session_header_after_owner_guard(
+            request=request,
+            headers=headers,
+            url=url,
+            custom_llm_provider=custom_llm_provider,
+            egress_credential_family=egress_credential_family,
+            expected_target_family=expected_target_family,
         )
         upstream_wait_started_at = datetime.now()
 
