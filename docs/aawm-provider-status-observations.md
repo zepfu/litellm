@@ -799,6 +799,19 @@ This path has two cooperating pieces:
   never reads Oracle cookies, and never ships `authenticator.py`,
   `common_utils.py`, or `httpx`.
 
+Native history capture is admitted only through the live sidecar
+`SidecarTaskState` that owns the private Oracle helper. The owner publishes its
+endpoint and anchor binding before registering a history worker, rejects
+borrowed or stale bindings, and retains each worker, exact-target closer, and
+scratch remover until their own process retirement is proven. Cleanup uses one
+absolute operation ceiling: target-close, cooperative termination, forced
+termination, reaping, and scratch removal may be shortened by shutdown but
+never restart a deadline or create a recovery allowance. A failed target proof
+or release channel remains an attributable cleanup failure; it is never
+reported as successful history or as an empty conversation set. Shutdown closes
+admission, requests abort for all published owners, and performs bounded
+nonblocking retirement through the same sidecar state.
+
 The sidecar image packages `conversation_init.py`, the owned
 `scripts/chatgpt_oracle_browser_session.mjs` helper, and pinned Playwright with
 Chromium shared libraries/Xvfb, `rsync`, and `xauth`; it does not download another

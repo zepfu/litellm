@@ -151,9 +151,7 @@ from litellm.llms.chatgpt.conversation_init import (
     NativeHistoryLifecycleCapability,
     NativeHistoryLifecycleRegistration,
     NativeHistoryReleaseProof,
-    _NATIVE_HISTORY_KILL_GRACE_SECONDS,
-    _NATIVE_HISTORY_REAP_GRACE_SECONDS,
-    _NATIVE_HISTORY_TERM_GRACE_SECONDS,
+    _NATIVE_HISTORY_CLEANUP_RESERVE_SECONDS,
     _NATIVE_HISTORY_TARGET_BROWSER_TERMINATED,
     _NATIVE_HISTORY_TARGET_NO_CREATE,
     collect_conversation_init_observations,
@@ -1743,6 +1741,7 @@ class SidecarTaskState:
         default_factory=threading.RLock,
         repr=False,
     )
+    chatgpt_oracle_browser_owners_stopping: bool = False
 
 
 _OAUTH_TERMINAL_REFRESH_ERROR_CLASSES = frozenset(
@@ -2287,70 +2286,139 @@ def _signal_chatgpt_oracle_process_group(
         pass
 
 
+def _record_chatgpt_oracle_owned_pid(
+    pid: int,
+    handle: int,
+    handles: Dict[int, int],
+    known_ancestry: Optional[set[int]],
+) -> None:
+    handles[pid] = handle
+    if known_ancestry is not None:
+        known_ancestry.add(pid)
+
+
+def _add_chatgpt_oracle_owner_handle(
+    process: subprocess.Popen,
+    handles: Dict[int, int],
+    known_ancestry: Optional[set[int]],
+) -> None:
+    if process.returncode is not None or process.pid in handles:
+        return
+    try:
+        handle = os.pidfd_open(process.pid)
+    except ProcessLookupError:
+        return
+    _record_chatgpt_oracle_owned_pid(
+        process.pid,
+        handle,
+        handles,
+        known_ancestry,
+    )
+
+
+def _scan_chatgpt_oracle_process_candidates(
+    marker: bytes,
+    handles: Dict[int, int],
+    candidates: Dict[int, tuple[int, int]],
+    known_ancestry: Optional[set[int]],
+    deadline: Optional[float],
+) -> None:
+    for entry in Path("/proc").iterdir():
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("Oracle browser process discovery timed out.")
+        if not entry.name.isdigit() or int(entry.name) in handles:
+            continue
+        pid = int(entry.name)
+        handle: Optional[int] = None
+        try:
+            handle = os.pidfd_open(pid)
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+            parent_pid = int(fields[1])
+            try:
+                with (entry / "environ").open("rb") as environ:
+                    marked = marker in environ.read(1_048_576).split(b"\0")
+            except OSError:
+                marked = False
+            if marked:
+                _record_chatgpt_oracle_owned_pid(
+                    pid,
+                    handle,
+                    handles,
+                    known_ancestry,
+                )
+            else:
+                candidates[pid] = (parent_pid, handle)
+            handle = None
+        except (OSError, ValueError, IndexError):
+            pass
+        finally:
+            if handle is not None:
+                os.close(handle)
+
+
+def _adopt_chatgpt_oracle_descendants(
+    candidates: Dict[int, tuple[int, int]],
+    handles: Dict[int, int],
+    ancestry: Collection[int],
+    known_ancestry: Optional[set[int]],
+) -> None:
+    # Sandbox children may hide environ, but still have an owned parent.
+    while candidates:
+        children = [
+            pid
+            for pid, (parent, _) in candidates.items()
+            if parent in ancestry
+        ]
+        if not children:
+            return
+        for pid in children:
+            _, handle = candidates.pop(pid)
+            _record_chatgpt_oracle_owned_pid(
+                pid,
+                handle,
+                handles,
+                known_ancestry,
+            )
+
+
 def _chatgpt_oracle_owned_handles(
     process: subprocess.Popen,
     temp_root: str,
     handles: Dict[int, int],
     deadline: Optional[float] = None,
-) -> None:
+    known_ancestry: Optional[set[int]] = None,
+) -> bool:
     marker = f"{CHATGPT_ORACLE_OWNER_ENV}={temp_root}".encode()
+    ancestry = handles.keys() if known_ancestry is None else known_ancestry
+    if known_ancestry is not None:
+        known_ancestry.update(handles)
     candidates: Dict[int, tuple[int, int]] = {}
     try:
-        if process.returncode is None and process.pid not in handles:
-            try:
-                handles[process.pid] = os.pidfd_open(process.pid)
-            except ProcessLookupError:
-                pass
-        for entry in Path("/proc").iterdir():
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError("Oracle browser process discovery timed out.")
-            if not entry.name.isdigit() or int(entry.name) in handles:
-                continue
-            pid = int(entry.name)
-            handle: Optional[int] = None
-            try:
-                handle = os.pidfd_open(pid)
-                fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
-                parent_pid = int(fields[1])
-                try:
-                    with (entry / "environ").open("rb") as environ:
-                        marked = marker in environ.read(1_048_576).split(b"\0")
-                except OSError:
-                    marked = False
-                if marked:
-                    handles[pid] = handle
-                else:
-                    candidates[pid] = (parent_pid, handle)
-                handle = None
-            except (OSError, ValueError, IndexError):
-                pass
-            finally:
-                if handle is not None:
-                    os.close(handle)
-        # Sandbox children may hide environ, but still have an owned parent.
-        while True:
-            children = []
-            for pid, (parent, _) in candidates.items():
-                parent_handle = handles.get(parent)
-                if parent_handle is not None and not select.select(
-                    [parent_handle], [], [], 0
-                )[0]:
-                    children.append(pid)
-            if not children:
-                break
-            for pid in children:
-                _, handle = candidates.pop(pid)
-                handles[pid] = handle
+        _add_chatgpt_oracle_owner_handle(process, handles, known_ancestry)
+        _scan_chatgpt_oracle_process_candidates(
+            marker,
+            handles,
+            candidates,
+            known_ancestry,
+            deadline,
+        )
+        _adopt_chatgpt_oracle_descendants(
+            candidates,
+            handles,
+            ancestry,
+            known_ancestry,
+        )
     finally:
         for _, handle in candidates.values():
             os.close(handle)
+    return True
 
 
 def _signal_chatgpt_oracle_handles(handles: Dict[int, int], sig: int) -> None:
     for handle in handles.values():
         try:
             signal.pidfd_send_signal(handle, sig)
-        except ProcessLookupError:
+        except (OSError, ValueError):
             pass
 
 
@@ -2413,16 +2481,25 @@ class _ChatGPTOracleBrowserOwner:
         temp_root: str,
         pending_registry: Dict[str, Any],
         pending_registry_lock: Any,
+        supervisor_state: Optional[SidecarTaskState] = None,
     ) -> None:
         self.process = process
         self.temp_root = temp_root
         self.pending_registry = pending_registry
         self.pending_registry_lock = pending_registry_lock
+        self.supervisor_state = supervisor_state
+        self.original_helper_pid = process.pid
         self.owner_id = "oracle-owner-" + uuid.uuid4().hex
         self.cdp_endpoint = ""
         self.anchor_target_id = ""
         self.registrations: Dict[str, NativeHistoryLifecycleRegistration] = {}
         self.handles: Dict[int, int] = {}
+        self.known_owned_pids: set[int] = set()
+        if isinstance(process.pid, int):
+            self.known_owned_pids.add(process.pid)
+        self.browser_discovery_complete = False
+        self.browser_termination_proven = False
+        self.helper_termination_requested = False
         self.cleanup_error: Optional[str] = None
         self.transferred = False
         self.closing = False
@@ -2430,9 +2507,12 @@ class _ChatGPTOracleBrowserOwner:
         self.bound = False
         self.operation_deadline: Optional[float] = None
         self.history_deadline: Optional[float] = None
-        self.cleanup_recovery_deadline: Optional[float] = None
         self.scratch_remover: Optional[subprocess.Popen] = None
         self.scratch_remover_handle: Optional[int] = None
+        self.scratch_deleted = False
+        self.scratch_cleanup_error: Optional[str] = None
+        self.cleanup_plan: Optional[Dict[str, float]] = None
+        self.cleanup_gate = threading.Lock()
 
     def publish(self) -> None:
         """Publish this concrete owner before any history worker can start."""
@@ -2460,6 +2540,14 @@ class _ChatGPTOracleBrowserOwner:
             self.anchor_target_id = anchor_target_id
             self.bound = True
 
+    def _original_helper_usable(self) -> bool:
+        if not isinstance(self.original_helper_pid, int):
+            return False
+        try:
+            return self.process.poll() is None
+        except (OSError, ValueError):
+            return False
+
     @staticmethod
     def _process_reaped(process: Any) -> bool:
         if getattr(process, "pid", None) is None:
@@ -2479,13 +2567,23 @@ class _ChatGPTOracleBrowserOwner:
                 or self.closing
                 or registration.finalizing
                 or not self.published
+                or self.supervisor_state is None
+                or self.supervisor_state.chatgpt_oracle_browser_owners_stopping
             ):
                 raise RuntimeError(
                     "Native history lifecycle owner is not accepting work."
                 )
+            if self.pending_registry.get(self.owner_id) is not self:
+                raise RuntimeError(
+                    "Native history lifecycle owner is not supervised."
+                )
             if not self.bound:
                 raise RuntimeError(
                     "Native history lifecycle owner has no validated binding."
+                )
+            if not self._original_helper_usable():
+                raise RuntimeError(
+                    "Native history lifecycle helper is no longer usable."
                 )
             if registration.registration_id in self.registrations:
                 raise RuntimeError("Native history lifecycle was registered twice.")
@@ -2513,7 +2611,9 @@ class _ChatGPTOracleBrowserOwner:
                     registration.deadline,
                 )
             if registration.cleanup_callback is None:
-                registration.cleanup_callback = lambda _deadline: False
+                registration.cleanup_callback = (
+                    lambda _deadline, poll_only=False: False
+                )
 
     def register_closer(
         self,
@@ -2526,7 +2626,9 @@ class _ChatGPTOracleBrowserOwner:
             ) is not registration:
                 raise RuntimeError("Native history closer has no lifecycle owner.")
             existing = registration.close_registration
-            if existing is not None and not existing.reaped:
+            if existing is closer:
+                return
+            if existing is not None:
                 raise RuntimeError("Native history closer is already active.")
             registration.close_registration = closer
 
@@ -2601,7 +2703,16 @@ class _ChatGPTOracleBrowserOwner:
             registration.released = True
             registration.release_proof = proof
             registration.release_authorized = True
-            registration.release_event.set()
+            try:
+                registration.release_event.set()
+            except (OSError, ValueError):
+                registration.release_control_failed = True
+                release_control_state = registration.release_control_state
+                if release_control_state is not None:
+                    release_control_state.value = True
+                registration.cleanup_failure = (
+                    "Native ChatGPT history release control failed."
+                )
 
     def retire(
         self,
@@ -2615,7 +2726,7 @@ class _ChatGPTOracleBrowserOwner:
             if not registration.release_authorized:
                 raise RuntimeError("Native history release was not authorized.")
             closer = registration.close_registration
-            if not self._process_reaped(registration.process) or (
+            if not registration.worker_retirement_proven or (
                 closer is not None and not closer.reaped
             ):
                 raise RuntimeError("Native history retirement is incomplete.")
@@ -2632,9 +2743,40 @@ class _ChatGPTOracleBrowserOwner:
             return False
         return bool(callback(deadline))
 
-    def _wait_for_owned_handles(self, deadline: float) -> bool:
+    def _reconcile_owned_browser_handles(self, deadline: float) -> bool:
+        if deadline is not None and time.monotonic() >= deadline:
+            # A phase cutoff forbids a new discovery scan; it must not erase
+            # ownership evidence already established in an earlier phase.
+            return self.browser_discovery_complete
+        try:
+            _chatgpt_oracle_owned_handles(
+                self.process,
+                self.temp_root,
+                self.handles,
+                deadline,
+                self.known_owned_pids,
+            )
+        except (OSError, ValueError, TimeoutError):
+            self.browser_discovery_complete = False
+            return False
+        self.browser_discovery_complete = True
+        return True
+
+    def _wait_for_owned_handles(
+        self,
+        deadline: float,
+        *,
+        poll_only: bool = False,
+    ) -> bool:
         pending = set(self.handles.values())
         while pending:
+            if poll_only:
+                try:
+                    ready, _, _ = select.select(list(pending), [], [], 0)
+                except (OSError, ValueError):
+                    return False
+                pending.difference_update(ready)
+                return not pending
             remaining = max(0.0, deadline - time.monotonic())
             if remaining <= 0:
                 return False
@@ -2646,6 +2788,13 @@ class _ChatGPTOracleBrowserOwner:
         return True
 
     def _owned_handles_reaped(self) -> bool:
+        if not self.browser_discovery_complete:
+            return False
+        try:
+            if self.process.poll() is None:
+                return False
+        except (OSError, ValueError):
+            return False
         try:
             return all(
                 bool(select.select([handle], [], [], 0)[0])
@@ -2654,157 +2803,170 @@ class _ChatGPTOracleBrowserOwner:
         except (OSError, ValueError):
             return False
 
-    def terminate_owned_browser(  # noqa: PLR0915 - bounded owner teardown
+    def _owner_cleanup_plan(self, deadline: float) -> Dict[str, float]:
+        ceiling = float(deadline)
+        for candidate in (self.operation_deadline, self.history_deadline):
+            if candidate is not None:
+                ceiling = min(ceiling, candidate)
+        now = time.monotonic()
+        if self.cleanup_plan is None:
+            start = min(now, ceiling)
+            reserve = min(
+                _NATIVE_HISTORY_CLEANUP_RESERVE_SECONDS,
+                max(0.0, ceiling - start),
+            )
+            self.cleanup_plan = {
+                "term_deadline": start + reserve / 2,
+                "kill_deadline": start + reserve * 2 / 3,
+                "reap_deadline": start + reserve * 5 / 6,
+                "final_deadline": start + reserve,
+            }
+        else:
+            for phase_name, phase_deadline in list(self.cleanup_plan.items()):
+                self.cleanup_plan[phase_name] = min(phase_deadline, ceiling)
+        return self.cleanup_plan
+
+    def _terminate_owned_browser(
         self,
-        deadline: float,
+        *,
+        term_deadline: float,
+        kill_deadline: float,
+        reap_deadline: float,
+        poll_only: bool = False,
     ) -> bool:
-        if deadline is None:
-            raise RuntimeError("Oracle browser termination deadline is required.")
-        if deadline <= time.monotonic():
-            raise TimeoutError("Oracle browser termination deadline expired.")
-        """Terminate only this profile owner's helper tree and prove reaping."""
+        """Terminate the helper tree and prove all owned descendants exited."""
 
-        if deadline is None or deadline <= time.monotonic():
-            self.cleanup_error = "Oracle browser termination deadline expired."
-            return False
-        try:
-            _chatgpt_oracle_owned_handles(
-                self.process,
-                self.temp_root,
-                self.handles,
-                deadline,
-            )
-            if self.process.stdin is not None:
-                self.process.stdin.close()
-        except (BrokenPipeError, OSError, TimeoutError) as exc:
-            self.cleanup_error = _redacted_failure_message(str(exc))
-            return False
-        _signal_chatgpt_oracle_handles(self.handles, signal.SIGTERM)
-        term_deadline = min(
-            deadline,
-            time.monotonic() + _NATIVE_HISTORY_TERM_GRACE_SECONDS,
-        )
-        term_complete = self._wait_for_owned_handles(term_deadline)
-        try:
-            known_handles = set(self.handles)
-            _chatgpt_oracle_owned_handles(
-                self.process,
-                self.temp_root,
-                self.handles,
-                term_deadline,
-            )
-            if set(self.handles) != known_handles:
-                # A browser child can appear after the first scan. Signal the
-                # newly discovered handles before treating the tree as closed.
-                _signal_chatgpt_oracle_handles(self.handles, signal.SIGTERM)
-                term_complete = (
-                    self._wait_for_owned_handles(term_deadline)
-                    and term_complete
-                )
-        except (OSError, ValueError, TimeoutError) as exc:
-            self.cleanup_error = _redacted_failure_message(str(exc))
-            return False
-        if not term_complete or not self._owned_handles_reaped():
-            _signal_chatgpt_oracle_handles(self.handles, signal.SIGKILL)
-            kill_deadline = min(
-                deadline,
-                time.monotonic() + _NATIVE_HISTORY_KILL_GRACE_SECONDS,
-            )
-            kill_complete = self._wait_for_owned_handles(kill_deadline)
+        if self.browser_termination_proven:
+            return True
+        if not self.helper_termination_requested:
             try:
-                known_handles = set(self.handles)
-                _chatgpt_oracle_owned_handles(
-                    self.process,
-                    self.temp_root,
-                    self.handles,
-                    kill_deadline,
-                )
-                if set(self.handles) != known_handles:
-                    _signal_chatgpt_oracle_handles(self.handles, signal.SIGKILL)
-                    kill_complete = (
-                        self._wait_for_owned_handles(kill_deadline)
-                        and kill_complete
-                    )
-            except (OSError, ValueError, TimeoutError) as exc:
+                if self.process.stdin is not None:
+                    self.process.stdin.close()
+            except (BrokenPipeError, OSError, ValueError) as exc:
                 self.cleanup_error = _redacted_failure_message(str(exc))
-                return False
-            if not kill_complete or not self._owned_handles_reaped():
-                self.cleanup_error = (
-                    "Oracle browser owner process cleanup timed out."
-                )
-                return False
-        try:
-            reap_deadline = min(
-                deadline,
-                time.monotonic() + _NATIVE_HISTORY_REAP_GRACE_SECONDS,
-            )
-            self.process.wait(timeout=max(0.0, reap_deadline - time.monotonic()))
-        except (OSError, subprocess.TimeoutExpired):
-            self.cleanup_error = "Oracle browser helper was not reaped."
-            return False
-        try:
-            known_handles = set(self.handles)
-            _chatgpt_oracle_owned_handles(
-                self.process,
-                self.temp_root,
-                self.handles,
-                deadline,
-            )
-            if set(self.handles) != known_handles:
-                _signal_chatgpt_oracle_handles(self.handles, signal.SIGKILL)
-            final_deadline = min(
-                deadline,
-                time.monotonic() + _NATIVE_HISTORY_REAP_GRACE_SECONDS,
-            )
-            if not self._wait_for_owned_handles(final_deadline):
-                self.cleanup_error = "Oracle browser descendant cleanup timed out."
-                return False
-        except (OSError, ValueError, TimeoutError) as exc:
-            self.cleanup_error = _redacted_failure_message(str(exc))
-            return False
-        return (
-            self.process.returncode is not None
-            and self._owned_handles_reaped()
-        )
+            self.helper_termination_requested = True
 
-    def _cleanup_owner(self, deadline: float) -> bool:
-        with self.pending_registry_lock:
-            self.closing = True
-        if not self.terminate_owned_browser(deadline):
+        now = time.monotonic()
+        self._reconcile_owned_browser_handles(term_deadline)
+        if now < term_deadline:
+            _signal_chatgpt_oracle_handles(self.handles, signal.SIGTERM)
+            if poll_only:
+                if self._owned_handles_reaped():
+                    self.browser_termination_proven = True
+                    return True
+                return False
+            self._wait_for_owned_handles(term_deadline, poll_only=False)
+        if self._owned_handles_reaped():
+            self.browser_termination_proven = True
+            return True
+
+        self._reconcile_owned_browser_handles(kill_deadline)
+        # KILL is identity-bound and remains valid even after the grace cutoff.
+        _signal_chatgpt_oracle_handles(self.handles, signal.SIGKILL)
+        if poll_only:
+            if self._owned_handles_reaped():
+                self.browser_termination_proven = True
+                return True
             return False
-        if not self._start_scratch_remover():
-            self.cleanup_error = (
-                self.cleanup_error or "Oracle browser scratch remover could not start."
+        if time.monotonic() < kill_deadline:
+            self._wait_for_owned_handles(kill_deadline, poll_only=False)
+        if self._owned_handles_reaped():
+            self.browser_termination_proven = True
+            return True
+
+        self._reconcile_owned_browser_handles(reap_deadline)
+        if not poll_only and time.monotonic() < reap_deadline:
+            self._wait_for_owned_handles(reap_deadline, poll_only=False)
+        if self._owned_handles_reaped():
+            self.browser_termination_proven = True
+            return True
+        self.cleanup_error = (
+            "Oracle browser owner process cleanup remains unproven."
+        )
+        return False
+
+    def terminate_owned_browser(
+        self,
+        *,
+        term_deadline: float,
+        kill_deadline: float,
+        reap_deadline: float,
+        poll_only: bool = False,
+    ) -> bool:
+        if not self.cleanup_gate.acquire(False):
+            return False
+        try:
+            return self._terminate_owned_browser(
+                term_deadline=term_deadline,
+                kill_deadline=kill_deadline,
+                reap_deadline=reap_deadline,
+                poll_only=poll_only,
             )
+        finally:
+            self.cleanup_gate.release()
+
+    def _cleanup_owner(self, deadline: float, *, poll_only: bool = False) -> bool:
+        if not self.cleanup_gate.acquire(False):
             return False
-        if not self._wait_for_scratch_remover(deadline):
-            self.cleanup_error = "Oracle browser scratch cleanup remains pending."
-            return False
-        if not self._owned_handles_reaped():
-            self.cleanup_error = "Oracle browser owner handles remain live."
-            return False
-        for handle in self.handles.values():
-            try:
-                os.close(handle)
-            except OSError:
-                pass
-        self.handles.clear()
-        for stream in (self.process.stdout, self.process.stderr):
-            if stream is not None:
+        try:
+            with self.pending_registry_lock:
+                self.closing = True
+            plan = self._owner_cleanup_plan(deadline)
+            if not self.browser_termination_proven:
+                self._terminate_owned_browser(
+                    term_deadline=plan["term_deadline"],
+                    kill_deadline=plan["kill_deadline"],
+                    reap_deadline=plan["reap_deadline"],
+                    poll_only=poll_only,
+                )
+            if not self.browser_termination_proven:
+                return False
+            for handle in self.handles.values():
                 try:
-                    stream.close()
+                    os.close(handle)
                 except OSError:
                     pass
-        return True
+            self.handles.clear()
+            if not self._start_scratch_remover(plan["final_deadline"]):
+                self.cleanup_error = (
+                    self.cleanup_error
+                    or "Oracle browser scratch remover could not start."
+                )
+                return False
+            if not self._wait_for_scratch_remover(
+                plan["final_deadline"],
+                poll_only=poll_only,
+            ):
+                self.cleanup_error = (
+                    self.scratch_cleanup_error
+                    or "Oracle browser scratch cleanup remains pending."
+                )
+                return False
+            for stream in (self.process.stdout, self.process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+            return True
+        finally:
+            self.cleanup_gate.release()
 
-    def _start_scratch_remover(self) -> bool:
+    def _start_scratch_remover(self, deadline: float) -> bool:
         """Start one remover only after private-browser termination is proven."""
 
+        if self.scratch_deleted:
+            return True
         if self.scratch_remover is not None:
             return True
         if not Path(self.temp_root).exists():
+            self.scratch_deleted = True
             return True
-        remover: Optional[subprocess.Popen] = None
+        if time.monotonic() >= deadline:
+            self.scratch_cleanup_error = (
+                "Oracle browser scratch cleanup deadline expired."
+            )
+            return False
         try:
             remover = subprocess.Popen(
                 [
@@ -2816,43 +2978,51 @@ class _ChatGPTOracleBrowserOwner:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            handle = os.pidfd_open(remover.pid)
         except OSError as exc:
-            if remover is not None:
-                try:
-                    remover.kill()
-                    remover.wait(timeout=1)
-                except (OSError, subprocess.TimeoutExpired):
-                    pass
-            self.cleanup_error = _redacted_failure_message(str(exc))
+            self.scratch_cleanup_error = _redacted_failure_message(str(exc))
             return False
         self.scratch_remover = remover
-        self.scratch_remover_handle = handle
-        self.handles[remover.pid] = handle
+        self.scratch_remover_handle = None
+        try:
+            self.scratch_remover_handle = os.pidfd_open(remover.pid)
+        except OSError as exc:
+            self.scratch_cleanup_error = _redacted_failure_message(str(exc))
         return True
 
-    def _wait_for_scratch_remover(self, deadline: float) -> bool:
+    def _wait_for_scratch_remover(
+        self,
+        deadline: float,
+        *,
+        poll_only: bool = False,
+    ) -> bool:
         remover = self.scratch_remover
         if remover is None:
-            return not Path(self.temp_root).exists()
-        try:
-            remover.wait(timeout=max(0.0, deadline - time.monotonic()))
-        except (OSError, subprocess.TimeoutExpired):
-            # Keep the same process and pidfd for supervisor recovery. Never
-            # kill-and-drop a timed-out remover or start a second one.
-            return False
-        if remover.returncode != 0 or Path(self.temp_root).exists():
+            return self.scratch_deleted
+        if remover.poll() is None:
+            if poll_only or time.monotonic() >= deadline:
+                return False
+            try:
+                remover.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+        if remover.poll() is None:
             return False
         handle = self.scratch_remover_handle
         if handle is not None:
-            self.handles.pop(remover.pid, None)
             try:
                 os.close(handle)
             except OSError:
                 pass
         self.scratch_remover = None
         self.scratch_remover_handle = None
-        return True
+        self.scratch_deleted = remover.returncode == 0 and not Path(
+            self.temp_root
+        ).exists()
+        if not self.scratch_deleted:
+            self.scratch_cleanup_error = (
+                "Oracle browser scratch cleanup failed."
+            )
+        return self.scratch_deleted
 
     def finalize(self, deadline: float) -> bool:
         with self.pending_registry_lock:
@@ -2860,12 +3030,18 @@ class _ChatGPTOracleBrowserOwner:
             registrations = list(self.registrations.values())
             for registration in registrations:
                 registration.finalizing = True
+                try:
+                    registration.abort_event.set()
+                except (OSError, ValueError):
+                    registration.cleanup_failure = (
+                        "Native ChatGPT history abort control failed."
+                    )
         for registration in registrations:
             callback = registration.cleanup_callback
             if callback is None:
                 continue
             try:
-                callback(deadline)
+                callback(deadline, poll_only=False)
             except Exception as exc:
                 registration.cleanup_failure = str(exc)
         with self.pending_registry_lock:
@@ -2874,36 +3050,69 @@ class _ChatGPTOracleBrowserOwner:
                 self.transferred = True
                 self.published = True
                 return False
-        completed = self._cleanup_owner(deadline)
+        completed = self._cleanup_owner(deadline, poll_only=False)
         if completed:
             with self.pending_registry_lock:
                 self.pending_registry.pop(self.owner_id, None)
                 self.published = False
         return completed
 
-    def service_pending(self) -> bool:
+    def request_shutdown(self) -> None:
+        with self.pending_registry_lock:
+            self.closing = True
+            for registration in self.registrations.values():
+                registration.finalizing = True
+                try:
+                    registration.abort_event.set()
+                except (OSError, ValueError):
+                    registration.cleanup_failure = (
+                        "Native ChatGPT history abort control failed."
+                    )
+
+    def service_pending(
+        self,
+        *,
+        deadline: Optional[float] = None,
+    ) -> bool:
         now = time.monotonic()
         with self.pending_registry_lock:
             registrations = list(self.registrations.values())
-            operation_deadline = self.operation_deadline or self.history_deadline
+            operation_deadline = self.operation_deadline
+            if operation_deadline is None:
+                operation_deadline = self.history_deadline
+
+            def release_control_failed(
+                registration: NativeHistoryLifecycleRegistration,
+            ) -> bool:
+                state = registration.release_control_state
+                return bool(
+                    registration.release_control_failed
+                    or (state is not None and bool(state.value))
+                )
+
             needs_cleanup = any(
                 registration.cleanup_failure is not None
                 or registration.abort_event.is_set()
                 or registration.released
+                or release_control_failed(registration)
                 or (
                     operation_deadline is not None
                     and now >= operation_deadline
                 )
                 for registration in registrations
             )
-            needs_cleanup = needs_cleanup or self.transferred or bool(
+            needs_cleanup = needs_cleanup or self.closing or self.transferred
+            needs_cleanup = needs_cleanup or bool(
                 self.cleanup_error
+                or self.scratch_remover
+                or self.scratch_cleanup_error
+                or self.handles
             )
             if not needs_cleanup:
                 return False
-            if self.cleanup_recovery_deadline is None:
-                self.cleanup_recovery_deadline = now + 5.0
-            cleanup_deadline = self.cleanup_recovery_deadline
+            cleanup_deadline = (
+                now if deadline is None else min(float(deadline), now)
+            )
             for registration in registrations:
                 registration.finalizing = True
         for registration in registrations:
@@ -2911,13 +3120,13 @@ class _ChatGPTOracleBrowserOwner:
             if callback is None:
                 continue
             try:
-                callback(cleanup_deadline)
+                callback(cleanup_deadline, poll_only=True)
             except Exception as exc:
                 registration.cleanup_failure = str(exc)
         with self.pending_registry_lock:
             if self.registrations:
                 return False
-        completed = self._cleanup_owner(cleanup_deadline)
+        completed = self._cleanup_owner(cleanup_deadline, poll_only=True)
         if completed:
             with self.pending_registry_lock:
                 self.pending_registry.pop(self.owner_id, None)
@@ -2965,10 +3174,20 @@ class _ChatGPTOracleBrowserLifecycleCapability:
     ) -> None:
         self.owner.retire(registration)
 
-    def terminate_owned_browser(self, deadline: float) -> bool:
-        if deadline is None:
-            raise RuntimeError("Oracle browser termination deadline is required.")
-        return self.owner.terminate_owned_browser(deadline)
+    def terminate_owned_browser(
+        self,
+        *,
+        term_deadline: float,
+        kill_deadline: float,
+        reap_deadline: float,
+        poll_only: bool = False,
+    ) -> bool:
+        return self.owner.terminate_owned_browser(
+            term_deadline=term_deadline,
+            kill_deadline=kill_deadline,
+            reap_deadline=reap_deadline,
+            poll_only=poll_only,
+        )
 
     def bind_native_history_endpoint(
         self,
@@ -3029,12 +3248,14 @@ def _cleanup_chatgpt_oracle_process(
 
 def _service_pending_chatgpt_oracle_browser_owners(
     state: SidecarTaskState,
+    *,
+    deadline: Optional[float] = None,
 ) -> None:
     with state.pending_chatgpt_oracle_browser_owners_lock:
         owners = list(state.pending_chatgpt_oracle_browser_owners.items())
     for owner_id, owner in owners:
         try:
-            completed = owner.service_pending()
+            completed = owner.service_pending(deadline=deadline)
         except Exception as exc:
             owner.cleanup_error = _redacted_failure_message(str(exc))
             completed = False
@@ -3050,11 +3271,21 @@ def _drain_pending_chatgpt_oracle_browser_owners(
 ) -> bool:
     """Give retained browser owners one bounded shutdown cleanup window."""
 
-    shutdown_deadline = deadline or (
+    shutdown_deadline = (
         time.monotonic() + DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS
+        if deadline is None
+        else float(deadline)
     )
+    state.chatgpt_oracle_browser_owners_stopping = True
+    with state.pending_chatgpt_oracle_browser_owners_lock:
+        owners = list(state.pending_chatgpt_oracle_browser_owners.values())
+    for owner in owners:
+        owner.request_shutdown()
     while True:
-        _service_pending_chatgpt_oracle_browser_owners(state)
+        _service_pending_chatgpt_oracle_browser_owners(
+            state,
+            deadline=shutdown_deadline,
+        )
         with state.pending_chatgpt_oracle_browser_owners_lock:
             pending = bool(state.pending_chatgpt_oracle_browser_owners)
         if not pending:
@@ -3069,6 +3300,7 @@ def _drain_pending_chatgpt_oracle_browser_owners(
 def _chatgpt_oracle_browser_binding(  # noqa: PLR0915 - bounded owner lifecycle binding
     binding: ChatGPTConversationInitAccountBinding,
     *,
+    history_task_state: Optional[SidecarTaskState] = None,
     pending_lifecycle_registry: Optional[Dict[str, Any]] = None,
     pending_lifecycle_registry_lock: Optional[Any] = None,
 ) -> Iterator[ChatGPTConversationInitResolvedBinding]:
@@ -3094,14 +3326,15 @@ def _chatgpt_oracle_browser_binding(  # noqa: PLR0915 - bounded owner lifecycle 
     process: Optional[subprocess.Popen] = None
     temp_root = tempfile.mkdtemp(prefix="aawm-oracle-owner-")
     owner: Optional[_ChatGPTOracleBrowserOwner] = None
+    supervised_history = isinstance(history_task_state, SidecarTaskState)
     registry = (
-        pending_lifecycle_registry
-        if pending_lifecycle_registry is not None
+        history_task_state.pending_chatgpt_oracle_browser_owners
+        if supervised_history
         else {}
     )
     registry_lock = (
-        pending_lifecycle_registry_lock
-        if pending_lifecycle_registry_lock is not None
+        history_task_state.pending_chatgpt_oracle_browser_owners_lock
+        if supervised_history
         else threading.RLock()
     )
     try:
@@ -3135,22 +3368,23 @@ def _chatgpt_oracle_browser_binding(  # noqa: PLR0915 - bounded owner lifecycle 
             temp_root,
             registry,
             registry_lock,
+            history_task_state if supervised_history else None,
         )
         # Publish the concrete owner before consuming startup output. Any
         # later history registration must resolve through this exact owner.
-        if pending_lifecycle_registry is not None:
+        if supervised_history:
             owner.publish()
-        capability = _ChatGPTOracleBrowserLifecycleCapability(owner)
         resolved = _read_chatgpt_oracle_startup_binding(process)
         owner.bind(
             cdp_endpoint=resolved.cdp_endpoint,
             anchor_target_id=resolved.page_target_id,
         )
+        capability = _ChatGPTOracleBrowserLifecycleCapability(owner)
         yield ChatGPTConversationInitResolvedBinding(
             cdp_endpoint=resolved.cdp_endpoint,
             page_target_id=resolved.page_target_id,
             lifecycle_capability=(
-                capability if pending_lifecycle_registry is not None else None
+                capability if supervised_history else None
             ),
         )
     finally:
@@ -3172,7 +3406,7 @@ def _chatgpt_oracle_browser_binding(  # noqa: PLR0915 - bounded owner lifecycle 
                 + DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS
             )
             completed = owner.finalize(cleanup_deadline)
-            if not completed and pending_lifecycle_registry is not None:
+            if not completed and supervised_history:
                 with owner.pending_registry_lock:
                     transferred_already = (
                         owner.pending_registry.get(owner.owner_id) is owner
@@ -15389,8 +15623,7 @@ def _collect_bound_chatgpt_conversation_init_account(
     binding: ChatGPTConversationInitAccountBinding,
     *,
     observed_at: datetime,
-    pending_lifecycle_registry: Dict[str, Any],
-    pending_lifecycle_registry_lock: Any,
+    history_task_state: SidecarTaskState,
 ) -> tuple[List[tuple[Any, ...]], Dict[str, Any]]:
     coverage = _new_chatgpt_conversation_init_account_coverage(
         record,
@@ -15437,10 +15670,7 @@ def _collect_bound_chatgpt_conversation_init_account(
             snapshot_path = str(Path(snapshot_dir) / "snapshot.json")
             with _chatgpt_oracle_browser_binding(
                 binding,
-                pending_lifecycle_registry=pending_lifecycle_registry,
-                pending_lifecycle_registry_lock=(
-                    pending_lifecycle_registry_lock
-                ),
+                history_task_state=history_task_state,
             ) as resolved_binding:
                 collector_summary = (
                     collect_conversation_init_snapshot_from_oracle_browser(
@@ -15630,12 +15860,7 @@ def _run_chatgpt_conversation_init_bound_poll(  # noqa: PLR0915
             record,
             binding,
             observed_at=observed_at,
-            pending_lifecycle_registry=(
-                state.pending_chatgpt_oracle_browser_owners
-            ),
-            pending_lifecycle_registry_lock=(
-                state.pending_chatgpt_oracle_browser_owners_lock
-            ),
+            history_task_state=state,
         )
         capture_completed_monotonic = time.monotonic()
 
@@ -16803,13 +17028,19 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
         )
         return 1
     stopping = False
+    sidecar_state: Optional[SidecarTaskState] = None
 
     def _stop(_signum: int, _frame: object) -> None:
         nonlocal stopping
         stopping = True
-
-    signal.signal(signal.SIGINT, _stop)
-    signal.signal(signal.SIGTERM, _stop)
+        if sidecar_state is not None:
+            sidecar_state.chatgpt_oracle_browser_owners_stopping = True
+            with sidecar_state.pending_chatgpt_oracle_browser_owners_lock:
+                owners = list(
+                    sidecar_state.pending_chatgpt_oracle_browser_owners.values()
+                )
+            for owner in owners:
+                owner.request_shutdown()
 
     if config.apply and config.setup_schema:
         try:
@@ -16829,10 +17060,12 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
                 return 1
 
     sidecar_state = SidecarTaskState()
-    def _drain_owners() -> None:
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+    def _drain_owners() -> bool:
         try:
             if _drain_pending_chatgpt_oracle_browser_owners(sidecar_state):
-                return
+                return True
             _emit(
                 {
                     "event": "provider_status_sidecar_task_error",
@@ -16846,6 +17079,7 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
                     ),
                 }
             )
+            return False
         except Exception as exc:
             _emit(
                 {
@@ -16857,6 +17091,7 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
                     "error_message": _redacted_failure_message(str(exc)),
                 }
             )
+            return False
 
     while not stopping:
         now = time.monotonic()
@@ -16926,8 +17161,12 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
                 sidecar_events,
             )
             _emit(one_shot_status)
-            _drain_owners()
-            return 1 if one_shot_status["required_failure_count"] else 0
+            drained = _drain_owners()
+            return (
+                1
+                if one_shot_status["required_failure_count"] or not drained
+                else 0
+            )
 
         _sleep_until_next_sidecar_deadline(
             config,
@@ -16935,7 +17174,7 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
             should_stop=lambda: stopping,
         )
 
-    _drain_owners()
+    drained = _drain_owners()
     _emit(
         {
             "event": "provider_status_observations_stopped",
@@ -16943,7 +17182,7 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
             "environment": config.environment,
         }
     )
-    return 0
+    return 0 if drained else 1
 
 
 if __name__ == "__main__":
