@@ -4503,10 +4503,13 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
     request_body: dict[str, Any],
 ) -> Response:
     canonical_request_body = copy.deepcopy(request_body)
+    adapted_request_body = copy.deepcopy(request_body)
     (
         adapted_request_body,
         _adapted_custom_tools,
-    ) = _adapt_codex_custom_tools_to_functions_from_request_body(request_body)
+    ) = _adapt_codex_custom_tools_to_functions_from_request_body(
+        adapted_request_body
+    )
     (
         adapted_request_body,
         _adapted_namespace_tools,
@@ -4522,6 +4525,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
     try:
         oa_xai_context = await BaseOpenAIPassThroughHandler._prepare_openai_oa_xai_context(
             endpoint=endpoint,
+            request=request,
             request_body=adapted_request_body,
         )
     except Exception as exc:

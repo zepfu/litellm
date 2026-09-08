@@ -10,11 +10,14 @@ This module keeps private-mode credential writes for Hermes migration only.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
+import stat
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, MutableMapping, Optional
 
 import httpx  # noqa: F401  # harness patch surface; refresh path removed (RR-040)
 
@@ -33,6 +36,9 @@ from litellm.secret_managers.main import get_secret_str
 from litellm.secret_managers.xai_oauth_credentials import (
     DEFAULT_XAI_OAUTH_AUTH_FILE,
     DEFAULT_XAI_OAUTH_SCOPE,
+    credential_account_identity,
+    credential_expires_at,
+    credential_identity,
     evaluate_xai_oauth_credential_lifecycle,
     resolve_xai_oauth_auth_path,
     resolve_xai_oauth_scope,
@@ -68,6 +74,40 @@ _XAI_UNSUPPORTED_INPUT_ITEM_TYPES = frozenset(
     {"reasoning", "tool_search_call", "tool_search_output"}
 )
 
+_XAI_CREDENTIAL_MAX_BYTES = 1_048_576
+_XAI_MANAGED_SNAPSHOT_FAMILY = "xai_oauth"
+_XAI_NATIVE_SNAPSHOT_FAMILY = "xai_grok_oidc"
+_XAI_SNAPSHOT_STATE_ATTR = "_aawm_xai_oauth_snapshots"
+
+
+@dataclass(frozen=True)
+class XaiOAuthCredentialSnapshot:
+    """Immutable, secret-bearing request snapshot.
+
+    The access token is retained only in process memory and is excluded from
+    repr/equality so generation and account identity remain the comparison
+    contract. Files are read through an already-open descriptor and never
+    mutated by request code.
+    """
+
+    credential_family: str
+    auth_file: Path = field(repr=False, compare=False)
+    scope: str
+    access_token: str = field(repr=False, compare=False)
+    generation: str
+    account_identity: Optional[str]
+    expires_at: datetime
+    generation_metadata: tuple[int, int, int, int, int] = field(
+        repr=False,
+        compare=False,
+    )
+
+
+_snapshot_cache: Dict[
+    tuple[str, str, str],
+    XaiOAuthCredentialSnapshot,
+] = {}
+_snapshot_locks: Dict[str, asyncio.Lock] = {}
 _refresh_locks: Dict[str, asyncio.Lock] = {}
 
 
@@ -163,7 +203,11 @@ def build_grok_native_oauth_metadata(public_model: str) -> Dict[str, Any]:
     }
 
 
-async def prepare_oa_xai_request(data: Dict[str, Any]) -> bool:
+async def prepare_oa_xai_request(
+    data: Dict[str, Any],
+    *,
+    snapshot_out: Optional[MutableMapping[str, Any]] = None,
+) -> bool:
     public_model = data.get("model")
     if not is_oa_xai_model(public_model):
         return False
@@ -171,7 +215,10 @@ async def prepare_oa_xai_request(data: Dict[str, Any]) -> bool:
     upstream_model = resolve_oa_xai_upstream_model(public_model)
     data["model"] = upstream_model
     data["api_base"] = get_secret_str("LITELLM_XAI_OAUTH_API_BASE") or XAI_API_BASE
-    data["api_key"] = await get_xai_oauth_access_token()
+    snapshot = await get_xai_oauth_snapshot()
+    if snapshot_out is not None:
+        snapshot_out["snapshot"] = snapshot
+    data["api_key"] = snapshot.access_token
     data["custom_llm_provider"] = "xai"
     decoded_previous_response_id = _decode_previous_response_id_in_place(data)
     removed_input_items = _drop_xai_unsupported_input_items_in_place(data)
@@ -302,7 +349,301 @@ def _merge_metadata(
         target["tags"] = merged_tags
 
 
-async def get_xai_oauth_access_token() -> str:
+def _stat_fingerprint(
+    stat_result: os.stat_result,
+) -> tuple[int, int, int, int, int]:
+    return (
+        int(stat_result.st_dev),
+        int(stat_result.st_ino),
+        int(stat_result.st_mtime_ns),
+        int(stat_result.st_ctime_ns),
+        int(stat_result.st_size),
+    )
+
+
+def _open_xai_credential_file(path: Path) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ValueError("xAI OAuth credential file cannot be opened safely.")
+    flags = os.O_RDONLY | nofollow
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    if cloexec is not None:
+        flags |= cloexec
+    try:
+        return os.open(os.fspath(path), flags)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            raise FileNotFoundError from None
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            raise ValueError("xAI OAuth credential file must not be a symlink.")
+        raise ValueError("xAI OAuth credential file is unreadable.") from None
+
+
+def _read_xai_credential_bytes(
+    file_descriptor: int,
+    *,
+    max_bytes: int = _XAI_CREDENTIAL_MAX_BYTES,
+) -> bytes:
+    chunks: list[bytes] = []
+    bytes_read = 0
+    while bytes_read <= max_bytes:
+        try:
+            chunk = os.read(
+                file_descriptor,
+                min(8192, max_bytes + 1 - bytes_read),
+            )
+        except OSError:
+            raise ValueError("xAI OAuth credential file could not be read.") from None
+        if not chunk:
+            break
+        chunks.append(chunk)
+        bytes_read += len(chunk)
+    if bytes_read > max_bytes:
+        raise ValueError("xAI OAuth credential file is too large.")
+    return b"".join(chunks)
+
+
+def _read_xai_credential_payload_secure(
+    path: Path,
+) -> tuple[Dict[str, Any], os.stat_result]:
+    file_descriptor = _open_xai_credential_file(path)
+    try:
+        try:
+            before = os.fstat(file_descriptor)
+        except OSError:
+            raise ValueError("xAI OAuth credential metadata is unreadable.") from None
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("xAI OAuth credential path is not a regular file.")
+        if before.st_size > _XAI_CREDENTIAL_MAX_BYTES:
+            raise ValueError("xAI OAuth credential file is too large.")
+        raw_bytes = _read_xai_credential_bytes(file_descriptor)
+        try:
+            after = os.fstat(file_descriptor)
+        except OSError:
+            raise ValueError("xAI OAuth credential metadata is unreadable.") from None
+    finally:
+        try:
+            os.close(file_descriptor)
+        except OSError:
+            pass
+
+    if _stat_fingerprint(before) != _stat_fingerprint(after):
+        raise ValueError("xAI OAuth credential changed while it was read.")
+    try:
+        payload = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise ValueError("xAI OAuth credential file is not valid JSON.") from None
+    if not isinstance(payload, dict):
+        raise ValueError("xAI OAuth credential file must contain a JSON object.")
+    return payload, after
+
+
+def _stat_xai_credential_file(path: Path) -> os.stat_result:
+    file_descriptor = _open_xai_credential_file(path)
+    try:
+        try:
+            result = os.fstat(file_descriptor)
+        except OSError:
+            raise ValueError("xAI OAuth credential metadata is unreadable.") from None
+    finally:
+        try:
+            os.close(file_descriptor)
+        except OSError:
+            pass
+    if not stat.S_ISREG(result.st_mode):
+        raise ValueError("xAI OAuth credential path is not a regular file.")
+    if result.st_size > _XAI_CREDENTIAL_MAX_BYTES:
+        raise ValueError("xAI OAuth credential file is too large.")
+    return result
+
+
+def _snapshot_cache_key(
+    *,
+    credential_family: str,
+    credential_path: Path,
+    scope: str,
+) -> tuple[str, str, str]:
+    return (
+        credential_family,
+        os.fspath(credential_path.resolve(strict=False)),
+        scope,
+    )
+
+
+def _snapshot_lock_key(cache_key: tuple[str, str, str]) -> str:
+    return "\x1f".join(cache_key)
+
+
+def _snapshot_is_route_usable(snapshot: XaiOAuthCredentialSnapshot) -> bool:
+    return datetime.now(timezone.utc) < snapshot.expires_at - timedelta(
+        seconds=_refresh_buffer_seconds()
+    )
+
+
+def _xai_oauth_credential_file_not_found_error(
+    *,
+    credential_family: str,
+    credential_path: Path,
+) -> ValueError:
+    if credential_family == _XAI_NATIVE_SNAPSHOT_FAMILY:
+        return ValueError(
+            f"Grok OIDC credential file not found at {credential_path}. "
+            "Run the health/provider-status sidecar Grok OIDC refresh or "
+            "relogin with the Grok CLI before Grok native traffic can proceed."
+        )
+    return ValueError(
+        f"xAI OAuth credential file not found at {credential_path}. Run the "
+        "provider-status sidecar xAI OAuth refresh or reseed/relogin the "
+        "managed xAI OAuth credential."
+    )
+
+
+def _load_xai_oauth_snapshot_sync(
+    *,
+    credential_family: str,
+    credential_path: Path,
+    scope: str,
+) -> XaiOAuthCredentialSnapshot:
+    payload, stat_result = _read_xai_credential_payload_secure(credential_path)
+    credential = _select_credential_record(payload, scope)
+    token = _credential_access_token(credential)
+    if not token:
+        if credential_family == _XAI_NATIVE_SNAPSHOT_FAMILY:
+            raise _grok_native_oauth_refresh_required_error(missing_token=True)
+        raise _xai_oauth_refresh_required_error(missing_token=True)
+
+    lifecycle = evaluate_xai_oauth_credential_lifecycle(
+        credential,
+        route_safety_buffer_seconds=_refresh_buffer_seconds(),
+        refresh_min_seconds=_refresh_buffer_seconds(),
+    )
+    expires_at = credential_expires_at(credential)
+    if (
+        expires_at is None
+        or not bool(lifecycle["route_usable"])
+        or not _snapshot_is_route_usable(
+            XaiOAuthCredentialSnapshot(
+                credential_family=credential_family,
+                auth_file=credential_path,
+                scope=scope,
+                access_token=token,
+                generation="",
+                account_identity=None,
+                expires_at=expires_at,
+                generation_metadata=_stat_fingerprint(stat_result),
+            )
+        )
+    ):
+        if credential_family == _XAI_NATIVE_SNAPSHOT_FAMILY:
+            raise _grok_native_oauth_refresh_required_error(missing_token=False)
+        raise _xai_oauth_refresh_required_error(missing_token=False)
+
+    generation = credential_identity(
+        credential_path,
+        credential,
+        scope=scope,
+        stat_result=stat_result,
+    )
+    if generation is None:
+        raise ValueError("xAI OAuth credential generation is unavailable.")
+    return XaiOAuthCredentialSnapshot(
+        credential_family=credential_family,
+        auth_file=credential_path,
+        scope=scope,
+        access_token=token,
+        generation=generation,
+        account_identity=credential_account_identity(
+            credential,
+            scope=scope,
+        ),
+        expires_at=expires_at,
+        generation_metadata=_stat_fingerprint(stat_result),
+    )
+
+
+async def _get_xai_oauth_snapshot_for_path(
+    *,
+    credential_family: str,
+    credential_path: Path,
+    scope: str,
+    force_reload: bool = False,
+) -> XaiOAuthCredentialSnapshot:
+    cache_key = _snapshot_cache_key(
+        credential_family=credential_family,
+        credential_path=credential_path,
+        scope=scope,
+    )
+    lock_key = _snapshot_lock_key(cache_key)
+    try:
+        observed_stat = await asyncio.to_thread(
+            _stat_xai_credential_file,
+            credential_path,
+        )
+    except FileNotFoundError as exc:
+        raise _xai_oauth_credential_file_not_found_error(
+            credential_family=credential_family,
+            credential_path=credential_path,
+        ) from exc
+    cached = _snapshot_cache.get(cache_key)
+    if (
+        not force_reload
+        and cached is not None
+        and cached.generation_metadata == _stat_fingerprint(observed_stat)
+        and _snapshot_is_route_usable(cached)
+    ):
+        return cached
+    if cached is not None and (
+        cached.generation_metadata != _stat_fingerprint(observed_stat)
+        or not _snapshot_is_route_usable(cached)
+    ):
+        _snapshot_cache.pop(cache_key, None)
+
+    lock = _snapshot_locks.setdefault(lock_key, asyncio.Lock())
+    async with lock:
+        try:
+            observed_stat = await asyncio.to_thread(
+                _stat_xai_credential_file,
+                credential_path,
+            )
+        except FileNotFoundError as exc:
+            raise _xai_oauth_credential_file_not_found_error(
+                credential_family=credential_family,
+                credential_path=credential_path,
+            ) from exc
+        cached = _snapshot_cache.get(cache_key)
+        if (
+            not force_reload
+            and cached is not None
+            and cached.generation_metadata == _stat_fingerprint(observed_stat)
+            and _snapshot_is_route_usable(cached)
+        ):
+            return cached
+        if cached is not None and (
+            cached.generation_metadata != _stat_fingerprint(observed_stat)
+            or not _snapshot_is_route_usable(cached)
+        ):
+            _snapshot_cache.pop(cache_key, None)
+        try:
+            snapshot = await asyncio.to_thread(
+                _load_xai_oauth_snapshot_sync,
+                credential_family=credential_family,
+                credential_path=credential_path,
+                scope=scope,
+            )
+        except FileNotFoundError as exc:
+            _snapshot_cache.pop(cache_key, None)
+            raise _xai_oauth_credential_file_not_found_error(
+                credential_family=credential_family,
+                credential_path=credential_path,
+            ) from exc
+        except Exception:
+            _snapshot_cache.pop(cache_key, None)
+            raise
+        _snapshot_cache[cache_key] = snapshot
+        return snapshot
+
+
+async def get_xai_oauth_snapshot() -> XaiOAuthCredentialSnapshot:
     path_resolution = resolve_xai_oauth_auth_path(value_getter=get_secret_str)
     if path_resolution.source == "default":
         raise ValueError(
@@ -313,19 +654,14 @@ async def get_xai_oauth_access_token() -> str:
             "OAuth refresh or reseed/relogin the managed credential before "
             "calling oa_xai/*."
         )
-
-    credential_path = path_resolution.path
-    scope = resolve_xai_oauth_scope(value_getter=get_secret_str).scope
-    lock_key = f"xai-oauth-read:{credential_path}:{scope}"
-    lock = _refresh_locks.setdefault(lock_key, asyncio.Lock())
-    async with lock:
-        return _get_xai_oauth_access_token_read_only(
-            credential_path=credential_path,
-            scope=scope,
-        )
+    return await _get_xai_oauth_snapshot_for_path(
+        credential_family=_XAI_MANAGED_SNAPSHOT_FAMILY,
+        credential_path=path_resolution.path,
+        scope=resolve_xai_oauth_scope(value_getter=get_secret_str).scope,
+    )
 
 
-async def get_grok_native_oauth_access_token() -> str:
+async def get_grok_native_oauth_snapshot() -> XaiOAuthCredentialSnapshot:
     credential_path = default_grok_xai_oauth_auth_path()
     scope = resolve_xai_oauth_scope(
         value_getter=get_secret_str,
@@ -335,13 +671,70 @@ async def get_grok_native_oauth_access_token() -> str:
         ),
         default_scope=_DEFAULT_XAI_OAUTH_SCOPE,
     ).scope
-    lock_key = f"grok-native-read:{credential_path}:{scope}"
-    lock = _refresh_locks.setdefault(lock_key, asyncio.Lock())
-    async with lock:
-        return _get_grok_native_oauth_access_token_read_only(
-            credential_path=credential_path,
-            scope=scope,
-        )
+    return await _get_xai_oauth_snapshot_for_path(
+        credential_family=_XAI_NATIVE_SNAPSHOT_FAMILY,
+        credential_path=credential_path,
+        scope=scope,
+    )
+
+
+async def get_xai_oauth_access_token() -> str:
+    return (await get_xai_oauth_snapshot()).access_token
+
+
+async def get_grok_native_oauth_access_token() -> str:
+    return (await get_grok_native_oauth_snapshot()).access_token
+
+
+async def reread_xai_oauth_snapshot_after_401(
+    snapshot: XaiOAuthCredentialSnapshot,
+) -> Optional[XaiOAuthCredentialSnapshot]:
+    """Reread one exact managed file/scope and require the same account."""
+
+    if snapshot.credential_family != _XAI_MANAGED_SNAPSHOT_FAMILY:
+        return None
+    current = await _get_xai_oauth_snapshot_for_path(
+        credential_family=snapshot.credential_family,
+        credential_path=snapshot.auth_file,
+        scope=snapshot.scope,
+        force_reload=True,
+    )
+    if current.generation == snapshot.generation:
+        return None
+    if current.account_identity != snapshot.account_identity:
+        return None
+    return current
+
+
+def bind_xai_oauth_snapshot_to_request(
+    request: Any,
+    snapshot: XaiOAuthCredentialSnapshot,
+) -> None:
+    state = getattr(request, "state", None)
+    if state is None:
+        return
+    snapshots = getattr(state, _XAI_SNAPSHOT_STATE_ATTR, None)
+    if not isinstance(snapshots, dict):
+        snapshots = {}
+        setattr(state, _XAI_SNAPSHOT_STATE_ATTR, snapshots)
+    snapshots[snapshot.credential_family] = snapshot
+
+
+def get_xai_oauth_snapshot_from_request(
+    request: Any,
+    *,
+    credential_family: str = _XAI_MANAGED_SNAPSHOT_FAMILY,
+) -> Optional[XaiOAuthCredentialSnapshot]:
+    state = getattr(request, "state", None)
+    snapshots = getattr(state, _XAI_SNAPSHOT_STATE_ATTR, None)
+    if not isinstance(snapshots, Mapping):
+        return None
+    snapshot = snapshots.get(credential_family)
+    return (
+        snapshot
+        if isinstance(snapshot, XaiOAuthCredentialSnapshot)
+        else None
+    )
 
 
 def _grok_native_oauth_refresh_required_error(*, missing_token: bool) -> ValueError:

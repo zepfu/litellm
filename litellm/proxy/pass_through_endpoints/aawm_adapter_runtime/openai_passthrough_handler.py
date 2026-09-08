@@ -286,6 +286,7 @@ class BaseOpenAIPassThroughHandler:
     async def _prepare_openai_oa_xai_context(
         *,
         endpoint: str,
+        request: "Request",
         request_body: dict[str, Any],
     ) -> Optional[tuple[str, str, dict[str, Any], str]]:
         rt = BaseOpenAIPassThroughHandler._get_runtime()
@@ -295,6 +296,7 @@ class BaseOpenAIPassThroughHandler:
             oa_xai_api_key,
         ) = await rt.prepare_oa_xai_passthrough_request_fn(
             request_body,
+            request=request,
             sanitize_responses_request=rt.is_openai_responses_endpoint_fn(
                 endpoint
             ),
@@ -570,6 +572,7 @@ class BaseOpenAIPassThroughHandler:
             oa_xai_context = (
                 await BaseOpenAIPassThroughHandler._prepare_openai_oa_xai_context(
                     endpoint=endpoint,
+                    request=request,
                     request_body=prepared_request_body,
                 )
             )
