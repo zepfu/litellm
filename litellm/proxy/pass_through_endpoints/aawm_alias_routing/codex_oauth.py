@@ -32,8 +32,8 @@ from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthCredentialSnapshot,
     CodexOAuthInventoryError,
     CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY,
-    load_codex_oauth_credential,
     load_codex_oauth_inventory,
+    read_codex_oauth_snapshot,
 )
 
 # ---------------------------------------------------------------------------
@@ -374,45 +374,13 @@ async def _load_codex_oauth_headers_for_record(
 ) -> CodexOAuthRequestAuth:
     """Build headers only from one already-selected immutable record."""
     try:
-        credential = load_codex_oauth_credential(record)
+        credential = await read_codex_oauth_snapshot(record)
     except CodexOAuthInventoryError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from None
-
-    if not _codex_oauth_credential_snapshot_is_valid(credential):
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"Codex OAuth credential '{record.label}' "
-                f"(account_hash={credential.account_hash}) is expired or "
-                "invalid. The "
-                "provider-status sidecar owns Codex auth refresh; confirm the "
-                "configured account can be refreshed."
-            ),
-        )
-
-    headers = _safe_get_request_headers(request)
-    assert _get_request_header_or_passthrough_alias is not None
-    session_id = (
-        _get_request_header_or_passthrough_alias(request, "session_id")
-        or headers.get("x-claude-code-session-id")
-        or headers.get("X-Claude-Code-Session-Id")
-    )
-
-    return CodexOAuthRequestAuth(
-        account_label=record.label,
-        account_hash=credential.account_hash,
-        lane_key=_codex_oauth_account_lane_key(
-            account_label=record.label,
-            account_hash=credential.account_hash,
-        ),
-        headers=get_chatgpt_default_headers(
-            access_token=credential.access_token,
-            account_id=credential.account_id,
-            session_id=session_id,
-        ),
-        account_display=(
-            credential.account_display or CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY
-        ),
+    return await _codex_oauth_request_auth_for_credential(
+        request,
+        record,
+        credential,
     )
 
 
@@ -645,10 +613,24 @@ async def reload_codex_oauth_credential_after_token_invalidated(
         return None
     try:
         with credential_file_lock(record.lock_path):
-            selection = await _load_codex_oauth_headers_for_record(
-                request, record
+            credential = await read_codex_oauth_snapshot(
+                record,
+                force_refresh=True,
             )
     except (HTTPException, CredentialFileLockError):
+        _record_codex_oauth_credential_reload_outcome(
+            request,
+            account_label=cleaned_label,
+            outcome="unchanged_already_reloaded",
+        )
+        return None
+    try:
+        selection = await _codex_oauth_request_auth_for_credential(
+            request,
+            record,
+            credential,
+        )
+    except HTTPException:
         _record_codex_oauth_credential_reload_outcome(
             request,
             account_label=cleaned_label,
@@ -685,6 +667,50 @@ async def reload_codex_oauth_credential_after_token_invalidated(
         outcome="reloaded",
     )
     return selection
+
+
+async def _codex_oauth_request_auth_for_credential(
+    request: Request,
+    record: CodexOAuthCredentialRecord,
+    credential: CodexOAuthCredentialSnapshot,
+) -> CodexOAuthRequestAuth:
+    """Validate a snapshot and build its request-local auth representation."""
+    if not _codex_oauth_credential_snapshot_is_valid(credential):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Codex OAuth credential '{record.label}' "
+                f"(account_hash={credential.account_hash}) is expired or "
+                "invalid. The "
+                "provider-status sidecar owns Codex auth refresh; confirm the "
+                "configured account can be refreshed."
+            ),
+        )
+
+    headers = _safe_get_request_headers(request)
+    assert _get_request_header_or_passthrough_alias is not None
+    session_id = (
+        _get_request_header_or_passthrough_alias(request, "session_id")
+        or headers.get("x-claude-code-session-id")
+        or headers.get("X-Claude-Code-Session-Id")
+    )
+
+    return CodexOAuthRequestAuth(
+        account_label=record.label,
+        account_hash=credential.account_hash,
+        lane_key=_codex_oauth_account_lane_key(
+            account_label=record.label,
+            account_hash=credential.account_hash,
+        ),
+        headers=get_chatgpt_default_headers(
+            access_token=credential.access_token,
+            account_id=credential.account_id,
+            session_id=session_id,
+        ),
+        account_display=(
+            credential.account_display or CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

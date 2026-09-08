@@ -33,6 +33,7 @@ from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
 )
 from litellm.secret_managers.codex_oauth_inventory import (
+    CodexOAuthCredentialSnapshot,
     CodexOAuthCredentialRecord,
     CodexOAuthIdentityMismatchError,
     validate_codex_oauth_account_identity,
@@ -277,6 +278,57 @@ def inspect_codex_oauth_credential_health(auth_file: str | Path) -> Dict[str, An
             refresh_threshold_source="fallback",
             refresh_threshold_degraded=True,
         )
+
+
+def inspect_codex_oauth_snapshot_health(
+    snapshot: CodexOAuthCredentialSnapshot,
+) -> Dict[str, Any]:
+    """Classify a shared identity-validated credential snapshot."""
+    if snapshot.expires_at is None:
+        return {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "health_status": "degraded",
+            "account_label": snapshot.record.label,
+            "account_hash": snapshot.account_hash,
+            "expires_at": None,
+            "issued_lifetime_seconds": snapshot.issued_lifetime_seconds,
+            "observed_at": snapshot.observed_at,
+            "credential_generation": snapshot.generation,
+            "error_class": "CredentialExpiryUnavailable",
+            "error_message": "Codex OAuth credential expiry is unavailable.",
+        }
+    expires_at_text = _format_expires_at(snapshot.expires_at)
+    if snapshot.expires_at <= snapshot.observed_at:
+        return {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "health_status": "expired",
+            "account_label": snapshot.record.label,
+            "account_hash": snapshot.account_hash,
+            "expires_at": expires_at_text,
+            "issued_lifetime_seconds": snapshot.issued_lifetime_seconds,
+            "observed_at": snapshot.observed_at,
+            "credential_generation": snapshot.generation,
+            "error_class": "CredentialExpiredError",
+            "error_message": "Codex OAuth credential is expired.",
+        }
+    return {
+        "attempted": True,
+        "refreshed": False,
+        "skipped": False,
+        "health_status": "fresh",
+        "account_label": snapshot.record.label,
+        "account_hash": snapshot.account_hash,
+        "expires_at": expires_at_text,
+        "issued_lifetime_seconds": snapshot.issued_lifetime_seconds,
+        "observed_at": snapshot.observed_at,
+        "credential_generation": snapshot.generation,
+        "error_class": None,
+        "error_message": None,
+    }
 
 
 def _codex_health_summary(

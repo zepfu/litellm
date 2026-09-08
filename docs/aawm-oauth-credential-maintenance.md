@@ -790,8 +790,12 @@ maintenance contract.
 Credential refresh is **file-based hot reload**:
 
 - Writers replace the auth JSON (or token file) in place under lock.
-- LiteLLM mounts the host credential directories **read-only** and re-reads them
-  when selecting a candidate or building provider headers.
+- LiteLLM mounts the host credential directories **read-only** and reads them
+  through one immutable, identity-validated Codex OAuth snapshot source. The
+  async runtime path uses `read_codex_oauth_snapshot`; passive sidecar reads use
+  `read_codex_oauth_snapshot_sync`. A bounded cache is keyed by inventory
+  identity and validated by file identity, expiry, and non-secret snapshot
+  generation. A forced reread after publication clears only that record's cache.
 - Successful sidecar or manual refresh does **not** require restarting the
   LiteLLM proxy container, the provider-status sidecar, or the host CLI for the
   new token to become visible to subsequent requests.
@@ -825,6 +829,7 @@ restart event.
 | Shared atomic write | `litellm/secret_managers/credential_file_write.py` |
 | Shared error sanitizer | `litellm/secret_managers/credential_error_sanitizer.py` |
 | Codex ordered inventory | `litellm/secret_managers/codex_oauth_inventory.py` |
+| Codex shared snapshot | `litellm/secret_managers/codex_oauth_inventory.py` |
 | Codex refresh | `scripts/codex_oauth_refresh.py` |
 | Managed xAI refresh | `scripts/xai_oauth_refresh.py` |
 | Grok OIDC refresh | `scripts/grok_oidc_refresh.py` |

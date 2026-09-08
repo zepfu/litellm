@@ -109,10 +109,9 @@ from litellm.secret_managers.codex_oauth_inventory import (
     CODEX_OAUTH_ACCOUNT_HASH_LENGTH,
     CODEX_OAUTH_INVENTORY_ENV,
     CodexOAuthCredentialRecord,
-    CodexOAuthCredentialSnapshot,
     CodexOAuthInventory,
-    load_codex_oauth_credential,
     load_codex_oauth_inventory,
+    read_codex_oauth_snapshot_sync,
 )
 from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
@@ -5490,10 +5489,10 @@ def _codex_reset_credit_poll_failure_message(
     return message + "."
 
 
-def _load_codex_reset_credit_auth_context(
+async def _load_codex_reset_credit_auth_context(
     record: CodexOAuthCredentialRecord,
 ) -> Dict[str, Any]:
-    snapshot = load_codex_oauth_credential(record)
+    snapshot = read_codex_oauth_snapshot_sync(record)
     return {
         "access_token": snapshot.access_token,
         "account_id": snapshot.account_id,
@@ -14262,46 +14261,8 @@ def _inspect_codex_inventory_record_health(
     record: CodexOAuthCredentialRecord,
 ) -> Dict[str, Any]:
     try:
-        snapshot: CodexOAuthCredentialSnapshot = load_codex_oauth_credential(record)
-        expires_at = snapshot.expires_at
-        if expires_at is None:
-            return {
-                "attempted": True,
-                "health_status": "degraded",
-                "account_label": record.label,
-                "account_hash": record.expected_account_hash,
-                "expires_at": None,
-                "error_class": "CredentialExpiryUnavailable",
-                "error_message": (
-                    f"Codex OAuth credential '{record.label}' expiry is unavailable."
-                ),
-            }
-        expires_at_text = (
-            datetime.fromtimestamp(expires_at, tz=timezone.utc)
-            .isoformat()
-            .replace("+00:00", "Z")
-        )
-        if expires_at <= time.time():
-            return {
-                "attempted": True,
-                "health_status": "expired",
-                "account_label": record.label,
-                "account_hash": record.expected_account_hash,
-                "expires_at": expires_at_text,
-                "error_class": "CredentialExpiredError",
-                "error_message": (
-                    f"Codex OAuth credential '{record.label}' is expired."
-                ),
-            }
-        return {
-            "attempted": True,
-            "health_status": "fresh",
-            "account_label": record.label,
-            "account_hash": record.expected_account_hash,
-            "expires_at": expires_at_text,
-            "error_class": None,
-            "error_message": None,
-        }
+        snapshot = read_codex_oauth_snapshot_sync(record)
+        return codex_oauth_refresh.inspect_codex_oauth_snapshot_health(snapshot)
     except Exception as exc:
         return {
             "attempted": True,
@@ -15252,7 +15213,7 @@ def _collect_bound_chatgpt_conversation_init_account(
     )
 
     try:
-        credential = load_codex_oauth_credential(record)
+        credential = read_codex_oauth_snapshot_sync(record)
         if credential.account_hash != record.expected_account_hash:
             _set_chatgpt_account_failure(
                 coverage,

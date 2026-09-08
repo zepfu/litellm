@@ -12,9 +12,12 @@ import errno
 import hashlib
 import json
 import math
+import asyncio
 import os
 import re
 import stat
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -24,6 +27,7 @@ CODEX_OAUTH_INVENTORY_SCHEMA_VERSION = 1
 CODEX_OAUTH_ACCOUNT_HASH_LENGTH = 12
 CODEX_OAUTH_AUTH_FILE_MODE = 0o600
 CODEX_OAUTH_AUTH_FILE_MAX_BYTES = 1_048_576
+CODEX_OAUTH_SNAPSHOT_CACHE_MAX_ENTRIES = 128
 
 _SAFE_LABEL_RE = re.compile(r"\A[a-z][a-z0-9._-]{0,63}\Z")
 _ACCOUNT_HASH_RE = re.compile(
@@ -195,9 +199,164 @@ class CodexOAuthCredentialSnapshot:
     record: CodexOAuthCredentialRecord
     account_hash: str
     expires_at: Optional[float]
+    issued_lifetime_seconds: Optional[float]
+    observed_at: float
+    generation: str
     access_token: str = field(repr=False)
     account_id: str = field(repr=False)
     account_display: Optional[str] = None
+
+
+_SNAPSHOT_CACHE: dict[tuple[str, str, str, str], "_SnapshotCacheEntry"] = {}
+_SNAPSHOT_CACHE_LOCK = threading.Lock()
+
+
+class CodexOAuthSnapshotReadError(CodexOAuthInventoryError):
+    """Raised when one immutable credential snapshot cannot be read."""
+
+    def __init__(
+        self,
+        *,
+        label: str,
+        reason: str,
+        observed_at: float,
+        identity_validated: bool = False,
+    ) -> None:
+        self.label = label
+        self.reason = reason
+        self.observed_at = observed_at
+        self.identity_validated = identity_validated
+        super().__init__(
+            f"Codex OAuth credential '{label}' could not be read: {reason}."
+        )
+
+
+@dataclass(frozen=True)
+class _SnapshotCacheEntry:
+    snapshot: Optional[CodexOAuthCredentialSnapshot] = None
+    error: Optional[CodexOAuthSnapshotReadError] = None
+    file_identity: tuple[int, int, int] = (0, 0, 0)
+
+
+async def read_codex_oauth_snapshot(
+    record: CodexOAuthCredentialRecord,
+    *,
+    force_refresh: bool = False,
+) -> CodexOAuthCredentialSnapshot:
+    """Read one identity-validated snapshot off the async event loop.
+
+    A snapshot is cached for this process until it expires or a caller forces
+    a re-read after publication. Read errors use the same bounded cache.
+    """
+    return await asyncio.to_thread(
+        read_codex_oauth_snapshot_sync,
+        record,
+        force_refresh=force_refresh,
+    )
+
+
+def read_codex_oauth_snapshot_sync(
+    record: CodexOAuthCredentialRecord,
+    *,
+    force_refresh: bool = False,
+) -> CodexOAuthCredentialSnapshot:
+    """Read the shared snapshot synchronously for non-async schedulers."""
+    cache_key = (
+        record.label,
+        os.fspath(record.auth_path),
+        os.fspath(record.lock_path),
+        record.expected_account_hash,
+    )
+    if not force_refresh:
+        with _SNAPSHOT_CACHE_LOCK:
+            cached = _SNAPSHOT_CACHE.get(cache_key)
+        if cached is not None and cached.snapshot is not None:
+            snapshot = cached.snapshot
+            if (
+                _codex_oauth_snapshot_matches_record(snapshot, record)
+                and cached.file_identity == _snapshot_file_identity(record)
+                and not _codex_oauth_snapshot_is_expired(snapshot)
+            ):
+                return snapshot
+        elif cached is not None and cached.error is not None:
+            raise cached.error
+
+    if force_refresh:
+        with _SNAPSHOT_CACHE_LOCK:
+            _SNAPSHOT_CACHE.pop(cache_key, None)
+    try:
+        snapshot = load_codex_oauth_credential(record)
+    except CodexOAuthCredentialError as exc:
+        error = _snapshot_read_error(record, exc)
+        with _SNAPSHOT_CACHE_LOCK:
+            _SNAPSHOT_CACHE[cache_key] = _SnapshotCacheEntry(
+                error=error,
+                file_identity=_snapshot_file_identity(record),
+            )
+            _prune_snapshot_cache_locked()
+        raise error from exc
+    with _SNAPSHOT_CACHE_LOCK:
+        _SNAPSHOT_CACHE[cache_key] = _SnapshotCacheEntry(
+            snapshot=snapshot,
+            file_identity=_snapshot_file_identity(record),
+        )
+        _prune_snapshot_cache_locked()
+    return snapshot
+
+
+def _codex_oauth_snapshot_generation(
+    payload: Mapping[str, Any],
+    account_hash: str,
+) -> str:
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"{account_hash}:{digest}"
+
+
+def _codex_oauth_snapshot_matches_record(
+    snapshot: CodexOAuthCredentialSnapshot,
+    record: CodexOAuthCredentialRecord,
+) -> bool:
+    return (
+        snapshot.record.auth_path == record.auth_path
+        and snapshot.record.lock_path == record.lock_path
+        and snapshot.account_hash == record.expected_account_hash
+    )
+
+
+def _codex_oauth_snapshot_is_expired(
+    snapshot: CodexOAuthCredentialSnapshot,
+) -> bool:
+    return snapshot.expires_at is not None and snapshot.expires_at <= time.time()
+
+
+def _snapshot_read_error(
+    record: CodexOAuthCredentialRecord,
+    exc: CodexOAuthCredentialError,
+) -> CodexOAuthSnapshotReadError:
+    reason = str(exc).removeprefix(
+        f"Codex OAuth credential '{record.label}' "
+    ).removesuffix(".")
+    return CodexOAuthSnapshotReadError(
+        label=record.label,
+        reason=reason or "is unreadable",
+        observed_at=time.time(),
+    )
+
+
+def _prune_snapshot_cache_locked() -> None:
+    while len(_SNAPSHOT_CACHE) > CODEX_OAUTH_SNAPSHOT_CACHE_MAX_ENTRIES:
+        _SNAPSHOT_CACHE.pop(next(iter(_SNAPSHOT_CACHE)), None)
+
+
+def _snapshot_file_identity(
+    record: CodexOAuthCredentialRecord,
+) -> tuple[int, int, int]:
+    try:
+        file_stat = os.lstat(record.auth_path)
+    except OSError:
+        return (0, 0, 0)
+    return (file_stat.st_ino, file_stat.st_size, file_stat.st_mtime_ns)
 
 
 def codex_oauth_account_identity_hash(account_id: Any) -> str:
@@ -386,7 +545,8 @@ def load_codex_oauth_credential(
         raise CodexOAuthCredentialError(
             f"Codex OAuth account '{record.label}' is disabled."
         )
-    payload = _read_private_auth_payload(record)
+    observed_at = time.time()
+    payload = _read_private_auth_payload(record, observed_at=observed_at)
     token_data = get_codex_oauth_token_data(payload, label=record.label)
     access_token = _clean_string(token_data.get("access_token"))
     if access_token is None:
@@ -399,10 +559,26 @@ def load_codex_oauth_credential(
             token_data,
         )
     )
+    expires_at = get_codex_oauth_token_expiry(token_data)
+    issued_at = _finite_timestamp(
+        _decode_jwt_claims_without_validation(access_token).get("iat")
+    )
+    issued_lifetime_seconds = (
+        expires_at - issued_at
+        if (
+            expires_at is not None
+            and issued_at is not None
+            and expires_at > issued_at
+        )
+        else None
+    )
     return CodexOAuthCredentialSnapshot(
         record=record,
         account_hash=account_hash,
-        expires_at=get_codex_oauth_token_expiry(token_data),
+        expires_at=expires_at,
+        issued_lifetime_seconds=issued_lifetime_seconds,
+        observed_at=observed_at,
+        generation=_codex_oauth_snapshot_generation(payload, account_hash),
         access_token=access_token,
         account_id=account_id,
         account_display=account_display or CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY,
@@ -662,18 +838,23 @@ def _validate_exact_fields(
 
 def _read_private_auth_payload(
     record: CodexOAuthCredentialRecord,
+    *,
+    observed_at: float,
 ) -> Mapping[str, Any]:
     file_descriptor = _open_private_auth_file(record)
     try:
         file_stat = os.fstat(file_descriptor)
         if not stat.S_ISREG(file_stat.st_mode):
-            raise CodexOAuthCredentialError(
-                f"Codex OAuth credential '{record.label}' is not a regular file."
+            raise CodexOAuthSnapshotReadError(
+                label=record.label,
+                reason="is not a regular file",
+                observed_at=observed_at,
             )
         if stat.S_IMODE(file_stat.st_mode) != CODEX_OAUTH_AUTH_FILE_MODE:
-            raise CodexOAuthCredentialError(
-                f"Codex OAuth credential '{record.label}' has invalid permissions; "
-                "expected mode 0600."
+            raise CodexOAuthSnapshotReadError(
+                label=record.label,
+                reason="has invalid permissions; expected mode 0600",
+                observed_at=observed_at,
             )
         raw_bytes = _read_bounded_bytes(file_descriptor, label=record.label)
     finally:
@@ -682,12 +863,16 @@ def _read_private_auth_payload(
     try:
         payload = json.loads(raw_bytes.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError):
-        raise CodexOAuthCredentialError(
-            f"Codex OAuth credential '{record.label}' is malformed."
+        raise CodexOAuthSnapshotReadError(
+            label=record.label,
+            reason="is malformed or not a JSON object",
+            observed_at=observed_at,
         ) from None
     if not isinstance(payload, dict):
-        raise CodexOAuthCredentialError(
-            f"Codex OAuth credential '{record.label}' must contain a JSON object."
+        raise CodexOAuthSnapshotReadError(
+            label=record.label,
+            reason="is malformed or not a JSON object",
+            observed_at=observed_at,
         )
     return payload
 
@@ -695,8 +880,10 @@ def _read_private_auth_payload(
 def _open_private_auth_file(record: CodexOAuthCredentialRecord) -> int:
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
-        raise CodexOAuthCredentialError(
-            "Secure Codex OAuth credential reads are unsupported on this platform."
+        raise CodexOAuthSnapshotReadError(
+            label=record.label,
+            reason="unsupported platform for secure reads",
+            observed_at=time.time(),
         )
     flags = os.O_RDONLY | nofollow
     cloexec = getattr(os, "O_CLOEXEC", None)
@@ -705,8 +892,10 @@ def _open_private_auth_file(record: CodexOAuthCredentialRecord) -> int:
     try:
         return os.open(record.auth_path, flags)
     except FileNotFoundError:
-        raise CodexOAuthCredentialError(
-            f"Codex OAuth credential '{record.label}' is missing."
+        raise CodexOAuthSnapshotReadError(
+            label=record.label,
+            reason="is missing",
+            observed_at=time.time(),
         ) from None
     except OSError as exc:
         if exc.errno in (errno.ELOOP, errno.EMLINK):
@@ -715,8 +904,10 @@ def _open_private_auth_file(record: CodexOAuthCredentialRecord) -> int:
             reason = "is not readable"
         else:
             reason = "could not be opened"
-        raise CodexOAuthCredentialError(
-            f"Codex OAuth credential '{record.label}' {reason}."
+        raise CodexOAuthSnapshotReadError(
+            label=record.label,
+            reason=reason,
+            observed_at=time.time(),
         ) from None
 
 
@@ -733,16 +924,20 @@ def _read_bounded_bytes(file_descriptor: int, *, label: str) -> bytes:
                 ),
             )
         except OSError:
-            raise CodexOAuthCredentialError(
-                f"Codex OAuth credential '{label}' could not be read."
+            raise CodexOAuthSnapshotReadError(
+                label=label,
+                reason="could not be read",
+                observed_at=time.time(),
             ) from None
         if not chunk:
             break
         chunks.append(chunk)
         bytes_read += len(chunk)
     if bytes_read > CODEX_OAUTH_AUTH_FILE_MAX_BYTES:
-        raise CodexOAuthCredentialError(
-            f"Codex OAuth credential '{label}' is too large."
+        raise CodexOAuthSnapshotReadError(
+            label=label,
+            reason="is too large",
+            observed_at=time.time(),
         )
     return b"".join(chunks)
 
@@ -777,6 +972,13 @@ def _clean_string(value: Any) -> Optional[str]:
     return cleaned or None
 
 
+def _finite_timestamp(value: Any) -> Optional[float]:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    result = float(value)
+    return result if math.isfinite(result) else None
+
+
 __all__ = [
     "CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY",
     "CODEX_OAUTH_ACCOUNT_HASH_LENGTH",
@@ -788,6 +990,7 @@ __all__ = [
     "CodexOAuthCredentialRecord",
     "CodexOAuthCredentialSnapshot",
     "CodexOAuthIdentityMismatchError",
+    "CodexOAuthSnapshotReadError",
     "CodexOAuthInventory",
     "CodexOAuthInventoryError",
     "CodexOAuthRoutingPolicy",
@@ -796,6 +999,8 @@ __all__ = [
     "get_codex_oauth_token_data",
     "get_codex_oauth_token_expiry",
     "load_codex_oauth_credential",
+    "read_codex_oauth_snapshot",
+    "read_codex_oauth_snapshot_sync",
     "load_codex_oauth_inventory",
     "parse_codex_oauth_inventory",
     "validate_codex_oauth_account_identity",

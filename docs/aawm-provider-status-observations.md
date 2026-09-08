@@ -302,12 +302,22 @@ suppress later records, including an otherwise idle `account2`. Refresh and
 health aggregates are `healthy` when every enabled record is usable,
 `degraded` when some are usable, and `terminal` when none are usable. Events
 emit only the configured label and pinned safe hash for account identity.
+Codex passive health and reset-credit authentication use the shared
+`read_codex_oauth_snapshot_sync` source. It validates identity and file policy
+before returning an immutable snapshot with factual expiry, lifetime,
+observation time, and non-secret generation. Its bounded generation-aware cache
+never reuses a read after expiry or a detected file replacement. Provider-status
+rows and observations remain observational.
 When inventory mode is configured, those record paths are the only Codex paths
 used by provider-status refresh, health, and quota work; the generic
 `~/.codex/auth.json` primitive is available only outside inventory mode.
 Refresh scheduler evidence and actual-attempt throttles remain independent for
 each label; one account's due check, failure, or endpoint attempt does not
 consume the other account's timer.
+
+Codex routing and request-time recovery use the same immutable snapshot source
+off the event loop. A forced post-publication reread removes only that record's
+cached snapshot and obeys the same secure-reader policy.
 
 OPENAI-004 request routing consumes the same explicit inventory plus the
 sidecar's fresh per-account provider-exposed scheduled quota observations.
