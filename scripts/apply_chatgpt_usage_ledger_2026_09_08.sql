@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS public.chatgpt_usage_attempts (
     updated_at TIMESTAMPTZ NOT NULL,
     last_seen_at TIMESTAMPTZ NOT NULL,
     superseded_by_attempt_id TEXT,
+    superseded_by_scope_key TEXT,
     PRIMARY KEY (scope_key, attempt_id)
 );
 
@@ -185,6 +186,8 @@ ALTER TABLE public.chatgpt_usage_attempts
     ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
 ALTER TABLE public.chatgpt_usage_attempts
     ADD COLUMN IF NOT EXISTS superseded_by_attempt_id TEXT;
+ALTER TABLE public.chatgpt_usage_attempts
+    ADD COLUMN IF NOT EXISTS superseded_by_scope_key TEXT;
 ALTER TABLE public.chatgpt_usage_attempts
     ADD COLUMN IF NOT EXISTS quarantine_state TEXT NOT NULL DEFAULT 'clear';
 ALTER TABLE public.chatgpt_usage_attempt_revisions

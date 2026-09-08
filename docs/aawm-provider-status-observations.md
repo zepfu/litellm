@@ -1022,17 +1022,25 @@ Identity is tracked through versioned collector-to-scope bindings. A collector
 binding is a generation fence: capture it before network work and pass the
 expected binding to the page transaction; a stale generation is rejected
 instead of silently rebinding the collector, and one page cannot switch scopes
-without an explicit new fence. A verified refinement retires and redirects a
-provisional scope while preserving its attempts and aliases; readers follow
-verified redirects so retained history remains visible under the active
-collector binding. Strong generation, message, and branch aliases take
+without an explicit new fence. Refinement can fill missing identity components
+but cannot drop or change any known provider, user, workspace, quota owner, or
+surface. Compatible refinements retire and redirect prior scopes while
+preserving their attempts and aliases; readers follow those redirects so
+retained history remains visible under the active collector binding. Strong
+generation, message, and branch aliases take
 precedence over weaker request and prompt grouping aliases. Distinct
-generations sharing a weak alias remain separate, while ambiguous alias
+generations sharing a weak alias retain their independent generation aliases;
+only the conflicting weak link is withheld. Ambiguous alias
 matches are retained with explicit quarantine state and a coverage gap.
 Active attempts with stronger identity evidence can retire weaker provisional
-aliases. Duplicate occurrences retain immutable evidence while refreshing
-bounded provenance freshness; stale observations never replace a newer current
-projection, and stale exact attempt replays do not append another revision.
+aliases. Retirement records retain the successor's physical scope and attempt
+ID. Aliasless replays consult that retained proof across compatible scope
+lineage; matching live attempt IDs alone do not establish equivalence.
+Duplicate current fingerprints advance the current projection's observation
+watermark. Differing older evidence remains non-current without advancing that
+watermark; an exact fingerprint/timestamp replay adds no further revision, but
+a fresh recurrence can become current. Quarantined evidence cannot transfer
+aliases or retire other attempts.
 
 The migration bootstrap creates generation 1 only for collectors with no
 existing binding, selecting one deterministic legacy scope per collector. It
@@ -1053,7 +1061,9 @@ to a window by fallback timestamp selection. Unknown and excluded counters keep
 ambiguous or unknown-time activity but omit rows proven outside the window. The
 result also exposes excluded non-Chat/shared activity, unknown
 identity/surface/origin/model classes, uncertain outcomes, and observed model
-mismatches.
+mismatches. A nongeneration record connected to multiple distinct generation
+identities contributes unknown identity, not another definite attempt; the
+known generations remain independently countable.
 
 These tables are independent of `rate_limit_observations`, which remains the
 capacity-only observation store. Source delivery requires separate operational
