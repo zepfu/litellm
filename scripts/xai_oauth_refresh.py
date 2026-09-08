@@ -605,6 +605,7 @@ def inspect_xai_oauth_refresh_eligibility(
     route_safety_buffer_seconds = _resolve_route_safety_buffer_seconds()
     resolution = None
     credential: Optional[MutableMapping[str, Any]] = None
+    credential_generation: Optional[str] = None
     try:
         resolution = resolve_xai_oauth_credentials(
             auth_file,
