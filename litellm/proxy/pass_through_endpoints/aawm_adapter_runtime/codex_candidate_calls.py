@@ -1739,12 +1739,35 @@ def _find_cursor_full_history_retained_state(
     if not states:
         return None
 
-    full_history = _cursor_replay_stock_codex_full_history_input(request_body)
-    if full_history.rejection is not None:
+    input_items = request_body.get("input")
+    if not isinstance(input_items, list):
         raise CursorConnectError(
             "Cursor Agent retained continuation requires valid complete tool history.",
             status_code=409,
         )
+    # Live continuation validates the trusted prefix, not the single-pair
+    # grammar used to authorize a provider-neutral fallback.
+    for item in input_items:
+        item_type = item.get("type") if isinstance(item, Mapping) else None
+        if item_type == "message":
+            validated = _cursor_replay_stock_codex_message_item(
+                item, allow_missing_metadata=True
+            )
+        elif item_type == "function_call":
+            validated = _cursor_replay_stock_codex_function_call_item(
+                item, allow_missing_metadata=True
+            )
+        elif item_type == "function_call_output":
+            validated = _cursor_replay_function_call_output_items(
+                {"input": [item]}, allow_missing_metadata=True
+            )
+        else:
+            validated = None
+        if validated is None or validated.rejection is not None:
+            raise CursorConnectError(
+                "Cursor Agent retained continuation requires valid complete tool history.",
+                status_code=409,
+            )
     messages = _responses_input_to_cursor_messages(request_body)
     if messages and messages[-1].get(_CURSOR_TOOL_CONTINUATION_CUE_MARKER):
         messages.pop()

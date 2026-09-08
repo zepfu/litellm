@@ -180,10 +180,11 @@ the provider-owned session is live. Generic MCP/function calls (operation field
 Run. Passive tool-progress notifications do not authorize another execution.
 For stock full-history requests without `previous_response_id`, lookup requires
 the existing guarded owner identity, unchanged assignment and tools, and exact
-pending call IDs. Only the newly completed outputs are sent back; historical
-outputs are not executed again. A mismatched or ambiguous live session fails
-closed. Missing or expired retained state is request-specific and does not cool
-unrelated Cursor sessions.
+pending call IDs. The trusted history prefix may contain earlier completed
+call/result pairs; only the newly completed pending outputs are sent back.
+Historical outputs are not executed again. A mismatched or ambiguous live
+session fails closed. Missing or expired retained state is request-specific and
+does not cool unrelated Cursor sessions.
 
 LiteLLM only permits provider-neutral
 fallback after reconstructing a complete, replay-safe request with the
