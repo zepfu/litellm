@@ -1436,6 +1436,116 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             "reason": "awaiting_terminal_validation",
         }
 
+    async def _close_peeked_stream(peeked_response: Any) -> None:
+        iterator = getattr(peeked_response, "body_iterator", None)
+        close = getattr(iterator, "aclose", None)
+        if callable(close):
+            try:
+                result = close()
+                if getattr(result, "__await__", None) is not None:
+                    await result
+                return
+            except BaseException:
+                verbose_proxy_logger.debug(
+                    "Failed to close marked Responses stream after bounded rejection",
+                    exc_info=True,
+                )
+        cleanup = getattr(peeked_response, _STREAM_CLEANUP_ATTR, None)
+        if callable(cleanup):
+            try:
+                result = cleanup()
+                if getattr(result, "__await__", None) is not None:
+                    await result
+            except BaseException:
+                verbose_proxy_logger.debug(
+                    "Failed to close marked Responses stream cleanup",
+                    exc_info=True,
+                )
+
+    async def _collect_pending_grok_marker_stream(peek: Any) -> Any:
+        if adapter not in {
+            "codex_auto_agent_grok_native_responses",
+            "codex_auto_agent_xai_oauth_responses",
+        } or peek.exhausted:
+            return peek
+
+        from litellm.proxy.pass_through_endpoints.providers.grok.direct_responses_validation import (
+            _buffered_sse_has_literal_tool_label_marker,
+            _extend_marked_stream_until_exhausted_or_ceiling,
+            _streaming_response_from_chunks,
+        )
+
+        if not _buffered_sse_has_literal_tool_label_marker(peek.buffered_chunks):
+            return peek
+
+        try:
+            collected_chunks = await _extend_marked_stream_until_exhausted_or_ceiling(
+                peek,
+                max_chunks=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS,  # noqa: F821
+                max_bytes=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES,  # noqa: F821
+            )
+        except BaseException:
+            await _close_peeked_stream(peek.response)
+            raise
+
+        if collected_chunks is None:
+            await _close_peeked_stream(peek.response)
+            _raise_codex_auto_agent_malformed_tool_call_text_payload(
+                response_body={
+                    "status": "incomplete",
+                    "model": adapter_model,
+                    "output": [],
+                },
+                adapter_model=adapter_model,
+                adapter=adapter,
+                adapter_label=adapter_label,
+                intake_context=intake_context,
+            )
+            raise AssertionError("unreachable")
+
+        replay = _streaming_response_from_chunks(
+            collected_chunks,
+            response=peek.response,
+        )
+
+        # The collected chunks have already passed through any live output
+        # guard on the peeked continuation. Mark the replay as guarded so the
+        # inheritance helper does not process the same bytes a second time.
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.repetitive_output import (
+            OUTPUT_GUARD_CONTEXT_ATTR,
+            WRAPPED_STREAM_ATTR,
+        )
+
+        context = getattr(peek.response, OUTPUT_GUARD_CONTEXT_ATTR, None)
+        if context is not None:
+            setattr(replay, OUTPUT_GUARD_CONTEXT_ATTR, context)
+        if getattr(peek.response, WRAPPED_STREAM_ATTR, False) or getattr(
+            getattr(peek.response, "body_iterator", None),
+            WRAPPED_STREAM_ATTR,
+            False,
+        ):
+            setattr(replay, WRAPPED_STREAM_ATTR, True)
+            setattr(replay.body_iterator, WRAPPED_STREAM_ATTR, True)
+
+        replay = inherit_or_wrap_passthrough_streaming_response(
+            replay,
+            source_response=response,
+        )
+        buffered_bytes = sum(
+            (
+                len(chunk)
+                if isinstance(chunk, (bytes, bytearray))
+                else len(str(chunk).encode("utf-8", errors="replace"))
+            )
+            for chunk in collected_chunks
+        )
+        return type(peek)(
+            response=replay,
+            buffered_chunks=collected_chunks,
+            buffered_bytes=buffered_bytes,
+            stop_reason="stream_exhausted",
+        )
+
     def _bind_incremental_stream_validation(  # noqa: PLR0915
         target: StreamingResponse,
         state: dict[str, Any],
@@ -1813,6 +1923,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 response
             ),
         )
+        peek = await _collect_pending_grok_marker_stream(peek)
         if not peek.exhausted:
             correlation = intake_context or {}
             model_alias = correlation.get("model_alias")

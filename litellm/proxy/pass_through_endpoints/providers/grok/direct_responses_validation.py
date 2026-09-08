@@ -306,17 +306,36 @@ def _copy_headers_without_content_length(headers: Any) -> dict[str, Any]:
     return copied
 
 
+class _ReplayAsyncIterator:
+    """Replay buffered chunks while allowing stream metadata to be attached."""
+
+    def __init__(self, chunks: list[Any]) -> None:
+        self._chunks = iter(chunks)
+        self._closed = False
+
+    def __aiter__(self) -> "_ReplayAsyncIterator":
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            return next(self._chunks)
+        except StopIteration:
+            self._closed = True
+            raise StopAsyncIteration from None
+
+    async def aclose(self) -> None:
+        self._closed = True
+
+
 def _streaming_response_from_chunks(
     chunks: list[Any],
     *,
     response: StreamingResponse,
 ) -> StreamingResponse:
-    async def _replay() -> Any:
-        for chunk in chunks:
-            yield chunk
-
     return StreamingResponse(
-        _replay(),
+        _ReplayAsyncIterator(chunks),
         headers=_copy_headers_without_content_length(response.headers),
         status_code=response.status_code,
         media_type=response.media_type or "text/event-stream",

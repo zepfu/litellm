@@ -20,6 +20,12 @@ from dataclasses import dataclass
 from types import FunctionType
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
+from litellm.llms.xai.route_descriptors import (
+    GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+    GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+    XAI_OAUTH_CREDENTIAL_FAMILY,
+    XAI_OAUTH_ROUTE_FAMILY,
+)
 from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
     load_text_watermark_config,
 )
@@ -1040,6 +1046,7 @@ def _maybe_wrap_xai_passthrough_responses_stream(
     request_body: dict[str, Any],
     route_family: str,
     resolved_model: Any = None,
+    egress_credential_family: str = XAI_OAUTH_CREDENTIAL_FAMILY,
 ) -> Response:
     """Live-forward CFG-025 wrap for xAI alias Responses SSE."""
     from fastapi.responses import StreamingResponse
@@ -1057,7 +1064,7 @@ def _maybe_wrap_xai_passthrough_responses_stream(
         ingress_path=str(getattr(getattr(request, "url", None), "path", "") or ""),
         method=str(getattr(request, "method", None) or "POST"),
         custom_llm_provider=litellm.LlmProviders.XAI.value,
-        egress_credential_family="xai",
+        egress_credential_family=egress_credential_family,
         route_family=route_family,
         resolved_model=resolved_model,
         request_body=request_body,
@@ -4926,8 +4933,8 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
             stream=bool(grok_prepared_body.get("stream")),
             custom_body=grok_prepared_body,
             custom_llm_provider=litellm.LlmProviders.XAI.value,
-            egress_credential_family="xai",
-            expected_target_family="xai",
+            egress_credential_family=GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+            expected_target_family=GROK_NATIVE_OAUTH_ROUTE_FAMILY,
             retryable_upstream_status_codes=[
                 429,
                 *_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES,
@@ -4971,6 +4978,7 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
         request_body=canonical_request_body,
         route_family="codex_auto_agent_grok_native_responses",
         resolved_model=grok_prepared_body.get("model") or request_body.get("model"),
+        egress_credential_family=GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
     )
     validated_response = await _validate_codex_auto_agent_responses_payload(
         response,
@@ -5044,8 +5052,8 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             stream=bool(oa_xai_prepared_body.get("stream")),
             custom_body=oa_xai_prepared_body,
             custom_llm_provider=litellm.LlmProviders.XAI.value,
-            egress_credential_family="xai",
-            expected_target_family="xai",
+            egress_credential_family=XAI_OAUTH_CREDENTIAL_FAMILY,
+            expected_target_family=XAI_OAUTH_ROUTE_FAMILY,
             managed_xai_oauth_request=True,
             blocked_pass_through_prefixed_headers=[
                 "authorization",
@@ -5098,6 +5106,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         route_family="codex_auto_agent_xai_oauth_responses",
         resolved_model=oa_xai_prepared_body.get("model")
         or canonical_request_body.get("model"),
+        egress_credential_family=XAI_OAUTH_CREDENTIAL_FAMILY,
     )
     validated_response = await _validate_codex_auto_agent_responses_payload(
         response,

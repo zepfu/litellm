@@ -5,12 +5,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Literal, Mapping, Optional
+from urllib.parse import urlsplit
+
+import httpx
 
 XAIRouteFamily = Literal["xai_oauth_api", "grok_cli_chat_proxy"]
 XAICredentialFamily = Literal["xai_oauth", "xai_grok_oidc"]
 XAIAuthMode = Literal["oauth", "grok_oidc"]
 
 OA_XAI_PROVIDER_PREFIX = "oa_xai/"
+XAI_OAUTH_API_HOST = "api.x.ai"
+GROK_CLI_CHAT_PROXY_HOST = "cli-chat-proxy.grok.com"
+XAI_OAUTH_API_BASE_PATHS = frozenset({"", "/", "/v1"})
+XAI_OAUTH_API_ALLOWED_PATHS = frozenset(
+    {
+        "/v1/chat/completions",
+        "/v1/responses",
+    }
+)
 XAI_OAUTH_ROUTE_FAMILY: XAIRouteFamily = "xai_oauth_api"
 XAI_OAUTH_CREDENTIAL_FAMILY: XAICredentialFamily = "xai_oauth"
 GROK_NATIVE_OAUTH_ROUTE_FAMILY: XAIRouteFamily = "grok_cli_chat_proxy"
@@ -30,6 +42,90 @@ class XAIRouteDescriptor:
     credential_family: XAICredentialFamily
     auth_mode: XAIAuthMode
     capabilities: frozenset[str] = frozenset()
+
+
+def _parse_xai_oauth_url(url: Any, *, label: str) -> Any:
+    if isinstance(url, httpx.URL):
+        raw_url = str(url)
+    elif isinstance(url, str):
+        raw_url = url.strip()
+    else:
+        raw_url = ""
+    if not raw_url:
+        raise ValueError(f"{label} must be a non-empty URL.")
+
+    parsed = urlsplit(raw_url)
+    if parsed.scheme.lower() != "https":
+        raise ValueError(f"{label} must use HTTPS.")
+    if (parsed.hostname or "").lower() != XAI_OAUTH_API_HOST:
+        raise ValueError(f"{label} must target {XAI_OAUTH_API_HOST}.")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(f"{label} must not include URL credentials.")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"{label} has an invalid port.") from exc
+    if port not in (None, 443):
+        raise ValueError(f"{label} must use the default HTTPS port.")
+    if parsed.fragment:
+        raise ValueError(f"{label} must not include a URL fragment.")
+    return parsed
+
+
+def validate_xai_oauth_api_base(url: Any) -> None:
+    """Fail closed unless a managed xAI API base is the approved host/path."""
+
+    parsed = _parse_xai_oauth_url(url, label="xAI OAuth API base")
+    normalized_path = parsed.path.rstrip("/") or "/"
+    normalized_base_paths = {
+        path.rstrip("/") or "/" for path in XAI_OAUTH_API_BASE_PATHS
+    }
+    if normalized_path not in normalized_base_paths:
+        raise ValueError(
+            "xAI OAuth API base must use the root or /v1 API path."
+        )
+    if parsed.query:
+        raise ValueError("xAI OAuth API base must not include query parameters.")
+
+
+def validate_xai_oauth_api_target(url: Any) -> None:
+    """Fail closed unless a managed xAI request uses an approved API path."""
+
+    parsed = _parse_xai_oauth_url(url, label="xAI OAuth API target")
+    normalized_path = parsed.path.rstrip("/") or "/"
+    normalized_target_paths = {
+        path.rstrip("/") or "/" for path in XAI_OAUTH_API_ALLOWED_PATHS
+    }
+    if normalized_path not in normalized_target_paths:
+        raise ValueError(
+            "xAI OAuth API target must use /v1/responses or "
+            "/v1/chat/completions."
+        )
+    if parsed.query:
+        raise ValueError("xAI OAuth API target must not include query parameters.")
+
+
+def get_xai_target_route_family(url: Any) -> Optional[XAIRouteFamily]:
+    """Resolve only canonical xAI targets; leave configured proxies generic."""
+
+    if isinstance(url, httpx.URL):
+        raw_url = str(url)
+    elif isinstance(url, str):
+        raw_url = url.strip()
+    else:
+        raw_url = ""
+    if not raw_url:
+        return None
+
+    try:
+        hostname = (urlsplit(raw_url).hostname or "").casefold()
+    except ValueError:
+        return None
+    if hostname == XAI_OAUTH_API_HOST:
+        return XAI_OAUTH_ROUTE_FAMILY
+    if hostname == GROK_CLI_CHAT_PROXY_HOST or hostname.endswith(".grok.com"):
+        return GROK_NATIVE_OAUTH_ROUTE_FAMILY
+    return None
 
 
 def _managed_descriptor(
