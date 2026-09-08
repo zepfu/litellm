@@ -2081,7 +2081,7 @@ def _normalize_named_collection(
                     key, value = next(iter(item.items()))
                     normalized_key = _normalize_key(key)
                     if normalized_key in {
-                        "_identity",
+                        _normalize_key("_identity"),
                         *(_normalize_key(field) for field in _IDENTITY_FIELD_NAMES),
                     }:
                         entries.append(item)
