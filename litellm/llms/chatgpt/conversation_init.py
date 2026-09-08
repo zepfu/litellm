@@ -1794,10 +1794,7 @@ def _parse_limits_progress(
     if "limits_progress" not in payload:
         return [], [], "absent_unknown", 0
     raw = payload.get("limits_progress")
-    entries, malformed = _normalize_named_collection(
-        raw,
-        identity_field="feature",
-    )
+    entries, malformed = _normalize_named_collection(raw)
     if isinstance(raw, list) and not raw:
         return [], [], "empty_unknown", malformed
     if isinstance(raw, Mapping) and not raw:
@@ -1837,10 +1834,7 @@ def _parse_model_limits(
     if "model_limits" not in payload:
         return [], [], "absent_unknown", 0
     raw = payload.get("model_limits")
-    entries, malformed = _normalize_named_collection(
-        raw,
-        identity_field="model",
-    )
+    entries, malformed = _normalize_named_collection(raw)
     if isinstance(raw, list) and not raw:
         return [], [], "empty_unknown", malformed
     if isinstance(raw, Mapping) and not raw:
@@ -2066,8 +2060,6 @@ def _entry_has_malformed_usage_fields(entry: Mapping[str, Any]) -> bool:
 
 def _normalize_named_collection(
     raw: Any,
-    *,
-    identity_field: Optional[str] = None,
 ) -> Tuple[List[Mapping[str, Any]], int]:
     malformed = 0
     entries: List[Mapping[str, Any]] = []
@@ -2088,10 +2080,10 @@ def _normalize_named_collection(
                 if len(item) == 1 and _entry_identity(item) is None:
                     key, value = next(iter(item.items()))
                     normalized_key = _normalize_key(key)
-                    if (
-                        identity_field is not None
-                        and normalized_key == _normalize_key(identity_field)
-                    ):
+                    if normalized_key in {
+                        "_identity",
+                        *(_normalize_key(field) for field in _IDENTITY_FIELD_NAMES),
+                    }:
                         entries.append(item)
                         continue
                     if _is_usage_number_field_name(normalized_key) or any(

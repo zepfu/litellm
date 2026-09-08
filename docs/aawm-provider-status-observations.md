@@ -875,7 +875,7 @@ When a bound capture cannot write a current snapshot,
 fixed sanitized values:
 `invalid_expected_account_hash`, `browser_boundary_unavailable`,
 `malformed_browser_response`, `browser_challenge`, `http_auth`,
-`http_error`, `native_identity_unverified`, `native_capture_error`,
+`http_error`, `http_http_error`, `native_identity_unverified`, `native_capture_error`,
 `native_capture_incomplete`,
 `native_capture_invalid_account_hash`,
 `native_capture_invalid_identity_source`,
