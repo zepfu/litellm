@@ -1745,6 +1745,7 @@ class OAuthRefreshScheduleState:
     credential_health: Optional[str] = None
     usable: Optional[bool] = None
     credential_identity: Optional[str] = None
+    credential_generation: Optional[str] = None
     actual_attempt_count: int = 0
     terminal_refresh_error_class: Optional[str] = None
     terminal_refresh_identity: Optional[str] = None
@@ -4576,6 +4577,7 @@ def _oauth_refresh_observation_metadata(event: Mapping[str, Any]) -> Dict[str, A
         "refresh_buffer_seconds",
         "refresh_threshold_seconds",
         "credential_identity",
+        "credential_generation",
         "structurally_valid",
         "access_available",
         "refresh_possible",
@@ -4714,14 +4716,15 @@ def _project_xai_oauth_passive_health_event(
     """Keep passive xAI usability separate from refresh-outcome authority."""
     passive_summary = dict(summary)
     scheduled_identity = schedule.credential_identity
-    initial_identity = _oauth_refresh_identity(passive_summary)
+    scheduled_generation = schedule.credential_generation
+    initial_generation = _oauth_refresh_generation(passive_summary)
     reinspection_performed = False
     stale_snapshot_rejected = False
 
     if (
-        scheduled_identity is not None
-        and initial_identity is not None
-        and initial_identity != scheduled_identity
+        scheduled_generation is not None
+        and initial_generation is not None
+        and initial_generation != scheduled_generation
     ):
         reinspection_performed = True
         try:
@@ -4735,19 +4738,25 @@ def _project_xai_oauth_passive_health_event(
                 "error_message": "xAI OAuth passive health reinspection failed.",
             }
         stale_snapshot_rejected = (
-            _oauth_refresh_identity(passive_summary) != initial_identity
+            _oauth_refresh_generation(passive_summary) != initial_generation
         )
 
     passive_identity = _oauth_refresh_identity(passive_summary)
+    passive_generation = _oauth_refresh_generation(passive_summary)
     passive_health = _xai_passive_health_status(passive_summary)
     passive_usable = bool(passive_summary.get("usable"))
     had_authoritative_failure = _xai_refresh_failure_remains_authoritative(schedule)
     confirmed_new_usable_generation = bool(
         reinspection_performed
-        and scheduled_identity is not None
-        and passive_identity is not None
-        and passive_identity != scheduled_identity
+        and scheduled_generation is not None
+        and passive_generation is not None
+        and passive_generation != scheduled_generation
         and passive_usable
+        and (
+            scheduled_identity is not None
+            and passive_identity is not None
+            and passive_identity == scheduled_identity
+        )
     )
 
     event = dict(passive_summary)
@@ -4756,6 +4765,7 @@ def _project_xai_oauth_passive_health_event(
             "passive_credential_health": passive_health,
             "passive_usable": passive_usable,
             "passive_credential_identity": passive_identity,
+            "passive_credential_generation": passive_generation,
             "passive_error_class": _redacted_summary_field(
                 passive_summary.get("error_class")
             ),
@@ -4774,7 +4784,8 @@ def _project_xai_oauth_passive_health_event(
         schedule.last_error_message = None
         schedule.terminal_refresh_error_class = None
         schedule.terminal_refresh_identity = None
-        schedule.credential_identity = passive_identity
+        schedule.credential_identity = passive_identity or schedule.credential_identity
+        schedule.credential_generation = passive_generation
         schedule.credential_health = passive_health
         schedule.usable = passive_usable
         event["scheduler_generation_replaced"] = True
@@ -4795,9 +4806,10 @@ def _project_xai_oauth_passive_health_event(
                 "health_status": scheduler_health,
                 "credential_health": scheduler_health,
                 "usable": schedule.usable,
-                "credential_identity": schedule.credential_identity,
                 "error_class": schedule.last_error_class,
                 "error_message": schedule.last_error_message,
+                "credential_identity": schedule.credential_identity or passive_identity,
+                "credential_generation": schedule.credential_generation,
                 "refresh_result_class": schedule.last_result_class
                 or "refresh_failed",
                 "scheduler_error_class": schedule.last_error_class,
@@ -4807,7 +4819,10 @@ def _project_xai_oauth_passive_health_event(
                     schedule.terminal_refresh_error_class
                     and schedule.terminal_refresh_identity
                     and schedule.terminal_refresh_identity
-                    == schedule.credential_identity
+                    == (
+                        schedule.credential_generation
+                        or schedule.credential_identity
+                    )
                 ),
                 "terminal_refresh_error_class": (
                     schedule.terminal_refresh_error_class
@@ -4851,6 +4866,9 @@ def _build_xai_oauth_passive_auth_observation(
             "passive_usable": event.get("passive_usable"),
             "passive_credential_identity": _redacted_summary_field(
                 event.get("passive_credential_identity")
+            ),
+            "passive_credential_generation": _redacted_summary_field(
+                event.get("passive_credential_generation")
             ),
             "passive_error_class": _redacted_summary_field(
                 event.get("passive_error_class")
@@ -12907,6 +12925,10 @@ def _merge_oauth_refresh_eligibility(
         "credential_identity"
     ) not in {None, ""}:
         merged["credential_identity"] = pre.get("credential_identity")
+    if merged.get("credential_generation") in {None, ""} and pre.get(
+        "credential_generation"
+    ) not in {None, ""}:
+        merged["credential_generation"] = pre.get("credential_generation")
     effective_threshold_seconds = post.get("refresh_threshold_seconds")
     if effective_threshold_seconds is None:
         effective_threshold_seconds = pre.get("refresh_threshold_seconds")
@@ -12966,6 +12988,7 @@ def _merge_oauth_refresh_eligibility(
             "credential_health",
             "refresh_threshold_seconds",
             "credential_identity",
+            "credential_generation",
         ):
             if pre.get(key) is not None:
                 merged[key] = pre[key]
@@ -12984,19 +13007,16 @@ def _oauth_refresh_result_class(
     prior_result_class: Optional[str],
     preserve_failure_when_not_due: bool = False,
 ) -> str:
+    if preserve_failure_when_not_due:
+        if operation_error_class:
+            return "refresh_failed"
+        if actual_attempt_count == 0 and prior_result_class == "refresh_failed":
+            return "refresh_failed"
     expires_at = _parse_sidecar_timestamp(eligibility.get("expires_at"))
     if expires_at is not None and expires_at <= wall_now:
         return "expired"
-    if operation_error_class and preserve_failure_when_not_due:
-        return "refresh_failed"
     eligible = bool(eligibility.get("eligible")) or not eligibility.get("expires_at")
     if not eligible:
-        if (
-            preserve_failure_when_not_due
-            and actual_attempt_count == 0
-            and prior_result_class == "refresh_failed"
-        ):
-            return "refresh_failed"
         return "refresh_not_due"
     if operation_error_class:
         return "refresh_failed"
@@ -13056,6 +13076,7 @@ def _oauth_refresh_schedule_evidence(
     credential_health: Optional[str] = None,
     terminal_refresh_blocked: bool = False,
     resolved_credential_identity: Optional[str] = None,
+    resolved_credential_generation: Optional[str] = None,
 ) -> Dict[str, Any]:
     effective_threshold_seconds = final.get("refresh_threshold_seconds")
     if effective_threshold_seconds is None:
@@ -13084,6 +13105,10 @@ def _oauth_refresh_schedule_evidence(
         or final.get("credential_identity")
         or pre.get("credential_identity")
         or schedule.credential_identity,
+        "credential_generation": resolved_credential_generation
+        or final.get("credential_generation")
+        or pre.get("credential_generation")
+        or schedule.credential_generation,
         "structurally_valid": final.get("structurally_valid")
         if final.get("structurally_valid") is not None
         else pre.get("structurally_valid"),
@@ -13161,6 +13186,21 @@ def _oauth_refresh_identity(eligibility: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def _oauth_refresh_generation(eligibility: Mapping[str, Any]) -> Optional[str]:
+    generation = eligibility.get("credential_generation")
+    if isinstance(generation, str) and generation.strip():
+        return generation.strip()
+    return None
+
+
+def _oauth_refresh_generation_key(
+    eligibility: Mapping[str, Any],
+) -> Optional[str]:
+    return _oauth_refresh_generation(eligibility) or _oauth_refresh_identity(
+        eligibility
+    )
+
+
 def _oauth_refresh_failure_remains_authoritative(
     schedule: OAuthRefreshScheduleState,
 ) -> bool:
@@ -13176,11 +13216,15 @@ def _clear_oauth_refresh_failure_on_usable_identity_change(
     eligibility: Mapping[str, Any],
 ) -> bool:
     candidate_identity = _oauth_refresh_identity(eligibility)
+    candidate_generation = _oauth_refresh_generation(eligibility)
     if (
         not _oauth_refresh_failure_remains_authoritative(schedule)
         or schedule.credential_identity is None
         or candidate_identity is None
-        or candidate_identity == schedule.credential_identity
+        or candidate_identity != schedule.credential_identity
+        or schedule.credential_generation is None
+        or candidate_generation is None
+        or candidate_generation == schedule.credential_generation
         or not eligibility.get("usable")
     ):
         return False
@@ -13189,7 +13233,8 @@ def _clear_oauth_refresh_failure_on_usable_identity_change(
     schedule.last_error_message = None
     schedule.terminal_refresh_error_class = None
     schedule.terminal_refresh_identity = None
-    schedule.credential_identity = candidate_identity
+    schedule.credential_identity = candidate_identity or schedule.credential_identity
+    schedule.credential_generation = candidate_generation
     schedule.credential_health = _redacted_summary_field(
         eligibility.get("credential_health")
     )
@@ -13206,8 +13251,8 @@ def _oauth_refresh_terminal_blocked(
         or schedule.terminal_refresh_identity is None
     ):
         return False
-    current_identity = _oauth_refresh_identity(eligibility)
-    return current_identity == schedule.terminal_refresh_identity
+    current_generation_key = _oauth_refresh_generation_key(eligibility)
+    return current_generation_key == schedule.terminal_refresh_identity
 
 
 def _record_oauth_refresh_schedule_outcome(
@@ -13218,7 +13263,7 @@ def _record_oauth_refresh_schedule_outcome(
     operation_summary: Mapping[str, Any],
     should_call: bool,
     terminal_blocked: bool,
-    current_identity: Optional[str],
+    current_generation_key: Optional[str],
     actual_attempt_count: int,
     wall_now: datetime,
     pre_result_class: str,
@@ -13232,7 +13277,7 @@ def _record_oauth_refresh_schedule_outcome(
     operation_error_class = _redacted_summary_field(
         operation_summary.get("error_class")
     )
-    operation_identity = _oauth_refresh_identity(operation_summary)
+    operation_generation = _oauth_refresh_generation(operation_summary)
     if (
         clear_failure_on_usable_identity_change
         and not operation_error_class
@@ -13265,26 +13310,30 @@ def _record_oauth_refresh_schedule_outcome(
     schedule.next_refresh_check_at = final.get("next_refresh_check_at")
     schedule.expires_at = final.get("expires_at")
     schedule.last_result_class = result_class
-    if (
-        preserve_failure_when_not_due
-        and operation_error_class
-        and operation_identity is not None
-    ):
-        recorded_identity = operation_identity
+    if preserve_failure_when_not_due and operation_error_class:
+        recorded_generation = (
+            operation_generation
+            or _oauth_refresh_generation(pre)
+            or _oauth_refresh_generation(final)
+            or schedule.credential_generation
+        )
     elif (
         prior_failure_active
         and result_class == "refresh_failed"
         and actual_attempt_count == 0
     ):
-        recorded_identity = (
-            schedule.credential_identity
-            or _oauth_refresh_identity(final)
-            or _oauth_refresh_identity(pre)
+        recorded_generation = (
+            schedule.credential_generation
+            or _oauth_refresh_generation(final)
+            or _oauth_refresh_generation(pre)
         )
     else:
-        recorded_identity = _oauth_refresh_identity(final) or _oauth_refresh_identity(
-            pre
-        )
+        recorded_generation = _oauth_refresh_generation(
+            final
+        ) or _oauth_refresh_generation(pre)
+    if recorded_generation is not None:
+        schedule.credential_generation = recorded_generation
+    recorded_identity = _oauth_refresh_identity(final) or _oauth_refresh_identity(pre)
     if recorded_identity is not None:
         schedule.credential_identity = recorded_identity
     if operation_error_class:
@@ -13295,14 +13344,24 @@ def _record_oauth_refresh_schedule_outcome(
         terminal_error = _oauth_terminal_refresh_error_class(operation_error_class)
         if preserve_failure_when_not_due:
             stored_identity = (
-                operation_identity or recorded_identity or current_identity
+                operation_generation
+                or recorded_generation
+                or current_generation_key
             )
         else:
-            stored_identity = current_identity or _oauth_refresh_identity(final)
+            stored_identity = current_generation_key or recorded_generation
         if terminal_error and stored_identity is not None:
             schedule.terminal_refresh_error_class = terminal_error
             schedule.terminal_refresh_identity = stored_identity
-    elif result_class != "refresh_failed" and not terminal_blocked:
+    elif (
+        result_class != "refresh_failed"
+        and not terminal_blocked
+        and not (
+            preserve_failure_when_not_due
+            and prior_failure_active
+            and actual_attempt_count == 0
+        )
+    ):
         schedule.last_error_class = None
         schedule.last_error_message = None
     if should_call and operation_summary.get("refreshed"):
@@ -13325,6 +13384,11 @@ def _record_oauth_refresh_schedule_outcome(
         terminal_refresh_blocked=terminal_blocked,
         resolved_credential_identity=(
             schedule.credential_identity
+            if preserve_failure_when_not_due
+            else None
+        ),
+        resolved_credential_generation=(
+            schedule.credential_generation
             if preserve_failure_when_not_due
             else None
         ),
@@ -13363,7 +13427,7 @@ def _run_oauth_refresh_schedule(
         inspector_kwargs=eligibility_inspector_kwargs,
         fallback_poll_interval_seconds=eligibility_cadence_seconds,
     )
-    current_identity = _oauth_refresh_identity(pre)
+    current_generation_key = _oauth_refresh_generation_key(pre)
     if clear_failure_on_usable_identity_change:
         _clear_oauth_refresh_failure_on_usable_identity_change(schedule, pre)
     prior_failure_active = (
@@ -13398,9 +13462,9 @@ def _run_oauth_refresh_schedule(
         attempt_interval_seconds=effective_attempt_interval_seconds,
     )
     if (
-        current_identity is not None
+        current_generation_key is not None
         and schedule.terminal_refresh_identity is not None
-        and current_identity != schedule.terminal_refresh_identity
+        and current_generation_key != schedule.terminal_refresh_identity
     ):
         if (
             not clear_failure_on_usable_identity_change
@@ -13462,7 +13526,7 @@ def _run_oauth_refresh_schedule(
         operation_summary=operation_summary,
         should_call=should_call,
         terminal_blocked=terminal_blocked,
-        current_identity=current_identity,
+        current_generation_key=current_generation_key,
         actual_attempt_count=actual_attempt_count,
         wall_now=wall_now,
         pre_result_class=pre_result_class,

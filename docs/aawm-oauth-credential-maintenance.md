@@ -122,20 +122,22 @@ enable routing or transport by itself.
 Managed xAI refresh reports only sanitized, stable error classes. The only
 terminal classes are the exact JSON `error` values `invalid_grant` and
 `refresh_token_reused` from an HTTP `400` token-endpoint response. They suppress
-another token-endpoint attempt only while the nonsecret `credential_identity`
-remains the same. Transport failures, timeouts, DNS failures, retryable HTTP
-statuses, other HTTP failures, malformed responses, and local refresh failures
-remain bounded and retryable. Provider response bodies and descriptions are not
-retained in refresh summaries or observations.
+another token-endpoint attempt only while the stable file/scope
+`credential_identity` remains the same and the nonsecret
+`credential_generation` remains unchanged. Transport failures, timeouts, DNS
+failures, retryable HTTP statuses, other HTTP failures, malformed responses,
+and local refresh failures remain bounded and retryable. Provider response
+bodies and descriptions are not retained in refresh summaries or observations.
 
 A failed managed xAI refresh remains authoritative through later not-due
 scheduler cycles and a passive local-file inspection of that same credential
 generation. The passive inspection records local usability separately and
 cannot manufacture a refresh or token-endpoint success timestamp. If it
-observes a different identity, the sidecar reinspects the local file once before
-using that result. Only a successful actual refresh or a confirmed different
-usable generation clears failed-refresh state and terminal suppression; an
-unusable or stale passive snapshot does not.
+observes a different `credential_generation`, the sidecar reinspects the local
+file once before using that result. It only accepts the replacement when the
+stable `credential_identity` still matches. Only a successful actual refresh or
+a confirmed different usable generation clears failed-refresh state and
+terminal suppression; an unusable or stale passive snapshot does not.
 
 ## Portable default paths
 
@@ -183,9 +185,11 @@ Managed xAI request and sidecar consumers share one file/scope resolver. Every
 supplied auth-file and scope value must agree before precedence selects a
 source. The nonsecret `credential_identity` is derived only from the canonical
 auth-file target and exact scope, so it remains stable when the token record is
-rotated and does not disclose raw paths, tokens, or file metadata. A
-configuration conflict has no selected identity and fails before credential or
-provider I/O.
+rotated and does not disclose raw paths, tokens, or file metadata.
+`credential_generation` is a separate nonsecret digest of the published file
+generation and safe lifecycle metadata; it changes when the managed credential
+record is replaced. A configuration conflict has no selected identity and
+fails before credential or provider I/O.
 
 ### Managed xAI lifecycle states
 

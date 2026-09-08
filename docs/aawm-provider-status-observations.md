@@ -118,10 +118,11 @@ Relevant environment variables:
 For managed xAI OAuth, passive inspection is explicitly not a refresh-success
 signal. It records local-file health and usability in separate metadata and
 never sets `last_success_at`. When a scheduled refresh failure belongs to the
-same nonsecret `credential_identity`, the passive row retains degraded
-refresh-state and sanitized scheduler error evidence even if the old access
-credential is locally usable. A differing passive identity is reread once to
-reject a stale snapshot. Only a successful actual refresh or a confirmed
+same stable `credential_identity` and `credential_generation`, the passive row
+retains degraded refresh-state and sanitized scheduler error evidence even if
+the old access credential is locally usable. A differing generation is reread
+once to reject a stale snapshot, and the replacement is accepted only when its
+stable identity still matches. Only a successful actual refresh or a confirmed
 different usable generation clears the failed state and either exact terminal
 suppression class, `invalid_grant` or `refresh_token_reused`. A failed refresh
 also remains authoritative through later not-due scheduler cycles that make no
@@ -566,8 +567,10 @@ read-only file/scope resolver. It checks every supplied path and scope value for
 agreement before selecting the documented precedence winner. A resolved
 `credential_identity` is a nonsecret hash of the canonical auth-file target and
 exact scope only; it is stable across token rotation and does not contain raw
-paths, credential fields, or filesystem metadata. Configuration conflicts return
-sanitized errors without selecting an identity or contacting the provider.
+paths, credential fields, or filesystem metadata. The separate nonsecret
+`credential_generation` digest includes only published file metadata and safe
+lifecycle fields, never token values. Configuration conflicts return sanitized
+errors without selecting an identity or contacting the provider.
 
 Combined credential/process health requires **both** credential records to have:
 
