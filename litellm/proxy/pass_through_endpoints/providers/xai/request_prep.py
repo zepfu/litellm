@@ -65,6 +65,10 @@ _grok_native_client_version_cache: dict[
     _GrokNativeClientVersionSnapshot,
 ] = {}
 _grok_native_client_version_locks: dict[str, asyncio.Lock] = {}
+_grok_native_client_version_flights: dict[
+    str,
+    "asyncio.Task[_GrokNativeClientVersionSnapshot]",
+] = {}
 _GROK_NATIVE_CLIENT_VERSION_READ_ATTEMPTS = 3
 
 
@@ -821,29 +825,58 @@ async def _get_grok_native_oauth_client_version_async() -> str:
         asyncio.Lock(),
     )
     async with lock:
-        observed = await asyncio.to_thread(
-            _stat_grok_native_client_version_file,
-            cache_path,
-        )
-        generation = _grok_native_version_stat_fingerprint(observed)
-        cached = _grok_native_client_version_cache.get(cache_path)
-        if (
-            cached is not None
-            and cached.generation == generation
-            and _grok_native_client_version_snapshot_is_fresh(cached)
-        ):
-            return cached.version
-        _grok_native_client_version_cache.pop(cache_path, None)
-        try:
-            snapshot = await asyncio.to_thread(
-                _resolve_grok_native_client_version_snapshot_sync,
+        flight = _grok_native_client_version_flights.get(cache_path)
+        if flight is None:
+            observed = await asyncio.to_thread(
+                _stat_grok_native_client_version_file,
                 cache_path,
             )
-        except Exception:
+            generation = _grok_native_version_stat_fingerprint(observed)
+            cached = _grok_native_client_version_cache.get(cache_path)
+            if (
+                cached is not None
+                and cached.generation == generation
+                and _grok_native_client_version_snapshot_is_fresh(cached)
+            ):
+                return cached.version
             _grok_native_client_version_cache.pop(cache_path, None)
-            raise
-        _grok_native_client_version_cache[cache_path] = snapshot
-        return snapshot.version
+            flight = asyncio.create_task(
+                _run_grok_native_client_version_flight(cache_path)
+            )
+            _grok_native_client_version_flights[cache_path] = flight
+            flight.add_done_callback(
+                lambda completed: _finish_grok_native_client_version_flight(
+                    cache_path,
+                    completed,
+                )
+            )
+    snapshot = await asyncio.shield(flight)
+    return snapshot.version
+
+
+async def _run_grok_native_client_version_flight(
+    cache_path: str,
+) -> _GrokNativeClientVersionSnapshot:
+    try:
+        snapshot = await asyncio.to_thread(
+            _resolve_grok_native_client_version_snapshot_sync,
+            cache_path,
+        )
+    except BaseException:
+        _grok_native_client_version_cache.pop(cache_path, None)
+        raise
+    _grok_native_client_version_cache[cache_path] = snapshot
+    return snapshot
+
+
+def _finish_grok_native_client_version_flight(
+    cache_path: str,
+    flight: "asyncio.Task[_GrokNativeClientVersionSnapshot]",
+) -> None:
+    if _grok_native_client_version_flights.get(cache_path) is flight:
+        _grok_native_client_version_flights.pop(cache_path, None)
+    if not flight.cancelled():
+        flight.exception()
 
 
 def _get_grok_native_oauth_session_id(
