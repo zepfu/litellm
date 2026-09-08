@@ -3773,6 +3773,23 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             retry_attempt_record["terminal_reason"] = (
                 "account_failover_second_selection_failed"
             )
+            if detail.get("selection_reason") == (
+                "authenticated_continuation_token_pin"
+            ):
+                detail["attempted_provider_call"] = bool(
+                    attempted_provider_call
+                )
+                setattr(
+                    selection_exc,
+                    "attempted_provider_call",
+                    bool(attempted_provider_call),
+                )
+                _aawm_dev_fault_plan.note_direct_openai_managed_terminal_exhaustion(
+                    request,
+                    request_body,
+                    selection=selection,
+                )
+                raise
             return None
         raise
 
