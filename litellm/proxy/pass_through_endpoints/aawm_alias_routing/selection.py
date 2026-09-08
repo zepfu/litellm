@@ -4870,6 +4870,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         )
 
     if isinstance(session_owner_record, dict) and sa._record_state(session_owner_record) == "owned":
+        durable_affinity: Optional[dict[str, Any]] = None
         cursor_effective_record: Optional[dict[str, Any]] = None
         cursor_effective_identity: Optional[str] = None
         cursor_effective_cache_key: Optional[str] = None
@@ -4952,7 +4953,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                         ),
                         request=request,
                     )
-                affinity = sa.owner_record_as_strict_affinity_hint(
+                durable_affinity = sa.owner_record_as_strict_affinity_hint(
                     session_owner_record,
                     preserve_account_identity=True,
                 )
@@ -4986,7 +4987,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 session_owner_identity = cursor_effective_identity
                 session_owner_record = cursor_effective_record
                 _cache_key = cursor_effective_cache_key
-                affinity = sa.owner_record_as_strict_affinity_hint(
+                durable_affinity = sa.owner_record_as_strict_affinity_hint(
                     cursor_effective_record,
                     preserve_account_identity=True,
                 )
@@ -5012,12 +5013,39 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     request=request,
                 )
         else:
-            affinity = sa.owner_record_as_affinity_hint(
+            durable_affinity = sa.owner_record_as_affinity_hint(
                 session_owner_record,
                 preserve_account_identity=True,
             )
+        if durable_affinity is None:
+            sa.raise_session_owner_redispatch_required(
+                session_identity=session_owner_identity,
+                alias_model=alias_model,
+                failure_phase="session_owner_owned_record_unusable",
+                guard=sa.SessionOwnerGuardResult(
+                    decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                    session_identity=session_owner_identity,
+                    cache_key=_cache_key,
+                    owner_record=session_owner_record,
+                    owner_id=session_owner_record.get("owner"),
+                    mismatch_reason=(
+                        "session_owner: owned record missing usable attributes"
+                    ),
+                    provenance=sa.build_session_owner_provenance(
+                        session_identity=session_owner_identity,
+                        decision="redispatch_required",
+                        owner_record=session_owner_record,
+                        owner_id=session_owner_record.get("owner"),
+                        mismatch_reason=(
+                            "session_owner: owned record missing usable attributes"
+                        ),
+                        cache_key=_cache_key,
+                    ),
+                ),
+                request=request,
+            )
         affinity = _codex_oauth_mod._codex_oauth_resolve_affinity(
-            durable_affinity=affinity,
+            durable_affinity=durable_affinity,
             token_affinity=token_affinity,
             conflict_message=(
                 "Codex OAuth continuation affinity state conflicts "
@@ -5036,30 +5064,6 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 ),
             }
         )
-        if affinity is None:
-            # Owned but unusable attributes => fail before free selection.
-            sa.raise_session_owner_redispatch_required(
-                session_identity=session_owner_identity,
-                alias_model=alias_model,
-                failure_phase="session_owner_owned_record_unusable",
-                guard=sa.SessionOwnerGuardResult(
-                    decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
-                    session_identity=session_owner_identity,
-                    cache_key=_cache_key,
-                    owner_record=session_owner_record,
-                    owner_id=session_owner_record.get("owner"),
-                    mismatch_reason="session_owner: owned record missing usable attributes",
-                    provenance=sa.build_session_owner_provenance(
-                        session_identity=session_owner_identity,
-                        decision="redispatch_required",
-                        owner_record=session_owner_record,
-                        owner_id=session_owner_record.get("owner"),
-                        mismatch_reason="session_owner: owned record missing usable attributes",
-                        cache_key=_cache_key,
-                    ),
-                ),
-                request=request,
-            )
     elif isinstance(session_owner_record, dict) and sa._record_state(session_owner_record) == "reserved":
         sa.raise_session_owner_redispatch_required(
             session_identity=session_owner_identity,
@@ -5387,10 +5391,25 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     candidate=dict(affinity_state.get("candidate") or affinity),
                     lane_key=affinity_state.get("lane_key")
                     or affinity.get("codex_oauth_lane_key"),
-                    cooldown_seconds=0.0,
+                    cooldown_seconds=float(
+                        affinity_state.get("cooldown_seconds") or 0.0
+                    ),
                     alias_model=alias_model,
-                    error_class="candidate_unavailable",
-                    failure_phase="account_bound_owner_unavailable",
+                    error_class=(
+                        "usage_limit_reached"
+                        if affinity_state.get("skip_reason") == "quota_exhausted"
+                        else "candidate_unavailable"
+                    ),
+                    cooldown_scope=(
+                        affinity_state.get("cooldown_scope") or "account"
+                    ),
+                    retry_after_seconds=affinity_state.get(
+                        "retry_after_seconds"
+                    ),
+                    failure_phase=(
+                        affinity_state.get("failure_phase")
+                        or "account_bound_owner_unavailable"
+                    ),
                     skipped_candidates=_build_auto_agent_skipped_candidates_from_states(
                         [affinity_state]
                     ),

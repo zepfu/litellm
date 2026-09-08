@@ -1660,12 +1660,82 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     token_affinity = continuation.as_affinity()
     if token_affinity is not None:
         planned_portable_failover = False
+        concrete_non_alias = False
     owner_affinity: Optional[dict[str, Any]] = None
     if session_identity is not None and not planned_portable_failover:
         owner_record, _cache_key, owner_error = await _sa.get_session_owner_record(
             session_identity=session_identity,
         )
-        if owner_error is None and isinstance(owner_record, dict):
+        owner_state = (
+            _sa._record_state(owner_record)
+            if isinstance(owner_record, dict)
+            else None
+        )
+        if owner_error is not None:
+            _sa.raise_session_owner_redispatch_required(
+                session_identity=session_identity,
+                alias_model=model or "codex_native",
+                failure_phase="session_owner_redis_unavailable",
+                message=(
+                    "Session ownership could not be verified against durable "
+                    "storage. Fail closed before direct account selection."
+                ),
+                guard=_sa.SessionOwnerGuardResult(
+                    decision=_sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                    session_identity=session_identity,
+                    cache_key=_cache_key,
+                    owner_record=owner_record,
+                    owner_id=(
+                        owner_record.get("owner")
+                        if isinstance(owner_record, dict)
+                        else None
+                    ),
+                    mismatch_reason=owner_error,
+                    provenance=_sa.build_session_owner_provenance(
+                        session_identity=session_identity,
+                        decision="redispatch_required",
+                        owner_record=owner_record,
+                        owner_id=(
+                            owner_record.get("owner")
+                            if isinstance(owner_record, dict)
+                            else None
+                        ),
+                        mismatch_reason=owner_error,
+                        cache_key=_cache_key,
+                    ),
+                ),
+                request=request,
+            )
+        if isinstance(owner_record, dict) and owner_state == "reserved":
+            _sa.raise_session_owner_redispatch_required(
+                session_identity=session_identity,
+                alias_model=model or "codex_native",
+                failure_phase="session_owner_competing_reservation",
+                guard=_sa.SessionOwnerGuardResult(
+                    decision=_sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                    session_identity=session_identity,
+                    cache_key=_cache_key,
+                    owner_record=owner_record,
+                    owner_id=owner_record.get("owner"),
+                    mismatch_reason=(
+                        "session_owner: concurrent reservation held by "
+                        "another request"
+                    ),
+                    provenance=_sa.build_session_owner_provenance(
+                        session_identity=session_identity,
+                        decision="redispatch_required",
+                        owner_record=owner_record,
+                        owner_id=owner_record.get("owner"),
+                        mismatch_reason=(
+                            "session_owner: concurrent reservation held by "
+                            "another request"
+                        ),
+                        cache_key=_cache_key,
+                    ),
+                ),
+                request=request,
+            )
+        if isinstance(owner_record, dict) and owner_state == "owned":
             owner_affinity = _direct_codex_oauth_affinity_from_session_owner(
                 _sa.owner_record_as_affinity_hint(
                     owner_record,
@@ -1673,6 +1743,36 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 ),
                 model=model,
             )
+            if owner_affinity is None:
+                _sa.raise_session_owner_redispatch_required(
+                    session_identity=session_identity,
+                    alias_model=model or "codex_native",
+                    failure_phase="session_owner_owned_record_unusable",
+                    guard=_sa.SessionOwnerGuardResult(
+                        decision=_sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                        session_identity=session_identity,
+                        cache_key=_cache_key,
+                        owner_record=owner_record,
+                        owner_id=owner_record.get("owner"),
+                        mismatch_reason=(
+                            "session_owner: owned record missing usable "
+                            "attributes"
+                        ),
+                        provenance=_sa.build_session_owner_provenance(
+                            session_identity=session_identity,
+                            decision="redispatch_required",
+                            owner_record=owner_record,
+                            owner_id=owner_record.get("owner"),
+                            mismatch_reason=(
+                                "session_owner: owned record missing usable "
+                                "attributes"
+                            ),
+                            cache_key=_cache_key,
+                        ),
+                    ),
+                    request=request,
+                )
+            concrete_non_alias = False
     affinity = _codex_oauth_resolve_affinity(
         durable_affinity=owner_affinity,
         token_affinity=token_affinity,

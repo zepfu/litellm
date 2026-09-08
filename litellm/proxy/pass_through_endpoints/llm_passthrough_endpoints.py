@@ -3895,6 +3895,21 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
     except HTTPException as selection_exc:
         detail = selection_exc.detail
         error = detail.get("error") if isinstance(detail, dict) else None
+        selection_attempted_provider_call = (
+            detail.get("attempted_provider_call")
+            if isinstance(detail, dict)
+            else None
+        )
+        attempted_provider_call = bool(
+            attempted_provider_call or selection_attempted_provider_call
+        )
+        if isinstance(detail, dict):
+            detail["attempted_provider_call"] = attempted_provider_call
+        setattr(
+            selection_exc,
+            "attempted_provider_call",
+            attempted_provider_call,
+        )
         if (
             selection_exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS
             and isinstance(error, dict)
@@ -3908,14 +3923,6 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             if detail.get("selection_reason") == (
                 "authenticated_continuation_token_pin"
             ):
-                detail["attempted_provider_call"] = bool(
-                    attempted_provider_call
-                )
-                setattr(
-                    selection_exc,
-                    "attempted_provider_call",
-                    bool(attempted_provider_call),
-                )
                 _aawm_dev_fault_plan.note_direct_openai_managed_terminal_exhaustion(
                     request,
                     request_body,
