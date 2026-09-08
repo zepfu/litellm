@@ -1014,6 +1014,21 @@ class PassThroughEndpointLogging:
             if isinstance(delivered_wire_disposition, dict)
             else None
         )
+        policy_failure_kind = (
+            str(delivered_wire_disposition.get("policy_failure_kind") or "").strip()
+            if isinstance(delivered_wire_disposition, dict)
+            else ""
+        )
+        policy_failure_code = (
+            str(delivered_wire_disposition.get("policy_failure_code") or "").strip()
+            if isinstance(delivered_wire_disposition, dict)
+            else ""
+        )
+        policy_failure_class = (
+            str(delivered_wire_disposition.get("policy_failure_class") or "").strip()
+            if isinstance(delivered_wire_disposition, dict)
+            else ""
+        )
         if (
             isinstance(delivered_wire_disposition, dict)
             and delivered_disposition != "completed"
@@ -1026,9 +1041,20 @@ class PassThroughEndpointLogging:
             metadata["aawm_delivered_disposition"] = failure_disposition
             metadata["aawm_route_rollup_turn_suppressed"] = True
             metadata["aawm_route_rollup_turn_recorded"] = True
+            if policy_failure_kind:
+                metadata["aawm_policy_failure_kind"] = policy_failure_kind
+            if policy_failure_code:
+                metadata["aawm_policy_failure_code"] = policy_failure_code
+            if policy_failure_class:
+                metadata["aawm_policy_failure_class"] = policy_failure_class
             record_aawm_route_rollup_failure(
                 kwargs,
-                message=f"delivered_disposition={failure_disposition}",
+                message=(
+                    f"policy_failure={policy_failure_kind or policy_failure_code}; "
+                    f"delivered_disposition={failure_disposition}"
+                    if policy_failure_kind or policy_failure_code
+                    else f"delivered_disposition={failure_disposition}"
+                ),
                 status=(
                     "Incomplete"
                     if failure_disposition == "incomplete"
@@ -1041,11 +1067,37 @@ class PassThroughEndpointLogging:
             )
             delivered_failure = annotate_delivered_wire_failure(
                 RuntimeError(
-                    "OpenAI Responses delivered disposition="
-                    f"{failure_disposition}"
+                    (
+                        "OpenAI Responses output policy failure="
+                        f"{policy_failure_kind or policy_failure_code}; "
+                        f"delivered disposition={failure_disposition}"
+                    )
+                    if policy_failure_kind or policy_failure_code
+                    else (
+                        "OpenAI Responses delivered disposition="
+                        f"{failure_disposition}"
+                    )
                 ),
                 delivered_disposition=failure_disposition,
             )
+            if policy_failure_kind:
+                setattr(
+                    delivered_failure,
+                    "policy_failure_kind",
+                    policy_failure_kind,
+                )
+            if policy_failure_code:
+                setattr(
+                    delivered_failure,
+                    "policy_failure_code",
+                    policy_failure_code,
+                )
+            if policy_failure_class:
+                setattr(
+                    delivered_failure,
+                    "policy_failure_class",
+                    policy_failure_class,
+                )
             try:
                 await logging_obj.async_failure_handler(
                     exception=delivered_failure,

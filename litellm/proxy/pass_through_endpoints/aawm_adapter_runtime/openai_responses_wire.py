@@ -25,6 +25,18 @@ from typing import (
 from starlette.responses import Response, StreamingResponse
 
 
+_POLICY_FAILURE_VALUE_MAX_LENGTH = 128
+
+
+def _bounded_policy_value(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    return normalized[:_POLICY_FAILURE_VALUE_MAX_LENGTH]
+
+
 class OpenAIResponsesWireDisposition(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
@@ -154,7 +166,94 @@ class OpenAIResponsesWireTrace:
             "finalization_started": self.finalization_started,
             "finalized": self.finalized,
             "asgi_delivery_complete": self.asgi_delivery_complete,
+            "policy_failure_kind": self.metadata.get("policy_failure_kind"),
+            "policy_failure_code": self.metadata.get("policy_failure_code"),
+            "policy_failure_class": self.metadata.get("policy_failure_class"),
         }
+
+    def record_policy_failure(
+        self,
+        *,
+        kind: Any = None,
+        code: Any = None,
+        classification: Any = None,
+    ) -> bool:
+        """Freeze a bounded policy cause before delivered consumers run."""
+
+        values = {
+            "policy_failure_kind": _bounded_policy_value(kind),
+            "policy_failure_code": _bounded_policy_value(code),
+            "policy_failure_class": _bounded_policy_value(classification),
+        }
+        if not any(values.values()):
+            return False
+        for key, value in values.items():
+            if value is not None and self.metadata.get(key) is None:
+                self.metadata[key] = value
+        self.publish_request_commitment()
+        return True
+
+    def record_policy_failure_from_payload(self, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        response_payload = payload.get("response")
+        if not isinstance(response_payload, dict):
+            return False
+        metadata = response_payload.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            return False
+        error = response_payload.get("error")
+        if not isinstance(error, dict):
+            error = payload.get("error")
+        if not isinstance(error, dict):
+            error = {}
+        kind = metadata.get("failure_kind")
+        code = error.get("code") or metadata.get("error_code")
+        classification = (
+            metadata.get("failure_class")
+            or metadata.get("policy_failure_class")
+            or kind
+        )
+        return self.record_policy_failure(
+            kind=kind,
+            code=code,
+            classification=classification,
+        )
+
+    def record_policy_failure_from_exception(self, exc: BaseException) -> bool:
+        marker = getattr(exc, "_aawm_policy_failure", None)
+        if not isinstance(marker, dict):
+            detail = getattr(exc, "detail", None)
+            if isinstance(detail, dict):
+                marker = detail
+        if not isinstance(marker, dict):
+            return False
+        metadata = marker.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = marker
+        error = marker.get("error")
+        if not isinstance(error, dict):
+            error = {}
+        return self.record_policy_failure(
+            kind=(
+                metadata.get("failure_kind")
+                or metadata.get("policy_failure_kind")
+                or marker.get("policy_failure_kind")
+            ),
+            code=(
+                error.get("code")
+                or metadata.get("error_code")
+                or marker.get("policy_failure_code")
+            ),
+            classification=(
+                metadata.get("failure_class")
+                or metadata.get("policy_failure_class")
+                or marker.get("policy_failure_class")
+                or metadata.get("failure_kind")
+            ),
+        )
 
     def record_response_start_delivery(self) -> None:
         """Record headers only after the ASGI send completed."""
@@ -685,6 +784,7 @@ class OpenAIResponsesWireCoordinator:
                         return
                     disposition = _terminal_disposition(event_type, payload)
                     if disposition is not None:
+                        self.trace.record_policy_failure_from_payload(payload)
                         if saw_done:
                             self.trace.upstream_done_suppressed += 1
                         terminal_response_payload = (
@@ -787,15 +887,23 @@ class OpenAIResponsesWireCoordinator:
             self._discard_partial_buffer()
             await self.finalize_transport(OpenAIResponsesWireDisposition.DISCONNECTED)
             raise
-        except Exception:
+        except Exception as exc:
             self._discard_partial_buffer()
+            policy_failure_recorded = (
+                self.trace.record_policy_failure_from_exception(exc)
+            )
             if self.trace.terminal_selected:
                 await self.finalize_transport(OpenAIResponsesWireDisposition.FAILED)
                 return
             if self.trace.first_body_sent or self.trace.response_start_sent:
                 async for emitted in self._emit_synthetic_terminal(
                     disposition=OpenAIResponsesWireDisposition.FAILED,
-                    reason="openai_responses_wire_source_error",
+                    reason=(
+                        self.trace.metadata.get("policy_failure_code")
+                        or self.trace.metadata.get("policy_failure_kind")
+                        if policy_failure_recorded
+                        else "openai_responses_wire_source_error"
+                    ),
                 ):
                     yield emitted
                 await _await_shielded(self._close_source())

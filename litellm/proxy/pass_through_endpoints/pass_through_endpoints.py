@@ -1278,6 +1278,39 @@ def _get_runtime_text_watermark_config() -> Any:
     return load_text_watermark_config(payload)
 
 
+def _is_passthrough_output_policy_exception(exc: BaseException) -> bool:
+    marker = getattr(exc, "_aawm_policy_failure", None)
+    if isinstance(marker, dict):
+        return True
+    detail = getattr(exc, "detail", None)
+    if not isinstance(detail, dict):
+        return False
+    metadata = detail.get("metadata")
+    if isinstance(metadata, dict) and (
+        metadata.get("failure_kind")
+        or metadata.get("policy_failure_kind")
+        or metadata.get("policy_failure_code")
+    ):
+        return True
+    error = detail.get("error")
+    return isinstance(error, dict) and str(
+        error.get("code") or ""
+    ).startswith("aawm_")
+
+
+def _serialize_passthrough_policy_exception(exc: BaseException) -> bytes:
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, (dict, list)):
+        payload: Any = detail
+    else:
+        payload = {"error": {"message": str(detail or exc)}}
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 def _set_passthrough_stream_timeout_metadata(
     *, kwargs: Optional[dict], policy: _PassThroughStreamReadTimeoutPolicy
 ) -> None:
@@ -5639,6 +5672,9 @@ async def pass_through_request(  # noqa: PLR0915
                 if is_native_openai_responses_route
                 else None
             )
+            stream_bookkeeping_state: Optional[Dict[str, Any]] = (
+                {} if is_native_openai_responses_route else None
+            )
             processed_chunks = PassThroughStreamingHandler.chunk_processor(
                 response=response,
                 request_body=_parsed_body,
@@ -5655,6 +5691,7 @@ async def pass_through_request(  # noqa: PLR0915
                 local_prepare_ms=local_prepare_ms,
                 error_log_context=error_log_context,
                 openai_wire_trace=wire_trace,
+                openai_stream_bookkeeping_state=stream_bookkeeping_state,
             )
             if (
                 responses_function_name_rewrite is not None
@@ -5704,6 +5741,36 @@ async def pass_through_request(  # noqa: PLR0915
                         else None
                     ),
                 )
+                if stream_bookkeeping_state is not None:
+
+                    async def _run_post_delivery_bookkeeping(
+                        delivered_snapshot: Dict[str, Any],
+                    ) -> None:
+                        callback = stream_bookkeeping_state.get("finalize_callback")
+                        if callback is not None:
+                            await callback(delivered_snapshot)
+                            return
+                        await PassThroughStreamingHandler._finalize_unstarted_native_stream(
+                            delivered_snapshot=delivered_snapshot,
+                            response=response,
+                            request_body=_parsed_body,
+                            litellm_logging_obj=logging_obj,
+                            endpoint_type=endpoint_type,
+                            start_time=start_time,
+                            passthrough_success_handler_obj=(
+                                pass_through_endpoint_logging
+                            ),
+                            url_route=str(url),
+                            passthrough_logging_payload=passthrough_logging_payload,
+                            custom_llm_provider=custom_llm_provider,
+                            success_handler_kwargs=kwargs,
+                            local_prepare_ms=local_prepare_ms,
+                            error_log_context=error_log_context,
+                        )
+
+                    wire_trace.register_post_finalization_callback(
+                        _run_post_delivery_bookkeeping
+                    )
                 bind_openai_responses_wire_trace_to_request(request, wire_trace)
                 stream_response = OpenAIResponsesStreamingResponse(
                     processed_chunks,
@@ -5917,6 +5984,9 @@ async def pass_through_request(  # noqa: PLR0915
                 if is_native_openai_responses_route
                 else None
             )
+            stream_bookkeeping_state: Optional[Dict[str, Any]] = (
+                {} if is_native_openai_responses_route else None
+            )
             processed_chunks = PassThroughStreamingHandler.chunk_processor(
                 response=response,
                 request_body=_parsed_body,
@@ -5933,6 +6003,7 @@ async def pass_through_request(  # noqa: PLR0915
                 local_prepare_ms=local_prepare_ms,
                 error_log_context=error_log_context,
                 openai_wire_trace=wire_trace,
+                openai_stream_bookkeeping_state=stream_bookkeeping_state,
             )
             if (
                 responses_function_name_rewrite is not None
@@ -5982,6 +6053,36 @@ async def pass_through_request(  # noqa: PLR0915
                         else None
                     ),
                 )
+                if stream_bookkeeping_state is not None:
+
+                    async def _run_post_delivery_bookkeeping(
+                        delivered_snapshot: Dict[str, Any],
+                    ) -> None:
+                        callback = stream_bookkeeping_state.get("finalize_callback")
+                        if callback is not None:
+                            await callback(delivered_snapshot)
+                            return
+                        await PassThroughStreamingHandler._finalize_unstarted_native_stream(
+                            delivered_snapshot=delivered_snapshot,
+                            response=response,
+                            request_body=_parsed_body,
+                            litellm_logging_obj=logging_obj,
+                            endpoint_type=endpoint_type,
+                            start_time=start_time,
+                            passthrough_success_handler_obj=(
+                                pass_through_endpoint_logging
+                            ),
+                            url_route=str(url),
+                            passthrough_logging_payload=passthrough_logging_payload,
+                            custom_llm_provider=custom_llm_provider,
+                            success_handler_kwargs=kwargs,
+                            local_prepare_ms=local_prepare_ms,
+                            error_log_context=error_log_context,
+                        )
+
+                    wire_trace.register_post_finalization_callback(
+                        _run_post_delivery_bookkeeping
+                    )
                 bind_openai_responses_wire_trace_to_request(request, wire_trace)
                 stream_response = OpenAIResponsesStreamingResponse(
                     processed_chunks,
@@ -6082,21 +6183,50 @@ async def pass_through_request(  # noqa: PLR0915
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ).encode("utf-8")
+        provider_response_body = response_body
+        # Preserve the provider payload before any output-policy evaluation.
+        passthrough_logging_payload["response_body"] = provider_response_body
+        output_policy_rejection: Optional[HTTPException] = None
         if isinstance(response_body, dict):
-            maybe_reject_passthrough_responses_body(
-                response_body,
-                request_context=output_guard_request_context,
-            )
-            response_body, content = maybe_apply_passthrough_watermark_response(
-                response_body,
-                content=content,
-                config=_get_runtime_text_watermark_config(),
-                success_handler_kwargs=kwargs,
-                endpoint=_watermark_endpoint_from_path(
-                    url, getattr(getattr(request, "url", None), "path", None)
-                ),
-            )
-        passthrough_logging_payload["response_body"] = response_body
+            try:
+                maybe_reject_passthrough_responses_body(
+                    response_body,
+                    request_context=output_guard_request_context,
+                )
+                response_body, content = maybe_apply_passthrough_watermark_response(
+                    response_body,
+                    content=content,
+                    config=_get_runtime_text_watermark_config(),
+                    success_handler_kwargs=kwargs,
+                    endpoint=_watermark_endpoint_from_path(
+                        url, getattr(getattr(request, "url", None), "path", None)
+                    ),
+                )
+            except Exception as policy_exc:
+                if not (
+                    is_native_openai_responses_route
+                    and _is_passthrough_output_policy_exception(policy_exc)
+                ):
+                    raise
+                output_policy_rejection = (
+                    policy_exc
+                    if isinstance(policy_exc, HTTPException)
+                    else HTTPException(
+                        status_code=status.HTTP_502_BAD_GATEWAY,
+                        detail=getattr(policy_exc, "detail", str(policy_exc)),
+                    )
+                )
+                response_body = provider_response_body
+                content = _serialize_passthrough_policy_exception(
+                    output_policy_rejection
+                )
+
+        logging_response_body = (
+            provider_response_body
+            if output_policy_rejection is not None
+            else response_body
+        )
+        passthrough_logging_payload["response_body"] = logging_response_body
         capture_passthrough_shape(
             mode="nonstream",
             provider=custom_llm_provider or endpoint_type.value,
@@ -6105,8 +6235,18 @@ async def pass_through_request(  # noqa: PLR0915
             request_body=_parsed_body,
             response=response,
             upstream_request=getattr(response, "request", None),
-            response_body=response_body,
-            response_content=content,
+            response_body=logging_response_body,
+            response_content=(
+                content
+                if output_policy_rejection is None
+                else json.dumps(
+                    provider_response_body,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                if isinstance(provider_response_body, dict)
+                else content
+            ),
             litellm_call_id=litellm_call_id,
             extra_metadata={"stream": False},
         )
@@ -6187,19 +6327,26 @@ async def pass_through_request(  # noqa: PLR0915
             )
         _publish_openai_send_telemetry()
         if is_native_openai_responses_route:
-            response_status = (
-                response_body.get("status")
-                if isinstance(response_body, dict)
-                else None
-            )
-            if str(response_status or "").lower() == "completed":
-                disposition = OpenAIResponsesWireDisposition.COMPLETED
-            elif str(response_status or "").lower() == "failed":
+            if output_policy_rejection is not None:
                 disposition = OpenAIResponsesWireDisposition.FAILED
             else:
-                disposition = OpenAIResponsesWireDisposition.INCOMPLETE
+                response_status = (
+                    response_body.get("status")
+                    if isinstance(response_body, dict)
+                    else None
+                )
+                if str(response_status or "").lower() == "completed":
+                    disposition = OpenAIResponsesWireDisposition.COMPLETED
+                elif str(response_status or "").lower() == "failed":
+                    disposition = OpenAIResponsesWireDisposition.FAILED
+                else:
+                    disposition = OpenAIResponsesWireDisposition.INCOMPLETE
 
             wire_trace = OpenAIResponsesWireTrace()
+            if output_policy_rejection is not None:
+                wire_trace.record_policy_failure_from_exception(
+                    output_policy_rejection
+                )
             wire_trace.metadata["buffered_response_disposition"] = disposition.value
 
             async def _on_native_wire_disposition(
@@ -6268,7 +6415,11 @@ async def pass_through_request(  # noqa: PLR0915
                 wire_trace=wire_trace,
                 disposition=disposition,
                 on_disposition=_on_native_wire_disposition,
-                status_code=response.status_code,
+                status_code=(
+                    output_policy_rejection.status_code
+                    if output_policy_rejection is not None
+                    else response.status_code
+                ),
                 headers=response_headers,
             )
         return Response(
