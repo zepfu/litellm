@@ -10,6 +10,7 @@ host-global integration dependencies, not locally owned functions.
 from __future__ import annotations
 
 import codecs
+import inspect
 import json
 from typing import Any, AsyncIterator, Optional, cast
 
@@ -140,6 +141,10 @@ _RESPONSES_VALIDATION_STATE_ATTR = "_aawm_responses_validation_state"
 _RESPONSES_VALIDATION_COMPLETE_ATTR = "_aawm_responses_validation_complete"
 _RESPONSES_VALIDATION_VALID_ATTR = "_aawm_responses_validation_valid"
 _RESPONSES_VALIDATION_CLEANUP_ATTR = "_aawm_responses_validation_cleanup"
+_RESPONSES_PRE_TERMINAL_VALIDATION_ATTR = (
+    "_aawm_responses_pre_terminal_validation"
+)
+_RESPONSES_BACKGROUND_OWNER_ATTR = "_aawm_responses_background_owner"
 _STREAM_CLEANUP_ATTR = "_aawm_streaming_response_cleanup"
 
 
@@ -151,6 +156,7 @@ def install(host_globals: dict) -> None:
     rebound object is published to both this module and the host module.
     """
     _mod = globals()
+    host_globals["inspect"] = inspect
     host_globals["_RESPONSES_VALID_STATUSES"] = _RESPONSES_VALID_STATUSES
     host_globals["_RESPONSES_OUTPUT_ITEM_TYPES"] = _RESPONSES_OUTPUT_ITEM_TYPES
     host_globals["_RESPONSES_VALID_ITEM_STATUSES"] = _RESPONSES_VALID_ITEM_STATUSES
@@ -198,6 +204,12 @@ def install(host_globals: dict) -> None:
     )
     host_globals["_RESPONSES_VALIDATION_CLEANUP_ATTR"] = (
         _RESPONSES_VALIDATION_CLEANUP_ATTR
+    )
+    host_globals["_RESPONSES_PRE_TERMINAL_VALIDATION_ATTR"] = (
+        _RESPONSES_PRE_TERMINAL_VALIDATION_ATTR
+    )
+    host_globals["_RESPONSES_BACKGROUND_OWNER_ATTR"] = (
+        _RESPONSES_BACKGROUND_OWNER_ATTR
     )
     host_globals["_STREAM_CLEANUP_ATTR"] = _STREAM_CLEANUP_ATTR
     for _name in _HOST_FUNCTION_NAMES:
@@ -1436,31 +1448,99 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             "reason": "awaiting_terminal_validation",
         }
 
-    async def _close_peeked_stream(peeked_response: Any) -> None:
-        iterator = getattr(peeked_response, "body_iterator", None)
-        close = getattr(iterator, "aclose", None)
-        if callable(close):
-            try:
-                result = close()
-                if getattr(result, "__await__", None) is not None:
-                    await result
+    def _install_once_background_owner(target: Any) -> Any:
+        existing_owner = getattr(target, _RESPONSES_BACKGROUND_OWNER_ATTR, None)
+        if callable(existing_owner):
+            if getattr(target, "background", None) is None:
+                setattr(target, "background", existing_owner)
+            return existing_owner
+
+        background = getattr(target, "background", None)
+        if not callable(background):
+            return None
+        completed = False
+
+        async def _run_background_once() -> None:
+            nonlocal completed
+            if completed:
                 return
-            except BaseException:
-                verbose_proxy_logger.debug(
-                    "Failed to close marked Responses stream after bounded rejection",
-                    exc_info=True,
-                )
-        cleanup = getattr(peeked_response, _STREAM_CLEANUP_ATTR, None)
-        if callable(cleanup):
-            try:
-                result = cleanup()
-                if getattr(result, "__await__", None) is not None:
-                    await result
-            except BaseException:
-                verbose_proxy_logger.debug(
-                    "Failed to close marked Responses stream cleanup",
-                    exc_info=True,
-                )
+            completed = True
+            result = background()
+            if inspect.isawaitable(result):
+                await result
+
+        setattr(target, _RESPONSES_BACKGROUND_OWNER_ATTR, _run_background_once)
+        setattr(target, "background", _run_background_once)
+        return _run_background_once
+
+    async def _close_peeked_stream(peeked_response: Any) -> None:
+        async def _close_and_finalize() -> None:
+            iterator = getattr(peeked_response, "body_iterator", None)
+            close = getattr(iterator, "aclose", None)
+            if callable(close):
+                try:
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+                except BaseException:
+                    verbose_proxy_logger.debug(
+                        "Failed to close marked Responses stream after bounded rejection",
+                        exc_info=True,
+                    )
+            cleanup = getattr(peeked_response, _STREAM_CLEANUP_ATTR, None)
+            if callable(cleanup):
+                try:
+                    result = cleanup()
+                    if inspect.isawaitable(result):
+                        await result
+                except BaseException:
+                    verbose_proxy_logger.debug(
+                        "Failed to close marked Responses stream cleanup",
+                        exc_info=True,
+                    )
+            background = getattr(
+                peeked_response,
+                _RESPONSES_BACKGROUND_OWNER_ATTR,
+                None,
+            )
+            if not callable(background):
+                background = getattr(peeked_response, "background", None)
+            if callable(background):
+                try:
+                    result = background()
+                    if inspect.isawaitable(result):
+                        await result
+                except BaseException:
+                    verbose_proxy_logger.debug(
+                        "Failed to complete marked Responses stream background",
+                        exc_info=True,
+                    )
+
+        try:
+            from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+                _await_shielded,
+            )
+
+            await _await_shielded(_close_and_finalize())
+        except BaseException:
+            verbose_proxy_logger.debug(
+                "Failed to finish marked Responses stream prefetch abort",
+                exc_info=True,
+            )
+
+    prefetch_state = _validated_stream_state()
+    _set_stream_validation_state(response, prefetch_state)
+    _install_once_background_owner(response)
+
+    def _mark_prefetch_abort(reason: str) -> None:
+        _invalidate_stream(response, prefetch_state, reason)
+        _update_stream_validation_state(
+            response,
+            prefetch_state,
+            complete=True,
+            valid=False,
+            reason=reason,
+        )
 
     async def _collect_pending_grok_marker_stream(peek: Any) -> Any:
         if adapter not in {
@@ -1485,10 +1565,12 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 max_bytes=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES,  # noqa: F821
             )
         except BaseException:
+            _mark_prefetch_abort("stream_prefetch_aborted")
             await _close_peeked_stream(peek.response)
             raise
 
         if collected_chunks is None:
+            _mark_prefetch_abort("stream_prefetch_rejected")
             await _close_peeked_stream(peek.response)
             _raise_codex_auto_agent_malformed_tool_call_text_payload(
                 response_body={
@@ -1659,6 +1741,136 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 state["terminal_status"] = None
                 _invalidate_stream(target, state, "missing_terminal_response")
 
+        def _validate_terminal_semantics(
+            *,
+            raise_failed_response: bool,
+        ) -> None:
+            if state.get("complete"):
+                return
+            if state.get("invalid"):
+                _update_stream_validation_state(
+                    target,
+                    state,
+                    complete=True,
+                    valid=False,
+                    reason=state.get("reason") or "invalid_stream",
+                )
+                _raise_codex_auto_agent_invalid_responses_shape(
+                    response_body=terminal_response,
+                    adapter_model=adapter_model,
+                    adapter=adapter,
+                    adapter_label=adapter_label,
+                    stream_event_summaries=event_summaries,
+                )
+            if terminal_response is None:
+                _update_stream_validation_state(
+                    target,
+                    state,
+                    complete=True,
+                    valid=False,
+                    reason="missing_terminal_response",
+                )
+                _raise_codex_auto_agent_invalid_responses_shape(
+                    response_body=None,
+                    adapter_model=adapter_model,
+                    adapter=adapter,
+                    adapter_label=adapter_label,
+                    stream_event_summaries=event_summaries,
+                )
+            if is_repetitive_output_loop_failure(terminal_response):
+                _update_stream_validation_state(
+                    target,
+                    state,
+                    complete=True,
+                    valid=False,
+                    reason="repetitive_output_failure",
+                )
+                return
+            if _responses_body_is_unsuccessful(
+                terminal_response,
+                terminal_event_type=terminal_event_type,
+            ):
+                _update_stream_validation_state(
+                    target,
+                    state,
+                    complete=True,
+                    valid=False,
+                    reason="failed_response",
+                )
+                if raise_failed_response:
+                    _raise_codex_auto_agent_failed_responses_payload(
+                        response_body=terminal_response,
+                        adapter_model=adapter_model,
+                        adapter=adapter,
+                        adapter_label=adapter_label,
+                        stream_event_summaries=event_summaries,
+                    )
+                return
+            if (
+                terminal_event_type not in {"response.completed", "response.done"}
+                or terminal_response.get("status") != "completed"
+            ):
+                _update_stream_validation_state(
+                    target,
+                    state,
+                    complete=True,
+                    valid=False,
+                    reason="unsuccessful_terminal_status",
+                )
+                _raise_codex_auto_agent_invalid_responses_shape(
+                    response_body=terminal_response,
+                    adapter_model=adapter_model,
+                    adapter=adapter,
+                    adapter_label=adapter_label,
+                    stream_event_summaries=event_summaries,
+                )
+            if not _is_responses_shaped_body(terminal_response):
+                _update_stream_validation_state(
+                    target,
+                    state,
+                    complete=True,
+                    valid=False,
+                    reason="invalid_response_shape",
+                )
+                _raise_codex_auto_agent_invalid_responses_shape(
+                    response_body=terminal_response,
+                    adapter_model=adapter_model,
+                    adapter=adapter,
+                    adapter_label=adapter_label,
+                    stream_event_summaries=event_summaries,
+                )
+            _update_stream_validation_state(
+                target,
+                state,
+                complete=True,
+                valid=True,
+                reason="validated_terminal_response",
+            )
+
+        async def _validate_terminal_before_delivery(
+            _terminal_block: bytes,
+            event_type: str,
+            payload: Optional[dict[str, Any]],
+            _disposition: Any,
+        ) -> None:
+            nonlocal terminal_response, terminal_event_type
+            if state.get("complete"):
+                return
+            terminal_event_type = event_type
+            terminal_response = (
+                payload.get("response")
+                if isinstance(payload, dict)
+                and isinstance(payload.get("response"), dict)
+                else None
+            )
+            state["terminal_seen"] = True
+            state["terminal_status"] = (
+                terminal_response.get("status")
+                if isinstance(terminal_response, dict)
+                else None
+            )
+            _validate_terminal_semantics(raise_failed_response=False)
+
         def _consume_sse_text(text: str, *, final: bool = False) -> None:
             nonlocal buffer_limit_exceeded, sse_buffer, trailing_cr
             if buffer_limit_exceeded:
@@ -1782,106 +1994,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                     except UnicodeDecodeError:
                         decoder_failed = True
                         _invalidate_stream(target, state, "malformed_sse_event")
-                if state.get("invalid"):
-                    _update_stream_validation_state(
-                        target,
-                        state,
-                        complete=True,
-                        valid=False,
-                        reason=state.get("reason") or "invalid_stream",
-                    )
-                    _raise_codex_auto_agent_invalid_responses_shape(
-                        response_body=terminal_response,
-                        adapter_model=adapter_model,
-                        adapter=adapter,
-                        adapter_label=adapter_label,
-                        stream_event_summaries=event_summaries,
-                    )
-                if terminal_response is None:
-                    _update_stream_validation_state(
-                        target,
-                        state,
-                        complete=True,
-                        valid=False,
-                        reason="missing_terminal_response",
-                    )
-                    _raise_codex_auto_agent_invalid_responses_shape(
-                        response_body=None,
-                        adapter_model=adapter_model,
-                        adapter=adapter,
-                        adapter_label=adapter_label,
-                        stream_event_summaries=event_summaries,
-                    )
-                repetitive_failure = is_repetitive_output_loop_failure(
-                    terminal_response
-                )
-                if repetitive_failure:
-                    _update_stream_validation_state(
-                        target,
-                        state,
-                        complete=True,
-                        valid=False,
-                        reason="repetitive_output_failure",
-                    )
-                    return
-                if _responses_body_is_unsuccessful(
-                    terminal_response,
-                    terminal_event_type=terminal_event_type,
-                ):
-                    _update_stream_validation_state(
-                        target,
-                        state,
-                        complete=True,
-                        valid=False,
-                        reason="failed_response",
-                    )
-                    _raise_codex_auto_agent_failed_responses_payload(
-                        response_body=terminal_response,
-                        adapter_model=adapter_model,
-                        adapter=adapter,
-                        adapter_label=adapter_label,
-                        stream_event_summaries=event_summaries,
-                    )
-                if (
-                    terminal_event_type not in {"response.completed", "response.done"}
-                    or terminal_response.get("status") != "completed"
-                ):
-                    _update_stream_validation_state(
-                        target,
-                        state,
-                        complete=True,
-                        valid=False,
-                        reason="unsuccessful_terminal_status",
-                    )
-                    _raise_codex_auto_agent_invalid_responses_shape(
-                        response_body=terminal_response,
-                        adapter_model=adapter_model,
-                        adapter=adapter,
-                        adapter_label=adapter_label,
-                        stream_event_summaries=event_summaries,
-                    )
-                if not _is_responses_shaped_body(terminal_response):
-                    _update_stream_validation_state(
-                        target,
-                        state,
-                        complete=True,
-                        valid=False,
-                        reason="invalid_response_shape",
-                    )
-                    _raise_codex_auto_agent_invalid_responses_shape(
-                        response_body=terminal_response,
-                        adapter_model=adapter_model,
-                        adapter=adapter,
-                        adapter_label=adapter_label,
-                        stream_event_summaries=event_summaries,
-                    )
-                _update_stream_validation_state(
-                    target,
-                    state,
-                    complete=True,
-                    valid=True,
-                    reason="validated_terminal_response",
-                )
+                _validate_terminal_semantics(raise_failed_response=True)
             except BaseException:
                 if not state.get("complete"):
                     if state.get("invalid"):
@@ -1910,19 +2023,29 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             _RESPONSES_VALIDATION_CLEANUP_ATTR,
             _close_validation_resources,
         )
+        setattr(
+            target,
+            _RESPONSES_PRE_TERMINAL_VALIDATION_ATTR,
+            _validate_terminal_before_delivery,
+        )
         _set_stream_validation_state(target, state)
         return target
 
     if isinstance(response, StreamingResponse):
         event_summaries: list[dict[str, Any]] = []
-        peek = await _aawm_alias_streaming.peek_streaming_response(  # noqa: F821
-            response,
-            max_chunks=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS,  # noqa: F821
-            max_bytes=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES,  # noqa: F821
-            terminalizer=_aawm_alias_streaming._get_stream_timeout_terminalizer(  # noqa: F821
-                response
-            ),
-        )
+        try:
+            peek = await _aawm_alias_streaming.peek_streaming_response(  # noqa: F821
+                response,
+                max_chunks=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS,  # noqa: F821
+                max_bytes=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES,  # noqa: F821
+                terminalizer=_aawm_alias_streaming._get_stream_timeout_terminalizer(  # noqa: F821
+                    response
+                ),
+            )
+        except BaseException:
+            _mark_prefetch_abort("stream_prefetch_aborted")
+            await _close_peeked_stream(response)
+            raise
         peek = await _collect_pending_grok_marker_stream(peek)
         if not peek.exhausted:
             correlation = intake_context or {}

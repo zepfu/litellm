@@ -1114,9 +1114,17 @@ def _bind_xai_responses_wire_stream(
     upstream_response = getattr(response, "_aawm_upstream_response", None)
     if upstream_response is None:
         upstream_response = response
+    pre_terminal_validation = getattr(
+        response,
+        "_aawm_responses_pre_terminal_validation",
+        None,
+    )
+    if not callable(pre_terminal_validation):
+        pre_terminal_validation = None
     processed_chunks, wire_trace = wrap_openai_responses_stream(
         source,
         upstream_response=upstream_response,
+        pre_terminal_validation=pre_terminal_validation,
         model=adapter_model,
     )
     bind_openai_responses_wire_trace_to_request(request, wire_trace)

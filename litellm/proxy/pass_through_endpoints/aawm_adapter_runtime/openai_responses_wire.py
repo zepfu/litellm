@@ -428,6 +428,10 @@ WireDispositionCallback = Callable[
     [OpenAIResponsesWireDisposition, OpenAIResponsesWireTrace],
     Awaitable[None],
 ]
+PreTerminalValidationCallback = Callable[
+    [bytes, str, Optional[dict[str, Any]], OpenAIResponsesWireDisposition],
+    Awaitable[None],
+]
 
 
 async def _await_shielded(awaitable: Awaitable[Any]) -> Any:
@@ -692,12 +696,14 @@ class OpenAIResponsesWireCoordinator:
         *,
         upstream_response: Any = None,
         on_disposition: Optional[WireDispositionCallback] = None,
+        pre_terminal_validation: Optional[PreTerminalValidationCallback] = None,
         trace: Optional[OpenAIResponsesWireTrace] = None,
         model: Optional[str] = None,
     ) -> None:
         self._source = source
         self._upstream_response = upstream_response
         self._on_disposition = on_disposition
+        self._pre_terminal_validation = pre_terminal_validation
         self.trace = trace or OpenAIResponsesWireTrace()
         self._model = model
         self._buffer = b""
@@ -814,6 +820,20 @@ class OpenAIResponsesWireCoordinator:
         ):
             yield emitted
 
+    async def _validate_terminal_before_emit(
+        self,
+        block: bytes,
+        *,
+        event_type: str,
+        payload: Optional[dict[str, Any]],
+        disposition: OpenAIResponsesWireDisposition,
+        synthetic: bool = False,
+    ) -> None:
+        callback = self._pre_terminal_validation
+        if callback is None or synthetic:
+            return
+        await callback(block, event_type, payload, disposition)
+
     # Keep terminal selection and transport cleanup in one ordered lifecycle.
     async def __aiter__(self) -> AsyncIterator[bytes]:  # noqa: PLR0915
         try:
@@ -909,6 +929,16 @@ class OpenAIResponsesWireCoordinator:
                             )
                             if removed_done:
                                 terminal_block = cleaned_block
+                        await self._validate_terminal_before_emit(
+                            terminal_block,
+                            event_type=terminal_event_type,
+                            payload=(
+                                response_payload
+                                if isinstance(response_payload, dict)
+                                else None
+                            ),
+                            disposition=disposition,
+                        )
                         async for emitted in self._emit_terminal(
                             terminal_block,
                             event_type=terminal_event_type,
@@ -1149,6 +1179,7 @@ def wrap_openai_responses_stream(
     *,
     upstream_response: Any = None,
     on_disposition: Optional[WireDispositionCallback] = None,
+    pre_terminal_validation: Optional[PreTerminalValidationCallback] = None,
     trace: Optional[OpenAIResponsesWireTrace] = None,
     model: Optional[str] = None,
 ) -> tuple[AsyncIterator[bytes], OpenAIResponsesWireTrace]:
@@ -1159,6 +1190,7 @@ def wrap_openai_responses_stream(
         source,
         upstream_response=upstream_response,
         on_disposition=on_disposition,
+        pre_terminal_validation=pre_terminal_validation,
         trace=trace,
         model=model,
     )

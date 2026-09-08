@@ -52,6 +52,10 @@ _STREAM_CLEANUP_CALLBACKS_ATTR = "_aawm_stream_cleanup_callbacks"
 # Kept local to avoid importing the alias streaming module back into this
 # module while preserving an already-bound provider-neutral terminalizer.
 _STREAM_TIMEOUT_TERMINALIZER_ATTR = "_aawm_stream_timeout_terminalizer"
+_RESPONSES_PRE_TERMINAL_VALIDATION_ATTR = (
+    "_aawm_responses_pre_terminal_validation"
+)
+_RESPONSES_BACKGROUND_OWNER_ATTR = "_aawm_responses_background_owner"
 
 
 def _event_type(event: Any) -> str:
@@ -654,6 +658,22 @@ def _inherit_stream_lifecycle(response: Any, source_response: Any) -> None:
         upstream_response = getattr(source_response, "_aawm_upstream_response", None)
         if upstream_response is not None:
             setattr(response, "_aawm_upstream_response", upstream_response)
+    for attribute in (
+        _RESPONSES_PRE_TERMINAL_VALIDATION_ATTR,
+        _RESPONSES_BACKGROUND_OWNER_ATTR,
+    ):
+        if getattr(response, attribute, None) is None:
+            inherited = getattr(source_response, attribute, None)
+            if inherited is not None:
+                setattr(response, attribute, inherited)
+    if (
+        getattr(response, "background", None) is None
+        and getattr(response, _RESPONSES_BACKGROUND_OWNER_ATTR, None) is not None
+    ):
+        response.background = getattr(
+            response,
+            _RESPONSES_BACKGROUND_OWNER_ATTR,
+        )
 
 
 def _terminal_metadata(
