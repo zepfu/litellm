@@ -269,9 +269,19 @@ async def route_request(  # noqa: PLR0915 - Complex routing function, refactorin
             )
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
             get_or_bind_xai_oauth_selected_account,
+            resolve_xai_oauth_direct_continuation_account,
         )
 
-        selected_xai_account = get_or_bind_xai_oauth_selected_account(request)
+        selected_xai_account = (
+            await resolve_xai_oauth_direct_continuation_account(
+                request,
+                data,
+            )
+        )
+        if selected_xai_account is None:
+            selected_xai_account = get_or_bind_xai_oauth_selected_account(
+                request
+            )
     prepared_oa_xai_request = await prepare_oa_xai_request(
         data,
         snapshot_out=snapshot_out,

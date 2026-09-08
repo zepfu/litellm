@@ -7,7 +7,7 @@ client metadata, and bearer material are never accepted as an account binding.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Optional
 
 from fastapi import HTTPException, Request
@@ -29,6 +29,25 @@ _XAI_OAUTH_MANAGED_ROUTE_FAMILIES = frozenset(
         "codex_xai_oauth_responses_adapter",
         "anthropic_xai_oauth_responses_adapter",
         "codex_auto_agent_xai_oauth_responses",
+    }
+)
+_XAI_OAUTH_DIRECT_OWNER_ROUTE_FAMILIES = frozenset(
+    {
+        "xai_oauth",
+        "xai_oauth_api",
+    }
+)
+_XAI_OAUTH_CONTINUATION_ITEM_TYPES = frozenset(
+    {
+        "function_call",
+        "function_call_output",
+        "item_reference",
+        "mcp_approval_request",
+        "mcp_approval_response",
+        "mcp_call",
+        "reasoning",
+        "tool_result",
+        "tool_use",
     }
 )
 
@@ -225,13 +244,308 @@ async def get_xai_oauth_snapshot_for_selected_account(
 
     snapshot = await get_xai_oauth_snapshot_for_record(selected.record)
     expected_identity = selected.record.expected_account_identity
-    actual_identity = getattr(snapshot, "account_identity", None)
+    actual_identity = _clean_string(getattr(snapshot, "account_identity", None))
+    if actual_identity is None:
+        raise XaiOAuthIdentityMismatchError(
+            "Managed xAI OAuth credential does not expose a verified account "
+            f"identity for record '{selected.label}'."
+        )
     if expected_identity is not None and actual_identity != expected_identity:
         raise XaiOAuthIdentityMismatchError(
             "Managed xAI OAuth credential identity does not match the configured "
             f"record '{selected.label}'."
         )
     return snapshot
+
+
+async def resolve_xai_oauth_selected_account_identity(
+    selected: XaiOAuthSelectedAccount,
+    *,
+    snapshot: Any = None,
+) -> XaiOAuthSelectedAccount:
+    """Resolve legacy account identity from one immutable credential snapshot."""
+
+    loaded_snapshot = (
+        snapshot
+        if snapshot is not None
+        else await get_xai_oauth_snapshot_for_selected_account(selected)
+    )
+    actual_identity = _clean_string(
+        getattr(loaded_snapshot, "account_identity", None)
+    )
+    if actual_identity is None:
+        raise XaiOAuthIdentityMismatchError(
+            "Managed xAI OAuth credential does not expose a verified account "
+            f"identity for record '{selected.label}'."
+        )
+    expected_identity = selected.record.expected_account_identity
+    if expected_identity is not None and actual_identity != expected_identity:
+        raise XaiOAuthIdentityMismatchError(
+            "Managed xAI OAuth credential identity does not match the configured "
+            f"record '{selected.label}'."
+        )
+    if expected_identity is not None:
+        return selected
+    return build_xai_oauth_selected_account(
+        replace(selected.record, expected_account_identity=actual_identity)
+    )
+
+
+def _xai_oauth_request_has_continuation_state(
+    value: Any,
+    _seen: Optional[set[int]] = None,
+) -> bool:
+    """Return whether a direct Responses request carries provider state."""
+
+    if isinstance(value, (dict, list)):
+        if _seen is None:
+            _seen = set()
+        value_id = id(value)
+        if value_id in _seen:
+            return False
+        _seen.add(value_id)
+
+    if isinstance(value, dict):
+        for key in (
+            "previous_response_id",
+            "call_id",
+            "tool_call_id",
+            "item_id",
+        ):
+            if value.get(key):
+                return True
+        item_type = value.get("type")
+        if (
+            isinstance(item_type, str)
+            and item_type.strip().casefold() in _XAI_OAUTH_CONTINUATION_ITEM_TYPES
+        ):
+            return True
+        if value.get("role") == "tool" or value.get("tool_calls"):
+            return True
+        return any(
+            _xai_oauth_request_has_continuation_state(child, _seen)
+            for child in value.values()
+        )
+    if isinstance(value, list):
+        return any(
+            _xai_oauth_request_has_continuation_state(item, _seen)
+            for item in value
+        )
+    return False
+
+
+def _raise_xai_oauth_direct_continuation_redispatch(
+    *,
+    request: Request,
+    session_identity: Optional[str],
+    cache_key: Optional[str],
+    owner_record: Optional[Mapping[str, Any]],
+    failure_phase: str,
+    mismatch_reason: str,
+) -> None:
+    """Raise the common 409 owner response without permitting provider I/O."""
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity,
+    )
+
+    owner_id = (
+        owner_record.get("owner")
+        if isinstance(owner_record, Mapping)
+        else None
+    )
+    owner_attributes = (
+        session_affinity._owner_attributes(owner_record)
+        if isinstance(owner_record, Mapping)
+        else {}
+    )
+    session_affinity.raise_session_owner_redispatch_required(
+        session_identity=session_identity,
+        candidate={
+            "provider": owner_attributes.get("provider"),
+            "route_family": owner_attributes.get("route_family"),
+            "xai_oauth_account_label": owner_attributes.get("account_label"),
+            "xai_oauth_account_hash": owner_attributes.get("account_hash"),
+            "xai_oauth_scope_identity": owner_attributes.get("account_scope"),
+            "xai_oauth_lane_key": owner_attributes.get("account_lane"),
+        },
+        failure_phase=failure_phase,
+        guard=session_affinity.SessionOwnerGuardResult(
+            decision=session_affinity.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+            session_identity=session_identity,
+            cache_key=cache_key,
+            owner_record=(
+                dict(owner_record)
+                if isinstance(owner_record, Mapping)
+                else None
+            ),
+            owner_id=owner_id if isinstance(owner_id, str) else None,
+            mismatch_reason=mismatch_reason,
+            provenance=session_affinity.build_session_owner_provenance(
+                session_identity=session_identity,
+                decision="redispatch_required",
+                owner_record=owner_record,
+                owner_id=owner_id if isinstance(owner_id, str) else None,
+                mismatch_reason=mismatch_reason,
+                cache_key=cache_key,
+            ),
+        ),
+        request=request,
+        attempted_provider_call=False,
+    )
+
+
+async def resolve_xai_oauth_direct_continuation_account(
+    request: Request,
+    request_body: Mapping[str, Any],
+) -> Optional[XaiOAuthSelectedAccount]:
+    """Validate durable owner identity before binding a direct continuation."""
+
+    if not _xai_oauth_request_has_continuation_state(request_body):
+        return None
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity,
+    )
+
+    session_identity = session_affinity.resolve_canonical_session_identity(
+        request,
+        request_body,
+    )
+    if session_identity is None:
+        _raise_xai_oauth_direct_continuation_redispatch(
+            request=request,
+            session_identity=None,
+            cache_key=None,
+            owner_record=None,
+            failure_phase="xai_direct_continuation_session_identity_missing",
+            mismatch_reason="session_owner: missing canonical session identity",
+        )
+
+    owner_record, cache_key, owner_error = (
+        await session_affinity.get_session_owner_record(
+            session_identity=session_identity,
+            request=request,
+            wait_for_foreign_reservation=False,
+        )
+    )
+    if owner_error is not None:
+        _raise_xai_oauth_direct_continuation_redispatch(
+            request=request,
+            session_identity=session_identity,
+            cache_key=cache_key,
+            owner_record=owner_record,
+            failure_phase="xai_direct_continuation_owner_redis_unavailable",
+            mismatch_reason=owner_error,
+        )
+    if owner_record is None:
+        _raise_xai_oauth_direct_continuation_redispatch(
+            request=request,
+            session_identity=session_identity,
+            cache_key=cache_key,
+            owner_record=None,
+            failure_phase="xai_direct_continuation_owner_missing",
+            mismatch_reason="session_owner: durable owner record is missing",
+        )
+
+    owner_state = session_affinity._record_state(owner_record)
+    if owner_state != "owned":
+        failure_phase = (
+            "xai_direct_continuation_owner_reserved"
+            if owner_state == "reserved"
+            else "xai_direct_continuation_owner_malformed"
+        )
+        mismatch_reason = (
+            "session_owner: session has an active competing reservation"
+            if owner_state == "reserved"
+            else "session_owner: malformed ownership state"
+        )
+        _raise_xai_oauth_direct_continuation_redispatch(
+            request=request,
+            session_identity=session_identity,
+            cache_key=cache_key,
+            owner_record=owner_record,
+            failure_phase=failure_phase,
+            mismatch_reason=mismatch_reason,
+        )
+
+    owner_attributes = session_affinity._owner_attributes(owner_record)
+    expected_route = _clean_string(owner_attributes.get("route_family"))
+    if (
+        _clean_string(owner_attributes.get("provider")) != "xai"
+        or expected_route not in _XAI_OAUTH_DIRECT_OWNER_ROUTE_FAMILIES
+        or _clean_string(owner_attributes.get("endpoint_contract"))
+        != "openai_responses"
+        or _clean_string(owner_attributes.get("state_format"))
+        != "openai_responses"
+    ):
+        _raise_xai_oauth_direct_continuation_redispatch(
+            request=request,
+            session_identity=session_identity,
+            cache_key=cache_key,
+            owner_record=owner_record,
+            failure_phase="xai_direct_continuation_owner_route_mismatch",
+            mismatch_reason=(
+                "session_owner: durable owner is not the managed xAI OAuth "
+                "Responses route"
+            ),
+        )
+
+    owner_label = _clean_string(owner_attributes.get("account_label"))
+    owner_hash = _clean_string(owner_attributes.get("account_hash"))
+    owner_lane = _clean_string(owner_attributes.get("account_lane"))
+    owner_scope = _clean_string(owner_attributes.get("account_scope"))
+    if not all((owner_label, owner_hash, owner_lane, owner_scope)):
+        _raise_xai_oauth_direct_continuation_redispatch(
+            request=request,
+            session_identity=session_identity,
+            cache_key=cache_key,
+            owner_record=owner_record,
+            failure_phase="xai_direct_continuation_owner_account_mismatch",
+            mismatch_reason=(
+                "session_owner: durable xAI OAuth owner is missing account identity"
+            ),
+        )
+    assert owner_label is not None
+    assert owner_hash is not None
+    assert owner_lane is not None
+    assert owner_scope is not None
+
+    try:
+        selected = build_xai_oauth_selected_account(
+            select_xai_oauth_account_record(label=owner_label)
+        )
+        selected = await resolve_xai_oauth_selected_account_identity(selected)
+    except Exception as exc:  # noqa: BLE001
+        _raise_xai_oauth_direct_continuation_redispatch(
+            request=request,
+            session_identity=session_identity,
+            cache_key=cache_key,
+            owner_record=owner_record,
+            failure_phase="xai_direct_continuation_account_unavailable",
+            mismatch_reason=str(exc),
+        )
+
+    if (
+        selected.label != owner_label
+        or selected.account_hash != owner_hash
+        or selected.lane_key != owner_lane
+        or selected.scope_identity != owner_scope
+    ):
+        _raise_xai_oauth_direct_continuation_redispatch(
+            request=request,
+            session_identity=session_identity,
+            cache_key=cache_key,
+            owner_record=owner_record,
+            failure_phase="xai_direct_continuation_owner_account_mismatch",
+            mismatch_reason=(
+                "session_owner: durable xAI OAuth account identity does not "
+                "match configured inventory"
+            ),
+        )
+
+    setattr(request.state, _XAI_OAUTH_SELECTED_ACCOUNT_STATE, selected)
+    return selected
 
 
 def xai_oauth_selected_account_metadata(
@@ -298,6 +612,8 @@ __all__ = [
     "get_or_bind_xai_oauth_selected_account",
     "get_xai_oauth_snapshot_for_selected_account",
     "is_managed_xai_oauth_candidate",
+    "resolve_xai_oauth_direct_continuation_account",
+    "resolve_xai_oauth_selected_account_identity",
     "select_xai_oauth_account_record",
     "validated_xai_oauth_server_account_metadata",
     "xai_oauth_account_lane_key",
