@@ -783,6 +783,54 @@ def _extract_xai_grok_oidc_account_hash(metadata: Dict[str, Any]) -> Optional[st
     return None
 
 
+def _resolve_xai_rate_limit_observation_identity(
+    *,
+    context: Dict[str, Any],
+    metadata: Dict[str, Any],
+    native: bool,
+) -> Optional[Dict[str, Any]]:
+    fallback_model = (
+        _clean_non_empty_string(context.get("model"))
+        if context.get("model") != "unknown"
+        else None
+    )
+    if native:
+        return {
+            "account_hash": _extract_xai_grok_oidc_account_hash(metadata),
+            "scope_identity": None,
+            "account_binding_evidence": {},
+            "model": (
+                _clean_non_empty_string(metadata.get("grok_model_override"))
+                or _clean_non_empty_string(metadata.get("model_group"))
+                or fallback_model
+            ),
+        }
+
+    server_account_metadata = _validated_xai_oauth_server_account_metadata(
+        metadata
+    )
+    if server_account_metadata is None:
+        return None
+    account_hash = str(server_account_metadata["xai_oauth_account_hash"])
+    scope_identity = str(server_account_metadata["xai_oauth_scope_identity"])
+    account_label = str(server_account_metadata["xai_oauth_account_label"])
+    account_lane = str(server_account_metadata["xai_oauth_lane_key"])
+    return {
+        "account_hash": account_hash,
+        "scope_identity": scope_identity,
+        "account_binding_evidence": {
+            "xai_oauth_server_account_binding": True,
+            "account_identity_source": "xai_oauth_inventory_record",
+            "account_label": account_label,
+            "account_hash": account_hash,
+            "account_lane": account_lane,
+            "scope_identity": scope_identity,
+        },
+        "model": _clean_non_empty_string(metadata.get("xai_oauth_public_model"))
+        or fallback_model,
+    }
+
+
 def _xai_oauth_header_remaining_pct(
     total: Optional[int],
     remaining: Optional[int],
@@ -841,37 +889,17 @@ def _extract_xai_header_rate_limit_observations(
         return []
     raw_metadata = context.get("metadata")
     metadata: Dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
-    if native:
-        account_hash = _extract_xai_grok_oidc_account_hash(metadata)
-        scope_identity = None
-        account_label = None
-        account_lane = None
-        model = (
-            _clean_non_empty_string(metadata.get("grok_model_override"))
-            or _clean_non_empty_string(metadata.get("model_group"))
-            or (
-                _clean_non_empty_string(context.get("model"))
-                if context.get("model") != "unknown"
-                else None
-            )
-        )
-    else:
-        server_account_metadata = _validated_xai_oauth_server_account_metadata(
-            metadata
-        )
-        if server_account_metadata is None:
-            return []
-        account_hash = str(server_account_metadata["xai_oauth_account_hash"])
-        scope_identity = str(
-            server_account_metadata["xai_oauth_scope_identity"]
-        )
-        account_label = str(server_account_metadata["xai_oauth_account_label"])
-        account_lane = str(server_account_metadata["xai_oauth_lane_key"])
-        model = _clean_non_empty_string(metadata.get("xai_oauth_public_model")) or (
-            _clean_non_empty_string(context.get("model"))
-            if context.get("model") != "unknown"
-            else None
-        )
+    identity = _resolve_xai_rate_limit_observation_identity(
+        context=context,
+        metadata=metadata,
+        native=native,
+    )
+    if identity is None:
+        return []
+    account_hash = identity["account_hash"]
+    scope_identity = identity["scope_identity"]
+    account_binding_evidence = identity["account_binding_evidence"]
+    model = identity["model"]
     accepted_sources = {source_name}
     if native:
         # Native responses written before XAI-027 used the managed key. Read
@@ -883,18 +911,6 @@ def _extract_xai_header_rate_limit_observations(
         "metadata_billing_period_end",
         "metadata_xai_oauth_billing_period_end",
     }
-    account_binding_evidence = (
-        {
-            "xai_oauth_server_account_binding": True,
-            "account_identity_source": "xai_oauth_inventory_record",
-            "account_label": account_label,
-            "account_hash": account_hash,
-            "account_lane": account_lane,
-            "scope_identity": scope_identity,
-        }
-        if not native
-        else {}
-    )
     observations: List[Dict[str, Any]] = []
     for candidate in _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result)):
         lower_headers = _rate_limit_header_map(candidate)

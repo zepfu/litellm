@@ -562,7 +562,7 @@ def _attach_kimi_managed_account_publication_telemetry(
     attempt_record["kimi_managed_account_publication"] = telemetry
 
 
-def _update_codex_auto_agent_retryable_attempt_record(
+def _update_codex_auto_agent_retryable_attempt_record(  # noqa: PLR0915
     *,
     attempt_record: dict[str, Any],
     exc: Any,
