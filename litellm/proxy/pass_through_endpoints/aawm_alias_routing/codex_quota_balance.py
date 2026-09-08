@@ -73,6 +73,8 @@ def _window(row: Mapping[str, Any], *, now: float, horizon: float) -> dict[str, 
         "source": row.get("source"),
         "environment": row.get("environment"),
         "quota_key": row.get("quota_key"),
+        "limit_scope": row.get("limit_scope"),
+        "quota_type": row.get("quota_type"),
         "model": row.get("model"),
         "quota_family": row.get("quota_family"),
         "status": row.get("status"),
@@ -133,6 +135,10 @@ def account_evidence(
                 "window_minutes",
             )
         ):
+            if window["exhausted"] and not previous["exhausted"]:
+                # Keep the zero's value and provenance for the hard quota gate.
+                latest[key] = window
+                previous = window
             previous["unusable_reason"] = "conflicting_current_windows"
     windows = list(latest.values())
     weekly = latest.get((environment or "", POLL_SOURCE, family or "", "seven_day"))

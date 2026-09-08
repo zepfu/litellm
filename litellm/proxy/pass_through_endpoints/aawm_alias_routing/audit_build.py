@@ -362,13 +362,11 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
         "candidate_semantic_ineligibility_remaining_seconds",
     ):
         value = candidate.get(field)
-        attempt_local = field in {"quota_balancing", "selection_diagnostics"} or (
-            candidate.get("provider") == _CODEX_AUTO_AGENT_NATIVE_PROVIDER
-            and field in {
-                "quota_snapshot_age_seconds", "quota_windows", "failover_ordinal",
-                "prior_account_outcome", "terminal_reset",
-            }
-        )
+        attempt_local = field in {
+            "quota_balancing", "selection_diagnostics", "quota_snapshot_age_seconds",
+            "quota_windows", "failover_ordinal", "prior_account_outcome",
+            "terminal_reset",
+        }
         if value is None and not attempt_local:
             value = selection.get(field)
         if value is not None:
