@@ -2233,8 +2233,15 @@ class PassThroughStreamingHandler:
         ).strip().lower()
         metadata["aawm_delivered_wire_disposition"] = dict(delivered_snapshot)
         metadata["aawm_delivered_disposition"] = delivered_disposition
-        metadata["aawm_stream_chunk_count"] = 0
-        metadata["aawm_stream_total_bytes"] = 0
+        prefix_chunks = [
+            chunk
+            for chunk in (upstream_prefix_bytes or [])
+            if isinstance(chunk, (bytes, bytearray, memoryview)) and chunk
+        ]
+        upstream_chunk_count = len(prefix_chunks)
+        upstream_byte_count = sum(len(chunk) for chunk in prefix_chunks)
+        metadata["aawm_stream_chunk_count"] = upstream_chunk_count
+        metadata["aawm_stream_total_bytes"] = upstream_byte_count
         metadata["aawm_stream_interrupted"] = delivered_disposition != "completed"
         metadata["aawm_route_rollup_turn_suppressed"] = True
         metadata["aawm_stream_unstarted"] = True
@@ -2249,8 +2256,8 @@ class PassThroughStreamingHandler:
         )
         transfer_extra = {
             "delivered_disposition": delivered_disposition,
-            "upstream_chunk_count": 0,
-            "upstream_byte_count": 0,
+            "upstream_chunk_count": upstream_chunk_count,
+            "upstream_byte_count": upstream_byte_count,
             "downstream_chunk_count": 0,
             "downstream_byte_count": 0,
         }

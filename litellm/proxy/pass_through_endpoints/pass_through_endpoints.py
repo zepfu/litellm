@@ -152,6 +152,7 @@ from .aawm_adapter_runtime.openai_responses_wire import (
     OpenAIResponsesBufferedResponse,
     OpenAIResponsesStreamingResponse,
     OpenAIResponsesWireDisposition,
+    OpenAIResponsesWireState,
     OpenAIResponsesWireTrace,
     bind_openai_responses_wire_trace_to_request,
     wrap_openai_responses_stream,
@@ -1276,6 +1277,71 @@ def _get_runtime_text_watermark_config() -> Any:
     except Exception:
         payload = None
     return load_text_watermark_config(payload)
+
+
+def _build_native_responses_wrapper_failure_body(
+    *,
+    wire_trace: OpenAIResponsesWireTrace,
+    wrapper_setup_failure: BaseException,
+) -> bytes:
+    """Build one failed terminal while retaining marked policy causes."""
+
+    policy_failure_recorded = wire_trace.record_policy_failure_from_exception(
+        wrapper_setup_failure
+    )
+    failure_metadata = {
+        key: wire_trace.metadata.get(key)
+        for key in (
+            "policy_failure_kind",
+            "policy_failure_code",
+            "policy_failure_class",
+        )
+        if wire_trace.metadata.get(key) is not None
+    }
+    failure_code = (
+        failure_metadata.get("policy_failure_code")
+        or "aawm_stream_wrapper_setup_failed"
+    )
+    failure_type = (
+        failure_metadata.get("policy_failure_class")
+        or failure_metadata.get("policy_failure_kind")
+        or type(wrapper_setup_failure).__name__
+    )
+    failure_message = (
+        (
+            "OpenAI Responses output policy rejected the "
+            f"delivered stream: {failure_code}"
+        )
+        if policy_failure_recorded
+        else str(wrapper_setup_failure)
+    )
+    terminal_payload = {
+        "type": "response.failed",
+        "response": {
+            "object": "response",
+            "status": "failed",
+            "error": {
+                "type": failure_type,
+                "code": failure_code,
+                "message": failure_message,
+                "param": None,
+            },
+            "metadata": failure_metadata,
+        },
+    }
+    wire_trace.terminal_event_type = "response.failed"
+    wire_trace.terminal_selected = True
+    wire_trace.disposition = OpenAIResponsesWireDisposition.FAILED
+    wire_trace.state = OpenAIResponsesWireState.TERMINAL_SELECTED
+    wire_trace._done_body = b"data: [DONE]\n\n"
+    wire_trace.metadata["aawm_stream_wrapper_setup_failed"] = type(
+        wrapper_setup_failure
+    ).__name__
+    return (
+        b"event: response.failed\ndata: "
+        + json.dumps(terminal_payload, separators=(",", ":")).encode("utf-8")
+        + b"\n\ndata: [DONE]\n\n"
+    )
 
 
 def _is_passthrough_output_policy_exception(exc: BaseException) -> bool:
@@ -5701,30 +5767,44 @@ async def pass_through_request(  # noqa: PLR0915
                     processed_chunks,
                     responses_function_name_rewrite,
                 )
-            processed_chunks = maybe_wrap_passthrough_responses_stream(
-                processed_chunks,
-                request_context=output_guard_request_context,
-                upstream_response=response,
-            )
-            processed_chunks = maybe_wrap_passthrough_watermark_responses_stream(
-                processed_chunks,
-                config=_get_runtime_text_watermark_config(),
-                success_handler_kwargs=kwargs,
-                endpoint=_watermark_endpoint_from_path(
-                    url, getattr(getattr(request, "url", None), "path", None)
-                ),
-            )
             wrapper_setup_failure: Optional[BaseException] = None
             if is_native_openai_responses_route:
                 try:
-                    await processed_chunks.__anext__()
-                except StopAsyncIteration:
-                    processed_chunks = iter(())
+                    processed_chunks = maybe_wrap_passthrough_responses_stream(
+                        processed_chunks,
+                        request_context=output_guard_request_context,
+                        upstream_response=response,
+                    )
+                    processed_chunks = (
+                        maybe_wrap_passthrough_watermark_responses_stream(
+                            processed_chunks,
+                            config=_get_runtime_text_watermark_config(),
+                            success_handler_kwargs=kwargs,
+                            endpoint=_watermark_endpoint_from_path(
+                                url,
+                                getattr(getattr(request, "url", None), "path", None),
+                            ),
+                        )
+                    )
                 except (asyncio.CancelledError, httpx.ReadTimeout):
                     raise
                 except BaseException as exc:
                     wrapper_setup_failure = exc
                     processed_chunks = iter(())
+            else:
+                processed_chunks = maybe_wrap_passthrough_responses_stream(
+                    processed_chunks,
+                    request_context=output_guard_request_context,
+                    upstream_response=response,
+                )
+                processed_chunks = maybe_wrap_passthrough_watermark_responses_stream(
+                    processed_chunks,
+                    config=_get_runtime_text_watermark_config(),
+                    success_handler_kwargs=kwargs,
+                    endpoint=_watermark_endpoint_from_path(
+                        url, getattr(getattr(request, "url", None), "path", None)
+                    ),
+                )
             response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
                 headers=response.headers,
                 litellm_call_id=litellm_call_id,
@@ -5753,6 +5833,10 @@ async def pass_through_request(  # noqa: PLR0915
                             else None
                         ),
                     )
+                bind_openai_responses_wire_trace_to_request(
+                    request,
+                    wire_trace,
+                )
                 if stream_bookkeeping_state is not None:
 
                     async def _run_post_delivery_bookkeeping(
@@ -5785,39 +5869,11 @@ async def pass_through_request(  # noqa: PLR0915
                         _run_post_delivery_bookkeeping
                     )
                     if wrapper_setup_failure is not None:
-                        terminal_payload = {
-                            "type": "response.failed",
-                            "response": {
-                                "object": "response",
-                                "status": "failed",
-                                "error": {
-                                    "type": type(wrapper_setup_failure).__name__,
-                                    "code": "aawm_stream_wrapper_setup_failed",
-                                    "message": str(wrapper_setup_failure),
-                                    "param": None,
-                                },
-                                "metadata": {},
-                            },
-                        }
-                        terminal_chunks = [
-                            (
-                                b"event: response.failed\ndata: "
-                                + json.dumps(
-                                    terminal_payload,
-                                    separators=(",", ":"),
-                                ).encode("utf-8")
-                                + b"\n\ndata: [DONE]\n\n"
-                            )
-                        ]
-                        wire_trace.terminal_event_type = "response.failed"
-                        wire_trace.terminal_selected = True
-                        wire_trace.terminal_sent = True
-                        wire_trace.terminal_wire_committed = True
-                        wire_trace.metadata[
-                            "aawm_stream_wrapper_setup_failed"
-                        ] = type(wrapper_setup_failure).__name__
                         stream_response = OpenAIResponsesBufferedResponse(
-                            content=b"".join(terminal_chunks),
+                            content=_build_native_responses_wrapper_failure_body(
+                                wire_trace=wire_trace,
+                                wrapper_setup_failure=wrapper_setup_failure,
+                            ),
                             wire_trace=wire_trace,
                             disposition=OpenAIResponsesWireDisposition.FAILED,
                             on_disposition=_on_native_wire_disposition,
@@ -5825,10 +5881,6 @@ async def pass_through_request(  # noqa: PLR0915
                             headers=response_headers,
                         )
                     else:
-                        bind_openai_responses_wire_trace_to_request(
-                            request,
-                            wire_trace,
-                        )
                         stream_response = OpenAIResponsesStreamingResponse(
                             processed_chunks,
                             wire_trace=wire_trace,
@@ -6070,19 +6122,44 @@ async def pass_through_request(  # noqa: PLR0915
                     processed_chunks,
                     responses_function_name_rewrite,
                 )
-            processed_chunks = maybe_wrap_passthrough_responses_stream(
-                processed_chunks,
-                request_context=output_guard_request_context,
-                upstream_response=response,
-            )
-            processed_chunks = maybe_wrap_passthrough_watermark_responses_stream(
-                processed_chunks,
-                config=_get_runtime_text_watermark_config(),
-                success_handler_kwargs=kwargs,
-                endpoint=_watermark_endpoint_from_path(
-                    url, getattr(getattr(request, "url", None), "path", None)
-                ),
-            )
+            wrapper_setup_failure: Optional[BaseException] = None
+            if is_native_openai_responses_route:
+                try:
+                    processed_chunks = maybe_wrap_passthrough_responses_stream(
+                        processed_chunks,
+                        request_context=output_guard_request_context,
+                        upstream_response=response,
+                    )
+                    processed_chunks = (
+                        maybe_wrap_passthrough_watermark_responses_stream(
+                            processed_chunks,
+                            config=_get_runtime_text_watermark_config(),
+                            success_handler_kwargs=kwargs,
+                            endpoint=_watermark_endpoint_from_path(
+                                url,
+                                getattr(getattr(request, "url", None), "path", None),
+                            ),
+                        )
+                    )
+                except (asyncio.CancelledError, httpx.ReadTimeout):
+                    raise
+                except BaseException as exc:
+                    wrapper_setup_failure = exc
+                    processed_chunks = iter(())
+            else:
+                processed_chunks = maybe_wrap_passthrough_responses_stream(
+                    processed_chunks,
+                    request_context=output_guard_request_context,
+                    upstream_response=response,
+                )
+                processed_chunks = maybe_wrap_passthrough_watermark_responses_stream(
+                    processed_chunks,
+                    config=_get_runtime_text_watermark_config(),
+                    success_handler_kwargs=kwargs,
+                    endpoint=_watermark_endpoint_from_path(
+                        url, getattr(getattr(request, "url", None), "path", None)
+                    ),
+                )
             response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
                 headers=response.headers,
                 litellm_call_id=litellm_call_id,
@@ -6098,17 +6175,22 @@ async def pass_through_request(  # noqa: PLR0915
                         trace=trace,
                     )
 
-                processed_chunks, wire_trace = wrap_openai_responses_stream(
-                    processed_chunks,
-                    upstream_response=response,
-                    on_disposition=_on_native_wire_disposition,
-                    trace=wire_trace,
-                    model=(
-                        str(provider_bound_body.get("model"))
-                        if isinstance(provider_bound_body, dict)
-                        and provider_bound_body.get("model") is not None
-                        else None
-                    ),
+                if wrapper_setup_failure is None:
+                    processed_chunks, wire_trace = wrap_openai_responses_stream(
+                        processed_chunks,
+                        upstream_response=response,
+                        on_disposition=_on_native_wire_disposition,
+                        trace=wire_trace,
+                        model=(
+                            str(provider_bound_body.get("model"))
+                            if isinstance(provider_bound_body, dict)
+                            and provider_bound_body.get("model") is not None
+                            else None
+                        ),
+                    )
+                bind_openai_responses_wire_trace_to_request(
+                    request,
+                    wire_trace,
                 )
                 if stream_bookkeeping_state is not None:
 
@@ -6141,14 +6223,26 @@ async def pass_through_request(  # noqa: PLR0915
                     wire_trace.register_post_finalization_callback(
                         _run_post_delivery_bookkeeping
                     )
-                bind_openai_responses_wire_trace_to_request(request, wire_trace)
-                stream_response = OpenAIResponsesStreamingResponse(
-                    processed_chunks,
-                    wire_trace=wire_trace,
-                    on_disposition=_on_native_wire_disposition,
-                    headers=response_headers,
-                    status_code=response.status_code,
-                )
+                    if wrapper_setup_failure is not None:
+                        stream_response = OpenAIResponsesBufferedResponse(
+                            content=_build_native_responses_wrapper_failure_body(
+                                wire_trace=wire_trace,
+                                wrapper_setup_failure=wrapper_setup_failure,
+                            ),
+                            wire_trace=wire_trace,
+                            disposition=OpenAIResponsesWireDisposition.FAILED,
+                            on_disposition=_on_native_wire_disposition,
+                            status_code=status.HTTP_502_BAD_GATEWAY,
+                            headers=response_headers,
+                        )
+                    else:
+                        stream_response = OpenAIResponsesStreamingResponse(
+                            processed_chunks,
+                            wire_trace=wire_trace,
+                            on_disposition=_on_native_wire_disposition,
+                            headers=response_headers,
+                            status_code=response.status_code,
+                        )
             else:
                 stream_response = StreamingResponse(
                     processed_chunks,
