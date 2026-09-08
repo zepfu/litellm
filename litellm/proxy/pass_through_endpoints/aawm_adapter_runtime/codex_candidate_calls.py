@@ -3357,6 +3357,8 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         _record_adapted_completed_route_rollup_turn,
     )
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.tool_call_restore import (
+        _advertised_namespace_tool_argument_schemas,
+        _advertised_namespace_tool_function_adapter_map,
         _restore_adapted_namespace_tool_calls_in_response_body,
     )
     from litellm.proxy.pass_through_endpoints.aawm_request_policy.codex_tool_policy import (
@@ -3438,6 +3440,24 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         and isinstance(request_tools, list)
     ):
         restoration_request_body["tools"] = copy.deepcopy(request_tools)
+    namespace_by_name = _advertised_namespace_tool_function_adapter_map(
+        restoration_request_body,
+        adapter_model=adapter_model,
+    )
+    if namespace_by_name.get("wait_agent") == "collaboration":
+        argument_schemas = _advertised_namespace_tool_argument_schemas(
+            restoration_request_body
+        )
+        wait_schema = argument_schemas.get("wait_agent", {})
+        wait_properties = wait_schema.get("properties")
+        if isinstance(wait_properties, dict):
+            timeout_schema = wait_properties.get("timeout_ms")
+            if (
+                isinstance(timeout_schema, dict)
+                and timeout_schema.get("type") == "number"
+            ):
+                # Stock Codex advertises number but deserializes this field as i64.
+                timeout_schema["type"] = "integer"
 
     retained_session = (
         replay_state.get("retained_session")
