@@ -112,10 +112,8 @@ export function claimTrigger(
     triggerId: state.pending?.triggerId ?? `scheduled-${state.nextTickIndex}-${context.at}`,
     kind: triggerKindForClaim(state.pending, dueCount),
     missedCount: (state.pending?.missedCount ?? 0) + dueCount,
-    dueAt: dueCount > 0
-      ? state.nextDueAt
-      : state.pending?.dueAt ?? null,
-    jitterMs: state.pending?.jitterMs ?? state.jitterMs,
+    dueAt: claimedDueAt(state.pending, state.nextDueAt, dueCount),
+    jitterMs: claimedJitterMs(state.pending, state.jitterMs, dueCount),
     claimedAt: context.at,
     fencingToken,
   };
@@ -124,7 +122,7 @@ export function claimTrigger(
     : state.nextTickIndex;
   return {
     trigger,
-    resumed: false,
+    resumed: state.pending?.triggerId !== undefined,
     state: {
       ...state,
       nextTickIndex,
@@ -168,7 +166,7 @@ export function completeTrigger(
     pending = pendingWithRequestedAt(
       combinePending(state.pending, {
         kind: state.active.kind,
-        missedCount: Math.max(1, state.active.missedCount),
+        missedCount: state.active.missedCount,
         triggerId: state.active.triggerId,
         dueAt: state.active.dueAt,
         jitterMs: state.active.jitterMs,
@@ -247,6 +245,7 @@ export function reconcileSchedule(
 ): ScheduleState {
   validateScope(state.scope);
   validateEpoch(context.at, "at");
+  const caughtUp = materializeDue(state, context);
   const interval = parseRefreshInterval(options.interval ?? state.interval);
   const jitterSeconds = validateJitterSeconds(options.jitterSeconds ?? state.jitterSeconds);
   const anchorAt = validateEpoch(options.anchorAt ?? state.anchorAt, "anchorAt");
@@ -255,73 +254,37 @@ export function reconcileSchedule(
   const jitterChanged = jitterSeconds !== state.jitterSeconds;
   const configChanged = intervalChanged || anchorChanged || jitterChanged;
 
-  const base = configChanged
-    ? rebaseSchedule(state, {
-        intervalSpec: interval.spec,
-        intervalMs: interval.milliseconds,
-        anchorAt,
-        jitterSeconds,
-        jitterMs: jitterChanged ? sampleJitter(jitterSeconds) : state.jitterMs,
-        reanchor: anchorChanged,
-      }, context.at)
-    : materializeDue(state, context);
-
   if (!configChanged) {
-    return base;
-  }
-  return materializeDue(base, context);
-}
-
-function rebaseSchedule(
-  state: ScheduleState,
-  config: {
-    intervalSpec: string;
-    intervalMs: number;
-    anchorAt: number;
-    jitterSeconds: number;
-    jitterMs: number;
-    reanchor: boolean;
-  },
-  now: number,
-): ScheduleState {
-  if (config.reanchor) {
-    const nextTickIndex = 1;
-    return {
-      ...state,
-      interval: config.intervalSpec,
-      intervalMs: config.intervalMs,
-      anchorAt: config.anchorAt,
-      jitterSeconds: config.jitterSeconds,
-      jitterMs: config.jitterMs,
-      nextTickIndex,
-      nextDueAt: scheduledDueAt(
-        config.anchorAt,
-        config.intervalMs,
-        nextTickIndex,
-        config.jitterMs,
-      ),
-    };
+    return caughtUp;
   }
 
-  const elapsed = now - config.anchorAt - config.jitterMs;
-  const nextTickIndex = elapsed < 0
-    ? 1
-    : Math.max(1, Math.floor(elapsed / config.intervalMs) + 1);
-  return {
-    ...state,
-    interval: config.intervalSpec,
-    intervalMs: config.intervalMs,
-    anchorAt: config.anchorAt,
-    jitterSeconds: config.jitterSeconds,
-    jitterMs: config.jitterMs,
+  const jitterMs = jitterChanged ? sampleJitter(jitterSeconds) : state.jitterMs;
+  const nextTickIndex = intervalChanged
+    ? firstFutureTickIndex(
+        anchorAt,
+        interval.milliseconds,
+        jitterMs,
+        context.at,
+      )
+    : anchorChanged
+      ? 1
+      : caughtUp.nextTickIndex;
+  const reconfigured = {
+    ...caughtUp,
+    interval: interval.spec,
+    intervalMs: interval.milliseconds,
+    anchorAt,
+    jitterSeconds,
+    jitterMs,
     nextTickIndex,
     nextDueAt: scheduledDueAt(
-      config.anchorAt,
-      config.intervalMs,
+      anchorAt,
+      interval.milliseconds,
       nextTickIndex,
-      config.jitterMs,
+      jitterMs,
     ),
   };
+  return materializeDue(reconfigured, context);
 }
 
 function combinePending(
@@ -330,14 +293,15 @@ function combinePending(
     Partial<Pick<SchedulePending, "triggerId" | "dueAt" | "jitterMs">>,
 ): SchedulePending {
   const combined: SchedulePending = {
-    kind: current === null || current.kind === incoming.kind ? incoming.kind : "coalesced",
+    kind: pendingKind(current, incoming),
     missedCount: (current?.missedCount ?? 0) + incoming.missedCount,
     requestedAt: current?.requestedAt ?? 0,
   };
   const triggerId = current?.triggerId ?? incoming.triggerId;
-  const dueAt = current?.dueAt ?? incoming.dueAt;
-  const jitterMs = current?.jitterMs ?? incoming.jitterMs;
-  const hasRetryMetadata = triggerId !== undefined || dueAt !== undefined || jitterMs !== undefined;
+  const dueAt = mergedDueAt(current, incoming);
+  const jitterMs = mergedJitterMs(current, incoming, dueAt);
+  const hasRetryMetadata =
+    triggerId !== undefined || dueAt !== undefined || jitterMs !== undefined;
   if (!hasRetryMetadata) {
     return combined;
   }
@@ -364,35 +328,96 @@ function pendingWithRequestedAt(
   pending: SchedulePending,
   requestedAt: number,
 ): SchedulePending {
-  if (
-    pending.triggerId === undefined &&
-    pending.dueAt === undefined &&
-    pending.jitterMs === undefined
-  ) {
-    return {
-      kind: pending.kind,
-      missedCount: pending.missedCount,
-      requestedAt,
-    };
-  }
-  return {
-    kind: pending.kind,
-    missedCount: pending.missedCount,
-    requestedAt,
-    ...(pending.triggerId === undefined ? {} : { triggerId: pending.triggerId }),
-    ...(pending.dueAt === undefined ? {} : { dueAt: pending.dueAt }),
-    ...(pending.jitterMs === undefined ? {} : { jitterMs: pending.jitterMs }),
-  };
+  return { ...pending, requestedAt };
 }
 
 function triggerKindForClaim(
   pending: SchedulePending | null,
   dueCount: number,
 ): TriggerKind {
-  if (!pending || (pending.missedCount === 0 && dueCount === 0)) {
+  if (dueCount === 0) {
     return pending?.kind ?? "scheduled";
   }
+  if (!pending || (pending.kind === "scheduled" && pending.triggerId === undefined)) {
+    return "scheduled";
+  }
   return "coalesced";
+}
+
+function pendingKind(
+  current: SchedulePending | null,
+  incoming: Pick<SchedulePending, "kind" | "missedCount"> &
+    Partial<Pick<SchedulePending, "triggerId" | "dueAt" | "jitterMs">>,
+): TriggerKind {
+  if (current === null) {
+    return incoming.kind;
+  }
+  if (current.triggerId !== undefined || incoming.triggerId !== undefined) {
+    return "coalesced";
+  }
+  return current.kind === incoming.kind ? incoming.kind : "coalesced";
+}
+
+function mergedDueAt(
+  current: SchedulePending | null,
+  incoming: Partial<Pick<SchedulePending, "dueAt">>,
+): number | null | undefined {
+  if (current === null) {
+    return incoming.dueAt;
+  }
+  if (current.dueAt === undefined) {
+    return undefined;
+  }
+  if (current.dueAt === null) {
+    return incoming.dueAt === undefined ? null : incoming.dueAt;
+  }
+  if (incoming.dueAt === undefined || incoming.dueAt === null) {
+    return current.dueAt;
+  }
+  return Math.min(current.dueAt, incoming.dueAt);
+}
+
+function mergedJitterMs(
+  current: SchedulePending | null,
+  incoming: Partial<Pick<SchedulePending, "dueAt" | "jitterMs">>,
+  dueAt: number | null | undefined,
+): number | undefined {
+  if (dueAt === undefined || dueAt === null) {
+    return undefined;
+  }
+  if (
+    current?.dueAt !== undefined &&
+    current.dueAt !== null &&
+    current.dueAt <= dueAt
+  ) {
+    return current.jitterMs;
+  }
+  return incoming.jitterMs;
+}
+
+function claimedDueAt(
+  pending: SchedulePending | null,
+  nextDueAt: number,
+  dueCount: number,
+): number | null {
+  if (pending?.dueAt === undefined) {
+    return pending === null && dueCount > 0 ? nextDueAt : null;
+  }
+  if (pending.dueAt === null) {
+    return dueCount > 0 ? nextDueAt : null;
+  }
+  return dueCount > 0 ? Math.min(pending.dueAt, nextDueAt) : pending.dueAt;
+}
+
+function claimedJitterMs(
+  pending: SchedulePending | null,
+  scheduleJitterMs: number,
+  dueCount: number,
+): number {
+  if (pending?.dueAt === undefined || pending.dueAt === null) {
+    return dueCount > 0 ? scheduleJitterMs : pending?.jitterMs ?? scheduleJitterMs;
+  }
+  return pending.jitterMs ?? scheduleJitterMs;
 }
 
 function countDueTicks(state: ScheduleState, now: number): number {
@@ -449,6 +474,15 @@ function retryDeadline(at: number, retryAfterMs: number | null): number | null {
     return null;
   }
   return addDuration(at, retryAfterMs, "retryAfterMs");
+}
+
+function firstFutureTickIndex(
+  anchorAt: number,
+  intervalMs: number,
+  jitterMs: number,
+  now: number,
+): number {
+  return Math.max(1, Math.floor((now - anchorAt - jitterMs) / intervalMs) + 1);
 }
 
 function addDuration(at: number, duration: number, label: string): number {

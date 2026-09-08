@@ -16,7 +16,7 @@ import type {
 
 export interface BridgeTransport {
   request(
-    operation: "loadState" | "compareAndSetState" | "recoverAuthentication",
+    operation: "loadState" | "compareAndSetState",
     payload: unknown,
   ): Promise<BridgeResult>;
 }
@@ -114,12 +114,6 @@ export class ScheduleBridgeStore {
     scope: ScheduleScope,
     at: number,
   ): Promise<ScheduleMutationResult> {
-    validateScope(scope);
-    validateEpoch(at, "at");
-    await this.transport.request("recoverAuthentication", {
-      kind: "authRecovery",
-      scope,
-    });
     return this.mutate(scope, at, (state) => {
       const current = requireState(scope, state);
       const result = scheduleTransitions.recoverAuthentication(current, { at });
