@@ -4508,47 +4508,43 @@ async def ensure_session_owner_guard_for_request(
             == _strip_legacy_affinity_prefixes(resolved_session_identity)
         )
         if not identities_match:
-            if active_lease.held_reservation:
-                mismatch_reason = (
-                    "session_owner: request lease identity does not match "
-                    "the requested session identity"
+            mismatch_reason = (
+                "session_owner: request lease identity does not match "
+                "the requested session identity"
+            )
+            mismatch_cache_key = (
+                build_aawm_alias_routing_session_owner_cache_key(
+                    session_identity=resolved_session_identity
                 )
-                mismatch_cache_key = (
-                    build_aawm_alias_routing_session_owner_cache_key(
-                        session_identity=resolved_session_identity
-                    )
-                    if resolved_session_identity is not None
-                    else None
-                )
-                guard = SessionOwnerGuardResult(
-                    decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                if resolved_session_identity is not None
+                else None
+            )
+            guard = SessionOwnerGuardResult(
+                decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                session_identity=resolved_session_identity,
+                cache_key=mismatch_cache_key,
+                owner_id=active_lease.owner_id,
+                reservation_token=active_lease.reservation_token,
+                mismatch_reason=mismatch_reason,
+                provenance=build_session_owner_provenance(
                     session_identity=resolved_session_identity,
-                    cache_key=mismatch_cache_key,
+                    decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,
                     owner_id=active_lease.owner_id,
-                    reservation_token=active_lease.reservation_token,
                     mismatch_reason=mismatch_reason,
-                    provenance=build_session_owner_provenance(
-                        session_identity=resolved_session_identity,
-                        decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,
-                        owner_id=active_lease.owner_id,
-                        mismatch_reason=mismatch_reason,
-                        cache_key=mismatch_cache_key,
-                        reservation_token=active_lease.reservation_token,
-                    ),
+                    cache_key=mismatch_cache_key,
+                    reservation_token=active_lease.reservation_token,
+                ),
+            )
+            if raise_on_redispatch:
+                raise_session_owner_redispatch_required(
+                    session_identity=resolved_session_identity,
+                    guard=guard,
+                    alias_model=alias_model,
+                    candidate=requested_attributes or candidate,
+                    failure_phase="session_owner_request_lease_identity_conflict",
+                    request=request,
                 )
-                if raise_on_redispatch:
-                    raise_session_owner_redispatch_required(
-                        session_identity=resolved_session_identity,
-                        guard=guard,
-                        alias_model=alias_model,
-                        candidate=requested_attributes or candidate,
-                        failure_phase="session_owner_request_lease_identity_conflict",
-                        request=request,
-                    )
-                return guard
-            # A non-held lease does not authorize the new identity. Let the
-            # new guard result replace it instead of donating stale state.
-            active_lease = None
+            return guard
     token = active_lease.reservation_token if active_lease is not None else None
     guard = await guard_session_owner_before_egress(
         session_identity=resolved_session_identity,
