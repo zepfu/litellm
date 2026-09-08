@@ -1288,6 +1288,19 @@ async def _perform_anthropic_responses_adapter_pass_through(
         state_format="openai_responses",
         failure_phase="session_owner_anthropic_nested_pre_egress",
     )
+    if (
+        config.adapter == _aawm_adapter_config.GROK_NATIVE_RESPONSES.adapter
+        and isinstance(custom_headers, dict)
+    ):
+        from litellm.proxy.pass_through_endpoints.providers.xai.request_prep import (
+            _bind_grok_native_oauth_owner_session_header,
+        )
+
+        custom_headers = _bind_grok_native_oauth_owner_session_header(
+            custom_headers,
+            request=request,
+        )
+        pt_kwargs["custom_headers"] = custom_headers
     upstream_response = await transport(**pt_kwargs)
     return await _finalize_anthropic_responses_adapter_from_config(
         config=config,
