@@ -871,6 +871,7 @@ _HOST_FUNCTION_NAMES = (
     "_perform_codex_auto_agent_oa_xai_responses_request",
     "_maybe_wrap_xai_passthrough_responses_stream",
     "_bind_xai_responses_wire_stream",
+    "_abort_xai_responses_prefetch",
     "_bind_responses_stream_timeout_terminalizer",
     "_validate_codex_auto_agent_openrouter_responses_stream",
     "_perform_codex_auto_agent_openrouter_responses_request",
@@ -945,6 +946,7 @@ def install(
     production facade.
     """
     _mod = globals()
+    host_globals.setdefault("asyncio", asyncio)
     host_globals.setdefault("_emit_aawm_terminal_error", _emit_aawm_terminal_error)
     for _name in (
         "_perform_codex_auto_agent_cursor_agent_request",
@@ -1061,6 +1063,14 @@ def _maybe_wrap_xai_passthrough_responses_stream(
 
     if not isinstance(response, StreamingResponse):
         return response
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.payload_validation import (
+        prepare_responses_prefetch_lifecycle,
+    )
+
+    prepare_responses_prefetch_lifecycle(
+        response,
+        create_wire_trace=True,
+    )
     request_context = output_guard_context_from_passthrough(
         ingress_path=str(getattr(getattr(request, "url", None), "path", "") or ""),
         method=str(getattr(request, "method", None) or "POST"),
@@ -1105,7 +1115,7 @@ def _bind_xai_responses_wire_stream(
         wrap_openai_responses_stream,
     )
 
-    if isinstance(response, OpenAIResponsesStreamingResponse):
+    if getattr(response, "_aawm_responses_wire_coordinator_installed", False):
         return response
 
     source = getattr(response, "body_iterator", None)
@@ -1114,32 +1124,104 @@ def _bind_xai_responses_wire_stream(
     upstream_response = getattr(response, "_aawm_upstream_response", None)
     if upstream_response is None:
         upstream_response = response
-    pre_terminal_validation = getattr(
+    original_pre_terminal_validation = getattr(
         response,
         "_aawm_responses_pre_terminal_validation",
         None,
     )
-    if not callable(pre_terminal_validation):
-        pre_terminal_validation = None
+    if not callable(original_pre_terminal_validation):
+        original_pre_terminal_validation = None
+    on_disposition = getattr(response, "_on_disposition", None)
+    trace = getattr(response, "wire_trace", None)
+    response_holder: dict[str, Any] = {}
+
+    async def _pre_terminal_validation(
+        block: bytes,
+        event_type: str,
+        payload: Optional[dict[str, Any]],
+        disposition: Any,
+    ) -> None:
+        if original_pre_terminal_validation is not None:
+            await original_pre_terminal_validation(
+                block,
+                event_type,
+                payload,
+                disposition,
+            )
+        final_response = response_holder.get("response")
+        state = getattr(response, "_aawm_responses_validation_state", None)
+        if final_response is not None and isinstance(state, dict):
+            setattr(final_response, "_aawm_responses_validation_state", state)
+            setattr(
+                final_response,
+                "_aawm_responses_validation_complete",
+                bool(state.get("complete")),
+            )
+            setattr(
+                final_response,
+                "_aawm_responses_validation_valid",
+                bool(state.get("valid")),
+            )
+
     processed_chunks, wire_trace = wrap_openai_responses_stream(
         source,
         upstream_response=upstream_response,
-        pre_terminal_validation=pre_terminal_validation,
+        on_disposition=on_disposition
+        if callable(on_disposition)
+        else None,
+        pre_terminal_validation=(
+            _pre_terminal_validation
+            if original_pre_terminal_validation is not None
+            else None
+        ),
+        trace=trace,
         model=adapter_model,
     )
+    background_owner = getattr(
+        response,
+        "_aawm_responses_background_owner",
+        None,
+    )
+    wire_trace.register_background_owner(background_owner)
     bind_openai_responses_wire_trace_to_request(request, wire_trace)
     wire_response = OpenAIResponsesStreamingResponse(
         processed_chunks,
         wire_trace=wire_trace,
+        on_disposition=on_disposition
+        if callable(on_disposition)
+        else None,
         headers=dict(response.headers),
         status_code=response.status_code,
         media_type=response.media_type or "text/event-stream",
         background=getattr(response, "background", None),
     )
     for name, value in vars(response).items():
-        if name.startswith("_aawm_"):
+        if name.startswith("_aawm_") or name == "_on_disposition":
             setattr(wire_response, name, value)
+    wire_response.wire_trace = wire_trace
+    response_holder["response"] = wire_response
+    setattr(
+        wire_response,
+        "_aawm_responses_wire_coordinator_installed",
+        True,
+    )
     return wire_response
+
+
+async def _abort_xai_responses_prefetch(
+    response: Any,
+    disposition: Any,
+) -> None:
+    """Join the response-local pre-ASGI abort owner when validation fails."""
+    abort_owner = getattr(response, "_aawm_responses_prefetch_abort", None)
+    if not callable(abort_owner):
+        return
+    try:
+        await abort_owner(disposition)
+    except BaseException:
+        # Preserve the original validation/cancellation cause. The owner
+        # shields and records cleanup/background failures independently.
+        return
 
 
 # ── CFG-004: encrypted reasoning detection ─────────────────────────
@@ -5024,28 +5106,46 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
             intake_context=grok_intake_context,
             rollup_kwargs=grok_rollup_kwargs,
         )
-    response = _maybe_wrap_xai_passthrough_responses_stream(
-        response,
-        request=request,
-        request_body=canonical_request_body,
-        route_family="codex_auto_agent_grok_native_responses",
-        resolved_model=grok_prepared_body.get("model") or request_body.get("model"),
-        egress_credential_family=GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        OpenAIResponsesWireDisposition,
     )
-    validated_response = await _validate_codex_auto_agent_responses_payload(
-        response,
-        adapter_model=grok_adapter_model,
-        adapter="codex_auto_agent_grok_native_responses",
-        adapter_label="Grok native",
-        intake_context=grok_intake_context,
-        request_body=canonical_request_body,
-    )
-    if isinstance(validated_response, StreamingResponse):
-        validated_response = _bind_xai_responses_wire_stream(
-            validated_response,
+
+    try:
+        response = _maybe_wrap_xai_passthrough_responses_stream(
+            response,
             request=request,
-            adapter_model=grok_adapter_model,
+            request_body=canonical_request_body,
+            route_family="codex_auto_agent_grok_native_responses",
+            resolved_model=grok_prepared_body.get("model")
+            or request_body.get("model"),
+            egress_credential_family=GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
         )
+        validated_response = await _validate_codex_auto_agent_responses_payload(
+            response,
+            adapter_model=grok_adapter_model,
+            adapter="codex_auto_agent_grok_native_responses",
+            adapter_label="Grok native",
+            intake_context=grok_intake_context,
+            request_body=canonical_request_body,
+        )
+        if isinstance(validated_response, StreamingResponse):
+            validated_response = _bind_xai_responses_wire_stream(
+                validated_response,
+                request=request,
+                adapter_model=grok_adapter_model,
+            )
+    except asyncio.CancelledError:
+        await _abort_xai_responses_prefetch(
+            response,
+            OpenAIResponsesWireDisposition.CANCELLED,
+        )
+        raise
+    except BaseException:
+        await _abort_xai_responses_prefetch(
+            response,
+            OpenAIResponsesWireDisposition.FAILED,
+        )
+        raise
     if getattr(validated_response, "body_iterator", None) is not None:
         setattr(validated_response, "_aawm_session_owner_promotion_deferred", True)
     return validated_response
@@ -5158,29 +5258,46 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             intake_context=xai_intake_context,
             rollup_kwargs=xai_rollup_kwargs,
         )
-    response = _maybe_wrap_xai_passthrough_responses_stream(
-        response,
-        request=request,
-        request_body=canonical_request_body,
-        route_family="codex_auto_agent_xai_oauth_responses",
-        resolved_model=oa_xai_prepared_body.get("model")
-        or canonical_request_body.get("model"),
-        egress_credential_family=XAI_OAUTH_CREDENTIAL_FAMILY,
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        OpenAIResponsesWireDisposition,
     )
-    validated_response = await _validate_codex_auto_agent_responses_payload(
-        response,
-        adapter_model=xai_adapter_model,
-        adapter="codex_auto_agent_xai_oauth_responses",
-        adapter_label="xAI OAuth",
-        intake_context=xai_intake_context,
-        request_body=canonical_request_body,
-    )
-    if isinstance(validated_response, StreamingResponse):
-        validated_response = _bind_xai_responses_wire_stream(
-            validated_response,
+
+    try:
+        response = _maybe_wrap_xai_passthrough_responses_stream(
+            response,
             request=request,
-            adapter_model=xai_adapter_model,
+            request_body=canonical_request_body,
+            route_family="codex_auto_agent_xai_oauth_responses",
+            resolved_model=oa_xai_prepared_body.get("model")
+            or canonical_request_body.get("model"),
+            egress_credential_family=XAI_OAUTH_CREDENTIAL_FAMILY,
         )
+        validated_response = await _validate_codex_auto_agent_responses_payload(
+            response,
+            adapter_model=xai_adapter_model,
+            adapter="codex_auto_agent_xai_oauth_responses",
+            adapter_label="xAI OAuth",
+            intake_context=xai_intake_context,
+            request_body=canonical_request_body,
+        )
+        if isinstance(validated_response, StreamingResponse):
+            validated_response = _bind_xai_responses_wire_stream(
+                validated_response,
+                request=request,
+                adapter_model=xai_adapter_model,
+            )
+    except asyncio.CancelledError:
+        await _abort_xai_responses_prefetch(
+            response,
+            OpenAIResponsesWireDisposition.CANCELLED,
+        )
+        raise
+    except BaseException:
+        await _abort_xai_responses_prefetch(
+            response,
+            OpenAIResponsesWireDisposition.FAILED,
+        )
+        raise
     if getattr(validated_response, "body_iterator", None) is not None:
         setattr(validated_response, "_aawm_session_owner_promotion_deferred", True)
     return validated_response

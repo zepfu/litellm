@@ -303,10 +303,13 @@ already forwarded text as executable calls or buffer an unbounded response
 to repair it.
 
 Codex auto-agent native Grok and managed xAI Responses streams bind the shared
-final-wire coordinator immediately after transport, before output-guard
-wrapping and validation. ASGI delivery, terminal selection, `[DONE]` ordering,
-and upstream closure therefore share one lifecycle. A post-first-byte timeout
-emits one standard terminal failure event and cannot re-enter provider fallback.
+final-wire coordinator at the final response boundary, after bounded
+output-guard and payload processing but before ASGI delivery. Terminal content
+validation settles before the coordinator emits a terminal event, while
+prefetch rejection/cancellation uses the same once-only cleanup and background
+owner. ASGI delivery, terminal selection, `[DONE]` ordering, and upstream
+closure therefore share one lifecycle. A post-first-byte timeout emits one
+standard terminal failure event and cannot re-enter provider fallback.
 
 ## Responses API Instructions
 

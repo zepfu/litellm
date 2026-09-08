@@ -56,6 +56,10 @@ _RESPONSES_PRE_TERMINAL_VALIDATION_ATTR = (
     "_aawm_responses_pre_terminal_validation"
 )
 _RESPONSES_BACKGROUND_OWNER_ATTR = "_aawm_responses_background_owner"
+_RESPONSES_PREFETCH_ABORT_ATTR = "_aawm_responses_prefetch_abort"
+_RESPONSES_VALIDATION_STATE_ATTR = "_aawm_responses_validation_state"
+_RESPONSES_VALIDATION_COMPLETE_ATTR = "_aawm_responses_validation_complete"
+_RESPONSES_VALIDATION_VALID_ATTR = "_aawm_responses_validation_valid"
 
 
 def _event_type(event: Any) -> str:
@@ -661,6 +665,10 @@ def _inherit_stream_lifecycle(response: Any, source_response: Any) -> None:
     for attribute in (
         _RESPONSES_PRE_TERMINAL_VALIDATION_ATTR,
         _RESPONSES_BACKGROUND_OWNER_ATTR,
+        _RESPONSES_PREFETCH_ABORT_ATTR,
+        _RESPONSES_VALIDATION_STATE_ATTR,
+        _RESPONSES_VALIDATION_COMPLETE_ATTR,
+        _RESPONSES_VALIDATION_VALID_ATTR,
     ):
         if getattr(response, attribute, None) is None:
             inherited = getattr(source_response, attribute, None)
