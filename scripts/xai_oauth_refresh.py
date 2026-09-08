@@ -58,8 +58,21 @@ DEFAULT_XAI_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_XAI_OAUTH_AUTH_FILE_MODE = 0o600
 DEFAULT_XAI_OAUTH_ERROR_MESSAGE_LIMIT = 500
 
+_XAI_OAUTH_TERMINAL_REFRESH_ERROR_CLASSES = frozenset(
+    {"invalid_grant", "refresh_token_reused"}
+)
+_XAI_OAUTH_RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 425, 429})
+
 # Keep historical module alias; redaction lives in secret_managers.
 _SECRET_FIELD_NAMES = DEFAULT_SECRET_FIELD_NAMES
+
+
+class XaiOAuthRefreshError(ValueError):
+    """A sanitized xAI OAuth refresh failure with a stable classification."""
+
+    def __init__(self, error_class: str, message: str) -> None:
+        self.error_class = error_class
+        super().__init__(message)
 
 
 def _issued_lifetime_seconds(
@@ -414,14 +427,15 @@ def refresh_xai_oauth_auth_file(
                 )
             except Exception:
                 pass
+        error_class, error_message = _refresh_error_summary(exc)
         return XaiOAuthRefreshSummary(
             attempted=True,
             refreshed=False,
             skipped=False,
             auth_file=str(resolved_auth_file),
             scope=resolved_scope,
-            error_class=exc.__class__.__name__,
-            error_message=_sanitize_error_message(str(exc)),
+            error_class=error_class,
+            error_message=error_message,
             auth_degraded=threshold_degraded,
             refresh_threshold_seconds=threshold,
             refresh_threshold_source=threshold_source,
@@ -854,8 +868,9 @@ def _refresh_credential_record(
 ) -> Mapping[str, Any]:
     refresh_token = _clean_oauth_string(credential.get("refresh_token"))
     if refresh_token is None:
-        raise ValueError(
-            "xAI OAuth credential is expired or near expiry and has no refresh_token."
+        raise XaiOAuthRefreshError(
+            "credential_unavailable",
+            "xAI OAuth credential cannot be refreshed without a refresh token.",
         )
 
     resolved_client_id = (
@@ -864,7 +879,10 @@ def _refresh_credential_record(
         or _clean_oauth_string(credential.get("client_id"))
     )
     if resolved_client_id is None:
-        raise ValueError("xAI OAuth refresh requires oidc_client_id or client_id.")
+        raise XaiOAuthRefreshError(
+            "credential_configuration_error",
+            "xAI OAuth refresh requires a configured client identifier.",
+        )
 
     resolved_token_endpoint = (
         _clean_oauth_string(token_endpoint)
@@ -896,26 +914,91 @@ def _refresh_credential_record(
         if on_token_endpoint_attempt is not None:
             on_token_endpoint_attempt()
         with urllib_request.urlopen(request, timeout=http_timeout_seconds) as response:
+            response_status = int(getattr(response, "status", 200))
             response_body = response.read()
     except urllib_error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")
-        raise ValueError(
-            f"xAI OAuth refresh failed with HTTP {exc.code}: {_sanitize_error_message(error_body)}"
-        ) from exc
-    except urllib_error.URLError as exc:
-        raise ValueError(
-            f"xAI OAuth refresh failed: {_sanitize_error_message(str(exc.reason))}"
+        try:
+            error_body = exc.read()
+        except OSError:
+            error_body = b""
+        raise _xai_oauth_http_error(exc.code, error_body) from exc
+    except (urllib_error.URLError, TimeoutError, OSError) as exc:
+        raise XaiOAuthRefreshError(
+            "transport_error",
+            "xAI OAuth token endpoint transport failed.",
         ) from exc
 
+    if response_status < 200 or response_status >= 300:
+        raise _xai_oauth_http_error(response_status, response_body)
+
     try:
-        payload = json.loads(response_body.decode("utf-8"))
+        payload = json.loads(response_body)
     except (UnicodeError, json.JSONDecodeError) as exc:
-        raise ValueError("xAI OAuth refresh response was not valid JSON.") from exc
+        raise XaiOAuthRefreshError(
+            "malformed_response",
+            "xAI OAuth token endpoint returned an invalid response.",
+        ) from exc
     if not isinstance(payload, Mapping):
-        raise ValueError("xAI OAuth refresh response must contain a JSON object.")
+        raise XaiOAuthRefreshError(
+            "malformed_response",
+            "xAI OAuth token endpoint returned an invalid response.",
+        )
     if _clean_oauth_string(payload.get("access_token")) is None:
-        raise ValueError("xAI OAuth refresh response did not contain an access_token.")
+        raise XaiOAuthRefreshError(
+            "malformed_response",
+            "xAI OAuth token endpoint returned an incomplete response.",
+        )
     return payload
+
+
+def _xai_oauth_http_error(
+    status_code: int,
+    response_body: bytes,
+) -> XaiOAuthRefreshError:
+    """Classify an HTTP failure without retaining provider response content."""
+    if status_code == 400:
+        terminal_error = _xai_oauth_terminal_error_code(response_body)
+        if terminal_error is not None:
+            return XaiOAuthRefreshError(
+                terminal_error,
+                "xAI OAuth token endpoint rejected the refresh grant.",
+            )
+    error_class = (
+        "retryable_http_error"
+        if status_code in _XAI_OAUTH_RETRYABLE_HTTP_STATUS_CODES
+        or status_code >= 500
+        else "http_error"
+    )
+    return XaiOAuthRefreshError(
+        error_class,
+        f"xAI OAuth token endpoint returned HTTP {status_code}.",
+    )
+
+
+def _xai_oauth_terminal_error_code(response_body: bytes) -> Optional[str]:
+    """Return only exact allowlisted terminal codes from a 400 JSON response."""
+    try:
+        payload = json.loads(response_body)
+    except (TypeError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    error_code = payload.get("error")
+    if (
+        isinstance(error_code, str)
+        and error_code in _XAI_OAUTH_TERMINAL_REFRESH_ERROR_CLASSES
+    ):
+        return error_code
+    return None
+
+
+def _refresh_error_summary(exc: Exception) -> tuple[str, str]:
+    if isinstance(exc, XaiOAuthRefreshError):
+        return exc.error_class, _sanitize_error_message(str(exc))
+    return (
+        "local_refresh_error",
+        "xAI OAuth refresh could not complete.",
+    )
 
 
 def _update_credential_record(
