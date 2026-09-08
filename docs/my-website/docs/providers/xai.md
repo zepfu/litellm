@@ -182,6 +182,12 @@ credential family and `grok-build` client family; managed headers use
 native observation under the managed key is read only when native metadata
 proves ownership, and authorization or unrelated headers are excluded.
 
+When xAI supplies quota limit or remaining values without provider reset or
+billing-period evidence, LiteLLM leaves the reset time and quota period
+unknown. It does not synthesize a monthly boundary that could drive cooldown,
+availability, rollover, or forecasting. Explicit provider reset and billing
+period evidence remains authoritative.
+
 ## OAuth Credential Scope Selection
 
 Managed xAI OAuth and native Grok OIDC credential files must contain the exact

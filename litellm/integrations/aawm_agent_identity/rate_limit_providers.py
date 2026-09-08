@@ -794,27 +794,13 @@ def _xai_oauth_header_remaining_pct(
     return round(max(0.0, min(100.0, (remaining / total) * 100.0)), 3)
 
 
-def _next_utc_month_start(value: Any) -> Optional[datetime]:
-    observed_dt = _normalize_datetime(value)
-    if observed_dt is None:
-        return None
-    observed_dt = observed_dt.astimezone(timezone.utc)
-    if observed_dt.month == 12:
-        return datetime(observed_dt.year + 1, 1, 1, tzinfo=timezone.utc)
-    return datetime(observed_dt.year, observed_dt.month + 1, 1, tzinfo=timezone.utc)
-
-
-def _is_xai_oauth_subscription_quota_context(metadata: Dict[str, Any]) -> bool:
-    quota_family = str(metadata.get("xai_quota_family") or metadata.get("shared_quota_family") or "").strip().lower()
-    return quota_family == "xai_grok_subscription" or metadata.get("grok_subscription_quota_shared") is True
-
-
 def _extract_xai_oauth_billing_period_end(
     *,
     candidate: Dict[str, Any],
     metadata: Dict[str, Any],
     observed_at: Any,
 ) -> Tuple[Optional[datetime], Optional[str]]:
+    del observed_at
     for source, value in (
         ("payload_billing_period_end", candidate.get("billingPeriodEnd")),
         (
@@ -830,11 +816,6 @@ def _extract_xai_oauth_billing_period_end(
         parsed = _parse_provider_timestamp(value)
         if parsed is not None:
             return parsed, source
-
-    if _is_xai_oauth_subscription_quota_context(metadata):
-        fallback = _next_utc_month_start(observed_at)
-        if fallback is not None:
-            return fallback, "xai_grok_subscription_month_boundary"
 
     return None, None
 
@@ -917,7 +898,6 @@ def _extract_xai_header_rate_limit_observations(
         "payload_config_billing_period_end",
         "metadata_billing_period_end",
         "metadata_xai_oauth_billing_period_end",
-        "xai_grok_subscription_month_boundary",
     }
     observations: List[Dict[str, Any]] = []
     candidates, accepted_sources = _select_xai_header_rate_limit_candidates(
@@ -987,9 +967,6 @@ def _extract_xai_header_rate_limit_observations(
                     metadata=metadata,
                     observed_at=context["observed_at"],
                 )
-                if native and reset_source == "xai_grok_subscription_month_boundary":
-                    provider_resets_at = None
-                    reset_source = None
             elif reset_hint_seconds is not None and provider_resets_at is not None:
                 reset_source = "retry_after"
             used = max(0, total - remaining) if total is not None and remaining is not None else None
@@ -1015,8 +992,7 @@ def _extract_xai_header_rate_limit_observations(
                         "limit_scope": limit_scope,
                         "quota_period": (
                             "monthly"
-                            if reset_source
-                            in billing_period_sources
+                            if reset_source in billing_period_sources
                             else None
                         ),
                         "quota_type": limit_scope,
@@ -1630,8 +1606,6 @@ _HOST_FUNCTION_NAMES = (
     "_extract_xai_oauth_account_hash",
     "_extract_xai_grok_oidc_account_hash",
     "_xai_oauth_header_remaining_pct",
-    "_next_utc_month_start",
-    "_is_xai_oauth_subscription_quota_context",
     "_extract_xai_oauth_billing_period_end",
     "_select_xai_header_rate_limit_candidates",
     "_extract_xai_header_rate_limit_observations",
