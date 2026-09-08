@@ -772,7 +772,10 @@ This path has two cooperating pieces:
 - Browser-boundary collector: `litellm/llms/chatgpt/conversation_init.py`
   accepts an injected transport, observes the native exchange, redacts
   cookies, tokens, headers, raw storage, and personal fields, then atomically
-  writes a credential-safe JSON snapshot. It refuses symlink destinations.
+  writes a credential-safe JSON snapshot no larger than the 1,000,000-byte
+  reader budget. It refuses symlink destinations. A failed current capture
+  retains the prior file only when that file parses and passes the same
+  sanitized persistability and serialized-size checks.
   The public
   `collect_conversation_init_snapshot_from_oracle_browser(...)` entry point
   attaches to a bound Oracle browser over CDP and observes the native exchange
