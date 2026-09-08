@@ -2602,6 +2602,44 @@ def _session_owner_renewal_task_error(
     return task.exception()
 
 
+def start_session_owner_lease_renewal(
+    lease: Optional[SessionOwnerLease],
+    *,
+    reservation_ttl_seconds: float = _DEFAULT_RESERVATION_TTL_SECONDS,
+    renewal_interval_seconds: Optional[float] = None,
+) -> Optional[Any]:
+    """Start or reuse the response-owned renewer for a held reservation."""
+
+    if not _session_owner_lease_is_renewable(lease):
+        return None
+    assert lease is not None
+
+    existing_task = lease.renewal_task
+    if existing_task is not None:
+        if not existing_task.done():
+            return existing_task
+        existing_error = _session_owner_renewal_task_error(existing_task, lease)
+        if existing_error is not None:
+            return existing_task
+        lease.renewal_task = None
+
+    ttl = _normalize_reservation_ttl(reservation_ttl_seconds)
+    interval = _normalize_reservation_renewal_interval(
+        ttl,
+        renewal_interval_seconds,
+    )
+    loop = asyncio.get_running_loop()
+    renewal_task = loop.create_task(
+        _session_owner_lease_renewal_loop(
+            lease,
+            ttl_seconds=ttl,
+            interval_seconds=interval,
+        )
+    )
+    lease.renewal_task = renewal_task
+    return renewal_task
+
+
 async def run_with_session_owner_lease_renewal(
     lease: Optional[SessionOwnerLease],
     operation: Callable[[], Awaitable[_SessionOwnerLeaseOperationT]],
@@ -3049,38 +3087,12 @@ def defer_session_owner_lease_until_wire_terminal(request: Any) -> bool:
         return False
     lease.wire_terminal_pending = True
     lease.wire_disposition = None
-    if lease.renewal_task is None or lease.renewal_task.done():
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return True
-        renewal_task = loop.create_task(
-            _session_owner_lease_renewal_loop(
-                lease,
-                ttl_seconds=_DEFAULT_RESERVATION_TTL_SECONDS,
-                interval_seconds=_normalize_reservation_renewal_interval(
-                    _DEFAULT_RESERVATION_TTL_SECONDS,
-                    None,
-                ),
-            )
-        )
-
-        def _consume_renewal_task_result(task: Any) -> None:
-            if task.cancelled():
-                return
-            try:
-                error = task.exception()
-            except BaseException:
-                return
-            if error is not None:
-                verbose_proxy_logger.error(
-                    "Session-owner reservation renewal stopped for deferred "
-                    "wire terminal: %s",
-                    type(error).__name__,
-                )
-
-        renewal_task.add_done_callback(_consume_renewal_task_result)
-        lease.renewal_task = renewal_task
+    try:
+        start_session_owner_lease_renewal(lease)
+    except RuntimeError:
+        # The lease can be marked pending before a response lifecycle owns an
+        # active loop; the first async lifecycle boundary will renew or release.
+        return True
     return True
 
 
