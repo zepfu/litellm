@@ -155,6 +155,26 @@ rotated and does not disclose raw paths, tokens, or file metadata. A
 configuration conflict has no selected identity and fails before credential or
 provider I/O.
 
+### Managed xAI lifecycle states
+
+Request readiness, refresh eligibility, and passive health use the same
+side-effect-free lifecycle evaluator. It distinguishes `structurally_valid`,
+`access_available`, `refresh_possible`, `expiry_available`, `refresh_due`,
+`route_usable`, and `terminal_unrefreshable`, with named states for malformed,
+access-unavailable, expiry-unavailable, expired, refresh-due, and fresh records.
+The route-safety buffer and proactive refresh threshold are separate controls:
+`refresh_due` does not by itself make a credential unusable for a request.
+Refresh-only records cannot serve requests, access-only records become terminal
+when due, and missing or malformed expiry remains degraded and eligible for
+safe refresh rather than being treated as permanently fresh.
+
+`AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS` is the writer's proactive refresh
+minimum. `LITELLM_XAI_OAUTH_REFRESH_BUFFER_SECONDS` is the consumer
+route-safety buffer shared by request readiness and sidecar health/eligibility.
+They are intentionally independent; helper calls without an explicit writer
+buffer retain the compatibility fallback from the writer setting to the
+consumer setting and then the 300-second default.
+
 Managed xAI refresh writers derive the default lock from that same canonical
 auth-file target, using its `.lock` sibling. This lets unrelated custom auth
 files refresh concurrently while all aliases for one file share one advisory

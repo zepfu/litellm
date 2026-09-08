@@ -192,6 +192,23 @@ configured values fail closed. Resolution metadata uses a nonsecret
 `credential_identity` derived from the canonical file target and exact scope;
 credential contents and raw paths are never included in that identity.
 
+Managed credential lifecycle is evaluated by one side-effect-free policy shared
+by request readiness, refresh eligibility, and passive health. It reports
+structural validity, access availability, expiry availability, refresh
+possibility, refresh due state, route usability, and terminal unrefreshability.
+The route-safety buffer controls whether an access token may be sent; the
+proactive refresh threshold is a separate value derived from issued lifetime
+and the configured minimum. A credential can therefore be `refresh_due` while
+remaining `route_usable`, and refresh-only, access-only, malformed-expiry, and
+expired records receive distinct lifecycle states. Missing or malformed expiry
+never becomes permanently fresh.
+
+`AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS` controls writer-side proactive refresh.
+`LITELLM_XAI_OAUTH_REFRESH_BUFFER_SECONDS` controls the route-safety deadline
+used by request handling and sidecar health/eligibility. These settings are
+independent; an omitted writer buffer retains the compatibility fallback to
+the consumer setting and then the 300-second default.
+
 Managed xAI refreshes derive their default advisory lock from the canonical
 resolved auth file, using the file's `.lock` sibling. Different custom auth
 files use independent locks, while aliases for one file coordinate on one

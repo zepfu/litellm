@@ -4574,6 +4574,19 @@ def _oauth_refresh_observation_metadata(event: Mapping[str, Any]) -> Dict[str, A
         "refresh_attempt_interval_seconds",
         "refresh_buffer_seconds",
         "refresh_threshold_seconds",
+        "credential_identity",
+        "structurally_valid",
+        "access_available",
+        "refresh_possible",
+        "route_usable",
+        "route_unusable",
+        "refresh_due",
+        "expiry_available",
+        "terminal_unrefreshable",
+        "lifecycle_state",
+        "route_unusable_reason",
+        "route_unusable_at",
+        "route_safety_buffer_seconds",
         "credential_health",
         "usable",
         "scheduler_error_class",
@@ -4636,6 +4649,20 @@ def _build_passive_provider_auth_observation(
                 "credential_identity": event.get("credential_identity"),
                 "scope_source": event.get("scope_source")
                 or config.xai_oauth_scope_source,
+                "structurally_valid": event.get("structurally_valid"),
+                "access_available": event.get("access_available"),
+                "refresh_possible": event.get("refresh_possible"),
+                "route_usable": event.get("route_usable"),
+                "route_unusable": event.get("route_unusable"),
+                "refresh_due": event.get("refresh_due"),
+                "expiry_available": event.get("expiry_available"),
+                "terminal_unrefreshable": event.get("terminal_unrefreshable"),
+                "lifecycle_state": event.get("lifecycle_state"),
+                "route_unusable_reason": event.get("route_unusable_reason"),
+                "route_unusable_at": event.get("route_unusable_at"),
+                "route_safety_buffer_seconds": event.get(
+                    "route_safety_buffer_seconds"
+                ),
             }
         )
     return {
@@ -12857,6 +12884,46 @@ def _oauth_refresh_schedule_evidence(
         "refresh_attempt_interval_seconds": attempt_interval_seconds,
         "refresh_buffer_seconds": buffer_seconds,
         "refresh_threshold_seconds": effective_threshold_seconds,
+        "credential_identity": final.get("credential_identity")
+        or pre.get("credential_identity"),
+        "structurally_valid": final.get("structurally_valid")
+        if final.get("structurally_valid") is not None
+        else pre.get("structurally_valid"),
+        "access_available": final.get("access_available")
+        if final.get("access_available") is not None
+        else pre.get("access_available"),
+        "refresh_possible": final.get("refresh_possible")
+        if final.get("refresh_possible") is not None
+        else pre.get("refresh_possible"),
+        "route_usable": final.get("route_usable")
+        if final.get("route_usable") is not None
+        else pre.get("route_usable"),
+        "route_unusable": final.get("route_unusable")
+        if final.get("route_unusable") is not None
+        else pre.get("route_unusable"),
+        "refresh_due": final.get("refresh_due")
+        if final.get("refresh_due") is not None
+        else pre.get("refresh_due"),
+        "expiry_available": final.get("expiry_available")
+        if final.get("expiry_available") is not None
+        else pre.get("expiry_available"),
+        "terminal_unrefreshable": final.get("terminal_unrefreshable")
+        if final.get("terminal_unrefreshable") is not None
+        else pre.get("terminal_unrefreshable"),
+        "lifecycle_state": final.get("lifecycle_state")
+        if final.get("lifecycle_state") is not None
+        else pre.get("lifecycle_state"),
+        "route_unusable_reason": (
+            final.get("route_unusable_reason")
+            if "route_unusable_reason" in final
+            else pre.get("route_unusable_reason")
+        ),
+        "route_unusable_at": final.get("route_unusable_at")
+        if final.get("route_unusable_at") is not None
+        else pre.get("route_unusable_at"),
+        "route_safety_buffer_seconds": final.get("route_safety_buffer_seconds")
+        if final.get("route_safety_buffer_seconds") is not None
+        else pre.get("route_safety_buffer_seconds"),
         "credential_health": credential_health
         if credential_health is not None
         else final.get("credential_health"),
@@ -13831,7 +13898,10 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
             "xai_oauth_passive_health_inspection",
             xai_oauth_refresh.inspect_xai_oauth_credential_health,
             (config.xai_oauth_auth_file,),
-            {"scope": config.xai_oauth_scope},
+            {
+                "scope": config.xai_oauth_scope,
+                "buffer_seconds": config.xai_oauth_refresh_buffer_seconds,
+            },
             "xai",
             "xai_oauth",
             config.xai_oauth_auth_file,

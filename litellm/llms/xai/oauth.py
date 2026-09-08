@@ -38,6 +38,8 @@ from litellm.secret_managers.xai_oauth_credentials import (
     DEFAULT_XAI_OAUTH_AUTH_FILE,
     DEFAULT_XAI_OAUTH_SCOPE,
     XaiOAuthCredentialResolution,
+    credential_access_token,
+    evaluate_xai_oauth_credential_lifecycle,
     resolve_xai_oauth_credentials,
     select_xai_oauth_credential_record,
 )
@@ -996,10 +998,7 @@ def _select_credential_record(
 
 
 def _credential_access_token(credential: Mapping[str, Any]) -> Optional[str]:
-    token = credential.get("access_token") or credential.get("key")
-    if isinstance(token, str) and token.strip():
-        return token.strip()
-    return None
+    return credential_access_token(credential)
 
 
 def _credential_needs_refresh(credential: Mapping[str, Any]) -> bool:
@@ -1009,11 +1008,13 @@ def _credential_needs_refresh(credential: Mapping[str, Any]) -> bool:
     permanently fresh). Production accessors are read-only and raise a sidecar
     refresh-required error in that case rather than minting a new token here.
     """
-    expires_at = _parse_expires_at(credential.get("expires_at"))
-    if expires_at is None:
-        return True
     buffer_seconds = _refresh_buffer_seconds()
-    return datetime.now(timezone.utc) >= expires_at - timedelta(seconds=buffer_seconds)
+    lifecycle = evaluate_xai_oauth_credential_lifecycle(
+        credential,
+        route_safety_buffer_seconds=buffer_seconds,
+        refresh_min_seconds=buffer_seconds,
+    )
+    return not bool(lifecycle["route_usable"])
 
 
 def _parse_expires_at(value: Any) -> Optional[datetime]:
