@@ -24,7 +24,10 @@ import type {
   BridgePageMutation,
 } from "../history/bridge-checkpoints.js";
 import { BridgeCheckpointStore } from "../history/bridge-checkpoints.js";
-import { HistoryCollector } from "../history/collector.js";
+import {
+  dedupeMessages,
+  HistoryCollector,
+} from "../history/collector.js";
 import { resolveRequestedRange } from "../history/range.js";
 import type {
   CollectorRunEnvelope,
@@ -45,6 +48,7 @@ export interface CollectorRunContext {
   request: HistoryCollectionRequest;
   bounds?: Partial<WorkerBounds>;
   signal?: AbortSignal;
+  authenticationRecoveryRequested?: boolean;
 }
 
 export async function runBoundedCollector(
@@ -63,6 +67,8 @@ export async function runBoundedCollector(
   let bridgeStateVersion = 0;
   const account = context.envelope.collectorAccountId;
   const store = new BridgeCheckpointStore();
+  let queueCoverage: "complete" | "partial" = "complete";
+  const queueWarnings: string[] = [];
 
   const bridgeCall = async <T>(operation: () => Promise<T>): Promise<T> => {
     assertBounds(++requestCount, bytesRead, bounds, signal);
@@ -85,7 +91,8 @@ export async function runBoundedCollector(
     );
   }
   if (initial !== null && initial.queueCoverage !== "complete") {
-    throw new BoundedWorkerError("bounds_exceeded", true, true);
+    queueCoverage = "partial";
+    queueWarnings.push("candidate_queue_hydration_incomplete");
   }
   store.hydrate(initial);
   bridgeStateVersion = initial?.stateVersionCounter ?? 0;
@@ -138,7 +145,7 @@ export async function runBoundedCollector(
         ...(mutation.attempts ? { attempts: mutation.attempts } : {}),
         checkpointMutations: {
           kind: "history",
-          value: store.snapshot(account, expectedStateVersion, "complete"),
+          value: store.snapshot(account, expectedStateVersion, queueCoverage),
         },
         candidateMutations: queueMutations,
         ...(mutation.coverageMutations
@@ -162,6 +169,7 @@ export async function runBoundedCollector(
   const collector = new HistoryCollector(budgetedReader, {
     accountId: account,
     store,
+    recoverAuthentication: context.authenticationRecoveryRequested === true,
     ...context.request,
     scope: context.scope,
     mapping: context.mapping,
@@ -176,7 +184,7 @@ export async function runBoundedCollector(
       const items: Array<Record<string, unknown>> = [];
       const warnings: string[] = [];
       const seenCursors = new Set<string>();
-      let coverage: HistoryMetadataPage["coverage"] = "complete";
+      let coverage: HistoryMetadataPage["coverage"];
       let truncated = false;
       let source: HistoryMetadataPage["source"];
       let schemaVersion: string | undefined;
@@ -185,6 +193,7 @@ export async function runBoundedCollector(
       let sourceInitialized = false;
       let schemaInitialized = false;
       let snapshotInitialized = false;
+      let resumableCursor: string | null = null;
 
       for (let page = 0; page < MAX_METADATA_PAGES; page += 1) {
         const current = await bridgeCall(() =>
@@ -196,16 +205,28 @@ export async function runBoundedCollector(
           }),
         );
         first ??= current;
-        if (!snapshotInitialized) {
-          expectedSnapshotId = current.snapshotId;
-          snapshotInitialized = true;
-        } else if (current.snapshotId !== expectedSnapshotId) {
+        const terminalPage =
+          current.hasMore === false &&
+          (current.nextCursor === undefined || current.nextCursor === null);
+        const snapshotChanged =
+          snapshotInitialized &&
+          current.snapshotId !== expectedSnapshotId &&
+          !(current.snapshotId === null && terminalPage);
+        if (snapshotChanged) {
           warnings.push("retained_metadata_snapshot_changed");
           coverage = "partial";
           truncated = true;
+          resumableCursor = null;
           break;
         }
-        if (current.snapshotId !== undefined) {
+        if (!snapshotInitialized) {
+          expectedSnapshotId = current.snapshotId;
+          snapshotInitialized = true;
+        }
+        if (
+          current.snapshotId !== undefined &&
+          current.snapshotId !== null
+        ) {
           snapshotId = current.snapshotId;
         }
         items.push(...(current.items ?? []));
@@ -215,15 +236,43 @@ export async function runBoundedCollector(
         if (!sourceInitialized) {
           source = current.source;
           sourceInitialized = true;
-        } else if (!sameValue(source, current.source)) {
+        } else if (current.source === undefined && source !== undefined) {
+          warnings.push("retained_metadata_source_missing");
+          coverage = "partial";
+        } else if (
+          current.source !== undefined &&
+          source !== undefined &&
+          !sameValue(source, current.source)
+        ) {
           warnings.push("retained_metadata_source_changed");
+          coverage = "partial";
+        } else if (source === undefined && current.source !== undefined) {
+          source = current.source;
+          warnings.push("retained_metadata_source_added");
           coverage = "partial";
         }
         if (!schemaInitialized) {
           schemaVersion = current.schemaVersion;
           schemaInitialized = true;
-        } else if (schemaVersion !== current.schemaVersion) {
+        } else if (
+          current.schemaVersion === undefined &&
+          schemaVersion !== undefined
+        ) {
+          warnings.push("retained_metadata_schema_missing");
+          coverage = "partial";
+        } else if (
+          current.schemaVersion !== undefined &&
+          schemaVersion !== undefined &&
+          schemaVersion !== current.schemaVersion
+        ) {
           warnings.push("retained_metadata_schema_changed");
+          coverage = "partial";
+        } else if (
+          schemaVersion === undefined &&
+          current.schemaVersion !== undefined
+        ) {
+          schemaVersion = current.schemaVersion;
+          warnings.push("retained_metadata_schema_added");
           coverage = "partial";
         }
         coverageDetails ??= current.coverageDetails;
@@ -233,24 +282,41 @@ export async function runBoundedCollector(
             ...current.coverageDetails,
           };
         }
-        if (current.coverage === "unknown") {
+        if (current.coverage === undefined) {
+          warnings.push("retained_metadata_coverage_missing");
+          coverage = "unknown";
+        } else if (coverage === undefined) {
+          coverage = current.coverage;
+        } else if (current.coverage === "unknown") {
           coverage = "unknown";
         } else if (current.coverage !== "complete" && coverage !== "unknown") {
           coverage = "partial";
         }
         truncated ||= current.truncated === true;
+        if (
+          (current.snapshotId === null || current.snapshotId === undefined) &&
+          current.hasMore === true
+        ) {
+          warnings.push("retained_metadata_missing_snapshot_for_continuation");
+          coverage = "partial";
+          truncated = true;
+          resumableCursor = null;
+          break;
+        }
         if (current.hasMore === false) {
           if (current.nextCursor !== undefined && current.nextCursor !== null) {
             warnings.push("retained_metadata_contradictory_continuation");
             coverage = "partial";
             truncated = true;
           }
+          resumableCursor = null;
           break;
         }
         if (current.hasMore !== true) {
           warnings.push("retained_metadata_missing_continuation_state");
           coverage = "partial";
           truncated = true;
+          resumableCursor = null;
           break;
         }
 
@@ -265,11 +331,13 @@ export async function runBoundedCollector(
           warnings.push("retained_metadata_invalid_continuation");
           coverage = "partial";
           truncated = true;
+          resumableCursor = null;
           break;
         }
         seenCursors.add(nextCursor);
         cursor = nextCursor;
         snapshotId = nextSnapshot;
+        resumableCursor = nextCursor;
         if (page === MAX_METADATA_PAGES - 1) {
           warnings.push("retained_metadata_page_budget_exhausted");
           coverage = "partial";
@@ -280,22 +348,32 @@ export async function runBoundedCollector(
       if (!first) {
         return null;
       }
+      const retainedMessages = dedupeMessages(messages);
+      const reconstructedAttempts =
+        retainedMessages.length > 0
+          ? reconstructAttempts(retainedMessages, {
+              scope: context.scope,
+              conversationId,
+              mapping: context.mapping,
+            })
+          : [];
+      const mergedAttempts = mergeAttempts(reconstructedAttempts, attempts);
       return {
         ...first,
         ...(items.length > 0 ? { items } : {}),
-        ...(messages.length > 0 ? { messages } : {}),
-        ...(attempts.length > 0 ? { attempts } : {}),
+        ...(retainedMessages.length > 0 ? { messages: retainedMessages } : {}),
+        ...(mergedAttempts.length > 0 ? { attempts: mergedAttempts } : {}),
         ...(source ? { source } : {}),
         ...(schemaVersion ? { schemaVersion } : {}),
         ...(coverageDetails ? { coverageDetails } : {}),
         ...(warnings.length > 0
           ? { warnings: [...new Set(warnings)] }
           : {}),
-        coverage,
+        ...(coverage ? { coverage } : {}),
         truncated,
         snapshotId,
-        nextCursor: cursor,
-        hasMore: truncated,
+        nextCursor: resumableCursor,
+        hasMore: resumableCursor !== null,
       };
     },
     onDiscoveryPageCommit: async (page) => {
@@ -344,7 +422,7 @@ export async function runBoundedCollector(
       const acknowledgment = await bridgeCall(() =>
         context.bridge.compareAndSetState({
           expectedStateVersion,
-          next: store.snapshot(account, expectedStateVersion, "complete"),
+          next: store.snapshot(account, expectedStateVersion, queueCoverage),
         }),
       );
       if (
@@ -363,8 +441,9 @@ export async function runBoundedCollector(
       result,
       requestCount,
       bytesRead,
-      coverageIncomplete: result.status !== "complete",
-      warnings: result.warnings,
+      coverageIncomplete:
+        result.status !== "complete" || queueCoverage !== "complete",
+      warnings: [...queueWarnings, ...result.warnings],
     };
   } catch (error) {
     if (signal.aborted) {

@@ -254,6 +254,8 @@ export interface HistoryCollectionRequest {
 export interface HistoryCollectionOptions {
   accountId: string;
   store: HistoryCheckpointStore;
+  /** Clear a durable history pause only after explicit verified recovery. */
+  recoverAuthentication?: boolean;
   clock?: { now(): Date };
   defaultBackfillDays?: number;
   overlapMs?: number;

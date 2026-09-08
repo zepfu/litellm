@@ -16,6 +16,7 @@ import type {
   RevisitEntry,
 } from "../contracts/history.js";
 import type {
+  IngestContext,
   LedgerScope,
   ModelMappingVersion,
 } from "../ledger/types.js";
@@ -57,6 +58,8 @@ import type {
 
 const MAX_QUEUE_PAGES = 16;
 const MAX_REPORT_PAGES = 100;
+const TERMINAL_REQUEST_RESERVE = 2;
+const TERMINAL_BYTES_RESERVE = 64 * 1024;
 
 export async function runStdioWorker(
   input: NodeJS.ReadableStream = process.stdin,
@@ -64,23 +67,27 @@ export async function runStdioWorker(
 ): Promise<void> {
   const budget = new WireBudget(DEFAULT_WORKER_BOUNDS);
   const inbox = new FrameInbox(input, budget);
-  const first = await inbox.next();
-  budget.consumeRequest();
-  const start = parseStartRun(first);
-  const deadlineAt = monotonicNow() + start.bounds.remainingMs;
-  budget.configure(start.bounds, deadlineAt);
-  inbox.setBounds();
-  const app = new WorkerClientApplication(
-    start,
-    deadlineAt,
-    budget,
-    inbox,
-    output,
-  );
+  let app: WorkerClientApplication | null = null;
   try {
+    const first = await inbox.next();
+    budget.consumeRequest();
+    const start = parseStartRun(first);
+    const deadlineAt = monotonicNow() + start.bounds.remainingMs;
+    budget.configure(start.bounds, deadlineAt);
+    inbox.setBounds();
+    app = new WorkerClientApplication(
+      start,
+      deadlineAt,
+      budget,
+      inbox,
+      output,
+    );
     await app.run();
   } finally {
-    app.close();
+    app?.close();
+    if (app === null) {
+      inbox.close();
+    }
   }
 }
 
@@ -108,9 +115,9 @@ class WorkerClientApplication {
   }
 
   async run(): Promise<void> {
+    const schedule = this.createScheduleStore();
+    const scope = scheduleScope(this.start.envelope);
     try {
-      const schedule = this.createScheduleStore();
-      const scope = scheduleScope(this.start.envelope);
       const at = Date.now();
       let scheduleState = await schedule.ensureSchedule(
         scope,
@@ -148,15 +155,22 @@ class WorkerClientApplication {
           deadlineAt: this.deadlineAt,
         },
         signal: this.controller.signal,
+        authenticationRecoveryRequested:
+          this.start.authenticationRecoveryRequested === true,
       });
-      const report = this.start.reportRequest
-        ? await this.collectReport(this.start.reportRequest)
-        : null;
+      const report = await this.collectReport(
+        this.start.reportRequest ?? {
+          account: this.start.envelope.collectorAccountId,
+          asOf: new Date().toISOString(),
+          modelDimension: "resolved",
+        },
+      );
       const completion = completionFor(
         collection.result,
         Date.now(),
         report?.truncated === true,
       );
+      this.bridge.enterTerminalPhase();
       const completed = await schedule.completeTrigger(
         scope,
         Date.now(),
@@ -190,7 +204,36 @@ class WorkerClientApplication {
       }
     } catch (error) {
       if (this.triggerId !== null && !this.finishRequested && !this.bridge.remoteCancelled) {
+        if (isAccountBlockingError(error)) {
+          try {
+            this.bridge.enterTerminalPhase();
+            const completion = completionForError(error, Date.now());
+            const completed = await schedule.completeTrigger(
+              scope,
+              Date.now(),
+              completion,
+            );
+            if (completed.applied) {
+              this.finishRequested = true;
+              await this.bridge.finishRun({
+                expectedVersion: this.bridge.stateVersion,
+                triggerId: this.triggerId,
+                outcome: completion.outcome,
+                summary: {
+                  errorCode: errorCode(error),
+                  coverageIncomplete: true,
+                },
+              });
+            }
+          } catch {
+            // Fall through to the bounded cancellation path below.
+          }
+        }
+        if (this.finishRequested) {
+          throw error;
+        }
         try {
+          this.bridge.enterTerminalPhase();
           await this.bridge.cancel({
             expectedVersion: this.bridge.stateVersion,
             triggerId: this.triggerId,
@@ -386,6 +429,7 @@ class ParentWorkerBridge implements WorkerBridge {
     private readonly onControl: (message: WorkerControlMessage) => void,
   ) {
     this.inbox.setAbortSignal(signal);
+    this.inbox.setControlHandler(onControl);
   }
 
   async requestRaw(
@@ -573,6 +617,10 @@ class ParentWorkerBridge implements WorkerBridge {
 
   markRemoteCancellation(): void {
     this.remoteCancelled = true;
+  }
+
+  enterTerminalPhase(): void {
+    this.budget.enterTerminalPhase();
   }
 
   close(): void {
@@ -794,6 +842,7 @@ class WireBudget {
   private totalBytes = 0;
   private requestCount = 0;
   private largestFrameBytes = 0;
+  private terminalPhase = false;
 
   constructor(bounds: {
     maxFrameBytes: number;
@@ -825,6 +874,7 @@ class WireBudget {
       "maxRequests",
     );
     this.deadlineAt = deadlineAt;
+    this.terminalPhase = false;
     if (
       this.totalBytes > this.maxTotalBytes ||
       this.largestFrameBytes > this.maxFrameBytes
@@ -835,6 +885,14 @@ class WireBudget {
   }
 
   consumeRequest(): void {
+    this.requestCount += 1;
+    if (this.requestCount > this.requestLimit()) {
+      throw new BoundedWorkerError("bounds_exceeded", true, true);
+    }
+    this.assertActive();
+  }
+
+  consumeIncomingControl(): void {
     this.requestCount += 1;
     if (this.requestCount > this.maxRequests) {
       throw new BoundedWorkerError("bounds_exceeded", true, true);
@@ -847,7 +905,7 @@ class WireBudget {
       throw new BoundedWorkerError("protocol_invalid", false, true);
     }
     this.totalBytes += bytes;
-    if (this.totalBytes > this.maxTotalBytes) {
+    if (this.totalBytes > this.byteLimit()) {
       throw new BoundedWorkerError("bounds_exceeded", true, true);
     }
     this.assertActive();
@@ -858,6 +916,11 @@ class WireBudget {
     if (bytes > this.maxFrameBytes) {
       throw new BoundedWorkerError("bounds_exceeded", true, true);
     }
+  }
+
+  enterTerminalPhase(): void {
+    this.terminalPhase = true;
+    this.assertActive();
   }
 
   assertActive(signal?: AbortSignal): void {
@@ -872,6 +935,18 @@ class WireBudget {
   remainingMs(): number {
     return Math.max(0, this.deadlineAt - monotonicNow());
   }
+
+  private requestLimit(): number {
+    return this.terminalPhase
+      ? this.maxRequests
+      : Math.max(0, this.maxRequests - TERMINAL_REQUEST_RESERVE);
+  }
+
+  private byteLimit(): number {
+    return this.terminalPhase
+      ? this.maxTotalBytes
+      : Math.max(0, this.maxTotalBytes - TERMINAL_BYTES_RESERVE);
+  }
 }
 
 class FrameInbox {
@@ -883,6 +958,8 @@ class FrameInbox {
   }> = [];
   private closedError: Error | null = null;
   private closed = false;
+  private controlHandler: ((message: WorkerControlMessage) => void) | null =
+    null;
 
   constructor(
     private readonly input: NodeJS.ReadableStream,
@@ -899,6 +976,22 @@ class FrameInbox {
   setAbortSignal(_signal: AbortSignal): void {
     // The bridge passes its signal to each bounded read; no stream-wide
     // listener is retained here, which keeps cancellation cleanup deterministic.
+  }
+
+  setControlHandler(handler: (message: WorkerControlMessage) => void): void {
+    this.controlHandler = handler;
+    const queuedControls = this.frames.filter(isControlMessage);
+    if (queuedControls.length === 0) {
+      return;
+    }
+    this.frames.splice(
+      0,
+      this.frames.length,
+      ...this.frames.filter((frame) => !isControlMessage(frame)),
+    );
+    for (const control of queuedControls) {
+      handler(control);
+    }
   }
 
   next(signal?: AbortSignal): Promise<unknown> {
@@ -1012,6 +1105,13 @@ class FrameInbox {
   }
 
   private push(value: unknown): void {
+    if (isControlMessage(value)) {
+      this.budget.consumeIncomingControl();
+      if (this.controlHandler) {
+        this.controlHandler(value);
+        return;
+      }
+    }
     const waiter = this.waiters.shift();
     if (waiter) {
       waiter.resolve(value);
@@ -1345,9 +1445,6 @@ function stateFromHeader(
   accountId: string,
   stateVersionCounter: number,
 ): BridgeStateEnvelope | null {
-  if (!isRecord(rawHeader) || !isRecord(rawHeader.checkpoint)) {
-    return null;
-  }
   const empty: BridgeStateEnvelope = {
     stateVersion: 1,
     collectorAccountId: accountId,
@@ -1356,6 +1453,18 @@ function stateFromHeader(
     revisits: [],
     queueCoverage: "partial",
   };
+  if (rawHeader === null || rawHeader === undefined) {
+    return stateVersionCounter === 0 ? null : empty;
+  }
+  if (!isRecord(rawHeader)) {
+    throw new BoundedWorkerError("protocol_invalid", false, true);
+  }
+  if (rawHeader.checkpoint === null || rawHeader.checkpoint === undefined) {
+    return stateVersionCounter === 0 ? null : empty;
+  }
+  if (!isRecord(rawHeader.checkpoint)) {
+    throw new BoundedWorkerError("protocol_invalid", false, true);
+  }
   const checkpoint = rawHeader.checkpoint;
   if (
     checkpoint.stateVersion === 1 &&
@@ -1493,6 +1602,12 @@ function typedReadResultFromWire(
   if (rawMessages !== undefined && !messagesAreValid) {
     shapeWarnings.push("history_messages_shape_invalid");
   }
+  const rawSource = result.source;
+  const source =
+    rawSource === undefined ? undefined : ingestContextFromWire(rawSource);
+  if (rawSource !== undefined && source === undefined) {
+    shapeWarnings.push("history_source_shape_invalid");
+  }
   const items = itemsAreValid
     ? rawItems.filter(isRecord)
     : messagesAreValid
@@ -1501,7 +1616,6 @@ function typedReadResultFromWire(
   const messages = messagesAreValid ? rawMessages.filter(isRecord) : [];
   const detail = isRecord(result.detail) ? result.detail : undefined;
   const summary = isRecord(result.summary) ? result.summary : undefined;
-  const source = isRecord(result.source) ? result.source : undefined;
   const normalized = {
     items,
     ...(detail ? { detail } : {}),
@@ -1561,9 +1675,7 @@ function typedReadResultFromWire(
     ...(messages.length > 0
       ? { messages: messages as unknown as MessageRecord[] }
       : {}),
-    ...(source
-      ? { source: source as unknown as import("../ledger/types.js").IngestContext }
-      : {}),
+    ...(source ? { source } : {}),
     ...(typeof result.snapshotId === "string" || result.snapshotId === null
       ? { snapshotId: result.snapshotId }
       : {}),
@@ -1618,13 +1730,17 @@ function parseConversationMetadata(
   }
   const firstSummary =
     summary ??
-    (items.find(
-      (item) => "conversationId" in item && "isArchived" in item,
-    ) as unknown as ConversationSummary | undefined);
+    (items
+      .map((item) => (isRecord(item.payload) ? item.payload : item))
+      .find(
+        (item) => "conversationId" in item && "isArchived" in item,
+      ) as unknown as ConversationSummary | undefined);
   const itemConversationIds = items
     .flatMap((item) => {
       const direct = item.conversationId;
-      const payload = isRecord(item.payload) ? item.payload.conversationId : undefined;
+      const payload = isRecord(item.payload)
+        ? item.payload.conversationId
+        : undefined;
       return [
         ...(typeof direct === "string" ? [direct] : []),
         ...(typeof payload === "string" ? [payload] : []),
@@ -1637,37 +1753,98 @@ function parseConversationMetadata(
   if (firstSummary && firstSummary.conversationId !== conversationId) {
     throw new BoundedWorkerError("protocol_invalid", false, true);
   }
+  const observationMessages = items.flatMap((item) => {
+    const payload = isRecord(item.payload) ? item.payload : item;
+    return Array.isArray(payload.messages)
+      ? payload.messages.filter(isRecord)
+      : [];
+  });
   const rawMessages = result.messages;
   if (rawMessages !== undefined && !Array.isArray(rawMessages)) {
     shapeWarnings.push("retained_metadata_messages_shape_invalid");
   }
-  const messages = Array.isArray(rawMessages)
+  const directMessages = Array.isArray(rawMessages)
     ? rawMessages.filter(isRecord)
-    : items.flatMap((item) =>
-        Array.isArray(item.messages)
-          ? item.messages.filter(isRecord)
-          : [],
-      );
-  if (Array.isArray(rawMessages) && messages.length !== rawMessages.length) {
+    : [];
+  const messages = [
+    ...directMessages,
+    ...items.flatMap((item) =>
+      Array.isArray(item.messages) ? item.messages.filter(isRecord) : [],
+    ),
+    ...observationMessages,
+  ];
+  if (
+    Array.isArray(rawMessages) &&
+    directMessages.length !== rawMessages.length
+  ) {
     shapeWarnings.push("retained_metadata_messages_shape_invalid");
   }
+  const observationAttempts = items.flatMap((item) => {
+    const payload = isRecord(item.payload) ? item.payload : item;
+    return Array.isArray(payload.attempts)
+      ? payload.attempts.filter(isRecord)
+      : [];
+  });
   const rawAttempts = result.attempts;
   if (rawAttempts !== undefined && !Array.isArray(rawAttempts)) {
     shapeWarnings.push("retained_metadata_attempts_shape_invalid");
   }
-  const attempts = Array.isArray(rawAttempts)
+  const directAttempts = Array.isArray(rawAttempts)
     ? rawAttempts.filter(isRecord)
-    : undefined;
+    : [];
+  const attempts = [...directAttempts, ...observationAttempts];
   if (
     Array.isArray(rawAttempts) &&
-    attempts !== undefined &&
-    attempts.length !== rawAttempts.length
+    directAttempts.length !== rawAttempts.length
   ) {
     shapeWarnings.push("retained_metadata_attempts_shape_invalid");
   }
-  const source = isRecord(result.source)
-    ? (result.source as unknown as HistoryMetadataPage["source"])
-    : undefined;
+  const sources: IngestContext[] = [];
+  for (const item of items) {
+    if (item.context === undefined) {
+      continue;
+    }
+    const source = ingestContextFromWire(item.context);
+    if (source === undefined) {
+      shapeWarnings.push("retained_metadata_context_shape_invalid");
+      continue;
+    }
+    sources.push(source);
+  }
+  const directSource =
+    result.source === undefined
+      ? undefined
+      : ingestContextFromWire(result.source);
+  if (result.source !== undefined && directSource === undefined) {
+    shapeWarnings.push("retained_metadata_source_shape_invalid");
+  }
+  const allSources = directSource ? [directSource, ...sources] : sources;
+  const source = allSources[0];
+  if (
+    allSources.length > 1 &&
+    allSources.some((candidate) => !sameValue(candidate, allSources[0]))
+  ) {
+    shapeWarnings.push("retained_metadata_source_changed");
+  }
+  const rawCoverage = result.coverage;
+  const coverageDetails: Record<string, unknown> = {
+    ...(isRecord(rawCoverage) ? { pageCoverage: rawCoverage } : {}),
+    ...(isRecord(result.coverageDetails) ? result.coverageDetails : {}),
+  };
+  const coverage =
+    rawCoverage === "complete" ||
+    rawCoverage === "partial" ||
+    rawCoverage === "unknown"
+      ? rawCoverage
+      : isRecord(rawCoverage)
+        ? metadataCoverageFromObject(rawCoverage)
+        : undefined;
+  const truncated =
+    typeof result.truncated === "boolean"
+      ? result.truncated
+      : isRecord(rawCoverage) && rawCoverage.truncated === true
+        ? true
+        : undefined;
   return {
     ...(firstSummary
       ? {
@@ -1680,7 +1857,7 @@ function parseConversationMetadata(
     ...(messages.length > 0
       ? { messages: messages as unknown as MessageRecord[] }
       : {}),
-    ...(attempts
+    ...(attempts.length > 0
       ? {
           attempts:
           attempts as unknown as import("../ledger/types.js").ReconstructedAttempt[],
@@ -1691,8 +1868,8 @@ function parseConversationMetadata(
     ...(typeof result.schemaVersion === "string"
       ? { schemaVersion: result.schemaVersion }
       : {}),
-    ...(isRecord(result.coverageDetails)
-      ? { coverageDetails: result.coverageDetails }
+    ...(Object.keys(coverageDetails).length > 0
+      ? { coverageDetails }
       : {}),
     ...(typeof result.snapshotId === "string" || result.snapshotId === null
       ? { snapshotId: result.snapshotId }
@@ -1703,14 +1880,8 @@ function parseConversationMetadata(
     ...(typeof result.hasMore === "boolean"
       ? { hasMore: result.hasMore }
       : {}),
-    ...(result.coverage === "complete" ||
-    result.coverage === "partial" ||
-    result.coverage === "unknown"
-      ? { coverage: result.coverage }
-      : {}),
-    ...(typeof result.truncated === "boolean"
-      ? { truncated: result.truncated }
-      : {}),
+    ...(coverage ? { coverage } : {}),
+    ...(truncated !== undefined ? { truncated } : {}),
     warnings: [
       ...shapeWarnings,
       ...(Array.isArray(result.warnings)
@@ -1780,6 +1951,71 @@ function parseUsageCoverage(
     branches: value.branches as UsageReportSnapshot["coverage"]["branches"],
     gaps: [...value.gaps],
   };
+}
+
+function ingestContextFromWire(value: unknown): IngestContext | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const required = [
+    "runId",
+    "observedAt",
+    "sourceKind",
+    "sourceId",
+    "schemaVersion",
+  ] as const;
+  if (
+    required.some(
+      (field) =>
+        typeof value[field] !== "string" ||
+        value[field].trim() === "",
+    )
+  ) {
+    return undefined;
+  }
+  if (
+    !isValidInstant(value.observedAt) ||
+    value.provenance !== undefined && !isRecord(value.provenance)
+  ) {
+    return undefined;
+  }
+  return {
+    runId: value.runId as string,
+    observedAt: value.observedAt as string,
+    sourceKind: value.sourceKind as string,
+    sourceId: value.sourceId as string,
+    schemaVersion: value.schemaVersion as string,
+    ...(value.provenance === undefined
+      ? {}
+      : { provenance: value.provenance as Record<string, unknown> }),
+  };
+}
+
+function metadataCoverageFromObject(
+  value: Record<string, unknown>,
+): "complete" | "partial" | "unknown" {
+  const candidates = [
+    value.status,
+    value.coverage,
+    value.overall,
+    value.state,
+  ];
+  for (const candidate of candidates) {
+    if (
+      candidate === "complete" ||
+      candidate === "partial" ||
+      candidate === "unknown"
+    ) {
+      return candidate;
+    }
+  }
+  return value.truncated === true || value.partial === true
+    ? "partial"
+    : "unknown";
+}
+
+function isValidInstant(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(new Date(value).getTime());
 }
 
 function throwIfDomainBlocked(
@@ -1858,6 +2094,37 @@ function completionFor(
           : "failure",
     retryAfterMs,
   };
+}
+
+function completionForError(
+  error: unknown,
+  now: number,
+): CompleteTriggerRequest {
+  return {
+    outcome:
+      error instanceof AuthenticationRequiredError
+        ? "authentication"
+        : "failure",
+    retryAfterMs:
+      error instanceof RateLimitedError
+        ? retryAfterMsFromWire(error.retryAfter, now)
+        : null,
+  };
+}
+
+function retryAfterMsFromWire(
+  value: string | null,
+  now: number,
+): number | null {
+  if (value === null || value.trim() === "") {
+    return null;
+  }
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(Number.MAX_SAFE_INTEGER, Math.floor(seconds * 1_000));
+  }
+  const instant = new Date(value).getTime();
+  return Number.isFinite(instant) ? Math.max(0, instant - now) : null;
 }
 
 function scopeFromWire(
@@ -2011,6 +2278,13 @@ function isAuthState(value: unknown): value is IdentityRecord["authState"] {
   );
 }
 
+function isAccountBlockingError(error: unknown): boolean {
+  return (
+    error instanceof AuthenticationRequiredError ||
+    error instanceof RateLimitedError
+  );
+}
+
 function monotonicNow(): number {
   return typeof performance !== "undefined" ? performance.now() : Date.now();
 }
@@ -2019,10 +2293,36 @@ function errorCode(error: unknown): string {
   if (error instanceof BoundedWorkerError) {
     return error.code;
   }
+  if (error instanceof AuthenticationRequiredError) {
+    return "auth_required";
+  }
+  if (error instanceof RateLimitedError) {
+    return "rate_limited";
+  }
   if (error instanceof Error && error.name) {
     return error.name.toLowerCase().replace(/[^a-z0-9]+/g, "_");
   }
   return "worker_error";
+}
+
+function sameValue(left: unknown, right: unknown): boolean {
+  return (
+    JSON.stringify(canonicalize(left)) === JSON.stringify(canonicalize(right))
+  );
+}
+
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonicalize);
+  }
+  if (value === null || typeof value !== "object") {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, canonicalize(item)]),
+  );
 }
 
 if (process.argv.includes("--stdio-v1")) {
