@@ -2,15 +2,50 @@ BEGIN;
 
 CREATE TABLE IF NOT EXISTS public.chatgpt_usage_scopes (
     scope_key TEXT PRIMARY KEY,
-    collector_account_id TEXT NOT NULL UNIQUE,
+    collector_account_id TEXT,
     provider TEXT NOT NULL,
     provider_user_id TEXT,
     workspace_id TEXT,
     quota_owner_id TEXT,
     surface TEXT NOT NULL,
+    identity_state TEXT NOT NULL DEFAULT 'provisional',
+    superseded_by_scope_key TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS public.chatgpt_usage_scope_bindings (
+    scope_key TEXT NOT NULL REFERENCES public.chatgpt_usage_scopes(scope_key)
+        ON DELETE CASCADE,
+    collector_account_id TEXT NOT NULL,
+    binding_generation INTEGER NOT NULL,
+    binding_state TEXT NOT NULL,
+    first_seen_at TIMESTAMPTZ NOT NULL,
+    last_seen_at TIMESTAMPTZ NOT NULL,
+    retired_at TIMESTAMPTZ,
+    PRIMARY KEY (scope_key, collector_account_id, binding_generation)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS chatgpt_usage_scope_bindings_active_collector_idx
+    ON public.chatgpt_usage_scope_bindings (collector_account_id)
+    WHERE binding_state = 'active';
+
+CREATE INDEX IF NOT EXISTS chatgpt_usage_scope_bindings_scope_idx
+    ON public.chatgpt_usage_scope_bindings (scope_key, binding_state, last_seen_at);
+
+CREATE TABLE IF NOT EXISTS public.chatgpt_usage_scope_redirects (
+    retired_scope_key TEXT PRIMARY KEY
+        REFERENCES public.chatgpt_usage_scopes(scope_key) ON DELETE CASCADE,
+    canonical_scope_key TEXT NOT NULL
+        REFERENCES public.chatgpt_usage_scopes(scope_key) ON DELETE CASCADE,
+    reason TEXT NOT NULL,
+    first_seen_at TIMESTAMPTZ NOT NULL,
+    last_seen_at TIMESTAMPTZ NOT NULL,
+    CHECK (retired_scope_key <> canonical_scope_key)
+);
+
+CREATE INDEX IF NOT EXISTS chatgpt_usage_scope_redirects_canonical_idx
+    ON public.chatgpt_usage_scope_redirects (canonical_scope_key);
 
 CREATE TABLE IF NOT EXISTS public.chatgpt_usage_attempts (
     attempt_id TEXT NOT NULL,
@@ -43,6 +78,8 @@ CREATE TABLE IF NOT EXISTS public.chatgpt_usage_attempts (
     tombstone BOOLEAN NOT NULL DEFAULT FALSE,
     observed_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
+    last_seen_at TIMESTAMPTZ NOT NULL,
+    superseded_by_attempt_id TEXT,
     PRIMARY KEY (scope_key, attempt_id)
 );
 
@@ -59,7 +96,7 @@ CREATE TABLE IF NOT EXISTS public.chatgpt_usage_attempt_revisions (
     collector_account_id TEXT NOT NULL,
     recorded_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (scope_key, attempt_id, revision),
-    UNIQUE (scope_key, attempt_id, projection_fingerprint),
+    is_current_projection BOOLEAN NOT NULL DEFAULT FALSE,
     FOREIGN KEY (scope_key, attempt_id)
         REFERENCES public.chatgpt_usage_attempts(scope_key, attempt_id)
         ON DELETE CASCADE
@@ -92,6 +129,7 @@ CREATE TABLE IF NOT EXISTS public.chatgpt_usage_observations (
     source_id TEXT NOT NULL,
     revision_fingerprint TEXT NOT NULL,
     revision_number INTEGER NOT NULL,
+    occurrence_number INTEGER NOT NULL,
     surface TEXT NOT NULL,
     conversation_id TEXT,
     payload JSONB NOT NULL,
@@ -99,9 +137,14 @@ CREATE TABLE IF NOT EXISTS public.chatgpt_usage_observations (
     run_id TEXT NOT NULL,
     schema_version TEXT NOT NULL,
     provenance JSONB NOT NULL DEFAULT '{}'::jsonb,
+    first_seen_at TIMESTAMPTZ NOT NULL,
+    last_seen_at TIMESTAMPTZ NOT NULL,
+    last_seen_run_id TEXT NOT NULL,
+    last_seen_provenance JSONB NOT NULL DEFAULT '{}'::jsonb,
+    is_current_projection BOOLEAN NOT NULL DEFAULT TRUE,
     supersedes_observation_id TEXT,
     PRIMARY KEY (scope_key, observation_id),
-    UNIQUE (scope_key, collector_account_id, source_kind, source_id, revision_fingerprint)
+    UNIQUE (scope_key, source_kind, source_id, occurrence_number)
 );
 
 CREATE TABLE IF NOT EXISTS public.chatgpt_usage_coverage_gaps (
@@ -131,6 +174,31 @@ CREATE TABLE IF NOT EXISTS public.chatgpt_usage_activity_provenance (
     PRIMARY KEY (scope_key, activity_kind, activity_id, collector_account_id)
 );
 
+ALTER TABLE public.chatgpt_usage_scopes
+    ALTER COLUMN collector_account_id DROP NOT NULL;
+ALTER TABLE public.chatgpt_usage_scopes
+    ADD COLUMN IF NOT EXISTS identity_state TEXT NOT NULL DEFAULT 'provisional';
+ALTER TABLE public.chatgpt_usage_scopes
+    ADD COLUMN IF NOT EXISTS superseded_by_scope_key TEXT;
+ALTER TABLE public.chatgpt_usage_attempts
+    ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
+ALTER TABLE public.chatgpt_usage_attempts
+    ADD COLUMN IF NOT EXISTS superseded_by_attempt_id TEXT;
+ALTER TABLE public.chatgpt_usage_attempt_revisions
+    ADD COLUMN IF NOT EXISTS is_current_projection BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE public.chatgpt_usage_observations
+    ADD COLUMN IF NOT EXISTS occurrence_number INTEGER;
+ALTER TABLE public.chatgpt_usage_observations
+    ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMPTZ;
+ALTER TABLE public.chatgpt_usage_observations
+    ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
+ALTER TABLE public.chatgpt_usage_observations
+    ADD COLUMN IF NOT EXISTS last_seen_run_id TEXT;
+ALTER TABLE public.chatgpt_usage_observations
+    ADD COLUMN IF NOT EXISTS last_seen_provenance JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE public.chatgpt_usage_observations
+    ADD COLUMN IF NOT EXISTS is_current_projection BOOLEAN NOT NULL DEFAULT TRUE;
+
 CREATE INDEX IF NOT EXISTS chatgpt_usage_attempts_time_idx
     ON public.chatgpt_usage_attempts (
         scope_key,
@@ -154,7 +222,16 @@ CREATE INDEX IF NOT EXISTS chatgpt_usage_observations_source_idx
         scope_key,
         source_kind,
         source_id,
-        revision_number
+        occurrence_number,
+        observed_at
+    );
+CREATE INDEX IF NOT EXISTS chatgpt_usage_observations_current_idx
+    ON public.chatgpt_usage_observations (
+        scope_key,
+        source_kind,
+        source_id,
+        is_current_projection,
+        observed_at
     );
 CREATE INDEX IF NOT EXISTS chatgpt_usage_coverage_gaps_state_idx
     ON public.chatgpt_usage_coverage_gaps (scope_key, state, last_seen_at);
@@ -165,5 +242,79 @@ CREATE INDEX IF NOT EXISTS chatgpt_usage_activity_provenance_lookup_idx
         activity_id,
         last_seen_at
     );
+
+ALTER TABLE public.chatgpt_usage_scopes
+    DROP CONSTRAINT IF EXISTS chatgpt_usage_scopes_collector_account_id_key;
+ALTER TABLE public.chatgpt_usage_observations
+    DROP CONSTRAINT IF EXISTS
+        chatgpt_usage_observations_scope_key_collector_account_id_source_kind_source_id_revision_fingerprint_key;
+ALTER TABLE public.chatgpt_usage_observations
+    DROP CONSTRAINT IF EXISTS
+        chatgpt_usage_observations_scope_key_collector_account_id_sourc;
+ALTER TABLE public.chatgpt_usage_attempt_revisions
+    DROP CONSTRAINT IF EXISTS
+        chatgpt_usage_attempt_revisions_scope_key_attempt_id_projection_fingerprint_key;
+ALTER TABLE public.chatgpt_usage_attempt_revisions
+    DROP CONSTRAINT IF EXISTS
+        chatgpt_usage_attempt_revisions_scope_key_attempt_id_projection;
+
+UPDATE public.chatgpt_usage_attempts
+SET last_seen_at = COALESCE(last_seen_at, updated_at, observed_at)
+WHERE last_seen_at IS NULL;
+ALTER TABLE public.chatgpt_usage_attempts
+    ALTER COLUMN last_seen_at SET NOT NULL;
+
+WITH numbered AS (
+    SELECT observation_id, scope_key,
+           ROW_NUMBER() OVER (
+               PARTITION BY scope_key, source_kind, source_id
+               ORDER BY revision_number, observed_at, observation_id
+           ) AS occurrence_number
+    FROM public.chatgpt_usage_observations
+)
+UPDATE public.chatgpt_usage_observations AS observations
+SET occurrence_number = COALESCE(
+        observations.occurrence_number,
+        numbered.occurrence_number
+    ),
+    first_seen_at = COALESCE(observations.first_seen_at, observations.observed_at),
+    last_seen_at = COALESCE(observations.last_seen_at, observations.observed_at),
+    last_seen_run_id = COALESCE(observations.last_seen_run_id, observations.run_id)
+FROM numbered
+WHERE observations.observation_id = numbered.observation_id
+  AND observations.scope_key = numbered.scope_key;
+ALTER TABLE public.chatgpt_usage_observations
+    ALTER COLUMN occurrence_number SET NOT NULL;
+ALTER TABLE public.chatgpt_usage_observations
+    ALTER COLUMN first_seen_at SET NOT NULL;
+ALTER TABLE public.chatgpt_usage_observations
+    ALTER COLUMN last_seen_at SET NOT NULL;
+ALTER TABLE public.chatgpt_usage_observations
+    ALTER COLUMN last_seen_run_id SET NOT NULL;
+
+UPDATE public.chatgpt_usage_scopes
+SET identity_state = CASE
+    WHEN provider_user_id IS NOT NULL
+     AND workspace_id IS NOT NULL
+     AND quota_owner_id IS NOT NULL
+    THEN 'verified'
+    ELSE identity_state
+END
+WHERE identity_state = 'provisional';
+
+CREATE UNIQUE INDEX IF NOT EXISTS chatgpt_usage_observations_occurrence_idx
+    ON public.chatgpt_usage_observations (
+        scope_key, source_kind, source_id, occurrence_number
+    );
+
+INSERT INTO public.chatgpt_usage_scope_bindings (
+    scope_key, collector_account_id, binding_generation, binding_state,
+    first_seen_at, last_seen_at
+)
+SELECT scope_key, collector_account_id, 1, 'active',
+       COALESCE(created_at, NOW()), COALESCE(updated_at, created_at, NOW())
+FROM public.chatgpt_usage_scopes
+WHERE collector_account_id IS NOT NULL
+ON CONFLICT (scope_key, collector_account_id, binding_generation) DO NOTHING;
 
 COMMIT;
