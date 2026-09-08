@@ -436,7 +436,15 @@ def _infer_rate_limit_client_family(
         or model_lower.startswith(("opencode/", "opencode-zen/", "zen/"))
     ):
         return "opencode_zen"
-    if credential_family == "xai_grok_oidc" or metadata.get("grok_native_oauth_managed") is True:
+    if credential_family == "xai_grok_oidc" or (
+        not credential_family
+        and "xai_oauth" not in route_family
+        and (
+            metadata.get("grok_native_oauth_managed") is True
+            or "grok_cli" in route_family
+            or route_family in {"grok-build", "grok_build"}
+        )
+    ):
         return "grok-build"
     if (
         "xai_oauth" in source_lower

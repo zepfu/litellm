@@ -740,7 +740,20 @@ def _looks_like_xai_grok_oidc_rate_limit_context(context: Dict[str, Any]) -> boo
     if not isinstance(metadata, dict):
         metadata = {}
     credential_family = str(metadata.get("credential_family") or "").lower()
-    return credential_family == "xai_grok_oidc" or metadata.get("grok_native_oauth_managed") is True
+    if credential_family:
+        return credential_family == "xai_grok_oidc"
+    route_family = str(
+        metadata.get("passthrough_route_family")
+        or metadata.get("route_family")
+        or context.get("route_family")
+        or ""
+    ).lower()
+    if route_family:
+        if "xai_oauth" in route_family:
+            return False
+        if "grok_cli" in route_family or route_family in {"grok-build", "grok_build"}:
+            return True
+    return metadata.get("grok_native_oauth_managed") is True
 
 
 def _extract_xai_oauth_account_hash(metadata: Dict[str, Any]) -> Optional[str]:
@@ -826,6 +839,39 @@ def _extract_xai_oauth_billing_period_end(
     return None, None
 
 
+def _select_xai_header_rate_limit_candidates(
+    kwargs: Dict[str, Any],
+    result: Any,
+    metadata: Dict[str, Any],
+    source_name: str,
+    native: bool,
+) -> Tuple[List[Dict[str, Any]], Set[str]]:
+    candidates = _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result))
+    accepted_sources = {source_name}
+    if not native:
+        return candidates, accepted_sources
+
+    accepted_sources.add("xai_oauth_response_headers")
+    canonical_candidates = _iter_rate_limit_dicts(metadata.get(source_name))
+    has_canonical_headers = any(
+        any(
+            isinstance(key, str) and key.lower().startswith("x-ratelimit-")
+            for key in candidate
+        )
+        for candidate in canonical_candidates
+    ) or any(
+        str(candidate.get("source") or "").lower() == source_name
+        and any(
+            isinstance(key, str) and key.lower().startswith("x-ratelimit-")
+            for key in candidate
+        )
+        for candidate in candidates
+    )
+    if has_canonical_headers:
+        accepted_sources.discard("xai_oauth_response_headers")
+    return candidates, accepted_sources
+
+
 def _extract_xai_header_rate_limit_observations(
     kwargs: Dict[str, Any],
     result: Any,
@@ -866,11 +912,6 @@ def _extract_xai_header_rate_limit_observations(
         if context.get("model") != "unknown"
         else None
     )
-    accepted_sources = {source_name}
-    if native:
-        # Native responses written before XAI-027 used the managed key. Read
-        # that source only while metadata proves native ownership.
-        accepted_sources.add("xai_oauth_response_headers")
     billing_period_sources = {
         "payload_billing_period_end",
         "payload_config_billing_period_end",
@@ -879,7 +920,14 @@ def _extract_xai_header_rate_limit_observations(
         "xai_grok_subscription_month_boundary",
     }
     observations: List[Dict[str, Any]] = []
-    for candidate in _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result)):
+    candidates, accepted_sources = _select_xai_header_rate_limit_candidates(
+        kwargs,
+        result,
+        metadata,
+        source_name,
+        native,
+    )
+    for candidate in candidates:
         lower_headers = _rate_limit_header_map(candidate)
         source = str(candidate.get("source") or "").lower()
         has_xai_header = any(
@@ -1585,6 +1633,7 @@ _HOST_FUNCTION_NAMES = (
     "_next_utc_month_start",
     "_is_xai_oauth_subscription_quota_context",
     "_extract_xai_oauth_billing_period_end",
+    "_select_xai_header_rate_limit_candidates",
     "_extract_xai_header_rate_limit_observations",
     "_extract_xai_oauth_header_rate_limit_observations",
     "_extract_xai_grok_oidc_header_rate_limit_observations",

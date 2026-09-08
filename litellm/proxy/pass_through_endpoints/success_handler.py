@@ -177,10 +177,20 @@ class PassThroughEndpointLogging:
 
     @staticmethod
     def _is_grok_native_oauth_metadata(metadata: dict) -> bool:
-        if metadata.get("grok_native_oauth_managed") is True:
-            return True
         credential_family = str(metadata.get("credential_family") or "").lower()
-        return credential_family == "xai_grok_oidc"
+        if credential_family:
+            return credential_family == "xai_grok_oidc"
+        route_family = str(
+            metadata.get("passthrough_route_family")
+            or metadata.get("route_family")
+            or ""
+        ).lower()
+        if route_family:
+            if "xai_oauth" in route_family:
+                return False
+            if "grok_cli" in route_family or route_family in {"grok-build", "grok_build"}:
+                return True
+        return metadata.get("grok_native_oauth_managed") is True
 
     @staticmethod
     def _is_xai_oauth_metadata(metadata: dict) -> bool:
