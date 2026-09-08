@@ -221,6 +221,13 @@ def _install_responses_prefetch_abort_owner(  # noqa: PLR0915
 ) -> Any:
     existing_owner = getattr(target, _RESPONSES_PREFETCH_ABORT_ATTR, None)
     if callable(existing_owner):
+        register = getattr(
+            existing_owner,
+            "_aawm_register_prefetch_continuation",
+            None,
+        )
+        if callable(register):
+            register(target, None)
         return existing_owner
 
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
