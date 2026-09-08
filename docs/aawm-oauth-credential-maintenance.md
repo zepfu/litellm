@@ -106,6 +106,109 @@ the same non-secret account identity. An unchanged generation, a second
 `401`, missing or unproven account evidence, or a different account ends
 recovery; native Grok OIDC does not use this policy.
 
+### Managed xAI account inventory and rollover
+
+Set `LITELLM_XAI_OAUTH_INVENTORY` to one strict JSON object to use more than
+one managed xAI OAuth record:
+
+```json
+{
+  "schema_version": 1,
+  "accounts": [
+    {
+      "label": "primary",
+      "auth_path": "/run/secrets/xai-primary.json",
+      "scope": "https://auth.x.ai::example-primary",
+      "priority": 0,
+      "enabled": true,
+      "expected_account_identity": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "label": "secondary",
+      "auth_path": "/run/secrets/xai-secondary.json",
+      "scope": "https://auth.x.ai::example-secondary",
+      "priority": 1,
+      "enabled": true,
+      "expected_account_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  ]
+}
+```
+
+Every enabled entry has one exact auth-file/scope selector, a unique safe label,
+and an identity pin derived from the credential record's nonsecret account
+identity. The request path never discovers records by scanning files or accepts
+an account selection from client metadata. Invalid inventory, disabled records,
+or a pin mismatch leave that record unavailable before provider I/O. When the
+inventory variable is absent, the existing explicit one-file configuration
+remains one legacy account lane.
+
+Each record receives a separate server-owned lane and rate-observation
+identity. Fresh, unbound traffic can move to an untraversed record only after a
+provider-returned `401`, `429`, or recognized quota failure. Same-account
+generation reread remains the first `401` recovery path. Continuations,
+`previous_response_id`, and other account-bound state remain pinned to their
+original record and fail explicitly rather than switching accounts. Attempt
+metadata distinguishes provider-call ordinal from account-traversal ordinal;
+rate observations use inventory-derived account and scope identities and reject
+inbound replacements.
+
+### Managed xAI concrete-send accounting
+
+Managed xAI request accounting is request-scoped and observational. A send is
+recorded only after the exact target and request headers pass the managed-route
+egress guard and immediately before the concrete HTTP transport send. The
+counter is not a retry budget, does not authorize another candidate, and does
+not accept account identity from inbound metadata. Connection-level retries
+that construct a new concrete request are recorded as separate sends.
+
+Managed xAI candidate attempt metadata may include:
+
+- `xai_oauth_actual_send_count`: the number of concrete managed xAI sends
+  produced by that candidate attempt.
+- `xai_oauth_actual_send_ordinal`: the request-global ordinal of the last
+  concrete send in the attempt, when at least one send occurred.
+- `xai_oauth_provider_attempt_ordinal`: the same concrete-send ordinal used
+  for provider-attempt accounting; it is distinct from
+  `xai_oauth_account_traversal_ordinal`.
+- `xai_oauth_actual_send_counter`: a bounded snapshot containing
+  `actual_send_count`, `next_send_ordinal`, `last_send_ordinal`,
+  `max_records`, and credential-free `records`.
+
+Each bounded record contains only `ordinal`, the validated
+`account_hash`/`lane_key`, a truncated `target_fingerprint`, and the
+low-cardinality `route_family`. It never contains tokens, raw account IDs,
+authorization headers, or raw target URLs. The record window is capped at 32
+entries; the monotonic total and ordinals remain authoritative after older
+records roll out of the window.
+
+An attempt with zero concrete sends reports
+`xai_oauth_actual_send_count=0`, omits send ordinals, and retains
+`attempted_provider_call=false`. Local route, credential-readiness, validation,
+or transport-construction failures before the guarded send do not advance the
+counter. Managed Responses requests disable automatic redirects so a 3xx
+response is rejected by the existing managed xAI redirect contract rather than
+creating an unobserved credential-bearing follow-up send. Generic provider
+requests keep their existing redirect behavior.
+
+### Managed xAI direct continuation ownership
+
+Direct managed xAI Responses traffic with `previous_response_id` or other
+provider-owned continuation state may proceed only when server state proves
+both the canonical session and the exact continuation/account association. A
+durable session-owner record containing provider, route, and account
+attributes is not sufficient: it does not bind the submitted response ID. If
+that association is missing, conflicting, or otherwise unproven, LiteLLM
+returns a structured non-failover `409` before primary inventory selection,
+credential snapshot loading, or provider I/O.
+
+This path does not trust inbound account metadata, create a response-to-account
+store, strip the continuation identifier, or fall back to the configured
+primary account. Alias and candidate dispatch may preserve a validated
+server-bound account already attached to the current request; that binding is
+not inferred from client metadata. Requests without provider-owned continuation
+state use normal server-owned selection and remain unchanged.
+
 ## OAuth refresh deadline contract
 
 Scheduled Grok OIDC, Codex OAuth, managed xAI OAuth, Kimi OAuth, and Nous

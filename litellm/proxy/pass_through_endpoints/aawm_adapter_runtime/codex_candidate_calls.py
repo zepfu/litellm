@@ -1400,8 +1400,12 @@ async def _perform_codex_auto_agent_alias_candidate_request(
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
         _bind_codex_oauth_candidate_to_request,
     )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+        bind_xai_oauth_candidate_to_request,
+    )
 
     _bind_codex_oauth_candidate_to_request(request, candidate)
+    bind_xai_oauth_candidate_to_request(request, candidate)
     if isinstance(candidate_body, dict):
         # Native OpenAI candidates are compiled below. Other adapter routes
         # still need the protocol-owned sidecar removal before their provider

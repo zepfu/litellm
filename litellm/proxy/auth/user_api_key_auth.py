@@ -1229,6 +1229,7 @@ async def _user_api_key_auth_builder(  # noqa: PLR0915
                             model=m["model"] if isinstance(m, dict) else m,
                             llm_router=llm_router,
                             user_model=None,
+                            request=request,
                         )
 
             # Check 2. If user_id for this token is in budget - done in common_checks()

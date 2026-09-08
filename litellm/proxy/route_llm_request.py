@@ -1,9 +1,12 @@
 import inspect
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
-from fastapi import HTTPException, status
+from fastapi import HTTPException, Request, status
 
 import litellm
+from litellm.llms.xai.managed_send_counter import (
+    MANAGED_XAI_SEND_REQUEST_KWARG,
+)
 
 if TYPE_CHECKING:
     from litellm.router import Router as _Router
@@ -237,6 +240,7 @@ async def route_request(  # noqa: PLR0915 - Complex routing function, refactorin
         "acancel_run",
         "adelete_run",
     ],
+    request: Optional[Request] = None,
 ):
     """
     Common helper to route the request
@@ -253,16 +257,62 @@ async def route_request(  # noqa: PLR0915 - Complex routing function, refactorin
             data["config"] = data.pop("generationConfig")
 
     from litellm.llms.xai.oauth import (
+        bind_xai_oauth_snapshot_to_request,
+        get_xai_oauth_snapshot_from_request,
+        is_oa_xai_model,
         prepare_oa_xai_request,
         reread_xai_oauth_snapshot_after_provider_401,
     )
 
     snapshot_out: dict[str, Any] = {}
+    selected_xai_account = None
+    xai_oauth_snapshot = None
+    if is_oa_xai_model(data.get("model")):
+        if request is None:
+            raise ValueError(
+                "Managed xAI OAuth routing requires the originating proxy "
+                "request context."
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+            get_or_bind_xai_oauth_selected_account_and_snapshot,
+            resolve_xai_oauth_direct_continuation_account,
+        )
+
+        proxy_server_request = data.get("proxy_server_request")
+        if isinstance(proxy_server_request, dict):
+            proxy_server_request["_request"] = request
+        else:
+            data["proxy_server_request"] = {"_request": request}
+        selected_xai_account = (
+            await resolve_xai_oauth_direct_continuation_account(
+                request,
+                data,
+            )
+        )
+        if selected_xai_account is None:
+            selected_xai_account, xai_oauth_snapshot = (
+                await get_or_bind_xai_oauth_selected_account_and_snapshot(
+                    request
+                )
+            )
+        else:
+            xai_oauth_snapshot = get_xai_oauth_snapshot_from_request(request)
+            if xai_oauth_snapshot is None:
+                selected_xai_account, xai_oauth_snapshot = (
+                    await get_or_bind_xai_oauth_selected_account_and_snapshot(
+                        request,
+                        selected_account=selected_xai_account,
+                    )
+                )
     prepared_oa_xai_request = await prepare_oa_xai_request(
         data,
         snapshot_out=snapshot_out,
+        snapshot=xai_oauth_snapshot,
+        selected_account=selected_xai_account,
     )
     if prepared_oa_xai_request:
+        if request is not None:
+            data[MANAGED_XAI_SEND_REQUEST_KWARG] = request
         route_fn = getattr(litellm, f"{route_type}")
         initial_invocation = route_fn(**data)
         if not inspect.isawaitable(initial_invocation):
@@ -286,6 +336,15 @@ async def route_request(  # noqa: PLR0915 - Complex routing function, refactorin
                 )
                 if refreshed_snapshot is None:
                     raise
+                bind_xai_oauth_snapshot_to_request(request, refreshed_snapshot)
+                from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+                    preserve_xai_oauth_snapshot_refresh_context,
+                )
+
+                preserve_xai_oauth_snapshot_refresh_context(
+                    request,
+                    refreshed_snapshot,
+                )
                 data["api_key"] = refreshed_snapshot.access_token
                 retry_invocation = route_fn(**data)
                 if inspect.isawaitable(retry_invocation):

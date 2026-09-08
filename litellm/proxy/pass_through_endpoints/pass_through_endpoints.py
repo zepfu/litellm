@@ -198,6 +198,9 @@ from .aawm_alias_routing.pre_commit_retry import (
     await_with_client_disconnect,
     get_or_create_openai_alpha_capacity_retry_coordinator,
 )
+from litellm.llms.xai.managed_send_counter import (
+    record_managed_xai_actual_send,
+)
 from .aawm_adapter_runtime.provider_call_ledger import (
     ProviderCallLedgerExhausted,
     ProviderCallReplayBlocked,
@@ -6367,6 +6370,15 @@ async def pass_through_request(  # noqa: PLR0915
                         )
                     if validate_prepared_request_fn is not None:
                         validate_prepared_request_fn(prepared_request)
+                    if managed_xai_oauth_request:
+                        record_managed_xai_actual_send(
+                            request,
+                            target=prepared_request.url,
+                            route_family=(
+                                expected_target_family
+                                or egress_credential_family
+                            ),
+                        )
                     response = await async_client.send(
                         prepared_request,
                         stream=send_stream,
@@ -6398,6 +6410,13 @@ async def pass_through_request(  # noqa: PLR0915
                     request=request,
                     prepared_request=prepared_request,
                     managed_xai_oauth_request=True,
+                )
+                record_managed_xai_actual_send(
+                    request,
+                    target=prepared_request.url,
+                    route_family=(
+                        expected_target_family or egress_credential_family
+                    ),
                 )
                 response = await async_client.send(
                     prepared_request,

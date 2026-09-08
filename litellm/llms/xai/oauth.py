@@ -235,6 +235,7 @@ async def prepare_oa_xai_request(
     *,
     snapshot_out: Optional[MutableMapping[str, Any]] = None,
     snapshot: Optional[XaiOAuthCredentialSnapshot] = None,
+    selected_account: Optional[Any] = None,
 ) -> bool:
     public_model = data.get("model")
     if not is_oa_xai_model(public_model):
@@ -252,22 +253,51 @@ async def prepare_oa_xai_request(
         raise ValueError(
             "Managed xAI OAuth request received the wrong credential snapshot."
         )
-    if snapshot is None:
-        resolved_snapshot, credential_resolution = (
-            await _get_xai_oauth_snapshot_with_resolution()
-        )
+    selected_metadata: Optional[dict[str, Any]] = None
+    if selected_account is None:
+        if snapshot is None:
+            resolved_snapshot, credential_resolution = (
+                await _get_xai_oauth_snapshot_with_resolution()
+            )
+        else:
+            credential_resolution = await asyncio.to_thread(
+                _resolve_xai_oauth_snapshot_inputs_sync
+            )
+            if (
+                credential_resolution.canonical_auth_file != snapshot.auth_file
+                or credential_resolution.scope != snapshot.scope
+            ):
+                raise ValueError(
+                    "Managed xAI OAuth request changed its credential file or scope."
+                )
+            resolved_snapshot = snapshot
     else:
-        credential_resolution = await asyncio.to_thread(
-            _resolve_xai_oauth_snapshot_inputs_sync
-        )
+        record = getattr(selected_account, "record", None)
+        auth_path = getattr(record, "auth_path", None)
+        scope = getattr(record, "scope", None)
+        if not isinstance(auth_path, Path) or not isinstance(scope, str) or not scope:
+            raise ValueError(
+                "Managed xAI OAuth request received an invalid selected account."
+            )
+        resolved_snapshot = snapshot or await get_xai_oauth_snapshot_for_record(record)
         if (
-            credential_resolution.canonical_auth_file != snapshot.auth_file
-            or credential_resolution.scope != snapshot.scope
+            resolved_snapshot.auth_file != auth_path
+            or resolved_snapshot.scope != scope
         ):
             raise ValueError(
-                "Managed xAI OAuth request changed its credential file or scope."
+                "Managed xAI OAuth selected account does not match its "
+                "credential snapshot."
             )
-        resolved_snapshot = snapshot
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+            resolve_xai_oauth_selected_account_identity,
+            xai_oauth_selected_account_metadata,
+        )
+
+        selected_account = await resolve_xai_oauth_selected_account_identity(
+            selected_account,
+            snapshot=resolved_snapshot,
+        )
+        selected_metadata = xai_oauth_selected_account_metadata(selected_account)
     if snapshot_out is not None:
         snapshot_out["snapshot"] = resolved_snapshot
     data["api_key"] = resolved_snapshot.access_token
@@ -288,15 +318,22 @@ async def prepare_oa_xai_request(
         build_oa_xai_metadata(public_model, upstream_model),
         authoritative=True,
     )
-    _merge_metadata(
-        litellm_metadata,
-        {
-            "credential_identity": credential_resolution.credential_identity,
-            "auth_file_source": credential_resolution.auth_file_source,
-            "scope_source": credential_resolution.scope_source,
-        },
-        authoritative=True,
-    )
+    if selected_account is None:
+        _merge_metadata(
+            litellm_metadata,
+            {
+                "credential_identity": credential_resolution.credential_identity,
+                "auth_file_source": credential_resolution.auth_file_source,
+                "scope_source": credential_resolution.scope_source,
+            },
+            authoritative=True,
+        )
+    if selected_metadata is not None:
+        _merge_metadata(
+            litellm_metadata,
+            selected_metadata,
+            authoritative=True,
+        )
     if decoded_previous_response_id:
         _merge_metadata(
             litellm_metadata,
@@ -841,6 +878,21 @@ async def _get_xai_oauth_snapshot_with_resolution(
     return snapshot, resolution
 
 
+async def get_xai_oauth_snapshot_for_record(
+    record: Any,
+) -> XaiOAuthCredentialSnapshot:
+    """Load one server-configured managed xAI auth-file/scope record."""
+
+    credential_path = getattr(record, "auth_path", None)
+    scope = getattr(record, "scope", None)
+    if not isinstance(credential_path, Path) or not isinstance(scope, str) or not scope:
+        raise ValueError("Managed xAI OAuth record is incomplete.")
+    return await _get_xai_oauth_snapshot_for_path(
+        credential_path=credential_path,
+        scope=scope,
+    )
+
+
 async def get_xai_oauth_snapshot() -> XaiOAuthCredentialSnapshot:
     """Return one immutable managed OAuth snapshot without blocking the loop."""
 
@@ -965,6 +1017,20 @@ def bind_xai_oauth_snapshot_to_request(
         snapshots = {}
         setattr(state, _XAI_SNAPSHOT_STATE_ATTR, snapshots)
     snapshots[snapshot.credential_family] = snapshot
+
+
+def clear_xai_oauth_snapshot_from_request(
+    request: Any,
+    *,
+    credential_family: str = _XAI_MANAGED_SNAPSHOT_FAMILY,
+) -> None:
+    """Drop a request snapshot before rebinding a different server account."""
+
+    state = getattr(request, "state", None)
+    snapshots = getattr(state, _XAI_SNAPSHOT_STATE_ATTR, None)
+    if not isinstance(snapshots, dict):
+        return
+    snapshots.pop(credential_family, None)
 
 
 def get_xai_oauth_snapshot_from_request(

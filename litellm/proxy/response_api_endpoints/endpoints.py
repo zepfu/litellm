@@ -1027,6 +1027,7 @@ async def responses_websocket_endpoint(
             route_type="_aresponses_websocket",
             llm_router=llm_router,
             user_model=user_model,
+            request=request,
         )
         await llm_call
     except Exception:

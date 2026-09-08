@@ -3118,6 +3118,7 @@ all_litellm_params = (
         "request_timeout",
         "complete_response",
         "self",
+        "_aawm_managed_xai_send_request",
         "client",
         "rpm",
         "tpm",

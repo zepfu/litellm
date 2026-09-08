@@ -148,6 +148,7 @@ async def create_realtime_client_secret(
             route_type="acreate_realtime_client_secret",
             llm_router=llm_router,
             user_model=user_model,
+            request=request,
         )
         upstream_resp: httpx.Response = await llm_call  # type: ignore
 
@@ -334,6 +335,7 @@ async def proxy_realtime_calls(
             route_type="arealtime_calls",
             llm_router=llm_router,
             user_model=user_model,
+            request=request,
         )
         upstream_resp: httpx.Response = await llm_call  # type: ignore
 

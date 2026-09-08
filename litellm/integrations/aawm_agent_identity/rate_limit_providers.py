@@ -756,21 +756,50 @@ def _looks_like_xai_grok_oidc_rate_limit_context(context: Dict[str, Any]) -> boo
     return metadata.get("grok_native_oauth_managed") is True
 
 
-def _extract_xai_oauth_account_hash(metadata: Dict[str, Any]) -> Optional[str]:
-    for key in ("xai_oauth_account_hash", "provider_account_hash"):
-        value = _clean_non_empty_string(metadata.get(key))
-        if value:
-            return value
-    for key in (
-        "xai_oauth_account_id",
-        "provider_account_id",
-        "organization_id",
-        "org_id",
-    ):
-        value = _clean_non_empty_string(metadata.get(key))
-        if value:
-            return _short_hash(value.encode("utf-8"))
-    return None
+def _validated_xai_oauth_server_account_metadata(
+    metadata: Dict[str, Any],
+    *,
+    kwargs: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, str | bool]]:
+    """Accept only a request-bound managed xAI account binding."""
+
+    try:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+            validated_xai_oauth_server_account_metadata,
+        )
+
+        request = None
+        if isinstance(kwargs, dict):
+            litellm_params = kwargs.get("litellm_params")
+            if isinstance(litellm_params, dict):
+                proxy_server_request = litellm_params.get(
+                    "proxy_server_request"
+                )
+                if isinstance(proxy_server_request, dict):
+                    request = proxy_server_request.get("_request")
+        return validated_xai_oauth_server_account_metadata(
+            metadata,
+            request=request,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _extract_xai_oauth_account_hash(
+    metadata: Dict[str, Any],
+    *,
+    kwargs: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    server_metadata = _validated_xai_oauth_server_account_metadata(
+        metadata,
+        kwargs=kwargs,
+    )
+    value = (
+        server_metadata.get("xai_oauth_account_hash")
+        if isinstance(server_metadata, dict)
+        else None
+    )
+    return value if isinstance(value, str) and value else None
 
 
 def _extract_xai_grok_oidc_account_hash(metadata: Dict[str, Any]) -> Optional[str]:
@@ -871,7 +900,7 @@ def _select_xai_header_rate_limit_candidates(
     return candidates, accepted_sources
 
 
-def _extract_xai_header_rate_limit_observations(
+def _extract_xai_header_rate_limit_observations(  # noqa: PLR0915
     kwargs: Dict[str, Any],
     result: Any,
     observed_at: Any,
@@ -894,10 +923,35 @@ def _extract_xai_header_rate_limit_observations(
         return []
     raw_metadata = context.get("metadata")
     metadata: Dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
+    server_account_metadata = (
+        None
+        if native
+        else _validated_xai_oauth_server_account_metadata(
+            metadata,
+            kwargs=kwargs,
+        )
+    )
+    if not native and server_account_metadata is None:
+        return []
     account_hash = (
         _extract_xai_grok_oidc_account_hash(metadata)
         if native
-        else _extract_xai_oauth_account_hash(metadata)
+        else str(server_account_metadata["xai_oauth_account_hash"])
+    )
+    scope_identity = (
+        None
+        if native
+        else str(server_account_metadata["xai_oauth_scope_identity"])
+    )
+    account_label = (
+        None
+        if native
+        else str(server_account_metadata["xai_oauth_account_label"])
+    )
+    account_lane = (
+        None
+        if native
+        else str(server_account_metadata["xai_oauth_lane_key"])
     )
     model = (
         (
@@ -993,6 +1047,58 @@ def _extract_xai_header_rate_limit_observations(
                 round(max(0.0, min(100.0, 100.0 - remaining_pct)), 3) if remaining_pct is not None else None
             )
             exhausted = remaining is not None and remaining <= 0
+            raw_provider_fields = {
+                total_key: _get_rate_limit_header_value(
+                    candidate, total_key, lower_headers=lower_headers
+                ),
+                remaining_key: _get_rate_limit_header_value(
+                    candidate, remaining_key, lower_headers=lower_headers
+                ),
+                "reset": reset_value,
+                "retry-after": _get_rate_limit_header_value(
+                    candidate, "retry-after", lower_headers=lower_headers
+                ),
+                "billingPeriodEnd": _json_safe_rate_limit_value(
+                    _maybe_get_path(candidate, "config", "billingPeriodEnd")
+                    or candidate.get("billingPeriodEnd")
+                    or metadata.get("xai_oauth_billing_period_end")
+                    or metadata.get("billingPeriodEnd")
+                ),
+                "quota_unit": f"{'xai_grok_oidc' if native else 'xai_oauth'}_{limit_scope}",
+                "quota_unit_interpretation": limit_scope,
+            }
+            evidence = {
+                "signals": [
+                    (
+                        "xai_grok_oidc_response_rate_limit_headers"
+                        if native
+                        else "xai_oauth_response_rate_limit_headers"
+                    )
+                ],
+                "provider_fields": [
+                    total_key,
+                    remaining_key,
+                    *reset_keys,
+                    "retry-after",
+                ],
+                "reset_absent": provider_resets_at is None,
+                "reset_header_absent": (
+                    reset_value is None and reset_hint_seconds is None
+                ),
+                "reset_source": reset_source,
+            }
+            if not native:
+                raw_provider_fields["xai_oauth_scope_identity"] = scope_identity
+                evidence.update(
+                    {
+                        "xai_oauth_server_account_binding": True,
+                        "account_identity_source": "xai_oauth_inventory_record",
+                        "account_label": account_label,
+                        "account_hash": account_hash,
+                        "account_lane": account_lane,
+                        "scope_identity": scope_identity,
+                    }
+                )
             observations.append(
                 _finalize_rate_limit_observation(
                     {
@@ -1032,42 +1138,8 @@ def _extract_xai_header_rate_limit_observations(
                         "reset_hint_seconds": reset_hint_seconds,
                         "model": model,
                         "model_family": "grok",
-                        "raw_provider_fields": {
-                            total_key: _get_rate_limit_header_value(candidate, total_key, lower_headers=lower_headers),
-                            remaining_key: _get_rate_limit_header_value(
-                                candidate, remaining_key, lower_headers=lower_headers
-                            ),
-                            "reset": reset_value,
-                            "retry-after": _get_rate_limit_header_value(
-                                candidate, "retry-after", lower_headers=lower_headers
-                            ),
-                            "billingPeriodEnd": _json_safe_rate_limit_value(
-                                _maybe_get_path(candidate, "config", "billingPeriodEnd")
-                                or candidate.get("billingPeriodEnd")
-                                or metadata.get("xai_oauth_billing_period_end")
-                                or metadata.get("billingPeriodEnd")
-                            ),
-                            "quota_unit": f"{'xai_grok_oidc' if native else 'xai_oauth'}_{limit_scope}",
-                            "quota_unit_interpretation": limit_scope,
-                        },
-                        "evidence": {
-                            "signals": [
-                                (
-                                    "xai_grok_oidc_response_rate_limit_headers"
-                                    if native
-                                    else "xai_oauth_response_rate_limit_headers"
-                                )
-                            ],
-                            "provider_fields": [
-                                total_key,
-                                remaining_key,
-                                *reset_keys,
-                                "retry-after",
-                            ],
-                            "reset_absent": provider_resets_at is None,
-                            "reset_header_absent": (reset_value is None and reset_hint_seconds is None),
-                            "reset_source": reset_source,
-                        },
+                        "raw_provider_fields": raw_provider_fields,
+                        "evidence": evidence,
                     },
                     context,
                 )
@@ -1621,6 +1693,7 @@ _HOST_FUNCTION_NAMES = (
     "_first_quota_float",
     "_looks_like_xai_oauth_rate_limit_context",
     "_looks_like_xai_grok_oidc_rate_limit_context",
+    "_validated_xai_oauth_server_account_metadata",
     "_extract_xai_oauth_account_hash",
     "_extract_xai_grok_oidc_account_hash",
     "_xai_oauth_header_remaining_pct",

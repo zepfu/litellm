@@ -2061,6 +2061,12 @@ _AAWM_RATE_LIMIT_METADATA_KEYS = (
     "xai_oauth_managed",
     "xai_oauth_public_model",
     "xai_oauth_upstream_model",
+    "xai_oauth_server_account_binding",
+    "xai_oauth_account_label",
+    "xai_oauth_account_hash",
+    "xai_oauth_record_identity",
+    "xai_oauth_scope_identity",
+    "xai_oauth_lane_key",
     "xai_quota_family",
     "shared_quota_family",
 )
@@ -3061,6 +3067,7 @@ _first_quota_number = _aawm_rate_limit_providers._first_quota_number
 _first_quota_float = _aawm_rate_limit_providers._first_quota_float
 _looks_like_xai_oauth_rate_limit_context = _aawm_rate_limit_providers._looks_like_xai_oauth_rate_limit_context
 _looks_like_xai_grok_oidc_rate_limit_context = _aawm_rate_limit_providers._looks_like_xai_grok_oidc_rate_limit_context
+_validated_xai_oauth_server_account_metadata = _aawm_rate_limit_providers._validated_xai_oauth_server_account_metadata
 _extract_xai_oauth_account_hash = _aawm_rate_limit_providers._extract_xai_oauth_account_hash
 _extract_xai_grok_oidc_account_hash = _aawm_rate_limit_providers._extract_xai_grok_oidc_account_hash
 _xai_oauth_header_remaining_pct = _aawm_rate_limit_providers._xai_oauth_header_remaining_pct

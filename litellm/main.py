@@ -1654,6 +1654,9 @@ def completion(  # type: ignore # noqa: PLR0915
             litellm_request_debug=kwargs.get("litellm_request_debug", False),
             tpm=kwargs.get("tpm"),
             rpm=kwargs.get("rpm"),
+            _aawm_managed_xai_send_request=kwargs.get(
+                "_aawm_managed_xai_send_request"
+            ),
         )
         cast(LiteLLMLoggingObj, logging).update_environment_variables(
             model=model,

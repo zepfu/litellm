@@ -32,6 +32,7 @@ _OPTIONAL_KWARGS_KEYS = frozenset(
         "aws_bedrock_runtime_endpoint",
         "tpm",
         "rpm",
+        "_aawm_managed_xai_send_request",
     }
 )
 
@@ -48,6 +49,12 @@ _XAI_OAUTH_AUTHORITATIVE_METADATA_KEYS = frozenset(
         "shared_quota_family",
         "grok_subscription_quota_shared",
         "model_group",
+        "xai_oauth_server_account_binding",
+        "xai_oauth_account_label",
+        "xai_oauth_account_hash",
+        "xai_oauth_lane_key",
+        "xai_oauth_record_identity",
+        "xai_oauth_scope_identity",
         "xai_responses_previous_response_id_decoded",
         "codex_unsupported_input_item_removed_count",
         "codex_unsupported_input_item_types_removed",

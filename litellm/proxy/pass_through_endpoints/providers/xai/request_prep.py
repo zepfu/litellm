@@ -25,10 +25,13 @@ from litellm.llms.xai.oauth import (
     build_grok_native_oauth_metadata as _build_grok_native_oauth_metadata,
 )
 from litellm.llms.xai.oauth import (
-    get_xai_oauth_snapshot_from_request as _get_xai_oauth_snapshot_from_request,
+    clear_xai_oauth_snapshot_from_request as _clear_xai_oauth_snapshot_from_request,
 )
 from litellm.llms.xai.oauth import (
     bind_xai_oauth_snapshot_to_request as _bind_xai_oauth_snapshot_to_request,
+)
+from litellm.llms.xai.oauth import (
+    get_xai_oauth_snapshot_from_request as _get_xai_oauth_snapshot_from_request,
 )
 from litellm.llms.xai.oauth import (
     get_grok_native_oauth_access_token as _get_grok_native_oauth_access_token,
@@ -622,7 +625,7 @@ def _sanitize_xai_responses_request_body_in_place(
     return removed_params, tool_changes
 
 
-async def _prepare_oa_xai_passthrough_request(
+async def _prepare_oa_xai_passthrough_request(  # noqa: PLR0915
     request_body: dict[str, Any],
     *,
     request: Optional[Request] = None,
@@ -637,12 +640,66 @@ async def _prepare_oa_xai_passthrough_request(
     ):
         request_body["litellm_metadata"] = {}
     snapshot_out: dict[str, Any] = {}
-    request_snapshot = (
-        _get_xai_oauth_snapshot_from_request(request)
-        if request is not None
-        else None
-    )
     prepare_fn = runtime.prepare_oa_xai_request
+    selected_account = None
+    request_snapshot = None
+    if request is not None and runtime.is_oa_xai_model(request_body.get("model")):
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+            get_bound_xai_oauth_selected_account,
+            get_or_bind_xai_oauth_selected_account_and_snapshot,
+            resolve_xai_oauth_direct_continuation_account,
+        )
+
+        # Alias dispatch binds the candidate account before entering this
+        # preparer. Preserve that server-owned binding; otherwise direct
+        # continuations must prove ownership before primary selection.
+        selected_account = get_bound_xai_oauth_selected_account(request)
+        if selected_account is None:
+            selected_account = (
+                await resolve_xai_oauth_direct_continuation_account(
+                    request,
+                    request_body,
+                )
+            )
+        if selected_account is None:
+            selected_account, request_snapshot = (
+                await get_or_bind_xai_oauth_selected_account_and_snapshot(
+                    request
+                )
+            )
+        else:
+            selected_account, request_snapshot = (
+                await get_or_bind_xai_oauth_selected_account_and_snapshot(
+                    request,
+                    selected_account=selected_account,
+                )
+            )
+    else:
+        request_snapshot = (
+            _get_xai_oauth_snapshot_from_request(request)
+            if request is not None
+            else None
+        )
+    if selected_account is not None and request_snapshot is not None:
+        selected_record = getattr(selected_account, "record", None)
+        selected_auth_path = getattr(selected_record, "auth_path", None)
+        selected_scope = getattr(selected_record, "scope", None)
+        selected_identity = getattr(
+            selected_record,
+            "expected_account_identity",
+            None,
+        )
+        snapshot_identity = getattr(request_snapshot, "account_identity", None)
+        if (
+            request_snapshot.auth_file != selected_auth_path
+            or request_snapshot.scope != selected_scope
+            or (
+                selected_identity is not None
+                and snapshot_identity != selected_identity
+            )
+        ):
+            _clear_xai_oauth_snapshot_from_request(request)
+            request_snapshot = None
     try:
         prepare_signature = inspect.signature(prepare_fn)
     except (TypeError, ValueError):
@@ -667,16 +724,33 @@ async def _prepare_oa_xai_passthrough_request(
             )
         )
     )
+    accepts_selected_account = bool(
+        prepare_signature is not None
+        and (
+            "selected_account" in prepare_signature.parameters
+            or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in prepare_signature.parameters.values()
+            )
+        )
+    )
     if request_snapshot is not None and not accepts_snapshot:
         raise ValueError(
             "Managed xAI OAuth request preparation cannot preserve the bound "
             "credential snapshot."
+        )
+    if selected_account is not None and not accepts_selected_account:
+        raise ValueError(
+            "Managed xAI OAuth request preparation cannot preserve the "
+            "server-selected account."
         )
     prepare_kwargs: dict[str, Any] = {}
     if accepts_snapshot_out:
         prepare_kwargs["snapshot_out"] = snapshot_out
     if accepts_snapshot and request_snapshot is not None:
         prepare_kwargs["snapshot"] = request_snapshot
+    if accepts_selected_account and selected_account is not None:
+        prepare_kwargs["selected_account"] = selected_account
     prepared = await prepare_fn(request_body, **prepare_kwargs)
     if not prepared:
         return False, None, None

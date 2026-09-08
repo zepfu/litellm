@@ -69,6 +69,11 @@ from litellm.llms.xai.route_descriptors import (
     XAI_OAUTH_ROUTE_FAMILY,
     validate_xai_oauth_api_target,
 )
+from litellm.llms.xai.managed_send_counter import (
+    MANAGED_XAI_SEND_REQUEST_KWARG,
+    get_managed_xai_send_request,
+    record_managed_xai_actual_send,
+)
 from litellm.responses.streaming_iterator import (
     BaseResponsesAPIStreamingIterator,
     MockResponsesAPIStreamingIterator,
@@ -163,12 +168,18 @@ class BaseLLMHTTPHandler:
         if not isinstance(metadata, dict):
             metadata = litellm_params.get("metadata")
         if not isinstance(metadata, dict):
-            return False
-        return (
+            metadata = {}
+        if (
             metadata.get("xai_oauth_managed") is True
             and metadata.get("auth_mode") == "oauth"
             and metadata.get("credential_family") == XAI_OAUTH_CREDENTIAL_FAMILY
             and metadata.get("route_family") == XAI_OAUTH_ROUTE_FAMILY
+        ):
+            return True
+        return (
+            get_managed_xai_send_request(litellm_params) is not None
+            and str(litellm_params.get("custom_llm_provider") or "").lower()
+            == "xai"
         )
 
     @staticmethod
@@ -329,6 +340,15 @@ class BaseLLMHTTPHandler:
                     prepared_request=prepared_request,
                     provider_config=provider_config,
                 )
+                managed_xai_send_request = get_managed_xai_send_request(
+                    litellm_params
+                )
+                if managed_xai_send_request is not None:
+                    record_managed_xai_actual_send(
+                        managed_xai_send_request,
+                        target=prepared_request.url,
+                        route_family=XAI_OAUTH_ROUTE_FAMILY,
+                    )
 
             validate_request_fn = _validate_prepared_request
 
@@ -424,6 +444,15 @@ class BaseLLMHTTPHandler:
                     prepared_request=prepared_request,
                     provider_config=provider_config,
                 )
+                managed_xai_send_request = get_managed_xai_send_request(
+                    litellm_params
+                )
+                if managed_xai_send_request is not None:
+                    record_managed_xai_actual_send(
+                        managed_xai_send_request,
+                        target=prepared_request.url,
+                        route_family=XAI_OAUTH_ROUTE_FAMILY,
+                    )
 
             validate_request_fn = _validate_prepared_request
 
@@ -2374,7 +2403,34 @@ class BaseLLMHTTPHandler:
             pass
         # Needed by streaming callbacks/metadata helpers to reconstruct api_base/model_id
         # but never included in the outbound provider payload.
-        request_context["litellm_params"] = dict(litellm_params)
+        request_context_litellm_params = dict(litellm_params)
+        request_context_litellm_params.pop(MANAGED_XAI_SEND_REQUEST_KWARG, None)
+        request_context["litellm_params"] = request_context_litellm_params
+
+        managed_xai_oauth_request = self._is_managed_xai_oauth_request(
+            litellm_params
+        )
+        managed_xai_send_request = get_managed_xai_send_request(
+            litellm_params
+        )
+        validate_request_fn: Optional[Callable[[httpx.Request], None]] = None
+        if managed_xai_oauth_request:
+
+            def _validate_prepared_request(
+                prepared_request: httpx.Request,
+            ) -> None:
+                self._validate_managed_xai_oauth_prepared_request(
+                    prepared_request=prepared_request,
+                    provider_config=responses_api_provider_config,
+                )
+                if managed_xai_send_request is not None:
+                    record_managed_xai_actual_send(
+                        managed_xai_send_request,
+                        target=prepared_request.url,
+                        route_family=XAI_OAUTH_ROUTE_FAMILY,
+                    )
+
+            validate_request_fn = _validate_prepared_request
 
         ## LOGGING
         logging_obj.pre_call(
@@ -2404,7 +2460,16 @@ class BaseLLMHTTPHandler:
                     timeout=timeout
                     or float(response_api_optional_request_params.get("timeout", 0)),
                     stream=stream,
+                    follow_redirects=(
+                        False if managed_xai_oauth_request else None
+                    ),
+                    validate_request_fn=validate_request_fn,
                 )
+                if managed_xai_oauth_request:
+                    self._validate_managed_xai_oauth_response_sync(
+                        response=response,
+                        provider_config=responses_api_provider_config,
+                    )
                 if fake_stream is True:
                     return MockResponsesAPIStreamingIterator(
                         response=response,
@@ -2435,7 +2500,16 @@ class BaseLLMHTTPHandler:
                     json=data,
                     timeout=timeout
                     or float(response_api_optional_request_params.get("timeout", 0)),
+                    follow_redirects=(
+                        False if managed_xai_oauth_request else None
+                    ),
+                    validate_request_fn=validate_request_fn,
                 )
+                if managed_xai_oauth_request:
+                    self._validate_managed_xai_oauth_response_sync(
+                        response=response,
+                        provider_config=responses_api_provider_config,
+                    )
         except Exception as e:
             raise self._handle_error(
                 e=e,
@@ -2519,7 +2593,34 @@ class BaseLLMHTTPHandler:
             pass
         # Needed by streaming callbacks/metadata helpers to reconstruct api_base/model_id
         # but never included in the outbound provider payload.
-        request_context["litellm_params"] = dict(litellm_params)
+        request_context_litellm_params = dict(litellm_params)
+        request_context_litellm_params.pop(MANAGED_XAI_SEND_REQUEST_KWARG, None)
+        request_context["litellm_params"] = request_context_litellm_params
+
+        managed_xai_oauth_request = self._is_managed_xai_oauth_request(
+            litellm_params
+        )
+        managed_xai_send_request = get_managed_xai_send_request(
+            litellm_params
+        )
+        validate_request_fn: Optional[Callable[[httpx.Request], None]] = None
+        if managed_xai_oauth_request:
+
+            def _validate_prepared_request(
+                prepared_request: httpx.Request,
+            ) -> None:
+                self._validate_managed_xai_oauth_prepared_request(
+                    prepared_request=prepared_request,
+                    provider_config=responses_api_provider_config,
+                )
+                if managed_xai_send_request is not None:
+                    record_managed_xai_actual_send(
+                        managed_xai_send_request,
+                        target=prepared_request.url,
+                        route_family=XAI_OAUTH_ROUTE_FAMILY,
+                    )
+
+            validate_request_fn = _validate_prepared_request
 
         ## LOGGING
         logging_obj.pre_call(
@@ -2549,7 +2650,16 @@ class BaseLLMHTTPHandler:
                     timeout=timeout
                     or float(response_api_optional_request_params.get("timeout", 0)),
                     stream=stream,
+                    follow_redirects=(
+                        False if managed_xai_oauth_request else None
+                    ),
+                    validate_request_fn=validate_request_fn,
                 )
+                if managed_xai_oauth_request:
+                    await self._validate_managed_xai_oauth_response(
+                        response=response,
+                        provider_config=responses_api_provider_config,
+                    )
 
                 if fake_stream is True:
                     return MockResponsesAPIStreamingIterator(
@@ -2582,7 +2692,16 @@ class BaseLLMHTTPHandler:
                     json=data,
                     timeout=timeout
                     or float(response_api_optional_request_params.get("timeout", 0)),
+                    follow_redirects=(
+                        False if managed_xai_oauth_request else None
+                    ),
+                    validate_request_fn=validate_request_fn,
                 )
+                if managed_xai_oauth_request:
+                    await self._validate_managed_xai_oauth_response(
+                        response=response,
+                        provider_config=responses_api_provider_config,
+                    )
 
         except Exception as e:
             raise self._handle_error(

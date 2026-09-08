@@ -37,6 +37,9 @@ from litellm.llms.chatgpt.common_utils import CHATGPT_API_BASE
 from litellm.llms.anthropic.experimental_pass_through.providers import (
     common as _anthropic_provider_common,
 )
+from litellm.llms.xai.managed_send_counter import (
+    MANAGED_XAI_SEND_REQUEST_KWARG,
+)
 from litellm.proxy.aawm_route_logging import (
     emit_aawm_route_access_log,
     record_aawm_route_rollup_turn,
@@ -161,6 +164,11 @@ async def _run_managed_xai_oauth_precommit_retry(
         if refreshed_snapshot is None:
             raise
         bind_xai_oauth_snapshot_to_request(request, refreshed_snapshot)
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+            preserve_xai_oauth_snapshot_refresh_context,
+        )
+
+        preserve_xai_oauth_snapshot_refresh_context(request, refreshed_snapshot)
         on_refresh(refreshed_snapshot)
         try:
             return await operation()
@@ -1534,7 +1542,7 @@ def _build_anthropic_completion_adapter_handler_call_kwargs(
     }
 
 
-async def _perform_anthropic_completion_adapter_messages_call(
+async def _perform_anthropic_completion_adapter_messages_call(  # noqa: PLR0915
     *,
     config: _aawm_adapter_config.AnthropicCompletionAdapterConfig,
     request: Request,
@@ -1560,6 +1568,10 @@ async def _perform_anthropic_completion_adapter_messages_call(
         LiteLLMMessagesToCompletionTransformationHandler,
     )
 
+    managed_xai_oauth_request = bool(
+        managed_xai_oauth_request
+        or config.adapter == _aawm_adapter_config.XAI_OAUTH_COMPLETION.adapter
+    )
     stream_flag = (
         bool(prepared_request_body.get("stream")) if client_requested_stream is None else bool(client_requested_stream)
     )
@@ -1574,6 +1586,7 @@ async def _perform_anthropic_completion_adapter_messages_call(
         "proxy_server_request": {
             "headers": dict(request.headers),
             "body": prepared_request_body,
+            "_request": request,
         },
     }
     if timeout is not None:
@@ -1582,6 +1595,8 @@ async def _perform_anthropic_completion_adapter_messages_call(
         handler_extra_kwargs["max_retries"] = max_retries
     if extra_handler_kwargs:
         handler_extra_kwargs.update(extra_handler_kwargs)
+    if managed_xai_oauth_request:
+        handler_extra_kwargs[MANAGED_XAI_SEND_REQUEST_KWARG] = request
 
     handler_call_kwargs = _build_anthropic_completion_adapter_handler_call_kwargs(
         prepared_request_body=prepared_request_body,
@@ -1651,11 +1666,7 @@ async def _perform_anthropic_completion_adapter_messages_call(
         return await _run_managed_xai_oauth_precommit_retry(
             request=request,
             api_base=api_base,
-            enabled=bool(
-                managed_xai_oauth_request
-                or config.adapter
-                == _aawm_adapter_config.XAI_OAUTH_COMPLETION.adapter
-            ),
+            enabled=managed_xai_oauth_request,
             operation=_initial_operation,
             on_refresh=_refresh_completion_credentials,
         )
@@ -1797,6 +1808,7 @@ _EXTRACTED_CONSTANT_NAMES: tuple[str, ...] = (
     "_ANTHROPIC_ADAPTER_NVIDIA_API_KEY_ENV_VARS",
     "_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES",
     "_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES_DEFAULT",
+    "MANAGED_XAI_SEND_REQUEST_KWARG",
     "_OPENAI_ADAPTER_PARALLEL_FUNCTION_TOOL_INSTRUCTIONS",
 )
 
