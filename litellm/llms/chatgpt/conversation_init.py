@@ -1170,6 +1170,7 @@ def _collection_diagnostics(
     payload: Any,
     *,
     malformed_collection_projection: bool,
+    projection_truncated: bool,
 ) -> Dict[str, Any]:
     diagnostics = {
         "model_limits_state": "absent_unknown",
@@ -1177,7 +1178,7 @@ def _collection_diagnostics(
         "blocked_features_state": "absent_unknown",
         "malformed_entry_count": 0,
         "valid_observation_count": 0,
-        "projection_truncated": False,
+        "projection_truncated": bool(projection_truncated),
         "malformed_collection_projection": bool(
             malformed_collection_projection
         ),
@@ -1190,7 +1191,8 @@ def _collection_diagnostics(
         {
             "malformed_collection_projection": (
                 malformed_collection_projection
-            )
+            ),
+            "projection_truncated": projection_truncated,
         },
     )
     for field_name in (
@@ -1206,7 +1208,9 @@ def _collection_diagnostics(
         max(int(parsed["malformed"]), 0),
         _MAX_COLLECTION_DIAGNOSTIC_COUNT,
     )
-    diagnostics["projection_truncated"] = parsed["truncated"] is True
+    diagnostics["projection_truncated"] = bool(
+        projection_truncated or parsed["truncated"] is True
+    )
     diagnostics["malformed_collection_projection"] = (
         parsed["projection_malformed"] is True
     )
@@ -1790,7 +1794,10 @@ def _parse_limits_progress(
     if "limits_progress" not in payload:
         return [], [], "absent_unknown", 0
     raw = payload.get("limits_progress")
-    entries, malformed = _normalize_named_collection(raw)
+    entries, malformed = _normalize_named_collection(
+        raw,
+        identity_field="feature",
+    )
     if isinstance(raw, list) and not raw:
         return [], [], "empty_unknown", malformed
     if isinstance(raw, Mapping) and not raw:
@@ -1830,7 +1837,10 @@ def _parse_model_limits(
     if "model_limits" not in payload:
         return [], [], "absent_unknown", 0
     raw = payload.get("model_limits")
-    entries, malformed = _normalize_named_collection(raw)
+    entries, malformed = _normalize_named_collection(
+        raw,
+        identity_field="model",
+    )
     if isinstance(raw, list) and not raw:
         return [], [], "empty_unknown", malformed
     if isinstance(raw, Mapping) and not raw:
@@ -2056,18 +2066,13 @@ def _entry_has_malformed_usage_fields(entry: Mapping[str, Any]) -> bool:
 
 def _normalize_named_collection(
     raw: Any,
+    *,
+    identity_field: Optional[str] = None,
 ) -> Tuple[List[Mapping[str, Any]], int]:
     malformed = 0
     entries: List[Mapping[str, Any]] = []
     if isinstance(raw, Mapping):
         for key, value in raw.items():
-            normalized_key = _normalize_key(key)
-            if _is_usage_number_field_name(normalized_key) or any(
-                normalized_key == _normalize_key(reset_key)
-                for reset_key in _RESET_KEYS
-            ):
-                malformed += 1
-                continue
             if isinstance(value, Mapping):
                 merged = dict(value)
                 merged.setdefault("_identity", str(key))
@@ -2083,6 +2088,12 @@ def _normalize_named_collection(
                 if len(item) == 1 and _entry_identity(item) is None:
                     key, value = next(iter(item.items()))
                     normalized_key = _normalize_key(key)
+                    if (
+                        identity_field is not None
+                        and normalized_key == _normalize_key(identity_field)
+                    ):
+                        entries.append(item)
+                        continue
                     if _is_usage_number_field_name(normalized_key) or any(
                         normalized_key == _normalize_key(reset_key)
                         for reset_key in _RESET_KEYS
@@ -3737,6 +3748,7 @@ def collect_conversation_init_snapshot(  # noqa: PLR0915 - collector state
             malformed_collection_projection=(
                 sanitized.get("malformed_collection_projection") is True
             ),
+            projection_truncated=sanitized.get("projection_truncated") is True,
         )
     )
     persistability_failure_reason = _snapshot_persistability_failure_reason(
@@ -3906,6 +3918,7 @@ def _collect_bound_conversation_init_snapshot(  # noqa: PLR0915 - bound state
             malformed_collection_projection=(
                 sanitized.get("malformed_collection_projection") is True
             ),
+            projection_truncated=sanitized.get("projection_truncated") is True,
         )
     )
     summary["account_hash"] = sanitized.get("account_hash")
