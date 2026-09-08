@@ -213,6 +213,145 @@ def _parse_rate_limit_reset_wait_seconds_from_headers(headers: dict[str, Any]) -
     return max(0.0, reset_epoch_seconds - time.time())
 
 
+_XAI_RATE_LIMIT_RESET_HEADERS = {
+    "requests": (
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-reset-request",
+    ),
+    "tokens": (
+        "x-ratelimit-reset-tokens",
+        "x-ratelimit-reset-token",
+    ),
+}
+_XAI_RATE_LIMIT_DURATION_RE = re.compile(
+    r"^(?P<value>[0-9]+(?:\.[0-9]+)?)\s*(?P<unit>ms|s|m|h|d)?$",
+    re.IGNORECASE,
+)
+
+
+def _xai_rate_limit_max_wait_seconds() -> float:
+    return max(1.0, _resolve_codex_auto_agent_usage_limit_cooldown_max_seconds())
+
+
+def _parse_xai_rate_limit_reset_wait_seconds(
+    value: Any,
+    *,
+    now_epoch: Optional[float] = None,
+) -> Optional[float]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    match = _XAI_RATE_LIMIT_DURATION_RE.fullmatch(text)
+    if match is None:
+        return None
+    try:
+        numeric_value = float(match.group("value"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric_value) or numeric_value < 0:
+        return None
+
+    unit = (match.group("unit") or "").lower()
+    if unit:
+        multiplier = {
+            "ms": 0.001,
+            "s": 1.0,
+            "m": 60.0,
+            "h": 3600.0,
+            "d": 86400.0,
+        }[unit]
+        wait_seconds = numeric_value * multiplier
+    elif numeric_value >= 1_000_000_000_000:
+        reset_epoch_seconds = numeric_value / 1000.0
+        wait_seconds = reset_epoch_seconds - (time.time() if now_epoch is None else now_epoch)
+    elif numeric_value >= 1_000_000_000:
+        wait_seconds = numeric_value - (time.time() if now_epoch is None else now_epoch)
+    else:
+        # xAI has emitted both epoch timestamps and short duration values.
+        # Treat small unitless values as durations; absurd values are bounded
+        # below rather than being allowed to become durable cooldowns.
+        wait_seconds = numeric_value
+
+    if not math.isfinite(wait_seconds) or wait_seconds < 0:
+        return None
+    if wait_seconds > _xai_rate_limit_max_wait_seconds():
+        return None
+    return wait_seconds
+
+
+def _is_xai_rate_limit_candidate(
+    exc: Any,
+    candidate: Optional[dict[str, Any]],
+) -> bool:
+    def _normalized_provider(value: Any) -> str:
+        return str(getattr(value, "value", value) or "").strip().lower()
+
+    expected_provider = _normalized_provider(_CODEX_AUTO_AGENT_XAI_PROVIDER)
+    if isinstance(candidate, Mapping):
+        for key in ("provider", "custom_llm_provider", "llm_provider"):
+            if _normalized_provider(candidate.get(key)) == expected_provider:
+                return True
+    for source in (exc, getattr(exc, "response", None)):
+        if source is None:
+            continue
+        for key in ("provider", "custom_llm_provider", "llm_provider"):
+            value = source.get(key) if isinstance(source, Mapping) else getattr(source, key, None)
+            if _normalized_provider(value) == expected_provider:
+                return True
+    return False
+
+
+def _parse_xai_rate_limit_header_wait_seconds(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]] = None,
+) -> Optional[float]:
+    if not _is_xai_rate_limit_candidate(exc, candidate):
+        return None
+    headers = _extract_adapter_upstream_headers(exc)
+    retry_after_value = _get_adapter_header_value(headers, "Retry-After")
+    if retry_after_value is not None:
+        try:
+            retry_after = float(retry_after_value)
+        except (TypeError, ValueError):
+            retry_after = None
+        if (
+            retry_after is not None
+            and math.isfinite(retry_after)
+            and 0.0 <= retry_after <= _xai_rate_limit_max_wait_seconds()
+        ):
+            return max(1.0, retry_after)
+
+    now_epoch = time.time()
+    waits_by_scope: dict[str, float] = {}
+    for scope, header_names in _XAI_RATE_LIMIT_RESET_HEADERS.items():
+        for header_name in header_names:
+            reset_value = _get_adapter_header_value(headers, header_name)
+            if reset_value is None:
+                continue
+            wait_seconds = _parse_xai_rate_limit_reset_wait_seconds(
+                reset_value,
+                now_epoch=now_epoch,
+            )
+            if wait_seconds is not None:
+                waits_by_scope[scope] = wait_seconds
+                break
+    if not waits_by_scope:
+        return None
+
+    error_text = _codex_auto_agent_error_text(exc).lower()
+    mentions_tokens = re.search(r"\btoken(?:s)?\b", error_text) is not None
+    mentions_requests = re.search(r"\brequest(?:s)?\b", error_text) is not None
+    if mentions_tokens and not mentions_requests and "tokens" in waits_by_scope:
+        return max(1.0, waits_by_scope["tokens"])
+    if mentions_requests and not mentions_tokens and "requests" in waits_by_scope:
+        return max(1.0, waits_by_scope["requests"])
+    # Without an attributable exhausted dimension, wait for both scopes.
+    return max(1.0, max(waits_by_scope.values()))
+
+
 def _extract_embedded_json_payload_candidates(detail: object) -> list[str]:
     """Shared exception-detail JSON/bytes extraction (RR-054 #59)."""
     if isinstance(detail, dict):
@@ -2681,8 +2820,28 @@ def plan_responses_pre_commit_retry(
 # ---------------------------------------------------------------------------
 
 
-def _parse_codex_auto_agent_header_wait_seconds(exc: Any) -> Optional[float]:
+def _parse_codex_auto_agent_header_wait_seconds(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]] = None,
+) -> Optional[float]:
     headers = _extract_adapter_upstream_headers(exc)
+    is_xai_candidate = _is_xai_rate_limit_candidate(exc, candidate)
+    xai_wait = _parse_xai_rate_limit_header_wait_seconds(
+        exc,
+        candidate=candidate,
+    )
+    if xai_wait is not None:
+        return xai_wait
+    if is_xai_candidate and (
+        _get_adapter_header_value(headers, "Retry-After") is not None
+        or any(
+            _get_adapter_header_value(headers, header_name) is not None
+            for header_names in _XAI_RATE_LIMIT_RESET_HEADERS.values()
+            for header_name in header_names
+        )
+    ):
+        return None
     retry_after = _parse_retry_after_seconds_from_headers(headers)
     if retry_after is not None:
         return max(1.0, retry_after)
@@ -2734,7 +2893,19 @@ def _get_codex_auto_agent_cooldown_seconds(
     attempted_provider_call: bool = True,
 ) -> float:
     assert _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS is not None
-    header_wait = _parse_codex_auto_agent_header_wait_seconds(exc)
+    xai_header_wait = _parse_xai_rate_limit_header_wait_seconds(
+        exc,
+        candidate=candidate,
+    )
+    header_wait = (
+        xai_header_wait
+        if xai_header_wait is not None
+        else _parse_codex_auto_agent_header_wait_seconds(
+            exc,
+            candidate=candidate,
+        )
+    )
+    is_xai_header_wait = xai_header_wait is not None
     usage_limit_max_seconds = _resolve_codex_auto_agent_usage_limit_cooldown_max_seconds()
     error_class = _classify_codex_auto_agent_retryable_exhaustion(
         exc,
@@ -2749,15 +2920,19 @@ def _get_codex_auto_agent_cooldown_seconds(
     if error_class == "usage_limit_reached":
         resolved = _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS
         if header_wait is not None:
-            resolved = min(
-                max(_CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS, header_wait),
-                usage_limit_max_seconds,
+            resolved = (
+                header_wait
+                if is_xai_header_wait
+                else min(
+                    max(_CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS, header_wait),
+                    usage_limit_max_seconds,
+                )
             )
         else:
             resolved = min(resolved, usage_limit_max_seconds)
         return resolved
     if header_wait is not None:
-        resolved = max(_CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS, header_wait)
+        resolved = header_wait if is_xai_header_wait else max(_CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS, header_wait)
     elif (
         error_class in {"capacity_exhausted", "upstream_overloaded", "server_overloaded"}
         or tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS
@@ -2978,6 +3153,8 @@ _HOST_FUNCTION_NAMES = (
     "_classify_codex_auto_agent_retryable_exhaustion",
     "_is_codex_auto_agent_retryable_exhaustion",
     "plan_responses_pre_commit_retry",
+    "_parse_xai_rate_limit_reset_wait_seconds",
+    "_parse_xai_rate_limit_header_wait_seconds",
     "_parse_codex_auto_agent_header_wait_seconds",
     "_get_codex_auto_agent_cooldown_seconds",
     "_iter_codex_auto_agent_error_blocks",
