@@ -1297,17 +1297,26 @@ class _PrefixedNativeResponsesAsyncIterator:
 
     def __init__(self, source: Any, consumed_chunks: List[Any]) -> None:
         self._source = source
-        self._consumed_chunks = iter(consumed_chunks)
+        self._consumed_chunks = list(consumed_chunks)
+        self._consumed_index = 0
         self._closed = False
 
     def __aiter__(self) -> "_PrefixedNativeResponsesAsyncIterator":
         return self
 
+    def prepend(self, consumed_chunks: List[Any]) -> None:
+        if not consumed_chunks:
+            return
+        remaining = self._consumed_chunks[self._consumed_index :]
+        self._consumed_chunks = list(consumed_chunks) + remaining
+        self._consumed_index = 0
+
     async def __anext__(self) -> Any:
-        try:
-            return next(self._consumed_chunks)
-        except StopIteration:
-            return await self._source.__anext__()
+        if self._consumed_index < len(self._consumed_chunks):
+            chunk = self._consumed_chunks[self._consumed_index]
+            self._consumed_index += 1
+            return chunk
+        return await self._source.__anext__()
 
     async def aclose(self) -> None:
         if self._closed:
@@ -5821,7 +5830,61 @@ async def pass_through_request(  # noqa: PLR0915
                 )
             wrapper_cleanup_source = processed_chunks
             wrapper_setup_failure: Optional[BaseException] = None
+            native_wire_stream_installed = False
+            native_wire_bookkeeping_registered = False
             if is_native_openai_responses_route:
+                async def _on_native_wire_disposition(
+                    disposition: OpenAIResponsesWireDisposition,
+                    trace: OpenAIResponsesWireTrace,
+                ) -> None:
+                    await _finalize_native_openai_responses_owner_wire_disposition(
+                        request=request,
+                        disposition=disposition,
+                        trace=trace,
+                    )
+
+                async def _run_post_delivery_bookkeeping(
+                    delivered_snapshot: Dict[str, Any],
+                ) -> None:
+                    callback = stream_bookkeeping_state.get("finalize_callback")
+                    if callback is not None:
+                        await callback(delivered_snapshot)
+                        return
+                    await PassThroughStreamingHandler._finalize_unstarted_native_stream(
+                        delivered_snapshot=delivered_snapshot,
+                        response=response,
+                        request_body=_parsed_body,
+                        litellm_logging_obj=logging_obj,
+                        endpoint_type=endpoint_type,
+                        start_time=start_time,
+                        passthrough_success_handler_obj=(
+                            pass_through_endpoint_logging
+                        ),
+                        url_route=str(url),
+                        passthrough_logging_payload=passthrough_logging_payload,
+                        custom_llm_provider=custom_llm_provider,
+                        success_handler_kwargs=kwargs,
+                        local_prepare_ms=local_prepare_ms,
+                        error_log_context=error_log_context,
+                        upstream_prefix_bytes=getattr(response, "_prefix", None),
+                    )
+
+                async def _finalize_prefetch_abort(
+                    disposition: OpenAIResponsesWireDisposition,
+                ) -> None:
+                    finalizer = wire_trace._finalize_transport
+                    if finalizer is not None:
+                        await finalizer(disposition)
+                    if stream_bookkeeping_state is not None:
+                        try:
+                            await _run_post_delivery_bookkeeping(
+                                wire_trace.snapshot()
+                            )
+                        except BaseException as exc:  # noqa: BLE001
+                            wire_trace.metadata[
+                                "post_finalization_callback_error"
+                            ] = type(exc).__name__
+
                 try:
                     processed_chunks = maybe_wrap_passthrough_responses_stream(
                         processed_chunks,
@@ -5841,16 +5904,63 @@ async def pass_through_request(  # noqa: PLR0915
                         )
                     )
                     wrapper_cleanup_source = processed_chunks
-                    consumed_chunks = (
-                        await _consume_native_responses_stream_prefix(
-                            processed_chunks
-                        )
-                    )
-                    processed_chunks = _replay_native_responses_stream_prefix(
+                    prefixed_source = _PrefixedNativeResponsesAsyncIterator(
                         processed_chunks,
-                        consumed_chunks,
+                        [],
                     )
-                except (asyncio.CancelledError, httpx.ReadTimeout):
+                    processed_chunks, wire_trace = wrap_openai_responses_stream(
+                        prefixed_source,
+                        upstream_response=response,
+                        on_disposition=_on_native_wire_disposition,
+                        trace=wire_trace,
+                        model=(
+                            str(provider_bound_body.get("model"))
+                            if isinstance(provider_bound_body, dict)
+                            and provider_bound_body.get("model") is not None
+                            else None
+                        ),
+                    )
+                    native_wire_stream_installed = True
+                    bind_openai_responses_wire_trace_to_request(
+                        request,
+                        wire_trace,
+                    )
+                    if stream_bookkeeping_state is not None:
+                        wire_trace.register_post_finalization_callback(
+                            _run_post_delivery_bookkeeping
+                        )
+                        native_wire_bookkeeping_registered = True
+                    consumed_chunks = await await_with_client_disconnect(
+                        lambda source=wrapper_cleanup_source: (
+                            _consume_native_responses_stream_prefix(source)
+                        ),
+                        request=request,
+                    )
+                    prefixed_source.prepend(consumed_chunks)
+                except asyncio.CancelledError as exc:
+                    if native_wire_stream_installed:
+                        disposition = (
+                            OpenAIResponsesWireDisposition.DISCONNECTED
+                            if isinstance(exc, ClientDisconnectedCancellation)
+                            else OpenAIResponsesWireDisposition.CANCELLED
+                        )
+                        try:
+                            await _finalize_prefetch_abort(disposition)
+                        except BaseException as cleanup_exc:  # noqa: BLE001
+                            wire_trace.metadata[
+                                "prefetch_cleanup_error"
+                            ] = type(cleanup_exc).__name__
+                    raise
+                except httpx.ReadTimeout:
+                    if native_wire_stream_installed:
+                        try:
+                            await _finalize_prefetch_abort(
+                                OpenAIResponsesWireDisposition.FAILED
+                            )
+                        except BaseException as cleanup_exc:  # noqa: BLE001
+                            wire_trace.metadata[
+                                "prefetch_cleanup_error"
+                            ] = type(cleanup_exc).__name__
                     raise
                 except BaseException as exc:
                     wrapper_setup_failure = exc
@@ -5874,90 +5984,53 @@ async def pass_through_request(  # noqa: PLR0915
                 litellm_call_id=litellm_call_id,
             )
             if is_native_openai_responses_route:
-                async def _on_native_wire_disposition(
-                    disposition: OpenAIResponsesWireDisposition,
-                    trace: OpenAIResponsesWireTrace,
-                ) -> None:
-                    await _finalize_native_openai_responses_owner_wire_disposition(
-                        request=request,
-                        disposition=disposition,
-                        trace=trace,
+                if not native_wire_stream_installed:
+                    processed_chunks, wire_trace = wrap_openai_responses_stream(
+                        wrapper_cleanup_source,
+                        upstream_response=response,
+                        on_disposition=_on_native_wire_disposition,
+                        trace=wire_trace,
+                        model=(
+                            str(provider_bound_body.get("model"))
+                            if isinstance(provider_bound_body, dict)
+                            and provider_bound_body.get("model") is not None
+                            else None
+                        ),
                     )
-
-                processed_chunks, wire_trace = wrap_openai_responses_stream(
-                    (
-                        processed_chunks
-                        if wrapper_setup_failure is None
-                        else wrapper_cleanup_source
-                    ),
-                    upstream_response=response,
-                    on_disposition=_on_native_wire_disposition,
-                    trace=wire_trace,
-                    model=(
-                        str(provider_bound_body.get("model"))
-                        if isinstance(provider_bound_body, dict)
-                        and provider_bound_body.get("model") is not None
-                        else None
+                    bind_openai_responses_wire_trace_to_request(
+                        request,
+                        wire_trace,
                     )
-                )
-                bind_openai_responses_wire_trace_to_request(
-                    request,
-                    wire_trace,
-                )
-                if stream_bookkeeping_state is not None:
-
-                    async def _run_post_delivery_bookkeeping(
-                        delivered_snapshot: Dict[str, Any],
-                    ) -> None:
-                        callback = stream_bookkeeping_state.get("finalize_callback")
-                        if callback is not None:
-                            await callback(delivered_snapshot)
-                            return
-                        await PassThroughStreamingHandler._finalize_unstarted_native_stream(
-                            delivered_snapshot=delivered_snapshot,
-                            response=response,
-                            request_body=_parsed_body,
-                            litellm_logging_obj=logging_obj,
-                            endpoint_type=endpoint_type,
-                            start_time=start_time,
-                            passthrough_success_handler_obj=(
-                                pass_through_endpoint_logging
-                            ),
-                            url_route=str(url),
-                            passthrough_logging_payload=passthrough_logging_payload,
-                            custom_llm_provider=custom_llm_provider,
-                            success_handler_kwargs=kwargs,
-                            local_prepare_ms=local_prepare_ms,
-                            error_log_context=error_log_context,
-                            upstream_prefix_bytes=getattr(response, "_prefix", None),
-                        )
-
+                if (
+                    stream_bookkeeping_state is not None
+                    and not native_wire_bookkeeping_registered
+                ):
                     wire_trace.register_post_finalization_callback(
                         _run_post_delivery_bookkeeping
                     )
-                    if wrapper_setup_failure is not None:
-                        failure_body, failure_status_code = (
-                            _build_native_responses_wrapper_failure_body(
-                                wire_trace=wire_trace,
-                                wrapper_setup_failure=wrapper_setup_failure,
-                            )
-                        )
-                        stream_response = OpenAIResponsesBufferedResponse(
-                            content=failure_body,
+                if wrapper_setup_failure is not None:
+                    failure_body, failure_status_code = (
+                        _build_native_responses_wrapper_failure_body(
                             wire_trace=wire_trace,
-                            disposition=OpenAIResponsesWireDisposition.FAILED,
-                            on_disposition=_on_native_wire_disposition,
-                            status_code=failure_status_code,
-                            headers=response_headers,
+                            wrapper_setup_failure=wrapper_setup_failure,
                         )
-                    else:
-                        stream_response = OpenAIResponsesStreamingResponse(
-                            processed_chunks,
-                            wire_trace=wire_trace,
-                            on_disposition=_on_native_wire_disposition,
-                            headers=response_headers,
-                            status_code=response.status_code,
-                        )
+                    )
+                    stream_response = OpenAIResponsesBufferedResponse(
+                        content=failure_body,
+                        wire_trace=wire_trace,
+                        disposition=OpenAIResponsesWireDisposition.FAILED,
+                        on_disposition=_on_native_wire_disposition,
+                        status_code=failure_status_code,
+                        headers=response_headers,
+                    )
+                else:
+                    stream_response = OpenAIResponsesStreamingResponse(
+                        processed_chunks,
+                        wire_trace=wire_trace,
+                        on_disposition=_on_native_wire_disposition,
+                        headers=response_headers,
+                        status_code=response.status_code,
+                    )
             else:
                 stream_response = StreamingResponse(
                     processed_chunks,
@@ -6194,7 +6267,61 @@ async def pass_through_request(  # noqa: PLR0915
                 )
             wrapper_cleanup_source = processed_chunks
             wrapper_setup_failure: Optional[BaseException] = None
+            native_wire_stream_installed = False
+            native_wire_bookkeeping_registered = False
             if is_native_openai_responses_route:
+                async def _on_native_wire_disposition(
+                    disposition: OpenAIResponsesWireDisposition,
+                    trace: OpenAIResponsesWireTrace,
+                ) -> None:
+                    await _finalize_native_openai_responses_owner_wire_disposition(
+                        request=request,
+                        disposition=disposition,
+                        trace=trace,
+                    )
+
+                async def _run_post_delivery_bookkeeping(
+                    delivered_snapshot: Dict[str, Any],
+                ) -> None:
+                    callback = stream_bookkeeping_state.get("finalize_callback")
+                    if callback is not None:
+                        await callback(delivered_snapshot)
+                        return
+                    await PassThroughStreamingHandler._finalize_unstarted_native_stream(
+                        delivered_snapshot=delivered_snapshot,
+                        response=response,
+                        request_body=_parsed_body,
+                        litellm_logging_obj=logging_obj,
+                        endpoint_type=endpoint_type,
+                        start_time=start_time,
+                        passthrough_success_handler_obj=(
+                            pass_through_endpoint_logging
+                        ),
+                        url_route=str(url),
+                        passthrough_logging_payload=passthrough_logging_payload,
+                        custom_llm_provider=custom_llm_provider,
+                        success_handler_kwargs=kwargs,
+                        local_prepare_ms=local_prepare_ms,
+                        error_log_context=error_log_context,
+                        upstream_prefix_bytes=getattr(response, "_prefix", None),
+                    )
+
+                async def _finalize_prefetch_abort(
+                    disposition: OpenAIResponsesWireDisposition,
+                ) -> None:
+                    finalizer = wire_trace._finalize_transport
+                    if finalizer is not None:
+                        await finalizer(disposition)
+                    if stream_bookkeeping_state is not None:
+                        try:
+                            await _run_post_delivery_bookkeeping(
+                                wire_trace.snapshot()
+                            )
+                        except BaseException as exc:  # noqa: BLE001
+                            wire_trace.metadata[
+                                "post_finalization_callback_error"
+                            ] = type(exc).__name__
+
                 try:
                     processed_chunks = maybe_wrap_passthrough_responses_stream(
                         processed_chunks,
@@ -6214,16 +6341,63 @@ async def pass_through_request(  # noqa: PLR0915
                         )
                     )
                     wrapper_cleanup_source = processed_chunks
-                    consumed_chunks = (
-                        await _consume_native_responses_stream_prefix(
-                            processed_chunks
-                        )
-                    )
-                    processed_chunks = _replay_native_responses_stream_prefix(
+                    prefixed_source = _PrefixedNativeResponsesAsyncIterator(
                         processed_chunks,
-                        consumed_chunks,
+                        [],
                     )
-                except (asyncio.CancelledError, httpx.ReadTimeout):
+                    processed_chunks, wire_trace = wrap_openai_responses_stream(
+                        prefixed_source,
+                        upstream_response=response,
+                        on_disposition=_on_native_wire_disposition,
+                        trace=wire_trace,
+                        model=(
+                            str(provider_bound_body.get("model"))
+                            if isinstance(provider_bound_body, dict)
+                            and provider_bound_body.get("model") is not None
+                            else None
+                        ),
+                    )
+                    native_wire_stream_installed = True
+                    bind_openai_responses_wire_trace_to_request(
+                        request,
+                        wire_trace,
+                    )
+                    if stream_bookkeeping_state is not None:
+                        wire_trace.register_post_finalization_callback(
+                            _run_post_delivery_bookkeeping
+                        )
+                        native_wire_bookkeeping_registered = True
+                    consumed_chunks = await await_with_client_disconnect(
+                        lambda source=wrapper_cleanup_source: (
+                            _consume_native_responses_stream_prefix(source)
+                        ),
+                        request=request,
+                    )
+                    prefixed_source.prepend(consumed_chunks)
+                except asyncio.CancelledError as exc:
+                    if native_wire_stream_installed:
+                        disposition = (
+                            OpenAIResponsesWireDisposition.DISCONNECTED
+                            if isinstance(exc, ClientDisconnectedCancellation)
+                            else OpenAIResponsesWireDisposition.CANCELLED
+                        )
+                        try:
+                            await _finalize_prefetch_abort(disposition)
+                        except BaseException as cleanup_exc:  # noqa: BLE001
+                            wire_trace.metadata[
+                                "prefetch_cleanup_error"
+                            ] = type(cleanup_exc).__name__
+                    raise
+                except httpx.ReadTimeout:
+                    if native_wire_stream_installed:
+                        try:
+                            await _finalize_prefetch_abort(
+                                OpenAIResponsesWireDisposition.FAILED
+                            )
+                        except BaseException as cleanup_exc:  # noqa: BLE001
+                            wire_trace.metadata[
+                                "prefetch_cleanup_error"
+                            ] = type(cleanup_exc).__name__
                     raise
                 except BaseException as exc:
                     wrapper_setup_failure = exc
@@ -6247,90 +6421,53 @@ async def pass_through_request(  # noqa: PLR0915
                 litellm_call_id=litellm_call_id,
             )
             if is_native_openai_responses_route:
-                async def _on_native_wire_disposition(
-                    disposition: OpenAIResponsesWireDisposition,
-                    trace: OpenAIResponsesWireTrace,
-                ) -> None:
-                    await _finalize_native_openai_responses_owner_wire_disposition(
-                        request=request,
-                        disposition=disposition,
-                        trace=trace,
+                if not native_wire_stream_installed:
+                    processed_chunks, wire_trace = wrap_openai_responses_stream(
+                        wrapper_cleanup_source,
+                        upstream_response=response,
+                        on_disposition=_on_native_wire_disposition,
+                        trace=wire_trace,
+                        model=(
+                            str(provider_bound_body.get("model"))
+                            if isinstance(provider_bound_body, dict)
+                            and provider_bound_body.get("model") is not None
+                            else None
+                        ),
                     )
-
-                processed_chunks, wire_trace = wrap_openai_responses_stream(
-                    (
-                        processed_chunks
-                        if wrapper_setup_failure is None
-                        else wrapper_cleanup_source
-                    ),
-                    upstream_response=response,
-                    on_disposition=_on_native_wire_disposition,
-                    trace=wire_trace,
-                    model=(
-                        str(provider_bound_body.get("model"))
-                        if isinstance(provider_bound_body, dict)
-                        and provider_bound_body.get("model") is not None
-                        else None
+                    bind_openai_responses_wire_trace_to_request(
+                        request,
+                        wire_trace,
                     )
-                )
-                bind_openai_responses_wire_trace_to_request(
-                    request,
-                    wire_trace,
-                )
-                if stream_bookkeeping_state is not None:
-
-                    async def _run_post_delivery_bookkeeping(
-                        delivered_snapshot: Dict[str, Any],
-                    ) -> None:
-                        callback = stream_bookkeeping_state.get("finalize_callback")
-                        if callback is not None:
-                            await callback(delivered_snapshot)
-                            return
-                        await PassThroughStreamingHandler._finalize_unstarted_native_stream(
-                            delivered_snapshot=delivered_snapshot,
-                            response=response,
-                            request_body=_parsed_body,
-                            litellm_logging_obj=logging_obj,
-                            endpoint_type=endpoint_type,
-                            start_time=start_time,
-                            passthrough_success_handler_obj=(
-                                pass_through_endpoint_logging
-                            ),
-                            url_route=str(url),
-                            passthrough_logging_payload=passthrough_logging_payload,
-                            custom_llm_provider=custom_llm_provider,
-                            success_handler_kwargs=kwargs,
-                            local_prepare_ms=local_prepare_ms,
-                            error_log_context=error_log_context,
-                            upstream_prefix_bytes=getattr(response, "_prefix", None),
-                        )
-
+                if (
+                    stream_bookkeeping_state is not None
+                    and not native_wire_bookkeeping_registered
+                ):
                     wire_trace.register_post_finalization_callback(
                         _run_post_delivery_bookkeeping
                     )
-                    if wrapper_setup_failure is not None:
-                        failure_body, failure_status_code = (
-                            _build_native_responses_wrapper_failure_body(
-                                wire_trace=wire_trace,
-                                wrapper_setup_failure=wrapper_setup_failure,
-                            )
-                        )
-                        stream_response = OpenAIResponsesBufferedResponse(
-                            content=failure_body,
+                if wrapper_setup_failure is not None:
+                    failure_body, failure_status_code = (
+                        _build_native_responses_wrapper_failure_body(
                             wire_trace=wire_trace,
-                            disposition=OpenAIResponsesWireDisposition.FAILED,
-                            on_disposition=_on_native_wire_disposition,
-                            status_code=failure_status_code,
-                            headers=response_headers,
+                            wrapper_setup_failure=wrapper_setup_failure,
                         )
-                    else:
-                        stream_response = OpenAIResponsesStreamingResponse(
-                            processed_chunks,
-                            wire_trace=wire_trace,
-                            on_disposition=_on_native_wire_disposition,
-                            headers=response_headers,
-                            status_code=response.status_code,
-                        )
+                    )
+                    stream_response = OpenAIResponsesBufferedResponse(
+                        content=failure_body,
+                        wire_trace=wire_trace,
+                        disposition=OpenAIResponsesWireDisposition.FAILED,
+                        on_disposition=_on_native_wire_disposition,
+                        status_code=failure_status_code,
+                        headers=response_headers,
+                    )
+                else:
+                    stream_response = OpenAIResponsesStreamingResponse(
+                        processed_chunks,
+                        wire_trace=wire_trace,
+                        on_disposition=_on_native_wire_disposition,
+                        headers=response_headers,
+                        status_code=response.status_code,
+                    )
             else:
                 stream_response = StreamingResponse(
                     processed_chunks,
