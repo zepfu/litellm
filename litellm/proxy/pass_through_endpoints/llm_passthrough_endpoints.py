@@ -6395,6 +6395,22 @@ async def openai_proxy_route(  # noqa: PLR0915
                     or bool(getattr(exc, "_aawm_provider_returned", False))
                 )
             )
+            if identity_readiness:
+                terminal_exc = HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=copy.deepcopy(getattr(exc, "detail", None)),
+                )
+                for field in (
+                    "attempted_provider_call",
+                    "_aawm_xai_identity_readiness",
+                    "failure_phase",
+                    "message",
+                    "param",
+                    "type",
+                ):
+                    if hasattr(exc, field):
+                        setattr(terminal_exc, field, getattr(exc, field))
+                raise terminal_exc from exc
             attempted_provider_call = provider_returned
             provider_status_code = (
                 _aawm_error_signals._extract_adapter_exception_status_code(exc)
