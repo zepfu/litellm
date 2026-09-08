@@ -83,12 +83,59 @@ export async function runBoundedCollector(
   );
   let initial = header;
   if (header !== null) {
-    initial = await bridgeCall(() =>
-      context.bridge.loadState({
-        kind: "candidates",
-        expectedStateVersion: header.stateVersionCounter,
-      }),
-    );
+    let cursor: string | null = null;
+    const seenCursors = new Set<string>();
+    let hydrated = header;
+    let queueComplete = false;
+    for (let page = 0; page < bounds.maxRequests; page += 1) {
+      let candidatePage: Awaited<ReturnType<WorkerBridge["loadState"]>>;
+      try {
+        candidatePage = await bridgeCall(() =>
+          context.bridge.loadState({
+            kind: "candidates",
+            cursor,
+            limit: 256,
+            expectedStateVersion: header.stateVersionCounter,
+          }),
+        );
+      } catch (error) {
+        if (
+          error instanceof BoundedWorkerError &&
+          error.code === "bounds_exceeded"
+        ) {
+          queueWarnings.push("candidate_queue_hydration_incomplete");
+          break;
+        }
+        throw error;
+      }
+      if (candidatePage === null) {
+        queueWarnings.push("candidate_queue_hydration_incomplete");
+        break;
+      }
+      hydrated = candidatePage;
+      if (candidatePage.hasMore === false) {
+        queueComplete = true;
+        break;
+      }
+      if (
+        candidatePage.hasMore !== true ||
+        typeof candidatePage.nextCursor !== "string" ||
+        candidatePage.nextCursor.trim() === "" ||
+        seenCursors.has(candidatePage.nextCursor)
+      ) {
+        queueWarnings.push("candidate_queue_hydration_incomplete");
+        break;
+      }
+      seenCursors.add(candidatePage.nextCursor);
+      cursor = candidatePage.nextCursor;
+    }
+    initial = hydrated;
+    if (!queueComplete) {
+      queueCoverage = "partial";
+      if (!queueWarnings.includes("candidate_queue_hydration_incomplete")) {
+        queueWarnings.push("candidate_queue_hydration_incomplete");
+      }
+    }
   }
   if (initial !== null && initial.queueCoverage !== "complete") {
     queueCoverage = "partial";
@@ -244,8 +291,9 @@ export async function runBoundedCollector(
           source !== undefined &&
           !sameValue(source, current.source)
         ) {
-          warnings.push("retained_metadata_source_changed");
-          coverage = "partial";
+          // Each retained observation carries its own valid context. The
+          // first page is newest; do not turn historical context changes into
+          // a false coverage gap.
         } else if (source === undefined && current.source !== undefined) {
           source = current.source;
           warnings.push("retained_metadata_source_added");
@@ -292,7 +340,17 @@ export async function runBoundedCollector(
         } else if (current.coverage !== "complete" && coverage !== "unknown") {
           coverage = "partial";
         }
-        truncated ||= current.truncated === true;
+        const terminalComplete =
+          terminalPage &&
+          current.coverage === "complete" &&
+          current.truncated === false &&
+          warnings.length === 0;
+        if (terminalComplete) {
+          coverage = "complete";
+          truncated = false;
+        } else {
+          truncated ||= current.truncated === true;
+        }
         if (
           (current.snapshotId === null || current.snapshotId === undefined) &&
           current.hasMore === true
@@ -542,13 +600,54 @@ function mergeAttempts(
   retained: readonly ReconstructedAttempt[],
 ): ReconstructedAttempt[] {
   const byId = new Map<string, ReconstructedAttempt>();
-  for (const attempt of retained) {
-    byId.set(attempt.attemptId, attempt);
-  }
-  for (const attempt of current) {
-    byId.set(attempt.attemptId, attempt);
+  for (const attempt of [...current, ...retained]) {
+    const previous = byId.get(attempt.attemptId);
+    byId.set(
+      attempt.attemptId,
+      previous ? mergeAttemptRecords(previous, attempt) : attempt,
+    );
   }
   return [...byId.values()];
+}
+
+function mergeAttemptRecords(
+  newest: ReconstructedAttempt,
+  older: ReconstructedAttempt,
+): ReconstructedAttempt {
+  return {
+    ...older,
+    ...newest,
+    attemptTime: newest.attemptTime ?? older.attemptTime,
+    earliestPossibleAt: newest.earliestPossibleAt ?? older.earliestPossibleAt,
+    latestPossibleAt: newest.latestPossibleAt ?? older.latestPossibleAt,
+    requestedModelRaw: newest.requestedModelRaw ?? older.requestedModelRaw,
+    requestedModeRaw: newest.requestedModeRaw ?? older.requestedModeRaw,
+    requestedReasoningEffortRaw:
+      newest.requestedReasoningEffortRaw ??
+      older.requestedReasoningEffortRaw,
+    recordedFinalModelRaw:
+      newest.recordedFinalModelRaw ?? older.recordedFinalModelRaw,
+    resolvedModelRaw: newest.resolvedModelRaw ?? older.resolvedModelRaw,
+    requestedFamily: newest.requestedFamily ?? older.requestedFamily,
+    recordedFinalFamily:
+      newest.recordedFinalFamily ?? older.recordedFinalFamily,
+    resolvedFamily: newest.resolvedFamily ?? older.resolvedFamily,
+    origin: newest.origin ?? older.origin,
+    aliases: [...new Map(
+      [...older.aliases, ...newest.aliases].map((alias) => [
+        `${alias[0]}\0${alias[1]}`,
+        alias,
+      ]),
+    ).values()],
+    evidenceMessageIds: [
+      ...new Set([
+        ...older.evidenceMessageIds,
+        ...newest.evidenceMessageIds,
+      ]),
+    ].sort(),
+    revision: Math.max(newest.revision, older.revision),
+    warnings: [...new Set([...older.warnings, ...newest.warnings])],
+  };
 }
 
 export class BoundedWorkerError extends Error {

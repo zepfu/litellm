@@ -61,6 +61,7 @@ interface ScopeDiscoveryResult {
   coverage: ScopeCoverageResult;
   warnings: string[];
   auditConversationIds: Set<string>;
+  auditExhausted: boolean;
 }
 
 interface DetailAcquisition {
@@ -180,7 +181,7 @@ export class HistoryCollector {
 
     const identity = await this.readIdentity(now);
 
-    const persistedAccountState = this.options.store.loadAccountState();
+    let persistedAccountState = this.options.store.loadAccountState();
     const explicitRecovery =
       this.options.recoverAuthentication === true &&
       persistedAccountState.status === "paused" &&
@@ -195,6 +196,22 @@ export class HistoryCollector {
         cooldownUntil: null,
         lastError: null,
       });
+      persistedAccountState = this.options.store.loadAccountState();
+    } else if (
+      persistedAccountState.status === "paused" &&
+      persistedAccountState.reason === "cooldown" &&
+      persistedAccountState.cooldownUntil !== null &&
+      isValidInstant(persistedAccountState.cooldownUntil) &&
+      new Date(persistedAccountState.cooldownUntil).getTime() <= now.getTime()
+    ) {
+      await this.setAccountState({
+        status: "ready",
+        reason: null,
+        pausedAt: null,
+        cooldownUntil: null,
+        lastError: null,
+      });
+      persistedAccountState = this.options.store.loadAccountState();
     } else if (persistedAccountState.status === "paused") {
       return blockedResult(
         this.options.accountId,
@@ -222,6 +239,7 @@ export class HistoryCollector {
     const candidates = new Map<string, Candidate>();
     const scopeResults: ScopeCoverageResult[] = [];
     const auditedConversationIds = new Map<HistoryScope, Set<string>>();
+    const exhaustedAudits = new Map<HistoryScope, boolean>();
     const warnings: string[] = [];
     let pagesFetched = 0;
 
@@ -253,6 +271,7 @@ export class HistoryCollector {
       }
       scopeResults.push(discovery.coverage);
       auditedConversationIds.set(scope, discovery.auditConversationIds);
+      exhaustedAudits.set(scope, discovery.auditExhausted);
       pagesFetched += discovery.coverage.pagesFetched;
       warnings.push(...discovery.warnings);
       for (const summary of discovery.summaries) {
@@ -345,6 +364,7 @@ export class HistoryCollector {
     await this.reconcileOlderHistoryAudits(
       scopeResults,
       auditedConversationIds,
+      exhaustedAudits,
       conversations,
       identity,
       scanStartedAt,
@@ -439,6 +459,15 @@ export class HistoryCollector {
     const seenOffsets = new Set<number>();
     const priorAudit = normalizeOlderHistoryAudit(previous?.olderHistoryAudit);
     const auditConversationIds = new Set<string>();
+    for (const candidate of candidateQueue) {
+      if (
+        priorAudit.enabled &&
+        isOlderHistoryAuditCandidate(candidate.summary, requestedRange.start)
+      ) {
+        auditConversationIds.add(candidate.summary.conversationId);
+      }
+    }
+    let auditExhausted = false;
     const pageBudget =
       request.maxIndexPagesPerScope ?? this.maxIndexPagesPerScope;
     const pageSize = request.indexPageSize ?? this.indexPageSize;
@@ -787,6 +816,7 @@ export class HistoryCollector {
         priorAudit,
       );
       auditState = audit.state;
+      auditExhausted = audit.exhausted;
       warnings.push(...audit.warnings);
       enqueuePageCandidates(audit.summaries, true);
       for (const summary of audit.summaries) {
@@ -838,6 +868,7 @@ export class HistoryCollector {
       },
       warnings,
       auditConversationIds,
+      auditExhausted,
     };
   }
 
@@ -852,6 +883,7 @@ export class HistoryCollector {
     summaries: ConversationSummary[];
     warnings: string[];
     state: OlderHistoryAuditState;
+    exhausted: boolean;
   }> {
     const pageBudget =
       request.olderHistoryAudit?.maxPages ??
@@ -866,6 +898,7 @@ export class HistoryCollector {
     const summaries: ConversationSummary[] = [];
     const warnings: string[] = [];
     const seenOffsets = new Set<number>();
+    let exhausted = false;
     let state: OlderHistoryAuditState = {
       ...previous,
       enabled: true,
@@ -873,6 +906,7 @@ export class HistoryCollector {
       continuation: offset,
       lastStartedAt: scanStartedAt,
       lastPageAt: previous.lastPageAt,
+      lastCompletedAt: null,
     };
 
     while (pagesFetched < pageBudget) {
@@ -943,10 +977,11 @@ export class HistoryCollector {
           page.coverage === "validated_page" && page.warnings.length === 0;
         state = {
           ...state,
-          status: complete ? "complete" : "partial",
+          status: "partial",
           continuation: null,
-          lastCompletedAt: complete ? scanStartedAt : state.lastCompletedAt,
+          lastCompletedAt: null,
         };
+        exhausted = complete;
         break;
       }
 
@@ -978,7 +1013,7 @@ export class HistoryCollector {
       warnings.push("older_history_audit_page_budget_exhausted");
       state = { ...state, status: "partial" };
     }
-    return { summaries, warnings, state };
+    return { summaries, warnings, state, exhausted };
   }
 
   private candidateCutoff(
@@ -1295,6 +1330,7 @@ export class HistoryCollector {
     let before =
       existingRevisit?.continuation ??
       (detail.paginationState === "continuation" ? detail.continuation : null);
+    const startedFromSavedContinuation = before !== null;
     let detailPagesFetched = 0;
     let currentRevisit = existingRevisit;
     let continuationRestarted = false;
@@ -1421,7 +1457,8 @@ export class HistoryCollector {
             retainedPageReason ??
             pageRevisitReason,
           1,
-          page.coverage === "validated_page" &&
+          !startedFromSavedContinuation &&
+            page.coverage === "validated_page" &&
             page.paginationState === "complete" &&
             page.warnings.length === 0,
         );
@@ -1961,6 +1998,7 @@ export class HistoryCollector {
   private async reconcileOlderHistoryAudits(
     scopeResults: ScopeCoverageResult[],
     auditedConversationIds: Map<HistoryScope, Set<string>>,
+    exhaustedAudits: Map<HistoryScope, boolean>,
     conversations: AcquiredConversation[],
     identity: IdentityRecord,
     scanStartedAt: string,
@@ -1969,16 +2007,14 @@ export class HistoryCollector {
   ): Promise<void> {
     const warning = "older_history_audit_details_incomplete";
     for (const coverage of scopeResults) {
-      if (
-        !coverage.olderHistoryAudit.enabled ||
-        coverage.olderHistoryAudit.status !== "complete"
-      ) {
+      if (!coverage.olderHistoryAudit.enabled) {
         continue;
       }
-      const conversationIds = auditedConversationIds.get(coverage.scope);
-      if (!conversationIds || conversationIds.size === 0) {
+      if (exhaustedAudits.get(coverage.scope) !== true) {
         continue;
       }
+      const conversationIds =
+        auditedConversationIds.get(coverage.scope) ?? new Set<string>();
       const incomplete = [...conversationIds].some((conversationId) => {
         const conversation = conversations.find(
           (item) => item.summary.conversationId === conversationId,
@@ -1990,11 +2026,35 @@ export class HistoryCollector {
           !this.committedCompleteConversationIds.has(conversationId)
         );
       });
+      const checkpoint = this.options.store.loadDiscovery(coverage.scope);
       if (!incomplete) {
+        const auditState: OlderHistoryAuditState = {
+          ...normalizeOlderHistoryAudit(checkpoint?.olderHistoryAudit),
+          enabled: true,
+          status: "complete",
+          continuation: null,
+          lastCompletedAt: scanStartedAt,
+        };
+        if (checkpoint) {
+          const nextCheckpoint: DiscoveryCheckpoint = {
+            ...checkpoint,
+            olderHistoryAudit: auditState,
+            warnings: checkpoint.warnings.filter(
+              (entry) => entry !== warning,
+            ),
+            updatedAt: now.toISOString(),
+          };
+          this.options.store.saveDiscovery(nextCheckpoint);
+          await this.commitDiscoveryCheckpoint(
+            nextCheckpoint,
+            identity,
+            scanStartedAt,
+          );
+        }
+        coverage.olderHistoryAudit = auditState;
         continue;
       }
 
-      const checkpoint = this.options.store.loadDiscovery(coverage.scope);
       if (
         checkpoint?.olderHistoryAudit &&
         checkpoint.olderHistoryAudit.status === "complete"
@@ -2515,27 +2575,28 @@ export function dedupeMessages(messages: MessageRecord[]): MessageRecord[] {
     }
     // Message pages can omit graph links that were present in the detail mapping.
     byId.set(message.messageId, {
-      ...message,
-      nodeId: message.nodeId === message.messageId
-        ? previous.nodeId ?? message.nodeId
-        : message.nodeId ?? previous.nodeId,
-      parentId: message.parentId ?? previous.parentId,
+      ...previous,
+      nodeId: previous.nodeId === previous.messageId
+        ? message.nodeId ?? previous.nodeId
+        : previous.nodeId ?? message.nodeId,
+      parentId: previous.parentId ?? message.parentId,
       children: [...new Set([...previous.children, ...message.children])].sort(),
-      role: message.role ?? previous.role,
-      channel: message.channel ?? previous.channel,
-      createdAt: message.createdAt ?? previous.createdAt,
-      status: message.status ?? previous.status,
-      endTurn: message.endTurn ?? previous.endTurn,
-      requestedModelRaw: message.requestedModelRaw ?? previous.requestedModelRaw,
-      requestedModeRaw: message.requestedModeRaw ?? previous.requestedModeRaw,
+      role: previous.role ?? message.role,
+      channel: previous.channel ?? message.channel,
+      createdAt: previous.createdAt ?? message.createdAt,
+      status: previous.status ?? message.status,
+      endTurn: previous.endTurn ?? message.endTurn,
+      requestedModelRaw: previous.requestedModelRaw ?? message.requestedModelRaw,
       requestedReasoningEffortRaw:
-        message.requestedReasoningEffortRaw ?? previous.requestedReasoningEffortRaw,
+        previous.requestedReasoningEffortRaw ??
+        message.requestedReasoningEffortRaw,
       recordedFinalModelRaw:
-        message.recordedFinalModelRaw ?? previous.recordedFinalModelRaw,
-      generationId: message.generationId ?? previous.generationId,
-      requestId: message.requestId ?? previous.requestId,
-      origin: message.origin ?? previous.origin,
-      metadata: { ...previous.metadata, ...message.metadata },
+        previous.recordedFinalModelRaw ?? message.recordedFinalModelRaw,
+      requestedModeRaw: previous.requestedModeRaw ?? message.requestedModeRaw,
+      generationId: previous.generationId ?? message.generationId,
+      requestId: previous.requestId ?? message.requestId,
+      origin: previous.origin ?? message.origin,
+      metadata: { ...message.metadata, ...previous.metadata },
     });
   }
   return [...byId.values()];

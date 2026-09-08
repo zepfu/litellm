@@ -56,10 +56,9 @@ import type {
   BridgeStateEnvelope,
 } from "../history/bridge-checkpoints.js";
 
-const MAX_QUEUE_PAGES = 16;
 const MAX_REPORT_PAGES = 100;
-const TERMINAL_REQUEST_RESERVE = 2;
-const TERMINAL_BYTES_RESERVE = 64 * 1024;
+const TERMINAL_REQUEST_RESERVE = 3;
+const TERMINAL_FRAME_RESERVE = 6;
 
 export async function runStdioWorker(
   input: NodeJS.ReadableStream = process.stdin,
@@ -134,10 +133,11 @@ class WorkerClientApplication {
       if (!claim) {
         throw new BoundedWorkerError("state_conflict", true, true);
       }
-      this.triggerId = claim.trigger.triggerId;
+      const triggerId = claim.trigger.triggerId;
+      this.triggerId = triggerId;
       scheduleState = claim.state;
 
-      const prepared = await this.bridge.prepareHistory(this.triggerId);
+      const prepared = await this.bridge.prepareHistory(triggerId);
       const reader = new ParentHistoryReader(this.bridge, prepared);
       const request = this.start.collectionRequest as unknown as HistoryCollectionRequest;
       const mapping = this.start.mapping as ModelMappingVersion;
@@ -159,11 +159,8 @@ class WorkerClientApplication {
           this.start.authenticationRecoveryRequested === true,
       });
       const report = await this.collectReport(
-        this.start.reportRequest ?? {
-          account: this.start.envelope.collectorAccountId,
-          asOf: new Date().toISOString(),
-          modelDimension: "resolved",
-        },
+        this.start.reportRequest ??
+          defaultReportRequest(collection.result),
       );
       const completion = completionFor(
         collection.result,
@@ -180,10 +177,9 @@ class WorkerClientApplication {
         throw new BoundedWorkerError("state_conflict", true, true);
       }
       scheduleState = completed.state ?? scheduleState;
-      this.finishRequested = true;
       const finished = await this.bridge.finishRun({
         expectedVersion: this.bridge.stateVersion,
-        triggerId: this.triggerId,
+        triggerId,
         outcome: completion.outcome,
         summary: {
           status: collection.result.status,
@@ -202,6 +198,7 @@ class WorkerClientApplication {
       if (!finished.finished) {
         throw new BoundedWorkerError("protocol_invalid", false, true);
       }
+      this.finishRequested = true;
     } catch (error) {
       if (this.triggerId !== null && !this.finishRequested && !this.bridge.remoteCancelled) {
         if (isAccountBlockingError(error)) {
@@ -214,8 +211,7 @@ class WorkerClientApplication {
               completion,
             );
             if (completed.applied) {
-              this.finishRequested = true;
-              await this.bridge.finishRun({
+              const finished = await this.bridge.finishRun({
                 expectedVersion: this.bridge.stateVersion,
                 triggerId: this.triggerId,
                 outcome: completion.outcome,
@@ -224,19 +220,26 @@ class WorkerClientApplication {
                   coverageIncomplete: true,
                 },
               });
+              if (finished.finished) {
+                this.finishRequested = true;
+              }
             }
           } catch {
             // Fall through to the bounded cancellation path below.
           }
         }
         if (this.finishRequested) {
-          throw error;
+          return;
         }
         try {
+          const triggerId = this.triggerId;
+          if (triggerId === null) {
+            throw error;
+          }
           this.bridge.enterTerminalPhase();
           await this.bridge.cancel({
             expectedVersion: this.bridge.stateVersion,
-            triggerId: this.triggerId,
+            triggerId,
             outcome: "cancelled_after_start",
             summary: {
               errorCode: errorCode(error),
@@ -291,13 +294,19 @@ class WorkerClientApplication {
         throw error;
       }
       first ??= current;
+      const terminalPage =
+        current.hasMore === false &&
+        (current.nextCursor === undefined || current.nextCursor === null);
       if (!snapshotInitialized) {
         expectedSnapshotId =
           typeof current.snapshotId === "string" || current.snapshotId === null
             ? current.snapshotId
             : undefined;
         snapshotInitialized = true;
-      } else if (current.snapshotId !== expectedSnapshotId) {
+      } else if (
+        current.snapshotId !== expectedSnapshotId &&
+        !(current.snapshotId === null && terminalPage)
+      ) {
         truncated = true;
         warnings.push("report_snapshot_changed");
         break;
@@ -312,8 +321,12 @@ class WorkerClientApplication {
       }
       const pageAttempts = current.attempts;
       attempts.push(...pageAttempts as UsageReportSnapshot["attempts"][number][]);
-      truncated ||= current.truncated === true;
-      if (current.hasMore === false) {
+      if (terminalPage && current.truncated === false) {
+        truncated = false;
+      } else {
+        truncated ||= current.truncated === true;
+      }
+      if (terminalPage) {
         if (
           current.nextCursor !== undefined &&
           current.nextCursor !== null
@@ -495,6 +508,8 @@ class ParentWorkerBridge implements WorkerBridge {
         throw new BoundedWorkerError("protocol_invalid", false, true);
       }
       this.headerState = state;
+      this.candidateState = null;
+      this.candidateStateVersion = null;
       this.stateVersion = stateVersion;
       return state;
     }
@@ -510,13 +525,27 @@ class ParentWorkerBridge implements WorkerBridge {
     ) {
       throw new BoundedWorkerError("state_conflict", true, true);
     }
-    const state = structuredClone(this.headerState);
-    const candidates = await this.readCandidateQueue(expectedStateVersion);
-    const merged = mergeQueueItems(state, candidates.items);
-    state.queueCoverage = candidates.complete && merged ? "complete" : "partial";
-    if (!candidates.complete) {
-      return state;
+    const cursor = request.cursor ?? null;
+    if (
+      cursor === null ||
+      this.candidateState === null ||
+      this.candidateStateVersion !== expectedStateVersion
+    ) {
+      this.candidateState = structuredClone(this.headerState);
+      this.candidateStateVersion = expectedStateVersion;
     }
+    const state = this.candidateState;
+    const candidates = await this.readCandidateQueue(
+      expectedStateVersion,
+      cursor,
+      request.limit,
+    );
+    const merged = mergeQueueItems(state, candidates.items);
+    state.queueCoverage =
+      !candidates.hasMore && merged ? "complete" : "partial";
+    state.nextCursor = candidates.nextCursor;
+    state.hasMore = candidates.hasMore;
+    this.candidateState = state;
     return state;
   }
 
@@ -632,43 +661,42 @@ class ParentWorkerBridge implements WorkerBridge {
   }
 
   private headerState: BridgeStateEnvelope | null = null;
+  private candidateState: BridgeStateEnvelope | null = null;
+  private candidateStateVersion: number | null = null;
 
   private async readCandidateQueue(
     expectedStateVersion: number,
-  ): Promise<{ items: Record<string, unknown>[]; complete: boolean }> {
-    const items: Record<string, unknown>[] = [];
-    let cursor: string | null = null;
-    const seenCursors = new Set<string>();
-    for (let page = 0; page < MAX_QUEUE_PAGES; page += 1) {
-      const result = await this.requestRaw("loadState", {
-        kind: "candidates",
-        cursor,
-        limit: 64,
-        expectedStateVersion,
-      });
-      if (requiredStateVersion(result.stateVersion) !== expectedStateVersion) {
-        throw new BoundedWorkerError("state_conflict", true, true);
-      }
-      const pageItems = Array.isArray(result.items)
-        ? result.items.filter(isRecord)
-        : [];
-      items.push(...pageItems);
-      if (result.hasMore === false) {
-        if (result.nextCursor !== undefined && result.nextCursor !== null) {
-          return { items, complete: false };
-        }
-        return { items, complete: true };
-      }
-      if (result.hasMore !== true) {
-        return { items, complete: false };
-      }
-      cursor = typeof result.nextCursor === "string" ? result.nextCursor : null;
-      if (cursor === null || seenCursors.has(cursor)) {
-        return { items, complete: false };
-      }
-      seenCursors.add(cursor);
+    cursor: string | null,
+    limit = 64,
+  ): Promise<{
+    items: Record<string, unknown>[];
+    nextCursor: string | null;
+    hasMore: boolean;
+  }> {
+    const result = await this.requestRaw("loadState", {
+      kind: "candidates",
+      cursor,
+      limit,
+      expectedStateVersion,
+    });
+    if (requiredStateVersion(result.stateVersion) !== expectedStateVersion) {
+      throw new BoundedWorkerError("state_conflict", true, true);
     }
-    return { items, complete: false };
+    const pageItems = Array.isArray(result.items)
+      ? result.items.filter(isRecord)
+      : [];
+    if (result.hasMore !== true && result.hasMore !== false) {
+      throw new BoundedWorkerError("protocol_invalid", false, true);
+    }
+    const nextCursor =
+      typeof result.nextCursor === "string" ? result.nextCursor : null;
+    if (result.hasMore === true && nextCursor === null) {
+      throw new BoundedWorkerError("protocol_invalid", false, true);
+    }
+    if (result.hasMore === false && nextCursor !== null) {
+      throw new BoundedWorkerError("protocol_invalid", false, true);
+    }
+    return { items: pageItems, nextCursor, hasMore: result.hasMore };
   }
 
   private async requestControl(
@@ -838,6 +866,7 @@ class WireBudget {
   private maxFrameBytes: number;
   private maxTotalBytes: number;
   private maxRequests: number;
+  private terminalBytesReserve: number;
   private deadlineAt = Number.POSITIVE_INFINITY;
   private totalBytes = 0;
   private requestCount = 0;
@@ -852,6 +881,8 @@ class WireBudget {
     this.maxFrameBytes = bounds.maxFrameBytes;
     this.maxTotalBytes = bounds.maxTotalBytes;
     this.maxRequests = bounds.maxRequests;
+    this.terminalBytesReserve =
+      TERMINAL_FRAME_RESERVE * this.maxFrameBytes;
   }
 
   configure(
@@ -873,6 +904,8 @@ class WireBudget {
       DEFAULT_WORKER_BOUNDS.maxRequests,
       "maxRequests",
     );
+    this.terminalBytesReserve =
+      TERMINAL_FRAME_RESERVE * this.maxFrameBytes;
     this.deadlineAt = deadlineAt;
     this.terminalPhase = false;
     if (
@@ -885,29 +918,29 @@ class WireBudget {
   }
 
   consumeRequest(): void {
-    this.requestCount += 1;
-    if (this.requestCount > this.requestLimit()) {
+    this.assertActive();
+    if (this.requestCount >= this.requestLimit()) {
       throw new BoundedWorkerError("bounds_exceeded", true, true);
     }
-    this.assertActive();
+    this.requestCount += 1;
   }
 
   consumeIncomingControl(): void {
-    this.requestCount += 1;
-    if (this.requestCount > this.maxRequests) {
+    this.assertActive();
+    if (this.requestCount >= this.maxRequests) {
       throw new BoundedWorkerError("bounds_exceeded", true, true);
     }
-    this.assertActive();
+    this.requestCount += 1;
   }
 
   consumeBytes(bytes: number): void {
     if (!Number.isSafeInteger(bytes) || bytes < 0) {
       throw new BoundedWorkerError("protocol_invalid", false, true);
     }
-    this.totalBytes += bytes;
-    if (this.totalBytes > this.byteLimit()) {
+    if (this.totalBytes + bytes > this.byteLimit()) {
       throw new BoundedWorkerError("bounds_exceeded", true, true);
     }
+    this.totalBytes += bytes;
     this.assertActive();
   }
 
@@ -945,7 +978,7 @@ class WireBudget {
   private byteLimit(): number {
     return this.terminalPhase
       ? this.maxTotalBytes
-      : Math.max(0, this.maxTotalBytes - TERMINAL_BYTES_RESERVE);
+      : Math.max(0, this.maxTotalBytes - this.terminalBytesReserve);
   }
 }
 
@@ -1450,7 +1483,6 @@ function stateFromHeader(
     collectorAccountId: accountId,
     stateVersionCounter,
     discovery: {},
-    revisits: [],
     queueCoverage: "partial",
   };
   if (rawHeader === null || rawHeader === undefined) {
@@ -1513,18 +1545,51 @@ function mergeQueueItems(
   items: readonly Record<string, unknown>[],
 ): boolean {
   const revisits = new Map(
-    state.revisits.map((entry) => [entry.conversationId, entry]),
+    (state.revisits ?? []).map((entry) => [entry.conversationId, entry]),
   );
   let complete = true;
   for (const item of items) {
+    const candidateKey =
+      typeof item.candidateKey === "string" ? item.candidateKey : null;
+    const payload = isRecord(item.payload) ? item.payload : item;
     if (item.operation === "remove") {
+      const queueKind =
+        item.queueKind ??
+        payload.queueKind ??
+        (candidateKey?.startsWith("revisit:") ? "revisit" : "candidate");
+      if (queueKind === "revisit") {
+        const conversationId =
+          candidateKey?.startsWith("revisit:")
+            ? candidateKey.slice("revisit:".length)
+            : isRecord(payload.entry) &&
+                typeof payload.entry.conversationId === "string"
+              ? payload.entry.conversationId
+              : null;
+        if (conversationId === null) {
+          complete = false;
+        } else {
+          revisits.delete(conversationId);
+        }
+      } else {
+        const conversationId = candidateConversationIdFromKey(candidateKey);
+        if (conversationId === null) {
+          complete = false;
+        } else {
+          for (const checkpoint of Object.values(state.discovery)) {
+            checkpoint?.candidateQueue &&
+              (checkpoint.candidateQueue = checkpoint.candidateQueue.filter(
+                (candidate) =>
+                  candidate.summary.conversationId !== conversationId,
+              ));
+          }
+        }
+      }
       continue;
     }
-    const payload = isRecord(item.payload) ? item.payload : item;
     const queueKind =
       item.queueKind ??
       payload.queueKind ??
-      (String(item.candidateKey).startsWith("revisit:")
+      (candidateKey?.startsWith("revisit:")
         ? "revisit"
         : "candidate");
     if (queueKind === "revisit" && isRecord(payload.entry)) {
@@ -1580,8 +1645,24 @@ function mergeQueueItems(
       ];
     }
   }
-  state.revisits = [...revisits.values()];
+  if (revisits.size > 0) {
+    state.revisits = [...revisits.values()];
+  } else {
+    delete state.revisits;
+  }
   return complete;
+}
+
+function candidateConversationIdFromKey(
+  candidateKey: string | null,
+): string | null {
+  if (candidateKey === null) {
+    return null;
+  }
+  const parts = candidateKey.split(":");
+  return parts.length >= 3 && parts[0] === "candidate"
+    ? parts.slice(2).join(":") || null
+    : null;
 }
 
 function typedReadResultFromWire(
@@ -1792,7 +1873,10 @@ function parseConversationMetadata(
   const directAttempts = Array.isArray(rawAttempts)
     ? rawAttempts.filter(isRecord)
     : [];
-  const attempts = [...directAttempts, ...observationAttempts];
+  const attempts = dedupeWireAttempts([
+    ...directAttempts,
+    ...observationAttempts,
+  ]);
   if (
     Array.isArray(rawAttempts) &&
     directAttempts.length !== rawAttempts.length
@@ -1820,24 +1904,21 @@ function parseConversationMetadata(
   }
   const allSources = directSource ? [directSource, ...sources] : sources;
   const source = allSources[0];
-  if (
-    allSources.length > 1 &&
-    allSources.some((candidate) => !sameValue(candidate, allSources[0]))
-  ) {
-    shapeWarnings.push("retained_metadata_source_changed");
-  }
   const rawCoverage = result.coverage;
   const coverageDetails: Record<string, unknown> = {
     ...(isRecord(rawCoverage) ? { pageCoverage: rawCoverage } : {}),
     ...(isRecord(result.coverageDetails) ? result.coverageDetails : {}),
   };
+  const terminalPage =
+    result.hasMore === false &&
+    (result.nextCursor === undefined || result.nextCursor === null);
   const coverage =
     rawCoverage === "complete" ||
     rawCoverage === "partial" ||
     rawCoverage === "unknown"
       ? rawCoverage
       : isRecord(rawCoverage)
-        ? metadataCoverageFromObject(rawCoverage)
+        ? metadataCoverageFromObject(rawCoverage, terminalPage)
         : undefined;
   const truncated =
     typeof result.truncated === "boolean"
@@ -1993,7 +2074,15 @@ function ingestContextFromWire(value: unknown): IngestContext | undefined {
 
 function metadataCoverageFromObject(
   value: Record<string, unknown>,
+  terminalPage = false,
 ): "complete" | "partial" | "unknown" {
+  if (
+    terminalPage &&
+    value.partial === false &&
+    value.truncated === false
+  ) {
+    return "complete";
+  }
   const candidates = [
     value.status,
     value.coverage,
@@ -2093,6 +2182,28 @@ function completionFor(
           ? "success"
           : "failure",
     retryAfterMs,
+  };
+}
+
+function defaultReportRequest(result: {
+  accountId: string;
+  range: { start: string; end: string };
+}): Record<string, unknown> {
+  const start = new Date(result.range.start).getTime();
+  const end = new Date(result.range.end).getTime();
+  if (
+    !Number.isFinite(start) ||
+    !Number.isFinite(end) ||
+    end <= start ||
+    !Number.isSafeInteger(end - start)
+  ) {
+    throw new BoundedWorkerError("protocol_invalid", false, true);
+  }
+  return {
+    account: result.accountId,
+    asOf: new Date(end).toISOString(),
+    modelDimension: "resolved",
+    elapsedLookbackMs: end - start,
   };
 }
 
@@ -2323,6 +2434,24 @@ function canonicalize(value: unknown): unknown {
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([key, item]) => [key, canonicalize(item)]),
   );
+}
+
+function dedupeWireAttempts(
+  attempts: readonly Record<string, unknown>[],
+): Record<string, unknown>[] {
+  const byId = new Map<string, Record<string, unknown>>();
+  const withoutId: Record<string, unknown>[] = [];
+  for (const attempt of attempts) {
+    const attemptId = attempt.attemptId;
+    if (typeof attemptId !== "string" || attemptId.trim() === "") {
+      withoutId.push(attempt);
+      continue;
+    }
+    if (!byId.has(attemptId)) {
+      byId.set(attemptId, attempt);
+    }
+  }
+  return [...byId.values(), ...withoutId];
 }
 
 if (process.argv.includes("--stdio-v1")) {

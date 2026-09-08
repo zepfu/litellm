@@ -17,9 +17,15 @@ export interface BridgeStateEnvelope {
   collectorAccountId: string;
   stateVersionCounter: number;
   discovery: Partial<Record<HistoryScope, DiscoveryCheckpoint>>;
-  revisits: RevisitEntry[];
+  /**
+   * Revisit rows are hydrated from the explicit candidate queue. They are
+   * intentionally absent from the durable header/checkpoint payload.
+   */
+  revisits?: RevisitEntry[];
   accountState?: HistoryAccountState;
   queueCoverage?: "complete" | "partial";
+  nextCursor?: string | null;
+  hasMore?: boolean;
 }
 
 export type BridgeQueueMutationOperation = "replace" | "remove";
@@ -101,7 +107,7 @@ export class BridgeCheckpointStore implements HistoryCheckpointStore {
       this.accountState = validateAccountState(state.accountState);
     }
     const hydratedRevisits = new Map<string, RevisitEntry>();
-    for (const revisit of state.revisits) {
+    for (const revisit of state.revisits ?? []) {
       hydratedRevisits.set(revisit.conversationId, clone(normalizeRevisit(revisit)));
     }
     const hydratedDiscovery = new Map<HistoryScope, DiscoveryCheckpoint>();
@@ -242,7 +248,6 @@ export class BridgeCheckpointStore implements HistoryCheckpointStore {
       collectorAccountId,
       stateVersionCounter,
       discovery,
-      revisits: this.listRevisits(),
       accountState: clone(this.accountState),
       queueCoverage,
     };
@@ -331,10 +336,12 @@ export function validateEnvelope(state: BridgeStateEnvelope): void {
   if (!Number.isSafeInteger(state.stateVersionCounter) || state.stateVersionCounter < 0) {
     throw new Error("collector state version is invalid");
   }
-  if (!isRecord(state.discovery) || !Array.isArray(state.revisits)) {
+  if (!isRecord(state.discovery) ||
+    state.revisits !== undefined && !Array.isArray(state.revisits)
+  ) {
     throw new Error("collector state contents are invalid");
   }
-  for (const revisit of state.revisits) {
+  for (const revisit of state.revisits ?? []) {
     normalizeRevisit(revisit);
   }
 }
