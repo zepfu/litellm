@@ -43,6 +43,7 @@ import select
 import signal
 import tempfile
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
@@ -112,6 +113,8 @@ _NATIVE_HISTORY_TARGET_ATTACHED = 2
 _NATIVE_HISTORY_TARGET_CLEANUP_PENDING = 3
 _NATIVE_HISTORY_TARGET_CLOSED = 4
 _NATIVE_HISTORY_TARGET_CLEANUP_HANDOFF = 5
+_NATIVE_HISTORY_TARGET_NO_CREATE = 6
+_NATIVE_HISTORY_TARGET_BROWSER_TERMINATED = 7
 
 
 # Truncation does not silently claim completeness.
@@ -2653,6 +2656,89 @@ class OracleBrowserBoundaryUnavailable(ChatGPTConversationInitError):
         super().__init__(message, telemetry_class="auth")
 
 
+class OracleBrowserCleanupError(OracleBrowserBoundaryUnavailable):
+    """Native-history cleanup could not be proven within its deadline."""
+
+
+@dataclass
+class NativeHistoryCloseRegistration:
+    """Process registration for the independent exact-target closer."""
+
+    process: Any
+    private_process_group: Any
+    target_proof: Any
+    driver_done: Any
+    reap_ack: Any
+    target_id: Optional[str]
+    creation_url: str
+    started: bool = False
+    reaped: bool = False
+
+
+@dataclass
+class NativeHistoryLifecycleRegistration:
+    """Nonserialized native-history ownership state held by its browser owner."""
+
+    process: Any
+    private_process_group: Any
+    creation_state: Any
+    owned_target: Any
+    creation_url: str
+    abort_event: Any
+    release_event: Any
+    creation_gate: Any
+    creation_settled: Any
+    creation_issued: Any
+    cdp_endpoint: str
+    anchor_target_id: str
+    deadline: float
+    cleanup_callback: Optional[Callable[[float], Any]] = None
+    close_registration: Optional[NativeHistoryCloseRegistration] = None
+    started: bool = False
+    released: bool = False
+    release_proof: Optional[str] = None
+    cleanup_failure: Optional[str] = None
+    registration_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.registration_id:
+            self.registration_id = "native-history-" + os.urandom(16).hex()
+
+
+class NativeHistoryLifecycleCapability(Protocol):
+    """Owner-side operations supplied only by a private browser owner."""
+
+    def register_native_history(
+        self, registration: NativeHistoryLifecycleRegistration
+    ) -> None:
+        ...
+
+    def register_native_history_closer(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        closer: NativeHistoryCloseRegistration,
+    ) -> None:
+        ...
+
+    def retain_native_history(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        reason: str,
+    ) -> None:
+        ...
+
+    def release_native_history(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        *,
+        proof: str,
+    ) -> None:
+        ...
+
+    def terminate_owned_browser(self, deadline: float) -> bool:
+        ...
+
+
 def _native_init_header(headers: Mapping[str, Any], name: str) -> Any:
     for key in headers:
         if key.lower() == name:
@@ -4536,6 +4622,7 @@ def observe_native_chatgpt_history_from_oracle_browser(
     *,
     page_target_id: str,
     cdp_endpoint: Optional[str] = None,
+    lifecycle_capability: Optional[NativeHistoryLifecycleCapability] = None,
     expected_account_hash: str = CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH,
     timeout_seconds: float = CHATGPT_NATIVE_HISTORY_DEFAULT_TIMEOUT_SECONDS,
     max_response_bytes: int = CHATGPT_NATIVE_HISTORY_MAX_RESPONSE_BYTES,
@@ -4547,9 +4634,24 @@ def observe_native_chatgpt_history_from_oracle_browser(
     that context, performs one ordinary ChatGPT home navigation, and returns
     bounded structural metadata. It never issues a direct history request,
     reads browser storage, exports headers, follows pagination, or requests
-    conversation details.
+    conversation details. Native history requires a lifecycle capability from
+    the owner that actually launched the private browser; a bare CDP endpoint
+    is intentionally insufficient.
     """
 
+    if lifecycle_capability is None or not all(
+        callable(getattr(lifecycle_capability, method_name, None))
+        for method_name in (
+            "register_native_history",
+            "register_native_history_closer",
+            "retain_native_history",
+            "release_native_history",
+            "terminate_owned_browser",
+        )
+    ):
+        raise OracleBrowserBoundaryUnavailable(
+            "Native ChatGPT history requires private browser lifecycle ownership."
+        )
     if expected_account_hash != CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH:
         raise OracleBrowserBoundaryUnavailable(
             "Native ChatGPT history requires the pinned inventory account hash."
@@ -4598,6 +4700,7 @@ def observe_native_chatgpt_history_from_oracle_browser(
                 expected_account_hash=expected_account_hash,
                 deadline=deadline,
                 max_response_bytes=max_response_bytes,
+                lifecycle_capability=lifecycle_capability,
             )
         )
     except OracleBrowserBoundaryUnavailable:
@@ -4857,19 +4960,25 @@ def _oracle_browser_capture_worker(
             sender.close()
 
 
-def _run_oracle_browser_history_observation_in_worker(
+def _run_oracle_browser_history_observation_in_worker(  # noqa: PLR0915 - bounded lifecycle supervisor
     *,
     cdp_endpoint: str,
     page_target_id: str,
     expected_account_hash: str,
     deadline: float,
     max_response_bytes: int,
+    lifecycle_capability: NativeHistoryLifecycleCapability,
 ) -> Mapping[str, Any]:
     context = _oracle_browser_process_context(None)
     receiver, sender = context.Pipe(duplex=False)
     private_process_group = context.RawValue("q", 0)
     owned_target = context.RawArray("c", 256)
     creation_state = context.RawValue("b", 0)
+    creation_issued = context.RawValue("b", False)
+    creation_gate = context.Lock()
+    creation_settled = context.Event()
+    abort_event = context.Event()
+    release_event = context.Event()
     creation_url = "about:blank#oracle-native-history-" + os.urandom(16).hex()
     cleanup_budget = min(
         3.0,
@@ -4883,125 +4992,316 @@ def _run_oracle_browser_history_observation_in_worker(
             cdp_endpoint,
             page_target_id,
             capture_deadline,
-            deadline,
             expected_account_hash,
             max_response_bytes,
             private_process_group,
             owned_target,
             creation_state,
             creation_url,
+            creation_issued,
+            creation_gate,
+            creation_settled,
+            abort_event,
+            release_event,
         ),
     )
+    registration = NativeHistoryLifecycleRegistration(
+        process=process,
+        private_process_group=private_process_group,
+        creation_state=creation_state,
+        owned_target=owned_target,
+        creation_url=creation_url,
+        abort_event=abort_event,
+        release_event=release_event,
+        creation_gate=creation_gate,
+        creation_settled=creation_settled,
+        creation_issued=creation_issued,
+        cdp_endpoint=cdp_endpoint,
+        anchor_target_id=page_target_id,
+        deadline=deadline,
+    )
+    registration.cleanup_callback = lambda cleanup_deadline: (
+        _finalize_native_history_registration(
+            registration,
+            lifecycle_capability,
+            cleanup_deadline,
+        )
+    )
     try:
-        process.start()
+        # The owner must know every shared handle before a child can publish
+        # browser or target state.
+        lifecycle_capability.register_native_history(registration)
     except Exception as exc:
         sender.close()
         receiver.close()
-        raise OracleBrowserBoundaryUnavailable(
-            "Oracle browser history observer worker could not start."
+        raise OracleBrowserCleanupError(
+            "Native ChatGPT history lifecycle registration failed."
         ) from exc
-    sender.close()
-    cleanup_confirmed = False
-    cleanup_error: Optional[Exception] = None
+    operation_error: Optional[Exception] = None
+    result: Optional[Mapping[str, Any]] = None
     try:
-        message = _receive_oracle_browser_worker_message(receiver, capture_deadline)
-        if not isinstance(message, Mapping) or message.get("ok") is not True:
-            raise OracleBrowserBoundaryUnavailable(
-                "Oracle browser history observer is unavailable."
-            )
-        result = message.get("result")
-        if not isinstance(result, Mapping):
-            raise OracleBrowserBoundaryUnavailable(
-                "Oracle browser history observer returned an invalid result."
-            )
-        # The capture deadline only bounds result delivery. The remaining
-        # operation deadline is reserved for target cleanup below.
-        return dict(result)
+        process.start()
+        registration.started = True
+    except Exception as exc:
+        operation_error = OracleBrowserBoundaryUnavailable(
+            "Oracle browser history observer worker could not start."
+        )
+        operation_error.__cause__ = exc
+    sender.close()
+    try:
+        if operation_error is None:
+            try:
+                message = _receive_oracle_browser_worker_message(
+                    receiver,
+                    capture_deadline,
+                )
+                if not isinstance(message, Mapping) or message.get("ok") is not True:
+                    raise OracleBrowserBoundaryUnavailable(
+                        "Oracle browser history observer is unavailable."
+                    )
+                candidate = message.get("result")
+                if not isinstance(candidate, Mapping):
+                    raise OracleBrowserBoundaryUnavailable(
+                        "Oracle browser history observer returned an invalid result."
+                    )
+                result = dict(candidate)
+            except Exception as exc:
+                operation_error = exc
     finally:
         receiver.close()
-        state = int(creation_state.value)
-        if state in {_NATIVE_HISTORY_TARGET_NONE, _NATIVE_HISTORY_TARGET_CLOSED}:
-            cleanup_confirmed = True
-        else:
-            target_id = (
-                owned_target.value
-                if state
-                in {
-                    _NATIVE_HISTORY_TARGET_ATTACHED,
-                    _NATIVE_HISTORY_TARGET_CLEANUP_PENDING,
-                    _NATIVE_HISTORY_TARGET_CLEANUP_HANDOFF,
-                }
-                else b""
+
+    cleanup_error: Optional[Exception] = None
+    try:
+        if not _finalize_native_history_registration(
+            registration,
+            lifecycle_capability,
+            deadline,
+        ):
+            cleanup_error = OracleBrowserCleanupError(
+                registration.cleanup_failure
+                or "Native ChatGPT history cleanup could not be proven."
             )
-            try:
-                _close_owned_oracle_target(
-                    cdp_endpoint=cdp_endpoint,
-                    target_id=target_id.decode("ascii") if target_id else None,
-                    anchor_target_id=page_target_id,
-                    creation_url=creation_url,
-                    deadline=deadline,
-                    playwright_factory=None,
-                )
-                cleanup_confirmed = True
-            except Exception as exc:
-                cleanup_error = exc
-        if cleanup_confirmed:
-            # Publish the acknowledgement before reaping the interception
-            # owner. A failed fallback must leave both values intact.
-            creation_state.value = _NATIVE_HISTORY_TARGET_CLOSED
-            owned_target.value = b""
-            _terminate_oracle_browser_worker(process, private_process_group.value)
-            process.join(
-                timeout=min(
-                    0.1,
-                    max(0.0, _remaining_browser_timeout(deadline)),
-                )
+    except Exception as exc:
+        cleanup_error = (
+            exc
+            if isinstance(exc, OracleBrowserCleanupError)
+            else OracleBrowserCleanupError(
+                "Native ChatGPT history cleanup failed."
             )
-        else:
-            # Keep the interception owner and target identity published. The
-            # caller receives a bounded failure, while a later owner can
-            # resume exact-target cleanup without a silent release.
-            creation_state.value = _NATIVE_HISTORY_TARGET_CLEANUP_HANDOFF
-        if cleanup_error is not None:
-            raise cleanup_error
+        )
+        if cleanup_error is not exc:
+            cleanup_error.__cause__ = exc
+    if cleanup_error is not None:
+        raise cleanup_error
+    if operation_error is not None:
+        raise operation_error
+    if result is None:
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle browser history observer returned no result."
+        )
+    return result
 
 
-def _close_native_history_target_from_session(
-    target_session: Any,
+def _native_history_mark_no_create(
     *,
-    owned_target: Any,
+    creation_state: Any,
+    creation_issued: Any,
+    creation_settled: Any,
 ) -> bool:
-    """Close the published target and require a positive CDP acknowledgement."""
+    """Publish an explicit no-create acknowledgement, never infer it from NONE."""
 
-    target_bytes = owned_target.value
-    if not target_bytes:
+    if bool(creation_issued.value):
+        return False
+    creation_state.value = _NATIVE_HISTORY_TARGET_NO_CREATE
+    creation_settled.set()
+    return True
+
+
+def _native_history_wait_for_release(
+    release_event: Any,
+) -> None:
+    while True:
+        try:
+            if release_event.wait(timeout=0.05):
+                return
+        except (OSError, ValueError):
+            return
+
+
+def _native_history_process_reaped(
+    process: Any,
+    private_process_group: Any,
+    deadline: float,
+) -> bool:
+    """Join a history child, escalating only within the shared deadline."""
+
+    if getattr(process, "pid", None) is None:
         return True
     try:
-        target_id = target_bytes.decode("ascii")
-    except (UnicodeDecodeError, AttributeError):
+        process.join(timeout=max(0.0, _remaining_browser_timeout(deadline)))
+    except (AssertionError, OSError):
         return False
-    try:
-        result = target_session.send(
-            "Target.closeTarget",
-            {"targetId": target_id},
+    if process.is_alive():
+        _terminate_oracle_browser_worker(process, private_process_group.value)
+        try:
+            process.join(timeout=max(0.0, _remaining_browser_timeout(deadline)))
+        except (AssertionError, OSError):
+            return False
+    return not process.is_alive() and getattr(process, "exitcode", None) is not None
+
+
+def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle finalizer
+    registration: NativeHistoryLifecycleRegistration,
+    lifecycle_capability: NativeHistoryLifecycleCapability,
+    deadline: float,
+) -> bool:
+    """Close, release, and reap one history operation without dropping ownership."""
+
+    if (
+        registration.released
+        and _native_history_process_reaped(
+            registration.process,
+            registration.private_process_group,
+            deadline,
         )
-        if isinstance(result, Mapping) and result.get("success") is True:
-            return True
-    except Exception:
-        pass
+        and (
+            registration.close_registration is None
+            or registration.close_registration.reaped
+        )
+    ):
+        registration.cleanup_failure = None
+        lifecycle_capability.release_native_history(
+            registration,
+            proof=f"{registration.release_proof or 'released'};worker_reaped",
+        )
+        return True
+
+    close_registration = registration.close_registration
+    if close_registration is not None and not close_registration.reaped:
+        if not _native_history_process_reaped(
+            close_registration.process,
+            close_registration.private_process_group,
+            deadline,
+        ):
+            registration.cleanup_failure = (
+                "Native ChatGPT history closer was not reaped."
+            )
+            lifecycle_capability.retain_native_history(
+                registration,
+                registration.cleanup_failure,
+            )
+            return False
+        close_registration.reaped = True
+        close_registration.reap_ack.set()
+
+    registration.abort_event.set()
+    state = int(registration.creation_state.value)
+    if (
+        state == _NATIVE_HISTORY_TARGET_NONE
+        and (
+            not registration.started
+            or (
+                registration.creation_settled.is_set()
+                and not bool(registration.creation_issued.value)
+            )
+        )
+    ):
+        state = _NATIVE_HISTORY_TARGET_NO_CREATE
+        registration.creation_state.value = state
+
+    proof: Optional[str] = None
+    if state == _NATIVE_HISTORY_TARGET_NO_CREATE:
+        proof = "no_create_acknowledged"
+    elif state in {
+        _NATIVE_HISTORY_TARGET_ATTACHED,
+        _NATIVE_HISTORY_TARGET_CLEANUP_PENDING,
+        _NATIVE_HISTORY_TARGET_CLEANUP_HANDOFF,
+        _NATIVE_HISTORY_TARGET_CREATING,
+        _NATIVE_HISTORY_TARGET_NONE,
+    }:
+        target_bytes = registration.owned_target.value
+        target_id = None
+        if target_bytes:
+            try:
+                target_id = target_bytes.decode("ascii")
+            except (UnicodeDecodeError, AttributeError):
+                target_id = None
+        try:
+            _close_owned_oracle_target(
+                cdp_endpoint=registration.cdp_endpoint,
+                target_id=target_id,
+                anchor_target_id=registration.anchor_target_id,
+                creation_url=registration.creation_url,
+                deadline=deadline,
+                playwright_factory=None,
+                lifecycle_capability=lifecycle_capability,
+                lifecycle_registration=registration,
+            )
+            registration.creation_state.value = _NATIVE_HISTORY_TARGET_CLOSED
+            proof = "target_close_and_absence_proven"
+        except Exception as exc:
+            registration.cleanup_failure = str(exc)
+    elif state == _NATIVE_HISTORY_TARGET_CLOSED:
+        proof = "target_close_and_absence_proven"
+    elif state == _NATIVE_HISTORY_TARGET_BROWSER_TERMINATED:
+        proof = "owned_browser_termination_proven"
+
+    if proof is None:
+        try:
+            if lifecycle_capability.terminate_owned_browser(deadline):
+                registration.creation_state.value = (
+                    _NATIVE_HISTORY_TARGET_BROWSER_TERMINATED
+                )
+                proof = "owned_browser_termination_proven"
+        except Exception as exc:
+            registration.cleanup_failure = str(exc)
+
+    if proof is None:
+        registration.cleanup_failure = (
+            registration.cleanup_failure
+            or "Native ChatGPT history target ownership could not be closed."
+        )
+        lifecycle_capability.retain_native_history(
+            registration,
+            registration.cleanup_failure,
+        )
+        return False
+
     try:
-        target_listing = target_session.send("Target.getTargets")
-    except Exception:
+        # The release event is the fence that allows the interception owner to
+        # disconnect. The capability retains the registration until reaping.
+        lifecycle_capability.release_native_history(
+            registration,
+            proof=proof,
+        )
+    except Exception as exc:
+        registration.cleanup_failure = str(exc)
+        lifecycle_capability.retain_native_history(
+            registration,
+            registration.cleanup_failure,
+        )
         return False
-    if not isinstance(target_listing, Mapping):
+    if not _native_history_process_reaped(
+        registration.process,
+        registration.private_process_group,
+        deadline,
+    ):
+        registration.cleanup_failure = (
+            "Native ChatGPT history interception worker was not reaped."
+        )
+        lifecycle_capability.retain_native_history(
+            registration,
+            registration.cleanup_failure,
+        )
         return False
-    targets = target_listing.get("targetInfos", ())
-    if not isinstance(targets, (list, tuple)):
-        return False
-    return not any(
-        isinstance(info, Mapping) and info.get("targetId") == target_id
-        for info in targets
+    registration.owned_target.value = b""
+    registration.released = True
+    registration.release_proof = proof
+    lifecycle_capability.release_native_history(
+        registration,
+        proof=f"{proof};worker_reaped",
     )
+    return True
 
 
 def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded cleanup handshake
@@ -5009,13 +5309,17 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
     cdp_endpoint: str,
     page_target_id: str,
     capture_deadline: float,
-    cleanup_deadline: float,
     expected_account_hash: str,
     max_response_bytes: int,
     private_process_group: Any,
     owned_target: Any,
     creation_state: Any,
     creation_url: str,
+    creation_issued: Any,
+    creation_gate: Any,
+    creation_settled: Any,
+    abort_event: Any,
+    release_event: Any,
 ) -> None:
     _enter_oracle_browser_worker_process_group(private_process_group)
     playwright = None
@@ -5023,9 +5327,12 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
     target_session = None
     result = None
     successful = False
-    close_confirmed = False
     try:
         _raise_if_browser_deadline_expired(capture_deadline)
+        if abort_event.is_set():
+            raise OracleBrowserBoundaryUnavailable(
+                "Native ChatGPT history was aborted before browser attachment."
+            )
         playwright = _start_playwright_from_factory(None)
         _raise_if_browser_deadline_expired(capture_deadline)
         browser = playwright.chromium.connect_over_cdp(
@@ -5047,7 +5354,7 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
                 "for native history."
             )
         target_session = browser.new_browser_cdp_session()
-        owned_page = _create_owned_oracle_page(
+        owned_page = _create_native_history_owned_page(
             target_session,
             source_page,
             page_target_id,
@@ -5055,7 +5362,15 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
             creation_state,
             creation_url,
             capture_deadline,
+            creation_issued,
+            creation_gate,
+            creation_settled,
+            abort_event,
         )
+        if abort_event.is_set():
+            raise OracleBrowserBoundaryUnavailable(
+                "Native ChatGPT history was aborted before navigation."
+            )
         result = _observe_native_history_oracle_page(
             owned_page,
             session=owned_page.context.new_cdp_session(owned_page),
@@ -5064,41 +5379,23 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
             max_response_bytes=max_response_bytes,
         )
         _raise_if_browser_deadline_expired(capture_deadline)
-        successful = True
+        successful = not abort_event.is_set()
     except Exception:
         successful = False
     finally:
-        close_failed = False
-        if owned_target.value:
-            if target_session is None:
-                close_failed = True
-                successful = False
-                creation_state.value = _NATIVE_HISTORY_TARGET_CLEANUP_PENDING
-            else:
-                close_confirmed = _close_native_history_target_from_session(
-                    target_session,
-                    owned_target=owned_target,
-                )
-                if close_confirmed:
-                    creation_state.value = _NATIVE_HISTORY_TARGET_CLOSED
-                    owned_target.value = b""
-                else:
-                    close_failed = True
-                    successful = False
-                    # The parent may close the target while this CDP
-                    # interception owner remains attached.
-                    creation_state.value = _NATIVE_HISTORY_TARGET_CLEANUP_PENDING
-        elif creation_state.value == _NATIVE_HISTORY_TARGET_CREATING:
-            close_failed = True
-            successful = False
+        if not creation_settled.is_set() and not bool(creation_issued.value):
+            _native_history_mark_no_create(
+                creation_state=creation_state,
+                creation_issued=creation_issued,
+                creation_settled=creation_settled,
+            )
+        elif (
+            creation_state.value == _NATIVE_HISTORY_TARGET_CREATING
+            and creation_settled.is_set()
+        ):
             creation_state.value = _NATIVE_HISTORY_TARGET_CLEANUP_PENDING
-        else:
-            close_confirmed = True
-        if close_confirmed:
-            try:
-                _disconnect_attached_browser(playwright, browser)
-            except Exception:
-                successful = False
+        if abort_event.is_set():
+            successful = False
         try:
             _send_oracle_browser_worker_message(
                 sender,
@@ -5117,36 +5414,67 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
                 pass
         finally:
             sender.close()
-        if close_failed:
-            while (
-                creation_state.value
-                in {
-                    _NATIVE_HISTORY_TARGET_CLEANUP_PENDING,
-                    _NATIVE_HISTORY_TARGET_CLEANUP_HANDOFF,
-                }
-                and _remaining_browser_timeout(cleanup_deadline) > 0
-            ):
-                if target_session is not None and _close_native_history_target_from_session(
-                    target_session,
-                    owned_target=owned_target,
-                ):
-                    creation_state.value = _NATIVE_HISTORY_TARGET_CLOSED
-                    owned_target.value = b""
-                    close_confirmed = True
-                    break
-                time.sleep(
-                    min(
-                        0.01,
-                        max(0.0, _remaining_browser_timeout(cleanup_deadline)),
-                    )
-                )
-            if creation_state.value != _NATIVE_HISTORY_TARGET_CLOSED:
-                # Do not detach an interception owner whose target closure was
-                # not acknowledged. The published state/target remain available
-                # for a later cleanup owner; the caller must fail closed.
-                creation_state.value = _NATIVE_HISTORY_TARGET_CLEANUP_HANDOFF
-        if creation_state.value == _NATIVE_HISTORY_TARGET_CLOSED:
+        # Keep Fetch interception and the attached browser alive until the
+        # owner proves target closure or terminates its private browser.
+        _native_history_wait_for_release(release_event)
+        try:
             _disconnect_attached_browser(playwright, browser)
+        except Exception:
+            pass
+
+
+def _create_native_history_owned_page(
+    target_session: Any,
+    source_page: Any,
+    anchor_target_id: str,
+    owned_target: Any,
+    creation_state: Any,
+    creation_url: str,
+    deadline: float,
+    creation_issued: Any,
+    creation_gate: Any,
+    creation_settled: Any,
+    abort_event: Any,
+) -> Any:
+    anchor = target_session.send(
+        "Target.getTargetInfo", {"targetId": anchor_target_id}
+    )["targetInfo"]
+    create_options = {"url": creation_url}
+    if anchor.get("browserContextId"):
+        create_options["browserContextId"] = anchor["browserContextId"]
+    with source_page.context.expect_page(
+        predicate=lambda page: page.url == creation_url,
+        timeout=_browser_timeout_milliseconds(_remaining_browser_timeout(deadline))
+    ) as page_event:
+        with creation_gate:
+            if abort_event.is_set():
+                _native_history_mark_no_create(
+                    creation_state=creation_state,
+                    creation_issued=creation_issued,
+                    creation_settled=creation_settled,
+                )
+                raise OracleBrowserBoundaryUnavailable(
+                    "Native ChatGPT history was aborted before target creation."
+                )
+            creation_state.value = _NATIVE_HISTORY_TARGET_CREATING
+            creation_issued.value = True
+            try:
+                created = target_session.send("Target.createTarget", create_options)
+                target_id = _validate_page_target_id(created["targetId"])
+                if target_id == anchor_target_id:
+                    raise OracleBrowserBoundaryUnavailable(
+                        "Oracle browser returned the context anchor as an owned target."
+                    )
+                owned_target.value = target_id.encode("ascii")
+                creation_state.value = _NATIVE_HISTORY_TARGET_ATTACHED
+            finally:
+                creation_settled.set()
+    candidate = page_event.value
+    if _page_target_id(source_page.context, candidate) != target_id:
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle browser owned page did not match its created target."
+        )
+    return candidate
 
 
 def _create_owned_oracle_page(
@@ -5194,6 +5522,8 @@ def _close_owned_oracle_target(
     creation_url: str,
     deadline: float,
     playwright_factory: Optional[Callable[[], Any]],
+    lifecycle_capability: Optional[NativeHistoryLifecycleCapability] = None,
+    lifecycle_registration: Optional[NativeHistoryLifecycleRegistration] = None,
 ) -> None:
     """Give exact-target cleanup its own bounded, killable driver."""
     if target_id == anchor_target_id:
@@ -5205,7 +5535,9 @@ def _close_owned_oracle_target(
     _raise_if_browser_deadline_expired(deadline)
     context = _oracle_browser_process_context(playwright_factory)
     private_process_group = context.RawValue("q", 0)
-    closed = context.RawValue("b", False)
+    target_proof = context.RawValue("b", False)
+    driver_done = context.Event()
+    reap_ack = context.Event()
     process = context.Process(
         target=_oracle_browser_close_target_worker,
         args=(
@@ -5216,19 +5548,67 @@ def _close_owned_oracle_target(
             deadline,
             playwright_factory,
             private_process_group,
-            closed,
+            target_proof,
+            driver_done,
+            lifecycle_registration is not None,
+            lifecycle_registration is not None,
         ),
     )
-    process.start()
+    close_registration: Optional[NativeHistoryCloseRegistration] = None
+    if lifecycle_capability is not None and lifecycle_registration is not None:
+        close_registration = NativeHistoryCloseRegistration(
+            process=process,
+            private_process_group=private_process_group,
+            target_proof=target_proof,
+            driver_done=driver_done,
+            reap_ack=reap_ack,
+            target_id=target_id,
+            creation_url=creation_url,
+        )
+        lifecycle_registration.close_registration = close_registration
+        lifecycle_capability.register_native_history_closer(
+            lifecycle_registration,
+            close_registration,
+        )
+    try:
+        process.start()
+        if close_registration is not None:
+            close_registration.started = True
+    except Exception as exc:
+        if close_registration is not None:
+            close_registration.reaped = True
+            reap_ack.set()
+        raise OracleBrowserCleanupError(
+            "Oracle browser owned-target closer could not start."
+        ) from exc
     try:
         process.join(timeout=max(0.0, _remaining_browser_timeout(deadline)))
-        if not closed.value:
+        if process.is_alive():
+            _terminate_oracle_browser_worker(process, private_process_group.value)
+            process.join(timeout=max(0.0, _remaining_browser_timeout(deadline)))
+        if process.is_alive() or getattr(process, "exitcode", None) is None:
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser owned-target closer was not reaped."
+            )
+        if close_registration is not None:
+            close_registration.reaped = True
+            reap_ack.set()
+        if not target_proof.value:
             raise OracleBrowserBoundaryUnavailable(
                 "Oracle browser owned-target cleanup was not confirmed."
             )
     finally:
-        _terminate_oracle_browser_worker(process, private_process_group.value)
-        process.join(timeout=0)
+        if process.is_alive():
+            _terminate_oracle_browser_worker(process, private_process_group.value)
+            try:
+                process.join(
+                    timeout=max(0.0, _remaining_browser_timeout(deadline))
+                )
+            except (AssertionError, OSError):
+                pass
+        if not process.is_alive() and close_registration is not None:
+            close_registration.reaped = True
+            reap_ack.set()
 
 
 def _oracle_browser_close_target_worker(
@@ -5239,7 +5619,10 @@ def _oracle_browser_close_target_worker(
     deadline: float,
     playwright_factory: Optional[Callable[[], Any]],
     private_process_group: Any,
-    closed: Any,
+    target_proof: Any,
+    driver_done: Any,
+    require_target_present: bool,
+    require_target_absence: bool,
 ) -> None:
     _enter_oracle_browser_worker_process_group(private_process_group)
     playwright = None
@@ -5255,29 +5638,55 @@ def _oracle_browser_close_target_worker(
         )
         session = browser.new_browser_cdp_session()
         # Only this published target may be closed; never close the browser.
-        targets = session.send("Target.getTargets").get("targetInfos", ())
+        target_listing = session.send("Target.getTargets")
+        if not isinstance(target_listing, Mapping):
+            return
+        targets = target_listing.get("targetInfos", ())
+        if not isinstance(targets, (list, tuple)):
+            return
         if target_id is None:
             # A lost createTarget reply is recoverable only by the unique URL
             # assigned before creation, never by host, page title, or account.
             matches = [
                 info.get("targetId")
                 for info in targets
-                if info.get("url") == creation_url
+                if isinstance(info, Mapping)
+                and info.get("url") == creation_url
                 and info.get("type") == "page"
                 and info.get("targetId") != anchor_target_id
             ]
             if len(matches) != 1 or not isinstance(matches[0], str):
                 return
             target_id = matches[0]
-        if not any(info.get("targetId") == target_id for info in targets):
-            closed.value = True
-        else:
-            result = session.send("Target.closeTarget", {"targetId": target_id})
-            closed.value = result.get("success") is True
+        if not any(
+            isinstance(info, Mapping) and info.get("targetId") == target_id
+            for info in targets
+        ):
+            target_proof.value = not require_target_present
+            return
+        result = session.send("Target.closeTarget", {"targetId": target_id})
+        if not isinstance(result, Mapping) or result.get("success") is not True:
+            return
+        if not require_target_absence:
+            target_proof.value = True
+            return
+        post_close_listing = session.send("Target.getTargets")
+        if not isinstance(post_close_listing, Mapping):
+            return
+        post_close_targets = post_close_listing.get("targetInfos", ())
+        if not isinstance(post_close_targets, (list, tuple)):
+            return
+        target_proof.value = not any(
+            isinstance(info, Mapping) and info.get("targetId") == target_id
+            for info in post_close_targets
+        )
     except Exception:
-        closed.value = False
+        target_proof.value = False
     finally:
-        _disconnect_attached_browser(playwright, browser)
+        try:
+            _disconnect_attached_browser(playwright, browser)
+        finally:
+            driver_done.set()
 
 
 def _receive_oracle_browser_worker_message(
