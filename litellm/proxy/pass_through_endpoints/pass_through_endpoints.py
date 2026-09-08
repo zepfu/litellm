@@ -6248,6 +6248,7 @@ async def pass_through_request(  # noqa: PLR0915
             from litellm.proxy.aawm_session_transfer.hooks import (
                 build_transfer_identity,
                 publish_transfer_phase,
+                publish_transfer_terminal,
             )
 
             _transfer_identity = build_transfer_identity(
@@ -6260,6 +6261,16 @@ async def pass_through_request(  # noqa: PLR0915
                 custom_llm_provider=custom_llm_provider,
                 stream_path="pass_through",
             )
+            if deferred_success_holder is not None:
+                async def _finalize_deferred_failure(phase: str) -> None:
+                    if _transfer_identity:
+                        await publish_transfer_terminal(
+                            _transfer_identity, phase
+                        )
+
+                deferred_success_holder.set_failure_finalizer(
+                    _finalize_deferred_failure
+                )
             await publish_transfer_phase(_transfer_identity, "request_received")
             await publish_transfer_phase(_transfer_identity, "request_preparing")
         except Exception:
@@ -7789,8 +7800,12 @@ async def pass_through_request(  # noqa: PLR0915
                 "cancellation",
                 exc_info=True,
             )
+        if deferred_success_holder is not None:
+            await deferred_success_holder.finalize_failure(phase="cancelled")
         raise
     except Exception as e:
+        if deferred_success_holder is not None:
+            await deferred_success_holder.finalize_failure()
         _publish_openai_send_telemetry()
         replay_blocked = getattr(e, "aawm_openai_wire_replay_blocked", False)
         if not replay_blocked:
@@ -8420,6 +8435,7 @@ def create_pass_through_route(
     allowed_pass_through_prefixed_headers: Optional[list[str]] = None,
     blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
     caller_managed_hidden_retry: bool = False,
+    defer_session_owner_promotion: bool = False,
 ):
     # check if target is an adapter.py or a url
     from litellm._uuid import uuid
@@ -8605,6 +8621,8 @@ def create_pass_through_route(
                     Optional[list[str]], param_blocked_pass_through_prefixed_headers
                 ),
                 caller_managed_hidden_retry=bool(param_caller_managed_hidden_retry),
+                # Promotion belongs to the calling handler, not route metadata.
+                defer_session_owner_promotion=defer_session_owner_promotion,
             )
 
     return endpoint_func
