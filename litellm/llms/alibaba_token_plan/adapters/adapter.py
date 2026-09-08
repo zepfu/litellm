@@ -140,9 +140,7 @@ def _restore_codex_agent_message_payloads(
     updated_body = restore_codex_agent_message_payloads_for_openai_egress(
         request_body,
     )
-    if updated_body is request_body or updated_body.get("input") is request_body.get(
-        "input",
-    ):
+    if updated_body is request_body:
         return request_body, {}
     return updated_body, {
         "alibaba_token_plan_codex_agent_task_payload_normalized": True,

@@ -31,14 +31,14 @@ Provider-neutral helpers that:
    prior-owner source, fail closed and strip. Alias text and model suffixes
    are not proof.
 
-6. On OpenAI Responses egress, restore ordinary Codex ``spawn_agent`` task
-   text that arrives as an ``agent_message`` with exactly two content parts:
-   first ``input_text`` whose text is the empty ``NEW_TASK`` envelope
-   ``Message Type: NEW_TASK\nTask name: <line>\nSender: <line>\nPayload:\n``,
-   and second ``encrypted_content`` whose nonempty string is the task text.
-   Append that sibling string onto the visible ``input_text`` and drop the
-   sibling. Do not classify the payload value, and do not treat this as
-   encrypted reasoning.
+6. On supported collaboration egress, normalize V2 ``spawn_agent``,
+   ``followup_task``, and ``send_message`` schemas by removing only their
+   misleading ``encrypted`` message annotation and requiring a versioned
+   plaintext frame. Both ``NEW_TASK`` and ``MESSAGE`` agent envelopes are
+   accepted only when their author/recipient identities match the outer
+   item. Opaque, unknown, malformed, mixed, duplicate, extra, and stale
+   single-part representations fail closed before provider dispatch. This
+   path does not decrypt or rewrite encrypted reasoning.
 
 D1-612 remains sole session/provider/model/route/account owner.
 OPENAI-007 remains sole function_call id/call_id owner.
