@@ -253,14 +253,31 @@ async def route_request(  # noqa: PLR0915 - Complex routing function, refactorin
             data["config"] = data.pop("generationConfig")
 
     from litellm.llms.xai.oauth import (
+        is_oa_xai_model,
         prepare_oa_xai_request,
-        reread_xai_oauth_snapshot_after_provider_401,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+        build_xai_oauth_direct_account_traversal,
+        recover_xai_oauth_direct_request,
     )
 
     snapshot_out: dict[str, Any] = {}
+    public_model = data.get("model")
+    xai_direct_traversal = (
+        await build_xai_oauth_direct_account_traversal(
+            cooldown_family="codex"
+        )
+        if is_oa_xai_model(public_model)
+        else None
+    )
     prepared_oa_xai_request = await prepare_oa_xai_request(
         data,
         snapshot_out=snapshot_out,
+        selected_account=(
+            xai_direct_traversal.selected_account
+            if xai_direct_traversal is not None
+            else None
+        ),
     )
     if prepared_oa_xai_request:
         route_fn = getattr(litellm, f"{route_type}")
@@ -272,25 +289,45 @@ async def route_request(  # noqa: PLR0915 - Complex routing function, refactorin
         api_base = data.get("api_base")
 
         async def _await_managed_xai_invocation():
-            try:
-                return await initial_invocation
-            except Exception as exc:
-                if snapshot is None:
-                    raise
-                refreshed_snapshot = (
-                    await reread_xai_oauth_snapshot_after_provider_401(
-                        snapshot,
-                        exc,
+            nonlocal initial_invocation, snapshot
+            while True:
+                try:
+                    return await initial_invocation
+                except Exception as exc:
+                    if xai_direct_traversal is None:
+                        raise
+                    recovery = await recover_xai_oauth_direct_request(
+                        traversal=xai_direct_traversal,
+                        request_body=data,
+                        exc=exc,
+                        snapshot=snapshot,
                         api_base=api_base if isinstance(api_base, str) else None,
                     )
-                )
-                if refreshed_snapshot is None:
-                    raise
-                data["api_key"] = refreshed_snapshot.access_token
-                retry_invocation = route_fn(**data)
-                if inspect.isawaitable(retry_invocation):
-                    return await retry_invocation
-                return retry_invocation
+                    if recovery is None:
+                        raise
+                    if recovery.refreshed_snapshot is not None:
+                        snapshot = recovery.refreshed_snapshot
+                        data["api_key"] = snapshot.access_token
+                    else:
+                        selected_account = recovery.selected_account
+                        if selected_account is None or not isinstance(
+                            public_model, str
+                        ):
+                            raise
+                        data["model"] = public_model
+                        snapshot_out.clear()
+                        prepared = await prepare_oa_xai_request(
+                            data,
+                            snapshot_out=snapshot_out,
+                            selected_account=selected_account,
+                        )
+                        if not prepared:
+                            raise
+                        snapshot = snapshot_out.get("snapshot")
+                    retry_invocation = route_fn(**data)
+                    if not inspect.isawaitable(retry_invocation):
+                        return retry_invocation
+                    initial_invocation = retry_invocation
 
         return _await_managed_xai_invocation()
 

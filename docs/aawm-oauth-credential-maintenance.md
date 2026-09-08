@@ -166,7 +166,15 @@ inventory variable is absent, the existing explicit one-file configuration
 remains one legacy account lane.
 
 Each record receives a separate server-owned lane and rate-observation
-identity. Fresh, unbound traffic can move to an untraversed record only after a
+identity. Before credential snapshot preparation, fresh unbound direct traffic
+skips records with an active `xai:__account_quota__:<lane>` cooldown: direct
+LiteLLM async routes and OpenAI passthrough use the Codex family, while direct
+Anthropic adapter routes use the Anthropic family. If every enabled record is
+cooling, no record is selected. A pre-commit exact `402`
+`GROK_BUILD_USAGE_BALANCE_EXHAUSTED` or exact `403`
+`GROK_PERSONAL_TEAM_SPENDING_LIMIT` publishes a three-hour cooldown for the
+selected record under that same family before any rollover decision. Fresh,
+unbound traffic can move to an untraversed eligible record only after a
 provider-returned `401`, `429`, or recognized quota failure. Same-account
 generation reread remains the first `401` recovery path. Continuations,
 `previous_response_id`, and other account-bound state remain pinned to their

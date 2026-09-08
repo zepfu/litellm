@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional
+from typing import Any, Literal, Mapping, Optional
 
 from fastapi import HTTPException, Request
 
@@ -31,6 +31,7 @@ _XAI_OAUTH_MANAGED_ROUTE_FAMILIES = frozenset(
         "codex_auto_agent_xai_oauth_responses",
     }
 )
+_XAI_OAUTH_DIRECT_ACCOUNT_COOLDOWN_SECONDS = 3 * 60 * 60.0
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,59 @@ class XaiOAuthSelectedAccount:
     @property
     def label(self) -> str:
         return self.record.label
+
+
+@dataclass
+class XaiOAuthDirectAccountTraversal:
+    """Bounded account state for one direct managed xAI request."""
+
+    selected_account: XaiOAuthSelectedAccount
+    accounts: tuple[XaiOAuthSelectedAccount, ...]
+    cooldown_family: Literal["codex", "anthropic"]
+    attempted_account_hashes: set[str] = field(default_factory=set)
+    generation_reread_account_hashes: set[str] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        self.attempted_account_hashes.add(self.selected_account.account_hash)
+
+    @property
+    def max_retry_attempts(self) -> int:
+        """Allow one same-account reread and one provider attempt per account."""
+
+        return max(1, (2 * len(self.accounts)) - 1)
+
+    def claim_same_account_generation_reread(self) -> bool:
+        """Permit at most one changed-generation reread for the active record."""
+
+        account_hash = self.selected_account.account_hash
+        if account_hash in self.generation_reread_account_hashes:
+            return False
+        self.generation_reread_account_hashes.add(account_hash)
+        return True
+
+    async def advance(self) -> Optional[XaiOAuthSelectedAccount]:
+        """Select the next untraversed account without an active cooldown."""
+
+        for account in self.accounts:
+            if account.account_hash in self.attempted_account_hashes:
+                continue
+            if not await _xai_oauth_direct_account_is_eligible(
+                account,
+                cooldown_family=self.cooldown_family,
+            ):
+                continue
+            self.attempted_account_hashes.add(account.account_hash)
+            self.selected_account = account
+            return account
+        return None
+
+
+@dataclass(frozen=True)
+class XaiOAuthDirectRetryRecovery:
+    """One direct managed xAI recovery action."""
+
+    refreshed_snapshot: Any = field(default=None, repr=False)
+    selected_account: Optional[XaiOAuthSelectedAccount] = None
 
 
 def is_managed_xai_oauth_candidate(candidate: Any) -> bool:
@@ -216,6 +270,279 @@ def get_or_bind_xai_oauth_selected_account(
     return selected
 
 
+def _xai_oauth_direct_cooldown_candidate(
+    *,
+    cooldown_family: Literal["codex", "anthropic"],
+) -> dict[str, str]:
+    if cooldown_family == "codex":
+        route_family = "codex_xai_oauth_responses_adapter"
+    elif cooldown_family == "anthropic":
+        route_family = "anthropic_xai_oauth_responses_adapter"
+    else:
+        raise ValueError("Unsupported managed xAI OAuth cooldown family.")
+    return {
+        "provider": "xai",
+        "model": "managed-xai-oauth",
+        "route_family": route_family,
+        "cooldown_identity_tag": (
+            f"direct-managed-xai-oauth:{cooldown_family}"
+        ),
+    }
+
+
+def _xai_oauth_direct_account_cooldown_key(
+    selected: XaiOAuthSelectedAccount,
+    *,
+    cooldown_family: Literal["codex", "anthropic"],
+) -> str:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals import (
+        _get_codex_auto_agent_grok_account_quota_lane_cooldown_key,
+    )
+
+    cooldown_key = (
+        _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(
+            _xai_oauth_direct_cooldown_candidate(
+                cooldown_family=cooldown_family
+            ),
+            selected.lane_key,
+        )
+    )
+    if not isinstance(cooldown_key, str) or not cooldown_key:
+        raise RuntimeError(
+            "Managed xAI OAuth account cooldown key could not be resolved."
+        )
+    return cooldown_key
+
+
+async def _xai_oauth_direct_account_cooldown_seconds(
+    selected: XaiOAuthSelectedAccount,
+    *,
+    cooldown_family: Literal["codex", "anthropic"],
+) -> float:
+    cooldown_key = _xai_oauth_direct_account_cooldown_key(
+        selected,
+        cooldown_family=cooldown_family,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_state import (
+        _get_anthropic_auto_agent_active_cooldown_state,
+        _get_codex_auto_agent_active_cooldown_state,
+    )
+
+    if cooldown_family == "codex":
+        seconds, _source = (
+            await _get_codex_auto_agent_active_cooldown_state(cooldown_key)
+        )
+    elif cooldown_family == "anthropic":
+        seconds, _source = (
+            await _get_anthropic_auto_agent_active_cooldown_state(cooldown_key)
+        )
+    else:
+        raise ValueError("Unsupported managed xAI OAuth cooldown family.")
+    return max(0.0, float(seconds))
+
+
+async def _xai_oauth_direct_account_is_eligible(
+    selected: XaiOAuthSelectedAccount,
+    *,
+    cooldown_family: Literal["codex", "anthropic"],
+) -> bool:
+    return (
+        await _xai_oauth_direct_account_cooldown_seconds(
+            selected,
+            cooldown_family=cooldown_family,
+        )
+        <= 0.0
+    )
+
+
+async def _select_xai_oauth_direct_eligible_account(
+    accounts: tuple[XaiOAuthSelectedAccount, ...],
+    *,
+    cooldown_family: Literal["codex", "anthropic"],
+) -> XaiOAuthSelectedAccount:
+    for account in accounts:
+        if await _xai_oauth_direct_account_is_eligible(
+            account,
+            cooldown_family=cooldown_family,
+        ):
+            return account
+    raise ValueError(
+        "No enabled managed xAI OAuth account is eligible while account "
+        "quota cooldowns are active."
+    )
+
+
+async def build_xai_oauth_direct_account_traversal(
+    *,
+    cooldown_family: Literal["codex", "anthropic"],
+    request: Optional[Request] = None,
+) -> XaiOAuthDirectAccountTraversal:
+    """Select an eligible direct record and retain bounded inventory order."""
+
+    accounts = tuple(
+        build_xai_oauth_selected_account(record)
+        for record in configured_xai_oauth_records()
+    )
+    selected = (
+        get_bound_xai_oauth_selected_account(request)
+        if request is not None
+        else None
+    )
+    if selected is None:
+        selected = await _select_xai_oauth_direct_eligible_account(
+            accounts,
+            cooldown_family=cooldown_family,
+        )
+        if request is not None:
+            bind_xai_oauth_selected_account_to_request(request, selected)
+    if not any(
+        account.account_hash == selected.account_hash for account in accounts
+    ):
+        raise ValueError("Selected xAI OAuth account is not in the inventory.")
+    return XaiOAuthDirectAccountTraversal(
+        selected_account=selected,
+        accounts=accounts,
+        cooldown_family=cooldown_family,
+    )
+
+
+def bind_xai_oauth_selected_account_to_request(
+    request: Request,
+    selected: XaiOAuthSelectedAccount,
+) -> None:
+    """Replace request state only with an inventory-proven selected account."""
+
+    expected = build_xai_oauth_selected_account(
+        select_xai_oauth_account_record(label=selected.label)
+    )
+    if expected != selected:
+        raise ValueError("Selected xAI OAuth account identity is invalid.")
+    setattr(request.state, _XAI_OAUTH_SELECTED_ACCOUNT_STATE, selected)
+
+
+def _direct_xai_oauth_rollover_body_is_fresh(
+    request_body: Mapping[str, Any],
+) -> bool:
+    """Reject continuation, reasoning, and account-bound request state."""
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_build import (
+        _aawm_auto_agent_audit_request_has_account_bound_state,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity import (
+        is_replay_safe_session_owner_redispatch_body,
+    )
+
+    return bool(
+        is_replay_safe_session_owner_redispatch_body(request_body)
+        and not _aawm_auto_agent_audit_request_has_account_bound_state(
+            request_body
+        )
+    )
+
+
+async def _publish_xai_oauth_direct_account_quota_cooldown(
+    selected: XaiOAuthSelectedAccount,
+    *,
+    cooldown_family: Literal["codex", "anthropic"],
+) -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_apply import (
+        _persist_anthropic_cooldown_durable,
+        _persist_codex_cooldown_durable,
+        execute_cooldown_publication_transaction,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_state import (
+        _publish_anthropic_cooldown_memory,
+        _publish_codex_cooldown_memory,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
+        CooldownPublicationPlan,
+    )
+
+    cooldown_key = _xai_oauth_direct_account_cooldown_key(
+        selected,
+        cooldown_family=cooldown_family,
+    )
+    plan = CooldownPublicationPlan(
+        memory_keys=(cooldown_key,),
+        durable_keys=(cooldown_key,),
+        duration_seconds=_XAI_OAUTH_DIRECT_ACCOUNT_COOLDOWN_SECONDS,
+        applied_scope="candidate",
+        grok_account_quota_exhausted=True,
+    )
+    if cooldown_family == "codex":
+        publish_cooldown_memory_fn = _publish_codex_cooldown_memory
+        persist_cooldown_fn = _persist_codex_cooldown_durable
+    elif cooldown_family == "anthropic":
+        publish_cooldown_memory_fn = _publish_anthropic_cooldown_memory
+        persist_cooldown_fn = _persist_anthropic_cooldown_durable
+    else:
+        raise ValueError("Unsupported managed xAI OAuth cooldown family.")
+    await execute_cooldown_publication_transaction(
+        alias_family=cooldown_family,
+        candidate=_xai_oauth_direct_cooldown_candidate(
+            cooldown_family=cooldown_family
+        ),
+        plan=plan,
+        publish_cooldown_memory_fn=publish_cooldown_memory_fn,
+        persist_cooldown_fn=persist_cooldown_fn,
+    )
+
+
+async def recover_xai_oauth_direct_request(
+    *,
+    traversal: XaiOAuthDirectAccountTraversal,
+    request_body: Mapping[str, Any],
+    exc: BaseException,
+    snapshot: Any,
+    api_base: Optional[str],
+) -> Optional[XaiOAuthDirectRetryRecovery]:
+    """Choose one same-account reread or fresh-request account rollover."""
+
+    from litellm.llms.xai.oauth import (
+        get_xai_oauth_exception_status_code,
+        is_xai_oauth_direct_account_quota_failure,
+        is_xai_oauth_direct_rollover_failure,
+        is_xai_oauth_precommit_provider_401,
+        reread_xai_oauth_snapshot_after_provider_401,
+    )
+
+    status_code = get_xai_oauth_exception_status_code(exc)
+    if (
+        status_code == 401
+        and snapshot is not None
+        and is_xai_oauth_precommit_provider_401(exc, api_base=api_base)
+        and traversal.claim_same_account_generation_reread()
+    ):
+        refreshed_snapshot = await reread_xai_oauth_snapshot_after_provider_401(
+            snapshot,
+            exc,
+            api_base=api_base,
+        )
+        if refreshed_snapshot is not None:
+            return XaiOAuthDirectRetryRecovery(
+                refreshed_snapshot=refreshed_snapshot
+            )
+
+    if is_xai_oauth_direct_account_quota_failure(
+        exc,
+        api_base=api_base,
+    ):
+        await _publish_xai_oauth_direct_account_quota_cooldown(
+            traversal.selected_account,
+            cooldown_family=traversal.cooldown_family,
+        )
+
+    if not (
+        is_xai_oauth_direct_rollover_failure(exc, api_base=api_base)
+        and _direct_xai_oauth_rollover_body_is_fresh(request_body)
+    ):
+        return None
+    selected_account = await traversal.advance()
+    if selected_account is None:
+        return None
+    return XaiOAuthDirectRetryRecovery(selected_account=selected_account)
+
+
 async def get_xai_oauth_snapshot_for_selected_account(
     selected: XaiOAuthSelectedAccount,
 ) -> Any:
@@ -290,8 +617,12 @@ def validated_xai_oauth_server_account_metadata(
 
 
 __all__ = [
+    "XaiOAuthDirectAccountTraversal",
+    "XaiOAuthDirectRetryRecovery",
     "XaiOAuthSelectedAccount",
+    "bind_xai_oauth_selected_account_to_request",
     "bind_xai_oauth_candidate_to_request",
+    "build_xai_oauth_direct_account_traversal",
     "build_xai_oauth_selected_account",
     "configured_xai_oauth_records",
     "get_bound_xai_oauth_selected_account",
@@ -299,6 +630,7 @@ __all__ = [
     "get_xai_oauth_snapshot_for_selected_account",
     "is_managed_xai_oauth_candidate",
     "select_xai_oauth_account_record",
+    "recover_xai_oauth_direct_request",
     "validated_xai_oauth_server_account_metadata",
     "xai_oauth_account_lane_key",
     "xai_oauth_selected_account_metadata",

@@ -26,6 +26,7 @@ class ResponsesAdapterRoutePlan:
     retry_after_exception: Optional[
         Callable[[Exception], Awaitable[Optional["ResponsesAdapterRoutePlan"]]]
     ] = None
+    max_retry_attempts: int = 1
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class CompletionAdapterRoutePlan:
     retry_after_exception: Optional[
         Callable[[Exception], Awaitable[Optional["CompletionAdapterRoutePlan"]]]
     ] = None
+    max_retry_attempts: int = 1
 
 
 ResponsesPrepare = Callable[..., Awaitable[ResponsesAdapterRoutePlan]]
@@ -90,24 +92,24 @@ async def run_responses_adapter_route(
             **route_plan.perform_kwargs,
         )
 
-    try:
-        return await perform_plan(plan)
-    except Exception as exc:
-        retry_plan = (
-            await plan.retry_after_exception(exc)
-            if plan.retry_after_exception is not None
-            else None
-        )
-        if retry_plan is not None:
-            try:
-                return await perform_plan(retry_plan)
-            except Exception as retry_exc:
-                if retry_plan.handle_exception is not None:
-                    retry_plan.handle_exception(retry_exc)
+    current_plan = plan
+    retries_remaining = max(0, int(plan.max_retry_attempts))
+    while True:
+        try:
+            return await perform_plan(current_plan)
+        except Exception as exc:
+            retry_plan = (
+                await current_plan.retry_after_exception(exc)
+                if retries_remaining > 0
+                and current_plan.retry_after_exception is not None
+                else None
+            )
+            if retry_plan is None:
+                if current_plan.handle_exception is not None:
+                    current_plan.handle_exception(exc)
                 raise
-        if plan.handle_exception is not None:
-            plan.handle_exception(exc)
-        raise
+            retries_remaining -= 1
+            current_plan = retry_plan
 
 
 async def run_completion_adapter_route(
@@ -148,21 +150,21 @@ async def run_completion_adapter_route(
             **route_plan.perform_kwargs,
         )
 
-    try:
-        return await perform_plan(plan)
-    except Exception as exc:
-        retry_plan = (
-            await plan.retry_after_exception(exc)
-            if plan.retry_after_exception is not None
-            else None
-        )
-        if retry_plan is not None:
-            try:
-                return await perform_plan(retry_plan)
-            except Exception as retry_exc:
-                if retry_plan.handle_exception is not None:
-                    retry_plan.handle_exception(retry_exc)
+    current_plan = plan
+    retries_remaining = max(0, int(plan.max_retry_attempts))
+    while True:
+        try:
+            return await perform_plan(current_plan)
+        except Exception as exc:
+            retry_plan = (
+                await current_plan.retry_after_exception(exc)
+                if retries_remaining > 0
+                and current_plan.retry_after_exception is not None
+                else None
+            )
+            if retry_plan is None:
+                if current_plan.handle_exception is not None:
+                    current_plan.handle_exception(exc)
                 raise
-        if plan.handle_exception is not None:
-            plan.handle_exception(exc)
-        raise
+            retries_remaining -= 1
+            current_plan = retry_plan

@@ -452,8 +452,10 @@ class BaseOpenAIPassThroughHandler:
         expected_target_family: Optional[str] = None
         endpoint_custom_body: Optional[dict[str, Any]] = None
         canonical_managed_oa_xai_request_body: Optional[dict[str, Any]] = None
+        managed_oa_xai_rollover_request_body: Optional[dict[str, Any]] = None
         bound_codex_oauth_identity: Optional[dict[str, str]] = None
         grok_native_oauth_request = False
+        xai_direct_traversal = None
         try:
             from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
                 _get_bound_codex_oauth_candidate_identity as _get_bound_identity,
@@ -596,6 +598,20 @@ class BaseOpenAIPassThroughHandler:
                             prepared_request_body
                         )
                     )
+            if is_managed_oa_xai_request:
+                managed_oa_xai_rollover_request_body = copy.deepcopy(
+                    prepared_request_body
+                )
+                from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+                    build_xai_oauth_direct_account_traversal,
+                )
+
+                xai_direct_traversal = (
+                    await build_xai_oauth_direct_account_traversal(
+                        cooldown_family="codex",
+                        request=request,
+                    )
+                )
             oa_xai_context = (
                 await BaseOpenAIPassThroughHandler._prepare_openai_oa_xai_context(
                     endpoint=endpoint,
@@ -914,6 +930,121 @@ class BaseOpenAIPassThroughHandler:
                         )
         session_owner_lease = _sa.get_request_session_owner_lease(request)
 
+        async def _reacquire_xai_session_owner_lease() -> Any:
+            if _sa.should_skip_session_owner_for_openai_models_discovery(
+                request,
+                endpoint=endpoint,
+                url=updated_url,
+            ) or _sa.request_session_owner_already_guarded(request):
+                return _sa.get_request_session_owner_lease(request)
+            direct_body = (
+                endpoint_custom_body
+                if isinstance(endpoint_custom_body, dict)
+                else {}
+            )
+            canonical_session_identity = _sa.resolve_canonical_session_identity(
+                request,
+                direct_body,
+            )
+            if canonical_session_identity is None:
+                return None
+            provider_name = (
+                custom_llm_provider.value
+                if isinstance(custom_llm_provider, litellm.LlmProviders)
+                else str(custom_llm_provider or "openai")
+            )
+            requested_model = direct_body.get("model")
+            is_responses_endpoint = bool(
+                rt.is_openai_responses_endpoint_fn(endpoint)
+            )
+            if egress_credential_family:
+                route_family = str(egress_credential_family)
+            elif expected_target_family:
+                route_family = str(expected_target_family)
+            elif is_responses_endpoint:
+                route_family = "openai_responses"
+            else:
+                route_family = provider_name
+            requested_attributes = _sa.build_session_owner_attributes(
+                provider=provider_name,
+                model=requested_model,
+                route_family=route_family,
+                endpoint_contract=(
+                    "openai_responses"
+                    if is_responses_endpoint
+                    else "openai_passthrough"
+                ),
+                state_format=(
+                    "openai_responses"
+                    if is_responses_endpoint
+                    else "openai"
+                ),
+                ingress="openai_passthrough",
+                requested_model=requested_model,
+                extra=_sa.extract_account_identity_from_context(
+                    request=request,
+                    request_body=direct_body,
+                ),
+            )
+            if _sa.route_requires_account_identity(requested_attributes):
+                incomplete = _sa.incomplete_owner_attribute_reason(
+                    requested_attributes,
+                    for_promotion=True,
+                )
+                if incomplete is not None:
+                    _sa.raise_session_owner_redispatch_required(
+                        session_identity=canonical_session_identity,
+                        failure_phase=(
+                            "session_owner_direct_openai_missing_account_identity"
+                        ),
+                        candidate=requested_attributes,
+                        guard=_sa.SessionOwnerGuardResult(
+                            decision=(
+                                _sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
+                            ),
+                            session_identity=canonical_session_identity,
+                            mismatch_reason=incomplete,
+                            provenance=_sa.build_session_owner_provenance(
+                                session_identity=canonical_session_identity,
+                                decision="redispatch_required",
+                                mismatch_reason=incomplete,
+                            ),
+                        ),
+                        request=request,
+                    )
+            guard = await _sa.ensure_session_owner_guard_for_request(
+                request=request,
+                request_body=direct_body,
+                session_identity=canonical_session_identity,
+                requested_attributes=requested_attributes,
+                alias_model=(
+                    str(requested_model)
+                    if requested_model is not None
+                    else None
+                ),
+                require_exact_attributes=True,
+                failure_phase="session_owner_direct_openai_pre_egress",
+                raise_on_redispatch=False,
+            )
+            if (
+                guard.decision
+                is _sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
+            ):
+                _sa.raise_session_owner_redispatch_required(
+                    session_identity=guard.session_identity
+                    or canonical_session_identity,
+                    guard=guard,
+                    alias_model=(
+                        str(requested_model)
+                        if requested_model is not None
+                        else None
+                    ),
+                    candidate=requested_attributes,
+                    failure_phase="session_owner_direct_openai_pre_egress",
+                    request=request,
+                )
+            return _sa.get_request_session_owner_lease(request)
+
         try:
             if grok_native_oauth_request and isinstance(extra_headers, dict):
                 from litellm.proxy.pass_through_endpoints.providers.xai.request_prep import (
@@ -925,42 +1056,113 @@ class BaseOpenAIPassThroughHandler:
                     request=request,
                 )
             endpoint_func = _build_endpoint_func(api_key)
-            try:
-                response = await endpoint_func(
-                    request,
-                    fastapi_response,
-                    user_api_key_dict,
-                    custom_body=endpoint_custom_body,
-                )
-            except Exception as exc:
-                refreshed_snapshot = None
-                if canonical_managed_oa_xai_request_body is not None:
+            while True:
+                try:
+                    response = await endpoint_func(
+                        request,
+                        fastapi_response,
+                        user_api_key_dict,
+                        custom_body=endpoint_custom_body,
+                    )
+                    break
+                except Exception as exc:
+                    if (
+                        xai_direct_traversal is None
+                        or managed_oa_xai_rollover_request_body is None
+                    ):
+                        raise
                     from litellm.llms.xai.oauth import (
                         bind_xai_oauth_snapshot_to_request,
+                        clear_xai_oauth_snapshot_from_request,
                         get_xai_oauth_snapshot_from_request,
-                        reread_xai_oauth_snapshot_after_provider_401,
+                    )
+                    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+                        bind_xai_oauth_selected_account_to_request,
+                        recover_xai_oauth_direct_request,
                     )
 
-                    snapshot = get_xai_oauth_snapshot_from_request(request)
-                    if snapshot is not None:
-                        refreshed_snapshot = (
-                            await reread_xai_oauth_snapshot_after_provider_401(
-                                snapshot,
-                                exc,
-                                api_base=base_target_url,
+                    recovery = await recover_xai_oauth_direct_request(
+                        traversal=xai_direct_traversal,
+                        request_body=managed_oa_xai_rollover_request_body,
+                        exc=exc,
+                        snapshot=get_xai_oauth_snapshot_from_request(request),
+                        api_base=base_target_url,
+                    )
+                    if recovery is None:
+                        raise
+                    if recovery.refreshed_snapshot is not None:
+                        bind_xai_oauth_snapshot_to_request(
+                            request,
+                            recovery.refreshed_snapshot,
+                        )
+                        api_key = recovery.refreshed_snapshot.access_token
+                    else:
+                        selected_account = recovery.selected_account
+                        if selected_account is None:
+                            raise
+                        if session_owner_lease is not None and (
+                            session_owner_lease.promoted
+                            or session_owner_lease.decision
+                            == _sa.SessionOwnerGuardDecision.COMPATIBLE_OWNER.value
+                        ):
+                            raise
+                        if session_owner_lease is not None:
+                            await _sa.finalize_session_owner_lease_on_failure(
+                                session_owner_lease
+                            )
+                        if _sa.request_session_owner_already_guarded(
+                            request
+                        ) and not _sa.reset_released_request_session_owner_guard(
+                            request
+                        ):
+                            raise
+                        bind_xai_oauth_selected_account_to_request(
+                            request,
+                            selected_account,
+                        )
+                        clear_xai_oauth_snapshot_from_request(request)
+                        rollover_body = copy.deepcopy(
+                            managed_oa_xai_rollover_request_body
+                        )
+                        rollover_context = await BaseOpenAIPassThroughHandler._prepare_openai_oa_xai_context(
+                            endpoint=endpoint,
+                            request=request,
+                            request_body=rollover_body,
+                        )
+                        if rollover_context is None:
+                            raise
+                        (
+                            base_target_url,
+                            api_key,
+                            prepared_request_body,
+                            updated_url,
+                        ) = rollover_context
+                        prepared_request_body = (
+                            rt.prepare_request_body_for_passthrough_observability_fn(
+                                request=request,
+                                request_body=prepared_request_body,
                             )
                         )
-                if refreshed_snapshot is None:
-                    raise
-                bind_xai_oauth_snapshot_to_request(request, refreshed_snapshot)
-                api_key = refreshed_snapshot.access_token
-                endpoint_func = _build_endpoint_func(api_key)
-                response = await endpoint_func(
-                    request,
-                    fastapi_response,
-                    user_api_key_dict,
-                    custom_body=endpoint_custom_body,
-                )
+                        if is_codex_responses_request:
+                            prepared_request_body = {
+                                **prepared_request_body,
+                                "store": False,
+                                "stream": True,
+                            }
+                        endpoint_custom_body = prepared_request_body
+                        rt.safe_set_request_parsed_body_fn(
+                            request,
+                            prepared_request_body,
+                        )
+                        is_streaming_request = (
+                            bool(prepared_request_body.get("stream"))
+                            if rt.is_openai_responses_endpoint_fn(endpoint)
+                            else "stream" in str(updated_url)
+                        )
+                        session_owner_lease = (
+                            await _reacquire_xai_session_owner_lease()
+                        )
+                    endpoint_func = _build_endpoint_func(api_key)
             status_code = getattr(response, "status_code", None)
             if (
                 isinstance(status_code, int)

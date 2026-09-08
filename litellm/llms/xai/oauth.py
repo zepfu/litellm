@@ -779,7 +779,9 @@ async def reread_xai_oauth_snapshot_after_401(
     return current
 
 
-def _xai_oauth_exception_status_code(exc: BaseException) -> Optional[int]:
+def get_xai_oauth_exception_status_code(exc: BaseException) -> Optional[int]:
+    """Return a provider status code without retaining response content."""
+
     for source in (exc, getattr(exc, "response", None)):
         for attribute in ("status_code", "code"):
             value = getattr(source, attribute, None)
@@ -796,11 +798,16 @@ def _xai_oauth_exception_status_code(exc: BaseException) -> Optional[int]:
 def _xai_oauth_response_matches_api_base(
     exc: BaseException,
     api_base: Optional[str],
+    *,
+    expected_status_code: int,
 ) -> bool:
     if not isinstance(api_base, str) or not api_base.strip():
         return False
     response = getattr(exc, "response", None)
-    if not isinstance(response, httpx.Response) or response.status_code != 401:
+    if (
+        not isinstance(response, httpx.Response)
+        or response.status_code != expected_status_code
+    ):
         return False
     try:
         expected_host = httpx.URL(api_base).host
@@ -810,15 +817,15 @@ def _xai_oauth_response_matches_api_base(
     return expected_host is not None and expected_host == response_host
 
 
-def is_xai_oauth_precommit_provider_401(
+def _is_xai_oauth_precommit_provider_status(
     exc: BaseException,
     *,
-    api_base: Optional[str] = None,
+    api_base: Optional[str],
+    expected_status_codes: frozenset[int],
 ) -> bool:
-    """Return whether a managed xAI request may retry before committing bytes."""
-
+    status_code = get_xai_oauth_exception_status_code(exc)
     if (
-        _xai_oauth_exception_status_code(exc) != 401
+        status_code not in expected_status_codes
         or getattr(exc, "pre_commit_retry_exhausted", False) is True
     ):
         return False
@@ -834,7 +841,87 @@ def is_xai_oauth_precommit_provider_401(
         or getattr(exc, "provider_returned", False) is True
     ):
         return True
-    return _xai_oauth_response_matches_api_base(exc, api_base)
+    return _xai_oauth_response_matches_api_base(
+        exc,
+        api_base,
+        expected_status_code=status_code,
+    )
+
+
+def is_xai_oauth_precommit_provider_401(
+    exc: BaseException,
+    *,
+    api_base: Optional[str] = None,
+) -> bool:
+    """Return whether a managed xAI request may retry before committing bytes."""
+
+    return _is_xai_oauth_precommit_provider_status(
+        exc,
+        api_base=api_base,
+        expected_status_codes=frozenset({401}),
+    )
+
+
+def is_xai_oauth_direct_account_quota_failure(
+    exc: BaseException,
+    *,
+    api_base: Optional[str] = None,
+) -> bool:
+    """Return whether a pre-commit direct request exhausted one xAI account."""
+
+    status_code = get_xai_oauth_exception_status_code(exc)
+    if (
+        status_code not in {402, 403}
+        or not isinstance(exc, Exception)
+        or not _is_xai_oauth_precommit_provider_status(
+            exc,
+            api_base=api_base,
+            expected_status_codes=frozenset({402, 403}),
+        )
+    ):
+        return False
+    try:
+        from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.grok import (
+            _is_known_grok_build_usage_balance_exhausted_response,
+            _is_known_grok_personal_team_spending_limit_response,
+        )
+
+        target = httpx.URL(api_base) if isinstance(api_base, str) else None
+        if status_code == 402:
+            return _is_known_grok_build_usage_balance_exhausted_response(
+                url=target,
+                custom_llm_provider="xai",
+                status_code=status_code,
+                exc=exc,
+            )
+        return _is_known_grok_personal_team_spending_limit_response(
+            url=target,
+            custom_llm_provider="xai",
+            status_code=status_code,
+            exc=exc,
+        )
+    except Exception:
+        return False
+
+
+def is_xai_oauth_direct_rollover_failure(
+    exc: BaseException,
+    *,
+    api_base: Optional[str] = None,
+) -> bool:
+    """Return whether a fresh direct request may move to another xAI account."""
+
+    status_code = get_xai_oauth_exception_status_code(exc)
+    if status_code in {401, 429}:
+        return _is_xai_oauth_precommit_provider_status(
+            exc,
+            api_base=api_base,
+            expected_status_codes=frozenset({401, 429}),
+        )
+    return is_xai_oauth_direct_account_quota_failure(
+        exc,
+        api_base=api_base,
+    )
 
 
 async def reread_xai_oauth_snapshot_after_provider_401(
@@ -865,6 +952,19 @@ def bind_xai_oauth_snapshot_to_request(
         snapshots = {}
         setattr(state, _XAI_SNAPSHOT_STATE_ATTR, snapshots)
     snapshots[snapshot.credential_family] = snapshot
+
+
+def clear_xai_oauth_snapshot_from_request(
+    request: Any,
+    *,
+    credential_family: str = _XAI_MANAGED_SNAPSHOT_FAMILY,
+) -> None:
+    """Remove one request-bound snapshot before switching managed accounts."""
+
+    state = getattr(request, "state", None)
+    snapshots = getattr(state, _XAI_SNAPSHOT_STATE_ATTR, None)
+    if isinstance(snapshots, dict):
+        snapshots.pop(credential_family, None)
 
 
 def get_xai_oauth_snapshot_from_request(

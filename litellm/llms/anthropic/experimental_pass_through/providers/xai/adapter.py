@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import inspect
 from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, NoReturn, Optional, Protocol
@@ -10,14 +11,21 @@ from litellm.llms.xai.route_descriptors import XAI_OAUTH_CREDENTIAL_FAMILY
 from litellm.llms.xai.oauth import (
     XaiOAuthCredentialSnapshot,
     bind_xai_oauth_snapshot_to_request,
+    clear_xai_oauth_snapshot_from_request,
     get_xai_oauth_snapshot_from_request,
-    reread_xai_oauth_snapshot_after_provider_401,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     adapter_config,
     adapter_driver,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.types import Payload
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+    XaiOAuthDirectAccountTraversal,
+    XaiOAuthSelectedAccount,
+    bind_xai_oauth_selected_account_to_request,
+    build_xai_oauth_direct_account_traversal,
+    recover_xai_oauth_direct_request,
+)
 
 
 class PreparePassthroughRequest(Protocol):
@@ -85,27 +93,31 @@ async def _prepare_passthrough_request(
     return await runtime.prepare_passthrough_request(request_body, **kwargs)
 
 
-async def _reread_xai_oauth_snapshot_for_retry(
+async def _recover_xai_oauth_direct_retry(
     *,
     request: object,
+    request_body: Payload,
+    traversal: Optional[XaiOAuthDirectAccountTraversal],
     exc: Exception,
     api_base: str,
     use_alias_candidate_probe: bool,
-) -> Optional[XaiOAuthCredentialSnapshot]:
-    if use_alias_candidate_probe:
-        return None
+) -> tuple[Optional[XaiOAuthCredentialSnapshot], Optional[XaiOAuthSelectedAccount]]:
+    if use_alias_candidate_probe or traversal is None:
+        return None, None
     snapshot = get_xai_oauth_snapshot_from_request(request)
-    if snapshot is None:
-        return None
-    refreshed_snapshot = await reread_xai_oauth_snapshot_after_provider_401(
-        snapshot,
-        exc,
+    recovery = await recover_xai_oauth_direct_request(
+        traversal=traversal,
+        request_body=request_body,
+        exc=exc,
+        snapshot=snapshot,
         api_base=api_base,
     )
-    if refreshed_snapshot is None:
-        return None
-    bind_xai_oauth_snapshot_to_request(request, refreshed_snapshot)
-    return refreshed_snapshot
+    if recovery is None:
+        return None, None
+    if recovery.refreshed_snapshot is not None:
+        bind_xai_oauth_snapshot_to_request(request, recovery.refreshed_snapshot)
+        return recovery.refreshed_snapshot, None
+    return None, recovery.selected_account
 
 
 async def prepare_responses_route(
@@ -133,6 +145,15 @@ async def prepare_responses_route(
     )
     translated_request_body, _unsupported = runtime.drop_unsupported_params(
         translated_request_body
+    )
+    rollover_request_body = copy.deepcopy(translated_request_body)
+    direct_traversal = (
+        None
+        if use_alias_candidate_probe
+        else await build_xai_oauth_direct_account_traversal(
+            cooldown_family="anthropic",
+            request=request,
+        )
     )
     try:
         prepared, target_base_url, api_key = await _prepare_passthrough_request(
@@ -188,28 +209,90 @@ async def prepare_responses_route(
             "expected_target_family": "xai",
         },
         handle_exception=handle_exception,
+        max_retry_attempts=(
+            direct_traversal.max_retry_attempts
+            if direct_traversal is not None
+            else 1
+        ),
     )
 
-    async def retry_after_exception(
-        exc: Exception,
-    ) -> Optional[adapter_driver.ResponsesAdapterRoutePlan]:
-        refreshed_snapshot = await _reread_xai_oauth_snapshot_for_retry(
-            request=request,
-            exc=exc,
-            api_base=target_base_url,
-            use_alias_candidate_probe=use_alias_candidate_probe,
-        )
-        if refreshed_snapshot is None:
-            return None
-        return replace(
-            plan,
-            custom_headers=runtime.assemble_headers(
-                api_key=refreshed_snapshot.access_token,
-                request=request,
-            ),
-        )
+    def _with_direct_retry(
+        route_plan: adapter_driver.ResponsesAdapterRoutePlan,
+    ) -> adapter_driver.ResponsesAdapterRoutePlan:
+        async def retry_after_exception(
+            exc: Exception,
+        ) -> Optional[adapter_driver.ResponsesAdapterRoutePlan]:
+            refreshed_snapshot, selected_account = (
+                await _recover_xai_oauth_direct_retry(
+                    request=request,
+                    request_body=rollover_request_body,
+                    traversal=direct_traversal,
+                    exc=exc,
+                    api_base=target_base_url,
+                    use_alias_candidate_probe=use_alias_candidate_probe,
+                )
+            )
+            if refreshed_snapshot is not None:
+                return _with_direct_retry(
+                    replace(
+                        route_plan,
+                        custom_headers=runtime.assemble_headers(
+                            api_key=refreshed_snapshot.access_token,
+                            request=request,
+                        ),
+                    )
+                )
+            if selected_account is None:
+                return None
+            bind_xai_oauth_selected_account_to_request(
+                request,
+                selected_account,
+            )
+            clear_xai_oauth_snapshot_from_request(request)
+            rollover_body = copy.deepcopy(rollover_request_body)
+            prepared, rollover_base_url, rollover_api_key = (
+                await _prepare_passthrough_request(
+                    runtime,
+                    rollover_body,
+                    request=request,
+                    sanitize_responses_request=True,
+                )
+            )
+            if (
+                not prepared
+                or rollover_base_url is None
+                or rollover_api_key is None
+            ):
+                raise Exception(
+                    "Anthropic adapter requests for xAI OAuth models require "
+                    "a managed xAI OAuth credential."
+                )
+            rollover_body["model"] = runtime.to_native_model(
+                rollover_body.get("model")
+            )
+            rollover_target_url = runtime.join_url(
+                runtime.url_factory(rollover_base_url),
+                runtime.normalize_endpoint(
+                    endpoint="/v1/responses",
+                    base_target_url=rollover_base_url,
+                ),
+                runtime.provider_target,
+            )
+            return _with_direct_retry(
+                replace(
+                    route_plan,
+                    translated_request_body=rollover_body,
+                    target_url=rollover_target_url,
+                    custom_headers=runtime.assemble_headers(
+                        api_key=rollover_api_key,
+                        request=request,
+                    ),
+                )
+            )
 
-    return replace(plan, retry_after_exception=retry_after_exception)
+        return replace(route_plan, retry_after_exception=retry_after_exception)
+
+    return _with_direct_retry(plan)
 
 
 async def prepare_completion_route(
@@ -230,6 +313,15 @@ async def prepare_completion_route(
         tag_prefix=config.tag_prefix,
         span_name=config.span_name,
         target_endpoint_label=config.target_endpoint_label,
+    )
+    rollover_request_body = copy.deepcopy(prepared_request_body)
+    direct_traversal = (
+        None
+        if use_alias_candidate_probe
+        else await build_xai_oauth_direct_account_traversal(
+            cooldown_family="anthropic",
+            request=request,
+        )
     )
     prepared, target_base_url, api_key = await _prepare_passthrough_request(
         runtime,
@@ -264,22 +356,84 @@ async def prepare_completion_route(
         api_base=target_base_url,
         client_requested_stream=client_requested_stream,
         perform_kwargs={"custom_llm_provider": runtime.provider},
+        max_retry_attempts=(
+            direct_traversal.max_retry_attempts
+            if direct_traversal is not None
+            else 1
+        ),
     )
 
-    async def retry_after_exception(
-        exc: Exception,
-    ) -> Optional[adapter_driver.CompletionAdapterRoutePlan]:
-        refreshed_snapshot = await _reread_xai_oauth_snapshot_for_retry(
-            request=request,
-            exc=exc,
-            api_base=target_base_url,
-            use_alias_candidate_probe=use_alias_candidate_probe,
-        )
-        if refreshed_snapshot is None:
-            return None
-        return replace(
-            plan,
-            api_key=refreshed_snapshot.access_token,
-        )
+    def _with_direct_retry(
+        route_plan: adapter_driver.CompletionAdapterRoutePlan,
+    ) -> adapter_driver.CompletionAdapterRoutePlan:
+        async def retry_after_exception(
+            exc: Exception,
+        ) -> Optional[adapter_driver.CompletionAdapterRoutePlan]:
+            refreshed_snapshot, selected_account = (
+                await _recover_xai_oauth_direct_retry(
+                    request=request,
+                    request_body=rollover_request_body,
+                    traversal=direct_traversal,
+                    exc=exc,
+                    api_base=target_base_url,
+                    use_alias_candidate_probe=use_alias_candidate_probe,
+                )
+            )
+            if refreshed_snapshot is not None:
+                return _with_direct_retry(
+                    replace(
+                        route_plan,
+                        api_key=refreshed_snapshot.access_token,
+                    )
+                )
+            if selected_account is None:
+                return None
+            bind_xai_oauth_selected_account_to_request(
+                request,
+                selected_account,
+            )
+            clear_xai_oauth_snapshot_from_request(request)
+            rollover_body = copy.deepcopy(rollover_request_body)
+            prepared, rollover_base_url, rollover_api_key = (
+                await _prepare_passthrough_request(
+                    runtime,
+                    rollover_body,
+                    request=request,
+                )
+            )
+            if (
+                not prepared
+                or rollover_base_url is None
+                or rollover_api_key is None
+            ):
+                raise Exception(
+                    "Anthropic adapter requests for xAI OAuth models require "
+                    "a managed xAI OAuth credential."
+                )
+            rollover_target_url = runtime.join_url(
+                runtime.url_factory(rollover_base_url),
+                runtime.normalize_endpoint(
+                    endpoint="/v1/chat/completions",
+                    base_target_url=rollover_base_url,
+                ),
+                runtime.provider_target,
+            )
+            runtime.validate_egress(
+                url=str(rollover_target_url),
+                headers={"Authorization": f"Bearer {rollover_api_key}"},
+                credential_family=config.credential_family,
+                expected_target_family=config.expected_target_family,
+            )
+            return _with_direct_retry(
+                replace(
+                    route_plan,
+                    prepared_request_body=rollover_body,
+                    target_url=rollover_target_url,
+                    api_key=rollover_api_key,
+                    api_base=rollover_base_url,
+                )
+            )
 
-    return replace(plan, retry_after_exception=retry_after_exception)
+        return replace(route_plan, retry_after_exception=retry_after_exception)
+
+    return _with_direct_retry(plan)
