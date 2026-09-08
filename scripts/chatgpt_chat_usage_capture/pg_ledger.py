@@ -994,7 +994,8 @@ class PgLedger:
                   ON scope_map.stored_scope_key = gaps.scope_key
                 WHERE gaps.source_kind = 'attempt_alias'
                   AND gaps.reason = 'alias_collision' AND gaps.state = 'open'
-                  AND gaps.details->'alias'->>'kind' IN ('message', 'branch')
+                  AND gaps.details->'alias'->>'kind'
+                      IN ('message', 'branch', 'request', 'prompt')
             ),
             strong_edges AS (
                 SELECT DISTINCT
@@ -1085,6 +1086,20 @@ class PgLedger:
                     node_scope_key,
                     node_attempt_id
             ),
+            contested_components AS (
+                SELECT DISTINCT
+                    members.canonical_scope_key,
+                    members.component_key
+                FROM strong_components AS members
+                JOIN alias_rows AS member_alias
+                  ON member_alias.canonical_scope_key = members.canonical_scope_key
+                 AND member_alias.scope_key = members.scope_key
+                 AND member_alias.attempt_id = members.attempt_id
+                JOIN contested_aliases
+                  ON contested_aliases.canonical_scope_key = members.canonical_scope_key
+                 AND contested_aliases.alias_kind = member_alias.alias_kind
+                 AND contested_aliases.alias_value = member_alias.alias_value
+            ),
             component_generation_keys AS (
                 SELECT
                     components.canonical_scope_key,
@@ -1092,7 +1107,7 @@ class PgLedger:
                     count(DISTINCT generations.generation_key)
                         AS generation_key_count,
                     MIN(generations.generation_key) AS generation_key,
-                    bool_or(contested_aliases.alias_kind IS NOT NULL)
+                    bool_or(contested_components.component_key IS NOT NULL)
                         AS contested_association,
                     bool_or(member_values.generation_alias_count > 1)
                         AS contradictory_generation_claims
@@ -1117,10 +1132,9 @@ class PgLedger:
                 LEFT JOIN generation_keys AS generations
                   ON generations.scope_key = anchor_alias.scope_key
                  AND generations.attempt_id = anchor_alias.attempt_id
-                LEFT JOIN contested_aliases
-                  ON contested_aliases.canonical_scope_key = members.canonical_scope_key
-                 AND contested_aliases.alias_kind = member_alias.alias_kind
-                 AND contested_aliases.alias_value = member_alias.alias_value
+                LEFT JOIN contested_components
+                  ON contested_components.canonical_scope_key = components.canonical_scope_key
+                 AND contested_components.component_key = components.component_key
                 GROUP BY
                     components.canonical_scope_key,
                     components.component_key
@@ -2989,7 +3003,9 @@ def _identity_candidates(
     if any(len(values) > 1 for values in anchor_sets) or len(anchors | generations) > 1:
         return rows, "ambiguous_attempt_alias"
     if not generations and not grouped and not retained and weak:
-        if anchors or len(rows) > 1:
+        # Request and prompt associations group attempts, not generations.
+        # Only an already-known physical head can be updated through them.
+        if anchors or set(rows) != {incoming_ref} or incoming_row is None:
             return rows, "ambiguous_attempt_alias"
     if retained and not grouped and len(rows) > 1 and (
         len(anchors) != 1 or any(not values for values in anchor_sets)
@@ -4298,6 +4314,11 @@ def _finish_observation_projection(
     projected["unknown_field_count"] = min(unknown_field_count, _OBSERVATION_MAX_FIELDS)
     if source_count is not None and source_count > _OBSERVATION_MAX_FIELDS:
         projected["unknown_field_count_lower_bound"] = True
+    if _looks_like_page(payload) and not any(
+        isinstance(projected.get(key), Mapping if key == "mapping" else list)
+        for key in _OBSERVATION_COLLECTION_FIELDS
+    ):
+        state.mark_incomplete()
     _record_observation_collection_counts(projected)
     _apply_observation_quarantine(projected)
     _apply_transfer_version_status(projected)

@@ -1013,8 +1013,10 @@ represented by bounded structural counts and provenance. Secret-like values,
 content, titles, credentials, browser state, and unallowlisted metadata are
 rejected or dropped before persistence.
 Opaque pagination cursors retain their exact bounded value, not identifier
-normalization. A rejected non-null cursor, malformed collection, unsupported
-transfer, or incomplete projection cannot establish exhaustion. Flat and nested
+normalization. A page must contain a supported collection before it can
+establish completeness; a missing collection is not an empty collection.
+A rejected non-null cursor, malformed collection, unsupported transfer, or
+incomplete projection cannot establish exhaustion. Flat and nested
 quarantine indicators combine conservatively. Truncation paths preserve root,
 indexed, and sanitized mapping-key forms; rejected path records retain explicit
 incompleteness without retaining unsafe text. Privacy diagnostics use structural
@@ -1040,6 +1042,9 @@ generations sharing an association retain their independent generation aliases;
 only the contested association is withheld. An unanchored observation cannot
 use that association to select one generation. Multiple different generation
 anchors on one input are contradictory, not a compound identity.
+Request or prompt matches alone never establish equivalence between different
+attempts, even when there is only one current candidate; merging requires
+positive generation, message, branch, or retained-retirement evidence.
 Alias preflight includes every proposed donor's aliases. Contested associations
 retain coverage-gap evidence before donor retirement.
 Active attempts with stronger identity evidence can retire weaker provisional
@@ -1081,6 +1086,9 @@ identities contributes unknown identity, not another definite attempt; the
 known generations remain independently countable. Anchored generations do not
 connect separate unanchored components. Equal-time conflicting projections
 remain uncertain under the same policy as ingestion.
+Contested request and prompt associations also make an unanchored component
+uncertain immediately, without waiting for its next observation. These weak
+associations never merge components or select a generation for counting.
 
 These tables are independent of `rate_limit_observations`, which remains the
 capacity-only observation store. Source delivery requires separate operational
