@@ -209,6 +209,7 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
     event_type: str,
     candidate_status: str,
     attempt_number: Optional[int] = None,
+    attempt_record_index: Optional[int] = None,
     selected: bool = False,
     skipped: bool = False,
     selection_reason: Optional[str] = None,
@@ -283,6 +284,7 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
         "lane_key": lane_key,
         "cooldown_key": cooldown_key,
         "attempt_number": attempt_number,
+        "attempt_record_index": attempt_record_index,
         "event_type": event_type,
         "selection_reason": selection_reason,
         "candidate_status": candidate_status,
@@ -502,9 +504,16 @@ def _build_auto_agent_alias_audit_events(  # noqa: PLR0915
             )
         ]
 
-    for index, attempt in enumerate(audit_attempts, start=1):
+    provider_attempt_number = 0
+    for attempt_record_index, attempt in enumerate(audit_attempts):
         if not isinstance(attempt, dict):
             continue
+        provider_attempt = (
+            attempt.get("terminal_disposition") != "skipped"
+            and attempt.get("attempted_provider_call") is not False
+        )
+        if provider_attempt:
+            provider_attempt_number += 1
         status = str(attempt.get("status") or "").strip()
         failure_class = attempt.get("error_class")
         if _candidate_schema_rejection(attempt) is not None:
@@ -572,7 +581,10 @@ def _build_auto_agent_alias_audit_events(  # noqa: PLR0915
                 candidate=attempt,
                 event_type=event_type,
                 candidate_status=candidate_status,
-                attempt_number=index,
+                attempt_number=(
+                    provider_attempt_number if provider_attempt else None
+                ),
+                attempt_record_index=attempt_record_index,
                 selected=selected,
                 skipped=skipped,
                 selection_reason=selection_reason,
@@ -580,7 +592,7 @@ def _build_auto_agent_alias_audit_events(  # noqa: PLR0915
                 # RR-054 #51: attach the attempt's own cooldown key (fall back to selection).
                 cooldown_key=(
                     attempt.get("cooldown_key") or selection.get("cooldown_key")
-                    if index == len(audit_attempts)
+                    if attempt_record_index == len(audit_attempts) - 1
                     else attempt.get("cooldown_key")
                 ),
                 cooldown_seconds=attempt.get("cooldown_seconds"),

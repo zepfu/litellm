@@ -31,7 +31,10 @@ _attach_auto_agent_alias_terminal_context_fields: Optional[Callable[..., Any]] =
 from .audit_build import (
     _format_auto_agent_alias_timestamp as _default_format_timestamp,
 )
-from .selection import _build_auto_agent_terminal_candidate_inventory
+from .selection import (
+    _build_auto_agent_terminal_candidate_inventory,
+    _provider_attempt_count,
+)
 from .schema_rejections import (
     SCHEMA_REJECTION_ERROR_CODE,
     SCHEMA_REJECTION_FAILURE_CLASS,
@@ -154,7 +157,7 @@ def _enrich_auto_agent_alias_terminal_event_from_attempts(
     if not normalized_attempts:
         return normalized_attempts
 
-    event["attempt_count"] = len(normalized_attempts)
+    event["attempt_count"] = _provider_attempt_count(normalized_attempts)
     event["attempts"] = copy.deepcopy(normalized_attempts)
     last_attempt = normalized_attempts[-1]
     last_failure_class = last_attempt.get("error_class")
@@ -378,7 +381,7 @@ def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
                     "redispatch_required" if redispatch_required else "failed"
                 ),
                 "fallback_result": event_type,
-                "attempt_count": len(normalized_attempts),
+                "attempt_count": _provider_attempt_count(normalized_attempts),
                 "attempts": copy.deepcopy(normalized_attempts),
             }
         )

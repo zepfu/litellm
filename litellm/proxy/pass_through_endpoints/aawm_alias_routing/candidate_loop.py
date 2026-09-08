@@ -1158,14 +1158,10 @@ async def handle_alias_route(  # noqa: PLR0915
         attempted_provider_call: bool,
         selection: Mapping[str, Any],
     ) -> Optional[str]:
-        """Classify only portable xAI failures that never reached egress."""
+        """Classify exact xAI failures that never reached egress."""
         if (
             str(candidate.get("provider") or "").strip().lower() != "xai"
             or attempted_provider_call
-            or not (
-                _genuinely_fresh_dispatch(selection)
-                or _validated_unowned_replay(selection)
-            )
         ):
             return None
         if _error_signals._is_codex_auto_agent_candidate_deterministically_ineligible(
@@ -1184,19 +1180,27 @@ async def handle_alias_route(  # noqa: PLR0915
     ) -> None:
         """Refund one counted xAI selection and mark its bounded skip outcome."""
         nonlocal provider_candidate_attempts
-        if (
+        if attempt_record.get("attempted_provider_call") is True:
+            return
+        already_skipped = (
             attempt_record.get("terminal_disposition") == "skipped"
             and attempt_record.get("skip_reason") == reason
-        ):
-            return
-        if budget_was_counted:
+        )
+        budget_refunded = (
+            attempt_record.get("provider_attempt_budget_refunded") is True
+        )
+        if budget_was_counted and not budget_refunded:
             provider_candidate_attempts = max(
                 0,
                 provider_candidate_attempts - 1,
             )
+            attempt_record["provider_attempt_budget_refunded"] = True
+        elif "provider_attempt_budget_refunded" not in attempt_record:
+            attempt_record["provider_attempt_budget_refunded"] = False
+        if already_skipped:
+            return
         attempt_record["terminal_disposition"] = "skipped"
         attempt_record["skip_reason"] = reason
-        attempt_record["provider_attempt_budget_refunded"] = budget_was_counted
 
     cursor_replay_rejection_request_shape_summary: Optional[dict[str, Any]] = None
     cursor_replay_fresh_dispatch_reject: Optional[dict[str, Any]] = None
@@ -2114,6 +2118,7 @@ async def handle_alias_route(  # noqa: PLR0915
                 probe_failure_exc: Optional[Exception] = None
                 probe_failure_plan: Optional[CooldownPublicationPlan] = None
                 xai_no_io_selection_skip_reason: Optional[str] = None
+                xai_no_io_selection_reselect_eligible = False
                 skip_after_probe_wait = False
                 response: Optional[Response] = None
                 intent = None
@@ -2935,6 +2940,10 @@ async def handle_alias_route(  # noqa: PLR0915
                             )
                         )
                         if xai_no_io_selection_skip_reason is not None:
+                            xai_no_io_selection_reselect_eligible = (
+                                _genuinely_fresh_dispatch(selection)
+                                or _validated_unowned_replay(selection)
+                            )
                             probe_failure_plan = CooldownPublicationPlan(
                                 applied_scope="none",
                                 grok_account_quota_exhausted=(
@@ -3838,6 +3847,20 @@ async def handle_alias_route(  # noqa: PLR0915
                         reason=xai_no_io_selection_skip_reason,
                         budget_was_counted=failover_ordinal == 0,
                     )
+                    if not xai_no_io_selection_reselect_eligible:
+                        attempt_record["status"] = "terminal_xai_no_io"
+                        _record_auto_agent_alias_attempt_failure(
+                            alias_family=alias_family,
+                            alias_model=alias_model,
+                            request=request,
+                            prepared_request_body=prepared_request_body,
+                            selection=selection,
+                            attempts=attempts,
+                            attempt_record=attempt_record,
+                            error_class=error_class,
+                            add_alias_metadata_fn=add_alias_metadata_fn,
+                        )
+                        _raise_terminal_alias_failure(failure_exc)
                 # D1-586: observational shadow action only. Does not change retry,
                 # failover, sleep, admission, or cooldown enforcement paths.
                 attempt_record["shadow_failure_action"] = (
@@ -3896,6 +3919,10 @@ async def handle_alias_route(  # noqa: PLR0915
                     cooldown_scope == "none"
                     and not _provider_owned_continuation()
                     and not deterministically_ineligible
+                    and (
+                        xai_no_io_selection_skip_reason is None
+                        or xai_no_io_selection_reselect_eligible
+                    )
                 ):
                     _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
                         request,
