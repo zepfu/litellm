@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
 from types import MappingProxyType
 from typing import Any, Literal, Mapping, Optional
 
@@ -60,9 +59,8 @@ def _native_descriptor(
     )
 
 
-@lru_cache(maxsize=128)
 def _get_xai_model_capabilities(model: str) -> frozenset[str]:
-    """Read xAI model capabilities from the canonical model metadata."""
+    """Read xAI model capabilities from the current canonical model metadata."""
 
     try:
         from litellm.utils import get_model_info
