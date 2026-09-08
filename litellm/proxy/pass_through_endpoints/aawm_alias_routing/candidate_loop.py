@@ -68,6 +68,9 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_led
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.deferred_success import (
     finalize_deferred_success,
 )
+from litellm.secret_managers.xai_oauth_inventory import (
+    XaiOAuthIdentityMismatchError,
+)
 
 from . import codex_oauth as _codex_oauth_mod
 from . import error_signals as _error_signals
@@ -875,6 +878,29 @@ def _proxy_exception_for_unclassified_probe_failure(exc: Exception) -> Exception
 
     if isinstance(exc, (HTTPException, ProxyException)):
         return exc
+    if _exception_chain_contains_type(exc, XaiOAuthIdentityMismatchError):
+        message = (
+            "xAI OAuth auto-agent candidate requires a valid managed xAI "
+            f"OAuth credential: {exc}"
+        )
+        proxy_exc = ProxyException(
+            message=message,
+            type="rate_limit_error",
+            param="model",
+            code=429,
+        )
+        setattr(proxy_exc, "failure_phase", "credential_readiness")
+        setattr(proxy_exc, "attempted_provider_call", False)
+        setattr(proxy_exc, "_aawm_xai_identity_readiness", True)
+        proxy_exc.detail = {
+            "error": {
+                "message": message,
+                "code": "aawm_codex_auto_agent_candidate_unavailable",
+            },
+            "failure_phase": "credential_readiness",
+            "attempted_provider_call": False,
+        }
+        return proxy_exc
     status_code = _error_signals._extract_adapter_exception_status_code(exc)
     if status_code is None or not (400 <= int(status_code) <= 599):
         return ProxyException(
@@ -1019,6 +1045,15 @@ async def handle_alias_route(  # noqa: PLR0915
         candidate: Optional[dict[str, Any]] = None,
         attempted_provider_call: bool = True,
     ) -> Optional[str]:
+        if (
+            not attempted_provider_call
+            and _is_managed_xai_oauth_candidate(candidate)
+            and _exception_chain_contains_type(
+                exc,
+                XaiOAuthIdentityMismatchError,
+            )
+        ):
+            return "candidate_unavailable"
         classifier_kwargs: dict[str, Any] = {
             "candidate": candidate,
             "attempted_provider_call": attempted_provider_call,
@@ -1189,6 +1224,8 @@ async def handle_alias_route(  # noqa: PLR0915
             exc
         ):
             return "candidate_ineligible"
+        if _exception_chain_contains_type(exc, XaiOAuthIdentityMismatchError):
+            return "credential_readiness"
         if getattr(exc, "failure_phase", None) == "credential_readiness":
             return "credential_readiness"
         return None
@@ -1225,6 +1262,8 @@ async def handle_alias_route(  # noqa: PLR0915
             attempt_record["provider_attempt_budget_refunded"] = False
         if already_skipped:
             return
+        if reason == "credential_readiness":
+            attempt_record["failure_phase"] = "credential_readiness"
         attempt_record["terminal_disposition"] = "skipped"
         attempt_record["skip_reason"] = reason
 
@@ -1659,6 +1698,24 @@ async def handle_alias_route(  # noqa: PLR0915
                     status_code=status_code,
                     detail=detail,
                 )
+        if (
+            terminal_exc is None
+            and getattr(exc, "_aawm_xai_identity_readiness", False) is True
+        ):
+            terminal_exc = HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=copy.deepcopy(getattr(exc, "detail", None)),
+            )
+            for field in (
+                "attempted_provider_call",
+                "_aawm_xai_identity_readiness",
+                "failure_phase",
+                "message",
+                "param",
+                "type",
+            ):
+                if hasattr(exc, field):
+                    setattr(terminal_exc, field, getattr(exc, field))
         if terminal_exc is None:
             error_class = str(
                 last_attempt.get("error_class")
@@ -3013,6 +3070,19 @@ async def handle_alias_route(  # noqa: PLR0915
                             _terminate_alias_capacity_retry_expiry(
                                 failure_exc=premarked_expiry[0],
                                 error_class=premarked_expiry[1],
+                            )
+                        if (
+                            not attempted_provider_call
+                            and _is_managed_xai_oauth_candidate(candidate)
+                            and _exception_chain_contains_type(
+                                probe_failure_exc,
+                                XaiOAuthIdentityMismatchError,
+                            )
+                        ):
+                            probe_failure_exc = (
+                                _proxy_exception_for_unclassified_probe_failure(
+                                    probe_failure_exc
+                                )
                             )
                         fresh_codex_auth_error_class = _classify_codex_fresh_auth_failure(
                             probe_failure_exc,
