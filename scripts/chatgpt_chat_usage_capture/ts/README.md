@@ -12,10 +12,22 @@ Stage 1 implements:
 - `inspect-capabilities`: read the active and archived conversation indexes and
   report adapter coverage. It supports live Playwright inspection and an
   explicit fixture-backed offline acceptance mode.
+- `observe-native-history`: one bounded, attach-only authenticated history
+  index observation through an explicit Oracle-owned CDP binding.
 
 Stage 1 does not implement ledger storage, attempt reconstruction, accounting,
 quota windows, scheduling, local API, dashboard UI, exports, or model
 reporting. Those commands fail closed with an explicit Stage-2 error.
+
+`observe-native-history` requires the live browser adapter, an existing
+ChatGPT page in the attached context, an explicit CDP endpoint and page target
+id, and the canonical12 inventory account hash. It creates one owned page,
+issues one GET history-index request, and closes only that page before
+disconnecting. It never launches a browser, retries, paginates, submits a
+model request, or mutates account state. Authentication, throttle, challenge,
+identity, shape, size, timeout, or boundary failures fail closed. Output is
+structural only: fixed booleans, counters, and model-field presence; no
+titles, IDs, payload content, headers, cookies, tokens, or storage values.
 
 ## Requirements
 

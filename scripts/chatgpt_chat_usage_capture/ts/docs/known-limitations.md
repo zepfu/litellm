@@ -12,6 +12,10 @@
 - Live operation requires a dedicated persistent Playwright profile and a
   locally installed Chromium browser. Automated credential acquisition is not
   supported.
+- `observe-native-history` is a feasibility probe only. It does not establish
+  history-ledger integration, pagination, durable scheduling, detail evidence,
+  or provider contract stability. It requires an externally owned and already
+  authenticated browser binding and emits only structural counts and booleans.
 - Fixture-backed `inspect-capabilities` is offline contract acceptance only; it
   does not prove live endpoint availability, authentication, or provider schema
   compatibility.

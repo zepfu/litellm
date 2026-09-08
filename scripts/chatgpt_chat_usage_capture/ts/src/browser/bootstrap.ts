@@ -19,6 +19,7 @@ import {
   type BrowserConfig,
   LiveBrowserUnavailable,
   PlaywrightTransport,
+  observeNativeHistoryIndex,
   createProfileDirectory,
   dedicatedProfileReady,
   ensureRestrictivePermissions,
@@ -63,6 +64,70 @@ export interface InspectCapabilitiesResult {
   }>;
   state: BootstrapState;
   notes: string[];
+}
+
+export interface NativeHistoryFeasibilityOptions {
+  cdpEndpoint: string;
+  pageTargetId: string;
+  expectedAccountHash: string;
+  lifetimeMs: number;
+  maxResponseBytes: number;
+}
+
+export interface NativeHistoryFeasibilityResult {
+  accountId: string;
+  state: "ready" | "browser_unavailable" | "auth_required" | "identity_mismatch" | "schema_unavailable";
+  observation: {
+    accountIdentityVerified: boolean;
+    accountIdentitySource: string | null;
+    requestResponseCorrelated: boolean;
+    requestMethod: string | null;
+    pageTargetIdMatched: boolean;
+    httpStatus: number | null;
+    retryAfterSeconds: number | null;
+    browserChallenge: boolean;
+    requestCount: number;
+    responseBytes: number | null;
+    modelFieldPresence: {
+      requestedModel: boolean | null;
+      recordedFinalModel: boolean | null;
+    };
+    warnings: string[];
+  } | null;
+  notes: string[];
+}
+
+export async function observeNativeHistoryFeasibility(
+  account: AccountConfig,
+  options: NativeHistoryFeasibilityOptions,
+): Promise<NativeHistoryFeasibilityResult> {
+  try {
+    const observation = await observeNativeHistoryIndex(account.browser, options);
+    return {
+      accountId: account.id,
+      state: "ready",
+      observation,
+      notes: ["one native history index observation completed"],
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "history observation failed";
+    const state: NativeHistoryFeasibilityResult["state"] =
+      message.includes("authentication")
+        ? "auth_required"
+        : message.includes("identity")
+          ? "identity_mismatch"
+          : message.includes("returned non-JSON content") ||
+              message.includes("invalid status") ||
+              message.includes("response budget")
+            ? "schema_unavailable"
+            : "browser_unavailable";
+    return {
+      accountId: account.id,
+      state,
+      observation: null,
+      notes: [message],
+    };
+  }
 }
 
 export async function bootstrapAccount(

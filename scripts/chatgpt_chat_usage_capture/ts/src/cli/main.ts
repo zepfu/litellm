@@ -16,6 +16,7 @@ import {
   bootstrapAccount,
   inspectCapabilities,
   inspectFixtureCapabilities,
+  observeNativeHistoryFeasibility,
 } from "../browser/bootstrap.js";
 import { ADAPTER_VERSION } from "../contracts/records.js";
 import type { BootstrapResult, InspectCapabilitiesResult } from "../browser/bootstrap.js";
@@ -27,9 +28,19 @@ interface CliArgs {
   interactiveLogin: boolean;
   stateDirectory: string | null;
   fixtureRoot: string | null;
+  cdpEndpoint: string | null;
+  pageTargetId: string | null;
+  expectedAccountHash: string | null;
+  lifetimeMs: number | null;
+  maxResponseBytes: number | null;
 }
 
-const STAGE1_COMMANDS = new Set(["init", "bootstrap", "inspect-capabilities"]);
+const STAGE1_COMMANDS = new Set([
+  "init",
+  "bootstrap",
+  "inspect-capabilities",
+  "observe-native-history",
+]);
 const STAGE2_PLUS_COMMANDS = new Set([
   "backfill",
   "refresh",
@@ -43,6 +54,7 @@ const STAGE2_PLUS_COMMANDS = new Set([
   "export",
   "dashboard",
   "models",
+  "native-history-index",
 ]);
 
 export async function run(argv: string[]): Promise<number> {
@@ -81,6 +93,9 @@ async function execute(args: CliArgs): Promise<number> {
   if (args.command === "bootstrap") {
     return runBootstrap(args);
   }
+  if (args.command === "observe-native-history") {
+    return runObserveNativeHistory(args);
+  }
   return runInspectCapabilities(args);
 }
 
@@ -97,6 +112,36 @@ function runInit(args: CliArgs): number {
       "Bind expected_provider_user_id / expected_workspace_id / quota_owner_id before bootstrap.",
   );
   return 0;
+}
+
+async function runObserveNativeHistory(args: CliArgs): Promise<number> {
+  const config = loadConfig(args.configPath);
+  const account = selectAccount(config.accounts, args.accountId);
+  if (!account) {
+    console.error(`usage-capture observe-native-history: account '${args.accountId}' not found`);
+    return 2;
+  }
+  if (account.browser.adapter !== "playwright_persistent_context") {
+    console.error(
+      "usage-capture observe-native-history: browser adapter is not playwright_persistent_context",
+    );
+    return 2;
+  }
+  if (!args.cdpEndpoint || !args.pageTargetId || !args.expectedAccountHash) {
+    console.error(
+      "usage-capture observe-native-history: --cdp-endpoint, --page-target-id, and --expected-account-hash are required",
+    );
+    return 2;
+  }
+  const result = await observeNativeHistoryFeasibility(account, {
+    cdpEndpoint: args.cdpEndpoint,
+    pageTargetId: args.pageTargetId,
+    expectedAccountHash: args.expectedAccountHash,
+    lifetimeMs: args.lifetimeMs ?? 10_000,
+    maxResponseBytes: args.maxResponseBytes ?? 1_048_576,
+  });
+  console.log(JSON.stringify(result, null, 2));
+  return result.state === "ready" ? 0 : 1;
 }
 
 async function runBootstrap(args: CliArgs): Promise<number> {
@@ -193,6 +238,11 @@ function parseArgs(argv: string[]): CliArgs {
   let interactiveLogin = false;
   let stateDirectory: string | null = null;
   let fixtureRoot: string | null = null;
+  let cdpEndpoint: string | null = null;
+  let pageTargetId: string | null = null;
+  let expectedAccountHash: string | null = null;
+  let lifetimeMs: number | null = null;
+  let maxResponseBytes: number | null = null;
 
   for (let index = 1; index < argv.length; index += 1) {
     const flag = argv[index];
@@ -210,6 +260,29 @@ function parseArgs(argv: string[]): CliArgs {
     } else if (flag === "--fixture-root" && argv[index + 1]) {
       fixtureRoot = argv[index + 1]!;
       index += 1;
+    } else if (flag === "--cdp-endpoint" && argv[index + 1]) {
+      cdpEndpoint = argv[index + 1]!;
+      index += 1;
+    } else if (flag === "--page-target-id" && argv[index + 1]) {
+      pageTargetId = argv[index + 1]!;
+      index += 1;
+    } else if (flag === "--expected-account-hash" && argv[index + 1]) {
+      expectedAccountHash = argv[index + 1]!;
+      index += 1;
+    } else if (flag === "--lifetime-ms" && argv[index + 1]) {
+      const parsed = Number(argv[index + 1]);
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        throw new Error("--lifetime-ms must be a positive integer");
+      }
+      lifetimeMs = parsed;
+      index += 1;
+    } else if (flag === "--max-response-bytes" && argv[index + 1]) {
+      const parsed = Number(argv[index + 1]);
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        throw new Error("--max-response-bytes must be a positive integer");
+      }
+      maxResponseBytes = parsed;
+      index += 1;
     } else if (flag === "--help" || flag === "-h") {
       printHelp();
       process.exit(0);
@@ -226,6 +299,20 @@ function parseArgs(argv: string[]): CliArgs {
   if (fixtureRoot && command !== "inspect-capabilities") {
     throw new Error("--fixture-root is only supported by inspect-capabilities");
   }
+  const nativeOnlyFlags = [
+    ["--cdp-endpoint", cdpEndpoint],
+    ["--page-target-id", pageTargetId],
+    ["--expected-account-hash", expectedAccountHash],
+    ["--lifetime-ms", lifetimeMs === null ? null : String(lifetimeMs)],
+    ["--max-response-bytes", maxResponseBytes === null ? null : String(maxResponseBytes)],
+  ];
+  const hasNativeOnlyFlag = nativeOnlyFlags.some((entry) => entry[1] !== null);
+  if (hasNativeOnlyFlag && command !== "observe-native-history") {
+    throw new Error("native history observation flags are only supported by observe-native-history");
+  }
+  if (command === "observe-native-history" && !hasNativeOnlyFlag) {
+    throw new Error("observe-native-history requires explicit CDP binding and account-hash flags");
+  }
 
   return {
     command,
@@ -234,6 +321,11 @@ function parseArgs(argv: string[]): CliArgs {
     interactiveLogin,
     stateDirectory,
     fixtureRoot,
+    cdpEndpoint,
+    pageTargetId,
+    expectedAccountHash,
+    lifetimeMs,
+    maxResponseBytes,
   };
 }
 
@@ -255,6 +347,13 @@ Stage-1 commands:
       Read-only capability inspection of active and archived history indexes.
       Use --fixture-root only with a fixture_history account for offline
       acceptance; live inspection requires playwright_persistent_context.
+
+  observe-native-history --config <path> --cdp-endpoint <url>
+      --page-target-id <id> --expected-account-hash <canonical12>
+      [--lifetime-ms <ms>] [--max-response-bytes <bytes>]
+      One attach-only authenticated history-index feasibility probe. Requires an
+      existing Oracle-owned ChatGPT page in the bound context and emits only
+      fixed structural counts and model-field presence.
 
 All other commands (backfill, refresh, report, schedule, windows, quota,
 rebuild, export, dashboard, models) are Stage-2+ and fail closed with an
