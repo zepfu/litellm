@@ -414,6 +414,9 @@ DEFAULT_CHATGPT_NATIVE_HISTORY_PROBE_TIMEOUT_SECONDS = 150.0
 CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV = (
     "AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS"
 )
+CHATGPT_NATIVE_HISTORY_PROBE_ACCOUNT_LABEL_ENV = (
+    "AAWM_CHATGPT_NATIVE_HISTORY_PROBE_ACCOUNT_LABEL"
+)
 CHATGPT_NATIVE_HISTORY_PROBE_COOLDOWN_CLEARED_ENV = (
     "AAWM_CHATGPT_NATIVE_HISTORY_PROBE_COOLDOWN_CLEARED"
 )
@@ -1754,6 +1757,7 @@ class SidecarTaskState:
         repr=False,
     )
     chatgpt_oracle_browser_owners_stopping: bool = False
+    chatgpt_native_history_probe_operation_deadline: Optional[float] = None
     chatgpt_oracle_browser_shutdown_deadline: Optional[float] = None
     chatgpt_oracle_browser_owners_admission: Any = dataclass_field(
         default=None,
@@ -2108,6 +2112,21 @@ def _env_int(name: str, default: int) -> int:
     if raw_value is None or raw_value == "":
         return default
     return int(raw_value)
+
+
+def _chatgpt_native_history_probe_requested(
+    argv: Optional[Sequence[str]],
+) -> bool:
+    """Detect probe intent without parsing or echoing untrusted config values."""
+    if os.getenv(CHATGPT_NATIVE_HISTORY_PROBE_ACCOUNT_LABEL_ENV):
+        return True
+    arguments = sys.argv[1:] if argv is None else argv
+    option = "--chatgpt-native-history-probe-account-label"
+    return any(
+        isinstance(argument, str)
+        and (argument == option or argument.startswith(f"{option}="))
+        for argument in arguments
+    )
 
 
 def _parse_chatgpt_conversation_init_account_bindings(
@@ -17131,13 +17150,7 @@ def _run_chatgpt_native_history_probe(  # noqa: PLR0915 - bounded one-shot probe
     probe_deadline = (
         time.monotonic() + DEFAULT_CHATGPT_NATIVE_HISTORY_PROBE_TIMEOUT_SECONDS
     )
-    if state.chatgpt_oracle_browser_shutdown_deadline is None:
-        state.chatgpt_oracle_browser_shutdown_deadline = probe_deadline
-    else:
-        state.chatgpt_oracle_browser_shutdown_deadline = min(
-            state.chatgpt_oracle_browser_shutdown_deadline,
-            probe_deadline,
-        )
+    state.chatgpt_native_history_probe_operation_deadline = probe_deadline
 
     label = config.chatgpt_native_history_probe_account_label
     if label is None:
@@ -17236,7 +17249,11 @@ def _run_chatgpt_native_history_probe(  # noqa: PLR0915 - bounded one-shot probe
         )
         return event
 
-    remaining = probe_deadline - time.monotonic()
+    effective_deadline = probe_deadline
+    cancellation_deadline = state.chatgpt_oracle_browser_shutdown_deadline
+    if cancellation_deadline is not None:
+        effective_deadline = min(effective_deadline, cancellation_deadline)
+    remaining = effective_deadline - time.monotonic()
     if remaining <= DEFAULT_CHATGPT_ORACLE_STARTUP_TIMEOUT_SECONDS:
         _set_chatgpt_native_history_probe_failure(
             event,
@@ -17250,8 +17267,15 @@ def _run_chatgpt_native_history_probe(  # noqa: PLR0915 - bounded one-shot probe
         with _chatgpt_oracle_browser_binding(
             binding,
             history_task_state=state,
+            operation_deadline=probe_deadline,
         ) as resolved:
-            remaining = probe_deadline - time.monotonic()
+            effective_deadline = probe_deadline
+            cancellation_deadline = (
+                state.chatgpt_oracle_browser_shutdown_deadline
+            )
+            if cancellation_deadline is not None:
+                effective_deadline = min(effective_deadline, cancellation_deadline)
+            remaining = effective_deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("native-history probe deadline expired")
             result = observe_native_chatgpt_history_from_oracle_browser(
@@ -17550,9 +17574,40 @@ def _sleep_until_next_sidecar_deadline(
 def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
     argv: Optional[Sequence[str]] = None,
 ) -> int:
+    native_probe_requested = _chatgpt_native_history_probe_requested(argv)
     try:
         config = parse_config(argv)
+    except SystemExit:
+        if native_probe_requested:
+            _emit(
+                {
+                    "event": "chatgpt_native_history_probe",
+                    "observed_at": _utc_timestamp(),
+                    "environment": os.getenv("AAWM_LITELLM_ENVIRONMENT", "dev"),
+                    "attempted": False,
+                    "error_class": (
+                        "ChatGPTNativeHistoryProbeConfigurationInvalid"
+                    ),
+                    "telemetry_class": "configuration",
+                }
+            )
+            return 1
+        raise
     except Exception as exc:
+        if native_probe_requested:
+            _emit(
+                {
+                    "event": "chatgpt_native_history_probe",
+                    "observed_at": _utc_timestamp(),
+                    "environment": os.getenv("AAWM_LITELLM_ENVIRONMENT", "dev"),
+                    "attempted": False,
+                    "error_class": (
+                        "ChatGPTNativeHistoryProbeConfigurationInvalid"
+                    ),
+                    "telemetry_class": "configuration",
+                }
+            )
+            return 1
         _emit(
             {
                 "event": "provider_status_observations_config_error",
@@ -17602,10 +17657,23 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
             # before it can be emitted must still reach the bounded drain.
             exit_status = 1
         finally:
-            shutdown_deadline = (
-                sidecar_state.chatgpt_oracle_browser_shutdown_deadline
-                or time.monotonic() + DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS
+            operation_deadline = (
+                sidecar_state.chatgpt_native_history_probe_operation_deadline
             )
+            cancellation_deadline = (
+                sidecar_state.chatgpt_oracle_browser_shutdown_deadline
+            )
+            if operation_deadline is not None and cancellation_deadline is not None:
+                shutdown_deadline = min(operation_deadline, cancellation_deadline)
+            elif operation_deadline is not None:
+                shutdown_deadline = operation_deadline
+            elif cancellation_deadline is not None:
+                shutdown_deadline = cancellation_deadline
+            else:
+                shutdown_deadline = (
+                    time.monotonic()
+                    + DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS
+                )
             try:
                 drained = _drain_pending_chatgpt_oracle_browser_owners(
                     sidecar_state,
@@ -17613,7 +17681,43 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
                 )
             except Exception:
                 drained = False
-            _release_sidecar_task_state(sidecar_state)
+            if not drained:
+                try:
+                    _emit(
+                        {
+                            "event": "provider_status_sidecar_task_error",
+                            "observed_at": _utc_timestamp(),
+                            "environment": config.environment,
+                            "task": "chatgpt_oracle_browser_owner_shutdown",
+                            "error_class": "OracleBrowserCleanupError",
+                            "error_message": (
+                                "Retained Oracle browser owners remained after "
+                                "the bounded shutdown drain."
+                            ),
+                        }
+                    )
+                except (BrokenPipeError, OSError):
+                    pass
+                # Keep the admitted state alive while an owner remains pending.
+                # Returning here would abandon the only in-memory supervisor.
+                while True:
+                    try:
+                        _service_pending_chatgpt_oracle_browser_owners(
+                            sidecar_state,
+                            deadline=shutdown_deadline,
+                        )
+                    except Exception:
+                        pass
+                    with sidecar_state.pending_chatgpt_oracle_browser_owners_lock:
+                        pending = bool(
+                            sidecar_state.pending_chatgpt_oracle_browser_owners
+                        )
+                    if not pending:
+                        drained = True
+                        break
+                    time.sleep(0.1)
+            if drained:
+                _release_sidecar_task_state(sidecar_state)
         return exit_status or (0 if drained else 1)
 
     try:

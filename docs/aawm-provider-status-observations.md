@@ -1045,6 +1045,19 @@ one-shot foreground action, not a recurring schedule. A
 `history_observation_failed` result exits nonzero; `no_history_observed` is a
 distinct bounded outcome and exits zero.
 
+The operation deadline is distinct from the sidecar's cancellation cutoff.
+Startup, observation, and cleanup use the same absolute operation ceiling;
+when SIGINT or SIGTERM is received, the effective cutoff is the earlier of
+that ceiling and the cancellation cutoff. The native probe caller passes the
+ceiling through the existing browser-binding context as the optional keyword
+`operation_deadline=<absolute monotonic deadline>`. The lifecycle binding must
+accept that keyword with a default of `None` for existing callers and
+propagate it through startup and failure cleanup; its effective cleanup
+deadline remains the minimum of the operation ceiling and cancellation cutoff.
+If a bounded drain cannot prove owner retirement, the admitted sidecar state
+continues supervising retained owners until they retire; it is not released
+while owners remain pending.
+
 Parent-run shape (replace only the profile path and deployment-specific
 executable paths):
 
