@@ -395,6 +395,21 @@ def _xai_stat_fingerprint(
     )
 
 
+def _xai_stat_read_fingerprint(
+    stat_result: os.stat_result,
+) -> Tuple[int, int, int, int]:
+    """Return descriptor-stable metadata for one complete read."""
+
+    # Unlinking an open old inode changes its ctime/link metadata without
+    # changing the bytes visible through the descriptor.
+    return (
+        int(stat_result.st_dev),
+        int(stat_result.st_ino),
+        int(stat_result.st_mtime_ns),
+        int(stat_result.st_size),
+    )
+
+
 def _open_xai_credential_file(path: Path) -> int:
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
@@ -463,7 +478,7 @@ def _read_xai_credential_payload_secure(
         except OSError:
             pass
 
-    if _xai_stat_fingerprint(before) != _xai_stat_fingerprint(after):
+    if _xai_stat_read_fingerprint(before) != _xai_stat_read_fingerprint(after):
         raise ValueError("xAI OAuth credential changed while it was read.")
     try:
         payload = json.loads(raw_bytes.decode("utf-8"))
@@ -521,6 +536,92 @@ def _xai_oauth_credential_file_not_found_error(
         "provider-status sidecar xAI OAuth refresh or reseed/relogin the "
         "managed xAI OAuth credential."
     )
+
+
+def _start_xai_snapshot_flight(
+    *,
+    cache_key: Tuple[str, str, str],
+    credential_path: Path,
+    scope: str,
+) -> "asyncio.Task[XaiOAuthCredentialSnapshot]":
+    flight = asyncio.create_task(
+        _run_xai_snapshot_flight(
+            cache_key=cache_key,
+            credential_path=credential_path,
+            scope=scope,
+        )
+    )
+    _xai_snapshot_flights[cache_key] = flight
+    flight.add_done_callback(
+        lambda completed: _finish_xai_snapshot_flight(
+            cache_key,
+            completed,
+        )
+    )
+    return flight
+
+
+async def _reload_xai_oauth_snapshot_after_flight(
+    *,
+    snapshot: XaiOAuthCredentialSnapshot,
+    cache_key: Tuple[str, str, str],
+    lock: asyncio.Lock,
+    credential_path: Path,
+    scope: str,
+) -> XaiOAuthCredentialSnapshot:
+    # A forced caller may have joined a flight that started before the file
+    # was atomically replaced. Re-stat after that flight and perform at most
+    # one follow-up load when its publication is no longer current.
+    try:
+        current_stat = await asyncio.to_thread(
+            _stat_xai_credential_file,
+            credential_path,
+        )
+    except FileNotFoundError as exc:
+        raise _xai_oauth_credential_file_not_found_error(
+            credential_path=credential_path,
+        ) from exc
+    if snapshot.generation_metadata == _xai_stat_fingerprint(current_stat):
+        return snapshot
+
+    async with lock:
+        flight = _xai_snapshot_flights.get(cache_key)
+        if flight is not None and flight.done():
+            _xai_snapshot_flights.pop(cache_key, None)
+            flight = None
+        if flight is None:
+            try:
+                current_stat = await asyncio.to_thread(
+                    _stat_xai_credential_file,
+                    credential_path,
+                )
+            except FileNotFoundError as exc:
+                raise _xai_oauth_credential_file_not_found_error(
+                    credential_path=credential_path,
+                ) from exc
+
+            current_fingerprint = _xai_stat_fingerprint(current_stat)
+            cached = _xai_snapshot_cache.get(cache_key)
+            if (
+                cached is not None
+                and cached.generation_metadata == current_fingerprint
+                and _xai_snapshot_is_route_usable(cached)
+            ):
+                return cached
+            if cached is not None:
+                _xai_snapshot_cache.pop(cache_key, None)
+            flight = _start_xai_snapshot_flight(
+                cache_key=cache_key,
+                credential_path=credential_path,
+                scope=scope,
+            )
+
+    try:
+        return await asyncio.shield(flight)
+    except FileNotFoundError as exc:
+        raise _xai_oauth_credential_file_not_found_error(
+            credential_path=credential_path,
+        ) from exc
 
 
 def _load_xai_oauth_snapshot_sync(
@@ -637,27 +738,27 @@ async def _get_xai_oauth_snapshot_for_path(
             ):
                 _xai_snapshot_cache.pop(cache_key, None)
 
-            flight = asyncio.create_task(
-                _run_xai_snapshot_flight(
-                    cache_key=cache_key,
-                    credential_path=credential_path,
-                    scope=scope,
-                )
-            )
-            _xai_snapshot_flights[cache_key] = flight
-            flight.add_done_callback(
-                lambda completed: _finish_xai_snapshot_flight(
-                    cache_key,
-                    completed,
-                )
+            flight = _start_xai_snapshot_flight(
+                cache_key=cache_key,
+                credential_path=credential_path,
+                scope=scope,
             )
 
     try:
-        return await asyncio.shield(flight)
+        snapshot = await asyncio.shield(flight)
     except FileNotFoundError as exc:
         raise _xai_oauth_credential_file_not_found_error(
             credential_path=credential_path,
         ) from exc
+    if not force_reload:
+        return snapshot
+    return await _reload_xai_oauth_snapshot_after_flight(
+        snapshot=snapshot,
+        cache_key=cache_key,
+        lock=lock,
+        credential_path=credential_path,
+        scope=scope,
+    )
 
 
 async def _run_xai_snapshot_flight(
