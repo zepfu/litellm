@@ -9,6 +9,7 @@ share one first-terminal-wins state.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from dataclasses import dataclass, field
 from enum import Enum
@@ -453,6 +454,10 @@ WireDispositionCallback = Callable[
     [OpenAIResponsesWireDisposition, OpenAIResponsesWireTrace],
     Awaitable[None],
 ]
+PreTerminalValidationCallback = Callable[
+    [bytes, str, Optional[dict[str, Any]], OpenAIResponsesWireDisposition],
+    Awaitable[None],
+]
 
 
 async def _await_shielded(awaitable: Awaitable[Any]) -> Any:
@@ -717,12 +722,14 @@ class OpenAIResponsesWireCoordinator:
         *,
         upstream_response: Any = None,
         on_disposition: Optional[WireDispositionCallback] = None,
+        pre_terminal_validation: Optional[PreTerminalValidationCallback] = None,
         trace: Optional[OpenAIResponsesWireTrace] = None,
         model: Optional[str] = None,
     ) -> None:
         self._source = source
         self._upstream_response = upstream_response
         self._on_disposition = on_disposition
+        self._pre_terminal_validation = pre_terminal_validation
         self.trace = trace or OpenAIResponsesWireTrace()
         self._model = model
         self._buffer = b""
@@ -839,6 +846,20 @@ class OpenAIResponsesWireCoordinator:
         ):
             yield emitted
 
+    async def _validate_terminal_before_emit(
+        self,
+        block: bytes,
+        *,
+        event_type: str,
+        payload: Optional[dict[str, Any]],
+        disposition: OpenAIResponsesWireDisposition,
+        synthetic: bool = False,
+    ) -> None:
+        callback = self._pre_terminal_validation
+        if callback is None or synthetic:
+            return
+        await callback(block, event_type, payload, disposition)
+
     # Keep terminal selection and transport cleanup in one ordered lifecycle.
     async def __aiter__(self) -> AsyncIterator[bytes]:  # noqa: PLR0915
         try:
@@ -934,6 +955,16 @@ class OpenAIResponsesWireCoordinator:
                             )
                             if removed_done:
                                 terminal_block = cleaned_block
+                        await self._validate_terminal_before_emit(
+                            terminal_block,
+                            event_type=terminal_event_type,
+                            payload=(
+                                response_payload
+                                if isinstance(response_payload, dict)
+                                else None
+                            ),
+                            disposition=disposition,
+                        )
                         async for emitted in self._emit_terminal(
                             terminal_block,
                             event_type=terminal_event_type,
@@ -1018,6 +1049,12 @@ class OpenAIResponsesStreamingResponse(StreamingResponse):
             await _await_shielded(close())
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        background = self.background
+        # Starlette skips background callbacks when the body raises or the
+        # client disconnects. Own the callback here so every response path
+        # executes it once, after the body attempt and wire finalization.
+        self.background = None
+
         async def tracked_send(message: Dict[str, Any]) -> None:
             message_type = message.get("type")
             await send(message)
@@ -1069,6 +1106,17 @@ class OpenAIResponsesStreamingResponse(StreamingResponse):
                 self.wire_trace.metadata[
                     "post_finalization_callback_error"
                 ] = type(exc).__name__
+            if background is not None:
+                try:
+                    result = background()
+                    if inspect.isawaitable(result):
+                        await _await_shielded(result)
+                except BaseException as exc:  # noqa: BLE001
+                    self.wire_trace.metadata["background_callback_error"] = type(
+                        exc
+                    ).__name__
+                    if "asgi_error" not in self.wire_trace.metadata:
+                        raise
             self.wire_trace.metadata.update(self.wire_trace.snapshot())
 
 
@@ -1104,6 +1152,9 @@ class OpenAIResponsesBufferedResponse(Response):
         await self.wire_trace._finalize_disposition(disposition, self._on_disposition)
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        background = self.background
+        self.background = None
+
         async def tracked_send(message: Dict[str, Any]) -> None:
             await send(message)
             message_type = message.get("type")
@@ -1135,6 +1186,17 @@ class OpenAIResponsesBufferedResponse(Response):
                 self.wire_trace.metadata[
                     "post_finalization_callback_error"
                 ] = type(exc).__name__
+            if background is not None:
+                try:
+                    result = background()
+                    if inspect.isawaitable(result):
+                        await _await_shielded(result)
+                except BaseException as exc:  # noqa: BLE001
+                    self.wire_trace.metadata["background_callback_error"] = type(
+                        exc
+                    ).__name__
+                    if "asgi_error" not in self.wire_trace.metadata:
+                        raise
             self.wire_trace.metadata.update(self.wire_trace.snapshot())
 
 
@@ -1143,6 +1205,7 @@ def wrap_openai_responses_stream(
     *,
     upstream_response: Any = None,
     on_disposition: Optional[WireDispositionCallback] = None,
+    pre_terminal_validation: Optional[PreTerminalValidationCallback] = None,
     trace: Optional[OpenAIResponsesWireTrace] = None,
     model: Optional[str] = None,
 ) -> tuple[AsyncIterator[bytes], OpenAIResponsesWireTrace]:
@@ -1153,6 +1216,7 @@ def wrap_openai_responses_stream(
         source,
         upstream_response=upstream_response,
         on_disposition=on_disposition,
+        pre_terminal_validation=pre_terminal_validation,
         trace=trace,
         model=model,
     )

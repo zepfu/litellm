@@ -5616,6 +5616,7 @@ async def pass_through_request(  # noqa: PLR0915
     defer_session_owner_promotion: bool = False,
     raw_body_passthrough: bool = False,
     passthrough_logging_metadata: Optional[dict[str, Any]] = None,
+    responses_wire_owned: bool = False,
 ):
     """
     Pass through endpoint handler, makes the httpx request for pass-through endpoints and ensures logging hooks are called
@@ -5643,6 +5644,8 @@ async def pass_through_request(  # noqa: PLR0915
             adapter/candidate-rotation callers do not double-retry upstream failures
         defer_session_owner_promotion: When true, the caller owns lease
             promotion after validating the complete candidate response.
+        responses_wire_owned: Mark an xAI Responses stream for the shared
+            final-wire lifecycle coordinator owned by the caller.
         raw_body_passthrough: Forward the original request body as bytes while
             using a small synthetic body for logging. This is intended for
             native binary/protobuf side-channel endpoints.
@@ -5820,6 +5823,14 @@ async def pass_through_request(  # noqa: PLR0915
         )
         is_native_openai_responses_route = (
             PassThroughStreamingHandler._is_openai_responses_stream(
+                endpoint_type=endpoint_type,
+                url_route=str(url),
+                custom_llm_provider=custom_llm_provider,
+            )
+        )
+        is_xai_responses_wire_owned_route = (
+            responses_wire_owned
+            and PassThroughStreamingHandler._is_xai_responses_route(
                 endpoint_type=endpoint_type,
                 url_route=str(url),
                 custom_llm_provider=custom_llm_provider,
@@ -6549,6 +6560,10 @@ async def pass_through_request(  # noqa: PLR0915
                         e,
                         error_content,
                     ) from e
+                if is_xai_responses_wire_owned_route:
+                    extensions = getattr(response, "extensions", None)
+                    if isinstance(extensions, dict):
+                        extensions["aawm_responses_wire_owned"] = True
                 if PassThroughStreamingHandler._is_openai_responses_stream(
                     endpoint_type=endpoint_type,
                     url_route=str(url),
@@ -6855,6 +6870,7 @@ async def pass_through_request(  # noqa: PLR0915
                     headers=response_headers,
                     status_code=response.status_code,
                 )
+            setattr(stream_response, "_aawm_upstream_response", response)
             _publish_openai_send_telemetry()
             return bind_output_guard_to_streaming_response(
                 bind_deferred_success_holder(
@@ -6958,6 +6974,10 @@ async def pass_through_request(  # noqa: PLR0915
                 credential_family=egress_credential_family,
                 expected_target_family=expected_target_family,
             )
+            if is_xai_responses_wire_owned_route:
+                extensions = getattr(response, "extensions", None)
+                if isinstance(extensions, dict):
+                    extensions["aawm_responses_wire_owned"] = True
             if _is_streaming_response(response) is True:
                 try:
                     response.raise_for_status()
@@ -7314,6 +7334,7 @@ async def pass_through_request(  # noqa: PLR0915
                     headers=response_headers,
                     status_code=response.status_code,
                 )
+            setattr(stream_response, "_aawm_upstream_response", response)
             _publish_openai_send_telemetry()
             return bind_output_guard_to_streaming_response(
                 bind_deferred_success_holder(
