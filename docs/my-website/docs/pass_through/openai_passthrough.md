@@ -25,6 +25,42 @@ Standard passthrough endpoint that may conflict with LiteLLM's native implementa
 
 **Note:** Some endpoints like `/openai/v1/responses` will be routed to LiteLLM's native implementation instead of OpenAI.
 
+## Responses streaming lifecycle
+
+Native OpenAI Responses streaming requires an authoritative terminal event:
+`response.completed`, `response.failed`, or `response.incomplete`. LiteLLM
+forwards the first valid terminal, emits exactly one `data: [DONE]`, and
+discards incomplete trailing frames. A stream that ends without a valid
+terminal is completed on the wire as `response.incomplete`; it is not treated
+as a successful response.
+
+For managed alias routing, the session-owner reservation and legacy session
+affinity remain request-scoped while the stream is active. A completed terminal
+can promote the owner and commit affinity. Failed, incomplete, cancelled, or
+disconnected streams release the reservation and do not write new affinity.
+
+The final delivered disposition is also published for logging, rollup, and
+session-transfer consumers. Consumers must use this disposition rather than
+the upstream HTTP status: `completed` is the only successful outcome;
+`failed`, `incomplete`, `cancelled`, and `disconnected` are non-success
+outcomes. The disposition is selected once, after the terminal event and
+`[DONE]` have been delivered for streams or after the response body has been
+sent for non-streaming Responses.
+
+Exit telemetry retains logical provider-call counts, transport connection
+failure counts, and hidden retry counts alongside the wire-enriched send-ledger
+snapshot.
+
+The internal callback contract is
+`on_disposition(disposition, trace)`. Consumers should read a copy from
+`trace.snapshot()` containing the wire state, response/body commitment,
+terminal and `[DONE]` markers, final disposition, and bounded duplicate,
+partial-frame, and close-error fields. Detailed malformed-frame metadata
+remains on `trace.metadata`; a malformed frame is converted to synthetic
+`response.failed` before any later success can be selected. Consumers must
+not promote ownership, write legacy affinity, or infer success independently
+from the provider response.
+
 ## When to use this?
 
 - For 90% of your use cases, you should use the [native LiteLLM OpenAI Integration](https://docs.litellm.ai/docs/providers/openai) (`/chat/completions`, `/embeddings`, `/completions`, `/images`, `/batches`, etc.)

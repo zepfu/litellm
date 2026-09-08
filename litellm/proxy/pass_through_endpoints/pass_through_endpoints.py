@@ -157,6 +157,14 @@ from .aawm_adapter_runtime.repetitive_output import (
     maybe_reject_passthrough_responses_body,
     maybe_wrap_passthrough_responses_stream,
 )
+from .aawm_adapter_runtime.openai_responses_wire import (
+    OpenAIResponsesBufferedResponse,
+    OpenAIResponsesStreamingResponse,
+    OpenAIResponsesWireDisposition,
+    OpenAIResponsesWireTrace,
+    bind_openai_responses_wire_trace_to_request,
+    wrap_openai_responses_stream,
+)
 from .aawm_adapter_runtime.openai_responses_body import (
     get_bound_openai_responses_wire_body,
 )
@@ -199,6 +207,7 @@ from .aawm_adapter_runtime.provider_call_ledger import (
     get_request_provider_call_ledger,
     get_request_provider_call_ledger_snapshot,
     publish_reservation_metadata,
+    publish_wire_commitment_snapshot,
     record_transport_connection_attempt,
     register_active_upstream_response,
     clear_active_upstream_response,
@@ -5117,6 +5126,19 @@ async def _aawm_session_owner_on_upstream_result(
     if defer_session_owner_promotion:
         return
     sa = _session_affinity_mod()
+    if not success:
+        state = getattr(request, "state", None)
+        if state is not None:
+            try:
+                # A failed candidate must not leave its staged legacy affinity
+                # attached to a later candidate in the same alias request.
+                setattr(
+                    state,
+                    "_aawm_native_openai_responses_affinity_commitment",
+                    None,
+                )
+            except Exception:
+                pass
     if success:
         await sa.finalize_request_session_owner_lease(
             request,
@@ -5129,6 +5151,210 @@ async def _aawm_session_owner_on_upstream_result(
             exc=RuntimeError("upstream_failed"),
             failure_phase="session_owner_pass_through_release",
         )
+
+
+# Keep ownership and legacy-affinity finalization ordered at the wire boundary.
+async def _finalize_native_openai_responses_owner_wire_disposition(  # noqa: PLR0915
+    *,
+    request: Request,
+    disposition: OpenAIResponsesWireDisposition,
+    trace: Optional[OpenAIResponsesWireTrace] = None,
+) -> None:
+    """Finalize native OpenAI ownership without failing delivered output."""
+
+    sa = _session_affinity_mod()
+    result = None
+    owner_finalized = disposition is not OpenAIResponsesWireDisposition.COMPLETED
+    if trace is None:
+        state = getattr(request, "state", None)
+        if state is not None:
+            try:
+                commitment = {
+                    "commitment": "done",
+                    "disposition": disposition.value,
+                    "terminal_wire_committed": True,
+                    "done_wire_committed": True,
+                    "finalized": False,
+                }
+                setattr(
+                    state,
+                    "_aawm_openai_responses_wire_commitment",
+                    commitment,
+                )
+                publish_wire_commitment_snapshot(
+                    request,
+                    commitment=commitment,
+                )
+            except Exception:
+                pass
+    try:
+        lease = sa.get_request_session_owner_lease(request)
+        result = await sa.finalize_session_owner_lease_on_wire_disposition(
+            request,
+            disposition=disposition.value,
+        )
+        outcome = getattr(getattr(result, "outcome", None), "value", None)
+        if trace is not None:
+            trace.metadata["session_owner_wire_disposition"] = disposition.value
+            if outcome is not None:
+                trace.metadata["session_owner_wire_outcome"] = outcome
+
+        expected_outcomes = (
+            {"promoted", "already_owned"}
+            if disposition is OpenAIResponsesWireDisposition.COMPLETED
+            else {"released", "not_held", "already_owned"}
+        )
+        owner_finalized = (
+            disposition is not OpenAIResponsesWireDisposition.COMPLETED
+            or (
+                result is not None
+                and outcome in expected_outcomes
+            )
+        )
+        if (
+            disposition is OpenAIResponsesWireDisposition.COMPLETED
+            and result is None
+            and (
+                lease is None
+                or getattr(lease, "promoted", False)
+                or (
+                    not getattr(lease, "held_reservation", False)
+                    and getattr(lease, "decision", None)
+                    == sa.SessionOwnerGuardDecision.COMPATIBLE_OWNER.value
+                )
+            )
+        ):
+            # Compatible durable owners intentionally have no request-local
+            # reservation to promote. Treat that no-op as an established owner
+            # so legacy affinity is not discarded as a false finalization error.
+            owner_finalized = True
+        if result is not None and outcome not in expected_outcomes:
+            verbose_proxy_logger.warning(
+                "Native OpenAI Responses owner finalization returned outcome=%s "
+                "for disposition=%s; releasing reservation",
+                outcome,
+                disposition.value,
+            )
+            lease = sa.get_request_session_owner_lease(request)
+            fallback = await sa.finalize_session_owner_lease_on_failure(lease)
+            fallback_outcome = getattr(
+                getattr(fallback, "outcome", None),
+                "value",
+                None,
+            )
+            if trace is not None and fallback_outcome is not None:
+                trace.metadata["session_owner_wire_fallback_outcome"] = (
+                    fallback_outcome
+                )
+            owner_finalized = False
+        await _finalize_native_openai_responses_legacy_affinity(
+            request=request,
+            disposition=disposition,
+            trace=trace,
+            owner_finalized=owner_finalized,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if trace is not None:
+            trace.metadata["session_owner_wire_callback_error"] = type(exc).__name__
+        verbose_proxy_logger.exception(
+            "Native OpenAI Responses owner finalization failed after wire "
+            "disposition=%s; releasing reservation",
+            disposition.value,
+        )
+        try:
+            lease = sa.get_request_session_owner_lease(request)
+            fallback = await sa.finalize_session_owner_lease_on_failure(lease)
+            fallback_outcome = getattr(
+                getattr(fallback, "outcome", None),
+                "value",
+                None,
+            )
+            if trace is not None and fallback_outcome is not None:
+                trace.metadata["session_owner_wire_fallback_outcome"] = (
+                    fallback_outcome
+                )
+        except Exception as fallback_exc:  # noqa: BLE001
+            if trace is not None:
+                trace.metadata["session_owner_wire_release_error"] = type(
+                    fallback_exc
+                ).__name__
+            verbose_proxy_logger.exception(
+                "Native OpenAI Responses owner release failed after "
+                "wire-finalization error"
+            )
+        await _finalize_native_openai_responses_legacy_affinity(
+            request=request,
+            disposition=disposition,
+            trace=trace,
+            owner_finalized=False,
+        )
+    if trace is None:
+        state = getattr(request, "state", None)
+        commitment = getattr(
+            state,
+            "_aawm_openai_responses_wire_commitment",
+            None,
+        )
+        if isinstance(commitment, dict):
+            commitment["finalized"] = True
+            try:
+                setattr(
+                    state,
+                    "_aawm_openai_responses_wire_commitment",
+                    commitment,
+                )
+                publish_wire_commitment_snapshot(
+                    request,
+                    commitment=commitment,
+                )
+            except Exception:
+                pass
+
+
+async def _finalize_native_openai_responses_legacy_affinity(
+    *,
+    request: Request,
+    disposition: OpenAIResponsesWireDisposition,
+    trace: Optional[OpenAIResponsesWireTrace],
+    owner_finalized: bool,
+) -> None:
+    """Commit staged legacy alias affinity only after completed wire output."""
+
+    state = getattr(request, "state", None)
+    pending = getattr(
+        state,
+        "_aawm_native_openai_responses_affinity_commitment",
+        None,
+    )
+    if not isinstance(pending, dict):
+        return
+    try:
+        if (
+            disposition is OpenAIResponsesWireDisposition.COMPLETED
+            and owner_finalized
+            and callable(pending.get("setter"))
+        ):
+            await pending["setter"](
+                pending.get("session_key"),
+                pending.get("candidate") or {},
+            )
+            if trace is not None:
+                trace.metadata["legacy_affinity_wire_commitment"] = "committed"
+        elif trace is not None:
+            trace.metadata["legacy_affinity_wire_commitment"] = "discarded"
+    except Exception as exc:  # noqa: BLE001
+        if trace is not None:
+            trace.metadata["legacy_affinity_wire_commitment_error"] = type(
+                exc
+            ).__name__
+        verbose_proxy_logger.exception(
+            "Native OpenAI Responses legacy affinity finalization failed"
+        )
+    finally:
+        try:
+            setattr(state, "_aawm_native_openai_responses_affinity_commitment", None)
+        except Exception:
+            pass
 
 
 async def _aawm_run_with_session_owner_lease_renewal(
@@ -5430,6 +5656,13 @@ async def pass_through_request(  # noqa: PLR0915
 
         endpoint_type: EndpointType = HttpPassThroughEndpointHelpers.get_endpoint_type(
             str(url)
+        )
+        is_native_openai_responses_route = (
+            PassThroughStreamingHandler._is_openai_responses_stream(
+                endpoint_type=endpoint_type,
+                url_route=str(url),
+                custom_llm_provider=custom_llm_provider,
+            )
         )
 
         # Skip body parsing for multipart requests - make_multipart_http_request will handle it
@@ -6208,6 +6441,10 @@ async def pass_through_request(  # noqa: PLR0915
             status_ok = bool(
                 getattr(response, "status_code", 500) < 300
             )
+            if status_ok and is_native_openai_responses_route:
+                _session_affinity_mod().defer_session_owner_lease_until_wire_terminal(
+                    request
+                )
             await _aawm_session_owner_on_upstream_result(
                 request=request,
                 success=status_ok,
@@ -6264,14 +6501,46 @@ async def pass_through_request(  # noqa: PLR0915
                     url, getattr(getattr(request, "url", None), "path", None)
                 ),
             )
-            stream_response = StreamingResponse(
-                processed_chunks,
-                headers=HttpPassThroughEndpointHelpers.get_response_headers(
-                    headers=response.headers,
-                    litellm_call_id=litellm_call_id,
-                ),
-                status_code=response.status_code,
+            response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
+                headers=response.headers,
+                litellm_call_id=litellm_call_id,
             )
+            if is_native_openai_responses_route:
+                async def _on_native_wire_disposition(
+                    disposition: OpenAIResponsesWireDisposition,
+                    trace: OpenAIResponsesWireTrace,
+                ) -> None:
+                    await _finalize_native_openai_responses_owner_wire_disposition(
+                        request=request,
+                        disposition=disposition,
+                        trace=trace,
+                    )
+
+                processed_chunks, wire_trace = wrap_openai_responses_stream(
+                    processed_chunks,
+                    upstream_response=response,
+                    on_disposition=_on_native_wire_disposition,
+                    model=(
+                        str(provider_bound_body.get("model"))
+                        if isinstance(provider_bound_body, dict)
+                        and provider_bound_body.get("model") is not None
+                        else None
+                    ),
+                )
+                bind_openai_responses_wire_trace_to_request(request, wire_trace)
+                stream_response = OpenAIResponsesStreamingResponse(
+                    processed_chunks,
+                    wire_trace=wire_trace,
+                    on_disposition=_on_native_wire_disposition,
+                    headers=response_headers,
+                    status_code=response.status_code,
+                )
+            else:
+                stream_response = StreamingResponse(
+                    processed_chunks,
+                    headers=response_headers,
+                    status_code=response.status_code,
+                )
             _publish_openai_send_telemetry()
             return bind_output_guard_to_streaming_response(
                 bind_deferred_success_holder(
@@ -6482,6 +6751,10 @@ async def pass_through_request(  # noqa: PLR0915
             )
             raise
         status_ok = bool(getattr(response, "status_code", 500) < 300)
+        if status_ok and is_native_openai_responses_route:
+            _session_affinity_mod().defer_session_owner_lease_until_wire_terminal(
+                request
+            )
         await _aawm_session_owner_on_upstream_result(
             request=request,
             success=status_ok,
@@ -6537,14 +6810,46 @@ async def pass_through_request(  # noqa: PLR0915
                     url, getattr(getattr(request, "url", None), "path", None)
                 ),
             )
-            stream_response = StreamingResponse(
-                processed_chunks,
-                headers=HttpPassThroughEndpointHelpers.get_response_headers(
-                    headers=response.headers,
-                    litellm_call_id=litellm_call_id,
-                ),
-                status_code=response.status_code,
+            response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
+                headers=response.headers,
+                litellm_call_id=litellm_call_id,
             )
+            if is_native_openai_responses_route:
+                async def _on_native_wire_disposition(
+                    disposition: OpenAIResponsesWireDisposition,
+                    trace: OpenAIResponsesWireTrace,
+                ) -> None:
+                    await _finalize_native_openai_responses_owner_wire_disposition(
+                        request=request,
+                        disposition=disposition,
+                        trace=trace,
+                    )
+
+                processed_chunks, wire_trace = wrap_openai_responses_stream(
+                    processed_chunks,
+                    upstream_response=response,
+                    on_disposition=_on_native_wire_disposition,
+                    model=(
+                        str(provider_bound_body.get("model"))
+                        if isinstance(provider_bound_body, dict)
+                        and provider_bound_body.get("model") is not None
+                        else None
+                    ),
+                )
+                bind_openai_responses_wire_trace_to_request(request, wire_trace)
+                stream_response = OpenAIResponsesStreamingResponse(
+                    processed_chunks,
+                    wire_trace=wire_trace,
+                    on_disposition=_on_native_wire_disposition,
+                    headers=response_headers,
+                    status_code=response.status_code,
+                )
+            else:
+                stream_response = StreamingResponse(
+                    processed_chunks,
+                    headers=response_headers,
+                    status_code=response.status_code,
+                )
             _publish_openai_send_telemetry()
             return bind_output_guard_to_streaming_response(
                 bind_deferred_success_holder(
@@ -6774,21 +7079,84 @@ async def pass_through_request(  # noqa: PLR0915
                 exc_info=True,
             )
         _publish_openai_send_telemetry()
-        response_to_return = Response(
-            content=content,
-            status_code=response.status_code,
-            headers=response_headers,
-        )
+        if is_native_openai_responses_route:
+            response_status = (
+                response_body.get("status")
+                if isinstance(response_body, dict)
+                else None
+            )
+            if str(response_status or "").lower() == "completed":
+                disposition = OpenAIResponsesWireDisposition.COMPLETED
+            elif str(response_status or "").lower() == "failed":
+                disposition = OpenAIResponsesWireDisposition.FAILED
+            else:
+                disposition = OpenAIResponsesWireDisposition.INCOMPLETE
+
+            wire_trace = OpenAIResponsesWireTrace()
+            wire_trace.metadata["buffered_response_disposition"] = disposition.value
+
+            async def _on_native_wire_disposition(
+                final_disposition: OpenAIResponsesWireDisposition,
+                trace: OpenAIResponsesWireTrace,
+            ) -> None:
+                await _finalize_native_openai_responses_owner_wire_disposition(
+                    request=request,
+                    disposition=final_disposition,
+                    trace=trace,
+                )
+
+            bind_openai_responses_wire_trace_to_request(request, wire_trace)
+            response_to_return = OpenAIResponsesBufferedResponse(
+                content=content,
+                wire_trace=wire_trace,
+                disposition=disposition,
+                on_disposition=_on_native_wire_disposition,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
+        else:
+            response_to_return = Response(
+                content=content,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
         if deferred_success_holder is not None:
             deferred_success_holder.set_finalizer(_finalize_deferred_success)
         return bind_deferred_success_holder(
             response_to_return,
             deferred_success_holder,
         )
+    except asyncio.CancelledError:
+        try:
+            await _aawm_session_owner_on_upstream_result(
+                request=request,
+                success=False,
+                defer_session_owner_promotion=defer_session_owner_promotion,
+            )
+        except Exception:
+            verbose_proxy_logger.debug(
+                "Failed to release session-owner lease after pass-through "
+                "cancellation",
+                exc_info=True,
+            )
+        raise
     except Exception as e:
         _publish_openai_send_telemetry()
-        if not getattr(e, "aawm_openai_wire_replay_blocked", False):
+        replay_blocked = getattr(e, "aawm_openai_wire_replay_blocked", False)
+        if not replay_blocked:
             await close_active_upstream_response(request)
+            try:
+                await _aawm_session_owner_on_upstream_result(
+                    request=request,
+                    success=False,
+                    defer_session_owner_promotion=defer_session_owner_promotion,
+                )
+            except Exception:
+                verbose_proxy_logger.debug(
+                    "Failed to release session-owner lease on pass-through "
+                    "exception",
+                    exc_info=True,
+                )
         custom_headers = ProxyBaseLLMRequestProcessing.get_custom_headers(
             user_api_key_dict=user_api_key_dict,
             call_id=litellm_call_id,

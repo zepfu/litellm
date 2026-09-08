@@ -123,6 +123,44 @@ def _request_endpoint_path(request: Any) -> Optional[str]:
     return path if isinstance(path, str) else None
 
 
+def _is_native_openai_responses_candidate(
+    *,
+    request: Any,
+    candidate: Mapping[str, Any],
+) -> bool:
+    endpoint = (_request_endpoint_path(request) or "").lower()
+    return (
+        str(candidate.get("provider") or "").strip().lower() == "openai"
+        and str(candidate.get("route_family") or "").strip().lower()
+        == "codex_responses"
+        and "responses" in endpoint
+    )
+
+
+def _stage_native_openai_responses_affinity_commitment(
+    *,
+    request: Any,
+    session_key: Optional[str],
+    candidate: Mapping[str, Any],
+    setter: Any,
+) -> None:
+    state = getattr(request, "state", None)
+    if state is None:
+        return
+    try:
+        setattr(
+            state,
+            "_aawm_native_openai_responses_affinity_commitment",
+            {
+                "session_key": session_key,
+                "candidate": dict(candidate),
+                "setter": setter,
+            },
+        )
+    except Exception:
+        return
+
+
 def _store_attempt_failure_state(
     attempt_record: dict[str, Any],
     exc: Any,
@@ -2191,6 +2229,20 @@ async def handle_alias_route(  # noqa: PLR0915
                         if guard.provenance:
                             selection["session_owner_provenance"] = guard.provenance
 
+                        if _is_native_openai_responses_candidate(
+                            request=request,
+                            candidate=candidate,
+                        ):
+                            # Stage legacy affinity before the provider call so
+                            # buffered and streaming Responses paths can commit
+                            # it from the same accepted wire disposition.
+                            _stage_native_openai_responses_affinity_commitment(
+                                request=request,
+                                session_key=selection.get("session_key"),
+                                candidate=candidate,
+                                setter=set_session_affinity_fn,
+                            )
+
                         _dev_fault_plan._raise_if_openai_fault_plan_slot_fails(
                             request,
                             candidate=candidate,
@@ -2399,10 +2451,14 @@ async def handle_alias_route(  # noqa: PLR0915
                                         ),
                                         cooldown_keys=(selection["cooldown_key"],),
                                     )
-                                await set_session_affinity_fn(
-                                    selection.get("session_key"),
-                                    candidate,
-                                )
+                                if not _is_native_openai_responses_candidate(
+                                    request=request,
+                                    candidate=candidate,
+                                ):
+                                    await set_session_affinity_fn(
+                                        selection.get("session_key"),
+                                        candidate,
+                                    )
                                 assert response is not None
                                 attempt_record["attempted_provider_call"] = (
                                     attempted_provider_call
@@ -2667,6 +2723,53 @@ async def handle_alias_route(  # noqa: PLR0915
                             ),
                             attempted_provider_call=True,
                             request=request,
+                        )
+
+                    if probe_failure_exc is not None and (
+                        isinstance(probe_failure_exc, ProviderCallReplayBlocked)
+                        or getattr(
+                            probe_failure_exc,
+                            "aawm_openai_wire_replay_blocked",
+                            False,
+                        )
+                    ):
+                        attempt_record["status"] = (
+                            "terminal_openai_wire_replay_blocked"
+                        )
+                        attempt_record["failure_phase"] = (
+                            "openai_wire_replay_blocked"
+                        )
+                        attempt_record["attempted_provider_call"] = False
+                        attempt_record["wire_commitment"] = getattr(
+                            probe_failure_exc,
+                            "wire_commitment",
+                            None,
+                        )
+                        _record_auto_agent_alias_attempt_failure(
+                            alias_family=alias_family,
+                            alias_model=alias_model,
+                            request=request,
+                            prepared_request_body=prepared_request_body,
+                            selection=selection,
+                            attempts=attempts,
+                            attempt_record=attempt_record,
+                            error_class="openai_wire_replay_blocked",
+                            add_alias_metadata_fn=add_alias_metadata_fn,
+                        )
+                        _raise_terminal_alias_failure(
+                            probe_failure_exc,
+                            extra_fields={
+                                "wire_commitment": getattr(
+                                    probe_failure_exc,
+                                    "wire_commitment",
+                                    None,
+                                ),
+                                "request_call_ledger": getattr(
+                                    probe_failure_exc,
+                                    "ledger_snapshot",
+                                    None,
+                                ),
+                            },
                         )
 
                     if (
