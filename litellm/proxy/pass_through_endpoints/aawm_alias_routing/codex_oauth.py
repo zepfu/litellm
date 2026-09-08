@@ -1009,23 +1009,28 @@ def _codex_oauth_affinity_conflicts(
         if left_value and right_value and left_value != right_value:
             return True
 
-    left_route = _clean_codex_auth_value(left.get("route_family"))
-    right_route = _clean_codex_auth_value(right.get("route_family"))
-    codex_routes = {
+    managed_codex_routes = {
         "codex_oauth",
         "codex_responses",
         "openai_responses",
     }
-    left_route = left_route.lower() if left_route else None
-    right_route = right_route.lower() if right_route else None
+    def _canonical_route_family(value: Any) -> Optional[str]:
+        route = _clean_codex_auth_value(value)
+        if route is None:
+            return None
+        normalized = route.lower()
+        return (
+            "codex_responses"
+            if normalized in managed_codex_routes
+            else normalized
+        )
+
+    left_route = _canonical_route_family(left.get("route_family"))
+    right_route = _canonical_route_family(right.get("route_family"))
     if (
         left_route
         and right_route
-        and (
-            left_route not in codex_routes
-            or right_route not in codex_routes
-            or left_route != right_route
-        )
+        and left_route != right_route
     ):
         return True
 
@@ -1614,6 +1619,14 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     )
     if continuation.invalid:
         raise _codex_oauth_affinity_token_invalid_exception()
+    if explicit_model is None and continuation.declared:
+        raise _codex_oauth_affinity_token_invalid_exception(
+            message=(
+                "A model-less direct Codex OAuth request cannot use a signed "
+                "continuation affinity because the concrete model cannot be "
+                "bound to the provider request body."
+            )
+        )
     token_affinity = continuation.as_affinity()
     affinity: Optional[dict[str, Any]] = None
     if session_identity is not None:

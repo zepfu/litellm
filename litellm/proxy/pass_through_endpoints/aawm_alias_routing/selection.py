@@ -409,8 +409,6 @@ _AUTO_AGENT_ACCOUNT_IDENTITY_FIELDS = frozenset(
         "account_lane",
         "account_display",
         "account_ref",
-        "cooldown_key",
-        "logical_cooldown_key",
         "lane_key",
         "prior_account_hash",
         "attempted_account_hashes",
@@ -427,18 +425,43 @@ _AUTO_AGENT_ACCOUNT_IDENTITY_FIELDS = frozenset(
 )
 
 
-def _redact_auto_agent_account_identity(value: Any) -> Any:
+def _redact_auto_agent_account_identity(
+    value: Any,
+    *,
+    redact_cooldown_keys: bool = False,
+) -> Any:
     """Remove account identity from client-visible alias diagnostics."""
+    excluded_fields = _AUTO_AGENT_ACCOUNT_IDENTITY_FIELDS
+    if redact_cooldown_keys:
+        excluded_fields = excluded_fields | {
+            "cooldown_key",
+            "logical_cooldown_key",
+        }
     if isinstance(value, dict):
         return {
-            key: _redact_auto_agent_account_identity(nested)
+            key: _redact_auto_agent_account_identity(
+                nested,
+                redact_cooldown_keys=redact_cooldown_keys,
+            )
             for key, nested in value.items()
-            if key not in _AUTO_AGENT_ACCOUNT_IDENTITY_FIELDS
+            if key not in excluded_fields
         }
     if isinstance(value, list):
-        return [_redact_auto_agent_account_identity(item) for item in value]
+        return [
+            _redact_auto_agent_account_identity(
+                item,
+                redact_cooldown_keys=redact_cooldown_keys,
+            )
+            for item in value
+        ]
     if isinstance(value, tuple):
-        return tuple(_redact_auto_agent_account_identity(item) for item in value)
+        return tuple(
+            _redact_auto_agent_account_identity(
+                item,
+                redact_cooldown_keys=redact_cooldown_keys,
+            )
+            for item in value
+        )
     return value
 
 
@@ -2172,6 +2195,10 @@ def _find_codex_auto_agent_affinity_candidate(
     for candidate in pool:
         if candidate.get("model") == affinity_model:
             return dict(candidate)
+    if affinity.get("affinity_state_source") == (
+        "authenticated_continuation_token"
+    ):
+        return None
     return dict(pool[0])
 
 
@@ -2299,6 +2326,10 @@ def _candidate_matches_affinity(
         return False
     if not _route_families_compatible_for_affinity(candidate, affinity):
         return False
+    if affinity.get("affinity_state_source") == (
+        "authenticated_continuation_token"
+    ):
+        return candidate.get("model") == affinity.get("model")
     # OPENAI-020: model and OpenAI account are mutable on the same hosted
     # provider. Do not require candidate.model or account_label/hash/lane.
     return True
@@ -4228,17 +4259,25 @@ def _build_auto_agent_redispatch_http_exception_detail(
         detail["attempted_provider_call"] = attempted_provider_call
     if isinstance(audit_events, list):
         detail["aawm_alias_routing_audit_events"] = (
-            _redact_auto_agent_account_identity(audit_events)
+            _redact_auto_agent_account_identity(
+                audit_events,
+                redact_cooldown_keys=alias_family == "codex_auto_agent",
+            )
         )
     if isinstance(attempts, list):
-        detail["attempts"] = _redact_auto_agent_account_identity(attempts)
+        detail["attempts"] = _redact_auto_agent_account_identity(
+            attempts,
+            redact_cooldown_keys=alias_family == "codex_auto_agent",
+        )
     if isinstance(skipped_candidates, list):
         detail["skipped_candidates"] = _redact_auto_agent_account_identity(
-            skipped_candidates
+            skipped_candidates,
+            redact_cooldown_keys=alias_family == "codex_auto_agent",
         )
     if isinstance(terminal_reset, dict):
         detail["terminal_reset"] = _redact_auto_agent_account_identity(
-            terminal_reset
+            terminal_reset,
+            redact_cooldown_keys=alias_family == "codex_auto_agent",
         )
     return detail
 
@@ -5327,12 +5366,16 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             "type": "rate_limit_error",
             "code": "aawm_codex_auto_agent_all_candidates_cooling_down",
         },
-        "candidates": _redact_auto_agent_account_identity(skipped),
+        "candidates": _redact_auto_agent_account_identity(
+            skipped,
+            redact_cooldown_keys=True,
+        ),
     }
     terminal_reset = _build_codex_oauth_terminal_reset_information(states)
     if terminal_reset is not None:
         detail["terminal_reset"] = _redact_auto_agent_account_identity(
-            terminal_reset
+            terminal_reset,
+            redact_cooldown_keys=True,
         )
     raise HTTPException(
         status_code=429,
@@ -5754,13 +5797,11 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
             "type": "rate_limit_error",
             "code": "aawm_anthropic_auto_agent_all_candidates_cooling_down",
         },
-        "candidates": _redact_auto_agent_account_identity(skipped),
+        "candidates": skipped,
     }
     terminal_reset = _build_codex_oauth_terminal_reset_information(states)
     if terminal_reset is not None:
-        detail["terminal_reset"] = _redact_auto_agent_account_identity(
-            terminal_reset
-        )
+        detail["terminal_reset"] = terminal_reset
     raise HTTPException(
         status_code=429,
         detail=detail,
