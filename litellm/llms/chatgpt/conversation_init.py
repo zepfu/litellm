@@ -3242,6 +3242,11 @@ def write_conversation_init_snapshot(path: str, snapshot: Mapping[str, Any]) -> 
             telemetry_class="malformed_telemetry",
         ) from exc
     serialized = json.dumps(dict(snapshot), sort_keys=True, ensure_ascii=True)
+    if len(serialized.encode("utf-8")) > MAX_CONVERSATION_INIT_SOURCE_BYTES:
+        raise ChatGPTConversationInitError(
+            "ChatGPT conversation-init snapshot exceeds the sanitized size limit.",
+            telemetry_class="malformed_telemetry",
+        )
     fd, tmp_name = tempfile.mkstemp(
         prefix=".conversation-init.",
         suffix=".tmp",
@@ -3819,6 +3824,19 @@ def _snapshot_is_persistable(
     return bool(sanitized.get("account_hash") or sanitized.get("source_identity_hash"))
 
 
+def _snapshot_fits_write_budget(sanitized: Mapping[str, Any]) -> bool:
+    return (
+        len(
+            json.dumps(
+                dict(sanitized),
+                sort_keys=True,
+                ensure_ascii=True,
+            ).encode("utf-8")
+        )
+        <= MAX_CONVERSATION_INIT_SOURCE_BYTES
+    )
+
+
 def _destination_has_reusable_snapshot(path: str) -> bool:
     try:
         raw = load_conversation_init_source(path)
@@ -3829,7 +3847,10 @@ def _destination_has_reusable_snapshot(path: str) -> bool:
         source_path=path,
         _allow_verified_envelope_identity=True,
     )
-    return _snapshot_is_persistable(sanitized)
+    return (
+        _snapshot_is_persistable(sanitized)
+        and _snapshot_fits_write_budget(sanitized)
+    )
 
 
 def _destination_has_reusable_bound_snapshot(
@@ -3850,7 +3871,7 @@ def _destination_has_reusable_bound_snapshot(
         sanitized,
         expected_account_hash=expected_account_hash,
         require_verified_identity=True,
-    )
+    ) and _snapshot_fits_write_budget(sanitized)
 
 
 def _failure_telemetry_status(sanitized: Mapping[str, Any]) -> str:
