@@ -748,6 +748,10 @@ function messageFromNode(
   const author: Record<string, unknown> = isRecord(authorRaw) ? authorRaw : {};
   const authorRole = sanitizeToken(author.role);
   const metadataRaw = message.metadata;
+  const origin = resolveOriginEvidence([
+    { root: node, metadata: metadataRaw },
+    { root: message, metadata: metadataRaw },
+  ]);
   const metadataProjection = sanitizeMetadataWithDiagnostics(
     isRecord(metadataRaw) ? metadataRaw : {},
   );
@@ -814,15 +818,7 @@ function messageFromNode(
       sanitizeToken(metadata.message_request_id),
     requestId: sanitizeToken(metadata.request_id),
     surface: conversationSurface,
-    origin:
-      sanitizeToken(metadata.origin) ??
-      (metadata.imported === true
-        ? "imported"
-        : metadata.from_copy === true
-          ? "copied"
-          : metadata.from_shared === true
-            ? "shared"
-            : null),
+    origin,
     metadata,
   };
 }
@@ -1131,26 +1127,66 @@ function summaryOrigin(
   item: Record<string, unknown>,
   warnings: string[],
 ): string | null {
-  const origin = optionalString(item.origin);
-  if (origin !== null) {
-    return origin;
-  }
   const metadataRaw = item.metadata;
-  if (!isRecord(metadataRaw)) {
-    return null;
-  }
-  const metadataProjection = sanitizeMetadataWithDiagnostics(metadataRaw);
-  if (metadataProjection.diagnostics.status !== "complete") {
+  const origin = resolveOriginEvidence([
+    { root: item, metadata: metadataRaw },
+  ]);
+  const metadataProjection = isRecord(metadataRaw)
+    ? sanitizeMetadataWithDiagnostics(metadataRaw)
+    : null;
+  if (metadataProjection?.diagnostics.status !== "complete") {
     warnings.push(
-      `metadata_projection_${metadataProjection.diagnostics.status}`,
+      `metadata_projection_${metadataProjection?.diagnostics.status ?? "invalid_type"}`,
     );
   }
-  const metadata = metadataProjection.metadata;
-  return (
-    optionalString(metadata.origin) ??
-    (metadata.imported === true ? "imported" : null) ??
-    (metadata.from_copy === true ? "copied" : null)
-  );
+  return origin;
+}
+
+function resolveOriginEvidence(
+  sources: Array<{ root: Record<string, unknown>; metadata: unknown }>,
+): string | null {
+  for (const [index, source] of sources.entries()) {
+    if (index > 0 && source.root === sources[0]?.root) {
+      continue;
+    }
+    if (source.root.imported === true) return "imported";
+    if (source.root.from_copy === true) return "copied";
+    if (source.root.from_shared === true) return "shared";
+  }
+  const metadataSources = sources
+    .map((source) => (isRecord(source.metadata) ? source.metadata : null))
+    .filter((metadata): metadata is Record<string, unknown> => metadata !== null);
+  for (const metadata of metadataSources) {
+    if (metadata.imported === true) return "imported";
+    if (metadata.from_copy === true) return "copied";
+    if (metadata.from_shared === true) return "shared";
+  }
+
+  const labels = new Set<string>();
+  let observedOrigin = false;
+  let malformedOrigin = false;
+  const collectOrigin = (value: unknown): void => {
+    if (value === undefined || value === null || value === false) return;
+    observedOrigin = true;
+    const label = sanitizeToken(value);
+    if (label === null) {
+      malformedOrigin = true;
+      return;
+    }
+    labels.add(label);
+  };
+  for (const source of sources) {
+    collectOrigin(source.root.origin);
+  }
+  for (const metadata of metadataSources) {
+    collectOrigin(metadata.origin);
+  }
+  if (labels.size === 1) {
+    const [label] = labels;
+    return label ?? null;
+  }
+  if (labels.size > 1 || malformedOrigin) return null;
+  return observedOrigin ? null : null;
 }
 
 function normalizeTimestamp(value: unknown): string | null {
