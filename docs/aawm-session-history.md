@@ -2018,6 +2018,16 @@ expiry, last successful validation time, and redacted failure class/message.
 Rows must never include access tokens, refresh tokens, raw auth-file contents,
 or the raw auth-file path.
 
+Direct Codex OAuth continuation affinity is server-owned. Only durable session
+ownership or the private ``aawm_codex_affinity_token`` issuer can provide an
+account pin; raw account label/hash/lane fields in request bodies and
+``litellm_metadata`` are ignored. The short-lived token binds issuer,
+audience, route family, model, session, expiry, and a server-keyed opaque
+account reference. It is removed before provider serialization and is not
+persisted in session-history metadata, diagnostics, or provider-auth telemetry.
+Malformed, conflicting, tampered, expired, or cross-scope declared state fails
+closed before provider egress rather than selecting a fresh account.
+
 Grok native and `oa_xai/*` Responses candidates remove request fields, hosted
 tools, and unsupported `reasoning` input items that the selected Grok-family
 model declares unsupported. This does not strip the supported
