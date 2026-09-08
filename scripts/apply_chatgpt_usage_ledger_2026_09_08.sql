@@ -295,6 +295,32 @@ ALTER TABLE public.chatgpt_usage_observations
 ALTER TABLE public.chatgpt_usage_observations
     ALTER COLUMN last_seen_run_id SET NOT NULL;
 
+UPDATE public.chatgpt_usage_attempt_revisions AS revisions
+SET is_current_projection = EXISTS (
+    SELECT 1
+    FROM public.chatgpt_usage_attempts AS attempts
+    WHERE attempts.scope_key = revisions.scope_key
+      AND attempts.attempt_id = revisions.attempt_id
+      AND attempts.revision = revisions.revision
+      AND attempts.projection_fingerprint = revisions.projection_fingerprint
+);
+
+WITH ranked_observations AS (
+    SELECT
+        observation_id,
+        scope_key,
+        ROW_NUMBER() OVER (
+            PARTITION BY scope_key, source_kind, source_id
+            ORDER BY observed_at DESC, occurrence_number DESC, observation_id DESC
+        ) AS freshness_rank
+    FROM public.chatgpt_usage_observations
+)
+UPDATE public.chatgpt_usage_observations AS observations
+SET is_current_projection = ranked_observations.freshness_rank = 1
+FROM ranked_observations
+WHERE observations.observation_id = ranked_observations.observation_id
+  AND observations.scope_key = ranked_observations.scope_key;
+
 UPDATE public.chatgpt_usage_scopes
 SET identity_state = CASE
     WHEN provider_user_id IS NOT NULL
@@ -309,6 +335,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS chatgpt_usage_observations_occurrence_idx
     ON public.chatgpt_usage_observations (
         scope_key, source_kind, source_id, occurrence_number
     );
+CREATE UNIQUE INDEX IF NOT EXISTS chatgpt_usage_attempt_revisions_current_idx
+    ON public.chatgpt_usage_attempt_revisions (scope_key, attempt_id)
+    WHERE is_current_projection;
+CREATE UNIQUE INDEX IF NOT EXISTS chatgpt_usage_observations_current_unique_idx
+    ON public.chatgpt_usage_observations (scope_key, source_kind, source_id)
+    WHERE is_current_projection;
 
 WITH bootstrap_scopes AS (
     SELECT DISTINCT ON (scopes.collector_account_id)
