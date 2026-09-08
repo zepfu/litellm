@@ -275,6 +275,112 @@ def _credential_identity(canonical_path: Path, scope: str) -> str:
     return f"sha256:{hashlib.sha256(identity_input).hexdigest()}"
 
 
+def credential_identity(
+    auth_path: Optional[AuthPathValue] = None,
+    record: Optional[Mapping[str, Any]] = None,
+    *,
+    scope: Optional[str] = None,
+    stat_result: Optional[os.stat_result] = None,
+) -> Optional[str]:
+    """Return a stable nonsecret identity for one published credential generation.
+
+    Access and refresh token values are intentionally excluded. Callers that
+    already opened and validated a file should pass its descriptor metadata so
+    request code does not perform a second blocking filesystem operation.
+    """
+
+    if stat_result is None and auth_path is not None:
+        try:
+            stat_result = Path(auth_path).stat()
+        except OSError:
+            stat_result = None
+
+    stat_parts: dict[str, Any] = {}
+    if stat_result is not None:
+        stat_parts = {
+            "st_dev": stat_result.st_dev,
+            "st_ino": stat_result.st_ino,
+            "st_mtime_ns": stat_result.st_mtime_ns,
+            "st_ctime_ns": stat_result.st_ctime_ns,
+            "st_size": stat_result.st_size,
+        }
+
+    safe_record: dict[str, Any] = {}
+    if isinstance(record, Mapping):
+        for field_name in (
+            "expires_at",
+            "expires_in",
+            "issued_at",
+            "obtained_at",
+            "refreshed_at",
+            "oidc_client_id",
+            "client_id",
+            "token_type",
+            "source",
+        ):
+            value = record.get(field_name)
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                safe_record[field_name] = value
+
+    if not stat_parts and not safe_record and _clean_string(scope) is None:
+        return None
+    payload = {
+        "scope": _clean_string(scope),
+        "stat": stat_parts,
+        "record": safe_record,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _account_identity_value(value: Any) -> Optional[str | int]:
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def credential_account_identity(
+    record: Optional[Mapping[str, Any]] = None,
+    *,
+    scope: Optional[str] = None,
+) -> Optional[str]:
+    """Return a stable nonsecret identity only when account evidence is present."""
+
+    account_evidence: dict[str, Any] = {}
+    if isinstance(record, Mapping):
+        for field_name in (
+            "account_id",
+            "source_account_id",
+            "subject",
+        ):
+            value = _account_identity_value(record.get(field_name))
+            if value is not None:
+                account_evidence[field_name] = value
+    if not account_evidence:
+        return None
+
+    context: dict[str, Any] = {}
+    if isinstance(record, Mapping):
+        for field_name in ("client_id", "oidc_client_id"):
+            value = _account_identity_value(record.get(field_name))
+            if value is not None:
+                context[field_name] = value
+
+    payload = {
+        "account": account_evidence,
+        "context": context,
+        "scope": _clean_string(scope),
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"sha256:{digest}"
+
+
 def looks_like_xai_oauth_credential(value: Mapping[str, Any]) -> bool:
     """Return whether a mapping contains at least one credential field."""
 

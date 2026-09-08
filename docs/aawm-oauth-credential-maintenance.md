@@ -85,6 +85,18 @@ request rebuilds it. Missing, malformed, ambiguous-scope, expired, or
 near-expiry records fail closed. Request handling never refreshes or writes
 these files.
 
+### Managed xAI OAuth request snapshots
+
+Managed xAI request preparation uses an immutable, process-local snapshot
+keyed by credential family, canonical auth-file target, and exact scope.
+Configuration resolution, descriptor metadata checks, file reads, and JSON
+validation run off the request event loop. Concurrent requests share one
+single-flight parse for a credential generation. A change in file identity or
+metadata, or entry into the route-safety expiry buffer, invalidates the cached
+snapshot before a later request rebuilds it. Missing, malformed, ambiguous-
+scope, expired, or near-expiry records fail closed; request handling never
+refreshes or writes the managed credential file.
+
 ## OAuth refresh deadline contract
 
 Scheduled Grok OIDC, Codex OAuth, managed xAI OAuth, Kimi OAuth, and Nous
