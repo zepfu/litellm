@@ -4788,7 +4788,8 @@ async def _aawm_session_owner_on_upstream_result(
         )
 
 
-async def _finalize_native_openai_responses_owner_wire_disposition(
+# Keep ownership and legacy-affinity finalization ordered at the wire boundary.
+async def _finalize_native_openai_responses_owner_wire_disposition(  # noqa: PLR0915
     *,
     request: Request,
     disposition: OpenAIResponsesWireDisposition,

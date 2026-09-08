@@ -568,7 +568,8 @@ class OpenAIResponsesWireCoordinator:
         ):
             yield emitted
 
-    async def __aiter__(self) -> AsyncIterator[bytes]:
+    # Keep terminal selection and transport cleanup in one ordered lifecycle.
+    async def __aiter__(self) -> AsyncIterator[bytes]:  # noqa: PLR0915
         try:
             self._source_iterator = self._source.__aiter__()
             async for raw_chunk in self._source_iterator:
