@@ -399,7 +399,9 @@ async function terminateOwnedStartupChrome(scratchDir, chrome) {
       // Cleanup continues with owned PID evidence below.
     }
   }
-  if (!scratchDir) {
+  // The sidecar retains stable process handles for supervised descendants.
+  // Do not race its cleanup with numeric PID/group fallback signals.
+  if (!scratchDir || process.env.AAWM_CHATGPT_ORACLE_OWNER === os.tmpdir()) {
     return;
   }
   const ownedPids = await listOwnedChromePids(scratchDir);

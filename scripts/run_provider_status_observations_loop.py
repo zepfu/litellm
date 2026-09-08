@@ -393,6 +393,7 @@ CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV = (
 CHATGPT_ORACLE_NODE_EXECUTABLE_ENV = "AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE"
 CHATGPT_ORACLE_PACKAGE_DIR_ENV = "AAWM_CHATGPT_ORACLE_PACKAGE_DIR"
 CHATGPT_ORACLE_CHROME_EXECUTABLE_ENV = "AAWM_CHATGPT_ORACLE_CHROME_EXECUTABLE"
+CHATGPT_ORACLE_OWNER_ENV = "AAWM_CHATGPT_ORACLE_OWNER"
 CHATGPT_ORACLE_BROWSER_SESSION_SCRIPT = (
     Path(__file__).resolve().with_name("chatgpt_oracle_browser_session.mjs")
 )
@@ -2256,33 +2257,131 @@ def _signal_chatgpt_oracle_process_group(
         pass
 
 
-def _cleanup_chatgpt_oracle_process(process: subprocess.Popen) -> None:
+def _chatgpt_oracle_owned_handles(
+    process: subprocess.Popen, temp_root: str, handles: Dict[int, int],
+) -> None:
+    marker = f"{CHATGPT_ORACLE_OWNER_ENV}={temp_root}".encode()
+    candidates: Dict[int, tuple[int, int]] = {}
     try:
+        if process.returncode is None and process.pid not in handles:
+            try:
+                handles[process.pid] = os.pidfd_open(process.pid)
+            except ProcessLookupError:
+                pass
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit() or int(entry.name) in handles:
+                continue
+            pid = int(entry.name)
+            handle: Optional[int] = None
+            try:
+                handle = os.pidfd_open(pid)
+                fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+                parent_pid = int(fields[1])
+                try:
+                    with (entry / "environ").open("rb") as environ:
+                        marked = marker in environ.read(1_048_576).split(b"\0")
+                except OSError:
+                    marked = False
+                if marked:
+                    handles[pid] = handle
+                else:
+                    candidates[pid] = (parent_pid, handle)
+                handle = None
+            except (OSError, ValueError, IndexError):
+                pass
+            finally:
+                if handle is not None:
+                    os.close(handle)
+        # Sandbox children may hide environ, but still have an owned parent.
+        while True:
+            children = []
+            for pid, (parent, _) in candidates.items():
+                parent_handle = handles.get(parent)
+                if parent_handle is not None and not select.select(
+                    [parent_handle], [], [], 0
+                )[0]:
+                    children.append(pid)
+            if not children:
+                break
+            for pid in children:
+                _, handle = candidates.pop(pid)
+                handles[pid] = handle
+    finally:
+        for _, handle in candidates.values():
+            os.close(handle)
+
+
+def _signal_chatgpt_oracle_handles(handles: Dict[int, int], sig: int) -> None:
+    for handle in handles.values():
+        try:
+            signal.pidfd_send_signal(handle, sig)
+        except ProcessLookupError:
+            pass
+
+
+def _remove_chatgpt_oracle_scratch(temp_root: str) -> None:
+    remover = subprocess.Popen(
+        [sys.executable, "-c", "import shutil,sys; shutil.rmtree(sys.argv[1])", temp_root],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        result = remover.wait(
+            timeout=DEFAULT_CHATGPT_ORACLE_FORCE_TERMINATION_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired as exc:
+        remover.kill()
+        try:
+            remover.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        raise RuntimeError("Oracle browser scratch cleanup timed out.") from exc
+    if result != 0 or Path(temp_root).exists():
+        raise RuntimeError("Oracle browser scratch cleanup failed.")
+
+
+def _cleanup_chatgpt_oracle_process(
+    process: subprocess.Popen, temp_root: str,
+) -> None:
+    handles: Dict[int, int] = {}
+    try:
+        _chatgpt_oracle_owned_handles(process, temp_root, handles)
         if process.stdin is not None:
             process.stdin.close()
     except (BrokenPipeError, OSError):
         pass
     try:
         process.wait(timeout=DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        _signal_chatgpt_oracle_process_group(process, signal.SIGTERM)
-        try:
-            process.wait(timeout=DEFAULT_CHATGPT_ORACLE_FORCE_TERMINATION_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            _signal_chatgpt_oracle_process_group(process, signal.SIGKILL)
-            try:
-                process.wait(timeout=DEFAULT_CHATGPT_ORACLE_FORCE_TERMINATION_TIMEOUT_SECONDS)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         pass
     finally:
-        for stream in (process.stdout, process.stderr):
-            if stream is not None:
-                try:
+        try:
+            # Run even after the helper exits: copied-profile workers and Chrome
+            # may outlive it. Retain handles across TERM/KILL and PID reuse.
+            _chatgpt_oracle_owned_handles(process, temp_root, handles)
+            _signal_chatgpt_oracle_handles(handles, signal.SIGTERM)
+            if handles:
+                ready, _, _ = select.select(list(handles.values()), [], [], 1)
+                _chatgpt_oracle_owned_handles(process, temp_root, handles)
+                _signal_chatgpt_oracle_handles(handles, signal.SIGKILL)
+                deadline = time.monotonic() + (
+                    DEFAULT_CHATGPT_ORACLE_FORCE_TERMINATION_TIMEOUT_SECONDS
+                )
+                pending = set(handles.values()) - set(ready)
+                while pending and time.monotonic() < deadline:
+                    ready, _, _ = select.select(
+                        list(pending), [], [], max(0, deadline - time.monotonic())
+                    )
+                    pending.difference_update(ready)
+                if pending:
+                    raise RuntimeError("Oracle browser process cleanup timed out.")
+            process.wait(timeout=1)
+            _remove_chatgpt_oracle_scratch(temp_root)
+        finally:
+            for handle in handles.values():
+                os.close(handle)
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
                     stream.close()
-                except OSError:
-                    pass
 
 
 @contextmanager
@@ -2298,7 +2397,21 @@ def _chatgpt_oracle_browser_binding(
         )
         return
 
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise RuntimeError("Oracle profile bindings require Linux process handles.")
+    try:
+        capability_handle = os.pidfd_open(os.getpid())
+        try:
+            signal.pidfd_send_signal(capability_handle, 0)
+        finally:
+            os.close(capability_handle)
+    except OSError as exc:
+        raise RuntimeError("Oracle process-handle supervision is unavailable.") from exc
     process: Optional[subprocess.Popen] = None
+    temp_root = tempfile.mkdtemp(prefix="aawm-oracle-owner-")
+    child_env = {
+        **os.environ, "TMPDIR": temp_root, CHATGPT_ORACLE_OWNER_ENV: temp_root,
+    }
     try:
         try:
             process = subprocess.Popen(
@@ -2309,13 +2422,16 @@ def _chatgpt_oracle_browser_binding(
                 shell=False,
                 close_fds=True,
                 start_new_session=(os.name == "posix"),
+                env=child_env,
             )
         except OSError as exc:
             raise RuntimeError("Oracle browser helper could not be started.") from exc
         yield _read_chatgpt_oracle_startup_binding(process)
     finally:
         if process is not None:
-            _cleanup_chatgpt_oracle_process(process)
+            _cleanup_chatgpt_oracle_process(process, temp_root)
+        else:
+            _remove_chatgpt_oracle_scratch(temp_root)
 
 
 def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915

@@ -805,6 +805,13 @@ defeat dedup. Empty `model_limits`, `limits_progress`, or `blocked_features`
 collections, and absent fields, are `empty_unknown` / `absent_unknown`. They
 are not proof of unlimited capacity or zero usage.
 
+Validated bare identities in named collections, numeric-string usage values,
+and supported reset-field aliases survive projection. Non-finite or overflowing
+numbers are rejected locally. A wholly malformed collection response does not
+replace a reusable snapshot; usable partial responses and genuinely empty
+collections remain distinct. Projection limits carry explicit truncation
+evidence through file rereads, rather than inferring loss from row counts.
+
 When `AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS` is absent, the sidecar
 preserves legacy file-only mode. That mode covers only the one
 configured snapshot path and must not be described as live all-account
@@ -877,13 +884,19 @@ copies the read-only base profile into a private working profile, and cleans up
 only its private processes and files. It must not open the shared base profile
 as a competing persistent browser context. It runs headed Chrome with an Xvfb
 fallback when `DISPLAY` is absent; it is not a standalone service.
+The Linux caller checks process-handle support before launch, creates a private
+scratch root, and retains stable handles for its children through cancellation.
+Cleanup also runs after helper exit, stops residual owned children, and verifies
+scratch removal. Failed process or file cleanup is an explicit capture failure,
+not a silently successful poll. No shared Oracle session is terminated.
 
 The actual sidecar is owned by
 `aawm-infrastructure/docker-compose.thoth-litellm.yml` and runs as UID 1000.
 Chrome, the installed Oracle Node/module tree, and base profiles are supplied
-through read-only runtime mounts. The copied-profile lifecycle remains pending
-review, and infrastructure integration requires separate approval; these
-contracts do not claim deployed acceptance.
+through read-only runtime mounts. Allocate sufficient memory for the existing
+sidecar plus Chrome and its temporary profile. Keep copied profiles on private
+ephemeral storage; do not mount the base profile writable. Deployment and
+per-account recurring persistence require separate operational verification.
 
 Polling uses a 600-second default cadence. `Retry-After` and backoff apply to
 the shared browser session, preserving other sessions and prior observation

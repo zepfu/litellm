@@ -151,6 +151,7 @@ _ENVELOPE_KEYS = {
     "browser_challenge",
     "retry_after_seconds",
     "request_body_omitted",
+    "projection_truncated",
 }
 _PAYLOAD_ENVELOPE_KEYS = ("body", "payload", "response", "json", "data")
 _SECRET_KEY_MARKERS = (
@@ -790,6 +791,19 @@ def sanitize_conversation_init_boundary(  # noqa: PLR0915 - boundary projection
         "payload": payload,
         "payload_schema": payload_schema,
         "payload_state": payload_state,
+        "projection_truncated": (
+            (
+                isinstance(payload_raw, Mapping)
+                and (
+                    len(payload_raw) > MAX_PROJECTION_OBJECT_KEYS
+                    or _schema_projection_truncated(payload_schema)
+                )
+            )
+            or (
+                _allow_verified_envelope_identity
+                and raw.get("projection_truncated") is True
+            )
+        ),
         "account_hash": account_hash,
         "account_identity_fields": account_identity_fields,
         "account_identity_source": account_identity_source,
@@ -944,7 +958,7 @@ def _resolve_parse_guard(  # noqa: PLR0915 - parser guard ordering
         "discovered_blocked_identities": [],
         "malformed_entry_count": 0,
         "valid_observation_count": 0,
-        "projection_truncated": False,
+        "projection_truncated": sanitized.get("projection_truncated") is True,
         "telemetry_status": "valid",
         "last_good_state_retained": False,
     }
@@ -1034,6 +1048,11 @@ def parse_conversation_init_observations(
     summary["discovered_blocked_identities"] = parsed["blocked_ids"]
     summary["malformed_entry_count"] = parsed["malformed"]
     summary["projection_truncated"] = parsed["truncated"]
+    if _collections_are_wholly_malformed(parsed):
+        summary["telemetry_status"] = "malformed"
+        summary["telemetry_class"] = "malformed_telemetry"
+        summary["last_good_state_retained"] = True
+        return [], summary
     if parsed["truncated"]:
         summary["telemetry_status"] = "partial"
     elif parsed["malformed"] and not parsed["model_ids"] and not parsed["feature_ids"]:
@@ -1082,11 +1101,7 @@ def _parse_collections(
     default_model_rows, default_model_ids = _parse_default_model_identities(
         payload, existing_ids=set(model_ids),
     )
-    truncated = (
-        len(feature_rows) >= MAX_PROJECTION_LIST_ITEMS
-        or len(model_rows) >= MAX_PROJECTION_LIST_ITEMS
-        or len(blocked_rows) >= MAX_PROJECTION_LIST_ITEMS
-    )
+    truncated = summary.get("projection_truncated") is True
     return {
         "feature_rows": feature_rows,
         "feature_ids": feature_ids,
@@ -1102,6 +1117,14 @@ def _parse_collections(
         "malformed": feature_malformed + model_malformed + blocked_malformed,
         "truncated": truncated,
     }
+
+
+def _collections_are_wholly_malformed(parsed: Mapping[str, Any]) -> bool:
+    return bool(parsed["malformed"]) and not any(
+        parsed[key] for key in ("feature_rows", "model_rows", "blocked_rows")
+    )
+
+
 def build_conversation_init_rate_limit_tuples(
     observations: Sequence[Mapping[str, Any]],
     *,
@@ -1235,7 +1258,7 @@ def _http_status_failure(status_code: Any) -> Optional[str]:
         return None
     try:
         code = int(status_code)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return None
     if 200 <= code < 300:
         return None
@@ -1332,7 +1355,12 @@ def _redact_mapping(
         redacted_value, node, nested_redacted = _redact_value(
             value,
             depth=depth + 1,
-            parent_key=name,
+            parent_key=(
+                "remaining"
+                if parent_normalized in {"model_limits", "limits_progress"}
+                and isinstance(value, str)
+                else name
+            ),
         )
         redacted_count += nested_redacted
         schema[name] = node
@@ -1394,12 +1422,17 @@ def _redact_value(
             "schema_fingerprint": fingerprint,
             "state": "present" if nested_schema else "empty_unknown",
             "projection": nested_payload,
+            "truncated": (
+                len(value) > MAX_PROJECTION_OBJECT_KEYS
+                or _schema_projection_truncated(nested_schema)
+            ),
         }
         return nested_payload, object_node, redacted
     if isinstance(value, list):
         items: List[Any] = []
         item_kinds: List[str] = []
         redacted = 0
+        nested_truncated = False
         bounded = value[:MAX_PROJECTION_LIST_ITEMS]
         for item in bounded:
             nested_value, item_node, nested_redacted = _redact_value(
@@ -1409,6 +1442,10 @@ def _redact_value(
             )
             redacted += nested_redacted
             item_kinds.append(str(item_node.get("kind") or "unknown"))
+            nested_truncated = nested_truncated or (
+                item_node.get("kind") == "truncated"
+                or item_node.get("truncated") is True
+            )
             if item_node.get("kind") != "redacted":
                 items.append(nested_value)
         state = "empty_unknown" if not value else "present"
@@ -1421,9 +1458,18 @@ def _redact_value(
             "state": state,
             "item_kinds": sorted(set(item_kinds)),
             "projection": items,
+            "truncated": truncated or nested_truncated,
         }
         return items, list_node, redacted
     return None, {"kind": "redacted"}, 1
+
+
+def _schema_projection_truncated(schema: Mapping[str, Any]) -> bool:
+    return any(
+        isinstance(node, Mapping)
+        and (node.get("kind") == "truncated" or node.get("truncated") is True)
+        for node in schema.values()
+    )
 
 
 def _schema_fingerprint(schema: Mapping[str, Any]) -> str:
@@ -1901,7 +1947,13 @@ def _is_safe_string_value(
 ) -> bool:
     """Allow strings only for explicitly safe telemetry field semantics."""
     normalized = _normalize_key(field_name) if field_name else ""
-    return normalized in _SAFE_STRING_FIELD_NAMES and _is_safe_telemetry_string(value)
+    identity_collection = normalized in {
+        "model_limits", "limits_progress", "blocked_features",
+    }
+    reset_field = normalized in {_normalize_key(key) for key in _RESET_KEYS}
+    return (
+        normalized in _SAFE_STRING_FIELD_NAMES or identity_collection or reset_field
+    ) and _is_safe_telemetry_string(value)
 
 
 def _entry_projections(entry: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1973,7 +2025,7 @@ def _parse_usage_number(value: Any) -> Optional[float]:
         return None
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return None
     if not isfinite(number) or number < 0:
         return None
@@ -1994,8 +2046,8 @@ def _parse_usage_timestamp(value: Any) -> Optional[datetime]:
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, (int, float)):
-        numeric = float(value)
-        if not isfinite(numeric):
+        numeric = _finite_float(value)
+        if numeric is None:
             return None
         if numeric > 10_000_000_000:
             numeric /= 1000.0
@@ -2028,7 +2080,9 @@ def _safe_identity(value: Any) -> Optional[str]:
         finite_value = _finite_float(value)
         if finite_value is None:
             return None
-        text = str(int(finite_value)) if finite_value.is_integer() else str(finite_value)
+        text = str(value) if isinstance(value, int) else (
+            str(int(value)) if finite_value.is_integer() else str(value)
+        )
     elif isinstance(value, str):
         text = value.strip()
     else:
@@ -2069,7 +2123,7 @@ def _is_safe_usage_number_string(field_name: Optional[str], value: str) -> bool:
     """Permit provider-supplied numeric usage values, including JSON numbers."""
 
     normalized = _normalize_key(field_name)
-    return any(
+    return not _is_unsafe_string(value) and any(
         marker in normalized
         for marker in (
             "limit",
@@ -2328,12 +2382,19 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
 
     def extra_seen(event: Mapping[str, Any]) -> None:
         request_id = event.get("requestId")
-        if isinstance(request_id, str) and (
-            len(extra_hashes) < 256 or request_id == capture.get("request_id")
-        ):
-            extra_hashes[request_id] = _native_init_account_hash(
-                event.get("headers", {})
+        if not isinstance(request_id, str):
+            return
+        account_hash = _native_init_account_hash(event.get("headers", {}))
+        captured_id = capture.get("request_id")
+        if account_hash is None and request_id != captured_id:
+            return
+        if request_id not in extra_hashes and len(extra_hashes) >= 256:
+            oldest = next(
+                (key for key in extra_hashes if key != captured_id), None
             )
+            if oldest is not None:
+                del extra_hashes[oldest]
+        extra_hashes[request_id] = account_hash
 
     def response_seen(event: Mapping[str, Any]) -> None:
         nonlocal failure, boundary_error, browser_challenge
@@ -3848,7 +3909,9 @@ def _snapshot_is_persistable(
     if sanitized.get("payload_state") != "present":
         return False
     payload = sanitized.get("payload")
-    if not looks_like_conversation_init_payload(payload):
+    if not isinstance(payload, Mapping) or not looks_like_conversation_init_payload(payload):
+        return False
+    if _collections_are_wholly_malformed(_parse_collections(payload, {})):
         return False
     if require_verified_identity:
         return bool(
