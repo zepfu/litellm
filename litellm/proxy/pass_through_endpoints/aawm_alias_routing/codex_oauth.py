@@ -60,6 +60,9 @@ _PROXY_OWNED_ACCOUNT_DISPLAY_METADATA_KEYS = (
     "codex_oauth_account_display",
     "codex_auto_agent_selected_account_display",
 )
+_CODEX_OAUTH_AFFINITY_TOKEN_BODY_KEY = "aawm_codex_affinity_token"
+_CODEX_OAUTH_AFFINITY_TOKEN_TYPE = "aawm_codex_account_affinity"
+_CODEX_OAUTH_AFFINITY_TOKEN_VERSION = 1
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -890,6 +893,95 @@ def _direct_codex_oauth_affinity_from_session_owner(
     }
 
 
+def _codex_oauth_affinity_token_from_request(
+    *,
+    body: dict[str, Any],
+) -> Optional[str]:
+    """Return the dedicated server-authenticated affinity token, if present."""
+    token = _clean_codex_auth_value(body.get(_CODEX_OAUTH_AFFINITY_TOKEN_BODY_KEY))
+    if token is not None:
+        return token
+    metadata = body.get("litellm_metadata")
+    if isinstance(metadata, dict):
+        return _clean_codex_auth_value(
+            metadata.get(_CODEX_OAUTH_AFFINITY_TOKEN_BODY_KEY)
+        )
+    return None
+
+
+def _codex_oauth_affinity_from_authenticated_token(
+    *,
+    token: Optional[str],
+    model: str,
+    session_identity: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Validate a server-issued account-affinity continuation token.
+
+    A token is accepted only for the exact account identity, model, route
+    family, and declared session. Invalid tokens do not create an untrusted
+    fallback pin; affected requests use normal fresh selection ordering.
+    """
+    cleaned_token = _clean_codex_auth_value(token)
+    if cleaned_token is None:
+        return None
+
+    import jwt
+
+    from litellm.proxy.common_utils.encrypt_decrypt_utils import _get_salt_key
+
+    signing_key = _get_salt_key()
+    if not signing_key:
+        return None
+    try:
+        claims = jwt.decode(
+            cleaned_token,
+            signing_key,
+            algorithms=["HS256"],
+            options={"require": ["exp", "type", "version"]},
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(claims, dict):
+        return None
+    if claims.get("type") != _CODEX_OAUTH_AFFINITY_TOKEN_TYPE:
+        return None
+    if claims.get("version") != _CODEX_OAUTH_AFFINITY_TOKEN_VERSION:
+        return None
+    if claims.get("route_family") != "codex_responses":
+        return None
+
+    token_model = _clean_codex_auth_value(claims.get("model"))
+    token_session = _clean_codex_auth_value(claims.get("session"))
+    label = _clean_codex_auth_value(claims.get("codex_oauth_account_label"))
+    account_hash = _clean_codex_auth_value(claims.get("codex_oauth_account_hash"))
+    lane_key = _clean_codex_auth_value(claims.get("codex_oauth_lane_key"))
+    if not all((token_model, token_session, label, account_hash, lane_key)):
+        return None
+    if (
+        session_identity is not None
+        and token_session != _clean_codex_auth_value(session_identity)
+    ):
+        return None
+    if model and token_model != model:
+        return None
+    expected_lane = _codex_oauth_account_lane_key(
+        account_label=label,
+        account_hash=account_hash,
+    )
+    if lane_key != expected_lane:
+        return None
+    return {
+        "provider": "openai",
+        "model": token_model,
+        "route_family": "codex_responses",
+        "last_resort": False,
+        "codex_oauth_account_label": label,
+        "codex_oauth_account_hash": account_hash,
+        "codex_oauth_lane_key": lane_key,
+        "affinity_state_source": "authenticated_continuation_token",
+    }
+
+
 
 async def _resolve_model_less_direct_codex_oauth_contexts(
     request: Request,
@@ -1083,43 +1175,24 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 model=model,
             )
 
-    # Body/request metadata pin (continuation metadata) when no owner pin.
+    # Only a server-authenticated continuation token may pin when no owner
+    # pin exists. Raw caller account labels, hashes, and lanes are ignored.
     if affinity is None:
-        metadata = body.get("litellm_metadata")
-        meta = metadata if isinstance(metadata, dict) else {}
-        pin_label = _clean_codex_auth_value(
-            meta.get("codex_oauth_account_label")
-            or meta.get("codex_auto_agent_selected_account_label")
-            or body.get("codex_oauth_account_label")
+        affinity = _codex_oauth_affinity_from_authenticated_token(
+            token=_codex_oauth_affinity_token_from_request(body=body),
+            model=model,
+            session_identity=session_identity,
         )
-        pin_hash = _clean_codex_auth_value(
-            meta.get("codex_oauth_account_hash")
-            or meta.get("codex_auto_agent_selected_account_hash")
-            or body.get("codex_oauth_account_hash")
-        )
-        pin_lane = _clean_codex_auth_value(
-            meta.get("codex_oauth_lane_key")
-            or meta.get("codex_auto_agent_selected_account_lane")
-            or body.get("codex_oauth_lane_key")
-        )
-        if all((pin_label, pin_hash, pin_lane)):
-            affinity = {
-                "provider": CODEX_AUTO_AGENT_NATIVE_PROVIDER,
-                "model": model,
-                "route_family": "codex_responses",
-                "last_resort": False,
-                "codex_oauth_account_label": pin_label,
-                "codex_oauth_account_hash": pin_hash,
-                "codex_oauth_lane_key": pin_lane,
-                "affinity_state_source": "request_metadata",
-            }
 
     affinity_selection_reason: Optional[str] = None
     if affinity is not None:
         if affinity.get("affinity_state_source") == "session_owner":
             affinity_selection_reason = "session_owner_pin"
-        elif affinity.get("affinity_state_source") == "request_metadata":
-            affinity_selection_reason = "request_metadata_pin"
+        elif (
+            affinity.get("affinity_state_source")
+            == "authenticated_continuation_token"
+        ):
+            affinity_selection_reason = "authenticated_continuation_token_pin"
 
     if inventory_model is None and affinity is None:
         # Model-less native path: reuse inventory model=None eligibility
@@ -1188,9 +1261,9 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 "accounts were intentionally not considered because this "
                 "continuation is owner-bound and non-portable."
             )
-        elif affinity_selection_reason == "request_metadata_pin":
+        elif affinity_selection_reason == "authenticated_continuation_token_pin":
             unavailable_message = (
-                "The required request-metadata-pinned Codex OAuth account is "
+                "The required continuation-token-pinned Codex OAuth account is "
                 "currently exhausted or unavailable for direct Responses traffic. "
                 "Alternate accounts were intentionally not considered because "
                 "this continuation is pinned and non-portable."
