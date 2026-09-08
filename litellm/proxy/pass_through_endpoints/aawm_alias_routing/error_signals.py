@@ -2449,7 +2449,10 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     assert _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS is not None
     status_code = _extract_adapter_exception_status_code(exc)
     tokens = _extract_codex_auto_agent_error_tokens(exc)
-    if _is_codex_auto_agent_grok_account_quota_exhaustion(exc):
+    if _is_codex_auto_agent_grok_account_quota_exhaustion(
+        exc,
+        candidate=candidate,
+    ):
         return "usage_limit_reached"
     alibaba_exhaustion_class = _classify_alibaba_token_plan_quota_exhaustion_response(
         exc,
