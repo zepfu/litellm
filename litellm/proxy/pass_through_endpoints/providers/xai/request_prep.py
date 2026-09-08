@@ -627,10 +627,24 @@ async def _prepare_oa_xai_passthrough_request(  # noqa: PLR0915
     selected_account = None
     if request is not None and runtime.is_oa_xai_model(request_body.get("model")):
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+            get_bound_xai_oauth_selected_account,
             get_or_bind_xai_oauth_selected_account,
+            resolve_xai_oauth_direct_continuation_account,
         )
 
-        selected_account = get_or_bind_xai_oauth_selected_account(request)
+        # Alias dispatch binds the candidate account before entering this
+        # preparer. Preserve that server-owned binding; otherwise direct
+        # continuations must prove ownership before primary selection.
+        selected_account = get_bound_xai_oauth_selected_account(request)
+        if selected_account is None:
+            selected_account = (
+                await resolve_xai_oauth_direct_continuation_account(
+                    request,
+                    request_body,
+                )
+            )
+        if selected_account is None:
+            selected_account = get_or_bind_xai_oauth_selected_account(request)
     request_snapshot = (
         _get_xai_oauth_snapshot_from_request(request)
         if request is not None

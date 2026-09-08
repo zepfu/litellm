@@ -399,7 +399,7 @@ async def resolve_xai_oauth_direct_continuation_account(
     request: Request,
     request_body: Mapping[str, Any],
 ) -> Optional[XaiOAuthSelectedAccount]:
-    """Validate durable owner identity before binding a direct continuation."""
+    """Require an established server association before direct continuation use."""
 
     if not _xai_oauth_request_has_continuation_state(request_body):
         return None
@@ -491,61 +491,21 @@ async def resolve_xai_oauth_direct_continuation_account(
             ),
         )
 
-    owner_label = _clean_string(owner_attributes.get("account_label"))
-    owner_hash = _clean_string(owner_attributes.get("account_hash"))
-    owner_lane = _clean_string(owner_attributes.get("account_lane"))
-    owner_scope = _clean_string(owner_attributes.get("account_scope"))
-    if not all((owner_label, owner_hash, owner_lane, owner_scope)):
-        _raise_xai_oauth_direct_continuation_redispatch(
-            request=request,
-            session_identity=session_identity,
-            cache_key=cache_key,
-            owner_record=owner_record,
-            failure_phase="xai_direct_continuation_owner_account_mismatch",
-            mismatch_reason=(
-                "session_owner: durable xAI OAuth owner is missing account identity"
-            ),
-        )
-    assert owner_label is not None
-    assert owner_hash is not None
-    assert owner_lane is not None
-    assert owner_scope is not None
-
-    try:
-        selected = build_xai_oauth_selected_account(
-            select_xai_oauth_account_record(label=owner_label)
-        )
-        selected = await resolve_xai_oauth_selected_account_identity(selected)
-    except Exception as exc:  # noqa: BLE001
-        _raise_xai_oauth_direct_continuation_redispatch(
-            request=request,
-            session_identity=session_identity,
-            cache_key=cache_key,
-            owner_record=owner_record,
-            failure_phase="xai_direct_continuation_account_unavailable",
-            mismatch_reason=str(exc),
-        )
-
-    if (
-        selected.label != owner_label
-        or selected.account_hash != owner_hash
-        or selected.lane_key != owner_lane
-        or selected.scope_identity != owner_scope
-    ):
-        _raise_xai_oauth_direct_continuation_redispatch(
-            request=request,
-            session_identity=session_identity,
-            cache_key=cache_key,
-            owner_record=owner_record,
-            failure_phase="xai_direct_continuation_owner_account_mismatch",
-            mismatch_reason=(
-                "session_owner: durable xAI OAuth account identity does not "
-                "match configured inventory"
-            ),
-        )
-
-    setattr(request.state, _XAI_OAUTH_SELECTED_ACCOUNT_STATE, selected)
-    return selected
+    # Session ownership is keyed by canonical session and currently carries no
+    # exact submitted continuation identifier. It cannot prove that this
+    # provider-owned response belongs to the durable xAI account, so do not
+    # select inventory or load credentials as a fallback.
+    _raise_xai_oauth_direct_continuation_redispatch(
+        request=request,
+        session_identity=session_identity,
+        cache_key=cache_key,
+        owner_record=owner_record,
+        failure_phase="xai_direct_continuation_owner_association_missing",
+        mismatch_reason=(
+            "session_owner: durable xAI OAuth owner is not associated with "
+            "the submitted continuation"
+        ),
+    )
 
 
 def xai_oauth_selected_account_metadata(
