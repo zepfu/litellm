@@ -182,6 +182,13 @@ configured values fail closed. Resolution metadata uses a nonsecret
 `credential_identity` derived from the canonical file target and exact scope;
 credential contents and raw paths are never included in that identity.
 
+Managed xAI refreshes derive their default advisory lock from the canonical
+resolved auth file, using the file's `.lock` sibling. Different custom auth
+files use independent locks, while aliases for one file coordinate on one
+lock. Set `AAWM_XAI_OAUTH_LOCK_FILE` or `--xai-oauth-lock-file` only to an
+alias of that canonical sibling; arbitrary paths, lock symlinks, and auth-file
+lock collisions fail closed.
+
 ## Proxy Retry and Quota Behavior
 
 For proxy routes that use Grok, LiteLLM treats these exact upstream responses as
