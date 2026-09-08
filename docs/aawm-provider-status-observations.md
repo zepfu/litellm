@@ -1000,12 +1000,28 @@ provider/provider-user/workspace/quota-owner/surface; an unverified identity
 remains collector-local. Identical projection fingerprints deduplicate;
 changed evidence appends an immutable revision. Alias collisions become
 coverage gaps rather than silently merging attempts.
-Identity is tracked through versioned collector-to-scope bindings. A verified
-refinement can retire and redirect a provisional scope while preserving its
-evidence; active attempts with stronger identity evidence can retire weaker
-provisional aliases, and ambiguous collisions remain quarantined. Duplicate
-occurrences retain immutable evidence while refreshing bounded provenance
-freshness; stale observations never replace a newer current projection.
+Identity is tracked through versioned collector-to-scope bindings. A collector
+binding is a generation fence: capture it before network work and pass the
+expected binding to the page transaction; a stale generation is rejected
+instead of silently rebinding the collector, and one page cannot switch scopes
+without an explicit new fence. A verified refinement retires and redirects a
+provisional scope while preserving its attempts and aliases; readers follow
+verified redirects so retained history remains visible under the active
+collector binding. Strong generation, message, and branch aliases take
+precedence over weaker request and prompt grouping aliases. Distinct
+generations sharing a weak alias remain separate, while ambiguous alias
+matches are retained with explicit quarantine state and a coverage gap.
+Active attempts with stronger identity evidence can retire weaker provisional
+aliases. Duplicate occurrences retain immutable evidence while refreshing
+bounded provenance freshness; stale observations never replace a newer current
+projection, and stale exact attempt replays do not append another revision.
+
+The migration bootstrap creates generation 1 only for collectors with no
+existing binding, selecting one deterministic legacy scope per collector. It
+is therefore idempotent across reruns and preserves later active or retired
+generations. Quarantined attempts remain auditable but are not definite usage
+evidence; count readers must keep them out of definite totals while exposing
+the retained uncertainty for reconciliation.
 
 `count_attempts(account, model_family=..., window_start=..., window_end=...)`
 uses one PostgreSQL statement snapshot, counts only non-tombstoned ordinary

@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS public.chatgpt_usage_attempts (
     revision INTEGER NOT NULL DEFAULT 1,
     projection_fingerprint TEXT NOT NULL,
     warnings JSONB NOT NULL DEFAULT '[]'::jsonb,
+    quarantine_state TEXT NOT NULL DEFAULT 'clear',
     tombstone BOOLEAN NOT NULL DEFAULT FALSE,
     observed_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
@@ -184,6 +185,8 @@ ALTER TABLE public.chatgpt_usage_attempts
     ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
 ALTER TABLE public.chatgpt_usage_attempts
     ADD COLUMN IF NOT EXISTS superseded_by_attempt_id TEXT;
+ALTER TABLE public.chatgpt_usage_attempts
+    ADD COLUMN IF NOT EXISTS quarantine_state TEXT NOT NULL DEFAULT 'clear';
 ALTER TABLE public.chatgpt_usage_attempt_revisions
     ADD COLUMN IF NOT EXISTS is_current_projection BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE public.chatgpt_usage_observations
@@ -307,14 +310,31 @@ CREATE UNIQUE INDEX IF NOT EXISTS chatgpt_usage_observations_occurrence_idx
         scope_key, source_kind, source_id, occurrence_number
     );
 
+WITH bootstrap_scopes AS (
+    SELECT DISTINCT ON (scopes.collector_account_id)
+           scopes.scope_key,
+           scopes.collector_account_id,
+           scopes.created_at,
+           scopes.updated_at
+    FROM public.chatgpt_usage_scopes AS scopes
+    WHERE scopes.collector_account_id IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1
+          FROM public.chatgpt_usage_scope_bindings AS existing
+          WHERE existing.collector_account_id = scopes.collector_account_id
+      )
+    ORDER BY scopes.collector_account_id,
+             (scopes.identity_state = 'verified') DESC,
+             scopes.updated_at DESC,
+             scopes.scope_key
+)
 INSERT INTO public.chatgpt_usage_scope_bindings (
     scope_key, collector_account_id, binding_generation, binding_state,
     first_seen_at, last_seen_at
 )
 SELECT scope_key, collector_account_id, 1, 'active',
        COALESCE(created_at, NOW()), COALESCE(updated_at, created_at, NOW())
-FROM public.chatgpt_usage_scopes
-WHERE collector_account_id IS NOT NULL
+FROM bootstrap_scopes
 ON CONFLICT (scope_key, collector_account_id, binding_generation) DO NOTHING;
 
 COMMIT;
