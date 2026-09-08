@@ -145,8 +145,10 @@ commitment. It publishes a bounded request snapshot through
 raises `ProviderCallReplayBlocked` when headers/body/terminal delivery,
 cancellation, or disconnect makes replay unsafe. The ledger mirrors that
 state for telemetry but does not independently decide wire ownership.
-Hidden-retry metadata counts recorded non-success logical-send failures;
-the trailing success record is excluded from the retry count.
+Hidden-retry metadata derives the logical retry count from admitted ledger
+reservations minus the initial send. A denied reservation is recorded
+separately as `reservation_denied` and cannot become a logical retry or
+provider-send event. Transport connection failures remain separate evidence.
 
 ### Tool-schema normalization gate (issue #9)
 
