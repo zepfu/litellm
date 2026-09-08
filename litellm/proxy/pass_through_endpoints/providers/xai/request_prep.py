@@ -7,6 +7,7 @@ The later integration step configures host-owned helpers through
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, cast
 from uuid import uuid4 as _uuid4
@@ -128,6 +129,13 @@ XAI_REQUEST_PREP_SEAM_DISPOSITION = {
 
 
 _request_prep_runtime: Optional[XAIRequestPrepRuntime] = None
+
+_GROK_NATIVE_OAUTH_OWNER_SESSION_ID_METADATA_KEY = (
+    "grok_native_oauth_owner_session_id"
+)
+_GROK_NATIVE_OAUTH_OWNER_SESSION_ID_HASH_DOMAIN = (
+    "litellm:grok-native-oauth:session-owner:v1:"
+)
 
 
 def _host_sanitize_xai_responses_request_body_in_place(
@@ -660,9 +668,18 @@ def _get_grok_native_oauth_session_id(
     request: Request,
     request_body: dict[str, Any],
 ) -> Optional[str]:
+    owner_session_id = _get_grok_native_oauth_owner_session_id(request)
+    if owner_session_id is not None:
+        return owner_session_id
+
     runtime = _require_runtime()
     metadata = request_body.get("litellm_metadata")
     if isinstance(metadata, dict):
+        owner_session_id = metadata.get(
+            _GROK_NATIVE_OAUTH_OWNER_SESSION_ID_METADATA_KEY
+        )
+        if isinstance(owner_session_id, str) and owner_session_id.strip():
+            return owner_session_id.strip()
         session_id = metadata.get("session_id")
         if isinstance(session_id, str) and session_id.strip():
             return session_id.strip()
@@ -680,6 +697,24 @@ def _get_grok_native_oauth_session_id(
         if header_value:
             return header_value
     return None
+
+
+def _get_grok_native_oauth_owner_session_id(request: Request) -> Optional[str]:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity,
+    )
+
+    lease = session_affinity.get_request_session_owner_lease(request)
+    session_identity = getattr(lease, "session_identity", None)
+    if not isinstance(session_identity, str) or not session_identity.strip():
+        return None
+
+    return hashlib.sha256(
+        (
+            _GROK_NATIVE_OAUTH_OWNER_SESSION_ID_HASH_DOMAIN
+            + session_identity.strip()
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _get_grok_native_oauth_request_id(request: Request) -> str:
@@ -789,11 +824,17 @@ async def _prepare_grok_native_oauth_passthrough_request(
 
     prepared_body = dict(request_body)
     prepared_body["model"] = model
+    owner_session_id = _get_grok_native_oauth_owner_session_id(request)
+    native_extra_fields = dict(extra_fields or {})
+    if owner_session_id is not None:
+        native_extra_fields[
+            _GROK_NATIVE_OAUTH_OWNER_SESSION_ID_METADATA_KEY
+        ] = owner_session_id
     prepared_body = _add_grok_native_oauth_metadata(
         prepared_body,
         model=model,
         tags_to_add=tags_to_add,
-        extra_fields=extra_fields,
+        extra_fields=native_extra_fields,
     )
     (
         prepared_body,
