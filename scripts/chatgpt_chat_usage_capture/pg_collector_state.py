@@ -301,6 +301,8 @@ STATE_NUMBER_KEYS = {
     "detailPagesFetched",
     "conversationsAudited",
     "pageNumber",
+    "observations",
+    "candidates",
 }
 STATE_STRING_KEYS = {
     "accountId",
@@ -349,6 +351,7 @@ STATE_STRING_ARRAY_KEYS = {
     "evidenceMessageIds",
     "unknownFields",
 }
+STATE_OBJECT_ARRAY_KEYS = {"candidateQueue", "scopes", "timestamps"}
 STATE_IDENTIFIER_KEYS = {
     "accountId",
     "collectorAccountId",
@@ -1056,6 +1059,7 @@ class PgCollectorState:
         )
         try:
             conn = snapshot.connection
+            self._refresh_snapshot_timeout(snapshot)
             with conn.cursor() as cur:
                 cursor_values = _decode_cursor(cursor, "observation")
                 cursor_time = (
@@ -1102,6 +1106,7 @@ class PgCollectorState:
                          AND binding.binding_state = 'active'
                     )
                 """
+                self._refresh_snapshot_timeout(snapshot)
                 cur.execute(
                     scope_cte
                     + """
@@ -1115,6 +1120,7 @@ class PgCollectorState:
                     (account, conversation),
                 )
                 total = int(cur.fetchone()[0])
+                self._refresh_snapshot_timeout(snapshot)
                 cur.execute(
                     scope_cte
                     + """
@@ -1223,6 +1229,7 @@ class PgCollectorState:
                 cursor_values["identityKey"] if cursor_values else None
             )
             conn = snapshot.connection
+            self._refresh_snapshot_timeout(snapshot)
             with conn.cursor() as cur:
                 scope_cte = """
                     WITH RECURSIVE scope_chain(
@@ -1262,6 +1269,7 @@ class PgCollectorState:
                          AND binding.binding_state = 'active'
                     )
                 """
+                self._refresh_snapshot_timeout(snapshot)
                 cur.execute(
                     scope_cte
                     + """
@@ -1274,6 +1282,7 @@ class PgCollectorState:
                     (account,),
                 )
                 total_attempts = int(cur.fetchone()[0])
+                self._refresh_snapshot_timeout(snapshot)
                 cur.execute(
                     scope_cte
                     + """
@@ -1286,6 +1295,7 @@ class PgCollectorState:
                     (account,),
                 )
                 open_gaps = int(cur.fetchone()[0])
+                self._refresh_snapshot_timeout(snapshot)
                 cur.execute(
                     scope_cte
                     + """
@@ -1296,6 +1306,7 @@ class PgCollectorState:
                     (account,),
                 )
                 scope_rows = cur.fetchall()
+                self._refresh_snapshot_timeout(snapshot)
                 cur.execute(
                     scope_cte
                     + """
@@ -1312,6 +1323,7 @@ class PgCollectorState:
                     (account, MAX_QUEUE_PAGE),
                 )
                 gap_rows = cur.fetchall()
+                self._refresh_snapshot_timeout(snapshot)
                 cur.execute(
                     scope_cte
                     + """
@@ -1325,8 +1337,31 @@ class PgCollectorState:
                                canonical_scope.workspace_id,
                                canonical_scope.quota_owner_id,
                                canonical_scope.surface AS canonical_surface,
-                               canonical_scope.identity_state
+                               canonical_scope.identity_state,
+                               revisions.payload AS projection_payload,
+                               (
+                                   revisions.payload - ARRAY[
+                                       'attemptId', 'identityBasis',
+                                       'sourceIdentityBasis', 'aliases',
+                                       'evidenceMessageIds'
+                                   ] || jsonb_build_object(
+                                       'sourceTimeBasis', COALESCE(
+                                           revisions.payload->'sourceTimeBasis',
+                                           revisions.payload->'timeBasis'
+                                       ),
+                                       'sourceOutcome', COALESCE(
+                                           revisions.payload->'sourceOutcome',
+                                           revisions.payload->'outcome'
+                                       )
+                                   )
+                               ) AS business_projection
                         FROM public.chatgpt_usage_attempts AS attempt
+                        LEFT JOIN public.chatgpt_usage_attempt_revisions AS revisions
+                          ON revisions.scope_key = attempt.scope_key
+                         AND revisions.attempt_id = attempt.attempt_id
+                         AND revisions.revision = attempt.revision
+                         AND revisions.projection_fingerprint =
+                             attempt.projection_fingerprint
                         JOIN account_scope_map AS scope_map
                           ON scope_map.stored_scope_key = attempt.scope_key
                         JOIN public.chatgpt_usage_scopes AS canonical_scope
@@ -1348,7 +1383,10 @@ class PgCollectorState:
                         SELECT scoped_attempts.canonical_scope_key,
                                scoped_attempts.scope_key,
                                scoped_attempts.attempt_id,
-                                string_agg(
+                               count(alias_rows.alias_value)
+                                   FILTER (WHERE alias_rows.alias_kind = 'generation')
+                                   AS generation_alias_count,
+                               string_agg(
                                    alias_rows.alias_value,
                                    ',' ORDER BY alias_rows.alias_value
                                ) FILTER (WHERE alias_rows.alias_kind = 'generation')
@@ -1379,7 +1417,21 @@ class PgCollectorState:
                                attempt_id,
                                'generation:' || generation_aliases AS generation_key
                         FROM alias_values
-                        WHERE generation_aliases IS NOT NULL
+                        WHERE generation_alias_count = 1
+                    ),
+                    contested_aliases AS (
+                        SELECT DISTINCT
+                               scope_map.canonical_scope_key,
+                               gap.details->'alias'->>'kind' AS alias_kind,
+                               gap.details->'alias'->>'value' AS alias_value
+                        FROM public.chatgpt_usage_coverage_gaps AS gap
+                        JOIN canonical_scope_map AS scope_map
+                          ON scope_map.stored_scope_key = gap.scope_key
+                        WHERE gap.source_kind = 'attempt_alias'
+                          AND gap.reason = 'alias_collision'
+                          AND gap.state = 'open'
+                          AND gap.details->'alias'->>'kind'
+                              IN ('message', 'branch', 'request', 'prompt')
                     ),
                     strong_edges AS (
                         SELECT DISTINCT
@@ -1394,7 +1446,15 @@ class PgCollectorState:
                                  left_alias.canonical_scope_key
                          AND right_alias.alias_kind = left_alias.alias_kind
                          AND right_alias.alias_value = left_alias.alias_value
+                        LEFT JOIN generation_keys AS left_generation
+                          ON left_generation.scope_key = left_alias.scope_key
+                         AND left_generation.attempt_id = left_alias.attempt_id
+                        LEFT JOIN generation_keys AS right_generation
+                          ON right_generation.scope_key = right_alias.scope_key
+                         AND right_generation.attempt_id = right_alias.attempt_id
                         WHERE left_alias.alias_kind IN ('message', 'branch')
+                          AND left_generation.generation_key IS NULL
+                          AND right_generation.generation_key IS NULL
                           AND (
                               left_alias.scope_key <> right_alias.scope_key
                               OR left_alias.attempt_id <> right_alias.attempt_id
@@ -1413,6 +1473,10 @@ class PgCollectorState:
                                scoped_attempts.scope_key,
                                scoped_attempts.attempt_id
                         FROM scoped_attempts
+                        LEFT JOIN generation_keys
+                          ON generation_keys.scope_key = scoped_attempts.scope_key
+                         AND generation_keys.attempt_id = scoped_attempts.attempt_id
+                        WHERE generation_keys.generation_key IS NULL
                         UNION
                         SELECT reach.canonical_scope_key,
                                CASE
@@ -1458,53 +1522,102 @@ class PgCollectorState:
                         FROM strong_reach
                         GROUP BY canonical_scope_key, node_scope_key, node_attempt_id
                     ),
+                    contested_components AS (
+                        SELECT DISTINCT
+                               members.canonical_scope_key,
+                               members.component_key
+                        FROM strong_components AS members
+                        JOIN alias_rows AS member_alias
+                          ON member_alias.canonical_scope_key =
+                                 members.canonical_scope_key
+                         AND member_alias.scope_key = members.scope_key
+                         AND member_alias.attempt_id = members.attempt_id
+                        JOIN contested_aliases
+                          ON contested_aliases.canonical_scope_key =
+                                 members.canonical_scope_key
+                         AND contested_aliases.alias_kind =
+                                 member_alias.alias_kind
+                         AND contested_aliases.alias_value =
+                                 member_alias.alias_value
+                    ),
                     component_generation_keys AS (
                         SELECT components.canonical_scope_key,
                                components.component_key,
                                count(DISTINCT generations.generation_key)
                                    AS generation_key_count,
-                               MIN(generations.generation_key) AS generation_key
-                        FROM strong_components AS components
+                               MIN(generations.generation_key) AS generation_key,
+                               bool_or(
+                                   contested_components.component_key IS NOT NULL
+                               ) AS contested_association,
+                               bool_or(
+                                   member_values.generation_alias_count > 1
+                               ) AS contradictory_generation_claims
+                        FROM (
+                            SELECT DISTINCT canonical_scope_key, component_key
+                            FROM strong_components
+                        ) AS components
                         LEFT JOIN strong_components AS members
                           ON members.canonical_scope_key =
                                  components.canonical_scope_key
                          AND members.component_key = components.component_key
+                        LEFT JOIN alias_values AS member_values
+                          ON member_values.scope_key = members.scope_key
+                         AND member_values.attempt_id = members.attempt_id
+                        LEFT JOIN alias_rows AS member_alias
+                          ON member_alias.scope_key = members.scope_key
+                         AND member_alias.attempt_id = members.attempt_id
+                         AND member_alias.alias_kind IN ('message', 'branch')
+                        LEFT JOIN alias_rows AS anchor_alias
+                          ON anchor_alias.canonical_scope_key =
+                                 members.canonical_scope_key
+                         AND anchor_alias.alias_kind = member_alias.alias_kind
+                         AND anchor_alias.alias_value = member_alias.alias_value
                         LEFT JOIN generation_keys AS generations
                           ON generations.canonical_scope_key =
-                                 members.canonical_scope_key
-                         AND generations.scope_key = members.scope_key
-                         AND generations.attempt_id = members.attempt_id
-                        GROUP BY components.canonical_scope_key,
-                                 components.component_key
-                    ),
-                    component_generation_count AS (
-                        SELECT components.canonical_scope_key,
-                               components.component_key,
-                               count(DISTINCT generation_keys.generation_key)
-                                   AS generation_key_count
-                        FROM strong_components AS components
-                        LEFT JOIN generation_keys
-                          ON generation_keys.canonical_scope_key =
+                                 anchor_alias.canonical_scope_key
+                         AND generations.scope_key = anchor_alias.scope_key
+                         AND generations.attempt_id = anchor_alias.attempt_id
+                        LEFT JOIN contested_components
+                          ON contested_components.canonical_scope_key =
                                  components.canonical_scope_key
-                         AND generation_keys.scope_key = components.scope_key
-                         AND generation_keys.attempt_id = components.attempt_id
+                         AND contested_components.component_key =
+                                 components.component_key
                         GROUP BY components.canonical_scope_key,
                                  components.component_key
                     ),
-                    identified_attempts AS (
+                    identified AS (
                         SELECT scoped_attempts.*,
+                               (
+                                   alias_values.generation_alias_count > 1
+                                   OR (
+                                       alias_values.generation_alias_count <> 1
+                                       AND (
+                                           component_generation_keys.generation_key_count > 1
+                                           OR component_generation_keys.contested_association
+                                           OR component_generation_keys.contradictory_generation_claims
+                                       )
+                                   )
+                               ) AS ambiguous_generation_component,
+                               (
+                                   alias_values.generation_alias_count = 1
+                                   OR component_generation_keys.generation_key_count = 1
+                               ) AS canonical_generation_known,
                                CASE
-                                   WHEN alias_values.generation_aliases IS NOT NULL
+                                   WHEN alias_values.generation_alias_count = 1
                                        THEN 'generation:' ||
                                             alias_values.generation_aliases
+                                   WHEN alias_values.generation_alias_count > 1
+                                       THEN 'attempt:' || scoped_attempts.scope_key ||
+                                            ':' || scoped_attempts.attempt_id
+                                   WHEN component_generation_keys.contested_association
+                                     OR component_generation_keys.contradictory_generation_claims
+                                       THEN 'uncertainty:' ||
+                                            strong_components.component_key
                                    WHEN component_generation_keys.generation_key_count = 1
                                        THEN component_generation_keys.generation_key
                                    WHEN component_generation_keys.generation_key_count > 1
-                                       THEN 'attempt:' || scoped_attempts.scope_key ||
-                                            ':' || scoped_attempts.attempt_id
-                                   WHEN component_generation_count.generation_key_count > 1
-                                       THEN 'attempt:' || scoped_attempts.scope_key ||
-                                            ':' || scoped_attempts.attempt_id
+                                       THEN 'uncertainty:' ||
+                                            strong_components.component_key
                                    WHEN alias_values.message_aliases IS NOT NULL
                                      OR alias_values.branch_aliases IS NOT NULL
                                        THEN 'strong:' || strong_components.component_key
@@ -1522,27 +1635,54 @@ class PgCollectorState:
                                  scoped_attempts.canonical_scope_key
                          AND strong_components.scope_key = scoped_attempts.scope_key
                          AND strong_components.attempt_id = scoped_attempts.attempt_id
-                        LEFT JOIN component_generation_count
-                          ON component_generation_count.canonical_scope_key =
-                                 strong_components.canonical_scope_key
-                         AND component_generation_count.component_key =
-                                 strong_components.component_key
-                         LEFT JOIN component_generation_keys
+                        LEFT JOIN component_generation_keys
                           ON component_generation_keys.canonical_scope_key =
                                  strong_components.canonical_scope_key
                          AND component_generation_keys.component_key =
                                  strong_components.component_key
                     ),
+                    identity_freshness AS (
+                        SELECT canonical_scope_key, identity_key,
+                               max(observed_at) AS observed_at
+                        FROM identified
+                        GROUP BY canonical_scope_key, identity_key
+                    ),
+                    identity_conflicts AS (
+                        SELECT identified.canonical_scope_key,
+                               identified.identity_key,
+                               (
+                                   count(DISTINCT identified.business_projection) > 1
+                                   OR bool_or(identified.projection_payload IS NULL)
+                               ) AS projection_conflict
+                        FROM identified
+                        JOIN identity_freshness AS freshness
+                          ON freshness.canonical_scope_key =
+                                 identified.canonical_scope_key
+                         AND freshness.identity_key = identified.identity_key
+                         AND freshness.observed_at = identified.observed_at
+                        GROUP BY identified.canonical_scope_key,
+                                 identified.identity_key
+                    ),
                     canonicalized_attempts AS (
-                        SELECT DISTINCT ON (canonical_scope_key, identity_key)
-                               identified_attempts.*
-                        FROM identified_attempts
-                        ORDER BY canonical_scope_key, identity_key,
+                        SELECT DISTINCT ON (
+                                   identified.canonical_scope_key,
+                                   identified.identity_key
+                               )
+                               identified.*,
+                               identity_conflicts.projection_conflict
+                        FROM identified
+                        JOIN identity_conflicts
+                          ON identity_conflicts.canonical_scope_key =
+                                 identified.canonical_scope_key
+                         AND identity_conflicts.identity_key =
+                                 identified.identity_key
+                        ORDER BY identified.canonical_scope_key,
+                                 identified.identity_key,
                                  observed_at DESC,
                                  (COALESCE(quarantine_state, 'unknown') <> 'clear') DESC,
                                  revision DESC,
                                  last_seen_at DESC,
-                                 (scope_key = canonical_scope_key) DESC,
+                                 (scope_key = identified.canonical_scope_key) DESC,
                                  scope_key, attempt_id
                     )
                     SELECT attempt.scope_key, attempt.canonical_scope_key,
@@ -1584,7 +1724,9 @@ class PgCollectorState:
                            attempt.workspace_id,
                            attempt.quota_owner_id,
                            attempt.canonical_surface,
-                           attempt.identity_state
+                           attempt.identity_state,
+                           attempt.ambiguous_generation_component,
+                           attempt.projection_conflict
                     FROM canonicalized_attempts AS attempt
                     WHERE (
                           %s::text IS NULL
@@ -1830,18 +1972,24 @@ class PgCollectorState:
         outcome: Optional[str] = None,
         summary: Optional[Mapping[str, Any]] = None,
     ) -> CollectorStateHeader:
-        self._close_owned_snapshots(
-            account=lease.collector_account_id,
-            profile=lease.profile_id,
-        )
         if expected_state_version is None:
             raise LedgerError("collector state version is required")
         if trigger_id is None:
             raise LedgerError("collector trigger is required")
         safe_run = _token(run_id, "run_id")
         safe_trigger = _token(trigger_id, "trigger_id")
+        safe_fence = _positive_int(
+            lease.lease_fencing_token,
+            "lease_fencing_token",
+        )
         safe_outcome = _token(outcome, "outcome") if outcome is not None else None
         safe_summary = _safe_terminal_summary(summary)
+        self._close_owned_snapshots(
+            account=lease.collector_account_id,
+            profile=lease.profile_id,
+            run_id=safe_run,
+            fencing_token=safe_fence,
+        )
         with self.ledger.connect() as conn, conn.cursor() as cur:
             self._require_active_lease(
                 cur,
@@ -1898,6 +2046,8 @@ class PgCollectorState:
         self._close_owned_snapshots(
             account=lease.collector_account_id,
             profile=lease.profile_id,
+            run_id=safe_run,
+            fencing_token=safe_fence,
         )
         return result
 
@@ -1911,18 +2061,24 @@ class PgCollectorState:
         outcome: Optional[str] = None,
         summary: Optional[Mapping[str, Any]] = None,
     ) -> CollectorStateHeader:
-        self._close_owned_snapshots(
-            account=lease.collector_account_id,
-            profile=lease.profile_id,
-        )
         if expected_state_version is None:
             raise LedgerError("collector state version is required")
         if trigger_id is None:
             raise LedgerError("collector trigger is required")
         safe_run = _token(run_id, "run_id")
         safe_trigger = _token(trigger_id, "trigger_id")
+        safe_fence = _positive_int(
+            lease.lease_fencing_token,
+            "lease_fencing_token",
+        )
         safe_outcome = _token(outcome, "outcome") if outcome is not None else None
         safe_summary = _safe_terminal_summary(summary)
+        self._close_owned_snapshots(
+            account=lease.collector_account_id,
+            profile=lease.profile_id,
+            run_id=safe_run,
+            fencing_token=safe_fence,
+        )
         with self.ledger.connect() as conn, conn.cursor() as cur:
             self._require_active_lease(
                 cur,
@@ -1979,6 +2135,8 @@ class PgCollectorState:
         self._close_owned_snapshots(
             account=lease.collector_account_id,
             profile=lease.profile_id,
+            run_id=safe_run,
+            fencing_token=safe_fence,
         )
         return result
 
@@ -2328,21 +2486,23 @@ class PgCollectorState:
             for section in (payload.get("discovery"), payload.get("page"))
             if isinstance(section, Mapping)
         ]
-        for section in canonical_sections:
-            operations.append(
-                PgCollectorState._canonical_observation_operation(
-                    section,
-                    source_map=source_map,
-                    default_run_id=default_run_id,
-                )
-            )
-        if canonical_sections:
-            # The adopted History*PageCommit objects are authoritative. Legacy
-            # top-level observation arrays remain a read-compatible fallback
-            # only for callers that have no canonical section.
+        # The worker emits an explicit observation mutation for every
+        # canonical page.  It carries discovery candidates that are no longer
+        # embedded in the checkpoint, so retain it whenever present.  Older
+        # callers without that mutation use the canonical section as a
+        # compatibility fallback.
+        has_explicit_observations = "observations" in payload
+        observations = payload.get("observations", ())
+        if not has_explicit_observations:
             observations = ()
-        else:
-            observations = payload.get("observations", ())
+            for section in canonical_sections:
+                operations.append(
+                    PgCollectorState._canonical_observation_operation(
+                        section,
+                        source_map=source_map,
+                        default_run_id=default_run_id,
+                    )
+                )
         attempts = payload.get("attempts", ())
         if attempts is not None:
             if not isinstance(attempts, Sequence) or isinstance(attempts, (str, bytes)):
@@ -2769,25 +2929,14 @@ class PgCollectorState:
             raise LedgerError("collector snapshot profile does not match its owner")
         safe_owner_fence = _positive_int(owner_fencing_token, "lease_fencing_token")
         if snapshot_id is not None:
-            safe_snapshot = _token(snapshot_id, "snapshot_id")
-            snapshot = self._snapshots.get(safe_snapshot)
-            if snapshot is None:
-                raise LedgerError("collector read snapshot is unavailable")
-            if (
-                snapshot.account != account
-                or snapshot.profile != safe_owner_profile
-                or snapshot.kind != kind
-                or snapshot.owner_run_id != safe_owner_run
-                or snapshot.owner_profile != safe_owner_profile
-                or snapshot.owner_fencing_token != safe_owner_fence
-            ):
-                raise LedgerError("collector read snapshot identity is stale")
-            now = datetime.now(timezone.utc)
-            age = (now - snapshot.created_at).total_seconds()
-            if age > MAX_SNAPSHOT_AGE_SECONDS or now >= snapshot.deadline_at:
-                self.close_snapshot(safe_snapshot)
-                raise LedgerError("collector read snapshot expired")
-            return snapshot, False
+            return self._reuse_snapshot(
+                account=account,
+                profile=safe_owner_profile,
+                kind=kind,
+                snapshot_id=snapshot_id,
+                owner_run_id=safe_owner_run,
+                owner_fencing_token=safe_owner_fence,
+            )
         requested_deadline = (
             ensure_utc(deadline_at) if deadline_at is not None else None
         )
@@ -2797,25 +2946,28 @@ class PgCollectorState:
             if requested_deadline <= created_at:
                 raise LedgerError("collector read snapshot deadline has expired")
             snapshot_deadline = min(snapshot_deadline, requested_deadline)
-        remaining_ms = max(
-            1,
-            int((snapshot_deadline - created_at).total_seconds() * 1000),
-        )
         conn = self.ledger.connect()
         try:
             # PgLedger.connect() opens a setup transaction. Roll it back before
             # starting the bounded repeatable-read snapshot so the transaction-
             # local timeout settings apply to the actual read.
+            self._remaining_snapshot_ms(snapshot_deadline, created_at=created_at)
             conn.rollback()
             conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            conn.execute(
-                "SELECT set_config('statement_timeout', %s, true)",
-                (f"{min(self.ledger.statement_timeout_ms, remaining_ms)}ms",),
+            safe_snapshot = uuid4().hex
+            snapshot = _ReadSnapshot(
+                safe_snapshot,
+                account,
+                safe_owner_profile,
+                kind,
+                conn,
+                created_at,
+                snapshot_deadline,
+                safe_owner_run,
+                safe_owner_profile,
+                safe_owner_fence,
             )
-            conn.execute(
-                "SELECT set_config('lock_timeout', %s, true)",
-                (f"{min(self.ledger.lock_timeout_ms, remaining_ms)}ms",),
-            )
+            self._refresh_snapshot_timeout(snapshot)
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -2844,19 +2996,6 @@ class PgCollectorState:
                 not in {"active", "claimed", "running"}
             ):
                 raise LedgerError("collector read snapshot owner lease is stale")
-            safe_snapshot = uuid4().hex
-            snapshot = _ReadSnapshot(
-                safe_snapshot,
-                account,
-                safe_owner_profile,
-                kind,
-                conn,
-                created_at,
-                snapshot_deadline,
-                safe_owner_run,
-                safe_owner_profile,
-                safe_owner_fence,
-            )
             self._snapshots[safe_snapshot] = snapshot
             return snapshot, True
         except BaseException:
@@ -2866,17 +3005,87 @@ class PgCollectorState:
                 conn.close()
             raise
 
+    def _reuse_snapshot(
+        self,
+        *,
+        account: str,
+        profile: str,
+        kind: str,
+        snapshot_id: str,
+        owner_run_id: str,
+        owner_fencing_token: int,
+    ) -> tuple[_ReadSnapshot, bool]:
+        safe_snapshot = _token(snapshot_id, "snapshot_id")
+        snapshot = self._snapshots.get(safe_snapshot)
+        if snapshot is None:
+            raise LedgerError("collector read snapshot is unavailable")
+        if (
+            snapshot.account != account
+            or snapshot.profile != profile
+            or snapshot.kind != kind
+            or snapshot.owner_run_id != owner_run_id
+            or snapshot.owner_profile != profile
+            or snapshot.owner_fencing_token != owner_fencing_token
+        ):
+            raise LedgerError("collector read snapshot identity is stale")
+        now = datetime.now(timezone.utc)
+        age = (now - snapshot.created_at).total_seconds()
+        if age > MAX_SNAPSHOT_AGE_SECONDS or now >= snapshot.deadline_at:
+            self.close_snapshot(safe_snapshot)
+            raise LedgerError("collector read snapshot expired")
+        try:
+            self._refresh_snapshot_timeout(snapshot)
+        except BaseException:
+            self.close_snapshot(safe_snapshot)
+            raise
+        return snapshot, False
+
     def _close_owned_snapshots(
         self,
         *,
         account: str,
-        profile: Optional[str],
+        profile: str,
+        run_id: str,
+        fencing_token: int,
     ) -> None:
+        safe_run = _token(run_id, "run_id")
+        safe_profile = _token(profile, "profile_id")
+        safe_fence = _positive_int(fencing_token, "lease_fencing_token")
         for snapshot_id, snapshot in tuple(self._snapshots.items()):
-            if snapshot.account == account and (
-                profile is None or snapshot.profile in {None, profile}
+            if (
+                snapshot.account == account
+                and snapshot.profile == safe_profile
+                and snapshot.owner_run_id == safe_run
+                and snapshot.owner_profile == safe_profile
+                and snapshot.owner_fencing_token == safe_fence
             ):
                 self.close_snapshot(snapshot_id)
+
+    def _refresh_snapshot_timeout(self, snapshot: _ReadSnapshot) -> None:
+        remaining_ms = self._remaining_snapshot_ms(snapshot.deadline_at)
+        snapshot.connection.execute(
+            "SELECT set_config('statement_timeout', %s, true)",
+            (f"{min(self.ledger.statement_timeout_ms, remaining_ms)}ms",),
+        )
+        snapshot.connection.execute(
+            "SELECT set_config('lock_timeout', %s, true)",
+            (f"{min(self.ledger.lock_timeout_ms, remaining_ms)}ms",),
+        )
+
+    @staticmethod
+    def _remaining_snapshot_ms(
+        deadline_at: datetime,
+        *,
+        created_at: Optional[datetime] = None,
+    ) -> int:
+        now = datetime.now(timezone.utc)
+        if now >= deadline_at:
+            raise LedgerError("collector read snapshot expired")
+        if created_at is not None and (
+            now - created_at
+        ).total_seconds() > MAX_SNAPSHOT_AGE_SECONDS:
+            raise LedgerError("collector read snapshot expired")
+        return max(1, int((deadline_at - now).total_seconds() * 1000))
 
     @staticmethod
     def _observation_snapshot(row: Sequence[Any]) -> dict[str, Any]:
@@ -2930,10 +3139,18 @@ class PgCollectorState:
             if isinstance(revision_payload.get("quarantine"), Mapping)
             else None
         )
+        ambiguous_generation = bool(row[38]) if len(row) > 38 else False
+        projection_conflict = bool(row[39]) if len(row) > 39 else False
         quarantine = _validated_quarantine_snapshot(
             revision_quarantine,
-            fallback_state=row[26] if len(row) > 26 else "unknown",
+            fallback_state=(
+                "quarantined"
+                if ambiguous_generation or projection_conflict
+                else row[26] if len(row) > 26 else "unknown"
+            ),
         )
+        if ambiguous_generation or projection_conflict:
+            quarantine["state"] = "quarantined"
         item = {
             "scopeKey": str(row[0]),
             "canonicalScopeKey": str(row[1]),
@@ -2960,7 +3177,19 @@ class PgCollectorState:
             "surface": str(row[22]),
             "origin": row[23],
             "revision": int(row[24]),
-            "warnings": list(row[25] or []),
+            "warnings": [
+                *list(row[25] or []),
+                *(
+                    ["ambiguous_generation_identity"]
+                    if ambiguous_generation
+                    else []
+                ),
+                *(
+                    ["projection_conflict"]
+                    if projection_conflict
+                    else []
+                ),
+            ],
             "quarantine": quarantine,
             "quarantineState": str(row[26]),
             "observedAt": row[27].isoformat() if row[27] else None,
@@ -3088,13 +3317,13 @@ def _validated_quarantine_snapshot(
 def _unknown_scope_coverage(scope: str) -> dict[str, Any]:
     return {
         "scope": scope,
-        "status": "unknown",
+        "status": "not_started",
         "coverage": "unknown",
         "pagesFetched": 0,
         "candidates": 0,
         "continuation": None,
         "paginationState": "unknown",
-        "candidateCutoff": None,
+        "candidateCutoff": "",
         "warnings": ["coverage_not_persisted_in_report_snapshot"],
         "olderHistoryAudit": {
             "enabled": False,
@@ -3295,19 +3524,32 @@ def _validate_state_field(
             raise LedgerError(f"collector state field {field_name} contains unsupported content")
         if allowed_keys is not None and key not in allowed_keys:
             raise LedgerError(f"collector state field {field_name} contains an unknown key")
-        if isinstance(child, Mapping):
+        shape = _state_child_shape(key, field_name)
+        if shape == "mapping":
+            if child is None:
+                continue
+            if not isinstance(child, Mapping):
+                raise LedgerError(
+                    f"collector state field {field_name}.{key} must be an object"
+                )
             nested_keys = _nested_state_keys(key, field_name)
             if nested_keys is None:
                 raise LedgerError(
                     f"collector state field {field_name}.{key} has an unsupported object"
                 )
             _validate_state_field(f"{field_name}.{key}", child, nested_keys)
-        elif isinstance(child, Sequence) and not isinstance(child, (str, bytes)):
+        elif shape == "array":
+            if child is None:
+                continue
+            if not isinstance(child, Sequence) or isinstance(child, (str, bytes)):
+                raise LedgerError(
+                    f"collector state field {field_name}.{key} must be an array"
+                )
             if len(child) > MAX_QUEUE_PAGE:
                 raise LedgerError(f"collector state field {field_name}.{key} is too large")
             for index, item in enumerate(child):
                 if isinstance(item, Mapping):
-                    nested_keys = _nested_state_keys(key, field_name)
+                    nested_keys = _state_array_item_keys(key, field_name)
                     if nested_keys is None:
                         raise LedgerError(
                             f"collector state field {field_name}.{key} has unsupported objects"
@@ -3322,6 +3564,10 @@ def _validate_state_field(
                         raise LedgerError(
                             f"collector state field {field_name}.{key}[{index}] must be a string"
                         )
+                    if _state_array_item_keys(key, field_name) is not None:
+                        raise LedgerError(
+                            f"collector state field {field_name}.{key}[{index}] must be an object"
+                        )
                     _validate_state_scalar(
                         f"{field_name}.{key}[{index}]",
                         key,
@@ -3332,8 +3578,62 @@ def _validate_state_field(
                     raise LedgerError(
                         f"collector state field {field_name}.{key} contains unsupported data"
                     )
+        elif isinstance(child, (Mapping, Sequence)) and not isinstance(
+            child, (str, bytes)
+        ):
+            raise LedgerError(
+                f"collector state field {field_name}.{key} must be a scalar"
+            )
         elif child is not None:
             _validate_state_scalar(field_name, key, child)
+
+
+def _state_child_shape(key: str, field_name: str) -> str:
+    """Return the contract shape for one state field in its parent context."""
+    if key in STATE_STRING_ARRAY_KEYS or key in STATE_OBJECT_ARRAY_KEYS:
+        return "array"
+    if key == "scope":
+        return "mapping" if field_name == "scheduleTransition" else "scalar"
+    if key == "coverage":
+        return "mapping" if field_name == "terminalSummary" else "scalar"
+    if key in {"active", "archived"}:
+        if (
+            "coverage" in field_name.lower()
+            or "olderHistoryAudit" in field_name
+            or field_name == "scheduleTransition"
+        ):
+            return "mapping"
+        return "scalar"
+    if key in {
+        "pending",
+        "range",
+        "summary",
+        "olderHistoryAudit",
+        "historyCoverage",
+        "identity",
+        "accountState",
+        "terminalSummary",
+        "candidate",
+        "revisit",
+        "malformedPage",
+        "outstandingGeneration",
+        "quarantine",
+    }:
+        return "mapping"
+    return "scalar"
+
+
+def _state_array_item_keys(
+    key: str,
+    field_name: str,
+) -> Optional[set[str]]:
+    if key == "candidateQueue":
+        return STATE_CANDIDATE_KEYS
+    if key == "timestamps":
+        return STATE_QUARANTINE_TIMESTAMP_KEYS
+    if key == "scopes" and "revisit" not in field_name:
+        return STATE_SCOPE_COVERAGE_KEYS
+    return None
 
 
 def _validate_state_scalar(field_name: str, key: str, value: Any) -> None:
@@ -3367,7 +3667,13 @@ def _validate_state_scalar(field_name: str, key: str, value: Any) -> None:
     ):
         raise LedgerError(f"collector state field {field_name}.{key} must be numeric")
     elif key in STATE_IDENTIFIER_KEYS:
-        if not isinstance(value, str) or sanitize_token(value) is None:
+        if (
+            key == "candidateCutoff"
+            and value == ""
+            and _is_coverage_object_path(field_name)
+        ):
+            pass
+        elif not isinstance(value, str) or sanitize_token(value) is None:
             raise LedgerError(
                 f"collector state field {field_name}.{key} must be an identifier"
             )
@@ -3402,6 +3708,7 @@ def _state_allowed_values(field_name: str, key: str) -> Optional[set[str]]:
             "checkpoint" in field_name
             or "historyCoverage" in field_name
             or "coverage" in field_name
+            or "scopes[" in field_name
         ):
             return {"active", "archived"}
         return None
@@ -3417,8 +3724,12 @@ def _state_allowed_values(field_name: str, key: str) -> Optional[set[str]]:
         if "accountState" in field_name:
             return {"authentication", "cooldown"}
         return None
-    if key == "coverage" and "coverage" in field_name:
-        return {"complete", "partial", "unknown", "validated_page", "unrecognized"}
+    if key == "coverage":
+        if field_name == "summary" or field_name.endswith(".summary"):
+            return {"validated_page", "partial", "unrecognized"}
+        if _is_coverage_object_path(field_name):
+            return {"complete", "partial", "unknown"}
+        return STATE_ENUM_VALUES["coverage"]
     if key == "paginationState":
         return STATE_ENUM_VALUES["paginationState"]
     if key != "status":
@@ -3429,9 +3740,17 @@ def _state_allowed_values(field_name: str, key: str) -> Optional[set[str]]:
         return {"ready", "paused"}
     if "revisit" in field_name:
         return {"pending", "complete"}
+    if "coverage" in field_name.lower():
+        return {"not_started", "in_progress", "complete", "partial"}
     if "activeTrigger" in field_name or field_name.endswith(".active"):
         return {"active", "claimed", "running", "idle", "cancelled"}
+    if field_name == "terminalSummary":
+        return {"complete", "partial", "blocked"}
     return {"not_started", "in_progress", "complete", "partial"}
+
+
+def _is_coverage_object_path(field_name: str) -> bool:
+    return "coverage" in field_name.lower() or "scopes[" in field_name
 
 
 def _nested_state_keys(key: str, field_name: str) -> Optional[set[str]]:
@@ -3449,9 +3768,10 @@ def _nested_state_keys(key: str, field_name: str) -> Optional[set[str]]:
         return STATE_HISTORY_COVERAGE_KEYS
     if key == "historyCoverage":
         return STATE_HISTORY_COVERAGE_KEYS
+    if key == "scope" and field_name == "scheduleTransition":
+        return STATE_SCOPE_KEYS
     return {
         "checkpoint": STATE_CHECKPOINT_KEYS,
-        "scope": STATE_SCOPE_KEYS | STATE_COVERAGE_KEYS,
         "pending": STATE_PENDING_KEYS,
         "range": STATE_RANGE_KEYS,
         "candidateQueue": STATE_CANDIDATE_KEYS,
@@ -3467,7 +3787,6 @@ def _nested_state_keys(key: str, field_name: str) -> Optional[set[str]]:
         "outstandingGeneration": STATE_OUTSTANDING_GENERATION_KEYS,
         "quarantine": STATE_QUARANTINE_KEYS,
         "timestamps": STATE_QUARANTINE_TIMESTAMP_KEYS,
-        "paginationState": STATE_PAGINATION_KEYS,
     }.get(key)
 
 
