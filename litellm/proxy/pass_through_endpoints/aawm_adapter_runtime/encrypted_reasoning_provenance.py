@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import base64
 import json
-from typing import Any, Callable, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, Mapping, MutableMapping, Optional, Sequence
 
 from fastapi import HTTPException
 
@@ -829,8 +829,6 @@ def stamp_route_identity_in_response(
 
 def prepare_encrypted_reasoning_items_for_openai_egress(
     request_body: Mapping[str, Any] | dict[str, Any],
-    *,
-    strip_route_identity_fn: Optional[Callable[[dict[str, Any]], Any]] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Unwrap stamped ciphertext for egress while collecting disposition metadata.
 
@@ -840,21 +838,6 @@ def prepare_encrypted_reasoning_items_for_openai_egress(
     """
     if not isinstance(request_body, dict):
         return dict(request_body) if isinstance(request_body, Mapping) else {}, {
-            "encrypted_reasoning_item_count": 0,
-            "encrypted_reasoning_disposition": "absent",
-            "encrypted_reasoning_compatibility_source": (
-                ENCRYPTED_REASONING_COMPATIBILITY_SOURCE
-            ),
-        }
-
-    if strip_route_identity_fn is None:
-        request_body = strip_route_identity_from_request_body(request_body)
-    else:
-        scoped_request_body = strip_route_identity_fn(request_body)
-        if isinstance(scoped_request_body, dict):
-            request_body = scoped_request_body
-    if not isinstance(request_body, dict):
-        return request_body, {
             "encrypted_reasoning_item_count": 0,
             "encrypted_reasoning_disposition": "absent",
             "encrypted_reasoning_compatibility_source": (
@@ -897,18 +880,6 @@ def prepare_encrypted_reasoning_items_for_openai_egress(
         if isinstance(encrypted, str) and original != encrypted:
             clean_item["encrypted_content"] = original
             changed = True
-        # Keep sidecar for local observability on the request object only when
-        # already present; do not invent ciphertext-bearing fields.
-        if provenance is not None and PROVENANCE_ITEM_FIELD not in clean_item:
-            clean_item[PROVENANCE_ITEM_FIELD] = dict(provenance)
-            changed = True
-
-        # OpenAI rejects unknown fields on reasoning items; strip sidecar before
-        # upstream send while retaining disposition from the extracted copy.
-        if PROVENANCE_ITEM_FIELD in clean_item:
-            clean_item.pop(PROVENANCE_ITEM_FIELD, None)
-            changed = True
-
         normalized_input.append(clean_item)
 
         family = (
@@ -1327,10 +1298,6 @@ def prepare_encrypted_function_output_items_for_openai_egress(
             else encrypted
         )
         clean_item = dict(item)
-        if PROVENANCE_ITEM_FIELD in clean_item:
-            clean_item.pop(PROVENANCE_ITEM_FIELD, None)
-            item.pop(PROVENANCE_ITEM_FIELD, None)
-            changed = True
 
         has_plaintext = _function_call_output_has_plaintext(clean_item)
         should_strip_nested = has_plaintext or strip_ciphertext_without_plaintext
@@ -1526,7 +1493,6 @@ def guard_openai_encrypted_reasoning_egress(
     custom_llm_provider: Any = None,
     selected_route_family: Any = None,
     model: Any = None,
-    strip_route_identity_fn: Optional[Callable[[dict[str, Any]], Any]] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Prepare body and fail closed on known-incompatible encrypted reasoning.
 
@@ -1537,7 +1503,6 @@ def guard_openai_encrypted_reasoning_egress(
     """
     prepared, disposition = prepare_encrypted_reasoning_items_for_openai_egress(
         request_body if isinstance(request_body, dict) else dict(request_body or {}),
-        strip_route_identity_fn=strip_route_identity_fn,
     )
     prepared = restore_codex_agent_message_payloads_for_openai_egress(prepared)
     prepared, function_output_disposition = (

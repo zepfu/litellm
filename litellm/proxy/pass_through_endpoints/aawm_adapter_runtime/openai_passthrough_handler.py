@@ -644,52 +644,6 @@ class BaseOpenAIPassThroughHandler:
                     request, prepared_request_body
                 )
                 endpoint_custom_body = prepared_request_body
-            if is_codex_responses_request:
-                from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_body import (
-                    get_bound_openai_responses_wire_body,
-                )
-
-                compiled_wire_body = get_bound_openai_responses_wire_body(request)
-                if compiled_wire_body is not None:
-                    # Keep the observability body on the request while passing
-                    # only the compiler's exact provider body downstream.
-                    endpoint_custom_body = compiled_wire_body.body
-            if (
-                rt.is_openai_responses_endpoint_fn(endpoint)
-                and str(
-                    getattr(custom_llm_provider, "value", custom_llm_provider)
-                    or ""
-                ).lower()
-                == litellm.LlmProviders.OPENAI.value
-            ):
-                from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_body import (
-                    bind_openai_responses_wire_body,
-                    compile_openai_responses_wire_body,
-                    get_bound_openai_responses_wire_body,
-                )
-
-                compiled_wire_body = get_bound_openai_responses_wire_body(request)
-                if compiled_wire_body is None:
-                    wire_body = compile_openai_responses_wire_body(
-                        prepared_request_body,
-                        request=request,
-                        resolved_model=prepared_request_body.get("model"),
-                        url=updated_url,
-                        egress_credential_family=(
-                            egress_credential_family or "openai"
-                        ),
-                        custom_llm_provider=litellm.LlmProviders.OPENAI.value,
-                        expected_target_family=(
-                            expected_target_family or "openai"
-                        ),
-                        endpoint=endpoint,
-                        drop_codex_request_params_fn=(
-                            rt.drop_unsupported_codex_request_params_fn
-                        ),
-                    )
-                    bind_openai_responses_wire_body(request, wire_body)
-                    compiled_wire_body = wire_body
-                endpoint_custom_body = compiled_wire_body.body
 
         ## check for streaming
         is_streaming_request = (

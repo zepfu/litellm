@@ -151,7 +151,6 @@ from .aawm_adapter_runtime.repetitive_output import (
 )
 from .aawm_adapter_runtime.openai_responses_body import (
     get_bound_openai_responses_wire_body,
-    sanitize_wire_envelope,
 )
 from .aawm_text_watermark.config import load_text_watermark_config
 from .aawm_text_watermark.response_hooks import (
@@ -4217,20 +4216,7 @@ def _aawm_apply_openai_encrypted_reasoning_pre_send(
         guard_openai_encrypted_reasoning_egress,
         is_openai_responses_egress,
         merge_encrypted_reasoning_disposition_into_request_body,
-        should_strip_encrypted_function_output_without_plaintext,
     )
-
-    def _strip_identity_in_place(body: Optional[dict]) -> None:
-        if not isinstance(body, dict):
-            return
-        stripped, _ = sanitize_wire_envelope(body)
-        if stripped is body or not isinstance(stripped, dict):
-            return
-        body.clear()
-        body.update(stripped)
-
-    _strip_identity_in_place(parsed_body)
-    _strip_identity_in_place(provider_bound_body)
 
     path = str(getattr(url, "path", "") or "")
     if not is_openai_responses_egress(
@@ -4257,10 +4243,6 @@ def _aawm_apply_openai_encrypted_reasoning_pre_send(
         request, identity_source
     )
 
-    def _scoped_route_identity_sanitizer(body: dict[str, Any]) -> dict[str, Any]:
-        sanitized, _ = sanitize_wire_envelope(body)
-        return sanitized if isinstance(sanitized, dict) else body
-
     compiled_wire_body = get_bound_openai_responses_wire_body(
         request, send_body
     )
@@ -4278,15 +4260,6 @@ def _aawm_apply_openai_encrypted_reasoning_pre_send(
                 target_provider="openai",
                 target_route_family=egress_credential_family or expected_target_family,
                 failure_phase="encrypted_reasoning_openai_pre_send",
-                strip_function_output_ciphertext_without_plaintext=(
-                    should_strip_encrypted_function_output_without_plaintext(
-                        url=url,
-                        egress_credential_family=egress_credential_family,
-                        custom_llm_provider=custom_llm_provider,
-                        request_body=identity_source,
-                    )
-                ),
-                strip_route_identity_fn=_scoped_route_identity_sanitizer,
             )
         except HTTPException as exc:
             _emit_openai_encrypted_reasoning_redispatch_terminal_error(
@@ -4814,6 +4787,60 @@ async def pass_through_request(  # noqa: PLR0915
                     str(url),
                     invalid_openai_tool_schemas[:10],
                 )
+
+        # Compile only after schema normalization, guardrail metadata, and the
+        # pre-call hook have finished mutating the observability body. The
+        # resulting immutable payload is the object handed to HTTPX.
+        if (
+            isinstance(_parsed_body, dict)
+            and _is_openai_responses_function_name_target(
+                url=url,
+                custom_llm_provider=custom_llm_provider,
+            )
+        ):
+            from .aawm_adapter_runtime.openai_responses_body import (
+                bind_openai_responses_wire_body,
+                compile_openai_responses_wire_body,
+            )
+            from .aawm_request_policy.codex_tool_policy import (
+                _drop_unsupported_codex_request_params_from_request_body,
+            )
+
+            body_stream = (
+                bool(_parsed_body["stream"])
+                if "stream" in _parsed_body
+                else (bool(stream) if stream is not None else None)
+            )
+            body_store = (
+                _parsed_body.get("store")
+                if isinstance(_parsed_body.get("store"), bool)
+                else None
+            )
+            session_identity = _session_affinity_mod().resolve_canonical_session_identity(
+                request,
+                _parsed_body,
+            )
+            compiled_wire_body = compile_openai_responses_wire_body(
+                _parsed_body,
+                request=request,
+                resolved_model=(
+                    _parsed_body.get("model")
+                    if isinstance(_parsed_body.get("model"), str)
+                    else None
+                ),
+                client_stream=body_stream,
+                store=body_store,
+                url=url,
+                egress_credential_family=egress_credential_family or "openai",
+                custom_llm_provider=custom_llm_provider,
+                expected_target_family=expected_target_family or "openai",
+                endpoint=str(url),
+                session_identity=session_identity,
+                drop_codex_request_params_fn=(
+                    _drop_unsupported_codex_request_params_from_request_body
+                ),
+            )
+            bind_openai_responses_wire_body(request, compiled_wire_body)
 
         stream_read_timeout_policy = _resolve_aawm_passthrough_stream_read_timeout_policy()
         async_client_obj = get_async_httpx_client(

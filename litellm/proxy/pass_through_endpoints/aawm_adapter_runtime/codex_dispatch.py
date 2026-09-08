@@ -468,17 +468,6 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
         prepared_request_body=prepared_request_body,
     )
     _sid = _sa.resolve_canonical_session_identity(request, prepared_request_body)
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_body import (
-        sanitize_wire_envelope,
-    )
-
-    sanitized_request_body, _ = sanitize_wire_envelope(prepared_request_body)
-    if (
-        sanitized_request_body is not prepared_request_body
-        and isinstance(sanitized_request_body, dict)
-    ):
-        prepared_request_body.clear()
-        prepared_request_body.update(sanitized_request_body)
 
     opencode_zen_adapter_model = _resolve_codex_opencode_zen_adapter_model(
         prepared_request_body,
@@ -927,23 +916,4 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
             prepared_request_body.clear()
             prepared_request_body.update(normalized_request_body)
 
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_body import (
-        bind_openai_responses_wire_body,
-        compile_openai_responses_wire_body,
-    )
-
-    wire_body = compile_openai_responses_wire_body(
-        prepared_request_body,
-        request=request,
-        resolved_model=direct_model,
-        client_stream=True,
-        store=False,
-        url=target_url,
-        egress_credential_family="openai",
-        custom_llm_provider="openai",
-        expected_target_family="openai",
-        endpoint=endpoint,
-        session_identity=_sid,
-    )
-    bind_openai_responses_wire_body(request, wire_body)
     return None

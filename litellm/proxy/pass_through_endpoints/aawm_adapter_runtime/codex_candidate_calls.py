@@ -4335,34 +4335,6 @@ async def _perform_codex_auto_agent_native_openai_request(
     request_body: dict[str, Any],
     custom_headers: Optional[dict[str, str]] = None,
 ) -> Response:
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_body import (
-        bind_openai_responses_wire_body,
-        compile_openai_responses_wire_body,
-    )
-
-    # The native candidate receives the resolved model, so the shared compiler
-    # owns legacy-history normalization, resolved-model parameter dropping,
-    # function-name rewriting, watermark egress, and encrypted-reasoning
-    # preparation exactly once.
-    wire_body = compile_openai_responses_wire_body(
-        request_body,
-        request=request,
-        resolved_model=request_body.get("model"),
-        client_stream=True,
-        store=False,
-        url=target_url,
-        egress_credential_family=(
-            "openai" if custom_headers is not None or forward_headers else None
-        ),
-        custom_llm_provider=litellm.LlmProviders.OPENAI.value,
-        expected_target_family="openai",
-        endpoint="responses",
-        drop_codex_request_params_fn=(
-            _drop_unsupported_codex_request_params_from_request_body
-        ),
-    )
-    bind_openai_responses_wire_body(request, wire_body)
-    request_body = wire_body.body
     is_streaming_request = bool(request_body.get("stream"))
     # The candidate loop attaches this coordinator only for eligible alpha
     # OpenAI capacity-retry requests. Preserve stock hidden transport retries

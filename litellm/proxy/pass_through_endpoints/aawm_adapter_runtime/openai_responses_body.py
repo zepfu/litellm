@@ -25,9 +25,8 @@ Design contract (from the OPENAI-044 Oracle egress evidence):
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, field
-from types import MappingProxyType
-from typing import Any, Callable, Mapping, Optional
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Mapping, NoReturn, Optional
 
 from litellm.types.utils import all_litellm_params
 
@@ -68,6 +67,75 @@ _INTERNAL_ENVELOPE_KEYS: tuple[str, ...] = (
     "codex_auto_agent_selected_account_display",
 )
 
+_SERVER_CONTEXT_KEYS: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        (
+            *_INTERNAL_ENVELOPE_KEYS,
+            *(key for key in all_litellm_params if key != "metadata"),
+        )
+    )
+)
+
+
+def _raise_wire_body_immutable(*args: Any, **kwargs: Any) -> NoReturn:
+    """Reject mutation of the exact provider-bound JSON payload."""
+    _ = (args, kwargs)
+    raise TypeError("OpenAI Responses wire body is immutable")
+
+
+class _FrozenWireDict(dict[str, Any]):
+    """JSON-serializable dict that rejects all mutation operations."""
+
+    __setitem__ = _raise_wire_body_immutable
+    __delitem__ = _raise_wire_body_immutable
+    clear = _raise_wire_body_immutable
+    pop = _raise_wire_body_immutable
+    popitem = _raise_wire_body_immutable
+    setdefault = _raise_wire_body_immutable
+    update = _raise_wire_body_immutable
+    __ior__ = _raise_wire_body_immutable
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> dict[str, Any]:
+        _ = memo
+        return {copy.deepcopy(key, memo): copy.deepcopy(value, memo) for key, value in self.items()}
+
+
+class _FrozenWireList(list[Any]):
+    """JSON-serializable list that rejects all mutation operations."""
+
+    __setitem__ = _raise_wire_body_immutable
+    __delitem__ = _raise_wire_body_immutable
+    append = _raise_wire_body_immutable
+    clear = _raise_wire_body_immutable
+    extend = _raise_wire_body_immutable
+    insert = _raise_wire_body_immutable
+    pop = _raise_wire_body_immutable
+    remove = _raise_wire_body_immutable
+    reverse = _raise_wire_body_immutable
+    sort = _raise_wire_body_immutable
+    __iadd__ = _raise_wire_body_immutable
+    __imul__ = _raise_wire_body_immutable
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> list[Any]:
+        _ = memo
+        return [copy.deepcopy(value, memo) for value in self]
+
+
+def _freeze_wire_value(value: Any) -> Any:
+    """Recursively freeze JSON containers while keeping them serializable."""
+    if isinstance(value, Mapping):
+        return _FrozenWireDict(
+            {
+                copy.deepcopy(key): _freeze_wire_value(nested)
+                for key, nested in value.items()
+            }
+        )
+    if isinstance(value, list):
+        return _FrozenWireList(_freeze_wire_value(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze_wire_value(item) for item in value)
+    return value
+
 
 def _strip_item_internal_fields(item: Any) -> Any:
     """Remove server-owned fields from a single Responses input item.
@@ -90,16 +158,16 @@ def _strip_item_internal_fields(item: Any) -> Any:
 def sanitize_wire_envelope(body: Any) -> tuple[Any, bool]:
     """Strip known server state at protocol-owned surfaces only.
 
-    Removes internal envelope keys and per-item route-identity/provenance
-    sidecars from top-level ``input``/``output`` items. Does not recurse into
-    user or tool structures. Returns ``(body, changed)``.
+    Removes server-owned top-level context and per-item route-identity/
+    provenance sidecars from top-level ``input``/``output`` items. Does not
+    recurse into user or tool structures. Returns ``(body, changed)``.
     """
     if not isinstance(body, dict):
         return body, False
 
     changed = False
     updated: Optional[dict[str, Any]] = None
-    for key in _INTERNAL_ENVELOPE_KEYS:
+    for key in _SERVER_CONTEXT_KEYS:
         if key in body:
             if updated is None:
                 updated = dict(body)
@@ -129,24 +197,48 @@ def sanitize_wire_envelope(body: Any) -> tuple[Any, bool]:
 
 
 @dataclass(frozen=True)
+class OpenAIResponsesWireDiagnostics:
+    """Immutable logging/restoration state kept beside the wire payload."""
+
+    observability_body: Optional[dict[str, Any]]
+    encrypted_reasoning_disposition: Mapping[str, Any]
+    function_name_rewrite: Optional[ResponsesFunctionNameRewrite]
+    dropped_codex_request_params: tuple[str, ...]
+    watermark_audit: Any
+
+
+@dataclass(frozen=True)
 class OpenAIResponsesWireBody:
-    """Immutable result of the canonical Responses wire-body compile.
+    """Immutable exact provider payload plus separated request diagnostics.
 
     ``body`` is the exact object to serialize to the provider. Diagnostics
-    and restoration state are carried separately so they cannot re-enter the
-    wire body. ``observability_body`` is a request-local copy for hooks and
-    logging; it is never used for provider serialization.
+    and restoration state are kept in a separate immutable object so they
+    cannot re-enter the wire body.
     """
 
     body: dict[str, Any]
     context: "OpenAIResponsesWireContext"
-    observability_body: Optional[dict[str, Any]] = None
-    encrypted_reasoning_disposition: Mapping[str, Any] = field(
-        default_factory=lambda: MappingProxyType({})
-    )
-    function_name_rewrite: Optional[ResponsesFunctionNameRewrite] = None
-    dropped_codex_request_params: tuple[str, ...] = ()
-    watermark_audit: Any = None
+    diagnostics: OpenAIResponsesWireDiagnostics
+
+    @property
+    def observability_body(self) -> Optional[dict[str, Any]]:
+        return self.diagnostics.observability_body
+
+    @property
+    def encrypted_reasoning_disposition(self) -> Mapping[str, Any]:
+        return self.diagnostics.encrypted_reasoning_disposition
+
+    @property
+    def function_name_rewrite(self) -> Optional[ResponsesFunctionNameRewrite]:
+        return self.diagnostics.function_name_rewrite
+
+    @property
+    def dropped_codex_request_params(self) -> tuple[str, ...]:
+        return self.diagnostics.dropped_codex_request_params
+
+    @property
+    def watermark_audit(self) -> Any:
+        return self.diagnostics.watermark_audit
 
     @property
     def function_name_rewrite_changed(self) -> bool:
@@ -200,29 +292,6 @@ def get_bound_openai_responses_wire_body(
     if body is not None and result.body is not body:
         return None
     return result
-
-
-def _strip_litellm_context_fields(body: dict[str, Any]) -> dict[str, Any]:
-    """Remove server context while preserving client OpenAI ``metadata``."""
-
-    # ``metadata`` is both a LiteLLM logging input and a supported OpenAI
-    # Responses request field. It must remain on the provider wire; the
-    # server-owned ``litellm_metadata`` namespace is removed below.
-    context_keys = tuple(
-        key for key in all_litellm_params if key != "metadata"
-    )
-    if not any(key in body for key in context_keys):
-        return body
-    updated = dict(body)
-    for key in context_keys:
-        updated.pop(key, None)
-    return updated
-
-
-def _scoped_route_identity_sanitizer(body: dict[str, Any]) -> dict[str, Any]:
-    """Adapter for the encrypted-reasoning guard's request-body callback."""
-    sanitized, _ = sanitize_wire_envelope(body)
-    return sanitized if isinstance(sanitized, dict) else body
 
 
 def _apply_watermark_egress(
@@ -304,12 +373,12 @@ def compile_openai_responses_wire_body(
 
     Applies every retained transformation exactly once, in canonical order:
 
-    1. scoped internal-state removal (envelope + input-item surfaces);
-    2. legacy function-history id normalization;
-    3. resolved-model unsupported Codex request-parameter removal;
-    4. request-local function-name sanitization (restoration map separated);
-    5. watermark egress;
-    6. encrypted-reasoning egress preparation (fail-closed guard).
+    1. legacy function-history id normalization;
+    2. resolved-model unsupported Codex request-parameter removal;
+    3. request-local function-name sanitization (restoration map separated);
+    4. watermark egress;
+    5. encrypted-reasoning egress preparation and provenance validation;
+    6. one scoped internal-state sanitation traversal.
 
     Diagnostics and restoration state are returned on the result and never
     re-attached to the wire body. The caller MUST serialize ``result.body``
@@ -321,13 +390,10 @@ def compile_openai_responses_wire_body(
     )
     body: dict[str, Any] = copy.deepcopy(source_snapshot)
 
-    # 1. Scoped sanitation of known server state at protocol-owned surfaces.
-    body, _ = sanitize_wire_envelope(body)
-
-    # 2. Legacy function-history id normalization (direct + alias contract).
+    # 1. Legacy function-history id normalization (direct + alias contract).
     body = normalize_direct_openai_legacy_function_call_history_ids(body)
 
-    # 3. Resolved-model unsupported Codex request-parameter removal.
+    # 2. Resolved-model unsupported Codex request-parameter removal.
     dropped_params: tuple[str, ...] = ()
     if drop_codex_request_params_fn is not None:
         if (
@@ -341,12 +407,12 @@ def compile_openai_responses_wire_body(
         if isinstance(dropped, (list, tuple)):
             dropped_params = tuple(str(item) for item in dropped)
 
-    # 4. Function-name sanitization; restoration map stays off the wire body.
+    # 3. Function-name sanitization; restoration map stays off the wire body.
     name_rewrite = sanitize_responses_function_names(body)
     if name_rewrite.changed and isinstance(name_rewrite.body, dict):
         body = name_rewrite.body
 
-    # 5. Watermark egress.
+    # 4. Watermark egress.
     body, watermark_audit = _apply_watermark_egress(
         body=body,
         request=request,
@@ -354,7 +420,7 @@ def compile_openai_responses_wire_body(
         metadata=body.get("litellm_metadata") if isinstance(body, dict) else None,
     )
 
-    # 6. Encrypted-reasoning preparation; fail-closed guard before send.
+    # 5. Encrypted-reasoning preparation; validate provenance before sanitation.
     body, disposition = guard_openai_encrypted_reasoning_egress(
         body,
         session_identity=session_identity,
@@ -366,12 +432,12 @@ def compile_openai_responses_wire_body(
         egress_credential_family=egress_credential_family,
         custom_llm_provider=custom_llm_provider,
         model=resolved_model,
-        strip_route_identity_fn=_scoped_route_identity_sanitizer,
     )
-    # Re-assert the scoped envelope invariant after provider-state preparation
-    # so the returned body carries no server state at protocol-owned surfaces.
+
+    # 6. The sole canonical sanitation traversal. It runs after provenance
+    # validation so foreign sidecars cannot be erased before compatibility
+    # checks observe them.
     body, _ = sanitize_wire_envelope(body)
-    body = _strip_litellm_context_fields(body)
 
     # Route-owned stream/store shaping is applied before the result is bound,
     # so the returned dict remains the exact serialized provider body.
@@ -382,8 +448,13 @@ def compile_openai_responses_wire_body(
         body = dict(body)
         body["store"] = bool(store)
 
+    frozen_rewrite = (
+        replace(name_rewrite, body=_freeze_wire_value(name_rewrite.body))
+        if name_rewrite.changed
+        else None
+    )
     return OpenAIResponsesWireBody(
-        body=body,
+        body=_freeze_wire_value(body),
         context=OpenAIResponsesWireContext(
             endpoint=endpoint,
             resolved_model=resolved_model,
@@ -407,14 +478,12 @@ def compile_openai_responses_wire_body(
                 str(session_identity) if session_identity is not None else None
             ),
         ),
-        observability_body=source_snapshot,
-        encrypted_reasoning_disposition=MappingProxyType(dict(disposition)),
-        function_name_rewrite=name_rewrite if name_rewrite.changed else None,
-        dropped_codex_request_params=dropped_params,
-        watermark_audit=(
-            MappingProxyType(dict(watermark_audit))
-            if isinstance(watermark_audit, dict)
-            else watermark_audit
+        diagnostics=OpenAIResponsesWireDiagnostics(
+            observability_body=_freeze_wire_value(source_snapshot),
+            encrypted_reasoning_disposition=_freeze_wire_value(disposition),
+            function_name_rewrite=frozen_rewrite,
+            dropped_codex_request_params=dropped_params,
+            watermark_audit=_freeze_wire_value(watermark_audit),
         ),
     )
 
