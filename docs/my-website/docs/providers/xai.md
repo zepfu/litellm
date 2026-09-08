@@ -225,6 +225,9 @@ precedence is an explicit configured scope, `AAWM_XAI_OAUTH_SCOPE`,
 configured values fail closed. Resolution metadata uses a nonsecret
 `credential_identity` derived from the canonical file target and exact scope;
 credential contents and raw paths are never included in that identity.
+Refresh and passive-health metadata also carries a separate nonsecret
+`credential_generation` digest for the published file generation; token values
+are excluded from both identifiers.
 
 Managed credential lifecycle is evaluated by one side-effect-free policy shared
 by request readiness, refresh eligibility, and passive health. It reports

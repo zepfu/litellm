@@ -7,6 +7,7 @@ import base64
 import json
 import math
 import os
+import stat
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -36,6 +37,7 @@ from litellm.secret_managers.xai_oauth_credentials import (
     DEFAULT_XAI_OAUTH_AUTH_FILE as _FOUNDATION_DEFAULT_XAI_OAUTH_AUTH_FILE,
     DEFAULT_XAI_OAUTH_LOCK_FILE as _FOUNDATION_DEFAULT_XAI_OAUTH_LOCK_FILE,
     DEFAULT_XAI_OAUTH_SCOPE as _FOUNDATION_DEFAULT_XAI_OAUTH_SCOPE,
+    credential_identity as _credential_generation,
     evaluate_xai_oauth_credential_lifecycle,
     refresh_threshold_metadata as _foundation_refresh_threshold_metadata,
     resolve_xai_oauth_credentials,
@@ -52,9 +54,23 @@ DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS = 300
 DEFAULT_XAI_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_XAI_OAUTH_AUTH_FILE_MODE = 0o600
 DEFAULT_XAI_OAUTH_ERROR_MESSAGE_LIMIT = 500
+_XAI_OAUTH_MAX_AUTH_FILE_BYTES = 1_048_576
+
+_XAI_OAUTH_TERMINAL_REFRESH_ERROR_CLASSES = frozenset(
+    {"invalid_grant", "refresh_token_reused"}
+)
+_XAI_OAUTH_RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 425, 429})
 
 # Keep historical module alias; redaction lives in secret_managers.
 _SECRET_FIELD_NAMES = DEFAULT_SECRET_FIELD_NAMES
+
+
+class XaiOAuthRefreshError(ValueError):
+    """A sanitized xAI OAuth refresh failure with a stable classification."""
+
+    def __init__(self, error_class: str, message: str) -> None:
+        self.error_class = error_class
+        super().__init__(message)
 
 
 def _issued_lifetime_seconds(
@@ -177,6 +193,7 @@ class XaiOAuthRefreshSummary:
     refresh_threshold_source: Optional[str] = None
     refresh_threshold_degraded: bool = False
     credential_identity: Optional[str] = None
+    credential_generation: Optional[str] = None
     auth_file_source: Optional[str] = None
     scope_source: Optional[str] = None
     structurally_valid: Optional[bool] = None
@@ -208,6 +225,7 @@ class XaiOAuthRefreshSummary:
             "refresh_threshold_source": self.refresh_threshold_source,
             "refresh_threshold_degraded": self.refresh_threshold_degraded,
             "credential_identity": self.credential_identity,
+            "credential_generation": self.credential_generation,
             "auth_file_source": self.auth_file_source,
             "scope_source": self.scope_source,
             "structurally_valid": self.structurally_valid,
@@ -237,6 +255,7 @@ def inspect_xai_oauth_credential_health(
     resolved_scope = _resolve_scope(scope)
     refresh_buffer_seconds = _resolve_buffer_seconds(buffer_seconds)
     route_safety_buffer_seconds = _resolve_route_safety_buffer_seconds()
+    credential_generation: Optional[str] = None
     try:
         resolution = resolve_xai_oauth_credentials(
             auth_file,
@@ -245,9 +264,15 @@ def inspect_xai_oauth_credential_health(
         )
         resolved_auth_file = resolution.auth_file
         resolved_scope = resolution.scope
-        credential = _select_credential_record(
-            _read_credential_payload(resolution.canonical_auth_file),
-            resolved_scope,
+        payload, stat_result = _read_credential_payload_with_stat(
+            resolution.canonical_auth_file
+        )
+        credential = _select_credential_record(payload, resolved_scope)
+        credential_generation = _credential_generation(
+            resolution.canonical_auth_file,
+            credential,
+            scope=resolved_scope,
+            stat_result=stat_result,
         )
         lifecycle = evaluate_xai_oauth_credential_lifecycle(
             credential,
@@ -280,6 +305,7 @@ def inspect_xai_oauth_credential_health(
             error_class=error_class,
             error_message=error_message,
             credential_identity=resolution.credential_identity,
+            credential_generation=credential_generation,
             auth_file_source=resolution.auth_file_source,
             scope_source=resolution.scope_source,
             lifecycle=lifecycle,
@@ -292,6 +318,7 @@ def inspect_xai_oauth_credential_health(
             "malformed",
             error_class=exc.__class__.__name__,
             error_message=_sanitize_error_message(str(exc)),
+            credential_generation=credential_generation,
             route_safety_buffer_seconds=route_safety_buffer_seconds,
         )
 
@@ -304,6 +331,7 @@ def _xai_health_summary(
     error_class: Optional[str] = None,
     error_message: Optional[str] = None,
     credential_identity: Optional[str] = None,
+    credential_generation: Optional[str] = None,
     auth_file_source: Optional[str] = None,
     scope_source: Optional[str] = None,
     lifecycle: Optional[Mapping[str, Any]] = None,
@@ -321,6 +349,7 @@ def _xai_health_summary(
         "error_class": error_class,
         "error_message": error_message,
         "credential_identity": credential_identity,
+        "credential_generation": credential_generation,
         "auth_file_source": auth_file_source,
         "scope_source": scope_source,
         "structurally_valid": lifecycle.get("structurally_valid"),
@@ -402,6 +431,7 @@ def refresh_xai_oauth_auth_file(
     resolution = None
     credential: Optional[MutableMapping[str, Any]] = None
     lifecycle: Optional[Mapping[str, Any]] = None
+    credential_generation: Optional[str] = None
 
     try:
         resolution = resolve_xai_oauth_credentials(
@@ -417,8 +447,16 @@ def refresh_xai_oauth_auth_file(
             lock_file,
         )
         with _credential_file_lock(resolved_lock_file):
-            raw_payload = _read_credential_payload(resolved_read_auth_file)
+            raw_payload, stat_result = _read_credential_payload_with_stat(
+                resolved_read_auth_file
+            )
             credential = _select_credential_record(raw_payload, resolved_scope)
+            credential_generation = _credential_generation(
+                resolved_read_auth_file,
+                credential,
+                scope=resolved_scope,
+                stat_result=stat_result,
+            )
             lifecycle = evaluate_xai_oauth_credential_lifecycle(
                 credential,
                 route_safety_buffer_seconds=route_safety_buffer_seconds,
@@ -445,6 +483,7 @@ def refresh_xai_oauth_auth_file(
                     refresh_threshold_source=threshold_source,
                     refresh_threshold_degraded=threshold_degraded,
                     credential_identity=resolution.credential_identity,
+                    credential_generation=credential_generation,
                     auth_file_source=resolution.auth_file_source,
                     scope_source=resolution.scope_source,
                     **_lifecycle_summary_fields(
@@ -463,6 +502,19 @@ def refresh_xai_oauth_auth_file(
             )
             _update_credential_record(credential, refreshed)
             _write_credential_payload(resolved_auth_file, raw_payload)
+            _published_payload, published_stat_result = (
+                _read_credential_payload_with_stat(resolved_read_auth_file)
+            )
+            published_credential = _select_credential_record(
+                _published_payload,
+                resolved_scope,
+            )
+            credential_generation = _credential_generation(
+                resolved_read_auth_file,
+                published_credential,
+                scope=resolved_scope,
+                stat_result=published_stat_result,
+            )
             lifecycle = evaluate_xai_oauth_credential_lifecycle(
                 credential,
                 route_safety_buffer_seconds=route_safety_buffer_seconds,
@@ -486,6 +538,7 @@ def refresh_xai_oauth_auth_file(
                 refresh_threshold_source=threshold_source,
                 refresh_threshold_degraded=threshold_degraded,
                 credential_identity=resolution.credential_identity,
+                credential_generation=credential_generation,
                 auth_file_source=resolution.auth_file_source,
                 scope_source=resolution.scope_source,
                 **_lifecycle_summary_fields(
@@ -505,14 +558,15 @@ def refresh_xai_oauth_auth_file(
                 )
             except Exception:
                 pass
+        error_class, error_message = _refresh_error_summary(exc)
         return XaiOAuthRefreshSummary(
             attempted=True,
             refreshed=False,
             skipped=False,
             auth_file=str(resolved_auth_file),
             scope=resolved_scope,
-            error_class=exc.__class__.__name__,
-            error_message=_sanitize_error_message(str(exc)),
+            error_class=error_class,
+            error_message=error_message,
             auth_degraded=threshold_degraded,
             refresh_threshold_seconds=threshold,
             refresh_threshold_source=threshold_source,
@@ -520,6 +574,7 @@ def refresh_xai_oauth_auth_file(
             credential_identity=(
                 resolution.credential_identity if resolution is not None else None
             ),
+            credential_generation=credential_generation,
             auth_file_source=(
                 resolution.auth_file_source if resolution is not None else None
             ),
@@ -550,6 +605,7 @@ def inspect_xai_oauth_refresh_eligibility(
     route_safety_buffer_seconds = _resolve_route_safety_buffer_seconds()
     resolution = None
     credential: Optional[MutableMapping[str, Any]] = None
+    credential_generation: Optional[str] = None
     try:
         resolution = resolve_xai_oauth_credentials(
             auth_file,
@@ -557,8 +613,16 @@ def inspect_xai_oauth_refresh_eligibility(
             value_getter=os.getenv,
         )
         resolved_scope = resolution.scope
-        payload = _read_credential_payload(resolution.canonical_auth_file)
+        payload, stat_result = _read_credential_payload_with_stat(
+            resolution.canonical_auth_file
+        )
         credential = _select_credential_record(payload, resolved_scope)
+        credential_generation = _credential_generation(
+            resolution.canonical_auth_file,
+            credential,
+            scope=resolved_scope,
+            stat_result=stat_result,
+        )
         lifecycle = evaluate_xai_oauth_credential_lifecycle(
             credential,
             now=lambda: observed_at,
@@ -600,6 +664,7 @@ def inspect_xai_oauth_refresh_eligibility(
             error_class=error_class,
             error_message=error_message,
             credential_identity=resolution.credential_identity,
+            credential_generation=credential_generation,
             auth_file_source=resolution.auth_file_source,
             scope_source=resolution.scope_source,
             lifecycle=lifecycle,
@@ -620,6 +685,7 @@ def inspect_xai_oauth_refresh_eligibility(
             credential_identity=(
                 resolution.credential_identity if resolution is not None else None
             ),
+            credential_generation=credential_generation,
             auth_file_source=(
                 resolution.auth_file_source if resolution is not None else None
             ),
@@ -643,6 +709,7 @@ def _eligibility_summary(
     error_class: Optional[str] = None,
     error_message: Optional[str] = None,
     credential_identity: Optional[str] = None,
+    credential_generation: Optional[str] = None,
     auth_file_source: Optional[str] = None,
     scope_source: Optional[str] = None,
     lifecycle: Optional[Mapping[str, Any]] = None,
@@ -663,6 +730,7 @@ def _eligibility_summary(
         "error_class": error_class,
         "error_message": error_message,
         "credential_identity": credential_identity,
+        "credential_generation": credential_generation,
         "auth_file_source": auth_file_source,
         "scope_source": scope_source,
         "structurally_valid": lifecycle.get("structurally_valid"),
@@ -787,19 +855,84 @@ def _apply_credential_file_metadata(
 
 
 def _read_credential_payload(auth_path: Path) -> Dict[str, Any]:
+    payload, _stat_result = _read_credential_payload_with_stat(auth_path)
+    return payload
+
+
+def _read_credential_payload_with_stat(  # noqa: PLR0915
+    auth_path: Path,
+) -> tuple[Dict[str, Any], os.stat_result]:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ValueError("xAI OAuth auth file cannot be opened safely.")
+    flags = os.O_RDONLY | nofollow
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    if cloexec is not None:
+        flags |= cloexec
     try:
-        with auth_path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
+        file_descriptor = os.open(os.fspath(auth_path), flags)
     except FileNotFoundError as exc:
         raise ValueError(f"xAI OAuth auth file not found at {auth_path}.") from exc
-    except json.JSONDecodeError as exc:
+    try:
+        try:
+            before = os.fstat(file_descriptor)
+        except OSError:
+            raise ValueError("xAI OAuth auth file metadata is unreadable.") from None
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("xAI OAuth auth file is not a regular file.")
+        if before.st_size > _XAI_OAUTH_MAX_AUTH_FILE_BYTES:
+            raise ValueError("xAI OAuth auth file is too large.")
+        chunks: list[bytes] = []
+        bytes_read = 0
+        while bytes_read <= _XAI_OAUTH_MAX_AUTH_FILE_BYTES:
+            try:
+                chunk = os.read(
+                    file_descriptor,
+                    min(
+                        8192,
+                        _XAI_OAUTH_MAX_AUTH_FILE_BYTES + 1 - bytes_read,
+                    ),
+                )
+            except OSError:
+                raise ValueError("xAI OAuth auth file could not be read.") from None
+            if not chunk:
+                break
+            chunks.append(chunk)
+            bytes_read += len(chunk)
+        if bytes_read > _XAI_OAUTH_MAX_AUTH_FILE_BYTES:
+            raise ValueError("xAI OAuth auth file is too large.")
+        try:
+            after = os.fstat(file_descriptor)
+        except OSError:
+            raise ValueError("xAI OAuth auth file metadata is unreadable.") from None
+    finally:
+        try:
+            os.close(file_descriptor)
+        except OSError:
+            pass
+
+    if (
+        int(before.st_dev),
+        int(before.st_ino),
+        int(before.st_mtime_ns),
+        int(before.st_size),
+    ) != (
+        int(after.st_dev),
+        int(after.st_ino),
+        int(after.st_mtime_ns),
+        int(after.st_size),
+    ):
+        raise ValueError("xAI OAuth auth file changed while it was read.")
+    try:
+        payload = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(
             f"xAI OAuth auth file at {auth_path} is not valid JSON."
         ) from exc
 
     if not isinstance(payload, dict):
         raise ValueError("xAI OAuth auth file must contain a JSON object.")
-    return payload
+    return payload, after
 
 
 def _select_credential_record(
@@ -998,8 +1131,9 @@ def _refresh_credential_record(
 ) -> Mapping[str, Any]:
     refresh_token = _clean_oauth_string(credential.get("refresh_token"))
     if refresh_token is None:
-        raise ValueError(
-            "xAI OAuth credential is expired or near expiry and has no refresh_token."
+        raise XaiOAuthRefreshError(
+            "credential_unavailable",
+            "xAI OAuth credential cannot be refreshed without a refresh token.",
         )
 
     resolved_client_id = (
@@ -1008,7 +1142,10 @@ def _refresh_credential_record(
         or _clean_oauth_string(credential.get("client_id"))
     )
     if resolved_client_id is None:
-        raise ValueError("xAI OAuth refresh requires oidc_client_id or client_id.")
+        raise XaiOAuthRefreshError(
+            "credential_configuration_error",
+            "xAI OAuth refresh requires a configured client identifier.",
+        )
 
     resolved_token_endpoint = (
         _clean_oauth_string(token_endpoint)
@@ -1040,26 +1177,91 @@ def _refresh_credential_record(
         if on_token_endpoint_attempt is not None:
             on_token_endpoint_attempt()
         with urllib_request.urlopen(request, timeout=http_timeout_seconds) as response:
+            response_status = int(getattr(response, "status", 200))
             response_body = response.read()
     except urllib_error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")
-        raise ValueError(
-            f"xAI OAuth refresh failed with HTTP {exc.code}: {_sanitize_error_message(error_body)}"
-        ) from exc
-    except urllib_error.URLError as exc:
-        raise ValueError(
-            f"xAI OAuth refresh failed: {_sanitize_error_message(str(exc.reason))}"
+        try:
+            error_body = exc.read()
+        except OSError:
+            error_body = b""
+        raise _xai_oauth_http_error(exc.code, error_body) from exc
+    except (urllib_error.URLError, TimeoutError, OSError) as exc:
+        raise XaiOAuthRefreshError(
+            "transport_error",
+            "xAI OAuth token endpoint transport failed.",
         ) from exc
 
+    if response_status < 200 or response_status >= 300:
+        raise _xai_oauth_http_error(response_status, response_body)
+
     try:
-        payload = json.loads(response_body.decode("utf-8"))
+        payload = json.loads(response_body)
     except (UnicodeError, json.JSONDecodeError) as exc:
-        raise ValueError("xAI OAuth refresh response was not valid JSON.") from exc
+        raise XaiOAuthRefreshError(
+            "malformed_response",
+            "xAI OAuth token endpoint returned an invalid response.",
+        ) from exc
     if not isinstance(payload, Mapping):
-        raise ValueError("xAI OAuth refresh response must contain a JSON object.")
+        raise XaiOAuthRefreshError(
+            "malformed_response",
+            "xAI OAuth token endpoint returned an invalid response.",
+        )
     if _clean_oauth_string(payload.get("access_token")) is None:
-        raise ValueError("xAI OAuth refresh response did not contain an access_token.")
+        raise XaiOAuthRefreshError(
+            "malformed_response",
+            "xAI OAuth token endpoint returned an incomplete response.",
+        )
     return payload
+
+
+def _xai_oauth_http_error(
+    status_code: int,
+    response_body: bytes,
+) -> XaiOAuthRefreshError:
+    """Classify an HTTP failure without retaining provider response content."""
+    if status_code == 400:
+        terminal_error = _xai_oauth_terminal_error_code(response_body)
+        if terminal_error is not None:
+            return XaiOAuthRefreshError(
+                terminal_error,
+                "xAI OAuth token endpoint rejected the refresh grant.",
+            )
+    error_class = (
+        "retryable_http_error"
+        if status_code in _XAI_OAUTH_RETRYABLE_HTTP_STATUS_CODES
+        or status_code >= 500
+        else "http_error"
+    )
+    return XaiOAuthRefreshError(
+        error_class,
+        f"xAI OAuth token endpoint returned HTTP {status_code}.",
+    )
+
+
+def _xai_oauth_terminal_error_code(response_body: bytes) -> Optional[str]:
+    """Return only exact allowlisted terminal codes from a 400 JSON response."""
+    try:
+        payload = json.loads(response_body)
+    except (TypeError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    error_code = payload.get("error")
+    if (
+        isinstance(error_code, str)
+        and error_code in _XAI_OAUTH_TERMINAL_REFRESH_ERROR_CLASSES
+    ):
+        return error_code
+    return None
+
+
+def _refresh_error_summary(exc: Exception) -> tuple[str, str]:
+    if isinstance(exc, XaiOAuthRefreshError):
+        return exc.error_class, _sanitize_error_message(str(exc))
+    return (
+        "local_refresh_error",
+        "xAI OAuth refresh could not complete.",
+    )
 
 
 def _update_credential_record(
