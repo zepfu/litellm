@@ -893,27 +893,152 @@ class PgLedger:
                  AND bindings.binding_state = 'active'
                 WHERE NOT attempts.tombstone
             ),
+            alias_rows AS (
+                SELECT
+                    scoped.canonical_scope_key,
+                    scoped.scope_key,
+                    scoped.attempt_id,
+                    aliases.alias_kind,
+                    aliases.alias_value
+                FROM scoped
+                JOIN public.chatgpt_usage_attempt_aliases AS aliases
+                  ON aliases.scope_key = scoped.scope_key
+                 AND aliases.attempt_id = scoped.attempt_id
+            ),
             alias_values AS (
                 SELECT
-                    aliases.scope_key,
-                    aliases.attempt_id,
+                    scoped.canonical_scope_key,
+                    scoped.scope_key,
+                    scoped.attempt_id,
                     string_agg(
-                        aliases.alias_value,
-                        ',' ORDER BY aliases.alias_value
-                    ) FILTER (WHERE aliases.alias_kind = 'generation')
+                        alias_rows.alias_value,
+                        ',' ORDER BY alias_rows.alias_value
+                    ) FILTER (WHERE alias_rows.alias_kind = 'generation')
                         AS generation_aliases,
                     string_agg(
-                        aliases.alias_value,
-                        ',' ORDER BY aliases.alias_value
-                    ) FILTER (WHERE aliases.alias_kind = 'message')
+                        alias_rows.alias_value,
+                        ',' ORDER BY alias_rows.alias_value
+                    ) FILTER (WHERE alias_rows.alias_kind = 'message')
                         AS message_aliases,
                     string_agg(
-                        aliases.alias_value,
-                        ',' ORDER BY aliases.alias_value
-                    ) FILTER (WHERE aliases.alias_kind = 'branch')
+                        alias_rows.alias_value,
+                        ',' ORDER BY alias_rows.alias_value
+                    ) FILTER (WHERE alias_rows.alias_kind = 'branch')
                         AS branch_aliases
-                FROM public.chatgpt_usage_attempt_aliases AS aliases
-                GROUP BY aliases.scope_key, aliases.attempt_id
+                FROM scoped
+                LEFT JOIN alias_rows
+                  ON alias_rows.canonical_scope_key = scoped.canonical_scope_key
+                 AND alias_rows.scope_key = scoped.scope_key
+                 AND alias_rows.attempt_id = scoped.attempt_id
+                GROUP BY
+                    scoped.canonical_scope_key,
+                    scoped.scope_key,
+                    scoped.attempt_id
+            ),
+            generation_keys AS (
+                SELECT
+                    canonical_scope_key,
+                    scope_key,
+                    attempt_id,
+                    'generation:' || generation_aliases AS generation_key
+                FROM alias_values
+                WHERE generation_aliases IS NOT NULL
+            ),
+            strong_edges AS (
+                SELECT DISTINCT
+                    left_alias.canonical_scope_key,
+                    left_alias.scope_key AS left_scope_key,
+                    left_alias.attempt_id AS left_attempt_id,
+                    right_alias.scope_key AS right_scope_key,
+                    right_alias.attempt_id AS right_attempt_id
+                FROM alias_rows AS left_alias
+                JOIN alias_rows AS right_alias
+                  ON right_alias.canonical_scope_key = left_alias.canonical_scope_key
+                 AND right_alias.alias_kind = left_alias.alias_kind
+                 AND right_alias.alias_value = left_alias.alias_value
+                WHERE left_alias.alias_kind IN ('message', 'branch')
+                  AND (
+                      left_alias.scope_key <> right_alias.scope_key
+                      OR left_alias.attempt_id <> right_alias.attempt_id
+                  )
+            ),
+            strong_reach (
+                canonical_scope_key,
+                node_scope_key,
+                node_attempt_id,
+                root_scope_key,
+                root_attempt_id
+            ) AS (
+                SELECT
+                    scoped.canonical_scope_key,
+                    scoped.scope_key,
+                    scoped.attempt_id,
+                    scoped.scope_key,
+                    scoped.attempt_id
+                FROM scoped
+                UNION
+                SELECT
+                    reach.canonical_scope_key,
+                    CASE
+                        WHEN edges.left_scope_key = reach.node_scope_key
+                         AND edges.left_attempt_id = reach.node_attempt_id
+                            THEN edges.right_scope_key
+                        ELSE edges.left_scope_key
+                    END,
+                    CASE
+                        WHEN edges.left_scope_key = reach.node_scope_key
+                         AND edges.left_attempt_id = reach.node_attempt_id
+                            THEN edges.right_attempt_id
+                        ELSE edges.left_attempt_id
+                    END,
+                    reach.root_scope_key,
+                    reach.root_attempt_id
+                FROM strong_reach AS reach
+                JOIN strong_edges AS edges
+                  ON edges.canonical_scope_key = reach.canonical_scope_key
+                 AND (
+                     (
+                         edges.left_scope_key = reach.node_scope_key
+                         AND edges.left_attempt_id = reach.node_attempt_id
+                     )
+                     OR (
+                         edges.right_scope_key = reach.node_scope_key
+                         AND edges.right_attempt_id = reach.node_attempt_id
+                     )
+                 )
+            ),
+            strong_components AS (
+                SELECT
+                    canonical_scope_key,
+                    node_scope_key AS scope_key,
+                    node_attempt_id AS attempt_id,
+                    MIN(
+                        jsonb_build_array(root_scope_key, root_attempt_id)::text
+                    ) AS component_key
+                FROM strong_reach
+                GROUP BY
+                    canonical_scope_key,
+                    node_scope_key,
+                    node_attempt_id
+            ),
+            component_generation_keys AS (
+                SELECT
+                    components.canonical_scope_key,
+                    components.component_key,
+                    count(DISTINCT generations.generation_key)
+                        AS generation_key_count,
+                    MIN(generations.generation_key) AS generation_key
+                FROM strong_components AS components
+                LEFT JOIN strong_components AS members
+                  ON members.canonical_scope_key = components.canonical_scope_key
+                 AND members.component_key = components.component_key
+                LEFT JOIN generation_keys AS generations
+                  ON generations.canonical_scope_key = members.canonical_scope_key
+                 AND generations.scope_key = members.scope_key
+                 AND generations.attempt_id = members.attempt_id
+                GROUP BY
+                    components.canonical_scope_key,
+                    components.component_key
             ),
             identified AS (
                 SELECT
@@ -921,18 +1046,31 @@ class PgLedger:
                     CASE
                         WHEN alias_values.generation_aliases IS NOT NULL
                             THEN 'generation:' || alias_values.generation_aliases
+                        WHEN component_generation_keys.generation_key_count = 1
+                            THEN component_generation_keys.generation_key
+                        WHEN component_generation_keys.generation_key_count > 1
+                            THEN 'attempt:' || scoped.scope_key || ':'
+                                || scoped.attempt_id
                         WHEN alias_values.message_aliases IS NOT NULL
-                            OR alias_values.branch_aliases IS NOT NULL
-                            THEN 'strong:'
-                                || COALESCE(alias_values.message_aliases, '')
-                                || '|'
-                                || COALESCE(alias_values.branch_aliases, '')
-                        ELSE 'attempt:' || scoped.attempt_id
+                          OR alias_values.branch_aliases IS NOT NULL
+                            THEN 'strong:' || strong_components.component_key
+                        ELSE 'attempt:' || scoped.scope_key || ':'
+                            || scoped.attempt_id
                     END AS identity_key
                 FROM scoped
                 LEFT JOIN alias_values
-                  ON alias_values.scope_key = scoped.scope_key
+                  ON alias_values.canonical_scope_key = scoped.canonical_scope_key
+                 AND alias_values.scope_key = scoped.scope_key
                  AND alias_values.attempt_id = scoped.attempt_id
+                JOIN strong_components
+                  ON strong_components.canonical_scope_key = scoped.canonical_scope_key
+                 AND strong_components.scope_key = scoped.scope_key
+                 AND strong_components.attempt_id = scoped.attempt_id
+                LEFT JOIN component_generation_keys
+                  ON component_generation_keys.canonical_scope_key =
+                         strong_components.canonical_scope_key
+                 AND component_generation_keys.component_key =
+                         strong_components.component_key
             ),
             canonicalized AS (
                 SELECT DISTINCT ON (canonical_scope_key, identity_key)
@@ -1288,7 +1426,7 @@ class PgLedgerPage:
                 collector_account_id=scope.collector_account_id,
                 seen_at=seen_at,
             )
-            if prior_identity_state == "provisional" and identity_state == "verified":
+            if prior_identity_state != "retired" and expected.scope_key != key:
                 _redirect_scope(
                     cur,
                     retired_scope_key=expected.scope_key,
@@ -1474,6 +1612,87 @@ class PgLedgerPage:
             _lock_scope(cur, binding.scope_key)
             prior = _latest_observation(cur, binding.scope_key, safe_context)
             current = _current_observation(cur, binding.scope_key, safe_context)
+            matching = _matching_observation(
+                cur,
+                binding.scope_key,
+                safe_context,
+                revision_fingerprint,
+            )
+            if (
+                matching is not None
+                and current is not None
+                and matching["observation_id"] == current["observation_id"]
+            ):
+                cur.execute(
+                    """
+                    UPDATE public.chatgpt_usage_observations
+                    SET observed_at = CASE
+                            WHEN %s >= observed_at THEN %s ELSE observed_at END,
+                        last_seen_at = GREATEST(last_seen_at, %s),
+                        last_seen_run_id = CASE
+                            WHEN %s >= last_seen_at THEN %s ELSE last_seen_run_id END,
+                        last_seen_provenance = CASE
+                            WHEN %s >= last_seen_at THEN %s::jsonb
+                            ELSE last_seen_provenance END
+                    WHERE scope_key = %s AND observation_id = %s
+                    """,
+                    (
+                        observed_at,
+                        observed_at,
+                        observed_at,
+                        observed_at,
+                        safe_context.run_id,
+                        observed_at,
+                        json.dumps(provenance, separators=(",", ":"), default=str),
+                        binding.scope_key,
+                        matching["observation_id"],
+                    ),
+                )
+                _record_activity_provenance(
+                    cur,
+                    binding.scope_key,
+                    "observation",
+                    matching["observation_id"],
+                    safe_scope.collector_account_id,
+                    observed_at,
+                )
+                return matching["observation_id"], False
+            if (
+                matching is not None
+                and current is not None
+                and matching["observation_id"] != current["observation_id"]
+                and observed_at <= current["observed_at"]
+            ):
+                cur.execute(
+                    """
+                    UPDATE public.chatgpt_usage_observations
+                    SET last_seen_at = GREATEST(last_seen_at, %s),
+                        last_seen_run_id = CASE
+                            WHEN %s >= last_seen_at THEN %s ELSE last_seen_run_id END,
+                        last_seen_provenance = CASE
+                            WHEN %s >= last_seen_at THEN %s::jsonb
+                            ELSE last_seen_provenance END
+                    WHERE scope_key = %s AND observation_id = %s
+                    """,
+                    (
+                        observed_at,
+                        observed_at,
+                        safe_context.run_id,
+                        observed_at,
+                        json.dumps(provenance, separators=(",", ":"), default=str),
+                        binding.scope_key,
+                        matching["observation_id"],
+                    ),
+                )
+                _record_activity_provenance(
+                    cur,
+                    binding.scope_key,
+                    "observation",
+                    matching["observation_id"],
+                    safe_scope.collector_account_id,
+                    observed_at,
+                )
+                return matching["observation_id"], False
             if prior is not None and prior["revision_fingerprint"] == revision_fingerprint:
                 should_promote = current is None or (
                     current["observation_id"] != prior["observation_id"]
@@ -1690,6 +1909,10 @@ class PgLedgerPage:
                 )
 
             quarantine_state = _attempt_quarantine_state(attempt_payload)
+            publish_aliases = (
+                quarantine_state == "clear"
+                and resolution.quarantine_reason is None
+            )
             if current is not None and current["projection_fingerprint"] == projection_fingerprint:
                 cur.execute(
                     """
@@ -1713,15 +1936,19 @@ class PgLedgerPage:
                     merge_refs=resolution.merge_refs,
                     seen_at=observed_at,
                 )
-                merge_result = _merge_attempt_links(
-                    self,
-                    cur,
-                    safe_scope,
-                    scope_key_value=canonical_scope_key,
-                    attempt_id=effective_id,
-                    aliases=aliases,
-                    seen_at=observed_at,
-                    lineage_keys=lineage_keys,
+                merge_result = (
+                    _merge_attempt_links(
+                        self,
+                        cur,
+                        safe_scope,
+                        scope_key_value=canonical_scope_key,
+                        attempt_id=effective_id,
+                        aliases=aliases,
+                        seen_at=observed_at,
+                        lineage_keys=lineage_keys,
+                    )
+                    if publish_aliases
+                    else AliasMergeResult()
                 )
                 _record_activity_provenance(
                     cur,
@@ -1839,15 +2066,19 @@ class PgLedgerPage:
                 merge_refs=resolution.merge_refs,
                 seen_at=observed_at,
             )
-            merge_result = _merge_attempt_links(
-                self,
-                cur,
-                safe_scope,
-                scope_key_value=canonical_scope_key,
-                attempt_id=effective_id,
-                aliases=aliases,
-                seen_at=observed_at,
-                lineage_keys=lineage_keys,
+            merge_result = (
+                _merge_attempt_links(
+                    self,
+                    cur,
+                    safe_scope,
+                    scope_key_value=canonical_scope_key,
+                    attempt_id=effective_id,
+                    aliases=aliases,
+                    seen_at=observed_at,
+                    lineage_keys=lineage_keys,
+                )
+                if publish_aliases
+                else AliasMergeResult()
             )
             _record_activity_provenance(
                 cur,
@@ -2126,7 +2357,7 @@ def _redirect_scope(
         INSERT INTO public.chatgpt_usage_scope_redirects (
             retired_scope_key, canonical_scope_key, reason,
             first_seen_at, last_seen_at
-        ) VALUES (%s, %s, 'verified_identity', %s, %s)
+        ) VALUES (%s, %s, 'identity_refinement', %s, %s)
         ON CONFLICT (retired_scope_key) DO NOTHING
         """,
         (retired_scope_key, canonical_scope_key, seen_at, seen_at),
@@ -2247,6 +2478,41 @@ def _current_observation(
     )
 
 
+def _matching_observation(
+    cur: psycopg.Cursor,
+    scope_key_value: str,
+    context: IngestContext,
+    revision_fingerprint: str,
+) -> Optional[dict[str, Any]]:
+    cur.execute(
+        """
+        SELECT observation_id, observed_at, last_seen_at, occurrence_number,
+               revision_fingerprint
+        FROM public.chatgpt_usage_observations
+        WHERE scope_key = %s AND source_kind = %s AND source_id = %s
+          AND revision_fingerprint = %s
+        ORDER BY observed_at DESC, occurrence_number DESC
+        LIMIT 1
+        """,
+        (scope_key_value, context.source_kind, context.source_id, revision_fingerprint),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return dict(
+        zip(
+            (
+                "observation_id",
+                "observed_at",
+                "last_seen_at",
+                "occurrence_number",
+                "revision_fingerprint",
+            ),
+            row,
+        )
+    )
+
+
 def _attempt(
     cur: psycopg.Cursor,
     scope_key_value: str,
@@ -2255,7 +2521,8 @@ def _attempt(
     cur.execute(
         """
         SELECT revision, projection_fingerprint, collector_account_id, tombstone,
-               quarantine_state, identity_basis, observed_at, last_seen_at
+               quarantine_state, identity_basis, observed_at, last_seen_at,
+               superseded_by_attempt_id
         FROM public.chatgpt_usage_attempts
         WHERE scope_key = %s AND attempt_id = %s
         """,
@@ -2275,6 +2542,7 @@ def _attempt(
                 "identity_basis",
                 "observed_at",
                 "last_seen_at",
+                "superseded_by_attempt_id",
             ),
             row,
         )
@@ -2343,6 +2611,28 @@ def _identity_rank(identity_basis: str) -> int:
     }.get(identity_basis, 0)
 
 
+def _follow_superseded_attempt(
+    cur: psycopg.Cursor,
+    ref: AttemptRef,
+    *,
+    max_depth: int = 64,
+) -> tuple[AttemptRef, Optional[dict[str, Any]]]:
+    current_ref = ref
+    visited: set[AttemptRef] = set()
+    for _ in range(max_depth):
+        if current_ref in visited:
+            break
+        visited.add(current_ref)
+        row = _attempt(cur, current_ref.scope_key, current_ref.attempt_id)
+        if row is None:
+            return current_ref, None
+        successor = row.get("superseded_by_attempt_id")
+        if not row["tombstone"] or not successor:
+            return current_ref, row
+        current_ref = AttemptRef(current_ref.scope_key, str(successor))
+    return current_ref, _attempt(cur, current_ref.scope_key, current_ref.attempt_id)
+
+
 def _resolve_attempt_identity(
     page: PgLedgerPage,
     cur: psycopg.Cursor,
@@ -2353,43 +2643,45 @@ def _resolve_attempt_identity(
     seen_at: datetime,
     lineage_keys: Optional[Sequence[str]] = None,
 ) -> AttemptIdentityResolution:
-    incoming_ref = AttemptRef(scope_key_value, attempt.attempt_id)
+    raw_incoming_ref = AttemptRef(scope_key_value, attempt.attempt_id)
+    incoming_ref, incoming_row = _follow_superseded_attempt(cur, raw_incoming_ref)
     lineage_keys = tuple(lineage_keys or _scope_lineage(cur, scope_key_value))
     strong_aliases = [alias for alias in aliases if alias[0] in _STRONG_ALIAS_KINDS]
     weak_aliases = [alias for alias in aliases if alias[0] not in _STRONG_ALIAS_KINDS]
     strong_matches = _matching_alias_refs(cur, lineage_keys, strong_aliases)
     if strong_matches:
         matches = strong_matches
-    elif attempt.identity_basis == "generation":
-        # Request/prompt aliases are grouping evidence once a generation is
-        # known; reusing one must never collapse distinct generations.
-        return AttemptIdentityResolution(incoming_ref)
     else:
         matches = _matching_alias_refs(cur, lineage_keys, weak_aliases)
+    matches.discard(raw_incoming_ref)
     matches.discard(incoming_ref)
-    if not matches:
-        return AttemptIdentityResolution(incoming_ref)
 
-    candidate_rows: dict[AttemptRef, dict[str, Any]] = {}
-    for ref in matches:
-        candidate = _attempt(cur, ref.scope_key, ref.attempt_id)
-        if candidate is not None:
-            candidate_rows[ref] = candidate
-    if len(candidate_rows) != len(matches):
+    candidate_refs: set[AttemptRef] = set()
+    missing_refs: set[AttemptRef] = set()
+    for matched_ref in matches:
+        resolved_ref, candidate = _follow_superseded_attempt(cur, matched_ref)
+        if candidate is None:
+            missing_refs.add(matched_ref)
+        else:
+            candidate_refs.add(resolved_ref)
+    if incoming_row is not None:
+        candidate_refs.add(incoming_ref)
+
+    if missing_refs:
         _record_identity_gap(
             page,
             cur,
             scope,
             scope_key_value,
-            source_id=incoming_ref.attempt_id,
+            source_id=raw_incoming_ref.attempt_id,
             reason="alias_to_missing_attempt",
             details={
                 "participants": [
-                    _attempt_participant(incoming_ref, role="incoming"),
+                    _attempt_participant(raw_incoming_ref, role="incoming"),
                     *[
                         _attempt_participant(ref, role="missing")
                         for ref in sorted(
-                            matches - candidate_rows.keys(),
+                            missing_refs,
                             key=lambda item: (item.scope_key, item.attempt_id),
                         )[:16]
                     ],
@@ -2399,9 +2691,20 @@ def _resolve_attempt_identity(
         )
         return AttemptIdentityResolution(
             incoming_ref,
-            conflicts=len(matches),
+            conflicts=len(missing_refs),
             quarantine_reason="alias_to_missing_attempt",
         )
+
+    if not candidate_refs:
+        return AttemptIdentityResolution(incoming_ref)
+
+    candidate_rows: dict[AttemptRef, dict[str, Any]] = {}
+    for ref in candidate_refs:
+        candidate = _attempt(cur, ref.scope_key, ref.attempt_id)
+        if candidate is not None:
+            candidate_rows[ref] = candidate
+    if not candidate_rows:
+        return AttemptIdentityResolution(incoming_ref)
 
     incoming_generations = _attempt_alias_values_for_input(aliases, "generation")
     candidate_generations = {
@@ -2413,28 +2716,40 @@ def _resolve_attempt_identity(
         for ref, generations in candidate_generations.items()
         if generations
         and incoming_generations
-        and generations != incoming_generations
+        and not generations.intersection(incoming_generations)
     }
-    nonempty_generation_groups = {
-        tuple(sorted(generations))
-        for generations in candidate_generations.values()
-        if generations
-    }
-    if incompatible or len(nonempty_generation_groups) > 1:
+    nonempty_generation_sets = [
+        generations for generations in candidate_generations.values() if generations
+    ]
+    generation_ambiguity = any(
+        not left.intersection(right)
+        for index, left in enumerate(nonempty_generation_sets)
+        for right in nonempty_generation_sets[index + 1 :]
+    )
+    weak_only = not strong_matches and bool(matches)
+    weak_selection = (
+        weak_only
+        and (
+            attempt.identity_basis == "generation"
+            or len(candidate_rows) > 1
+            or any(candidate_generations.values())
+        )
+    )
+    if incompatible or generation_ambiguity or weak_selection:
         _record_identity_gap(
             page,
             cur,
             scope,
             scope_key_value,
-            source_id=incoming_ref.attempt_id,
+            source_id=raw_incoming_ref.attempt_id,
             reason="ambiguous_attempt_alias",
             details={
                 "participants": [
-                    _attempt_participant(incoming_ref, role="incoming"),
+                    _attempt_participant(raw_incoming_ref, role="incoming"),
                     *[
                         _attempt_participant(ref, role="candidate")
                         for ref in sorted(
-                            matches,
+                            candidate_rows,
                             key=lambda item: (item.scope_key, item.attempt_id),
                         )[:16]
                     ],
@@ -2444,7 +2759,7 @@ def _resolve_attempt_identity(
         )
         return AttemptIdentityResolution(
             incoming_ref,
-            conflicts=len(matches),
+            conflicts=len(candidate_rows),
             quarantine_reason="ambiguous_attempt_alias",
         )
 
@@ -2457,11 +2772,11 @@ def _resolve_attempt_identity(
             cur,
             scope,
             scope_key_value,
-            source_id=incoming_ref.attempt_id,
+            source_id=raw_incoming_ref.attempt_id,
             reason="alias_to_retired_attempt",
             details={
                 "participants": [
-                    _attempt_participant(incoming_ref, role="incoming"),
+                    _attempt_participant(raw_incoming_ref, role="incoming"),
                     *[
                         _attempt_participant(ref, role="retired")
                         for ref in sorted(
@@ -2503,7 +2818,7 @@ def _resolve_attempt_identity(
     canonical_ref = incoming_ref if prefer_incoming else canonical_candidate
     merge_refs = tuple(
         sorted(
-            matches - {canonical_ref},
+            candidate_rows.keys() - {canonical_ref},
             key=lambda item: (item.scope_key, item.attempt_id),
         )
     )
@@ -2570,35 +2885,93 @@ def _reassign_attempt_aliases(
         """,
         (previous_ref.scope_key, previous_ref.attempt_id),
     )
-    for alias_kind, alias_value, first_seen_at, last_seen_at in cur.fetchall():
+    aliases = cur.fetchall()
+    for alias_kind, alias_value, first_seen_at, last_seen_at in aliases:
+        transfer_seen_at = max(last_seen_at, seen_at)
+        if previous_ref.scope_key == canonical_ref.scope_key:
+            cur.execute(
+                """
+                UPDATE public.chatgpt_usage_attempt_aliases
+                SET attempt_id = %s,
+                    first_seen_at = LEAST(first_seen_at, %s),
+                    last_seen_at = GREATEST(last_seen_at, %s)
+                WHERE scope_key = %s AND alias_kind = %s AND alias_value = %s
+                  AND attempt_id = %s
+                """,
+                (
+                    canonical_ref.attempt_id,
+                    first_seen_at,
+                    transfer_seen_at,
+                    previous_ref.scope_key,
+                    alias_kind,
+                    alias_value,
+                    previous_ref.attempt_id,
+                ),
+            )
+            continue
         cur.execute(
             """
-            INSERT INTO public.chatgpt_usage_attempt_aliases (
-                scope_key, alias_kind, alias_value, attempt_id,
-                first_seen_at, last_seen_at
-            ) VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (scope_key, alias_kind, alias_value) DO UPDATE SET
-                last_seen_at = GREATEST(
-                    public.chatgpt_usage_attempt_aliases.last_seen_at,
-                    EXCLUDED.last_seen_at
-                )
+            SELECT attempt_id
+            FROM public.chatgpt_usage_attempt_aliases
+            WHERE scope_key = %s AND alias_kind = %s AND alias_value = %s
             """,
             (
                 canonical_ref.scope_key,
                 alias_kind,
                 alias_value,
-                canonical_ref.attempt_id,
-                first_seen_at,
-                max(last_seen_at, seen_at),
             ),
         )
-    cur.execute(
-        """
-        DELETE FROM public.chatgpt_usage_attempt_aliases
-        WHERE scope_key = %s AND attempt_id = %s
-        """,
-        (previous_ref.scope_key, previous_ref.attempt_id),
-    )
+        target = cur.fetchone()
+        if target is None:
+            cur.execute(
+                """
+                INSERT INTO public.chatgpt_usage_attempt_aliases (
+                    scope_key, alias_kind, alias_value, attempt_id,
+                    first_seen_at, last_seen_at
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    canonical_ref.scope_key,
+                    alias_kind,
+                    alias_value,
+                    canonical_ref.attempt_id,
+                    first_seen_at,
+                    transfer_seen_at,
+                ),
+            )
+            target_attempt_id = canonical_ref.attempt_id
+        else:
+            target_attempt_id = str(target[0])
+            if target_attempt_id == canonical_ref.attempt_id:
+                cur.execute(
+                    """
+                    UPDATE public.chatgpt_usage_attempt_aliases
+                    SET first_seen_at = LEAST(first_seen_at, %s),
+                        last_seen_at = GREATEST(last_seen_at, %s)
+                    WHERE scope_key = %s AND alias_kind = %s AND alias_value = %s
+                    """,
+                    (
+                        first_seen_at,
+                        transfer_seen_at,
+                        canonical_ref.scope_key,
+                        alias_kind,
+                        alias_value,
+                    ),
+                )
+        if target_attempt_id == canonical_ref.attempt_id:
+            cur.execute(
+                """
+                DELETE FROM public.chatgpt_usage_attempt_aliases
+                WHERE scope_key = %s AND alias_kind = %s AND alias_value = %s
+                  AND attempt_id = %s
+                """,
+                (
+                    previous_ref.scope_key,
+                    alias_kind,
+                    alias_value,
+                    previous_ref.attempt_id,
+                ),
+            )
 
 
 def _finalize_identity_merges(
@@ -2611,13 +2984,13 @@ def _finalize_identity_merges(
     for previous_ref in merge_refs:
         if previous_ref == canonical_ref:
             continue
-        _tombstone_attempt(
+        _reassign_attempt_aliases(
             cur,
             previous_ref=previous_ref,
             canonical_ref=canonical_ref,
             seen_at=seen_at,
         )
-        _reassign_attempt_aliases(
+        _tombstone_attempt(
             cur,
             previous_ref=previous_ref,
             canonical_ref=canonical_ref,
@@ -2840,6 +3213,7 @@ def _merge_attempt_links(
     safe_aliases = _unique_aliases(aliases)
     safe_seen_at = _utc_datetime(seen_at, "seen_at")
     ledger.assert_safe_record(safe_aliases)
+    conflicts_by_alias: dict[tuple[str, str], set[AttemptRef]] = {}
     for alias_kind, safe_value in safe_aliases:
         existing_refs = _matching_alias_refs(
             cur,
@@ -2848,12 +3222,15 @@ def _merge_attempt_links(
         )
         existing_refs.discard(AttemptRef(scope_key_value, attempt_id))
         if existing_refs:
+            conflicts_by_alias[(alias_kind, safe_value)] = existing_refs
+            conflicts += 1
+            quarantine_conflicts += 1 if alias_kind in _STRONG_ALIAS_KINDS else 0
+    if conflicts_by_alias:
+        for (alias_kind, safe_value), existing_refs in conflicts_by_alias.items():
             existing_ref = sorted(
                 existing_refs,
                 key=lambda item: (item.scope_key, item.attempt_id),
             )[0]
-            conflicts += 1
-            quarantine_conflicts += 1 if alias_kind in _STRONG_ALIAS_KINDS else 0
             _record_alias_collision(
                 ledger,
                 cur,
@@ -2864,7 +3241,11 @@ def _merge_attempt_links(
                 incoming_ref=AttemptRef(scope_key_value, attempt_id),
                 seen_at=safe_seen_at,
             )
-            continue
+        return AliasMergeResult(
+            conflicts=conflicts,
+            quarantine_conflicts=quarantine_conflicts,
+        )
+    for alias_kind, safe_value in safe_aliases:
         cur.execute(
             """
             SELECT first_seen_at, last_seen_at

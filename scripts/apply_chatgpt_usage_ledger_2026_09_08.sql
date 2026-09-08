@@ -296,24 +296,52 @@ ALTER TABLE public.chatgpt_usage_observations
     ALTER COLUMN last_seen_run_id SET NOT NULL;
 
 UPDATE public.chatgpt_usage_attempt_revisions AS revisions
-SET is_current_projection = EXISTS (
+SET is_current_projection = FALSE
+WHERE revisions.is_current_projection
+  AND NOT EXISTS (
     SELECT 1
     FROM public.chatgpt_usage_attempts AS attempts
     WHERE attempts.scope_key = revisions.scope_key
       AND attempts.attempt_id = revisions.attempt_id
+      AND NOT attempts.tombstone
       AND attempts.revision = revisions.revision
       AND attempts.projection_fingerprint = revisions.projection_fingerprint
 );
 
-WITH ranked_observations AS (
+UPDATE public.chatgpt_usage_attempt_revisions AS revisions
+SET is_current_projection = TRUE
+WHERE NOT revisions.is_current_projection
+  AND EXISTS (
+    SELECT 1
+    FROM public.chatgpt_usage_attempts AS attempts
+    WHERE attempts.scope_key = revisions.scope_key
+      AND attempts.attempt_id = revisions.attempt_id
+      AND NOT attempts.tombstone
+      AND attempts.revision = revisions.revision
+      AND attempts.projection_fingerprint = revisions.projection_fingerprint
+);
+
+WITH invalid_observation_groups AS (
+    SELECT scope_key, source_kind, source_id
+    FROM public.chatgpt_usage_observations
+    GROUP BY scope_key, source_kind, source_id
+    HAVING count(*) FILTER (WHERE is_current_projection) <> 1
+),
+ranked_observations AS (
     SELECT
-        observation_id,
-        scope_key,
+        observations.observation_id,
+        observations.scope_key,
         ROW_NUMBER() OVER (
-            PARTITION BY scope_key, source_kind, source_id
+            PARTITION BY observations.scope_key,
+                         observations.source_kind,
+                         observations.source_id
             ORDER BY observed_at DESC, occurrence_number DESC, observation_id DESC
         ) AS freshness_rank
-    FROM public.chatgpt_usage_observations
+    FROM public.chatgpt_usage_observations AS observations
+    JOIN invalid_observation_groups AS invalid
+      ON invalid.scope_key = observations.scope_key
+     AND invalid.source_kind = observations.source_kind
+     AND invalid.source_id = observations.source_id
 )
 UPDATE public.chatgpt_usage_observations AS observations
 SET is_current_projection = ranked_observations.freshness_rank = 1
