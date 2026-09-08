@@ -1826,10 +1826,16 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     elif affinity_selection_reason is not None:
         selection_reason = affinity_selection_reason
     else:
+        quota_selection = selected_state.get("quota_selection")
         selection_reason = (
-            "direct_inventory_interchangeable"
-            if interchangeable_accounts
-            else "direct_inventory_first_available"
+            quota_selection.get("selection_reason")
+            if isinstance(quota_selection, dict)
+            and quota_selection.get("selection_reason")
+            else (
+                "direct_inventory_interchangeable"
+                if interchangeable_accounts
+                else "direct_inventory_first_available"
+            )
         )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_build import (
         _codex_auto_agent_request_has_continuation_state,

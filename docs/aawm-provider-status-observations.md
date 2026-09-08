@@ -1321,6 +1321,9 @@ Relevant environment variables:
 - `AAWM_CODEX_RESET_CREDIT_POLL_ENABLED`: enables the scheduled poll.
 - `AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS`: minimum seconds between poll
   attempts (default `600`).
+- `AAWM_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_PCT`: minimum percentage-point
+  gap in comparable fresh weekly remaining quota required for fresh OpenAI
+  account dispatches to prefer the less-depleted account (default `10`).
 - `AAWM_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS`: HTTP timeout.
 - `AAWM_CODEX_USAGE_URL`: live usage poll URL (defaults to `/wham/usage`).
 - `AAWM_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS`: max attempts per scheduled run.

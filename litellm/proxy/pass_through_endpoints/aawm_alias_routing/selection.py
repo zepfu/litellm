@@ -124,6 +124,10 @@ _CODEX_OAUTH_QUOTA_FAILURE_RETRY_SECONDS = 5.0
 _CODEX_OAUTH_QUOTA_LOOKUP_TIMEOUT_SECONDS = 0.5
 _CODEX_OAUTH_QUOTA_VALIDITY_DEFAULT_SECONDS = 600.0
 _CODEX_OAUTH_QUOTA_VALIDITY_ENV = "AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS"
+_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_DEFAULT_PCT = 10.0
+_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_ENV = (
+    "AAWM_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_PCT"
+)
 _CODEX_OAUTH_QUOTA_CLIENT = "codex"
 _CODEX_OAUTH_QUOTA_SOURCE = "codex_quota_poll"
 _CODEX_OAUTH_QUOTA_FAMILY_OVERALL = "overall"
@@ -3148,7 +3152,16 @@ def _codex_oauth_dual_family_remaining(
 def _select_first_available_codex_oauth_account_state(
     states: Sequence[dict[str, Any]],
 ) -> Optional[dict[str, Any]]:
-    """Pick the first account in deterministic configured priority order."""
+    """Select a fresh Codex account using comparable weekly quota evidence.
+
+    Accounts are compared only when every available account has a fresh,
+    same-environment weekly observation for the request's quota family. A
+    difference of at least 10 percentage points is material and prefers the
+    less-depleted account; smaller differences and exact ties retain configured
+    priority order. When any available account lacks comparable evidence, the
+    selector falls back explicitly to priority order rather than inventing
+    fresh capacity.
+    """
     available = [
         state
         for state in states
@@ -3156,7 +3169,86 @@ def _select_first_available_codex_oauth_account_state(
     ]
     if not available:
         return None
-    return available[0]
+
+    remaining_by_state: dict[int, float] = {}
+    oldest_age_by_state: dict[int, float] = {}
+    family_by_state: dict[int, str] = {}
+    threshold = _codex_oauth_weekly_balance_threshold_pct()
+    for index, state in enumerate(available):
+        candidate = state["candidate"]
+        family = _codex_oauth_quota_family_for_model(candidate.get("model"))
+        family_by_state[index] = family
+        remaining = _codex_oauth_dual_family_remaining(state).get(family)
+        if remaining is None:
+            remaining_by_state.clear()
+            oldest_age_by_state.clear()
+            break
+        remaining_by_state[index] = remaining
+        observation = state.get("quota_observation")
+        try:
+            age = float(observation.get("observation_age_seconds") or 0.0)
+        except (AttributeError, TypeError, ValueError):
+            age = 0.0
+        oldest_age_by_state[index] = max(0.0, age)
+
+    observations = {
+        str(state["candidate"].get("codex_oauth_account_label") or index): (
+            remaining_by_state[index]
+            if index in remaining_by_state
+            else None
+        )
+        for index, state in enumerate(available)
+    }
+    quota_selection: dict[str, Any] = {
+        "strategy": "weekly_quota_balance",
+        "window": "weekly",
+        "threshold_pct": threshold,
+        "comparable_observations": bool(remaining_by_state),
+        "observations": observations,
+        "max_observation_age_seconds": (
+            max(oldest_age_by_state.values())
+            if oldest_age_by_state
+            else None
+        ),
+    }
+
+    selected_index = 0
+    if len(available) > 1 and remaining_by_state:
+        highest = max(remaining_by_state.values())
+        gap = highest - min(remaining_by_state.values())
+        quota_selection["observed_gap_pct"] = gap
+        if gap >= quota_selection["threshold_pct"]:
+            selected_index = next(
+                index
+                for index, remaining in remaining_by_state.items()
+                if remaining == highest
+            )
+            quota_selection["selection_reason"] = "weekly_quota_balanced"
+        else:
+            quota_selection["selection_reason"] = "weekly_quota_priority_tie"
+    else:
+        quota_selection["selection_reason"] = (
+            "weekly_quota_observation_fallback"
+        )
+
+    selected = available[selected_index]
+    selected["quota_selection"] = quota_selection
+    if family_by_state:
+        quota_selection["quota_family"] = family_by_state[selected_index]
+    return selected
+
+
+def _codex_oauth_weekly_balance_threshold_pct() -> float:
+    configured = os.getenv(_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_ENV)
+    if configured is None:
+        return _CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_DEFAULT_PCT
+    try:
+        parsed = float(configured)
+    except (TypeError, ValueError):
+        return _CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_DEFAULT_PCT
+    if not math.isfinite(parsed) or not 0.0 < parsed <= 100.0:
+        return _CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_DEFAULT_PCT
+    return parsed
 
 
 def _format_codex_oauth_quota_reset_at(value: Any) -> Optional[str]:
@@ -3636,6 +3728,21 @@ def _apply_codex_oauth_account_context_to_state(
             state["skip_reason"] = "quota_exhausted"
             state["cooldown_state_source"] = "normalized_quota_observation"
             state["terminal_reset"] = _build_codex_oauth_terminal_reset_information([state])
+        candidate = state["candidate"]
+        if _is_codex_oauth_account_candidate(candidate):
+            candidate.setdefault(
+                "selection_group",
+                "codex_oauth_accounts",
+            )
+            candidate.setdefault("selection_strategy", "weekly_quota_balance")
+            candidate.setdefault(
+                "selection_choice",
+                str(candidate.get("codex_oauth_account_label")),
+            )
+            candidate.setdefault(
+                "selection_weight",
+                float(candidate.get("codex_oauth_account_weight", 1.0)),
+            )
     return _apply_codex_oauth_failover_context_to_state(request, state)
 
 
@@ -4081,6 +4188,15 @@ def _select_available_state(
             selected_choice = str(
                 selected_state["candidate"].get("selection_choice") or ""
             )
+        elif strategy == "weekly_quota_balance":
+            selected_state = _select_first_available_codex_oauth_account_state(
+                tier
+            )
+            if selected_state is None:
+                return None
+            selected_choice = str(
+                selected_state["candidate"].get("selection_choice") or ""
+            )
         elif strategy in {
             "highest_quota_available",
             "lowest_quota_available",
@@ -4113,6 +4229,7 @@ def _select_available_state(
         selected_by_group[str(group)] = selected_choice
 
     selected = selected_state or states_by_choice[selected_choice][0]
+    quota_balancing = selected.get("quota_selection")
     total_weight = sum(max(0.0, weights[choice]) for choice in choices)
     selected["selection_diagnostics"] = {
         "strategy": strategy,
@@ -4131,6 +4248,8 @@ def _select_available_state(
             str(group), 0
         ),
     }
+    if isinstance(quota_balancing, dict):
+        selected["selection_diagnostics"]["quota_balancing"] = quota_balancing
     return selected
 
 
@@ -5568,11 +5687,16 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         last_resort=False,
     )
     if state is not None:
-        selection_reason = (
-            "codex_oauth_account_failover"
-            if int(state.get("failover_ordinal") or 0) > 0
-            else "first_available"
-        )
+        if int(state.get("failover_ordinal") or 0) > 0:
+            selection_reason = "codex_oauth_account_failover"
+        else:
+            quota_selection = state.get("quota_selection")
+            selection_reason = (
+                quota_selection.get("selection_reason")
+                if isinstance(quota_selection, dict)
+                and quota_selection.get("selection_reason")
+                else "first_available"
+            )
         return _attach_account_bound_selection_metadata(
             _attach_session_owner_selection_fields(
                 _attach_aawm_alias_routing_state_sources(
@@ -5604,11 +5728,10 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         last_resort=True,
     )
     if state is not None:
-        selection_reason = (
-            "codex_oauth_account_failover"
-            if int(state.get("failover_ordinal") or 0) > 0
-            else "last_resort"
-        )
+        if int(state.get("failover_ordinal") or 0) > 0:
+            selection_reason = "codex_oauth_account_failover"
+        else:
+            selection_reason = "last_resort"
         return _attach_account_bound_selection_metadata(
             _attach_session_owner_selection_fields(
                 _attach_aawm_alias_routing_state_sources(

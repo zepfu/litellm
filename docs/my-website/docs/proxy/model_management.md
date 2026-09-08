@@ -339,6 +339,17 @@ non-Anthropic routes do not use this path.
 
 ## Managed Codex OAuth account failover
 
+Fresh managed Codex OAuth dispatches compare eligible accounts using fresh
+same-environment weekly remaining-quota observations. A gap of at least 10
+percentage points (configurable with
+`AAWM_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_PCT`) selects the less-depleted
+account; smaller gaps and exact ties retain configured account priority. If any
+eligible account lacks comparable evidence, selection falls back to priority
+order and reports the fallback rather than treating missing evidence as fresh
+capacity. Five-hour and weekly exhaustion, credential eligibility, and model
+support remain hard exclusions. Account-bound continuations retain ownership;
+parent-session or diagnostic metadata cannot pin a genuinely fresh request.
+
 Managed Codex OAuth direct Responses requests preserve canonical session
 ownership and allow at most one replay-safe account move. The guard validates
 that the original durable owner still owns the session before clearing the
