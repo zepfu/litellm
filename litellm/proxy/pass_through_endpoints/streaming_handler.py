@@ -300,9 +300,14 @@ class PassThroughStreamingHandler:
         custom_llm_provider: Optional[str],
     ) -> bool:
         parsed_url = urlparse(url_route)
+        provider_name = (
+            custom_llm_provider.value
+            if isinstance(custom_llm_provider, litellm.LlmProviders)
+            else custom_llm_provider
+        )
         return (
             endpoint_type == EndpointType.OPENAI
-            and custom_llm_provider == "openai"
+            and provider_name == "openai"
             and parsed_url.hostname in {"api.openai.com", "chatgpt.com"}
             and OpenAIPassthroughLoggingHandler.is_openai_responses_route(url_route)
         )
@@ -911,6 +916,22 @@ class PassThroughStreamingHandler:
                 PassThroughStreamingHandler._build_responses_pre_commit_failure(
                     error_payload=error_payload,
                     event_type=event_type,
+                    openai_alpha_capacity_retry_enabled=openai_alpha_capacity_retry_enabled,
+                ),
+            )
+        if decision in {"empty", "lifecycle"}:
+            return (
+                _PrefixedHttpxByteStream(response, peeked, iterator),
+                PassThroughStreamingHandler._build_responses_pre_commit_failure(
+                    error_payload={
+                        "code": "openai_responses_stream_missing_terminal",
+                        "type": "invalid_response",
+                        "message": (
+                            "OpenAI Responses stream ended before a substantive "
+                            "or terminal event."
+                        ),
+                    },
+                    event_type=decision,
                     openai_alpha_capacity_retry_enabled=openai_alpha_capacity_retry_enabled,
                 ),
             )
