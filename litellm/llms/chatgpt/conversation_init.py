@@ -152,6 +152,7 @@ _ENVELOPE_KEYS = {
     "retry_after_seconds",
     "request_body_omitted",
     "projection_truncated",
+    "malformed_collection_projection",
 }
 _PAYLOAD_ENVELOPE_KEYS = ("body", "payload", "response", "json", "data")
 _SECRET_KEY_MARKERS = (
@@ -661,6 +662,7 @@ def sanitize_conversation_init_boundary(  # noqa: PLR0915 - boundary projection
             "request_body_omitted": contract["body_omitted"],
             "retry_after_seconds": None,
             "browser_challenge": False,
+            "malformed_collection_projection": False,
         }
 
     status_code, payload_raw, envelope_redacted = _split_boundary_envelope(raw)
@@ -779,6 +781,16 @@ def sanitize_conversation_init_boundary(  # noqa: PLR0915 - boundary projection
         payload, payload_schema, value_redacted = None, {}, 1
         payload_state = "malformed"
 
+    malformed_collection_projection = (
+        _schema_collection_projection_has_dropped_entries(payload_schema)
+        if isinstance(payload_raw, Mapping)
+        else False
+    )
+    if _allow_verified_envelope_identity and raw.get(
+        "malformed_collection_projection"
+    ) is True:
+        malformed_collection_projection = True
+
     account_identity_source = _resolve_account_identity_source(
         raw,
         account_hash=account_hash,
@@ -804,6 +816,7 @@ def sanitize_conversation_init_boundary(  # noqa: PLR0915 - boundary projection
                 and raw.get("projection_truncated") is True
             )
         ),
+        "malformed_collection_projection": malformed_collection_projection,
         "account_hash": account_hash,
         "account_identity_fields": account_identity_fields,
         "account_identity_source": account_identity_source,
@@ -959,6 +972,9 @@ def _resolve_parse_guard(  # noqa: PLR0915 - parser guard ordering
         "malformed_entry_count": 0,
         "valid_observation_count": 0,
         "projection_truncated": sanitized.get("projection_truncated") is True,
+        "malformed_collection_projection": (
+            sanitized.get("malformed_collection_projection") is True
+        ),
         "telemetry_status": "valid",
         "last_good_state_retained": False,
     }
@@ -1102,6 +1118,9 @@ def _parse_collections(
         payload, existing_ids=set(model_ids),
     )
     truncated = summary.get("projection_truncated") is True
+    projection_malformed = (
+        summary.get("malformed_collection_projection") is True
+    )
     return {
         "feature_rows": feature_rows,
         "feature_ids": feature_ids,
@@ -1114,7 +1133,13 @@ def _parse_collections(
         "model_limits_state": model_state,
         "limits_progress_state": feature_state,
         "blocked_features_state": blocked_state,
-        "malformed": feature_malformed + model_malformed + blocked_malformed,
+        "malformed": (
+            feature_malformed
+            + model_malformed
+            + blocked_malformed
+            + (1 if projection_malformed else 0)
+        ),
+        "projection_malformed": projection_malformed,
         "truncated": truncated,
     }
 
@@ -1355,12 +1380,7 @@ def _redact_mapping(
         redacted_value, node, nested_redacted = _redact_value(
             value,
             depth=depth + 1,
-            parent_key=(
-                "remaining"
-                if parent_normalized in {"model_limits", "limits_progress"}
-                and isinstance(value, str)
-                else name
-            ),
+            parent_key=name,
         )
         redacted_count += nested_redacted
         schema[name] = node
@@ -1422,6 +1442,10 @@ def _redact_value(
             "schema_fingerprint": fingerprint,
             "state": "present" if nested_schema else "empty_unknown",
             "projection": nested_payload,
+            "projection_dropped": (
+                len(value) <= MAX_PROJECTION_OBJECT_KEYS
+                and len(nested_payload) < len(value)
+            ),
             "truncated": (
                 len(value) > MAX_PROJECTION_OBJECT_KEYS
                 or _schema_projection_truncated(nested_schema)
@@ -1432,6 +1456,7 @@ def _redact_value(
         items: List[Any] = []
         item_kinds: List[str] = []
         redacted = 0
+        dropped_items = 0
         nested_truncated = False
         bounded = value[:MAX_PROJECTION_LIST_ITEMS]
         for item in bounded:
@@ -1448,6 +1473,8 @@ def _redact_value(
             )
             if item_node.get("kind") != "redacted":
                 items.append(nested_value)
+            else:
+                dropped_items += 1
         state = "empty_unknown" if not value else "present"
         truncated = len(value) > MAX_PROJECTION_LIST_ITEMS
         if truncated:
@@ -1458,6 +1485,7 @@ def _redact_value(
             "state": state,
             "item_kinds": sorted(set(item_kinds)),
             "projection": items,
+            "dropped_items": dropped_items,
             "truncated": truncated or nested_truncated,
         }
         return items, list_node, redacted
@@ -1470,6 +1498,24 @@ def _schema_projection_truncated(schema: Mapping[str, Any]) -> bool:
         and (node.get("kind") == "truncated" or node.get("truncated") is True)
         for node in schema.values()
     )
+
+
+def _schema_collection_projection_has_dropped_entries(
+    schema: Mapping[str, Any],
+) -> bool:
+    for collection_name in (
+        "model_limits",
+        "limits_progress",
+        "blocked_features",
+    ):
+        node = schema.get(collection_name)
+        if not isinstance(node, Mapping):
+            continue
+        if node.get("kind") == "array" and node.get("dropped_items", 0):
+            return True
+        if node.get("kind") == "object" and node.get("projection_dropped") is True:
+            return True
+    return False
 
 
 def _schema_fingerprint(schema: Mapping[str, Any]) -> str:
@@ -1573,6 +1619,8 @@ def _snapshot_observation(
     }
     if summary.get("projection_truncated"):
         result["raw_provider_fields"]["projection_truncated"] = True
+    if summary.get("malformed_collection_projection"):
+        result["raw_provider_fields"]["malformed_collection_projection"] = True
     return result
 
 
@@ -3911,7 +3959,16 @@ def _snapshot_is_persistable(
     payload = sanitized.get("payload")
     if not isinstance(payload, Mapping) or not looks_like_conversation_init_payload(payload):
         return False
-    if _collections_are_wholly_malformed(_parse_collections(payload, {})):
+    if _collections_are_wholly_malformed(
+        _parse_collections(
+            payload,
+            {
+                "malformed_collection_projection": (
+                    sanitized.get("malformed_collection_projection") is True
+                )
+            },
+        )
+    ):
         return False
     if require_verified_identity:
         return bool(

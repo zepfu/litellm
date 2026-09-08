@@ -14516,6 +14516,28 @@ def _stamp_chatgpt_conversation_init_account_hash(
     return stamped
 
 
+def _record_chatgpt_collector_summary(
+    coverage: Dict[str, Any],
+    collector_summary: Mapping[str, Any],
+) -> None:
+    coverage["collector_written"] = bool(collector_summary.get("written"))
+    coverage["status_code"] = collector_summary.get("status_code")
+    coverage["retry_after_seconds"] = (
+        _chatgpt_conversation_init_retry_after_seconds(
+            collector_summary.get("retry_after_seconds")
+        )
+    )
+    coverage["telemetry_class"] = collector_summary.get("telemetry_class")
+    coverage["telemetry_status"] = collector_summary.get("telemetry_status")
+    coverage["request_body_omitted"] = (
+        _chatgpt_native_capture_request_body_omitted(collector_summary)
+    )
+    coverage["account_identity_verified"] = bool(
+        collector_summary.get("account_identity_verified")
+    )
+    coverage["verified_account_hash"] = collector_summary.get("account_hash")
+
+
 def _collect_bound_chatgpt_conversation_init_account(
     config: ProviderStatusLoopConfig,
     record: CodexOAuthCredentialRecord,
@@ -14555,6 +14577,7 @@ def _collect_bound_chatgpt_conversation_init_account(
         )
         return [], coverage
 
+    collector_summary: Optional[Mapping[str, Any]] = None
     try:
         source_parent = Path(
             config.chatgpt_conversation_init_source_path
@@ -14578,25 +14601,8 @@ def _collect_bound_chatgpt_conversation_init_account(
                         request_url=config.chatgpt_conversation_init_url,
                     )
                 )
-            coverage["collector_written"] = bool(
-                collector_summary.get("written")
-            )
-            coverage["status_code"] = collector_summary.get("status_code")
-            coverage["retry_after_seconds"] = (
-                _chatgpt_conversation_init_retry_after_seconds(
-                    collector_summary.get("retry_after_seconds")
-                )
-            )
-            coverage["telemetry_class"] = collector_summary.get("telemetry_class")
-            coverage["telemetry_status"] = collector_summary.get("telemetry_status")
-            coverage["request_body_omitted"] = (
-                _chatgpt_native_capture_request_body_omitted(collector_summary)
-            )
-            coverage["account_identity_verified"] = bool(
-                collector_summary.get("account_identity_verified")
-            )
-            verified_account_hash = collector_summary.get("account_hash")
-            coverage["verified_account_hash"] = verified_account_hash
+            _record_chatgpt_collector_summary(coverage, collector_summary)
+            verified_account_hash = coverage["verified_account_hash"]
 
             if not coverage["collector_written"]:
                 identity_error = collector_summary.get(
@@ -14693,8 +14699,12 @@ def _collect_bound_chatgpt_conversation_init_account(
             coverage["capture_status"] = "parsed"
             return bound_payloads, coverage
     except Exception as exc:
+        if collector_summary is not None:
+            _record_chatgpt_collector_summary(coverage, collector_summary)
+            coverage["collector_written"] = False
+            coverage["fresh_capture"] = False
         _set_chatgpt_account_capture_exception(coverage, exc)
-    return [], coverage
+        return [], coverage
 
 
 def _run_chatgpt_conversation_init_bound_poll(  # noqa: PLR0915
