@@ -21,6 +21,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import urllib.error
@@ -118,13 +119,10 @@ from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
 )
 from litellm.secret_managers.xai_oauth_credentials import (
-    DEFAULT_XAI_OAUTH_LOCK_FILE as FOUNDATION_DEFAULT_XAI_OAUTH_LOCK_FILE,
     XAI_OAUTH_AUTH_FILE_ENV_VARS,
     XAI_OAUTH_SCOPE_ENV_VARS,
-    default_xai_oauth_lock_path,
     resolve_xai_oauth_auth_path,
     resolve_xai_oauth_credentials,
-    resolve_xai_oauth_lock_path,
     resolve_xai_oauth_scope,
 )
 from litellm.llms.cursor_agent.constants import CURSOR_AGENT_DASHBOARD_HOST
@@ -148,6 +146,16 @@ from litellm.llms.cursor_agent.usage import (
 from litellm.llms.chatgpt.conversation_init import (
     CHATGPT_CONVERSATION_INIT_DEFAULT_URL,
     ChatGPTConversationInitError,
+    OracleBrowserCleanupError,
+    NativeHistoryCloseRegistration,
+    NativeHistoryLifecycleCapability,
+    NativeHistoryLifecycleRegistration,
+    NativeHistoryReleaseProof,
+    _NATIVE_HISTORY_KILL_GRACE_SECONDS,
+    _NATIVE_HISTORY_REAP_GRACE_SECONDS,
+    _NATIVE_HISTORY_TERM_GRACE_SECONDS,
+    _NATIVE_HISTORY_TARGET_BROWSER_TERMINATED,
+    _NATIVE_HISTORY_TARGET_NO_CREATE,
     collect_conversation_init_observations,
     collect_conversation_init_snapshot_from_oracle_browser,
 )
@@ -184,7 +192,7 @@ CODEX_SIDECAR_DEFAULT_AUTH_PATHS = (
 DEFAULT_CODEX_OAUTH_REFRESH_INTERVAL_SECONDS = 300.0
 DEFAULT_CODEX_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_XAI_OAUTH_AUTH_FILE = xai_oauth_refresh.DEFAULT_XAI_OAUTH_AUTH_FILE
-DEFAULT_XAI_OAUTH_LOCK_FILE = FOUNDATION_DEFAULT_XAI_OAUTH_LOCK_FILE
+DEFAULT_XAI_OAUTH_LOCK_FILE = xai_oauth_refresh.DEFAULT_XAI_OAUTH_LOCK_FILE
 XAI_OAUTH_SIDECAR_AUTH_FILE_ENV_VARS = XAI_OAUTH_AUTH_FILE_ENV_VARS
 DEFAULT_XAI_OAUTH_REFRESH_INTERVAL_SECONDS = 300.0
 DEFAULT_XAI_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
@@ -1448,6 +1456,11 @@ class ChatGPTConversationInitResolvedBinding:
 
     cdp_endpoint: str
     page_target_id: str
+    lifecycle_capability: Optional[NativeHistoryLifecycleCapability] = dataclass_field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -1723,6 +1736,13 @@ class SidecarTaskState:
     optional_poll_futures: Dict[str, Future[Any]] = dataclass_field(
         default_factory=dict
     )
+    pending_chatgpt_oracle_browser_owners: Dict[str, Any] = dataclass_field(
+        default_factory=dict
+    )
+    pending_chatgpt_oracle_browser_owners_lock: Any = dataclass_field(
+        default_factory=threading.RLock,
+        repr=False,
+    )
 
 
 _OAUTH_TERMINAL_REFRESH_ERROR_CLASSES = frozenset(
@@ -1744,8 +1764,6 @@ class OAuthRefreshScheduleState:
     last_error_message: Optional[str] = None
     credential_health: Optional[str] = None
     usable: Optional[bool] = None
-    credential_identity: Optional[str] = None
-    credential_generation: Optional[str] = None
     actual_attempt_count: int = 0
     terminal_refresh_error_class: Optional[str] = None
     terminal_refresh_identity: Optional[str] = None
@@ -1884,40 +1902,6 @@ def _resolve_xai_oauth_sidecar_scope(
         default_scope=xai_oauth_refresh.DEFAULT_XAI_OAUTH_SCOPE,
     )
     return resolution.scope, resolution.source
-
-
-def _resolve_xai_oauth_sidecar_lock_file(
-    explicit_lock_file: Optional[str],
-    auth_file: str,
-) -> str:
-    """Derive one default lock identity for each canonical auth file."""
-
-    explicit_value = (
-        explicit_lock_file.strip()
-        if isinstance(explicit_lock_file, str) and explicit_lock_file.strip()
-        else None
-    )
-    if explicit_value is None:
-        configured_lock_file = os.getenv("AAWM_XAI_OAUTH_LOCK_FILE")
-        if isinstance(configured_lock_file, str) and configured_lock_file.strip():
-            explicit_value = configured_lock_file.strip()
-    if explicit_value is not None:
-        explicit_path = Path(explicit_value).expanduser()
-        resolved_explicit_path = resolve_xai_oauth_lock_path(
-            auth_file,
-            explicit_path,
-        )
-        canonical_path = default_xai_oauth_lock_path(auth_file)
-        default_lock_path = Path(DEFAULT_XAI_OAUTH_LOCK_FILE).expanduser().resolve(
-            strict=False
-        )
-        if (
-            resolved_explicit_path == default_lock_path
-            and canonical_path != default_lock_path
-        ):
-            return str(canonical_path)
-        return str(resolved_explicit_path)
-    return str(resolve_xai_oauth_lock_path(auth_file))
 
 
 def _resolve_kimi_oauth_sidecar_auth_file(
@@ -2304,7 +2288,10 @@ def _signal_chatgpt_oracle_process_group(
 
 
 def _chatgpt_oracle_owned_handles(
-    process: subprocess.Popen, temp_root: str, handles: Dict[int, int],
+    process: subprocess.Popen,
+    temp_root: str,
+    handles: Dict[int, int],
+    deadline: Optional[float] = None,
 ) -> None:
     marker = f"{CHATGPT_ORACLE_OWNER_ENV}={temp_root}".encode()
     candidates: Dict[int, tuple[int, int]] = {}
@@ -2315,6 +2302,8 @@ def _chatgpt_oracle_owned_handles(
             except ProcessLookupError:
                 pass
         for entry in Path("/proc").iterdir():
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Oracle browser process discovery timed out.")
             if not entry.name.isdigit() or int(entry.name) in handles:
                 continue
             pid = int(entry.name)
@@ -2385,6 +2374,614 @@ def _remove_chatgpt_oracle_scratch(temp_root: str) -> None:
         raise RuntimeError("Oracle browser scratch cleanup failed.")
 
 
+def _remove_chatgpt_oracle_scratch_bounded(
+    temp_root: str,
+    deadline: float,
+) -> bool:
+    if not Path(temp_root).exists():
+        return True
+    remover: Optional[subprocess.Popen] = None
+    try:
+        remover = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import shutil,sys; shutil.rmtree(sys.argv[1])",
+                temp_root,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        remover.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except (OSError, subprocess.TimeoutExpired):
+        if remover is not None:
+            try:
+                remover.kill()
+                remover.wait(timeout=0)
+            except (OSError, subprocess.TimeoutExpired, ValueError):
+                return False
+        return False
+    return remover.returncode == 0 and not Path(temp_root).exists()
+
+
+class _ChatGPTOracleBrowserOwner:
+    """Own one private Oracle helper and any history children it spawned."""
+
+    def __init__(
+        self,
+        process: subprocess.Popen,
+        temp_root: str,
+        pending_registry: Dict[str, Any],
+        pending_registry_lock: Any,
+    ) -> None:
+        self.process = process
+        self.temp_root = temp_root
+        self.pending_registry = pending_registry
+        self.pending_registry_lock = pending_registry_lock
+        self.owner_id = "oracle-owner-" + uuid.uuid4().hex
+        self.cdp_endpoint = ""
+        self.anchor_target_id = ""
+        self.registrations: Dict[str, NativeHistoryLifecycleRegistration] = {}
+        self.handles: Dict[int, int] = {}
+        self.cleanup_error: Optional[str] = None
+        self.transferred = False
+        self.closing = False
+        self.published = False
+        self.bound = False
+        self.operation_deadline: Optional[float] = None
+        self.history_deadline: Optional[float] = None
+        self.cleanup_recovery_deadline: Optional[float] = None
+        self.scratch_remover: Optional[subprocess.Popen] = None
+        self.scratch_remover_handle: Optional[int] = None
+
+    def publish(self) -> None:
+        """Publish this concrete owner before any history worker can start."""
+
+        with self.pending_registry_lock:
+            if self.published:
+                return
+            if self.pending_registry.get(self.owner_id) not in (None, self):
+                raise RuntimeError("Oracle browser owner registration collision.")
+            self.pending_registry[self.owner_id] = self
+            self.published = True
+
+    def bind(self, *, cdp_endpoint: str, anchor_target_id: str) -> None:
+        with self.pending_registry_lock:
+            if self.closing or self.transferred:
+                raise RuntimeError("Oracle browser lifecycle authority is closing.")
+            if not cdp_endpoint or not anchor_target_id:
+                raise RuntimeError("Oracle browser lifecycle binding is incomplete.")
+            if self.bound and (
+                self.cdp_endpoint != cdp_endpoint
+                or self.anchor_target_id != anchor_target_id
+            ):
+                raise RuntimeError("Oracle browser lifecycle binding changed.")
+            self.cdp_endpoint = cdp_endpoint
+            self.anchor_target_id = anchor_target_id
+            self.bound = True
+
+    @staticmethod
+    def _process_reaped(process: Any) -> bool:
+        if getattr(process, "pid", None) is None:
+            return True
+        try:
+            return not process.is_alive() and process.exitcode is not None
+        except (AssertionError, OSError):
+            return False
+
+    def register(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+    ) -> None:
+        with self.pending_registry_lock:
+            if (
+                self.transferred
+                or self.closing
+                or registration.finalizing
+                or not self.published
+            ):
+                raise RuntimeError(
+                    "Native history lifecycle owner is not accepting work."
+                )
+            if not self.bound:
+                raise RuntimeError(
+                    "Native history lifecycle owner has no validated binding."
+                )
+            if registration.registration_id in self.registrations:
+                raise RuntimeError("Native history lifecycle was registered twice.")
+            if registration.cdp_endpoint != self.cdp_endpoint:
+                raise RuntimeError(
+                    "Native history CDP endpoint does not match lifecycle owner."
+                )
+            if registration.anchor_target_id != self.anchor_target_id:
+                raise RuntimeError(
+                    "Native history anchor target does not match lifecycle owner."
+                )
+            self.registrations[registration.registration_id] = registration
+            if self.operation_deadline is None:
+                self.operation_deadline = registration.deadline
+            else:
+                self.operation_deadline = min(
+                    self.operation_deadline,
+                    registration.deadline,
+                )
+            if self.history_deadline is None:
+                self.history_deadline = registration.deadline
+            else:
+                self.history_deadline = min(
+                    self.history_deadline,
+                    registration.deadline,
+                )
+            if registration.cleanup_callback is None:
+                registration.cleanup_callback = lambda _deadline: False
+
+    def register_closer(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        closer: NativeHistoryCloseRegistration,
+    ) -> None:
+        with self.pending_registry_lock:
+            if self.registrations.get(
+                registration.registration_id
+            ) is not registration:
+                raise RuntimeError("Native history closer has no lifecycle owner.")
+            existing = registration.close_registration
+            if existing is not None and not existing.reaped:
+                raise RuntimeError("Native history closer is already active.")
+            registration.close_registration = closer
+
+    def retain(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        reason: str,
+    ) -> None:
+        with self.pending_registry_lock:
+            if self.registrations.get(
+                registration.registration_id
+            ) is not registration:
+                raise RuntimeError(
+                    "Native history retention has no registered owner."
+                )
+            registration.cleanup_failure = reason
+
+    def release(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        *,
+        proof: NativeHistoryReleaseProof,
+    ) -> None:
+        with self.pending_registry_lock:
+            registered = self.registrations.get(registration.registration_id)
+            if registered is not registration:
+                if (
+                    registration.release_authorized
+                    and registration.release_proof == proof
+                ):
+                    return
+                raise RuntimeError(
+                    "Native history release has no registered owner."
+                )
+            if not isinstance(proof, NativeHistoryReleaseProof):
+                raise RuntimeError("Native history release proof is invalid.")
+            if proof.registration_id != registration.registration_id:
+                raise RuntimeError("Native history release proof owner mismatch.")
+            if (
+                proof.anchor_target_id != registration.anchor_target_id
+                or proof.creation_url != registration.creation_url
+            ):
+                raise RuntimeError("Native history release proof binding mismatch.")
+            if proof.kind == "target_close_and_absence_proven":
+                resolution = registration.target_resolution
+                if resolution is None or (
+                    resolution.target_id != proof.target_id
+                    or resolution.anchor_target_id != proof.anchor_target_id
+                    or resolution.creation_url != proof.creation_url
+                ):
+                    raise RuntimeError("Native history target proof is not valid.")
+            elif proof.kind == "no_create_acknowledged":
+                if (
+                    int(registration.creation_state.value)
+                    != _NATIVE_HISTORY_TARGET_NO_CREATE
+                ):
+                    raise RuntimeError("Native history no-create proof is not valid.")
+            elif proof.kind == "owned_browser_termination_proven":
+                if (
+                    int(registration.creation_state.value)
+                    != _NATIVE_HISTORY_TARGET_BROWSER_TERMINATED
+                ):
+                    raise RuntimeError(
+                        "Native history browser-termination proof is not valid."
+                    )
+            else:
+                raise RuntimeError("Native history release proof kind is invalid.")
+            if registration.release_authorized:
+                if registration.release_proof == proof:
+                    return
+                raise RuntimeError("Native history release proof changed.")
+            registration.released = True
+            registration.release_proof = proof
+            registration.release_authorized = True
+            registration.release_event.set()
+
+    def retire(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+    ) -> None:
+        with self.pending_registry_lock:
+            if self.registrations.get(registration.registration_id) is not registration:
+                if registration.retired:
+                    return
+                raise RuntimeError("Native history retirement has no owner.")
+            if not registration.release_authorized:
+                raise RuntimeError("Native history release was not authorized.")
+            closer = registration.close_registration
+            if not self._process_reaped(registration.process) or (
+                closer is not None and not closer.reaped
+            ):
+                raise RuntimeError("Native history retirement is incomplete.")
+            registration.retired = True
+            self.registrations.pop(registration.registration_id, None)
+
+    def _cleanup_registration(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        deadline: float,
+    ) -> bool:
+        callback = registration.cleanup_callback
+        if callback is None or callback is self._cleanup_registration:
+            return False
+        return bool(callback(deadline))
+
+    def _wait_for_owned_handles(self, deadline: float) -> bool:
+        pending = set(self.handles.values())
+        while pending:
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                return False
+            try:
+                ready, _, _ = select.select(list(pending), [], [], remaining)
+            except (OSError, ValueError):
+                return False
+            pending.difference_update(ready)
+        return True
+
+    def _owned_handles_reaped(self) -> bool:
+        try:
+            return all(
+                bool(select.select([handle], [], [], 0)[0])
+                for handle in self.handles.values()
+            )
+        except (OSError, ValueError):
+            return False
+
+    def terminate_owned_browser(  # noqa: PLR0915 - bounded owner teardown
+        self,
+        deadline: float,
+    ) -> bool:
+        if deadline is None:
+            raise RuntimeError("Oracle browser termination deadline is required.")
+        if deadline <= time.monotonic():
+            raise TimeoutError("Oracle browser termination deadline expired.")
+        """Terminate only this profile owner's helper tree and prove reaping."""
+
+        if deadline is None or deadline <= time.monotonic():
+            self.cleanup_error = "Oracle browser termination deadline expired."
+            return False
+        try:
+            _chatgpt_oracle_owned_handles(
+                self.process,
+                self.temp_root,
+                self.handles,
+                deadline,
+            )
+            if self.process.stdin is not None:
+                self.process.stdin.close()
+        except (BrokenPipeError, OSError, TimeoutError) as exc:
+            self.cleanup_error = _redacted_failure_message(str(exc))
+            return False
+        _signal_chatgpt_oracle_handles(self.handles, signal.SIGTERM)
+        term_deadline = min(
+            deadline,
+            time.monotonic() + _NATIVE_HISTORY_TERM_GRACE_SECONDS,
+        )
+        term_complete = self._wait_for_owned_handles(term_deadline)
+        try:
+            known_handles = set(self.handles)
+            _chatgpt_oracle_owned_handles(
+                self.process,
+                self.temp_root,
+                self.handles,
+                term_deadline,
+            )
+            if set(self.handles) != known_handles:
+                # A browser child can appear after the first scan. Signal the
+                # newly discovered handles before treating the tree as closed.
+                _signal_chatgpt_oracle_handles(self.handles, signal.SIGTERM)
+                term_complete = (
+                    self._wait_for_owned_handles(term_deadline)
+                    and term_complete
+                )
+        except (OSError, ValueError, TimeoutError) as exc:
+            self.cleanup_error = _redacted_failure_message(str(exc))
+            return False
+        if not term_complete or not self._owned_handles_reaped():
+            _signal_chatgpt_oracle_handles(self.handles, signal.SIGKILL)
+            kill_deadline = min(
+                deadline,
+                time.monotonic() + _NATIVE_HISTORY_KILL_GRACE_SECONDS,
+            )
+            kill_complete = self._wait_for_owned_handles(kill_deadline)
+            try:
+                known_handles = set(self.handles)
+                _chatgpt_oracle_owned_handles(
+                    self.process,
+                    self.temp_root,
+                    self.handles,
+                    kill_deadline,
+                )
+                if set(self.handles) != known_handles:
+                    _signal_chatgpt_oracle_handles(self.handles, signal.SIGKILL)
+                    kill_complete = (
+                        self._wait_for_owned_handles(kill_deadline)
+                        and kill_complete
+                    )
+            except (OSError, ValueError, TimeoutError) as exc:
+                self.cleanup_error = _redacted_failure_message(str(exc))
+                return False
+            if not kill_complete or not self._owned_handles_reaped():
+                self.cleanup_error = (
+                    "Oracle browser owner process cleanup timed out."
+                )
+                return False
+        try:
+            reap_deadline = min(
+                deadline,
+                time.monotonic() + _NATIVE_HISTORY_REAP_GRACE_SECONDS,
+            )
+            self.process.wait(timeout=max(0.0, reap_deadline - time.monotonic()))
+        except (OSError, subprocess.TimeoutExpired):
+            self.cleanup_error = "Oracle browser helper was not reaped."
+            return False
+        try:
+            known_handles = set(self.handles)
+            _chatgpt_oracle_owned_handles(
+                self.process,
+                self.temp_root,
+                self.handles,
+                deadline,
+            )
+            if set(self.handles) != known_handles:
+                _signal_chatgpt_oracle_handles(self.handles, signal.SIGKILL)
+            final_deadline = min(
+                deadline,
+                time.monotonic() + _NATIVE_HISTORY_REAP_GRACE_SECONDS,
+            )
+            if not self._wait_for_owned_handles(final_deadline):
+                self.cleanup_error = "Oracle browser descendant cleanup timed out."
+                return False
+        except (OSError, ValueError, TimeoutError) as exc:
+            self.cleanup_error = _redacted_failure_message(str(exc))
+            return False
+        return (
+            self.process.returncode is not None
+            and self._owned_handles_reaped()
+        )
+
+    def _cleanup_owner(self, deadline: float) -> bool:
+        with self.pending_registry_lock:
+            self.closing = True
+        if not self.terminate_owned_browser(deadline):
+            return False
+        if not self._start_scratch_remover():
+            self.cleanup_error = (
+                self.cleanup_error or "Oracle browser scratch remover could not start."
+            )
+            return False
+        if not self._wait_for_scratch_remover(deadline):
+            self.cleanup_error = "Oracle browser scratch cleanup remains pending."
+            return False
+        if not self._owned_handles_reaped():
+            self.cleanup_error = "Oracle browser owner handles remain live."
+            return False
+        for handle in self.handles.values():
+            try:
+                os.close(handle)
+            except OSError:
+                pass
+        self.handles.clear()
+        for stream in (self.process.stdout, self.process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        return True
+
+    def _start_scratch_remover(self) -> bool:
+        """Start one remover only after private-browser termination is proven."""
+
+        if self.scratch_remover is not None:
+            return True
+        if not Path(self.temp_root).exists():
+            return True
+        remover: Optional[subprocess.Popen] = None
+        try:
+            remover = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import shutil,sys; shutil.rmtree(sys.argv[1])",
+                    self.temp_root,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            handle = os.pidfd_open(remover.pid)
+        except OSError as exc:
+            if remover is not None:
+                try:
+                    remover.kill()
+                    remover.wait(timeout=1)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            self.cleanup_error = _redacted_failure_message(str(exc))
+            return False
+        self.scratch_remover = remover
+        self.scratch_remover_handle = handle
+        self.handles[remover.pid] = handle
+        return True
+
+    def _wait_for_scratch_remover(self, deadline: float) -> bool:
+        remover = self.scratch_remover
+        if remover is None:
+            return not Path(self.temp_root).exists()
+        try:
+            remover.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except (OSError, subprocess.TimeoutExpired):
+            # Keep the same process and pidfd for supervisor recovery. Never
+            # kill-and-drop a timed-out remover or start a second one.
+            return False
+        if remover.returncode != 0 or Path(self.temp_root).exists():
+            return False
+        handle = self.scratch_remover_handle
+        if handle is not None:
+            self.handles.pop(remover.pid, None)
+            try:
+                os.close(handle)
+            except OSError:
+                pass
+        self.scratch_remover = None
+        self.scratch_remover_handle = None
+        return True
+
+    def finalize(self, deadline: float) -> bool:
+        with self.pending_registry_lock:
+            self.closing = True
+            registrations = list(self.registrations.values())
+            for registration in registrations:
+                registration.finalizing = True
+        for registration in registrations:
+            callback = registration.cleanup_callback
+            if callback is None:
+                continue
+            try:
+                callback(deadline)
+            except Exception as exc:
+                registration.cleanup_failure = str(exc)
+        with self.pending_registry_lock:
+            has_registrations = bool(self.registrations)
+            if has_registrations:
+                self.transferred = True
+                self.published = True
+                return False
+        completed = self._cleanup_owner(deadline)
+        if completed:
+            with self.pending_registry_lock:
+                self.pending_registry.pop(self.owner_id, None)
+                self.published = False
+        return completed
+
+    def service_pending(self) -> bool:
+        now = time.monotonic()
+        with self.pending_registry_lock:
+            registrations = list(self.registrations.values())
+            operation_deadline = self.operation_deadline or self.history_deadline
+            needs_cleanup = any(
+                registration.cleanup_failure is not None
+                or registration.abort_event.is_set()
+                or registration.released
+                or (
+                    operation_deadline is not None
+                    and now >= operation_deadline
+                )
+                for registration in registrations
+            )
+            needs_cleanup = needs_cleanup or self.transferred or bool(
+                self.cleanup_error
+            )
+            if not needs_cleanup:
+                return False
+            if self.cleanup_recovery_deadline is None:
+                self.cleanup_recovery_deadline = now + 5.0
+            cleanup_deadline = self.cleanup_recovery_deadline
+            for registration in registrations:
+                registration.finalizing = True
+        for registration in registrations:
+            callback = registration.cleanup_callback
+            if callback is None:
+                continue
+            try:
+                callback(cleanup_deadline)
+            except Exception as exc:
+                registration.cleanup_failure = str(exc)
+        with self.pending_registry_lock:
+            if self.registrations:
+                return False
+        completed = self._cleanup_owner(cleanup_deadline)
+        if completed:
+            with self.pending_registry_lock:
+                self.pending_registry.pop(self.owner_id, None)
+                self.published = False
+        return completed
+
+
+class _ChatGPTOracleBrowserLifecycleCapability:
+    """Nonserialized lifecycle authority tied to one private profile owner."""
+
+    def __init__(self, owner: _ChatGPTOracleBrowserOwner) -> None:
+        self.owner = owner
+
+    def register_native_history(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+    ) -> None:
+        self.owner.register(registration)
+
+    def register_native_history_closer(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        closer: NativeHistoryCloseRegistration,
+    ) -> None:
+        self.owner.register_closer(registration, closer)
+
+    def retain_native_history(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        reason: str,
+    ) -> None:
+        self.owner.retain(registration, reason)
+
+    def release_native_history(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        *,
+        proof: NativeHistoryReleaseProof,
+    ) -> None:
+        self.owner.release(registration, proof=proof)
+
+    def retire_native_history(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+    ) -> None:
+        self.owner.retire(registration)
+
+    def terminate_owned_browser(self, deadline: float) -> bool:
+        if deadline is None:
+            raise RuntimeError("Oracle browser termination deadline is required.")
+        return self.owner.terminate_owned_browser(deadline)
+
+    def bind_native_history_endpoint(
+        self,
+        *,
+        cdp_endpoint: str,
+        anchor_target_id: str,
+    ) -> None:
+        self.owner.bind(
+            cdp_endpoint=cdp_endpoint,
+            anchor_target_id=anchor_target_id,
+        )
+
+
 def _cleanup_chatgpt_oracle_process(
     process: subprocess.Popen, temp_root: str,
 ) -> None:
@@ -2430,9 +3027,50 @@ def _cleanup_chatgpt_oracle_process(
                     stream.close()
 
 
+def _service_pending_chatgpt_oracle_browser_owners(
+    state: SidecarTaskState,
+) -> None:
+    with state.pending_chatgpt_oracle_browser_owners_lock:
+        owners = list(state.pending_chatgpt_oracle_browser_owners.items())
+    for owner_id, owner in owners:
+        try:
+            completed = owner.service_pending()
+        except Exception as exc:
+            owner.cleanup_error = _redacted_failure_message(str(exc))
+            completed = False
+        if completed:
+            with state.pending_chatgpt_oracle_browser_owners_lock:
+                state.pending_chatgpt_oracle_browser_owners.pop(owner_id, None)
+
+
+def _drain_pending_chatgpt_oracle_browser_owners(
+    state: SidecarTaskState,
+    *,
+    deadline: Optional[float] = None,
+) -> bool:
+    """Give retained browser owners one bounded shutdown cleanup window."""
+
+    shutdown_deadline = deadline or (
+        time.monotonic() + DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS
+    )
+    while True:
+        _service_pending_chatgpt_oracle_browser_owners(state)
+        with state.pending_chatgpt_oracle_browser_owners_lock:
+            pending = bool(state.pending_chatgpt_oracle_browser_owners)
+        if not pending:
+            return True
+        remaining = shutdown_deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.1, remaining))
+
+
 @contextmanager
-def _chatgpt_oracle_browser_binding(
+def _chatgpt_oracle_browser_binding(  # noqa: PLR0915 - bounded owner lifecycle binding
     binding: ChatGPTConversationInitAccountBinding,
+    *,
+    pending_lifecycle_registry: Optional[Dict[str, Any]] = None,
+    pending_lifecycle_registry_lock: Optional[Any] = None,
 ) -> Iterator[ChatGPTConversationInitResolvedBinding]:
     if binding.oracle_profile_path is None:
         if binding.cdp_endpoint is None or binding.page_target_id is None:
@@ -2455,6 +3093,17 @@ def _chatgpt_oracle_browser_binding(
         raise RuntimeError("Oracle process-handle supervision is unavailable.") from exc
     process: Optional[subprocess.Popen] = None
     temp_root = tempfile.mkdtemp(prefix="aawm-oracle-owner-")
+    owner: Optional[_ChatGPTOracleBrowserOwner] = None
+    registry = (
+        pending_lifecycle_registry
+        if pending_lifecycle_registry is not None
+        else {}
+    )
+    registry_lock = (
+        pending_lifecycle_registry_lock
+        if pending_lifecycle_registry_lock is not None
+        else threading.RLock()
+    )
     try:
         private_home = Path(temp_root)
         # Keep Chrome's desktop/config state separate from the sidecar user's home.
@@ -2481,9 +3130,66 @@ def _chatgpt_oracle_browser_binding(
             )
         except OSError as exc:
             raise RuntimeError("Oracle browser helper could not be started.") from exc
-        yield _read_chatgpt_oracle_startup_binding(process)
+        owner = _ChatGPTOracleBrowserOwner(
+            process,
+            temp_root,
+            registry,
+            registry_lock,
+        )
+        # Publish the concrete owner before consuming startup output. Any
+        # later history registration must resolve through this exact owner.
+        if pending_lifecycle_registry is not None:
+            owner.publish()
+        capability = _ChatGPTOracleBrowserLifecycleCapability(owner)
+        resolved = _read_chatgpt_oracle_startup_binding(process)
+        owner.bind(
+            cdp_endpoint=resolved.cdp_endpoint,
+            anchor_target_id=resolved.page_target_id,
+        )
+        yield ChatGPTConversationInitResolvedBinding(
+            cdp_endpoint=resolved.cdp_endpoint,
+            page_target_id=resolved.page_target_id,
+            lifecycle_capability=(
+                capability if pending_lifecycle_registry is not None else None
+            ),
+        )
     finally:
-        if process is not None:
+        if owner is not None and owner.transferred:
+            pass
+        elif owner is not None:
+            deadlines = [
+                registration.deadline
+                for registration in owner.registrations.values()
+            ]
+            if owner.operation_deadline is not None:
+                deadlines.append(owner.operation_deadline)
+            if owner.history_deadline is not None:
+                deadlines.append(owner.history_deadline)
+            cleanup_deadline = (
+                min(deadlines)
+                if deadlines
+                else time.monotonic()
+                + DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS
+            )
+            completed = owner.finalize(cleanup_deadline)
+            if not completed and pending_lifecycle_registry is not None:
+                with owner.pending_registry_lock:
+                    transferred_already = (
+                        owner.pending_registry.get(owner.owner_id) is owner
+                    )
+                if not transferred_already:
+                    owner.transferred = True
+                    owner.published = True
+                    with owner.pending_registry_lock:
+                        owner.pending_registry[owner.owner_id] = owner
+            if not completed:
+                raise OracleBrowserCleanupError(
+                    owner.cleanup_error
+                    or "Oracle browser lifecycle cleanup remains pending."
+                )
+        elif process is not None:
+            # An owner is created immediately after Popen. This branch only
+            # covers a failure before that publication point.
             _cleanup_chatgpt_oracle_process(process, temp_root)
         else:
             _remove_chatgpt_oracle_scratch(temp_root)
@@ -2788,12 +3494,10 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     )
     parser.add_argument(
         "--xai-oauth-lock-file",
-        default=None,
+        default=os.getenv("AAWM_XAI_OAUTH_LOCK_FILE", DEFAULT_XAI_OAUTH_LOCK_FILE),
         help=(
-            "Lock file for sidecar managed xAI OAuth refresh writes. When "
-            "omitted, the shared resolver derives a canonical sibling of the "
-            "resolved auth file; AAWM_XAI_OAUTH_LOCK_FILE must resolve to that "
-            "same sibling when supplied."
+            "Lock file for sidecar managed xAI OAuth refresh writes. Defaults "
+            "to AAWM_XAI_OAUTH_LOCK_FILE or ~/.litellm/xai/oauth-auth.json.lock."
         ),
     )
     parser.add_argument(
@@ -4208,10 +4912,6 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
     _maybe_reject_default_auth_source(xai_oauth_resolution.auth_file_source)
     resolved_xai_oauth_auth_file = str(xai_oauth_resolution.auth_file)
     resolved_xai_oauth_auth_file_source = xai_oauth_resolution.auth_file_source
-    resolved_xai_oauth_lock_file = _resolve_xai_oauth_sidecar_lock_file(
-        args.xai_oauth_lock_file,
-        resolved_xai_oauth_auth_file,
-    )
     resolved_xai_oauth_scope = xai_oauth_resolution.scope
     resolved_xai_oauth_scope_source = xai_oauth_resolution.scope_source
     (
@@ -4263,7 +4963,7 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         xai_oauth_refresh_enabled=args.xai_oauth_refresh_enabled,
         xai_oauth_auth_file=resolved_xai_oauth_auth_file,
         xai_oauth_auth_file_source=resolved_xai_oauth_auth_file_source,
-        xai_oauth_lock_file=resolved_xai_oauth_lock_file,
+        xai_oauth_lock_file=args.xai_oauth_lock_file,
         xai_oauth_scope=resolved_xai_oauth_scope,
         xai_oauth_scope_source=resolved_xai_oauth_scope_source,
         xai_oauth_refresh_interval_seconds=args.xai_oauth_refresh_interval_seconds,
@@ -4576,20 +5276,6 @@ def _oauth_refresh_observation_metadata(event: Mapping[str, Any]) -> Dict[str, A
         "refresh_attempt_interval_seconds",
         "refresh_buffer_seconds",
         "refresh_threshold_seconds",
-        "credential_identity",
-        "credential_generation",
-        "structurally_valid",
-        "access_available",
-        "refresh_possible",
-        "route_usable",
-        "route_unusable",
-        "refresh_due",
-        "expiry_available",
-        "terminal_unrefreshable",
-        "lifecycle_state",
-        "route_unusable_reason",
-        "route_unusable_at",
-        "route_safety_buffer_seconds",
         "credential_health",
         "usable",
         "scheduler_error_class",
@@ -4652,20 +5338,6 @@ def _build_passive_provider_auth_observation(
                 "credential_identity": event.get("credential_identity"),
                 "scope_source": event.get("scope_source")
                 or config.xai_oauth_scope_source,
-                "structurally_valid": event.get("structurally_valid"),
-                "access_available": event.get("access_available"),
-                "refresh_possible": event.get("refresh_possible"),
-                "route_usable": event.get("route_usable"),
-                "route_unusable": event.get("route_unusable"),
-                "refresh_due": event.get("refresh_due"),
-                "expiry_available": event.get("expiry_available"),
-                "terminal_unrefreshable": event.get("terminal_unrefreshable"),
-                "lifecycle_state": event.get("lifecycle_state"),
-                "route_unusable_reason": event.get("route_unusable_reason"),
-                "route_unusable_at": event.get("route_unusable_at"),
-                "route_safety_buffer_seconds": event.get(
-                    "route_safety_buffer_seconds"
-                ),
             }
         )
     return {
@@ -4686,207 +5358,6 @@ def _build_passive_provider_auth_observation(
         "error_message": _redacted_failure_message(event.get("error_message")),
         "metadata": metadata,
     }
-
-
-def _xai_refresh_failure_remains_authoritative(
-    schedule: OAuthRefreshScheduleState,
-) -> bool:
-    return bool(
-        schedule.last_result_class == "refresh_failed"
-        or schedule.last_error_class
-        or schedule.terminal_refresh_error_class
-    )
-
-
-def _xai_passive_health_status(summary: Mapping[str, Any]) -> Optional[str]:
-    value = _redacted_summary_field(
-        summary.get("health_status") or summary.get("credential_health")
-    )
-    if value in {"fresh", "degraded", "malformed", "expired"}:
-        return value
-    return None
-
-
-def _project_xai_oauth_passive_health_event(
-    schedule: OAuthRefreshScheduleState,
-    summary: Mapping[str, Any],
-    *,
-    reinspect: Callable[[], Mapping[str, Any]],
-) -> Dict[str, Any]:
-    """Keep passive xAI usability separate from refresh-outcome authority."""
-    passive_summary = dict(summary)
-    scheduled_identity = schedule.credential_identity
-    scheduled_generation = schedule.credential_generation
-    initial_generation = _oauth_refresh_generation(passive_summary)
-    reinspection_performed = False
-    stale_snapshot_rejected = False
-
-    if (
-        scheduled_generation is not None
-        and initial_generation is not None
-        and initial_generation != scheduled_generation
-    ):
-        reinspection_performed = True
-        try:
-            passive_summary = dict(reinspect())
-        except Exception:
-            passive_summary = {
-                "attempted": True,
-                "health_status": "malformed",
-                "usable": False,
-                "error_class": "passive_reinspection_error",
-                "error_message": "xAI OAuth passive health reinspection failed.",
-            }
-        stale_snapshot_rejected = (
-            _oauth_refresh_generation(passive_summary) != initial_generation
-        )
-
-    passive_identity = _oauth_refresh_identity(passive_summary)
-    passive_generation = _oauth_refresh_generation(passive_summary)
-    passive_health = _xai_passive_health_status(passive_summary)
-    passive_usable = bool(passive_summary.get("usable"))
-    had_authoritative_failure = _xai_refresh_failure_remains_authoritative(schedule)
-    confirmed_new_usable_generation = bool(
-        reinspection_performed
-        and scheduled_generation is not None
-        and passive_generation is not None
-        and passive_generation != scheduled_generation
-        and passive_usable
-        and (
-            scheduled_identity is not None
-            and passive_identity is not None
-            and passive_identity == scheduled_identity
-        )
-    )
-
-    event = dict(passive_summary)
-    event.update(
-        {
-            "passive_credential_health": passive_health,
-            "passive_usable": passive_usable,
-            "passive_credential_identity": passive_identity,
-            "passive_credential_generation": passive_generation,
-            "passive_error_class": _redacted_summary_field(
-                passive_summary.get("error_class")
-            ),
-            "passive_error_message": _redacted_failure_message(
-                passive_summary.get("error_message")
-            ),
-            "passive_reinspection_performed": reinspection_performed,
-            "passive_snapshot_stale": stale_snapshot_rejected,
-            "scheduler_generation_replaced": False,
-        }
-    )
-
-    if had_authoritative_failure and confirmed_new_usable_generation:
-        schedule.last_result_class = None
-        schedule.last_error_class = None
-        schedule.last_error_message = None
-        schedule.terminal_refresh_error_class = None
-        schedule.terminal_refresh_identity = None
-        schedule.credential_identity = passive_identity or schedule.credential_identity
-        schedule.credential_generation = passive_generation
-        schedule.credential_health = passive_health
-        schedule.usable = passive_usable
-        event["scheduler_generation_replaced"] = True
-        event["refresh_result_class"] = "generation_replaced"
-        event["scheduler_error_class"] = None
-        event["scheduler_error_message"] = None
-        event["last_result_class"] = None
-        event["terminal_refresh_blocked"] = False
-        event["terminal_refresh_error_class"] = None
-        return event
-
-    if had_authoritative_failure:
-        scheduler_health = schedule.credential_health
-        if scheduler_health not in {"degraded", "malformed", "expired"}:
-            scheduler_health = "degraded"
-        event.update(
-            {
-                "health_status": scheduler_health,
-                "credential_health": scheduler_health,
-                "usable": schedule.usable,
-                "error_class": schedule.last_error_class,
-                "error_message": schedule.last_error_message,
-                "credential_identity": schedule.credential_identity or passive_identity,
-                "credential_generation": schedule.credential_generation,
-                "refresh_result_class": schedule.last_result_class
-                or "refresh_failed",
-                "scheduler_error_class": schedule.last_error_class,
-                "scheduler_error_message": schedule.last_error_message,
-                "last_result_class": schedule.last_result_class,
-                "terminal_refresh_blocked": bool(
-                    schedule.terminal_refresh_error_class
-                    and schedule.terminal_refresh_identity
-                    and schedule.terminal_refresh_identity
-                    == (
-                        schedule.credential_generation
-                        or schedule.credential_identity
-                    )
-                ),
-                "terminal_refresh_error_class": (
-                    schedule.terminal_refresh_error_class
-                ),
-            }
-        )
-        return event
-
-    event.update(
-        {
-            "scheduler_error_class": schedule.last_error_class,
-            "scheduler_error_message": schedule.last_error_message,
-            "last_result_class": schedule.last_result_class,
-            "terminal_refresh_blocked": False,
-            "terminal_refresh_error_class": schedule.terminal_refresh_error_class,
-        }
-    )
-    return event
-
-
-def _build_xai_oauth_passive_auth_observation(
-    config: ProviderStatusLoopConfig,
-    event: Mapping[str, Any],
-) -> Dict[str, Any]:
-    observation = _build_passive_provider_auth_observation(
-        config,
-        event,
-        provider="xai",
-        auth_family="xai_oauth",
-        auth_file=config.xai_oauth_auth_file,
-        auth_file_source=config.xai_oauth_auth_file_source,
-        credential_scope=event.get("scope") or config.xai_oauth_scope,
-    )
-    observation["last_success_at"] = None
-    observation["metadata"].update(_oauth_refresh_observation_metadata(event))
-    observation["metadata"].update(
-        {
-            "passive_credential_health": _redacted_summary_field(
-                event.get("passive_credential_health")
-            ),
-            "passive_usable": event.get("passive_usable"),
-            "passive_credential_identity": _redacted_summary_field(
-                event.get("passive_credential_identity")
-            ),
-            "passive_credential_generation": _redacted_summary_field(
-                event.get("passive_credential_generation")
-            ),
-            "passive_error_class": _redacted_summary_field(
-                event.get("passive_error_class")
-            ),
-            "passive_error_message": _redacted_failure_message(
-                event.get("passive_error_message")
-            ),
-            "passive_reinspection_performed": bool(
-                event.get("passive_reinspection_performed")
-            ),
-            "passive_snapshot_stale": bool(event.get("passive_snapshot_stale")),
-            "scheduler_generation_replaced": bool(
-                event.get("scheduler_generation_replaced")
-            ),
-            "passive_never_advances_success_time": True,
-        }
-    )
-    return observation
 
 
 def _persist_passive_provider_auth_observation(
@@ -12925,10 +13396,6 @@ def _merge_oauth_refresh_eligibility(
         "credential_identity"
     ) not in {None, ""}:
         merged["credential_identity"] = pre.get("credential_identity")
-    if merged.get("credential_generation") in {None, ""} and pre.get(
-        "credential_generation"
-    ) not in {None, ""}:
-        merged["credential_generation"] = pre.get("credential_generation")
     effective_threshold_seconds = post.get("refresh_threshold_seconds")
     if effective_threshold_seconds is None:
         effective_threshold_seconds = pre.get("refresh_threshold_seconds")
@@ -12988,7 +13455,6 @@ def _merge_oauth_refresh_eligibility(
             "credential_health",
             "refresh_threshold_seconds",
             "credential_identity",
-            "credential_generation",
         ):
             if pre.get(key) is not None:
                 merged[key] = pre[key]
@@ -13005,13 +13471,7 @@ def _oauth_refresh_result_class(
     actual_attempt_count: int,
     operation_error_class: Optional[str],
     prior_result_class: Optional[str],
-    preserve_failure_when_not_due: bool = False,
 ) -> str:
-    if preserve_failure_when_not_due:
-        if operation_error_class:
-            return "refresh_failed"
-        if actual_attempt_count == 0 and prior_result_class == "refresh_failed":
-            return "refresh_failed"
     expires_at = _parse_sidecar_timestamp(eligibility.get("expires_at"))
     if expires_at is not None and expires_at <= wall_now:
         return "expired"
@@ -13075,8 +13535,6 @@ def _oauth_refresh_schedule_evidence(
     threshold_seconds: Optional[float] = None,
     credential_health: Optional[str] = None,
     terminal_refresh_blocked: bool = False,
-    resolved_credential_identity: Optional[str] = None,
-    resolved_credential_generation: Optional[str] = None,
 ) -> Dict[str, Any]:
     effective_threshold_seconds = final.get("refresh_threshold_seconds")
     if effective_threshold_seconds is None:
@@ -13101,52 +13559,6 @@ def _oauth_refresh_schedule_evidence(
         "refresh_attempt_interval_seconds": attempt_interval_seconds,
         "refresh_buffer_seconds": buffer_seconds,
         "refresh_threshold_seconds": effective_threshold_seconds,
-        "credential_identity": resolved_credential_identity
-        or final.get("credential_identity")
-        or pre.get("credential_identity")
-        or schedule.credential_identity,
-        "credential_generation": resolved_credential_generation
-        or final.get("credential_generation")
-        or pre.get("credential_generation")
-        or schedule.credential_generation,
-        "structurally_valid": final.get("structurally_valid")
-        if final.get("structurally_valid") is not None
-        else pre.get("structurally_valid"),
-        "access_available": final.get("access_available")
-        if final.get("access_available") is not None
-        else pre.get("access_available"),
-        "refresh_possible": final.get("refresh_possible")
-        if final.get("refresh_possible") is not None
-        else pre.get("refresh_possible"),
-        "route_usable": final.get("route_usable")
-        if final.get("route_usable") is not None
-        else pre.get("route_usable"),
-        "route_unusable": final.get("route_unusable")
-        if final.get("route_unusable") is not None
-        else pre.get("route_unusable"),
-        "refresh_due": final.get("refresh_due")
-        if final.get("refresh_due") is not None
-        else pre.get("refresh_due"),
-        "expiry_available": final.get("expiry_available")
-        if final.get("expiry_available") is not None
-        else pre.get("expiry_available"),
-        "terminal_unrefreshable": final.get("terminal_unrefreshable")
-        if final.get("terminal_unrefreshable") is not None
-        else pre.get("terminal_unrefreshable"),
-        "lifecycle_state": final.get("lifecycle_state")
-        if final.get("lifecycle_state") is not None
-        else pre.get("lifecycle_state"),
-        "route_unusable_reason": (
-            final.get("route_unusable_reason")
-            if "route_unusable_reason" in final
-            else pre.get("route_unusable_reason")
-        ),
-        "route_unusable_at": final.get("route_unusable_at")
-        if final.get("route_unusable_at") is not None
-        else pre.get("route_unusable_at"),
-        "route_safety_buffer_seconds": final.get("route_safety_buffer_seconds")
-        if final.get("route_safety_buffer_seconds") is not None
-        else pre.get("route_safety_buffer_seconds"),
         "credential_health": credential_health
         if credential_health is not None
         else final.get("credential_health"),
@@ -13186,62 +13598,6 @@ def _oauth_refresh_identity(eligibility: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
-def _oauth_refresh_generation(eligibility: Mapping[str, Any]) -> Optional[str]:
-    generation = eligibility.get("credential_generation")
-    if isinstance(generation, str) and generation.strip():
-        return generation.strip()
-    return None
-
-
-def _oauth_refresh_generation_key(
-    eligibility: Mapping[str, Any],
-) -> Optional[str]:
-    return _oauth_refresh_generation(eligibility) or _oauth_refresh_identity(
-        eligibility
-    )
-
-
-def _oauth_refresh_failure_remains_authoritative(
-    schedule: OAuthRefreshScheduleState,
-) -> bool:
-    return bool(
-        schedule.last_result_class == "refresh_failed"
-        or schedule.last_error_class
-        or schedule.terminal_refresh_error_class
-    )
-
-
-def _clear_oauth_refresh_failure_on_usable_identity_change(
-    schedule: OAuthRefreshScheduleState,
-    eligibility: Mapping[str, Any],
-) -> bool:
-    candidate_identity = _oauth_refresh_identity(eligibility)
-    candidate_generation = _oauth_refresh_generation(eligibility)
-    if (
-        not _oauth_refresh_failure_remains_authoritative(schedule)
-        or schedule.credential_identity is None
-        or candidate_identity is None
-        or candidate_identity != schedule.credential_identity
-        or schedule.credential_generation is None
-        or candidate_generation is None
-        or candidate_generation == schedule.credential_generation
-        or not eligibility.get("usable")
-    ):
-        return False
-    schedule.last_result_class = None
-    schedule.last_error_class = None
-    schedule.last_error_message = None
-    schedule.terminal_refresh_error_class = None
-    schedule.terminal_refresh_identity = None
-    schedule.credential_identity = candidate_identity or schedule.credential_identity
-    schedule.credential_generation = candidate_generation
-    schedule.credential_health = _redacted_summary_field(
-        eligibility.get("credential_health")
-    )
-    schedule.usable = bool(eligibility.get("usable"))
-    return True
-
-
 def _oauth_refresh_terminal_blocked(
     schedule: OAuthRefreshScheduleState,
     eligibility: Mapping[str, Any],
@@ -13251,8 +13607,8 @@ def _oauth_refresh_terminal_blocked(
         or schedule.terminal_refresh_identity is None
     ):
         return False
-    current_generation_key = _oauth_refresh_generation_key(eligibility)
-    return current_generation_key == schedule.terminal_refresh_identity
+    current_identity = _oauth_refresh_identity(eligibility)
+    return current_identity == schedule.terminal_refresh_identity
 
 
 def _record_oauth_refresh_schedule_outcome(
@@ -13263,7 +13619,7 @@ def _record_oauth_refresh_schedule_outcome(
     operation_summary: Mapping[str, Any],
     should_call: bool,
     terminal_blocked: bool,
-    current_generation_key: Optional[str],
+    current_identity: Optional[str],
     actual_attempt_count: int,
     wall_now: datetime,
     pre_result_class: str,
@@ -13271,34 +13627,16 @@ def _record_oauth_refresh_schedule_outcome(
     attempt_interval_seconds: float,
     buffer_seconds: Optional[float],
     threshold_seconds: Optional[float],
-    preserve_failure_when_not_due: bool = False,
-    clear_failure_on_usable_identity_change: bool = False,
 ) -> tuple[str, Dict[str, Any]]:
     operation_error_class = _redacted_summary_field(
         operation_summary.get("error_class")
-    )
-    operation_generation = _oauth_refresh_generation(operation_summary)
-    if (
-        clear_failure_on_usable_identity_change
-        and not operation_error_class
-    ):
-        _clear_oauth_refresh_failure_on_usable_identity_change(schedule, final)
-    prior_failure_active = (
-        preserve_failure_when_not_due
-        and _oauth_refresh_failure_remains_authoritative(schedule)
-    )
-    prior_result_class = (
-        "refresh_failed"
-        if prior_failure_active
-        else schedule.last_result_class
     )
     result_class = _oauth_refresh_result_class(
         final,
         wall_now=wall_now,
         actual_attempt_count=actual_attempt_count,
         operation_error_class=operation_error_class,
-        prior_result_class=prior_result_class if not should_call else None,
-        preserve_failure_when_not_due=preserve_failure_when_not_due,
+        prior_result_class=schedule.last_result_class if not should_call else None,
     )
     effective_health = _effective_oauth_credential_health(
         final,
@@ -13310,58 +13648,17 @@ def _record_oauth_refresh_schedule_outcome(
     schedule.next_refresh_check_at = final.get("next_refresh_check_at")
     schedule.expires_at = final.get("expires_at")
     schedule.last_result_class = result_class
-    if preserve_failure_when_not_due and operation_error_class:
-        recorded_generation = (
-            operation_generation
-            or _oauth_refresh_generation(pre)
-            or _oauth_refresh_generation(final)
-            or schedule.credential_generation
-        )
-    elif (
-        prior_failure_active
-        and result_class == "refresh_failed"
-        and actual_attempt_count == 0
-    ):
-        recorded_generation = (
-            schedule.credential_generation
-            or _oauth_refresh_generation(final)
-            or _oauth_refresh_generation(pre)
-        )
-    else:
-        recorded_generation = _oauth_refresh_generation(
-            final
-        ) or _oauth_refresh_generation(pre)
-    if recorded_generation is not None:
-        schedule.credential_generation = recorded_generation
-    recorded_identity = _oauth_refresh_identity(final) or _oauth_refresh_identity(pre)
-    if recorded_identity is not None:
-        schedule.credential_identity = recorded_identity
     if operation_error_class:
         schedule.last_error_class = operation_error_class
         schedule.last_error_message = _redacted_failure_message(
             operation_summary.get("error_message")
         )
         terminal_error = _oauth_terminal_refresh_error_class(operation_error_class)
-        if preserve_failure_when_not_due:
-            stored_identity = (
-                operation_generation
-                or recorded_generation
-                or current_generation_key
-            )
-        else:
-            stored_identity = current_generation_key or recorded_generation
+        stored_identity = current_identity or _oauth_refresh_identity(final)
         if terminal_error and stored_identity is not None:
             schedule.terminal_refresh_error_class = terminal_error
             schedule.terminal_refresh_identity = stored_identity
-    elif (
-        result_class != "refresh_failed"
-        and not terminal_blocked
-        and not (
-            preserve_failure_when_not_due
-            and prior_failure_active
-            and actual_attempt_count == 0
-        )
-    ):
+    elif result_class != "refresh_failed" and not terminal_blocked:
         schedule.last_error_class = None
         schedule.last_error_message = None
     if should_call and operation_summary.get("refreshed"):
@@ -13382,16 +13679,6 @@ def _record_oauth_refresh_schedule_outcome(
         threshold_seconds=threshold_seconds,
         credential_health=effective_health,
         terminal_refresh_blocked=terminal_blocked,
-        resolved_credential_identity=(
-            schedule.credential_identity
-            if preserve_failure_when_not_due
-            else None
-        ),
-        resolved_credential_generation=(
-            schedule.credential_generation
-            if preserve_failure_when_not_due
-            else None
-        ),
     )
     evidence["helper_called"] = should_call
     return result_class, evidence
@@ -13412,8 +13699,6 @@ def _run_oauth_refresh_schedule(
     buffer_seconds: Optional[float] = None,
     threshold_seconds: Optional[float] = None,
     eligibility_inspector_kwargs: Optional[Mapping[str, Any]] = None,
-    preserve_failure_when_not_due: bool = False,
-    clear_failure_on_usable_identity_change: bool = False,
 ) -> tuple[
     Dict[str, Any],
     Dict[str, Any],
@@ -13427,24 +13712,12 @@ def _run_oauth_refresh_schedule(
         inspector_kwargs=eligibility_inspector_kwargs,
         fallback_poll_interval_seconds=eligibility_cadence_seconds,
     )
-    current_generation_key = _oauth_refresh_generation_key(pre)
-    if clear_failure_on_usable_identity_change:
-        _clear_oauth_refresh_failure_on_usable_identity_change(schedule, pre)
-    prior_failure_active = (
-        preserve_failure_when_not_due
-        and _oauth_refresh_failure_remains_authoritative(schedule)
-    )
     pre_result_class = _oauth_refresh_result_class(
         pre,
         wall_now=wall_now,
         actual_attempt_count=0,
         operation_error_class=None,
-        prior_result_class=(
-            "refresh_failed"
-            if prior_failure_active
-            else schedule.last_result_class
-        ),
-        preserve_failure_when_not_due=preserve_failure_when_not_due,
+        prior_result_class=schedule.last_result_class,
     )
     actual_attempt_count = 0
     operation_summary: Mapping[str, Any] = {}
@@ -13461,17 +13734,14 @@ def _run_oauth_refresh_schedule(
         now_monotonic=now_monotonic,
         attempt_interval_seconds=effective_attempt_interval_seconds,
     )
+    current_identity = _oauth_refresh_identity(pre)
     if (
-        current_generation_key is not None
+        current_identity is not None
         and schedule.terminal_refresh_identity is not None
-        and current_generation_key != schedule.terminal_refresh_identity
+        and current_identity != schedule.terminal_refresh_identity
     ):
-        if (
-            not clear_failure_on_usable_identity_change
-            or bool(pre.get("usable"))
-        ):
-            schedule.terminal_refresh_error_class = None
-            schedule.terminal_refresh_identity = None
+        schedule.terminal_refresh_error_class = None
+        schedule.terminal_refresh_identity = None
     terminal_blocked = _oauth_refresh_terminal_blocked(schedule, pre)
 
     def on_token_endpoint_attempt() -> None:
@@ -13526,7 +13796,7 @@ def _run_oauth_refresh_schedule(
         operation_summary=operation_summary,
         should_call=should_call,
         terminal_blocked=terminal_blocked,
-        current_generation_key=current_generation_key,
+        current_identity=current_identity,
         actual_attempt_count=actual_attempt_count,
         wall_now=wall_now,
         pre_result_class=pre_result_class,
@@ -13534,10 +13804,6 @@ def _run_oauth_refresh_schedule(
         attempt_interval_seconds=attempt_interval_seconds,
         buffer_seconds=buffer_seconds,
         threshold_seconds=threshold_seconds,
-        preserve_failure_when_not_due=preserve_failure_when_not_due,
-        clear_failure_on_usable_identity_change=(
-            clear_failure_on_usable_identity_change
-        ),
     )
     return dict(final), dict(operation_summary), post, evidence, should_call
 
@@ -13871,10 +14137,7 @@ def _run_xai_oauth_refresh_task(
             scope=config.xai_oauth_scope,
             buffer_seconds=config.xai_oauth_refresh_buffer_seconds,
             force=config.xai_oauth_force_refresh,
-            lock_file=_resolve_xai_oauth_sidecar_lock_file(
-                config.xai_oauth_lock_file,
-                config.xai_oauth_auth_file,
-            ),
+            lock_file=config.xai_oauth_lock_file,
             http_timeout_seconds=config.xai_oauth_http_timeout_seconds,
             on_token_endpoint_attempt=callback,
         ),
@@ -13882,8 +14145,6 @@ def _run_xai_oauth_refresh_task(
         attempt_interval_seconds=config.xai_oauth_refresh_interval_seconds,
         eligibility_cadence_seconds=config.interval_seconds,
         buffer_seconds=config.xai_oauth_refresh_buffer_seconds,
-        preserve_failure_when_not_due=True,
-        clear_failure_on_usable_identity_change=True,
     )
 
     event = {
@@ -14269,10 +14530,7 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
             "xai_oauth_passive_health_inspection",
             xai_oauth_refresh.inspect_xai_oauth_credential_health,
             (config.xai_oauth_auth_file,),
-            {
-                "scope": config.xai_oauth_scope,
-                "buffer_seconds": config.xai_oauth_refresh_buffer_seconds,
-            },
+            {"scope": config.xai_oauth_scope},
             "xai",
             "xai_oauth",
             config.xai_oauth_auth_file,
@@ -14328,12 +14586,6 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
                     "error_class": exc.__class__.__name__,
                     "error_message": _redacted_failure_message(str(exc)),
                 }
-            if event_name == "xai_oauth_passive_health_inspection":
-                summary = _project_xai_oauth_passive_health_event(
-                    state.xai_oauth_refresh_schedule,
-                    summary,
-                    reinspect=lambda: inspector(*inspector_args, **inspector_kwargs),
-                )
             event = {
                 "event": event_name,
                 "source_task": "provider_auth_health_poll",
@@ -14341,21 +14593,15 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
                 "environment": config.environment,
                 **{key: value for key, value in summary.items() if key != "auth_file"},
             }
-            if event_name == "xai_oauth_passive_health_inspection":
-                observation = _build_xai_oauth_passive_auth_observation(
-                    config,
-                    event,
-                )
-            else:
-                observation = _build_passive_provider_auth_observation(
-                    config,
-                    event,
-                    provider=provider,
-                    auth_family=auth_family,
-                    auth_file=auth_file,
-                    auth_file_source=auth_file_source,
-                    credential_scope=summary.get(scope_field),
-                )
+            observation = _build_passive_provider_auth_observation(
+                config,
+                event,
+                provider=provider,
+                auth_family=auth_family,
+                auth_file=auth_file,
+                auth_file_source=auth_file_source,
+                credential_scope=summary.get(scope_field),
+            )
             persisted, inserted_count, skip_error_class, skip_reason = (
                 _persist_passive_provider_auth_observation(config, observation)
             )
@@ -15143,6 +15389,8 @@ def _collect_bound_chatgpt_conversation_init_account(
     binding: ChatGPTConversationInitAccountBinding,
     *,
     observed_at: datetime,
+    pending_lifecycle_registry: Dict[str, Any],
+    pending_lifecycle_registry_lock: Any,
 ) -> tuple[List[tuple[Any, ...]], Dict[str, Any]]:
     coverage = _new_chatgpt_conversation_init_account_coverage(
         record,
@@ -15187,7 +15435,13 @@ def _collect_bound_chatgpt_conversation_init_account(
             dir=str(source_parent),
         ) as snapshot_dir:
             snapshot_path = str(Path(snapshot_dir) / "snapshot.json")
-            with _chatgpt_oracle_browser_binding(binding) as resolved_binding:
+            with _chatgpt_oracle_browser_binding(
+                binding,
+                pending_lifecycle_registry=pending_lifecycle_registry,
+                pending_lifecycle_registry_lock=(
+                    pending_lifecycle_registry_lock
+                ),
+            ) as resolved_binding:
                 collector_summary = (
                     collect_conversation_init_snapshot_from_oracle_browser(
                         snapshot_path,
@@ -15376,6 +15630,12 @@ def _run_chatgpt_conversation_init_bound_poll(  # noqa: PLR0915
             record,
             binding,
             observed_at=observed_at,
+            pending_lifecycle_registry=(
+                state.pending_chatgpt_oracle_browser_owners
+            ),
+            pending_lifecycle_registry_lock=(
+                state.pending_chatgpt_oracle_browser_owners_lock
+            ),
         )
         capture_completed_monotonic = time.monotonic()
 
@@ -16041,6 +16301,7 @@ def run_due_sidecar_tasks(
     now = time.monotonic() if now_monotonic is None else now_monotonic
     wall_now = _normalize_scheduler_wall_now(now_wall)
     events: list[Dict[str, Any]] = []
+    _service_pending_chatgpt_oracle_browser_owners(state)
     required_runners = {
         _run_grok_oidc_metadata_repair_task,
         _run_grok_oidc_refresh_task,
@@ -16389,6 +16650,7 @@ def _run_due_managed_refresh_tasks(
     now: float,
     wall_now: Optional[datetime] = None,
 ) -> list[Dict[str, Any]]:
+    _service_pending_chatgpt_oracle_browser_owners(state)
     due_names = {
         name
         for name, deadline in _managed_refresh_deadlines(
@@ -16511,7 +16773,9 @@ def _sleep_until_next_sidecar_deadline(
         wake_delay = sleep_deadline - time.monotonic()
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
+    argv: Optional[Sequence[str]] = None,
+) -> int:
     try:
         config = parse_config(argv)
     except Exception as exc:
@@ -16565,6 +16829,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 1
 
     sidecar_state = SidecarTaskState()
+    def _drain_owners() -> None:
+        try:
+            if _drain_pending_chatgpt_oracle_browser_owners(sidecar_state):
+                return
+            _emit(
+                {
+                    "event": "provider_status_sidecar_task_error",
+                    "observed_at": _utc_timestamp(),
+                    "environment": config.environment,
+                    "task": "chatgpt_oracle_browser_owner_shutdown",
+                    "error_class": "OracleBrowserCleanupError",
+                    "error_message": (
+                        "Retained Oracle browser owners remained after "
+                        "the bounded shutdown drain."
+                    ),
+                }
+            )
+        except Exception as exc:
+            _emit(
+                {
+                    "event": "provider_status_sidecar_task_error",
+                    "observed_at": _utc_timestamp(),
+                    "environment": config.environment,
+                    "task": "chatgpt_oracle_browser_owner_shutdown",
+                    "error_class": exc.__class__.__name__,
+                    "error_message": _redacted_failure_message(str(exc)),
+                }
+            )
+
     while not stopping:
         now = time.monotonic()
         generic_cycle_deadline = sidecar_state.next_generic_cycle_due_monotonic
@@ -16605,6 +16898,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 }
             )
             if config.once:
+                _drain_owners()
                 return 1
         try:
             sidecar_events = run_due_sidecar_tasks(config, sidecar_state)
@@ -16623,6 +16917,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 }
             )
             if config.once:
+                _drain_owners()
                 return 1
 
         if config.once:
@@ -16631,6 +16926,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 sidecar_events,
             )
             _emit(one_shot_status)
+            _drain_owners()
             return 1 if one_shot_status["required_failure_count"] else 0
 
         _sleep_until_next_sidecar_deadline(
@@ -16639,6 +16935,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             should_stop=lambda: stopping,
         )
 
+    _drain_owners()
     _emit(
         {
             "event": "provider_status_observations_stopped",
