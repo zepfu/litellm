@@ -68,6 +68,7 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.deferred_success 
 from . import codex_oauth as _codex_oauth_mod
 from . import error_signals as _error_signals
 from . import dev_fault_plan as _dev_fault_plan
+from .codex_quota_balance import snapshot_selection
 from .interfaces import (
     AliasRouteServices,
     ClassifyKimiFailureFn,
@@ -1915,16 +1916,7 @@ async def handle_alias_route(  # noqa: PLR0915
             lane_key=selection.get("lane_key"),
             reason=selection.get("selection_reason"),
         )
-        for field in (
-            "quota_snapshot_age_seconds",
-            "quota_windows",
-            "failover_ordinal",
-            "prior_account_outcome",
-            "terminal_reset",
-        ):
-            value = selection.get(field)
-            if value is not None:
-                attempt_record[field] = value
+        attempt_record.update(snapshot_selection(selection))
         attempt_record["attempted_provider_call"] = False
         if (
             capacity_retry_coordinator is not None
