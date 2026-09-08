@@ -107,15 +107,6 @@ async def _reread_xai_oauth_snapshot_for_retry(
     return refreshed_snapshot
 
 
-def _with_xai_oauth_snapshot(
-    request_body: Payload,
-    snapshot: XaiOAuthCredentialSnapshot,
-) -> Payload:
-    updated_request_body = dict(request_body)
-    updated_request_body["api_key"] = snapshot.access_token
-    return updated_request_body
-
-
 async def prepare_responses_route(
     *,
     runtime: Runtime,
@@ -211,10 +202,6 @@ async def prepare_responses_route(
             return None
         return replace(
             plan,
-            translated_request_body=_with_xai_oauth_snapshot(
-                plan.translated_request_body,
-                refreshed_snapshot,
-            ),
             custom_headers=runtime.assemble_headers(
                 api_key=refreshed_snapshot.access_token,
                 request=request,
@@ -291,10 +278,6 @@ async def prepare_completion_route(
             return None
         return replace(
             plan,
-            prepared_request_body=_with_xai_oauth_snapshot(
-                plan.prepared_request_body,
-                refreshed_snapshot,
-            ),
             api_key=refreshed_snapshot.access_token,
         )
 
