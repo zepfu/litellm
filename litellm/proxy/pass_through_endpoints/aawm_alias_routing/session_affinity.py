@@ -3284,6 +3284,34 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
         if on_failure is not None:
             await on_failure(cause)
 
+    async def _attempt_failure_cleanup(
+        cause: Optional[BaseException],
+    ) -> tuple[
+        Optional[SessionOwnerMutationResult],
+        Optional[BaseException],
+    ]:
+        """Release a failed deferred lease without losing the failure callback."""
+        cleanup_task = asyncio.ensure_future(
+            finalize_session_owner_lease_on_failure(lease)
+        )
+        release_result: Optional[SessionOwnerMutationResult] = None
+        cleanup_error: Optional[BaseException] = None
+        try:
+            release_result = await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            try:
+                release_result = await asyncio.shield(cleanup_task)
+            except BaseException as exc:  # noqa: BLE001
+                cleanup_error = exc
+        except BaseException as exc:  # noqa: BLE001
+            cleanup_error = exc
+        try:
+            await _notify_failure(cause)
+        except BaseException as exc:  # noqa: BLE001
+            if cleanup_error is None:
+                cleanup_error = exc
+        return release_result, cleanup_error
+
     async def _run_finalization(
         success: bool,
         cause: Optional[BaseException],
@@ -3330,7 +3358,26 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                 phase=f"{failure_phase}_validation",
             )
 
-        result = await success_finalizer()
+        try:
+            result = await success_finalizer()
+        except BaseException as finalization_error:  # noqa: BLE001
+            release_result, cleanup_error = await _attempt_failure_cleanup(
+                finalization_error
+            )
+            if (
+                release_result is not None
+                and release_result.outcome is SessionOwnerMutationOutcome.ERROR
+            ):
+                _raise_structured_failure(
+                    mutation=release_result,
+                    phase=f"{failure_phase}_release",
+                )
+            if cleanup_error is not None:
+                _raise_structured_failure(
+                    mutation=_mutation_error(str(cleanup_error)),
+                    phase=f"{failure_phase}_release",
+                )
+            raise
         if (
             result is not None
             and result.outcome not in success_outcomes
