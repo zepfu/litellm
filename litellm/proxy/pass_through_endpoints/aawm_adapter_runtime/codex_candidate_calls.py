@@ -1594,6 +1594,33 @@ def _cursor_message_input_item(
     function_calls: dict[str, str],
 ) -> Optional[dict[str, Any]]:
     item_type = str(item.get("type") or "")
+    if item_type == "agent_message":
+        content = item.get("content")
+        if (
+            set(item) - {
+                "type", "id", "author", "recipient", "content",
+                "internal_chat_message_metadata_passthrough",
+            }
+            or any(
+                not isinstance(item.get(key), str) or not item[key].strip()
+                for key in ("author", "recipient")
+            )
+            or not isinstance(content, list)
+            or not content
+            or any(
+                not isinstance(part, dict)
+                or set(part) != {"type", "text"}
+                or part.get("type") != "input_text"
+                or not isinstance(part.get("text"), str)
+                for part in content
+            )
+        ):
+            return None
+        text = "\n".join(part["text"] for part in content)
+        if not text.strip():
+            return None
+        # Project only the Cursor chat view; keep the stock input item intact.
+        return {"role": "user", "content": text}
     if item_type == "input_text":
         return {
             "role": "user",

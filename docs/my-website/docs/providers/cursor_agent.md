@@ -166,6 +166,11 @@ visible in the existing `agent_message`. Other envelope shapes, encrypted
 reasoning, and provider-owned continuation state remain subject to the existing
 ownership guards.
 
+At the Cursor boundary, stock `agent_message` items with an author, recipient,
+and entirely plaintext `input_text` content become user messages in the derived
+chat history. The canonical Responses items are not rewritten. Mixed opaque
+content, malformed parts, and unsupported fields fail closed before egress.
+
 ## Continuations and ownership
 
 Ordinary external-tool continuations retain the Cursor session assignment while
