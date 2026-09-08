@@ -52,6 +52,9 @@ from litellm.llms.xai.route_descriptors import (
     XAI_NATIVE_RESPONSES_TOOL_HISTORY_CAPABILITY,
     has_grok_native_route_capability,
 )
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+    normalize_codex_collaboration_dispatch_body,
+)
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.secret_managers.main import get_secret_str as _get_secret_str
 from litellm.types.llms.openai import ResponsesAPIOptionalRequestParams
@@ -190,6 +193,17 @@ def _host_sanitize_xai_responses_request_body_in_place(
     )
 
     return _host._sanitize_xai_responses_request_body_in_place(request_body)
+
+
+def _normalize_codex_collaboration_dispatch_in_place(
+    request_body: Payload,
+) -> None:
+    """Apply the shared readable-assignment contract before xAI shaping."""
+    normalized_body = normalize_codex_collaboration_dispatch_body(request_body)
+    if normalized_body is request_body:
+        return
+    request_body.clear()
+    request_body.update(normalized_body)
 
 
 def build_default_xai_request_prep_runtime(
@@ -615,7 +629,10 @@ async def _prepare_oa_xai_passthrough_request(
     sanitize_responses_request: bool = False,
 ) -> tuple[bool, Optional[str], Optional[str]]:
     runtime = _require_runtime()
-    if runtime.is_oa_xai_model(request_body.get("model")) and not isinstance(
+    is_oa_xai_model = runtime.is_oa_xai_model(request_body.get("model"))
+    if is_oa_xai_model:
+        _normalize_codex_collaboration_dispatch_in_place(request_body)
+    if is_oa_xai_model and not isinstance(
         request_body.get("litellm_metadata"), dict
     ):
         request_body["litellm_metadata"] = {}
@@ -1157,6 +1174,7 @@ async def _prepare_grok_native_oauth_passthrough_request(
         tags_to_add=tags_to_add,
         extra_fields=native_extra_fields,
     )
+    _normalize_codex_collaboration_dispatch_in_place(prepared_body)
     (
         prepared_body,
         _grok_unsupported_hosted_tools,

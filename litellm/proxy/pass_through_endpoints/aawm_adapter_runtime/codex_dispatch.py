@@ -14,6 +14,10 @@ from typing import TYPE_CHECKING, Any, Optional
 from fastapi import Request, Response
 
 from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+    normalize_codex_collaboration_dispatch_body,
+)
+
 if TYPE_CHECKING:
 
     # Host-global functions (bound via install())
@@ -458,6 +462,14 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
     ``BaseOpenAIPassThroughHandler._base_openai_pass_through_handler``.
     """
     import litellm
+
+    normalized_request_body = normalize_codex_collaboration_dispatch_body(
+        prepared_request_body
+    )
+    if normalized_request_body is not prepared_request_body:
+        prepared_request_body.clear()
+        prepared_request_body.update(normalized_request_body)
+        _safe_set_request_parsed_body(request, prepared_request_body)
 
     # D1-612: early nested ownership is consult-only. Do not exact-compare a
     # concrete owner against generic openai/<inbound>/codex_nested. Concrete

@@ -22,7 +22,7 @@ from litellm.proxy.common_utils.http_parsing_utils import (
     _safe_set_request_parsed_body,
 )
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
-    normalize_codex_collaboration_dispatch_body,
+    normalize_codex_collaboration_tool_schemas,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
     AliasRouteServices,
@@ -98,7 +98,7 @@ async def handle_codex_auto_agent_alias_route(
 ) -> "Response":
     """Normalize child tasks before ownership classification and alias routing."""
     # Ordinary child task text is not provider-owned encrypted state.
-    normalized_body = normalize_codex_collaboration_dispatch_body(
+    normalized_body = normalize_codex_collaboration_tool_schemas(
         prepared_request_body
     )
     if normalized_body is not prepared_request_body:

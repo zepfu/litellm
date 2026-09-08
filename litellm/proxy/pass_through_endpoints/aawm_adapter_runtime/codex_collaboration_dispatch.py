@@ -71,7 +71,7 @@ _MESSAGE_FRAME_INSTRUCTION = (
     "Do not encrypt this argument."
 )
 _CODEX_ENVELOPE_PATTERN = re.compile(
-    r"\AMessage Type: (NEW_TASK|MESSAGE)\n"
+    r"\AMessage Type: (NEW_TASK|MESSAGE|FINAL_ANSWER)\n"
     r"Task name: ([^\n]+)\n"
     r"Sender: ([^\n]+)\n"
     r"Payload:\n"
@@ -90,6 +90,10 @@ class CodexCollaborationDispatchError(ValueError):
     def __init__(self, reason: str):
         super().__init__(f"unsupported Codex collaboration assignment: {reason}")
         self.reason = reason
+
+
+class _NormalizedCodexAgentMessage(dict[str, Any]):
+    """Python-only marker for an already materialized collaboration payload."""
 
 
 def raise_codex_assignment_unreadable(
@@ -139,7 +143,7 @@ def parse_codex_collaboration_text_frame(value: Any) -> str:
         ).raw_decode(value)
     except CodexCollaborationDispatchError:
         raise
-    except (TypeError, ValueError):
+    except (RecursionError, TypeError, ValueError):
         raise CodexCollaborationDispatchError("unknown_representation") from None
 
     if remainder != len(value):
@@ -150,7 +154,10 @@ def parse_codex_collaboration_text_frame(value: Any) -> str:
         "text",
     }:
         raise CodexCollaborationDispatchError("unknown_representation")
-    if decoded.get("cfg047") != COLLABORATION_FRAME_VERSION:
+    if (
+        type(decoded.get("cfg047")) is not int
+        or decoded.get("cfg047") != COLLABORATION_FRAME_VERSION
+    ):
         raise CodexCollaborationDispatchError("unknown_representation")
     if decoded.get("encoding") != COLLABORATION_TEXT_ENCODING:
         raise CodexCollaborationDispatchError("unknown_representation")
@@ -309,6 +316,31 @@ def _is_v1_spawn_schema(parameters: Any) -> bool:
     )
 
 
+def _has_encrypted_message_marker(parameters: Any) -> bool:
+    if not isinstance(parameters, dict):
+        return False
+    properties = parameters.get("properties")
+    if not isinstance(properties, dict):
+        return False
+    message_schema = properties.get(COLLABORATION_MESSAGE_PROPERTY)
+    return (
+        isinstance(message_schema, dict)
+        and message_schema.get("encrypted") is True
+    )
+
+
+def _is_canonical_v2_tool_schema(
+    parameters: Any,
+    *,
+    tool_name: str,
+) -> bool:
+    """Require the encrypted message contract before bare-name matching."""
+    if not _has_encrypted_message_marker(parameters):
+        return False
+    _message_schema(parameters, tool_name=tool_name)
+    return True
+
+
 def _targeted_tool_name(
     *,
     name: str,
@@ -331,11 +363,19 @@ def _targeted_tool_name(
     if namespace in _V1_NAMESPACES:
         return None
     if name in {"followup_task", "send_message"}:
-        return name
+        return (
+            name
+            if _is_canonical_v2_tool_schema(parameters, tool_name=name)
+            else None
+        )
     if name == "spawn_agent":
         if _is_v1_spawn_schema(parameters):
             return None
-        return name
+        return (
+            name
+            if _is_canonical_v2_tool_schema(parameters, tool_name=name)
+            else None
+        )
     return None
 
 
@@ -497,16 +537,21 @@ def _validate_visible_agent_message(
     if envelope is None:
         return None
 
-    _message_type, task_name, sender, payload_offset = envelope
+    message_type, task_name, sender, payload_offset = envelope
     _validate_envelope_identity(item, task_name=task_name, sender=sender)
     remainder = visible_text[payload_offset:]
     if not remainder:
+        if message_type == "FINAL_ANSWER":
+            return None
         raise CodexCollaborationDispatchError("invalid_envelope")
-    if _is_opaque_representation(remainder):
+    if (
+        message_type != "FINAL_ANSWER"
+        and _is_opaque_representation(remainder)
+    ):
         raise CodexCollaborationDispatchError("opaque")
     if _FRAME_PREFIX_PATTERN.match(remainder):
         assignment = parse_codex_collaboration_text_frame(remainder)
-        normalized_item = dict(item)
+        normalized_item = _NormalizedCodexAgentMessage(item)
         normalized_item["content"] = [
             {
                 "type": visible_part["type"],
@@ -518,6 +563,9 @@ def _validate_visible_agent_message(
 
 
 def _normalize_agent_message_item(item: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    if isinstance(item, _NormalizedCodexAgentMessage):
+        return item, False
+
     content = item.get("content")
     if not isinstance(content, list):
         return item, False
@@ -556,7 +604,7 @@ def _normalize_agent_message_item(item: dict[str, Any]) -> tuple[dict[str, Any],
         if _is_opaque_representation(payload):
             raise CodexCollaborationDispatchError("opaque")
         assignment = parse_codex_collaboration_text_frame(payload)
-        normalized_item = dict(item)
+        normalized_item = _NormalizedCodexAgentMessage(item)
         normalized_item["content"] = [
             {
                 "type": visible_part["type"],

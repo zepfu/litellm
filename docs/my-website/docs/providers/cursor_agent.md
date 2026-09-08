@@ -160,17 +160,18 @@ credentials, resume/fork state, selected context, parent state, environment,
 or model parameters. Protocol framing and transport failures remain separate
 upstream errors.
 
-Before Codex alias ownership classification, LiteLLM normalizes only recognized
-V2 collaboration message schemas. The stock client is asked to place the exact
-assignment in a versioned plaintext frame inside the `message` string; LiteLLM
-validates that frame, supports both `NEW_TASK` and `MESSAGE` envelopes, checks
-their author/recipient identities, and then makes the text visible in the
-existing `agent_message`. Opaque, unknown, malformed, mixed, or stale
-single-part payloads fail closed before provider dispatch. Regenerate and resend
-the assignment after correction; retries or profile changes cannot repair an
-existing ciphertext blob. Other envelope shapes, encrypted reasoning, and
-provider-owned continuation state remain subject to the existing ownership
-guards.
+Before Codex ownership or provider-route admission, LiteLLM normalizes only
+recognized V2 collaboration message schemas. The stock client is asked to
+place the exact assignment in a versioned plaintext frame inside the `message`
+string; LiteLLM validates that frame, supports `NEW_TASK`, `MESSAGE`, and
+`FINAL_ANSWER` envelopes, checks their author/recipient identities, and then
+makes readable assignment text visible in the existing `agent_message`.
+Opaque, unknown, malformed, mixed, or stale single-part payloads fail closed
+before provider dispatch. Direct and native xAI parent routes use the same
+framing instruction. Regenerate and resend the assignment after correction;
+retries or profile changes cannot repair an existing ciphertext blob. Other
+envelope shapes, encrypted reasoning, and provider-owned continuation state
+remain subject to the existing ownership guards.
 
 At the Cursor boundary, stock `agent_message` items with an author, recipient,
 and entirely plaintext `input_text` content become user messages in the derived

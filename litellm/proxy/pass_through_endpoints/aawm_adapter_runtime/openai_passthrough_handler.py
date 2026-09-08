@@ -39,6 +39,9 @@ from litellm.llms.xai.route_descriptors import (
     XAI_OAUTH_CREDENTIAL_FAMILY,
     XAI_OAUTH_ROUTE_FAMILY,
 )
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+    normalize_codex_collaboration_dispatch_body,
+)
 from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
     load_text_watermark_config,
 )
@@ -544,7 +547,18 @@ class BaseOpenAIPassThroughHandler:
                         "codex_responses",
                     )
                 )
-            if is_codex_responses_request or is_managed_oa_xai_request:
+            if (
+                is_codex_responses_request
+                or is_managed_oa_xai_request
+                or rt.is_grok_native_oauth_request_body_fn(prepared_request_body)
+            ):
+                normalized_request_body = (
+                    normalize_codex_collaboration_dispatch_body(
+                        prepared_request_body
+                    )
+                )
+                if normalized_request_body is not prepared_request_body:
+                    prepared_request_body = normalized_request_body
                 if (
                     is_managed_oa_xai_request
                     or direct_codex_kimi_adapter_model is not None
