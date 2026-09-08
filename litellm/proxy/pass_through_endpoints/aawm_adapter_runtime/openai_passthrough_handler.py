@@ -654,21 +654,25 @@ class BaseOpenAIPassThroughHandler:
             else "stream" in str(updated_url)
         )
 
-        ## CREATE PASS-THROUGH
-        endpoint_func = rt.create_pass_through_route_fn(
-            endpoint=endpoint,
-            target=str(updated_url),
-            custom_headers=BaseOpenAIPassThroughHandler._assemble_headers(
-                api_key=api_key, request=request, extra_headers=extra_headers
-            ),
-            _forward_headers=forward_headers,
-            is_streaming_request=is_streaming_request,  # type: ignore
-            custom_llm_provider=custom_llm_provider.value
-            if isinstance(custom_llm_provider, litellm.LlmProviders)
-            else custom_llm_provider,
-            egress_credential_family=egress_credential_family,
-            expected_target_family=expected_target_family,
-        )
+        def _build_endpoint_func(current_api_key: Optional[str]):
+            return rt.create_pass_through_route_fn(
+                endpoint=endpoint,
+                target=str(updated_url),
+                custom_headers=BaseOpenAIPassThroughHandler._assemble_headers(
+                    api_key=current_api_key,
+                    request=request,
+                    extra_headers=extra_headers,
+                ),
+                _forward_headers=forward_headers,
+                is_streaming_request=is_streaming_request,  # type: ignore
+                custom_llm_provider=custom_llm_provider.value
+                if isinstance(custom_llm_provider, litellm.LlmProviders)
+                else custom_llm_provider,
+                egress_credential_family=egress_credential_family,
+                expected_target_family=expected_target_family,
+            )
+
+        endpoint_func = _build_endpoint_func(api_key)
 
         # D1-612: request-scoped session-owner guard for direct OpenAI fallthrough.
         # Does not mutate the egress body (preserves caller body identity). Nested
@@ -879,12 +883,42 @@ class BaseOpenAIPassThroughHandler:
         session_owner_lease = _sa.get_request_session_owner_lease(request)
 
         try:
-            response = await endpoint_func(
-                request,
-                fastapi_response,
-                user_api_key_dict,
-                custom_body=endpoint_custom_body,
-            )
+            try:
+                response = await endpoint_func(
+                    request,
+                    fastapi_response,
+                    user_api_key_dict,
+                    custom_body=endpoint_custom_body,
+                )
+            except Exception as exc:
+                refreshed_snapshot = None
+                if canonical_managed_oa_xai_request_body is not None:
+                    from litellm.llms.xai.oauth import (
+                        bind_xai_oauth_snapshot_to_request,
+                        get_xai_oauth_snapshot_from_request,
+                        reread_xai_oauth_snapshot_after_provider_401,
+                    )
+
+                    snapshot = get_xai_oauth_snapshot_from_request(request)
+                    if snapshot is not None:
+                        refreshed_snapshot = (
+                            await reread_xai_oauth_snapshot_after_provider_401(
+                                snapshot,
+                                exc,
+                                api_base=base_target_url,
+                            )
+                        )
+                if refreshed_snapshot is None:
+                    raise
+                bind_xai_oauth_snapshot_to_request(request, refreshed_snapshot)
+                api_key = refreshed_snapshot.access_token
+                endpoint_func = _build_endpoint_func(api_key)
+                response = await endpoint_func(
+                    request,
+                    fastapi_response,
+                    user_api_key_dict,
+                    custom_body=endpoint_custom_body,
+                )
             status_code = getattr(response, "status_code", None)
             if (
                 isinstance(status_code, int)

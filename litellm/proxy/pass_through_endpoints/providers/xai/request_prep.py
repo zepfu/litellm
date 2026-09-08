@@ -32,6 +32,9 @@ from litellm.llms.xai.oauth import (
     get_grok_native_oauth_snapshot as _get_grok_native_oauth_snapshot,
 )
 from litellm.llms.xai.oauth import (
+    get_xai_oauth_snapshot_from_request as _get_xai_oauth_snapshot_from_request,
+)
+from litellm.llms.xai.oauth import (
     get_xai_oauth_snapshot as _get_xai_oauth_snapshot,
 )
 from litellm.llms.xai.oauth import (
@@ -539,6 +542,11 @@ async def _prepare_oa_xai_passthrough_request(
         request_body["litellm_metadata"] = {}
     snapshot_out: dict[str, Any] = {}
     prepare_fn = runtime.prepare_oa_xai_request
+    request_snapshot = (
+        _get_xai_oauth_snapshot_from_request(request)
+        if request is not None
+        else None
+    )
     try:
         prepare_signature = inspect.signature(prepare_fn)
     except (TypeError, ValueError):
@@ -553,13 +561,27 @@ async def _prepare_oa_xai_passthrough_request(
             )
         )
     )
-    if accepts_snapshot_out:
-        prepared = await prepare_fn(
-            request_body,
-            snapshot_out=snapshot_out,
+    accepts_snapshot = bool(
+        prepare_signature is not None
+        and (
+            "snapshot" in prepare_signature.parameters
+            or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in prepare_signature.parameters.values()
+            )
         )
-    else:
-        prepared = await prepare_fn(request_body)
+    )
+    if request_snapshot is not None and not accepts_snapshot:
+        raise ValueError(
+            "Managed xAI OAuth request preparation cannot preserve the bound "
+            "credential snapshot."
+        )
+    prepare_kwargs: dict[str, Any] = {}
+    if accepts_snapshot_out:
+        prepare_kwargs["snapshot_out"] = snapshot_out
+    if accepts_snapshot and request_snapshot is not None:
+        prepare_kwargs["snapshot"] = request_snapshot
+    prepared = await prepare_fn(request_body, **prepare_kwargs)
     if not prepared:
         return False, None, None
     snapshot = snapshot_out.get("snapshot")

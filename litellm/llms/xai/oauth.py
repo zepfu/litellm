@@ -207,6 +207,7 @@ async def prepare_oa_xai_request(
     data: Dict[str, Any],
     *,
     snapshot_out: Optional[MutableMapping[str, Any]] = None,
+    snapshot: Optional[XaiOAuthCredentialSnapshot] = None,
 ) -> bool:
     public_model = data.get("model")
     if not is_oa_xai_model(public_model):
@@ -215,10 +216,17 @@ async def prepare_oa_xai_request(
     upstream_model = resolve_oa_xai_upstream_model(public_model)
     data["model"] = upstream_model
     data["api_base"] = get_secret_str("LITELLM_XAI_OAUTH_API_BASE") or XAI_API_BASE
-    snapshot = await get_xai_oauth_snapshot()
+    if (
+        snapshot is not None
+        and snapshot.credential_family != _XAI_MANAGED_SNAPSHOT_FAMILY
+    ):
+        raise ValueError(
+            "Managed xAI OAuth request received the wrong credential snapshot."
+        )
+    resolved_snapshot = snapshot or await get_xai_oauth_snapshot()
     if snapshot_out is not None:
-        snapshot_out["snapshot"] = snapshot
-    data["api_key"] = snapshot.access_token
+        snapshot_out["snapshot"] = resolved_snapshot
+    data["api_key"] = resolved_snapshot.access_token
     data["custom_llm_provider"] = "xai"
     decoded_previous_response_id = _decode_previous_response_id_in_place(data)
     removed_input_items = _drop_xai_unsupported_input_items_in_place(data)
@@ -691,7 +699,10 @@ async def reread_xai_oauth_snapshot_after_401(
 ) -> Optional[XaiOAuthCredentialSnapshot]:
     """Reread one exact managed file/scope and require the same account."""
 
-    if snapshot.credential_family != _XAI_MANAGED_SNAPSHOT_FAMILY:
+    if (
+        snapshot.credential_family != _XAI_MANAGED_SNAPSHOT_FAMILY
+        or snapshot.account_identity is None
+    ):
         return None
     current = await _get_xai_oauth_snapshot_for_path(
         credential_family=snapshot.credential_family,
@@ -701,9 +712,86 @@ async def reread_xai_oauth_snapshot_after_401(
     )
     if current.generation == snapshot.generation:
         return None
-    if current.account_identity != snapshot.account_identity:
+    if (
+        current.account_identity is None
+        or current.account_identity != snapshot.account_identity
+    ):
         return None
     return current
+
+
+def _xai_oauth_exception_status_code(exc: BaseException) -> Optional[int]:
+    for source in (exc, getattr(exc, "response", None)):
+        for attribute in ("status_code", "code"):
+            value = getattr(source, attribute, None)
+            if isinstance(value, int):
+                return value
+            try:
+                if value is not None:
+                    return int(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _xai_oauth_response_matches_api_base(
+    exc: BaseException,
+    api_base: Optional[str],
+) -> bool:
+    if not isinstance(api_base, str) or not api_base.strip():
+        return False
+    response = getattr(exc, "response", None)
+    if not isinstance(response, httpx.Response) or response.status_code != 401:
+        return False
+    try:
+        expected_host = httpx.URL(api_base).host
+        response_host = response.request.url.host
+    except Exception:
+        return False
+    return expected_host is not None and expected_host == response_host
+
+
+def is_xai_oauth_precommit_provider_401(
+    exc: BaseException,
+    *,
+    api_base: Optional[str] = None,
+) -> bool:
+    """Return whether a managed xAI request may retry before committing bytes."""
+
+    if (
+        _xai_oauth_exception_status_code(exc) != 401
+        or getattr(exc, "pre_commit_retry_exhausted", False) is True
+    ):
+        return False
+    failure_phase = getattr(exc, "failure_phase", None)
+    if isinstance(failure_phase, str) and (
+        "post_first_byte" in failure_phase
+        or "stream_interrupted" in failure_phase
+        or "post_commit" in failure_phase
+    ):
+        return False
+    if (
+        getattr(exc, "_aawm_provider_returned", False) is True
+        or getattr(exc, "provider_returned", False) is True
+    ):
+        return True
+    return _xai_oauth_response_matches_api_base(exc, api_base)
+
+
+async def reread_xai_oauth_snapshot_after_provider_401(
+    snapshot: XaiOAuthCredentialSnapshot,
+    exc: BaseException,
+    *,
+    api_base: Optional[str] = None,
+) -> Optional[XaiOAuthCredentialSnapshot]:
+    """Return one verified replacement snapshot for an eligible 401."""
+
+    if not is_xai_oauth_precommit_provider_401(exc, api_base=api_base):
+        return None
+    try:
+        return await reread_xai_oauth_snapshot_after_401(snapshot)
+    except Exception:
+        return None
 
 
 def bind_xai_oauth_snapshot_to_request(
