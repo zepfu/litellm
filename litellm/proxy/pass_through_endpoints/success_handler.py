@@ -57,6 +57,10 @@ _XAI_OAUTH_RATE_LIMIT_HEADER_PREFIXES = (
 _XAI_OAUTH_RATE_LIMIT_HEADER_NAMES = {
     "retry-after",
 }
+_XAI_OAUTH_RATE_LIMIT_HEADERS_KEY = "xai_oauth_response_headers"
+_XAI_GROK_OIDC_RATE_LIMIT_HEADERS_KEY = "xai_grok_oidc_response_headers"
+_XAI_OAUTH_RATE_LIMIT_SOURCE = "xai_oauth_response_headers"
+_XAI_GROK_OIDC_RATE_LIMIT_SOURCE = "xai_grok_oidc_response_headers"
 _COHERE_DIRECT_ROUTE_FAMILY = "codex_cohere_chat_completions_adapter"
 _COHERE_LOCAL_OBSERVATION_SOURCE = "locally_counted"
 
@@ -138,6 +142,26 @@ class PassThroughEndpointLogging:
     def _sanitize_xai_oauth_rate_limit_headers(
         response_headers: httpx.Headers,
     ) -> dict[str, str]:
+        return PassThroughEndpointLogging._sanitize_xai_rate_limit_headers(
+            response_headers,
+            source=_XAI_OAUTH_RATE_LIMIT_SOURCE,
+        )
+
+    @staticmethod
+    def _sanitize_xai_grok_oidc_rate_limit_headers(
+        response_headers: httpx.Headers,
+    ) -> dict[str, str]:
+        return PassThroughEndpointLogging._sanitize_xai_rate_limit_headers(
+            response_headers,
+            source=_XAI_GROK_OIDC_RATE_LIMIT_SOURCE,
+        )
+
+    @staticmethod
+    def _sanitize_xai_rate_limit_headers(
+        response_headers: httpx.Headers,
+        *,
+        source: str,
+    ) -> dict[str, str]:
         sanitized: dict[str, str] = {}
         for header_name, header_value in response_headers.items():
             normalized_name = str(header_name).lower()
@@ -148,14 +172,21 @@ class PassThroughEndpointLogging:
                 continue
             sanitized[normalized_name] = str(header_value)
         if sanitized:
-            sanitized["source"] = "xai_oauth_response_headers"
+            sanitized["source"] = source
         return sanitized
 
     @staticmethod
-    def _is_xai_oauth_metadata(metadata: dict) -> bool:
-        if metadata.get("xai_oauth_managed") is True:
-            return True
+    def _is_grok_native_oauth_metadata(metadata: dict) -> bool:
         if metadata.get("grok_native_oauth_managed") is True:
+            return True
+        credential_family = str(metadata.get("credential_family") or "").lower()
+        return credential_family == "xai_grok_oidc"
+
+    @staticmethod
+    def _is_xai_oauth_metadata(metadata: dict) -> bool:
+        if PassThroughEndpointLogging._is_grok_native_oauth_metadata(metadata):
+            return False
+        if metadata.get("xai_oauth_managed") is True:
             return True
         credential_family = str(metadata.get("credential_family") or "").lower()
         route_family = str(
@@ -178,12 +209,20 @@ class PassThroughEndpointLogging:
         custom_llm_provider: Optional[str],
     ) -> None:
         metadata = self._ensure_metadata(kwargs)
-        if custom_llm_provider == "xai" and self._is_xai_oauth_metadata(metadata):
-            sanitized_headers = self._sanitize_xai_oauth_rate_limit_headers(
-                httpx_response.headers
-            )
-            if sanitized_headers:
-                metadata["xai_oauth_response_headers"] = sanitized_headers
+        if custom_llm_provider == "xai":
+            if self._is_grok_native_oauth_metadata(metadata):
+                sanitized_headers = self._sanitize_xai_grok_oidc_rate_limit_headers(
+                    httpx_response.headers
+                )
+                if sanitized_headers:
+                    metadata[_XAI_GROK_OIDC_RATE_LIMIT_HEADERS_KEY] = sanitized_headers
+                return
+            if self._is_xai_oauth_metadata(metadata):
+                sanitized_headers = self._sanitize_xai_oauth_rate_limit_headers(
+                    httpx_response.headers
+                )
+                if sanitized_headers:
+                    metadata[_XAI_OAUTH_RATE_LIMIT_HEADERS_KEY] = sanitized_headers
             return
         if not (
             custom_llm_provider == "anthropic"
