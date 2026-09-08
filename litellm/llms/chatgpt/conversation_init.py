@@ -3309,7 +3309,8 @@ def _native_history_finalize_observation(
     request_hash = capture.get("request_account_hash")
     extra_hash = capture.get("extra_account_hash")
     identity_match = (
-        request_hash == expected_account_hash
+        not capture.get("identity_conflict")
+        and request_hash == expected_account_hash
         and extra_hash == expected_account_hash
     )
     status = _native_history_status(capture.get("status_code"))
@@ -3593,7 +3594,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
     pending_network_order: List[str] = []
     history_network_ids: set[str] = set()
     seen_fetch_request_ids: set[str] = set()
-    fetch_actions: Dict[str, str] = {}
+    fetch_actions: Dict[Tuple[str, str], str] = {}
     init_fetch_id: Optional[str] = None
     observer_closed = False
     response_read_in_progress = False
@@ -3710,14 +3711,20 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             return retry_after_max
         return None
 
-    def fail_fetch(request_id: Any, *, intentional_disposal: bool = False) -> None:
+    def fail_fetch(
+        request_id: Any,
+        *,
+        pause_stage: str,
+        intentional_disposal: bool = False,
+    ) -> None:
         if observer_closed:
             return
         if not isinstance(request_id, str) or not request_id:
             return
-        if request_id in fetch_actions:
+        action_key = (request_id, pause_stage)
+        if action_key in fetch_actions:
             return
-        fetch_actions[request_id] = "fail"
+        fetch_actions[action_key] = "fail"
         if intentional_disposal:
             capture["intentional_disposal_request_id"] = request_id
         try:
@@ -3738,9 +3745,10 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
         if not isinstance(request_id, str) or not request_id:
             set_boundary("fetch_control_failed")
             return
-        if request_id in fetch_actions:
+        action_key = (request_id, "request")
+        if action_key in fetch_actions:
             return
-        fetch_actions[request_id] = "continue"
+        fetch_actions[action_key] = "continue"
         try:
             session.send("Fetch.continueRequest", {"requestId": request_id})
         except Exception:
@@ -3969,7 +3977,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             status=status,
             headers=normalized_headers,
         )
-        if classify_boundary:
+        if classify_boundary and is_history_url(response_url):
             if not record["response_url_valid"]:
                 set_boundary("history_response_mismatch")
             elif status is None:
@@ -4034,7 +4042,10 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
         owned_response = pending_response
         pending_response = None
         if is_stopped():
-            fail_fetch(owned_response.get("fetch_request_id"))
+            fail_fetch(
+                owned_response.get("fetch_request_id"),
+                pause_stage="response",
+            )
             capture["finished"] = True
             return
         if (
@@ -4080,10 +4091,14 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
         ):
             fail_fetch(
                 owned_response.get("fetch_request_id"),
+                pause_stage="response",
                 intentional_disposal=True,
             )
         else:
-            fail_fetch(owned_response.get("fetch_request_id"))
+            fail_fetch(
+                owned_response.get("fetch_request_id"),
+                pause_stage="response",
+            )
 
     def guard_response(event: Mapping[str, Any]) -> None:
         nonlocal pending_response
@@ -4095,7 +4110,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
         network_request_id = event.get("networkId")
         if not is_history_url(response_url):
             set_boundary("history_response_unowned")
-            fail_fetch(fetch_request_id)
+            fail_fetch(fetch_request_id, pause_stage="response")
             return
         if (
             not history_admitted
@@ -4103,7 +4118,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             or network_request_id != capture.get("network_request_id")
         ):
             set_boundary("history_response_unowned")
-            fail_fetch(fetch_request_id)
+            fail_fetch(fetch_request_id, pause_stage="response")
             return
         status = _native_history_status(event.get("responseStatusCode"))
         headers = event.get("responseHeaders")
@@ -4119,7 +4134,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             capture["body_failure_reason"] = "history_response_transport_failed"
             capture["finished"] = True
             set_boundary("history_response_transport_failed")
-            fail_fetch(fetch_request_id)
+            fail_fetch(fetch_request_id, pause_stage="response")
             return
         store_response(
             request_id=network_request_id,
@@ -4127,14 +4142,19 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             status=status,
             headers=headers,
         )
-        if (
-            terminal_failure is not None
-            or boundary_reason is not None
-            or status is None
-            or _native_history_failure_for_status(status) is not None
-            or capture.get("content_type") != "json"
-        ):
-            fail_fetch(fetch_request_id)
+        status_failure = _native_history_failure_for_status(status)
+        if terminal_failure is not None or boundary_reason is not None:
+            fail_fetch(fetch_request_id, pause_stage="response")
+            capture["finished"] = True
+            return
+        if status_failure is not None:
+            capture["body_failure_reason"] = status_failure
+            fail_fetch(fetch_request_id, pause_stage="response")
+            capture["finished"] = True
+            return
+        if capture.get("content_type") != "json":
+            capture["body_failure_reason"] = "non_json_response"
+            fail_fetch(fetch_request_id, pause_stage="response")
             capture["finished"] = True
             return
         pending_response = {
@@ -4156,13 +4176,13 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             guard_response(event)
             return
         if observer_closed:
-            fail_fetch(event.get("requestId"))
+            fail_fetch(event.get("requestId"), pause_stage="request")
             return
         request = event.get("request")
         request_id = event.get("requestId")
         if not isinstance(request, Mapping):
             set_boundary("malformed_request_event")
-            fail_fetch(request_id)
+            fail_fetch(request_id, pause_stage="request")
             return
         url = request.get("url", "")
         parsed = urlsplit(url if isinstance(url, str) else "")
@@ -4170,6 +4190,9 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
         redirected = event.get("redirectedRequestId")
         history = is_history_url(url)
         blocked = False
+        if isinstance(init_fetch_id, str) and redirected == init_fetch_id:
+            set_boundary("init_request_redirected")
+            blocked = True
         if isinstance(request_id, str):
             if request_id in seen_fetch_request_ids:
                 set_boundary("fetch_request_replayed")
@@ -4275,7 +4298,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
         if is_stopped():
             blocked = True
         if blocked:
-            fail_fetch(request_id)
+            fail_fetch(request_id, pause_stage="request")
         elif not is_stopped():
             continue_fetch(request_id)
 
@@ -4306,6 +4329,11 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
         elif is_init_url(url) and (
             event.get("redirectResponse")
             or event.get("redirectedRequestId") is not None
+        ):
+            set_boundary("init_request_redirected")
+        if (
+            isinstance(init_fetch_id, str)
+            and event.get("redirectedRequestId") == init_fetch_id
         ):
             set_boundary("init_request_redirected")
         if network_id == capture.get("network_request_id"):
@@ -4355,7 +4383,10 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
 
     def finalize_capture(failure_reason: Optional[str] = None) -> Mapping[str, Any]:
         if pending_response is not None:
-            fail_fetch(pending_response.get("fetch_request_id"))
+            fail_fetch(
+                pending_response.get("fetch_request_id"),
+                pause_stage="response",
+            )
         if boundary_reason is not None:
             capture["boundary_reason"] = boundary_reason
         if terminal_failure is not None:
@@ -4844,6 +4875,15 @@ def _run_oracle_browser_history_observation_in_worker(
     sender.close()
     try:
         message = _receive_oracle_browser_worker_message(receiver, capture_deadline)
+        if not isinstance(message, Mapping) or message.get("ok") is not True:
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser history observer is unavailable."
+            )
+        result = message.get("result")
+        if not isinstance(result, Mapping):
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser history observer returned an invalid result."
+            )
         remaining_seconds = _remaining_browser_timeout(capture_deadline)
         if remaining_seconds <= 0:
             raise OracleBrowserBoundaryUnavailable(
@@ -4854,20 +4894,13 @@ def _run_oracle_browser_history_observation_in_worker(
             raise OracleBrowserBoundaryUnavailable(
                 "Oracle browser history observer cleanup timed out."
             )
-        if not isinstance(message, Mapping) or message.get("ok") is not True:
-            raise OracleBrowserBoundaryUnavailable(
-                "Oracle browser history observer is unavailable."
-            )
-        result = message.get("result")
-        if not isinstance(result, Mapping):
-            raise OracleBrowserBoundaryUnavailable(
-                "Oracle browser history observer returned an invalid result."
-            )
         return dict(result)
     finally:
         receiver.close()
         try:
-            target_id = owned_target.value if creation_state.value == 2 else b""
+            target_id = (
+                owned_target.value if creation_state.value in {2, 3} else b""
+            )
             if creation_state.value:
                 _close_owned_oracle_target(
                     cdp_endpoint=cdp_endpoint,
@@ -4878,6 +4911,8 @@ def _run_oracle_browser_history_observation_in_worker(
                     playwright_factory=None,
                 )
         finally:
+            creation_state.value = 0
+            owned_target.value = b""
             # Keep the interception owner alive until exact-target cleanup has
             # completed. A forced worker reap before Target.closeTarget can
             # resume requests that were still held by Fetch interception.
@@ -4890,7 +4925,7 @@ def _run_oracle_browser_history_observation_in_worker(
             )
 
 
-def _oracle_browser_history_observation_worker(
+def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded cleanup handshake
     sender: Any,
     cdp_endpoint: str,
     page_target_id: str,
@@ -4952,24 +4987,35 @@ def _oracle_browser_history_observation_worker(
     except Exception:
         successful = False
     finally:
-        if owned_target.value and target_session is not None:
-            try:
-                closed = target_session.send(
-                    "Target.closeTarget",
-                    {"targetId": owned_target.value.decode("ascii")},
-                )
-                if closed.get("success") is not True:
-                    raise OracleBrowserBoundaryUnavailable(
-                        "Oracle browser did not close its history target."
+        close_failed = False
+        if owned_target.value:
+            if target_session is None:
+                close_failed = True
+                successful = False
+                creation_state.value = 3
+            else:
+                try:
+                    closed = target_session.send(
+                        "Target.closeTarget",
+                        {"targetId": owned_target.value.decode("ascii")},
                     )
-                creation_state.value = 0
-                owned_target.value = b""
+                    if closed.get("success") is not True:
+                        raise OracleBrowserBoundaryUnavailable(
+                            "Oracle browser did not close its history target."
+                        )
+                    creation_state.value = 0
+                    owned_target.value = b""
+                except Exception:
+                    close_failed = True
+                    successful = False
+                    # The parent must close the target while this CDP
+                    # interception owner remains attached.
+                    creation_state.value = 3
+        if not close_failed:
+            try:
+                _disconnect_attached_browser(playwright, browser)
             except Exception:
                 successful = False
-        try:
-            _disconnect_attached_browser(playwright, browser)
-        except Exception:
-            successful = False
         try:
             _send_oracle_browser_worker_message(
                 sender,
@@ -4988,6 +5034,21 @@ def _oracle_browser_history_observation_worker(
                 pass
         finally:
             sender.close()
+        if close_failed:
+            while (
+                creation_state.value == 3
+                and _remaining_browser_timeout(deadline) > 0
+            ):
+                time.sleep(
+                    min(
+                        0.01,
+                        max(0.0, _remaining_browser_timeout(deadline)),
+                    )
+                )
+            try:
+                _disconnect_attached_browser(playwright, browser)
+            except Exception:
+                pass
 
 
 def _create_owned_oracle_page(
