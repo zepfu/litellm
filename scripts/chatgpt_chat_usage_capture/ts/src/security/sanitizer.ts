@@ -770,17 +770,59 @@ function projectObject(
     const entries = Object.entries(value);
     const out: Record<string, unknown> = {};
 
-    // Root flags and metadata origin precede recursive metadata diagnostics,
-    // regardless of the provider's property insertion order.
-    for (const [rawKey, rawValue] of originFirstEntries(value, entries)) {
+    // Root origin evidence precedes recursive metadata diagnostics, regardless
+    // of the provider's property insertion order. Defer the metadata object
+    // itself until sibling allowlisted fields (especially identifiers) have
+    // been projected, because its unknown subtree shares this budget.
+    for (const [rawKey, rawValue] of originPriorityEntries(value)) {
       const key = String(rawKey);
-      if (isExcludedKey(key) || !allowlist.has(key)) {
+      if (key === "metadata" || isExcludedKey(key) || !allowlist.has(key)) {
         continue;
       }
       const childPath = diagnosticPath(path, key, state);
       const projected = projectField(key, rawValue, state, depth + 1, childPath);
       if (projected !== undefined) {
         out[key] = projected;
+      }
+    }
+
+    // Project all other allowlisted siblings before entering metadata. This
+    // keeps identifiers and model fields available even when metadata
+    // diagnostics later exhaust the shared traversal budget.
+    for (const [rawKey, rawValue] of entries) {
+      const key = String(rawKey);
+      if (
+        key === "metadata" ||
+        ORIGIN_FIELD_PRIORITY.has(key) ||
+        isExcludedKey(key) ||
+        !allowlist.has(key)
+      ) {
+        continue;
+      }
+      const childPath = diagnosticPath(path, key, state);
+      const projected = projectField(key, rawValue, state, depth + 1, childPath);
+      if (projected !== undefined) {
+        out[key] = projected;
+      }
+    }
+
+    // Metadata retains its own origin-first/allowlisted-before-diagnostics
+    // ordering, but must not starve sibling fields at this object level.
+    const metadataEntry = entries.find(([rawKey]) => rawKey === "metadata");
+    if (metadataEntry !== undefined && allowlist.has("metadata")) {
+      const [rawKey, rawValue] = metadataEntry;
+      if (!isExcludedKey(rawKey)) {
+        const childPath = diagnosticPath(path, rawKey, state);
+        const projected = projectField(
+          rawKey,
+          rawValue,
+          state,
+          depth + 1,
+          childPath,
+        );
+        if (projected !== undefined) {
+          out[rawKey] = projected;
+        }
       }
     }
 
@@ -810,14 +852,20 @@ function* originFirstEntries(
   value: Record<string, unknown>,
   entries: [string, unknown][],
 ): Generator<[string, unknown]> {
-  for (const key of ORIGIN_FIELD_PRIORITY) {
-    if (Object.hasOwn(value, key)) {
-      yield [key, value[key]];
-    }
-  }
+  yield* originPriorityEntries(value);
   for (const entry of entries) {
     if (!ORIGIN_FIELD_PRIORITY.has(entry[0])) {
       yield entry;
+    }
+  }
+}
+
+function* originPriorityEntries(
+  value: Record<string, unknown>,
+): Generator<[string, unknown]> {
+  for (const key of ORIGIN_FIELD_PRIORITY) {
+    if (Object.hasOwn(value, key)) {
+      yield [key, value[key]];
     }
   }
 }

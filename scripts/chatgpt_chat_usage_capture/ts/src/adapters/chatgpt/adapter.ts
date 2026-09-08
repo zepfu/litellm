@@ -596,7 +596,7 @@ export function adaptMessagePage(
   // Envelopes may exclude contained activity, but cannot establish that an
   // otherwise unknown message is native.
   const originConstraint =
-    envelopeOrigin === "unknown" ||
+    (envelopeOrigin !== null && envelopeOrigin.toLowerCase() === "unknown") ||
     (envelopeOrigin !== null && excludedOriginLabel(envelopeOrigin) !== null)
       ? envelopeOrigin
       : null;
