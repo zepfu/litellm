@@ -525,6 +525,7 @@ async def _validate_alias_candidate_responses_stream_if_needed(
             adapter_label=adapter_label,
             intake_context=intake_context,
             request_body=request_body,
+            request=request,
         ),
     )
 
@@ -790,6 +791,18 @@ def _raise_codex_auto_agent_invalid_responses_shape(
         "adapter_model": adapter_model,
         "body_type": type(response_body).__name__,
     }
+    shape_error: dict[str, Any] = {}
+    _is_responses_shaped_body(response_body, shape_error=shape_error)
+    if shape_error:
+        diagnostic["shape_error"] = shape_error
+        verbose_proxy_logger.warning(
+            "Responses shape rejected adapter=%s model=%s path=%s expected=%s actual_type=%s",
+            adapter,
+            adapter_model,
+            shape_error["path"],
+            shape_error["expected"],
+            shape_error["actual_type"],
+        )
     if stream_event_summaries is not None:
         diagnostic["stream_event_summaries"] = stream_event_summaries
     exc = ProxyException(
@@ -817,7 +830,9 @@ def _raise_codex_auto_agent_invalid_responses_shape(
     raise exc
 
 
-def _responses_item_has_valid_content_part(part: Any) -> bool:
+def _responses_item_has_valid_content_part(
+    part: Any, *, shape_error: Optional[dict[str, Any]] = None
+) -> bool:
     if not isinstance(part, dict):
         return False
     part_type = part.get("type")
@@ -825,6 +840,14 @@ def _responses_item_has_valid_content_part(part: Any) -> bool:
         return False
     if part_type in {"output_text", "text"}:
         if not isinstance(part.get("text"), str):
+            if shape_error is not None:
+                shape_error.update(
+                    path=".text",
+                    expected="string",
+                    actual_type=(
+                        type(part["text"]).__name__ if "text" in part else "missing"
+                    ),
+                )
             return False
         annotations = part.get("annotations")
         return annotations is None or (
@@ -966,6 +989,8 @@ def _responses_required_nonempty_strings(
 
 def _responses_output_item_is_structurally_valid(  # noqa: PLR0915
     item: Any,
+    *,
+    shape_error: Optional[dict[str, Any]] = None,
 ) -> bool:
     if not isinstance(item, dict):
         return False
@@ -997,10 +1022,17 @@ def _responses_output_item_is_structurally_valid(  # noqa: PLR0915
         if item.get("role") != "assistant":
             return False
         content = item.get("content")
-        if not isinstance(content, list) or not all(
-            _responses_item_has_valid_content_part(part) for part in content
-        ):
+        if not isinstance(content, list):
             return False
+        for index, part in enumerate(content):
+            if not _responses_item_has_valid_content_part(
+                part, shape_error=shape_error
+            ):
+                if shape_error is not None:
+                    shape_error["path"] = (
+                        f".content[{index}]" + shape_error.get("path", "")
+                    )
+                return False
     elif item_type == "file_search_call":
         if not _responses_status_is_valid(
             item,
@@ -1457,21 +1489,43 @@ def _responses_output_item_is_structurally_valid(  # noqa: PLR0915
     return True
 
 
-def _is_responses_shaped_body(response_body: Any) -> bool:
+def _is_responses_shaped_body(
+    response_body: Any, *, shape_error: Optional[dict[str, Any]] = None
+) -> bool:
+    def reject(path: str, expected: str, value: Any) -> bool:
+        if shape_error is not None:
+            shape_error.update(
+                path=path, expected=expected, actual_type=type(value).__name__
+            )
+        return False
+
     if not isinstance(response_body, dict):
-        return False
+        return reject("response", "object", response_body)
     if response_body.get("object") != "response":
-        return False
+        return reject(
+            "response.object", "response discriminator", response_body.get("object")
+        )
     response_id = response_body.get("id")
     if not isinstance(response_id, str) or not response_id.strip():
-        return False
+        return reject("response.id", "nonempty string", response_id)
     status = response_body.get("status")
     if not isinstance(status, str) or status not in _RESPONSES_VALID_STATUSES:
-        return False
+        return reject("response.status", "Responses status", status)
     output = response_body.get("output")
-    return isinstance(output, list) and all(
-        _responses_output_item_is_structurally_valid(item) for item in output
-    )
+    if not isinstance(output, list):
+        return reject("response.output", "array", output)
+    for index, item in enumerate(output):
+        if not _responses_output_item_is_structurally_valid(
+            item, shape_error=shape_error
+        ):
+            if shape_error is not None:
+                shape_error["path"] = (
+                    f"response.output[{index}]" + shape_error.get("path", "")
+                )
+                shape_error.setdefault("expected", "valid output item")
+                shape_error.setdefault("actual_type", type(item).__name__)
+            return False
+    return True
 
 
 def _responses_body_is_unsuccessful(
@@ -1607,6 +1661,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
     adapter_label: str,
     intake_context: Optional[dict[str, Any]] = None,
     request_body: Optional[dict[str, Any]] = None,
+    request: Optional[Request] = None,
 ) -> Response:
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.repetitive_output import (
         inherit_or_wrap_passthrough_streaming_response,
@@ -2307,7 +2362,15 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 event_summaries=event_summaries,
                 reject_malformed_tool_text=True,
             )
-            return validated_response
+            from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+                _bind_responses_wire_stream,
+            )
+
+            return _bind_responses_wire_stream(
+                validated_response,
+                request=request,
+                adapter_model=adapter_model,
+            )
         validation_state = prefetch_state
         _set_stream_validation_state(peek.response, validation_state)
         validated_response = _bind_incremental_stream_validation(

@@ -966,6 +966,7 @@ _HOST_FUNCTION_NAMES = (
     "_perform_codex_auto_agent_oa_xai_responses_request",
     "_maybe_wrap_xai_passthrough_responses_stream",
     "_bind_xai_responses_wire_stream",
+    "_bind_responses_wire_stream",
     "_abort_xai_responses_prefetch",
     "_bind_responses_stream_timeout_terminalizer",
     "_validate_codex_auto_agent_openrouter_responses_stream",
@@ -1203,7 +1204,18 @@ def _bind_xai_responses_wire_stream(
     request: Request,
     adapter_model: str,
 ) -> StreamingResponse:
-    """Bind xAI Responses to the shared ASGI-aware final-wire coordinator."""
+    return _bind_responses_wire_stream(
+        response, request=request, adapter_model=adapter_model
+    )
+
+
+def _bind_responses_wire_stream(
+    response: StreamingResponse,
+    *,
+    request: Optional[Request],
+    adapter_model: str,
+) -> StreamingResponse:
+    """Bind validated Responses to the shared ASGI-aware terminal coordinator."""
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
         OpenAIResponsesStreamingResponse,
         bind_openai_responses_wire_trace_to_request,
@@ -1236,27 +1248,29 @@ def _bind_xai_responses_wire_stream(
         payload: Optional[dict[str, Any]],
         disposition: Any,
     ) -> None:
-        if original_pre_terminal_validation is not None:
-            await original_pre_terminal_validation(
-                block,
-                event_type,
-                payload,
-                disposition,
-            )
-        final_response = response_holder.get("response")
-        state = getattr(response, "_aawm_responses_validation_state", None)
-        if final_response is not None and isinstance(state, dict):
-            setattr(final_response, "_aawm_responses_validation_state", state)
-            setattr(
-                final_response,
-                "_aawm_responses_validation_complete",
-                bool(state.get("complete")),
-            )
-            setattr(
-                final_response,
-                "_aawm_responses_validation_valid",
-                bool(state.get("valid")),
-            )
+        try:
+            if original_pre_terminal_validation is not None:
+                await original_pre_terminal_validation(
+                    block,
+                    event_type,
+                    payload,
+                    disposition,
+                )
+        finally:
+            final_response = response_holder.get("response")
+            state = getattr(response, "_aawm_responses_validation_state", None)
+            if final_response is not None and isinstance(state, dict):
+                setattr(final_response, "_aawm_responses_validation_state", state)
+                setattr(
+                    final_response,
+                    "_aawm_responses_validation_complete",
+                    bool(state.get("complete")),
+                )
+                setattr(
+                    final_response,
+                    "_aawm_responses_validation_valid",
+                    bool(state.get("valid")),
+                )
 
     processed_chunks, wire_trace = wrap_openai_responses_stream(
         source,
@@ -1271,6 +1285,7 @@ def _bind_xai_responses_wire_stream(
         ),
         trace=trace,
         model=adapter_model,
+        allow_response_done=True,
     )
     background_owner = getattr(
         response,
@@ -1278,7 +1293,8 @@ def _bind_xai_responses_wire_stream(
         None,
     )
     wire_trace.register_background_owner(background_owner)
-    bind_openai_responses_wire_trace_to_request(request, wire_trace)
+    if request is not None:
+        bind_openai_responses_wire_trace_to_request(request, wire_trace)
     wire_response = OpenAIResponsesStreamingResponse(
         processed_chunks,
         wire_trace=wire_trace,
@@ -4855,6 +4871,7 @@ async def _handle_codex_cohere_chat_completions_adapter_route(
         adapter_label="Cohere",
         intake_context=intake_context,
         request_body=prepared_request_body,
+        request=request,
     )
     if isinstance(validated_response, StreamingResponse):
         return _record_adapted_completed_route_rollup_after_stream(
@@ -5213,6 +5230,7 @@ async def _handle_codex_nvidia_completion_adapter_route(
         adapter_label="NVIDIA",
         intake_context=intake_context,
         request_body=prepared_request_body,
+        request=request,
     )
     if isinstance(validated_response, StreamingResponse):
         return _record_adapted_completed_route_rollup_after_stream(
@@ -5438,6 +5456,7 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
             adapter_label="Grok native",
             intake_context=grok_intake_context,
             request_body=canonical_request_body,
+            request=request,
         )
         if isinstance(validated_response, StreamingResponse):
             validated_response = _bind_xai_responses_wire_stream(
@@ -5590,6 +5609,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             adapter_label="xAI OAuth",
             intake_context=xai_intake_context,
             request_body=canonical_request_body,
+            request=request,
         )
         if isinstance(validated_response, StreamingResponse):
             validated_response = _bind_xai_responses_wire_stream(
@@ -6214,6 +6234,7 @@ async def _handle_codex_kimi_chat_completions_adapter_route(
         adapter_label="Kimi Code",
         intake_context=intake_context,
         request_body=prepared_request_body,
+        request=request,
     )
     if isinstance(validated_response, StreamingResponse):
         return _record_adapted_completed_route_rollup_after_stream(
@@ -6519,6 +6540,7 @@ async def _handle_codex_alibaba_token_plan_adapter_route(
             provider="alibaba_token_plan",
         ),
         request_body=prepared_request_body,
+        request=request,
     )
     if isinstance(validated_response, StreamingResponse):
         return _record_adapted_completed_route_rollup_after_stream(
@@ -6729,6 +6751,7 @@ async def _handle_codex_zai_coding_plan_adapter_route(
         adapter_label="Z.AI Coding Plan",
         intake_context=intake_context,
         request_body=prepared_request_body,
+        request=request,
     )
     if isinstance(validated_response, StreamingResponse):
         return _record_adapted_completed_route_rollup_after_stream(
@@ -8082,6 +8105,7 @@ async def _perform_codex_auto_agent_openrouter_completion_request(  # noqa: PLR0
             adapter_label="OpenRouter chat-completions",
             intake_context=intake_context,
             request_body=canonical_request_body,
+            request=request,
         )
         if isinstance(validated_response, StreamingResponse):
             return _record_adapted_completed_route_rollup_after_stream(
@@ -8125,6 +8149,7 @@ async def _perform_codex_auto_agent_openrouter_completion_request(  # noqa: PLR0
         adapter_label="OpenRouter chat-completions",
         intake_context=intake_context,
         request_body=canonical_request_body,
+        request=request,
     )
     _record_adapted_completed_route_rollup_turn(
         rollup_kwargs,
