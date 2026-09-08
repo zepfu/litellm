@@ -3380,6 +3380,19 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                     "Failed to close deferred session-owner stream iterator",
                     exc_info=True,
                 )
+        cleanup = getattr(
+            response,
+            "_aawm_responses_validation_cleanup",
+            None,
+        )
+        if callable(cleanup):
+            try:
+                await cleanup()
+            except BaseException:
+                verbose_proxy_logger.debug(
+                    "Failed to close deferred Responses validation resources",
+                    exc_info=True,
+                )
 
     class _DeferredLeaseIterator:
         def __init__(self) -> None:

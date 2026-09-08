@@ -139,6 +139,8 @@ _RESPONSES_VALID_ITEM_STATUSES = frozenset(
 _RESPONSES_VALIDATION_STATE_ATTR = "_aawm_responses_validation_state"
 _RESPONSES_VALIDATION_COMPLETE_ATTR = "_aawm_responses_validation_complete"
 _RESPONSES_VALIDATION_VALID_ATTR = "_aawm_responses_validation_valid"
+_RESPONSES_VALIDATION_CLEANUP_ATTR = "_aawm_responses_validation_cleanup"
+_STREAM_CLEANUP_ATTR = "_aawm_streaming_response_cleanup"
 
 
 def install(host_globals: dict) -> None:
@@ -194,6 +196,10 @@ def install(host_globals: dict) -> None:
     host_globals["_RESPONSES_VALIDATION_VALID_ATTR"] = (
         _RESPONSES_VALIDATION_VALID_ATTR
     )
+    host_globals["_RESPONSES_VALIDATION_CLEANUP_ATTR"] = (
+        _RESPONSES_VALIDATION_CLEANUP_ATTR
+    )
+    host_globals["_STREAM_CLEANUP_ATTR"] = _STREAM_CLEANUP_ATTR
     for _name in _HOST_FUNCTION_NAMES:
         _obj = _mod[_name]
         _rebound = FunctionType(
@@ -1434,6 +1440,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
         event_summaries: list[dict[str, Any]],
     ) -> StreamingResponse:
         original_iterator = target.body_iterator
+        upstream_cleanup = getattr(target, _STREAM_CLEANUP_ATTR, None)
         decoder = codecs.getincrementaldecoder("utf-8")()
         sse_buffer = ""
         trailing_cr = False
@@ -1441,8 +1448,8 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
         decoder_failed = False
         terminal_response: Optional[dict[str, Any]] = None
         terminal_event_type: Optional[str] = None
-        iterator_finished = False
         iterator_closed = False
+        validation_cleanup_called = False
         max_buffered_bytes = max(
             0,
             int(_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES),  # noqa: F821
@@ -1560,8 +1567,55 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                     _record_event_block(sse_buffer)
                     sse_buffer = ""
 
+        async def _close_bound_iterator() -> None:
+            nonlocal iterator_closed
+            if iterator_closed:
+                return
+            iterator_closed = True
+            close = getattr(original_iterator, "aclose", None)
+            if callable(close):
+                try:
+                    await close()
+                except BaseException:
+                    verbose_proxy_logger.debug(
+                        "Failed to close Responses validation stream",
+                        exc_info=True,
+                    )
+
+        async def _close_validation_resources() -> None:
+            nonlocal validation_cleanup_called
+            if validation_cleanup_called:
+                return
+            validation_cleanup_called = True
+            if not state.get("complete"):
+                if state.get("invalid"):
+                    _update_stream_validation_state(
+                        target,
+                        state,
+                        complete=True,
+                        valid=False,
+                        reason=state.get("reason") or "invalid_stream",
+                    )
+                else:
+                    _update_stream_validation_state(
+                        target,
+                        state,
+                        complete=False,
+                        valid=False,
+                        reason="stream_closed_before_validation",
+                    )
+            if callable(upstream_cleanup):
+                try:
+                    await upstream_cleanup()
+                except BaseException:
+                    verbose_proxy_logger.debug(
+                        "Failed to close peeked Responses validation stream",
+                        exc_info=True,
+                    )
+            await _close_bound_iterator()
+
         async def _validated_iterator() -> Any:  # noqa: PLR0915
-            nonlocal decoder_failed, iterator_finished, iterator_closed
+            nonlocal decoder_failed
             try:
                 async for raw_chunk in original_iterator:
                     yield raw_chunk
@@ -1589,7 +1643,6 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                     except UnicodeDecodeError:
                         decoder_failed = True
                         _invalidate_stream(target, state, "malformed_sse_event")
-                iterator_finished = True
                 if state.get("invalid"):
                     _update_stream_validation_state(
                         target,
@@ -1710,36 +1763,14 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                         )
                 raise
             finally:
-                if not iterator_finished and not state.get("complete"):
-                    if state.get("invalid"):
-                        _update_stream_validation_state(
-                            target,
-                            state,
-                            complete=True,
-                            valid=False,
-                            reason=state.get("reason") or "invalid_stream",
-                        )
-                    else:
-                        _update_stream_validation_state(
-                            target,
-                            state,
-                            complete=False,
-                            valid=False,
-                            reason="stream_closed_before_validation",
-                        )
-                if not iterator_closed:
-                    iterator_closed = True
-                    close = getattr(original_iterator, "aclose", None)
-                    if callable(close):
-                        try:
-                            await close()
-                        except BaseException:
-                            verbose_proxy_logger.debug(
-                                "Failed to close Responses validation stream",
-                                exc_info=True,
-                            )
+                await _close_validation_resources()
 
         target.body_iterator = _validated_iterator()
+        setattr(
+            target,
+            _RESPONSES_VALIDATION_CLEANUP_ATTR,
+            _close_validation_resources,
+        )
         _set_stream_validation_state(target, state)
         return target
 
@@ -1802,15 +1833,22 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 request_body=request_body,
                 adapter_model=adapter_model,
             )
+            stream_cleanup = getattr(peek.response, _STREAM_CLEANUP_ATTR, None)
+            if callable(stream_cleanup):
+                setattr(restored_response, _STREAM_CLEANUP_ATTR, stream_cleanup)
             restored_response = _restore_adapted_namespace_tool_calls_in_streaming_response(  # noqa: F821
                 restored_response,
                 request_body=request_body,
                 adapter_model=adapter_model,
             )
+            if callable(stream_cleanup):
+                setattr(restored_response, _STREAM_CLEANUP_ATTR, stream_cleanup)
             validated_response = inherit_or_wrap_passthrough_streaming_response(
                 restored_response,
                 source_response=response,
             )
+            if callable(stream_cleanup):
+                setattr(validated_response, _STREAM_CLEANUP_ATTR, stream_cleanup)
             validation_state = _validated_stream_state()
             _bind_incremental_stream_validation(
                 validated_response,
@@ -1818,8 +1856,14 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 event_summaries=event_summaries,
             )
             return validated_response
-        response_body = await _collect_responses_response_from_stream(  # noqa: F821
+        validation_state = _validated_stream_state()
+        validated_response = _bind_incremental_stream_validation(
             peek.response,
+            validation_state,
+            event_summaries=event_summaries,
+        )
+        response_body = await _collect_responses_response_from_stream(  # noqa: F821
+            validated_response,
             event_summaries=event_summaries,
         )
         identity_changed = False
@@ -2064,7 +2108,11 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                     adapter_label=adapter_label,
                     intake_context=intake_context,
                 )
-            if not _is_responses_shaped_body(response_body):
+            if (
+                not isinstance(response_body, dict)
+                or response_body.get("status") != "completed"
+                or not _is_responses_shaped_body(response_body)
+            ):
                 _raise_codex_auto_agent_invalid_responses_shape(
                     response_body=response_body,
                     adapter_model=adapter_model,
