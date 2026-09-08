@@ -188,6 +188,18 @@ Grok Build, and unprofiled future models do not inherit the native policy.
 Malformed native output remains request-local and does not create a durable
 candidate cooldown.
 
+## Native Grok Continuation Recovery
+
+For a provider-owned continuation on a capability-enabled native Grok route,
+bare `upstream_transient_internal` failures use the native request-scoped
+continuation budget. The planner runs before generic pre-commit retry handling,
+so transient recovery uses bounded short backoff instead of the generic
+ten-second wait. Five transient failures can therefore be followed by a sixth
+provider attempt, while exhaustion terminates at the configured request budget.
+
+Fresh requests, managed `oa_xai/*` routes, and non-transient failures retain
+their existing generic retry and cooldown policy.
+
 ## Sample Usage - Vision
 
 ```python showLineNumbers title="LiteLLM python sdk usage - Vision"
