@@ -12,6 +12,7 @@ the symbols.
 from __future__ import annotations
 
 import copy
+import inspect
 import math
 from typing import Any, Callable, Mapping, Optional
 from uuid import uuid4
@@ -55,6 +56,34 @@ def _resolve_supports_xhigh_reasoning_effort() -> Optional[Callable[..., bool]]:
         except Exception:
             return None
     return _supports_xhigh_reasoning_effort
+
+
+def _parse_header_wait_seconds_compat(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]],
+) -> Optional[float]:
+    """Call injected wait parsers without breaking legacy callback shapes."""
+    parser = _parse_codex_auto_agent_header_wait_seconds
+    assert parser is not None
+    try:
+        signature = inspect.signature(parser)
+    except (TypeError, ValueError):
+        return parser(exc)
+
+    candidate_parameter = signature.parameters.get("candidate")
+    accepts_candidate_keyword = (
+        candidate_parameter is not None
+        and candidate_parameter.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    ) or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    if accepts_candidate_keyword:
+        return parser(exc, candidate=candidate)
+    return parser(exc)
+
 
 # ---------------------------------------------------------------------------
 # Injected runtime seams (god-module / error_signals / classification / state)
@@ -584,7 +613,7 @@ def _update_codex_auto_agent_retryable_attempt_record(  # noqa: PLR0915
     error_tokens = _extract_codex_auto_agent_error_tokens(exc)
     error_status_code = _extract_exception_status_code(exc)
     error_type, error_code = _extract_codex_auto_agent_error_type_and_code(exc)
-    retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(
+    retry_after_seconds = _parse_header_wait_seconds_compat(
         exc,
         candidate=candidate,
     )
@@ -756,7 +785,7 @@ def _record_codex_failure_evidence(
 
     error_status_code = _extract_exception_status_code(exc)
     source_error = _get_codex_auto_agent_source_error_summary(exc, status_code=error_status_code)
-    raw_retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(
+    raw_retry_after_seconds = _parse_header_wait_seconds_compat(
         exc,
         candidate=candidate,
     )
