@@ -3253,6 +3253,7 @@ def _select_first_available_codex_oauth_account_state(
 
     selected = available[selected_index]
     selected["quota_selection"] = quota_selection
+    selected["quota_balancing"] = quota_selection
     if family_by_state:
         quota_selection["quota_family"] = family_by_state[selected_index]
     return selected
@@ -3269,6 +3270,38 @@ def _codex_oauth_weekly_balance_threshold_pct() -> float:
     if not math.isfinite(parsed) or not 0.0 < parsed <= 100.0:
         return _CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_DEFAULT_PCT
     return parsed
+
+
+def _select_codex_oauth_account_within_identity(
+    tier: Sequence[dict[str, Any]],
+    selected_state: dict[str, Any],
+    *,
+    last_resort: bool,
+) -> dict[str, Any]:
+    """Balance managed accounts only within the outer selected identity."""
+    candidate = selected_state["candidate"]
+    identity = candidate.get("codex_oauth_account_selection_identity")
+    if (
+        candidate.get("codex_oauth_account_selection_strategy")
+        != "weekly_quota_balance"
+        or identity is None
+    ):
+        return selected_state
+    identity_states = [
+        state
+        for state in tier
+        if state["candidate"].get(
+            "codex_oauth_account_selection_identity"
+        )
+        == identity
+    ]
+    return (
+        _select_first_available_codex_oauth_account_state(
+            identity_states,
+            allow_cooled_down=last_resort,
+        )
+        or selected_state
+    )
 
 
 def _format_codex_oauth_quota_reset_at(value: Any) -> Optional[str]:
@@ -3755,11 +3788,11 @@ def _apply_codex_oauth_account_context_to_state(
                 str(candidate.get("model") or ""),
                 str(candidate.get("route_family") or ""),
             )
-            candidate["selection_group"] = f"codex_oauth_identity:{identity}"
-            candidate["selection_strategy"] = (
+            candidate["codex_oauth_account_selection_identity"] = identity
+            candidate["codex_oauth_account_selection_strategy"] = (
                 "weekly_quota_balance"
             )
-            candidate["selection_choice"] = str(
+            candidate["codex_oauth_account_selection_choice"] = str(
                 candidate.get("codex_oauth_account_label")
             )
             candidate.setdefault(
@@ -4201,13 +4234,6 @@ def _select_available_state(
             counts[str(group)] = counts.get(str(group), 0) + 1
         if strategy == "proportional":
             selected_choice = _weighted_choice(choices, weights)
-            if strategy == "weekly_quota_balance":
-                account_state = _select_first_available_codex_oauth_account_state(
-                    states_by_choice[selected_choice],
-                    allow_cooled_down=last_resort,
-                )
-                if account_state is not None:
-                    selected_state = account_state
         elif strategy == "round_robin":
             selected_state = _select_round_robin_available_state(
                 request,
@@ -4250,6 +4276,11 @@ def _select_available_state(
         selected_by_group[str(group)] = selected_choice
 
     selected = selected_state or states_by_choice[selected_choice][0]
+    selected = _select_codex_oauth_account_within_identity(
+        tier,
+        selected,
+        last_resort=last_resort,
+    )
     quota_balancing = selected.get("quota_selection")
     total_weight = sum(max(0.0, weights[choice]) for choice in choices)
     selected["selection_diagnostics"] = {
