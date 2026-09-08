@@ -929,33 +929,19 @@ def _codex_oauth_affinity_token_request_state(
     """
     values: list[str] = []
     malformed = False
-    seen: set[int] = set()
-
-    def _visit(value: Any) -> None:
-        nonlocal malformed
-        if isinstance(value, dict):
-            marker = id(value)
-            if marker in seen:
-                return
-            seen.add(marker)
-            if _CODEX_OAUTH_AFFINITY_TOKEN_BODY_KEY in value:
-                raw_token = value.get(_CODEX_OAUTH_AFFINITY_TOKEN_BODY_KEY)
-                cleaned_token = _clean_codex_auth_value(raw_token)
-                if cleaned_token is None:
-                    malformed = True
-                else:
-                    values.append(cleaned_token)
-            for nested in value.values():
-                _visit(nested)
-        elif isinstance(value, list):
-            marker = id(value)
-            if marker in seen:
-                return
-            seen.add(marker)
-            for nested in value:
-                _visit(nested)
-
-    _visit(body)
+    containers: list[dict[str, Any]] = [body]
+    metadata = body.get("litellm_metadata")
+    if isinstance(metadata, dict):
+        containers.append(metadata)
+    for container in containers:
+        if _CODEX_OAUTH_AFFINITY_TOKEN_BODY_KEY not in container:
+            continue
+        raw_token = container.get(_CODEX_OAUTH_AFFINITY_TOKEN_BODY_KEY)
+        cleaned_token = _clean_codex_auth_value(raw_token)
+        if cleaned_token is None:
+            malformed = True
+        else:
+            values.append(cleaned_token)
     if not values:
         return None, malformed
     if malformed or any(value != values[0] for value in values[1:]):
@@ -976,26 +962,10 @@ def _remove_codex_oauth_affinity_token_from_body(
     body: dict[str, Any],
 ) -> None:
     """Keep internal continuation state out of the provider wire body."""
-    seen: set[int] = set()
-
-    def _visit(value: Any) -> None:
-        if isinstance(value, dict):
-            marker = id(value)
-            if marker in seen:
-                return
-            seen.add(marker)
-            value.pop(_CODEX_OAUTH_AFFINITY_TOKEN_BODY_KEY, None)
-            for nested in value.values():
-                _visit(nested)
-        elif isinstance(value, list):
-            marker = id(value)
-            if marker in seen:
-                return
-            seen.add(marker)
-            for nested in value:
-                _visit(nested)
-
-    _visit(body)
+    body.pop(_CODEX_OAUTH_AFFINITY_TOKEN_BODY_KEY, None)
+    metadata = body.get("litellm_metadata")
+    if isinstance(metadata, dict):
+        metadata.pop(_CODEX_OAUTH_AFFINITY_TOKEN_BODY_KEY, None)
 
 
 def _codex_oauth_affinity_token_digest(token: str) -> str:
@@ -1046,6 +1016,8 @@ def _codex_oauth_affinity_conflicts(
         "codex_responses",
         "openai_responses",
     }
+    left_route = left_route.lower() if left_route else None
+    right_route = right_route.lower() if right_route else None
     if (
         left_route
         and right_route
@@ -1086,10 +1058,14 @@ def _get_codex_oauth_affinity_continuation_state(
     request: Request,
     *,
     body: dict[str, Any],
-    model: str,
+    model: Optional[str],
     session_identity: Optional[str],
 ) -> CodexOAuthAffinityContinuation:
-    """Validate once and retain immutable server state across retries."""
+    """Validate once and retain immutable server state across retries.
+
+    ``model`` is omitted for alias and model-less native requests; in those
+    cases the signed token model becomes the frozen concrete scope.
+    """
     token, token_declared = _codex_oauth_affinity_token_request_state(body=body)
     _remove_codex_oauth_affinity_token_from_body(body)
     normalized_model = _clean_codex_auth_value(model) or ""
@@ -1109,7 +1085,11 @@ def _get_codex_oauth_affinity_continuation_state(
         if existing.invalid:
             return existing
         if (
-            existing.model != normalized_model
+            (
+                existing.model
+                and normalized_model
+                and existing.model != normalized_model
+            )
             or existing.session_identity != normalized_session
             or (
                 token_declared
@@ -1142,14 +1122,19 @@ def _get_codex_oauth_affinity_continuation_state(
     else:
         affinity = _codex_oauth_affinity_from_authenticated_token(
             token=token,
-            model=normalized_model,
+            model=normalized_model or None,
             session_identity=normalized_session,
         )
+        authoritative_model = (
+            _clean_codex_auth_value(affinity.get("model"))
+            if affinity is not None
+            else normalized_model
+        ) or ""
         state = CodexOAuthAffinityContinuation(
             declared=True,
             invalid=affinity is None,
             token_digest=token_digest,
-            model=normalized_model,
+            model=authoritative_model,
             session_identity=normalized_session,
             affinity_items=(
                 tuple(sorted(affinity.items())) if affinity is not None else ()
@@ -1179,6 +1164,8 @@ def _redact_codex_oauth_account_diagnostics(
             "account_lane",
             "account_display",
             "lane_key",
+            "cooldown_key",
+            "logical_cooldown_key",
         ):
             shaped.pop(identity_field, None)
         redacted.append(shaped)
@@ -1331,14 +1318,17 @@ def _issue_codex_oauth_affinity_token(
 def _codex_oauth_affinity_from_authenticated_token(
     *,
     token: Optional[str],
-    model: str,
+    model: Optional[str],
     session_identity: Optional[str],
 ) -> Optional[dict[str, Any]]:
     """Validate a server-issued account-affinity continuation token.
 
     A token is accepted only for the exact server-issued account reference,
-    model, route family, and declared session. Invalid tokens return ``None``
-    so the caller can fail closed without exposing token or account contents.
+    model, route family, and declared session. ``model=None`` is reserved for
+    alias/model-less resolution; the signed model remains authoritative and is
+    checked against alias membership before selection. Invalid tokens return
+    ``None`` so the caller can fail closed without exposing token or account
+    contents.
     """
     cleaned_token = _clean_codex_auth_value(token)
     if cleaned_token is None:
@@ -1391,11 +1381,11 @@ def _codex_oauth_affinity_from_authenticated_token(
         return None
     request_model = _clean_codex_auth_value(model)
     request_session = _clean_codex_auth_value(session_identity)
-    if request_model is None or request_session is None:
+    if request_session is None:
         return None
     if token_session != request_session:
         return None
-    if token_model != request_model:
+    if request_model is not None and token_model != request_model:
         return None
     if len(account_ref) != hashlib.sha256().digest_size * 2:
         return None

@@ -409,6 +409,8 @@ _AUTO_AGENT_ACCOUNT_IDENTITY_FIELDS = frozenset(
         "account_lane",
         "account_display",
         "account_ref",
+        "cooldown_key",
+        "logical_cooldown_key",
         "lane_key",
         "prior_account_hash",
         "attempted_account_hashes",
@@ -4538,7 +4540,10 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         _codex_oauth_mod._get_codex_oauth_affinity_continuation_state(
             request,
             body=request_body,
-            model=alias_model,
+            # Alias names are not the token's model scope. The authenticated
+            # continuation freezes its signed concrete model before affinity
+            # membership and owner compatibility are evaluated below.
+            model=None,
             session_identity=canonical_session_identity,
         )
     )
@@ -5749,11 +5754,13 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
             "type": "rate_limit_error",
             "code": "aawm_anthropic_auto_agent_all_candidates_cooling_down",
         },
-        "candidates": skipped,
+        "candidates": _redact_auto_agent_account_identity(skipped),
     }
     terminal_reset = _build_codex_oauth_terminal_reset_information(states)
     if terminal_reset is not None:
-        detail["terminal_reset"] = terminal_reset
+        detail["terminal_reset"] = _redact_auto_agent_account_identity(
+            terminal_reset
+        )
     raise HTTPException(
         status_code=429,
         detail=detail,
