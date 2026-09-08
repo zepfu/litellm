@@ -58,6 +58,8 @@ class AawmOpenAIFaultPlanError(HTTPException):
     """Typed synthetic usage-limit response consumed by existing classifiers."""
 
     def __init__(self) -> None:
+        self.attempted_provider_call = False
+        self.failure_phase = "direct_openai_fault_plan"
         super().__init__(
             status_code=429,
             detail={
@@ -249,7 +251,10 @@ def _direct_attempted_account_hashes(
     """Return stable account hashes already attempted, in failover order."""
     hashes: list[str] = []
     for attempt in attempts:
-        if not isinstance(attempt, dict):
+        if (
+            not isinstance(attempt, dict)
+            or attempt.get("attempted_provider_call") is not True
+        ):
             continue
         account_hash = attempt.get("account_hash")
         if (
@@ -264,12 +269,24 @@ def _direct_attempted_account_hashes(
         "aawm_codex_oauth_request_local_failover_context",
         None,
     )
-    context_hashes = (
-        context.get("attempted_account_hashes")
+    prior_account_outcomes = (
+        context.get("prior_account_outcomes")
         if isinstance(context, dict)
         else None
     )
-    for account_hash in context_hashes or ():
+    if not isinstance(prior_account_outcomes, (list, tuple)):
+        prior_account_outcomes = (
+            [context.get("prior_account_outcome")]
+            if isinstance(context, dict)
+            else []
+        )
+    for prior_account_outcome in prior_account_outcomes:
+        if (
+            not isinstance(prior_account_outcome, dict)
+            or prior_account_outcome.get("attempted_provider_call") is not True
+        ):
+            continue
+        account_hash = prior_account_outcome.get("account_hash")
         if (
             isinstance(account_hash, str)
             and account_hash
@@ -320,6 +337,11 @@ def _apply_direct_attempt_trace(
             )
             if attempt_record is not None
             else "not_planned",
+            "guard_rebind_rejection_reason": (
+                attempt_record.get("guard_rebind_rejection_reason")
+                if attempt_record is not None
+                else None
+            ),
             "terminal_reason": (
                 attempt_record.get("terminal_reason")
                 if attempt_record is not None
@@ -349,6 +371,7 @@ def _copy_direct_attempt_trace_to_event(
         "guard_reset_outcome",
         "credential_reload_outcome",
         "failover_decision",
+        "guard_rebind_rejection_reason",
         "terminal_reason",
         "attempted_account_hashes",
     ):
@@ -404,6 +427,10 @@ def _add_direct_openai_managed_metadata(
         "failover_decision": trace["failover_decision"],
         "attempted_account_hashes": trace["attempted_account_hashes"],
     }
+    if trace["guard_rebind_rejection_reason"] is not None:
+        metadata_trace["guard_rebind_rejection_reason"] = trace[
+            "guard_rebind_rejection_reason"
+        ]
     if trace["terminal_reason"] is not None:
         metadata_trace["terminal_reason"] = trace["terminal_reason"]
     return _merge_litellm_metadata(
@@ -462,6 +489,7 @@ def _new_direct_attempt_record(
         value = selection.get(field)
         if value is not None:
             attempt_record[field] = value
+    attempt_record["attempted_provider_call"] = False
     _direct_attempts(request).append(attempt_record)
     setattr(
         request.state,
@@ -536,6 +564,7 @@ def update_direct_openai_managed_failure_attempt(
     selection: dict[str, Any],
     exc: Exception,
     cooldown_seconds: float,
+    attempted_provider_call: Optional[bool] = None,
 ) -> Optional[dict[str, Any]]:
     """Apply existing classifier fields to a retryable direct attempt."""
     if isinstance(exc, AawmOpenAIFaultPlanError):
@@ -558,6 +587,7 @@ def update_direct_openai_managed_failure_attempt(
         cooldown_scope="candidate",
         alias_model=_direct_alias_model(request_body, selection),
         candidate=candidate,
+        attempted_provider_call=attempted_provider_call,
     )
     return attempt_record
 

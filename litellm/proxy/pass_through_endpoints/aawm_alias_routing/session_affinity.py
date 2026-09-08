@@ -3834,17 +3834,26 @@ async def clear_compatible_non_held_request_session_owner_guard_for_failover(
     lease = get_request_session_owner_lease(request)
     if lease is None:
         return SessionOwnerLeaseRebindResult(False, "lease_missing")
-    if lease.decision != SessionOwnerGuardDecision.COMPATIBLE_OWNER.value:
+    released_decisions = {
+        SessionOwnerGuardDecision.UNOWNED_RESERVED.value,
+        SessionOwnerGuardDecision.RESERVATION_RENEWED.value,
+        SessionOwnerGuardDecision.COMPATIBLE_OWNER.value,
+    }
+    if (
+        lease.released
+        and lease.decision not in released_decisions
+    ) or (
+        not lease.released
+        and lease.decision != SessionOwnerGuardDecision.COMPATIBLE_OWNER.value
+    ):
         return SessionOwnerLeaseRebindResult(
             False,
             "lease_decision_not_compatible_owner",
         )
-    if lease.held_reservation:
-        return SessionOwnerLeaseRebindResult(False, "lease_held_reservation")
-    if lease.released:
-        return SessionOwnerLeaseRebindResult(True)
     if lease.promoted:
         return SessionOwnerLeaseRebindResult(False, "lease_promoted")
+    if not lease.released and lease.held_reservation:
+        return SessionOwnerLeaseRebindResult(False, "lease_held_reservation")
     if _clean_optional_str(lease.owner_id) is None:
         return SessionOwnerLeaseRebindResult(False, "lease_owner_missing")
     if not account_failover_planned:
@@ -3914,7 +3923,10 @@ async def clear_compatible_non_held_request_session_owner_guard_for_failover(
             request=request,
             wait_for_foreign_reservation=False,
         )
-        if (
+        durable_record_absent = owner_record is None and error is None
+        if lease.released and durable_record_absent:
+            owner_record = None
+        elif (
             error is not None
             or owner_record is None
             or _record_state(owner_record) != SessionOwnerRecordState.OWNED.value
@@ -3925,23 +3937,36 @@ async def clear_compatible_non_held_request_session_owner_guard_for_failover(
                 False,
                 "durable_owner_changed_or_missing",
             )
-        owner_attributes = _core_owner_attributes(_owner_attributes(owner_record))
-        if (
-            incomplete_owner_attribute_reason(
-                owner_attributes, for_promotion=True
+        if owner_record is not None:
+            owner_attributes = _core_owner_attributes(
+                _owner_attributes(owner_record)
             )
-            is not None
-            or not _accounts_are_interchangeable(owner_attributes, alternate)
-            or _compatibility_mismatch_reason(
-                owner_record=owner_record,
-                requested_attributes=current,
-                require_exact_attributes=True,
-            )
-            is not None
-        ):
-            return SessionOwnerLeaseRebindResult(False, "durable_owner_mismatch")
+            if (
+                incomplete_owner_attribute_reason(
+                    owner_attributes, for_promotion=True
+                )
+                is not None
+                or not _accounts_are_interchangeable(
+                    owner_attributes, alternate
+                )
+                or _compatibility_mismatch_reason(
+                    owner_record=owner_record,
+                    requested_attributes=current,
+                    require_exact_attributes=True,
+                )
+                is not None
+            ):
+                return SessionOwnerLeaseRebindResult(
+                    False,
+                    "durable_owner_mismatch",
+                )
 
-    if not clear_non_held_request_session_owner_lease(request):
+    clear_request_lease = (
+        reset_released_request_session_owner_guard
+        if lease.released
+        else clear_non_held_request_session_owner_lease
+    )
+    if not clear_request_lease(request):
         return SessionOwnerLeaseRebindResult(False, "request_lease_clear_failed")
     return SessionOwnerLeaseRebindResult(True)
 
