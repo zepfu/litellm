@@ -155,6 +155,12 @@ ownerless provider state fail closed before egress. A valid replay may then
 traverse native `xai` and managed `oa_xai` candidates without migrating the
 owned Cursor session.
 
+Replay validation preserves function namespaces even when the installed OpenAI
+SDK predates namespace tools. The compatibility path validates the namespace
+shape and each function schema rather than restricting namespace or function
+names to a fixed catalog. Unknown fields, malformed children, and duplicate
+function names fail closed; accepted replay retains the original tool definitions.
+
 For Responses streams, session ownership is promoted only after the validator
 has observed a structurally valid terminal response with `status=completed` and
 the response stream has reached its terminal lifecycle. Malformed, incomplete,
