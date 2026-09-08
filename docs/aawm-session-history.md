@@ -2667,6 +2667,11 @@ literal-tool marker detector used by direct Grok. If the initial peek contains
 tool-call text. Marker-free pending streams remain lazy and preserve first-byte
 behavior.
 
+When an xAI alias output guard or validator rebuilds a stream, the new response
+inherits the source response's existing cleanup, deferred-success, background,
+and timeout-terminalizer state without creating a second terminalizer. Rebuilt
+stream headers omit stale `Content-Length` values.
+
 OpenRouter completion-adapter candidates classify provider-wrapped 400 responses
 with `metadata.provider_name` and `metadata.raw=ERROR` as terminal candidate
 failures. Alias probes cool down only that OpenRouter candidate, record
