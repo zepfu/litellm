@@ -1373,12 +1373,9 @@ def _redact_mapping(
     items = list(mapping.items())[:MAX_PROJECTION_OBJECT_KEYS]
     parent_normalized = _normalize_key(parent_key) if parent_key else ""
     identity_container = parent_normalized in _ACCOUNT_IDENTITY_CONTAINERS
-    scalar_map = (
+    collection_map = (
         parent_normalized in _NAMED_USAGE_COLLECTIONS
         and not collection_entry
-        and all(
-            not isinstance(value, (Mapping, list)) for value in mapping.values()
-        )
     )
     for key, value in items:
         name = str(key)
@@ -1394,13 +1391,15 @@ def _redact_mapping(
             schema[_schema_key_for_redaction(name)] = {"kind": "redacted"}
             redacted_count += 1
             continue
-        child_parent_key = "remaining" if scalar_map else name
-        malformed_usage_field = _malformed_usage_field(
-            child_parent_key,
-            value,
+        scalar_member = collection_map and not isinstance(value, (Mapping, list))
+        child_parent_key = "remaining" if scalar_member else name
+        malformed_usage_field = (
+            _malformed_usage_field(child_parent_key, value)
+            if not collection_map or scalar_member
+            else None
         )
         if malformed_usage_field is not None:
-            if scalar_map:
+            if scalar_member:
                 marker = {_MALFORMED_FIELDS_KEY: [child_parent_key]}
                 marker_schema = {
                     _MALFORMED_FIELDS_KEY: {
@@ -1436,7 +1435,6 @@ def _redact_mapping(
             collection_entry=(
                 parent_normalized in _NAMED_USAGE_COLLECTIONS
                 and isinstance(value, Mapping)
-                and not scalar_map
             ),
         )
         redacted_count += nested_redacted
