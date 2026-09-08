@@ -32,6 +32,7 @@ _OPTIONAL_KWARGS_KEYS = frozenset(
         "aws_bedrock_runtime_endpoint",
         "tpm",
         "rpm",
+        "_aawm_managed_xai_send_request",
     }
 )
 

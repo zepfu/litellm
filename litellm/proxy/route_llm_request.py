@@ -4,6 +4,9 @@ from typing import TYPE_CHECKING, Any, Literal, Optional
 from fastapi import HTTPException, Request, status
 
 import litellm
+from litellm.llms.xai.managed_send_counter import (
+    MANAGED_XAI_SEND_REQUEST_KWARG,
+)
 
 if TYPE_CHECKING:
     from litellm.router import Router as _Router
@@ -278,6 +281,8 @@ async def route_request(  # noqa: PLR0915 - Complex routing function, refactorin
         selected_account=selected_xai_account,
     )
     if prepared_oa_xai_request:
+        if request is not None:
+            data[MANAGED_XAI_SEND_REQUEST_KWARG] = request
         route_fn = getattr(litellm, f"{route_type}")
         initial_invocation = route_fn(**data)
         if not inspect.isawaitable(initial_invocation):

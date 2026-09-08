@@ -55,6 +55,10 @@ from litellm.proxy.aawm_route_logging import (
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.cohere import (
     classify_cohere_failure,
 )
+from litellm.llms.xai.managed_send_counter import (
+    get_managed_xai_actual_send_counter,
+    get_or_create_managed_xai_actual_send_counter,
+)
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
     ProviderCallLedgerExhausted,
     ProviderCallReplayBlocked,
@@ -1067,7 +1071,6 @@ async def handle_alias_route(  # noqa: PLR0915
     # attempts. Must not reset when the outer candidate-selection loop re-enters.
     native_grok_continuation_transient_provider_attempts = 0
     provider_candidate_attempts = 0
-    managed_xai_oauth_provider_attempts = 0
     same_account_transient_attempts_by_slot: dict[Optional[str], int] = {}
     managed_xai_generation_retry_attempted_lanes: set[str] = set()
     request_retry_started_at = time.monotonic()
@@ -2281,10 +2284,24 @@ async def handle_alias_route(  # noqa: PLR0915
                         async def _perform_candidate_request() -> Response:  # noqa: PLR0915
                             nonlocal attempted_provider_call
                             nonlocal provider_candidate_attempts
-                            nonlocal managed_xai_oauth_provider_attempts
                             candidate_is_openai = (
                                 str(candidate.get("provider") or "").strip().lower()
                                 == "openai"
+                            )
+                            managed_xai_candidate = _is_managed_xai_oauth_candidate(
+                                candidate
+                            )
+                            managed_xai_send_counter = (
+                                get_or_create_managed_xai_actual_send_counter(
+                                    request
+                                )
+                                if managed_xai_candidate
+                                else None
+                            )
+                            managed_xai_send_start_count = (
+                                managed_xai_send_counter.actual_send_count
+                                if managed_xai_send_counter is not None
+                                else 0
                             )
                             request_ledger = (
                                 get_request_provider_call_ledger(request)
@@ -2296,7 +2313,7 @@ async def handle_alias_route(  # noqa: PLR0915
                                 if request_ledger is not None
                                 else 0
                             )
-                            if _is_managed_xai_oauth_candidate(candidate):
+                            if managed_xai_candidate:
                                 attempt_record[
                                     "xai_oauth_account_traversal_ordinal"
                                 ] = max(1, failover_ordinal + 1)
@@ -2364,7 +2381,49 @@ async def handle_alias_route(  # noqa: PLR0915
                                     attempt_record[
                                         "transport_connection_failures"
                                     ] = request_ledger.transport_connection_failures
-                                if candidate_is_openai and request_ledger is not None:
+                                managed_xai_send_count = 0
+                                if managed_xai_candidate:
+                                    managed_xai_send_counter = (
+                                        get_managed_xai_actual_send_counter(
+                                            request
+                                        )
+                                    )
+                                    if managed_xai_send_counter is not None:
+                                        managed_xai_send_count = max(
+                                            0,
+                                            managed_xai_send_counter.actual_send_count
+                                            - managed_xai_send_start_count,
+                                        )
+                                        attempt_record[
+                                            "xai_oauth_actual_send_counter"
+                                        ] = managed_xai_send_counter.snapshot()
+                                    attempt_record[
+                                        "xai_oauth_actual_send_count"
+                                    ] = managed_xai_send_count
+                                    if managed_xai_send_count > 0:
+                                        actual_send_snapshot = (
+                                            managed_xai_send_counter.snapshot()
+                                            if managed_xai_send_counter is not None
+                                            else None
+                                        )
+                                        actual_send_ordinal = (
+                                            actual_send_snapshot.get(
+                                                "last_send_ordinal"
+                                            )
+                                            if actual_send_snapshot is not None
+                                            else None
+                                        )
+                                        if isinstance(actual_send_ordinal, int):
+                                            attempt_record[
+                                                "xai_oauth_actual_send_ordinal"
+                                            ] = actual_send_ordinal
+                                            attempt_record[
+                                                "xai_oauth_provider_attempt_ordinal"
+                                            ] = actual_send_ordinal
+                                    attempted_provider_call = (
+                                        managed_xai_send_count > 0
+                                    )
+                                elif candidate_is_openai and request_ledger is not None:
                                     attempted_provider_call = bool(ordinals)
                                 elif perform_exc is None:
                                     attempted_provider_call = True
@@ -2396,11 +2455,6 @@ async def handle_alias_route(  # noqa: PLR0915
                                 )
                                 if attempted_provider_call:
                                     provider_candidate_attempts += 1
-                                    if _is_managed_xai_oauth_candidate(candidate):
-                                        managed_xai_oauth_provider_attempts += 1
-                                        attempt_record[
-                                            "xai_oauth_provider_attempt_ordinal"
-                                        ] = managed_xai_oauth_provider_attempts
                                 if "hidden_logical_retry_count" not in attempt_record:
                                     attempt_record["hidden_logical_retry_count"] = (
                                         getattr(
