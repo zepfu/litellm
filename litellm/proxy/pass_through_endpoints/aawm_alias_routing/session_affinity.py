@@ -859,6 +859,52 @@ def _hosted_provider_from_attributes(attrs: Mapping[str, Any]) -> str:
     return provider
 
 
+def derive_session_owner_effective_identity(
+    base_session_identity: Optional[str],
+) -> Optional[str]:
+    """Derive, without activating, the first-generation redispatch identity."""
+
+    base = _clean_optional_str(base_session_identity)
+    if base is None:
+        return None
+    digest = hashlib.sha256(
+        (
+            _SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_DOMAIN_SEPARATOR + base
+        ).encode("utf-8")
+    ).hexdigest()
+    return (
+        f"{_SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX}{digest}"
+    )
+
+
+def derive_session_owner_base_identity(
+    effective_session_identity: Optional[str],
+) -> Optional[str]:
+    """Reverse the server-only first-generation redispatch identity."""
+
+    identity = _clean_optional_str(effective_session_identity)
+    if identity is None or not identity.startswith(
+        _SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX
+    ):
+        return None
+    try:
+        raw = bytes.fromhex(
+            identity[
+                len(_SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX):
+            ]
+        )
+        label, base = raw.split(b"\x00", 1)
+    except (ValueError, TypeError):
+        return None
+    if label != (
+        _SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_DOMAIN_SEPARATOR[:-1].encode(
+            "ascii"
+        )
+    ):
+        return None
+    return _clean_optional_str(base.decode("utf-8"))
+
+
 def _hosted_providers_match(
     left: Mapping[str, Any],
     right: Optional[Mapping[str, Any]] = None,
@@ -1477,6 +1523,24 @@ def owner_record_as_affinity_hint(
     if attrs.get("account_lane") and include_account_identity:
         affinity["codex_oauth_lane_key"] = attrs.get("account_lane")
     return {k: v for k, v in affinity.items() if v is not None}
+
+
+def owner_record_as_strict_affinity_hint(
+    owner_record: Optional[Mapping[str, Any]],
+    *,
+    preserve_account_identity: bool = False,
+) -> Optional[dict[str, Any]]:
+    if owner_record is None or not isinstance(owner_record, Mapping):
+        return None
+    if _record_state(owner_record) not in {
+        SessionOwnerRecordState.OWNED.value,
+        SessionOwnerRecordState.RESERVED.value,
+    }:
+        return None
+    return owner_record_as_affinity_hint(
+        owner_record,
+        preserve_account_identity=preserve_account_identity,
+    )
 
 
 def _build_reserved_record(
@@ -3775,6 +3839,54 @@ def request_session_owner_already_guarded(request: Any) -> bool:
     return value is True
 
 
+def validate_cursor_replay_matches_body(
+    request: Any,
+    *,
+    body: Any,
+) -> bool:
+    """Return true only for validation bound to this exact body object."""
+
+    if request is None:
+        return False
+    state = getattr(request, "state", None)
+    if state is None:
+        return False
+    validation = getattr(
+        state,
+        "_aawm_validated_cursor_replay",
+        None,
+    )
+    return (
+        isinstance(validation, Mapping)
+        and validation.get("body_id") == id(body)
+    )
+
+
+def set_validated_cursor_replay(
+    request: Any,
+    *,
+    body: Any,
+    stage: str,
+    reason: str,
+) -> None:
+    """Bind server-owned replay validation to the exact rebuilt body."""
+
+    if request is None or not isinstance(body, dict):
+        return
+    state = getattr(request, "state", None)
+    if state is None:
+        return
+    setattr(
+        state,
+        "_aawm_validated_cursor_replay",
+        {
+            "body_id": id(body),
+            "stage": stage,
+            "reason": reason,
+        },
+    )
+
+
 def reset_released_request_session_owner_guard(request: Any) -> bool:
     """Allow a fresh-request retry after its reservation was released."""
     if request is None:
@@ -3804,6 +3916,31 @@ def clear_non_held_request_session_owner_lease(request: Any) -> bool:
     setattr(state, _REQUEST_STATE_LEASE_ATTR, None)
     setattr(state, _REQUEST_STATE_GUARDED_ATTR, False)
     return True
+
+
+def clear_expected_non_held_request_session_owner_lease(
+    request: Any,
+    *,
+    expected_session_identity: str,
+) -> bool:
+    """Clear only a non-held lease matching this base identity."""
+
+    if request is None:
+        return False
+    state = getattr(request, "state", None)
+    if state is None:
+        return False
+    lease = get_request_session_owner_lease(request)
+    if lease is None:
+        return True
+    if (
+        lease.held_reservation
+        or lease.promoted
+        or lease.released
+        or lease.session_identity != expected_session_identity
+    ):
+        return False
+    return clear_non_held_request_session_owner_lease(request)
 
 
 async def clear_compatible_non_held_request_session_owner_guard_for_failover(

@@ -147,6 +147,7 @@ _CURSOR_REPLAY_FRESH_DISPATCH_REJECTION_REASONS = frozenset(
         "id_only_reasoning_reference",
         "explicit_item_reference",
         "invalid_body_shape",
+        "cursor_continuation_identifier",
     }
 )
 _CURSOR_CONTINUATION_FIELDS = frozenset(
@@ -2296,6 +2297,15 @@ def _cursor_replay_stock_codex_full_history_input(
             "stock_full_history",
             "unresolved_call_id",
         )
+    continuation_key = _cursor_replay_input_contains_cursor_continuation_identifier(
+        replayed_input
+    )
+    if continuation_key is not None:
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "cursor_continuation_identifier",
+            item=continuation_key,
+        )
     return _CursorReplayValidationResult(value=replayed_input)
 
 
@@ -2367,7 +2377,53 @@ def _cursor_replay_unresolved_function_call_ids(
 
     if not seen_call_ids:
         return _cursor_replay_rejected(stage, "function_call_count")
+    if unresolved_call_ids:
+        return _cursor_replay_rejected(stage, "unresolved_call_id")
     return _CursorReplayValidationResult(value=unresolved_call_ids)
+
+
+def _cursor_replay_input_contains_cursor_continuation_identifier(
+    value: Any,
+    *,
+    seen: Optional[set[int]] = None,
+) -> Optional[str]:
+    if seen is None:
+        seen = set()
+    if isinstance(value, Mapping):
+        marker = id(value)
+        if marker in seen:
+            return None
+        seen.add(marker)
+        continuation_fields = {
+            field.casefold() for field in _CURSOR_CONTINUATION_FIELDS
+        }
+        for key, child in value.items():
+            if (
+                isinstance(key, str)
+                and key.casefold() in continuation_fields
+                and child is not None
+            ):
+                return key
+            found = _cursor_replay_input_contains_cursor_continuation_identifier(
+                child,
+                seen=seen,
+            )
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, list):
+        marker = id(value)
+        if marker in seen:
+            return None
+        seen.add(marker)
+        for child in value:
+            found = _cursor_replay_input_contains_cursor_continuation_identifier(
+                child,
+                seen=seen,
+            )
+            if found is not None:
+                return found
+    return None
 
 
 def _cursor_replay_canonicalize_stock_tool_search(
@@ -2771,6 +2827,15 @@ def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
         fresh_body.pop(field, None)
     if instructions is not None:
         fresh_body["instructions"] = instructions
+    continuation_key = _cursor_replay_input_contains_cursor_continuation_identifier(
+        fresh_body
+    )
+    if continuation_key is not None:
+        return _cursor_replay_build_rejected(
+            "fresh_body_copy",
+            "cursor_continuation_identifier",
+            item=continuation_key,
+        )
 
     if registry_state is not None:
         previous_response_id = request_body.get("previous_response_id")

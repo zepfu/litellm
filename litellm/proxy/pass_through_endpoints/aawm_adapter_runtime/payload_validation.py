@@ -431,6 +431,53 @@ def _raise_codex_auto_agent_failed_responses_payload(
     raise exc
 
 
+def _raise_codex_auto_agent_invalid_responses_shape(
+    *,
+    response_body: Any,
+    adapter_model: str,
+    adapter: str,
+    adapter_label: str,
+    stream_event_summaries: Optional[list[dict[str, Any]]] = None,
+) -> None:
+    diagnostic: dict[str, Any] = {
+        "adapter": adapter,
+        "adapter_model": adapter_model,
+        "body_type": type(response_body).__name__,
+    }
+    if stream_event_summaries is not None:
+        diagnostic["stream_event_summaries"] = stream_event_summaries
+    exc = ProxyException(
+        message=(
+            f"Auto-agent {adapter_label} candidate returned a malformed "
+            "Responses payload."
+        ),
+        type="upstream_error",
+        param="model",
+        code=502,
+    )
+    setattr(
+        exc,
+        "detail",
+        {
+            "error": {
+                "message": exc.message,
+                "code": "aawm_auto_agent_invalid_responses_shape",
+                "status": "RESPONSES_INVALID_SHAPE",
+                "type": "upstream_error",
+            },
+            "diagnostic": diagnostic,
+        },
+    )
+    raise exc
+
+
+def _is_responses_shaped_body(response_body: Any) -> bool:
+    return (
+        isinstance(response_body, dict)
+        and response_body.get("object") == "response"
+    )
+
+
 def _raise_responses_adapter_failed_response(
     *,
     response_body: dict[str, Any],
@@ -643,6 +690,14 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 adapter_label=adapter_label,
                 stream_event_summaries=event_summaries,
             )
+        if not _is_responses_shaped_body(response_body):
+            _raise_codex_auto_agent_invalid_responses_shape(
+                response_body=response_body,
+                adapter_model=adapter_model,
+                adapter=adapter,
+                adapter_label=adapter_label,
+                stream_event_summaries=event_summaries,
+            )
         response_changed = identity_changed
         repaired_body = (
             _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body(  # noqa: F821
@@ -744,6 +799,13 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             response_body = json.loads(_decode_http_response_body(response.body))  # noqa: F821
         except Exception:
             return response
+        if not _is_responses_shaped_body(response_body):
+            _raise_codex_auto_agent_invalid_responses_shape(
+                response_body=response_body,
+                adapter_model=adapter_model,
+                adapter=adapter,
+                adapter_label=adapter_label,
+            )
         identity_changed = False
         if isinstance(response_body, dict):
             preserved_body = _preserve_distinct_function_call_identity_fields(

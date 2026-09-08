@@ -4362,6 +4362,13 @@ async def _aawm_session_owner_pre_send_guard(
         # Renew held reservation before potentially long upstream I/O.
         lease = sa.get_request_session_owner_lease(request)
         if lease is not None and lease.held_reservation and not lease.promoted:
+            if (egress_credential_family or "").casefold() == "xai":
+                sa.raise_session_owner_redispatch_required(
+                    session_identity=lease.session_identity,
+                    candidate=lease.attributes,
+                    failure_phase="session_owner_unpromoted_lease_managed_xai",
+                    request=request,
+                )
             await sa.ensure_session_owner_guard_for_request(
                 request=request,
                 request_body=parsed_body if isinstance(parsed_body, dict) else {},

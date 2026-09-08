@@ -936,9 +936,17 @@ async def handle_alias_route(  # noqa: PLR0915
         )
     )
 
+    def _provider_owned_continuation() -> bool:
+        return has_continuation_state and not (
+            _session_affinity_mod().validate_cursor_replay_matches_body(
+                request,
+                body=prepared_request_body,
+            )
+        )
+
     def _genuinely_fresh_dispatch(selection: Mapping[str, Any]) -> bool:
         return (
-            not has_continuation_state
+            not _provider_owned_continuation()
             and not has_previous_response_id
             and not bool(selection.get("has_account_bound_state"))
             and not bool(selection.get("in_flight_session"))
@@ -1047,10 +1055,17 @@ async def handle_alias_route(  # noqa: PLR0915
                         ),
                     )
             return None
-        return _lpe._merge_litellm_metadata(
+        final_fallback_body = _lpe._merge_litellm_metadata(
             fresh_fallback_body,
             extra_fields={"aawm_redispatch_ordinal": 1},
         )
+        _session_affinity_mod().set_validated_cursor_replay(
+            request,
+            body=final_fallback_body,
+            stage="cursor_replay_built",
+            reason="strict_reconstruction_validated",
+        )
+        return final_fallback_body
 
     def _prefer_codex_oauth_account_failover(
         *,
@@ -1077,7 +1092,7 @@ async def handle_alias_route(  # noqa: PLR0915
         ) and not account_failover_replay_safe:
             return False
         return (
-            not has_continuation_state
+            not _provider_owned_continuation()
             or candidate.get("codex_oauth_credential_affinity")
             == "interchangeable"
         )
@@ -1656,7 +1671,7 @@ async def handle_alias_route(  # noqa: PLR0915
                 selection=selection,
                 attempt_record=attempt_record,
                 error_class=admission_error_class,
-                has_continuation_state=has_continuation_state,
+                has_continuation_state=_provider_owned_continuation(),
                 has_previous_response_id=has_previous_response_id,
                 account_failover_replay_safe=account_failover_replay_safe,
                 provider_status_code=attempt_record.get("error_status_code"),
@@ -2093,7 +2108,7 @@ async def handle_alias_route(  # noqa: PLR0915
                             ),
                         )
                     ):
-                        if not has_continuation_state:
+                        if not _provider_owned_continuation():
                             raise probe_failure_exc
                         attempt_record["status"] = (
                             "terminal_in_flight_unpersisted_item_not_found"
@@ -2160,7 +2175,7 @@ async def handle_alias_route(  # noqa: PLR0915
                             candidate=candidate,
                             selection=selection,
                             is_codex_alias=codex_failure_evidence_alias is not None,
-                            has_continuation_state=has_continuation_state,
+                            has_continuation_state=_provider_owned_continuation(),
                             has_previous_response_id=has_previous_response_id,
                             attempted_provider_call=attempted_provider_call,
                         )
@@ -2556,10 +2571,8 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                     if fresh_fallback_body is not None:
                         prepared_request_body = fresh_fallback_body
-                        has_continuation_state = (
-                            _codex_auto_agent_request_has_continuation_state(
-                                prepared_request_body
-                            )
+                        has_continuation_state = _codex_auto_agent_request_has_continuation_state(
+                            prepared_request_body
                         )
                         has_previous_response_id = bool(
                             prepared_request_body.get("previous_response_id")
@@ -2851,7 +2864,7 @@ async def handle_alias_route(  # noqa: PLR0915
                         "apply_account_exhaustion_cooldown": False,
                         "retryable": True,
                     }
-                    if has_continuation_state:
+                    if _provider_owned_continuation():
                         raise HTTPException(
                             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail={
@@ -2945,14 +2958,14 @@ async def handle_alias_route(  # noqa: PLR0915
                     selection=selection,
                     attempt_record=attempt_record,
                     error_class=error_class,
-                    has_continuation_state=has_continuation_state,
+                    has_continuation_state=_provider_owned_continuation(),
                     has_previous_response_id=has_previous_response_id,
                     account_failover_replay_safe=account_failover_replay_safe,
                     provider_status_code=attempt_record.get("error_status_code"),
                 )
                 if (
                     cooldown_scope == "none"
-                    and not has_continuation_state
+                    and not _provider_owned_continuation()
                     and not deterministically_ineligible
                 ):
                     _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
@@ -2962,7 +2975,7 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                 if (
                     error_class == "token_invalidated"
-                    and has_continuation_state
+                    and _provider_owned_continuation()
                     and not account_failover_replay_safe
                     and not account_failover_planned
                 ):
@@ -3023,7 +3036,7 @@ async def handle_alias_route(  # noqa: PLR0915
                         )
                         raise
                 if (
-                    has_continuation_state
+                    _provider_owned_continuation()
                     and cooldown_scope != "none"
                     and not account_failover_planned
                     and not (
@@ -3128,7 +3141,7 @@ async def handle_alias_route(  # noqa: PLR0915
                     provider_candidate_attempts += 1
                 native_grok_retry_eligible = _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
                     is_native_grok_4_5_candidate=(_is_codex_auto_agent_native_grok_4_5_candidate(candidate)),
-                    has_continuation_state=has_continuation_state,
+                    has_continuation_state=_provider_owned_continuation(),
                     error_class=error_class,
                     cooldown_scope=cooldown_scope,
                 )
@@ -3143,7 +3156,7 @@ async def handle_alias_route(  # noqa: PLR0915
                     native_grok_retry_metadata,
                 ) = _plan_codex_auto_agent_native_grok_continuation_transient_retry(
                     is_native_grok_4_5_candidate=(_is_codex_auto_agent_native_grok_4_5_candidate(candidate)),
-                    has_continuation_state=has_continuation_state,
+                    has_continuation_state=_provider_owned_continuation(),
                     error_class=error_class,
                     cooldown_scope=cooldown_scope,
                     provider_attempt=native_grok_provider_attempt,
