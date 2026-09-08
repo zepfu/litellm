@@ -151,6 +151,19 @@ observability, routing, authentication, and session metadata remain in the
 separate `litellm_metadata` structure and are never merged into caller
 top-level `metadata`.
 
+## Rate-limit handling
+
+For an xAI provider `429`, LiteLLM uses a valid `Retry-After` value first.
+Otherwise it uses the request or token reset header for the exhausted
+dimension. If the response does not identify the exhausted dimension and both
+dimension-specific values are valid, LiteLLM waits for the later reset.
+Bounded generic reset headers are used only when no dimension-specific reset
+is available.
+
+Reset values may be bounded durations, epoch timestamps, ISO timestamps, or
+HTTP-date values. Malformed, expired, non-finite, and unreasonably future
+values are ignored instead of creating a durable cooldown.
+
 ## OAuth Credential Scope Selection
 
 Managed xAI OAuth and native Grok OIDC credential files must contain the exact
