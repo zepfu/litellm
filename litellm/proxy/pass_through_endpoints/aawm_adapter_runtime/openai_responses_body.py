@@ -78,6 +78,7 @@ _SERVER_CONTEXT_KEYS: tuple[str, ...] = tuple(
 _SERVER_GUARDRAIL_METADATA_KEYS: tuple[str, ...] = (
     "guardrails",
     "applied_guardrails",
+    "standard_logging_guardrail_information",
 )
 
 
