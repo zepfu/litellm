@@ -5869,22 +5869,6 @@ async def pass_through_request(  # noqa: PLR0915
                         upstream_prefix_bytes=getattr(response, "_prefix", None),
                     )
 
-                async def _finalize_prefetch_abort(
-                    disposition: OpenAIResponsesWireDisposition,
-                ) -> None:
-                    finalizer = wire_trace._finalize_transport
-                    if finalizer is not None:
-                        await finalizer(disposition)
-                    if stream_bookkeeping_state is not None:
-                        try:
-                            await _run_post_delivery_bookkeeping(
-                                wire_trace.snapshot()
-                            )
-                        except BaseException as exc:  # noqa: BLE001
-                            wire_trace.metadata[
-                                "post_finalization_callback_error"
-                            ] = type(exc).__name__
-
                 try:
                     processed_chunks = maybe_wrap_passthrough_responses_stream(
                         processed_chunks,
@@ -5945,7 +5929,7 @@ async def pass_through_request(  # noqa: PLR0915
                             else OpenAIResponsesWireDisposition.CANCELLED
                         )
                         try:
-                            await _finalize_prefetch_abort(disposition)
+                            await wire_trace.finalize_prefetch_abort(disposition)
                         except BaseException as cleanup_exc:  # noqa: BLE001
                             wire_trace.metadata[
                                 "prefetch_cleanup_error"
@@ -5954,7 +5938,7 @@ async def pass_through_request(  # noqa: PLR0915
                 except httpx.ReadTimeout:
                     if native_wire_stream_installed:
                         try:
-                            await _finalize_prefetch_abort(
+                            await wire_trace.finalize_prefetch_abort(
                                 OpenAIResponsesWireDisposition.FAILED
                             )
                         except BaseException as cleanup_exc:  # noqa: BLE001
@@ -6306,22 +6290,6 @@ async def pass_through_request(  # noqa: PLR0915
                         upstream_prefix_bytes=getattr(response, "_prefix", None),
                     )
 
-                async def _finalize_prefetch_abort(
-                    disposition: OpenAIResponsesWireDisposition,
-                ) -> None:
-                    finalizer = wire_trace._finalize_transport
-                    if finalizer is not None:
-                        await finalizer(disposition)
-                    if stream_bookkeeping_state is not None:
-                        try:
-                            await _run_post_delivery_bookkeeping(
-                                wire_trace.snapshot()
-                            )
-                        except BaseException as exc:  # noqa: BLE001
-                            wire_trace.metadata[
-                                "post_finalization_callback_error"
-                            ] = type(exc).__name__
-
                 try:
                     processed_chunks = maybe_wrap_passthrough_responses_stream(
                         processed_chunks,
@@ -6382,7 +6350,7 @@ async def pass_through_request(  # noqa: PLR0915
                             else OpenAIResponsesWireDisposition.CANCELLED
                         )
                         try:
-                            await _finalize_prefetch_abort(disposition)
+                            await wire_trace.finalize_prefetch_abort(disposition)
                         except BaseException as cleanup_exc:  # noqa: BLE001
                             wire_trace.metadata[
                                 "prefetch_cleanup_error"
@@ -6391,7 +6359,7 @@ async def pass_through_request(  # noqa: PLR0915
                 except httpx.ReadTimeout:
                     if native_wire_stream_installed:
                         try:
-                            await _finalize_prefetch_abort(
+                            await wire_trace.finalize_prefetch_abort(
                                 OpenAIResponsesWireDisposition.FAILED
                             )
                         except BaseException as cleanup_exc:  # noqa: BLE001

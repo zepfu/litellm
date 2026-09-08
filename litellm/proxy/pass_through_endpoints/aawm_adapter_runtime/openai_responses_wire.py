@@ -93,6 +93,9 @@ class OpenAIResponsesWireTrace:
     _finalize_transport: Optional[
         Callable[[OpenAIResponsesWireDisposition], Awaitable[None]]
     ] = field(default=None, repr=False, compare=False)
+    _finalize_prefetch_abort: Optional[
+        Callable[[OpenAIResponsesWireDisposition], Awaitable[None]]
+    ] = field(default=None, repr=False, compare=False)
     _terminal_body: Optional[bytes] = field(
         default=None,
         repr=False,
@@ -364,6 +367,26 @@ class OpenAIResponsesWireTrace:
 
             self._post_finalization_task = asyncio.create_task(_run_callbacks())
         await _await_shielded(self._post_finalization_task)
+
+    async def finalize_prefetch_abort(
+        self,
+        disposition: OpenAIResponsesWireDisposition,
+    ) -> None:
+        """Finalize an aborted prefetch without downstream ASGI delivery."""
+
+        async def _run() -> None:
+            finalizer = self._finalize_prefetch_abort
+            if finalizer is not None:
+                await finalizer(disposition)
+                return
+            if self._finalize_transport is not None:
+                await self._finalize_transport(disposition)
+            if not self.finalized:
+                await self._finalize_disposition(disposition, None)
+            self.record_asgi_delivery_complete()
+            await self.run_post_finalization_callbacks()
+
+        await _await_shielded(_run())
 
     async def _finalize_disposition(
         self,
@@ -711,6 +734,21 @@ class OpenAIResponsesWireCoordinator:
         try:
             if not self.trace.finalized:
                 await self._notify(disposition)
+        finally:
+            if not self._closed:
+                await _await_shielded(self._close_source())
+
+    async def finalize_prefetch_abort(
+        self,
+        disposition: OpenAIResponsesWireDisposition,
+    ) -> None:
+        """Publish no-delivery bookkeeping before closing the transport."""
+
+        try:
+            if not self.trace.finalized:
+                await self._notify(disposition)
+            self.trace.record_asgi_delivery_complete()
+            await self.trace.run_post_finalization_callbacks()
         finally:
             if not self._closed:
                 await _await_shielded(self._close_source())
@@ -1092,4 +1130,5 @@ def wrap_openai_responses_stream(
         model=model,
     )
     trace._finalize_transport = coordinator.finalize_transport
+    trace._finalize_prefetch_abort = coordinator.finalize_prefetch_abort
     return coordinator.__aiter__(), trace
