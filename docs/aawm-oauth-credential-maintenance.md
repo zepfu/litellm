@@ -105,9 +105,17 @@ deadline evicts the cached snapshot before a later request rebuilds it.
 
 `AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS` is the writer's early-refresh lead
 time. `LITELLM_XAI_OAUTH_REFRESH_BUFFER_SECONDS` is the consumer route-safety
-buffer. They are intentionally independent: sidecar status reports route
-usability using the consumer value while scheduling refresh from the writer
-value.
+buffer. They are intentionally independent: `litellm-dev` and
+`provider-status-observations` receive the consumer value, so request handling
+and sidecar route-usability status use the same threshold while scheduling uses
+the writer value.
+
+An explicit `AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS` setting controls writer
+scheduling. For compatibility, helper calls without an explicit writer buffer
+resolve `AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS`, then
+`LITELLM_XAI_OAUTH_REFRESH_BUFFER_SECONDS`, then the `300`-second default.
+That legacy fallback does not make the consumer and writer settings equivalent
+when a writer override is present.
 
 For a provider-returned managed `401` before response bytes are committed,
 alias routing, direct LiteLLM async routes, OpenAI passthrough, and Anthropic
