@@ -3824,7 +3824,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
                 ),
             )
         )
-        if not guard_rebound:
+        if not guard_rebound.rebound:
             request_state = getattr(request, "state", None)
             if request_state is not None:
                 if pre_selection_bound_account is missing_request_state:
@@ -3846,6 +3846,9 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             else:
                 request.scope["parsed_body"] = pre_selection_parsed_body
             retry_attempt_record["guard_reset_outcome"] = "rebind_rejected"
+            retry_attempt_record["guard_rebind_rejection_reason"] = (
+                guard_rebound.rejection_reason
+            )
             retry_attempt_record["failover_decision"] = "terminal"
             retry_attempt_record["terminal_reason"] = (
                 "account_failover_guard_rebind_failed"

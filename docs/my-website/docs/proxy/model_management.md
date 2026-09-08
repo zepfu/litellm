@@ -344,7 +344,13 @@ ownership and allow at most one replay-safe account move. The guard validates
 that the original durable owner still owns the session before clearing the
 request-local lease. When the move is eligible and interchangeable, second
 selection is not pinned to the account that was just exhausted. Requests with
-genuine account-bound state remain non-portable.
+genuine account-bound state remain non-portable. Request bodies and metadata
+cannot establish or change this ownership; it comes only from the proxy's
+authenticated session-owner state.
+
+Attempt telemetry records actual upstream provider sends separately from
+selection and guard rejection outcomes. Guard rejections retain the exact
+failed predicate for diagnosis.
 
 If no alternate is available after a planned failover, telemetry identifies the
 second-selection failure. This is distinct from an owner-bound rejection of a

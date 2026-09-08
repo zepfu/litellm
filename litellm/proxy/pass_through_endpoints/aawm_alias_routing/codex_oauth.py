@@ -1090,43 +1090,10 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 model=model,
             )
 
-    # Body/request metadata pin (continuation metadata) when no owner pin.
-    if affinity is None:
-        metadata = body.get("litellm_metadata")
-        meta = metadata if isinstance(metadata, dict) else {}
-        pin_label = _clean_codex_auth_value(
-            meta.get("codex_oauth_account_label")
-            or meta.get("codex_auto_agent_selected_account_label")
-            or body.get("codex_oauth_account_label")
-        )
-        pin_hash = _clean_codex_auth_value(
-            meta.get("codex_oauth_account_hash")
-            or meta.get("codex_auto_agent_selected_account_hash")
-            or body.get("codex_oauth_account_hash")
-        )
-        pin_lane = _clean_codex_auth_value(
-            meta.get("codex_oauth_lane_key")
-            or meta.get("codex_auto_agent_selected_account_lane")
-            or body.get("codex_oauth_lane_key")
-        )
-        if all((pin_label, pin_hash, pin_lane)):
-            affinity = {
-                "provider": CODEX_AUTO_AGENT_NATIVE_PROVIDER,
-                "model": model,
-                "route_family": "codex_responses",
-                "last_resort": False,
-                "codex_oauth_account_label": pin_label,
-                "codex_oauth_account_hash": pin_hash,
-                "codex_oauth_lane_key": pin_lane,
-                "affinity_state_source": "request_metadata",
-            }
-
     affinity_selection_reason: Optional[str] = None
     if affinity is not None:
         if affinity.get("affinity_state_source") == "session_owner":
             affinity_selection_reason = "session_owner_pin"
-        elif affinity.get("affinity_state_source") == "request_metadata":
-            affinity_selection_reason = "request_metadata_pin"
 
     if inventory_model is None and affinity is None:
         # Model-less native path: reuse inventory model=None eligibility
@@ -1199,13 +1166,6 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 "exhausted or unavailable for direct Responses traffic. Alternate "
                 "accounts were intentionally not considered because this "
                 "continuation is owner-bound and non-portable."
-            )
-        elif affinity_selection_reason == "request_metadata_pin":
-            unavailable_message = (
-                "The required request-metadata-pinned Codex OAuth account is "
-                "currently exhausted or unavailable for direct Responses traffic. "
-                "Alternate accounts were intentionally not considered because "
-                "this continuation is pinned and non-portable."
             )
         detail: dict[str, Any] = {
             "error": {
