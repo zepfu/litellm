@@ -5673,6 +5673,9 @@ async def pass_through_request(  # noqa: PLR0915
             span_metadata={"stage": "post_response_finalize", "stream": False},
         )
         duration_metadata = _ensure_passthrough_metadata(kwargs)
+        request.state.aawm_passthrough_hidden_retry_count = (
+            duration_metadata.get("aawm_passthrough_hidden_retry_count", 0)
+        )
         if duration_metadata:
             duration_metadata["aawm_total_proxy_overhead_ms"] = round(
                 local_prepare_ms + local_finalize_ms, 3
@@ -5967,6 +5970,9 @@ async def pass_through_request(  # noqa: PLR0915
             )
         elif suppress_terminal_failure_traceback:
             hidden_retry_metadata = _ensure_passthrough_metadata(kwargs)
+            request.state.aawm_passthrough_hidden_retry_count = (
+                hidden_retry_metadata.get("aawm_passthrough_hidden_retry_count", 0)
+            )
             hidden_retry_failure_classification = hidden_retry_metadata.get(
                 "aawm_passthrough_hidden_retry_failure_classification"
             )
