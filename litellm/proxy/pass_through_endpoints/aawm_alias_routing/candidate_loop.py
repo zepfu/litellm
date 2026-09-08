@@ -924,6 +924,7 @@ async def handle_alias_route(  # noqa: PLR0915
     # attempts. Must not reset when the outer candidate-selection loop re-enters.
     native_grok_continuation_transient_provider_attempts = 0
     provider_candidate_attempts = 0
+    request_send_ledger_ordinal = 0
     same_account_transient_attempts_by_slot: dict[Optional[str], int] = {}
     request_retry_started_at = time.monotonic()
     request_retry_budget = OpenAIAlphaCapacityRetryBudget()
@@ -1923,15 +1924,27 @@ async def handle_alias_route(  # noqa: PLR0915
 
                         async def _perform_candidate_request() -> Response:
                             nonlocal attempted_provider_call
+                            nonlocal request_send_ledger_ordinal
                             attempts.append(attempt_record)
+                            request_send_ledger_ordinal += 1
+                            attempt_record["send_ledger_ordinal"] = (
+                                request_send_ledger_ordinal
+                            )
                             attempt_record["attempted_provider_call"] = True
                             attempted_provider_call = True
                             try:
-                                return await perform_candidate_request_fn(
+                                response = await perform_candidate_request_fn(
                                     candidate=candidate,
                                     candidate_body=candidate_body,
                                 )
                             except Exception as perform_exc:
+                                attempt_record["hidden_connection_attempt_count"] = (
+                                    getattr(
+                                        request.state,
+                                        "aawm_passthrough_hidden_retry_count",
+                                        0,
+                                    )
+                                )
                                 if (
                                     getattr(
                                         perform_exc,
@@ -1943,6 +1956,14 @@ async def handle_alias_route(  # noqa: PLR0915
                                     attempt_record["attempted_provider_call"] = False
                                     attempted_provider_call = False
                                 raise
+                            attempt_record["hidden_connection_attempt_count"] = (
+                                getattr(
+                                    request.state,
+                                    "aawm_passthrough_hidden_retry_count",
+                                    0,
+                                )
+                            )
+                            return response
 
                         async def _run_candidate_operation() -> Response:
                             run_with_lease_renewal = getattr(
