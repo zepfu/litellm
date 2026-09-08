@@ -827,29 +827,47 @@ def _select_xai_header_rate_limit_candidates(
     source_name: str,
     native: bool,
 ) -> Tuple[List[Dict[str, Any]], Set[str]]:
-    candidates = _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result))
+    candidate_roots = _rate_limit_candidate_roots(kwargs, result)
     accepted_sources = {source_name}
     if not native:
-        return candidates, accepted_sources
+        return _iter_rate_limit_dicts(*candidate_roots), accepted_sources
 
     accepted_sources.add("xai_oauth_response_headers")
-    canonical_candidates = _iter_rate_limit_dicts(metadata.get(source_name))
-    has_canonical_headers = any(
-        any(
-            isinstance(key, str) and key.lower().startswith("x-ratelimit-")
+
+    def _has_xai_rate_limit_header(candidate: Dict[str, Any]) -> bool:
+        return any(
+            isinstance(key, str)
+            and (
+                key.lower().startswith("x-ratelimit-")
+                or key.lower() == "retry-after"
+            )
             for key in candidate
         )
-        for candidate in canonical_candidates
-    ) or any(
-        str(candidate.get("source") or "").lower() == source_name
-        and any(
-            isinstance(key, str) and key.lower().startswith("x-ratelimit-")
-            for key in candidate
-        )
+
+    def _mark_canonical_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
+        if str(candidate.get("source") or "").lower() == source_name:
+            return candidate
+        marked_candidate = dict(candidate)
+        marked_candidate["source"] = source_name
+        return marked_candidate
+
+    canonical_candidates = [
+        _mark_canonical_candidate(candidate)
+        for candidate in _iter_rate_limit_dicts(metadata.get(source_name))
+        if _has_xai_rate_limit_header(candidate)
+    ]
+    if canonical_candidates:
+        return canonical_candidates, {source_name}
+
+    candidates = _iter_rate_limit_dicts(*candidate_roots)
+    canonical_candidates = [
+        _mark_canonical_candidate(candidate)
         for candidate in candidates
-    )
-    if has_canonical_headers:
-        accepted_sources.discard("xai_oauth_response_headers")
+        if str(candidate.get("source") or "").lower() == source_name
+        and _has_xai_rate_limit_header(candidate)
+    ]
+    if canonical_candidates:
+        return canonical_candidates, {source_name}
     return candidates, accepted_sources
 
 
