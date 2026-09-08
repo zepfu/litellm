@@ -16159,6 +16159,11 @@ def _run_chatgpt_usage_bridge_task(
     profile_filter: Optional[str] = None,
     authentication_recovery_requested: bool = False,
 ) -> Optional[Dict[str, Any]]:
+    bridge = state.chatgpt_usage_bridge_owner
+    if bridge is not None:
+        state.chatgpt_usage_bridge_cleanup_errors = bridge.reap_pending()
+    if not state.chatgpt_usage_bridge_admitting:
+        return None
     if not force and not config.chatgpt_usage_bridge_enabled:
         return None
     last_attempt = state.chatgpt_usage_bridge_last_attempt_monotonic
@@ -16338,8 +16343,13 @@ def _run_chatgpt_usage_bridge_accounts(
         task_state.chatgpt_usage_bridge_owner = bridge
     results: list[Dict[str, Any]] = []
     for account_id, bound_scope in bindings.items():
+        if not task_state.chatgpt_usage_bridge_admitting:
+            break
         configured_profile = str(bound_scope["profile_id"] or account_id)
         try:
+            task_state.chatgpt_usage_bridge_cleanup_errors = bridge.reap_pending()
+            if task_state.chatgpt_usage_bridge_cleanup_errors:
+                raise RuntimeError("ChatGPT usage bridge cleanup is incomplete")
             selected_profile = _chatgpt_usage_bridge_selected_profile(
                 account_id,
                 bound_scope,
@@ -16371,6 +16381,42 @@ def _run_chatgpt_usage_bridge_accounts(
                 )
             )
     return results
+
+
+def _stop_chatgpt_usage_bridge(state: SidecarTaskState) -> None:
+    state.chatgpt_usage_bridge_admitting = False
+    bridge = state.chatgpt_usage_bridge_owner
+    if bridge is not None:
+        bridge.request_shutdown()
+
+
+def _close_chatgpt_usage_bridge(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+) -> List[str]:
+    _stop_chatgpt_usage_bridge(state)
+    bridge = state.chatgpt_usage_bridge_owner
+    if bridge is None:
+        return []
+    try:
+        errors = bridge.close()
+    except Exception as exc:
+        errors = [f"bridge cleanup failed: {type(exc).__name__}"]
+    state.chatgpt_usage_bridge_cleanup_errors = errors
+    if errors:
+        _emit(
+            {
+                "event": "chatgpt_usage_bridge_cleanup",
+                "observed_at": _utc_timestamp(),
+                "environment": config.environment,
+                "ok": False,
+                "error_class": "ChatGPTUsageBridgeCleanupFailed",
+                "error_count": len(errors),
+            }
+        )
+    else:
+        state.chatgpt_usage_bridge_owner = None
+    return errors
 
 
 def _chatgpt_usage_bridge_selected_profile(
@@ -16947,8 +16993,8 @@ def _next_sidecar_wake_delay(
 
 def _run_explicit_chatgpt_usage_bridge_recovery(
     config: ProviderStatusLoopConfig,
+    recovery_state: SidecarTaskState,
 ) -> Dict[str, Any]:
-    recovery_state = SidecarTaskState()
     try:
         recovery_event = _run_chatgpt_usage_bridge_task(
             config,
@@ -17052,10 +17098,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 1
     stopping = False
+    sidecar_state = SidecarTaskState()
 
     def _stop(_signum: int, _frame: object) -> None:
         nonlocal stopping
         stopping = True
+        _stop_chatgpt_usage_bridge(sidecar_state)
 
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
@@ -17063,13 +17111,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not _setup_schema_before_loop(config) and config.once:
         return 1
 
-    if config.chatgpt_usage_bridge_recovery_account is not None:
-        recovery_event = _run_explicit_chatgpt_usage_bridge_recovery(config)
-        _emit(recovery_event)
-        return 0 if recovery_event.get("ok") is True else 1
+    try:
+        if config.chatgpt_usage_bridge_recovery_account is not None:
+            recovery_event = _run_explicit_chatgpt_usage_bridge_recovery(
+                config,
+                sidecar_state,
+            )
+            _emit(recovery_event)
+            exit_code = 0 if recovery_event.get("ok") is True else 1
+        else:
+            exit_code = _run_sidecar_loop(
+                config,
+                sidecar_state,
+                should_stop=lambda: stopping,
+            )
+    finally:
+        cleanup_errors = _close_chatgpt_usage_bridge(config, sidecar_state)
+    return 1 if cleanup_errors else exit_code
 
-    sidecar_state = SidecarTaskState()
-    while not stopping:
+
+def _run_sidecar_loop(
+    config: ProviderStatusLoopConfig,
+    sidecar_state: SidecarTaskState,
+    *,
+    should_stop: Callable[[], bool],
+) -> int:
+    while not should_stop():
         now = time.monotonic()
         generic_cycle_deadline = sidecar_state.next_generic_cycle_due_monotonic
         if generic_cycle_deadline is None:
@@ -17088,7 +17155,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _sleep_until_next_sidecar_deadline(
                 config,
                 sidecar_state,
-                should_stop=lambda: stopping,
+                should_stop=should_stop,
             )
             continue
 
@@ -17140,7 +17207,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _sleep_until_next_sidecar_deadline(
             config,
             sidecar_state,
-            should_stop=lambda: stopping,
+            should_stop=should_stop,
         )
 
     _emit(

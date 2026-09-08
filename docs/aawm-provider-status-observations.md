@@ -1021,11 +1021,22 @@ match the selected account's configured profile. Recovery is one-shot and does
 not enable authentication recovery in the recurring scheduler. Failure events
 retain the selected configured profile for account attribution.
 
+The sidecar retains one bridge owner across runs, services unfinished child
+cleanup before admitting another account, and closes that owner on one-shot,
+recovery, and signal-driven exits. Cleanup uses a five-second cutoff with
+time reserved for forced termination and reaping. Cleanup failures remain
+failures even when the worker has already committed its final receipt.
+
 The bridge reports `history_contract=unavailable` when the native history
 preparer or capability contract is not available. That state is not an empty
 successful history and does not advance a completed per-model count. Native
 reader activation, schema provisioning, deployment, and fresh per-account
 row verification remain separate gates.
+
+Capability inventories may describe unavailable operations alongside verified
+ones. Each requested operation and archive scope still requires its own
+manifest evidence; a missing optional capability does not disable other
+verified history operations.
 
 ## Alibaba Token Plan quota polling
 

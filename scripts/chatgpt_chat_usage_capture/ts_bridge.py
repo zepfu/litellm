@@ -37,6 +37,7 @@ MAX_CURSOR_BYTES = 512
 MAX_JSON_DEPTH = 32
 DEFAULT_CHILD_TTL_SECONDS = 3600
 TERMINAL_CLEANUP_SECONDS = 5
+TERMINAL_REAP_SECONDS = 1
 DEFAULT_WORKER_ROOT = "/app/scripts/chatgpt_chat_usage_capture/ts"
 DEFAULT_MODEL_MAPPING = {
     "version": "initial-unmapped",
@@ -147,7 +148,7 @@ class BridgeConfig:
             mapping=(
                 dict(DEFAULT_MODEL_MAPPING)
                 if mapping is None
-                else dict(mapping)
+                else _validate_model_mapping(mapping)
             ),
             history_preparer=history_preparer,
             binding_bootstrapper=binding_bootstrapper,
@@ -217,7 +218,7 @@ class BridgeOperationContext:
         return _remaining_ms(self.deadline_monotonic)
 
     def check(self) -> None:
-        if self.cancelled:
+        if self.cancelled and not self.ignore_cancel:
             raise BridgeProtocolError(
                 "worker operation was cancelled",
                 code="cancelled",
@@ -236,9 +237,15 @@ class BridgeOperationContext:
         if deadline_monotonic is None or deadline_at is None:
             deadline_monotonic = self.deadline_monotonic
             deadline_at = self.deadline_at
+        cutoff = min(
+            deadline_monotonic,
+            time.monotonic() + TERMINAL_CLEANUP_SECONDS,
+        )
+        deadline_at -= timedelta(seconds=deadline_monotonic - cutoff)
+        deadline_monotonic = cutoff
         return BridgeOperationContext(
-            deadline_monotonic=deadline_monotonic,
-            deadline_at=deadline_at,
+            deadline_monotonic=deadline_monotonic - TERMINAL_REAP_SECONDS,
+            deadline_at=deadline_at - timedelta(seconds=TERMINAL_REAP_SECONDS),
             cancel_event=self.cancel_event,
             run_id=self.run_id,
             collector_account_id=self.collector_account_id,
@@ -306,6 +313,8 @@ class TsWorkerBridge:
         self.config = config
         self._children: dict[tuple[str, str], _Child] = {}
         self._lock = threading.Lock()
+        self._admitting = True
+        self._active_operation: Optional[BridgeOperationContext] = None
 
     def _call_with_deadline(
         self,
@@ -315,6 +324,7 @@ class TsWorkerBridge:
         operation: Optional[BridgeOperationContext] = None,
         on_result: Optional[Callable[[Any], None]] = None,
         check_cancel: bool = True,
+        forward_operation: bool = True,
         **kwargs: Any,
     ) -> Any:
         self._check_operation(
@@ -323,6 +333,8 @@ class TsWorkerBridge:
             check_cancel=check_cancel,
         )
         try:
+            if forward_operation:
+                kwargs["operation"] = operation
             result = callback(*args, **kwargs)
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -352,6 +364,7 @@ class TsWorkerBridge:
         operation: Optional[BridgeOperationContext] = None,
         on_result: Optional[Callable[[Any], None]] = None,
         check_cancel: bool = True,
+        forward_operation: bool = True,
         **kwargs: Any,
     ) -> Any:
         active_operation = operation or context.operation
@@ -362,6 +375,7 @@ class TsWorkerBridge:
             operation=active_operation,
             on_result=on_result,
             check_cancel=check_cancel,
+            forward_operation=forward_operation,
             **kwargs,
         )
 
@@ -410,6 +424,12 @@ class TsWorkerBridge:
         mapping: Optional[Mapping[str, Any]] = None,
         authentication_recovery_requested: bool = False,
     ) -> dict[str, Any]:
+        if not self._admitting:
+            raise BridgeProtocolError(
+                "worker bridge is shutting down",
+                code="cancelled",
+                retryable=True,
+            )
         account = _metadata_token(collector_account_id, "collector_account_id")
         profile = _metadata_token(profile_id, "profile_id")
         requested_scope = _scope_for_account(scope, account)
@@ -439,6 +459,10 @@ class TsWorkerBridge:
             terminal_deadline_monotonic=terminal_deadline_monotonic,
             terminal_deadline_at=terminal_deadline_at,
         )
+        self._active_operation = operation
+        if not self._admitting:
+            cancel_event.set()
+        cleanup_operation: Optional[BridgeOperationContext] = None
         lease: Optional[CollectorLease] = None
         lease_holder: list[CollectorLease] = []
         child: Optional[_Child] = None
@@ -477,7 +501,7 @@ class TsWorkerBridge:
                     ttl_seconds=self.config.child_ttl_seconds,
                     expected_binding=binding,
                 )
-            except Exception:
+            except BaseException:
                 if lease is None and lease_holder:
                     lease = lease_holder[-1]
                 raise
@@ -525,6 +549,7 @@ class TsWorkerBridge:
                     retryable=True,
                 )
         except BaseException as exc:
+            cleanup_operation = operation.terminal()
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 control_error = exc
                 control_traceback = exc.__traceback__
@@ -542,35 +567,37 @@ class TsWorkerBridge:
                 cancel_signal_error = self._send_parent_cancel(
                     context,
                     reason=_failure_code(exc),
-                    operation=operation.terminal(),
+                    operation=cleanup_operation,
                 )
                 if cancel_signal_error is not None:
                     context.cleanup_errors.append(cancel_signal_error)
                 cancel_error = self._cancel_state(
                     context,
                     exc,
-                    operation=operation.terminal(),
+                    operation=cleanup_operation,
                 )
                 if cancel_error is not None:
                     context.cleanup_errors.append(cancel_error)
             elif lease is not None:
                 lease_error = self._release_lease_quietly(
                     lease,
-                    operation=operation.terminal(),
+                    operation=cleanup_operation,
                 )
                 if lease_error is not None:
                     result = _with_cleanup_failure(result, [lease_error])
         finally:
+            if cleanup_operation is None:
+                cleanup_operation = operation.terminal()
             if context is not None:
                 context.cleanup_errors.extend(
                     self._close_tracked_snapshots(
                         context,
-                        operation=operation.terminal(),
+                        operation=cleanup_operation,
                     )
                 )
                 cleanup_error = self._close_prepared_history(
                     context,
-                    operation=operation.terminal(),
+                    operation=cleanup_operation,
                 )
                 if cleanup_error is not None:
                     context.cleanup_errors.append(cleanup_error)
@@ -578,7 +605,9 @@ class TsWorkerBridge:
                 reap_error = self._reap(
                     key=key,
                     child=child,
-                    deadline_monotonic=operation.terminal().deadline_monotonic,
+                    deadline_monotonic=(
+                        cleanup_operation.terminal_deadline_monotonic
+                    ),
                 )
                 if reap_error is not None:
                     if context is not None:
@@ -587,6 +616,7 @@ class TsWorkerBridge:
                         result = _with_cleanup_failure(result, [reap_error])
             if context is not None and context.cleanup_errors:
                 result = _with_cleanup_failure(result, context.cleanup_errors)
+            self._active_operation = None
         if control_error is not None:
             raise control_error.with_traceback(control_traceback)
         return result
@@ -626,7 +656,7 @@ class TsWorkerBridge:
             )
         bootstrapped_scope = self._call_with_deadline(
             operation.deadline_monotonic,
-            lambda candidate_scope, observed_at: bootstrapper(
+            lambda candidate_scope, observed_at, *, operation: bootstrapper(
                 candidate_scope,
                 observed_at,
                 operation,
@@ -729,9 +759,9 @@ class TsWorkerBridge:
             "protocolVersion": PROTOCOL_VERSION,
             "control": "startRun",
             "envelope": envelope,
-            "scheduleOptions": dict(schedule_options),
-            "collectionRequest": dict(collection_request),
-            "mapping": dict(mapping),
+            "scheduleOptions": schedule_options,
+            "collectionRequest": collection_request,
+            "mapping": mapping,
             "bounds": {
                 "maxFrameBytes": self.config.max_frame_bytes,
                 "maxTotalBytes": self.config.max_total_bytes,
@@ -742,6 +772,8 @@ class TsWorkerBridge:
         if authentication_recovery_requested:
             request["authenticationRecoveryRequested"] = True
         _assert_bounded_safe(request, max_bytes=self.config.max_frame_bytes)
+        request["scheduleOptions"] = dict(schedule_options)
+        request["collectionRequest"] = dict(collection_request)
         context.child.request_count += 1
         self._write_frame(context.child, request)
 
@@ -1167,6 +1199,7 @@ class TsWorkerBridge:
             context.collector_account_id,
             context.profile_id,
             context.operation,
+            forward_operation=False,
             on_result=lambda value: self._retain_prepared_history(context, value),
         )
         if not isinstance(prepared, Mapping):
@@ -1183,7 +1216,14 @@ class TsWorkerBridge:
         context.verified_history = verified
         context.capabilities = verified["capabilities"]
         context.capability_manifest = verified["capabilityManifest"]
-        context.history_status = "ready"
+        context.history_status = (
+            "ready"
+            if _native_history_capability_is_verified(
+                context.capabilities,
+                context.capability_manifest,
+            )
+            else "unavailable"
+        )
         context.history_reason = None
         return verified
 
@@ -1315,6 +1355,7 @@ class TsWorkerBridge:
             reader,
             dict(payload),
             context.operation,
+            forward_operation=False,
         )
         if not isinstance(result, Mapping):
             raise BridgeProtocolError(
@@ -1554,15 +1595,20 @@ class TsWorkerBridge:
         return {"cancelled": True, "stateVersion": header.state_version}
 
     def _await_child_exit(self, child: _Child) -> None:
-        remaining = max(0.0, child.deadline_monotonic - time.monotonic())
-        try:
-            return_code = child.process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired as exc:
-            raise BridgeProtocolError(
-                "worker did not terminate after committed finish",
-                code="bounds_exceeded",
-                retryable=True,
-            ) from exc
+        while True:
+            if self._active_operation is not None:
+                self._active_operation.check()
+            remaining = max(0.0, child.deadline_monotonic - time.monotonic())
+            try:
+                return_code = child.process.wait(timeout=min(0.1, remaining))
+                break
+            except subprocess.TimeoutExpired as exc:
+                if remaining <= 0:
+                    raise BridgeProtocolError(
+                        "worker did not terminate after committed finish",
+                        code="bounds_exceeded",
+                        retryable=True,
+                    ) from exc
         if return_code != 0:
             raise BridgeProtocolError(
                 f"worker exited with status {return_code} after finish",
@@ -1727,6 +1773,13 @@ class TsWorkerBridge:
             except Exception as retain_exc:
                 return f"{reason}; retention failed: {type(retain_exc).__name__}"
             return reason
+        if getattr(registration, "cleanup_failure", None):
+            reason = "native history registration retained a cleanup failure"
+            try:
+                retain(registration, reason)
+            except Exception as exc:
+                return f"{reason}; retention failed: {type(exc).__name__}"
+            return reason
         if not completed or not bool(getattr(registration, "retired", False)):
             reason = "native history retirement was not proven"
             try:
@@ -1780,6 +1833,7 @@ class TsWorkerBridge:
                     snapshot_id,
                     operation=active_operation,
                     check_cancel=False,
+                    forward_operation=False,
                 )
                 closed = True
             except Exception as exc:
@@ -1869,13 +1923,9 @@ class TsWorkerBridge:
                             code="bounds_exceeded",
                             retryable=True,
                         )
-                events = selector.select(timeout)
+                events = selector.select(min(0.1, timeout))
                 if not events:
-                    raise BridgeProtocolError(
-                        "worker write deadline exceeded",
-                        code="bounds_exceeded",
-                        retryable=True,
-                    )
+                    continue
                 try:
                     written = os.write(fd, view)
                 except BlockingIOError:
@@ -1941,13 +1991,9 @@ class TsWorkerBridge:
                         code="bounds_exceeded",
                         retryable=True,
                     )
-                events = selector.select(self._remaining_timeout(child))
+                events = selector.select(min(0.1, self._remaining_timeout(child)))
                 if not events:
-                    raise BridgeProtocolError(
-                        "worker read deadline exceeded",
-                        code="bounds_exceeded",
-                        retryable=True,
-                    )
+                    continue
                 remaining_frame = self.config.max_frame_bytes - len(child.read_buffer)
                 remaining_total = self.config.max_total_bytes - child.total_bytes
                 read_size = min(8192, remaining_frame, remaining_total)
@@ -2014,6 +2060,8 @@ class TsWorkerBridge:
             )
 
     def _check_deadline(self, child: _Child) -> None:
+        if self._active_operation is not None:
+            self._active_operation.check()
         if child.process.poll() is not None and not child.ready_frames:
             raise BridgeProtocolError(
                 "worker exited before completing the run",
@@ -2041,6 +2089,7 @@ class TsWorkerBridge:
         resolved = False
         failure: Optional[str] = None
         terminal_deadline = min(
+            time.monotonic() + TERMINAL_CLEANUP_SECONDS,
             child.terminal_deadline_monotonic,
             deadline_monotonic
             if deadline_monotonic is not None
@@ -2073,7 +2122,12 @@ class TsWorkerBridge:
 
         try:
             _terminate_process_group(process, child.process_group_id)
-            if not wait_for_retirement(terminal_deadline):
+            term_deadline = min(
+                terminal_deadline,
+                time.monotonic()
+                + min(1.0, max(0.0, terminal_deadline - time.monotonic()) / 2),
+            )
+            if not wait_for_retirement(term_deadline):
                 _kill_process_group(process, child.process_group_id)
                 resolved = wait_for_retirement(terminal_deadline)
             else:
@@ -2094,8 +2148,20 @@ class TsWorkerBridge:
                     self._children.pop(key, None)
         return None if resolved else failure or "worker retirement was not proven"
 
+    def request_shutdown(self) -> None:
+        """Stop admission and cancel the current owned operation."""
+        self._admitting = False
+        operation = self._active_operation
+        if operation is not None:
+            operation.cancel_event.set()
+
     def close(self) -> list[str]:
         """Boundedly reap every child still owned by this bridge."""
+        self.request_shutdown()
+        return self.reap_pending()
+
+    def reap_pending(self) -> list[str]:
+        """Service retained children between sidecar runs without reopening admission."""
         with self._lock:
             children = list(self._children.items())
         errors: list[str] = []
@@ -2265,15 +2331,6 @@ def _validate_prepared_history(
         normalized_identity,
         normalized_capabilities,
     )
-    if not _native_history_capability_is_verified(
-        normalized_capabilities,
-        normalized_manifest,
-    ):
-        raise BridgeProtocolError(
-            "native history capability is unavailable",
-            code="history_contract_unavailable",
-            retryable=True,
-        )
     return {
         "identity": normalized_identity,
         "capabilities": normalized_capabilities,
@@ -2398,7 +2455,6 @@ def _validate_capability_record(value: Mapping[str, Any]) -> dict[str, Any]:
     warnings = value["warnings"]
     if (
         not isinstance(index_scopes, list)
-        or not index_scopes
         or any(
             not isinstance(item, str)
             or not item.strip()
@@ -2431,8 +2487,6 @@ def _validate_capability_record(value: Mapping[str, Any]) -> dict[str, Any]:
         if (
             not isinstance(value[field_name], str)
             or not value[field_name].strip()
-            or value[field_name].strip().lower()
-            in _UNAVAILABLE_CAPABILITY_STATES
         ):
             raise BridgeProtocolError(
                 "history capability inventory contains an invalid field",
@@ -2489,10 +2543,11 @@ def _validate_capability_manifest(
     status = _first_value(native_history, "status", "state")
     if (
         kind not in _NATIVE_HISTORY_KINDS
-        or status in _UNAVAILABLE_CAPABILITY_STATES
-        or status not in {"available", "verified", "supported", True}
+        or status not in (
+            _UNAVAILABLE_CAPABILITY_STATES
+            | {"available", "verified", "supported", True, False}
+        )
         or not isinstance(archive_scopes, list)
-        or not archive_scopes
         or any(
             not isinstance(scope, str)
             or scope not in {"active", "archived"}
@@ -2528,15 +2583,12 @@ def _validate_capability_manifest(
                 "claims",
                 "methods",
             )
-            if claim_status in _UNAVAILABLE_CAPABILITY_STATES or claim_status is False:
-                raise BridgeProtocolError(
-                    "native history operation claim is unavailable",
-                    code="history_contract_unavailable",
-                    retryable=True,
-                )
             if (
                 claim_status is not None
-                and claim_status not in {"available", "verified", "supported", True}
+                and claim_status not in (
+                    _UNAVAILABLE_CAPABILITY_STATES
+                    | {"available", "verified", "supported", True, False}
+                )
             ):
                 raise BridgeProtocolError(
                     "native history operation claim is invalid",
@@ -2545,10 +2597,8 @@ def _validate_capability_manifest(
                 )
             if claim_operations is not None and (
                 not isinstance(claim_operations, list)
-                or not any(
-                    isinstance(item, str)
-                    and item.strip()
-                    and item not in _UNAVAILABLE_CAPABILITY_STATES
+                or any(
+                    not isinstance(item, str) or not item.strip()
                     for item in claim_operations
                 )
             ):
@@ -2564,18 +2614,19 @@ def _validate_capability_manifest(
                     retryable=True,
                 )
         elif isinstance(claims, list):
-            if not any(
-                isinstance(item, str)
-                and item.strip()
-                and item not in _UNAVAILABLE_CAPABILITY_STATES
+            if any(
+                not isinstance(item, str) or not item.strip()
                 for item in claims
             ):
                 raise BridgeProtocolError(
-                    "native history operation claim is unavailable",
+                    "native history operation claim is invalid",
                     code="history_contract_unavailable",
                     retryable=True,
                 )
-        elif claims not in {True, "available", "verified", "supported"}:
+        elif claims not in (
+            _UNAVAILABLE_CAPABILITY_STATES
+            | {True, False, "available", "verified", "supported"}
+        ):
             raise BridgeProtocolError(
                 "native history operation claim is invalid",
                 code="history_contract_unavailable",
@@ -2599,8 +2650,6 @@ def _native_history_capability_is_verified(
             scope in {"active", "archived"}
             for scope in capabilities.get("indexScopes", ())
         )
-        and capabilities.get("modernDetail") not in _UNAVAILABLE_CAPABILITY_STATES
-        and capabilities.get("pagination") not in _UNAVAILABLE_CAPABILITY_STATES
     )
 
 
@@ -2989,6 +3038,22 @@ def _preflight_json_value(  # noqa: PLR0915 - bounded recursive JSON walk
                 )
         return size
 
+    def integer_size(current: int, current_path: str) -> int:
+        bits = current.bit_length()
+        # Reject oversized integers before allocating decimal text; then
+        # count exactly so a supported boundary value is not rejected.
+        minimum_digits = max(1, (max(0, bits - 1) * 3) // 10 + 1)
+        sign_size = 1 if current < 0 else 0
+        if used + minimum_digits + sign_size > max_bytes:
+            add(minimum_digits + sign_size, current_path)
+        try:
+            return len(str(current))
+        except ValueError as exc:
+            raise BridgeProtocolError(
+                f"JSON integer cannot be encoded at {current_path}",
+                code="protocol_invalid",
+            ) from exc
+
     def walk(current: Any, current_path: str, depth: int) -> None:
         if depth > MAX_JSON_DEPTH:
             raise BridgeProtocolError(
@@ -3006,11 +3071,7 @@ def _preflight_json_value(  # noqa: PLR0915 - bounded recursive JSON walk
             add(4 if current else 5, current_path)
             return
         if isinstance(current, int):
-            bits = current.bit_length()
-            # 30103/100000 is a conservative upper bound for log10(2);
-            # bit_length() avoids allocating a copy of attacker-sized ints.
-            decimal_digits = max(1, (bits * 30103 + 99_999) // 100_000)
-            add(decimal_digits + (1 if current < 0 else 0), current_path)
+            add(integer_size(current, current_path), current_path)
             return
         if isinstance(current, float):
             if not math.isfinite(current):
