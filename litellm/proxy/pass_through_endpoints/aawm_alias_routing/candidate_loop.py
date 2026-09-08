@@ -2643,6 +2643,53 @@ async def handle_alias_route(  # noqa: PLR0915
                             request=request,
                         )
 
+                    if probe_failure_exc is not None and (
+                        isinstance(probe_failure_exc, ProviderCallReplayBlocked)
+                        or getattr(
+                            probe_failure_exc,
+                            "aawm_openai_wire_replay_blocked",
+                            False,
+                        )
+                    ):
+                        attempt_record["status"] = (
+                            "terminal_openai_wire_replay_blocked"
+                        )
+                        attempt_record["failure_phase"] = (
+                            "openai_wire_replay_blocked"
+                        )
+                        attempt_record["attempted_provider_call"] = False
+                        attempt_record["wire_commitment"] = getattr(
+                            probe_failure_exc,
+                            "wire_commitment",
+                            None,
+                        )
+                        _record_auto_agent_alias_attempt_failure(
+                            alias_family=alias_family,
+                            alias_model=alias_model,
+                            request=request,
+                            prepared_request_body=prepared_request_body,
+                            selection=selection,
+                            attempts=attempts,
+                            attempt_record=attempt_record,
+                            error_class="openai_wire_replay_blocked",
+                            add_alias_metadata_fn=add_alias_metadata_fn,
+                        )
+                        _raise_terminal_alias_failure(
+                            probe_failure_exc,
+                            extra_fields={
+                                "wire_commitment": getattr(
+                                    probe_failure_exc,
+                                    "wire_commitment",
+                                    None,
+                                ),
+                                "request_call_ledger": getattr(
+                                    probe_failure_exc,
+                                    "ledger_snapshot",
+                                    None,
+                                ),
+                            },
+                        )
+
                     # Resolve the plan AFTER lock release.  If the resolver
                     # raises, the outer BaseException handler cleans up the
                     # intent.  No lock is held here (canonical order: no family

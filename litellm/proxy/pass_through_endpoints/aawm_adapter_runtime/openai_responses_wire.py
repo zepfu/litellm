@@ -76,6 +76,15 @@ class OpenAIResponsesWireTrace:
             )
         except Exception:
             return
+        try:
+            from .provider_call_ledger import publish_wire_commitment_snapshot
+
+            publish_wire_commitment_snapshot(
+                request,
+                commitment=self.snapshot(),
+            )
+        except Exception:
+            return
 
     def snapshot(self) -> Dict[str, Any]:
         return {

@@ -194,6 +194,7 @@ from .aawm_adapter_runtime.provider_call_ledger import (
     get_request_provider_call_ledger,
     get_request_provider_call_ledger_snapshot,
     publish_reservation_metadata,
+    publish_wire_commitment_snapshot,
     record_transport_connection_attempt,
     register_active_upstream_response,
     clear_active_upstream_response,
@@ -4788,16 +4789,21 @@ async def _finalize_native_openai_responses_owner_wire_disposition(
         state = getattr(request, "state", None)
         if state is not None:
             try:
+                commitment = {
+                    "commitment": "done",
+                    "disposition": disposition.value,
+                    "terminal_wire_committed": True,
+                    "done_wire_committed": True,
+                    "finalized": False,
+                }
                 setattr(
                     state,
                     "_aawm_openai_responses_wire_commitment",
-                    {
-                        "commitment": "done",
-                        "disposition": disposition.value,
-                        "terminal_wire_committed": True,
-                        "done_wire_committed": True,
-                        "finalized": False,
-                    },
+                    commitment,
+                )
+                publish_wire_commitment_snapshot(
+                    request,
+                    commitment=commitment,
                 )
             except Exception:
                 pass
@@ -4898,6 +4904,10 @@ async def _finalize_native_openai_responses_owner_wire_disposition(
                     state,
                     "_aawm_openai_responses_wire_commitment",
                     commitment,
+                )
+                publish_wire_commitment_snapshot(
+                    request,
+                    commitment=commitment,
                 )
             except Exception:
                 pass
@@ -5669,6 +5679,21 @@ async def pass_through_request(  # noqa: PLR0915
                 return response
 
             openai_send_request_fn = _send_prepared_openai_request
+
+        def _publish_openai_send_telemetry() -> None:
+            request_state = getattr(request, "state", None)
+            if request_state is None:
+                return
+            if openai_call_ledger is not None:
+                ledger_snapshot = (
+                    get_request_provider_call_ledger_snapshot(request)
+                    or openai_call_ledger.snapshot()
+                )
+                setattr(
+                    request_state,
+                    "aawm_openai_send_ledger_snapshot",
+                    ledger_snapshot,
+                )
 
         send_request_fn = openai_send_request_fn
         if managed_xai_oauth_request and send_request_fn is None:
