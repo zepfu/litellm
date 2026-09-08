@@ -75,6 +75,10 @@ _SERVER_CONTEXT_KEYS: tuple[str, ...] = tuple(
         )
     )
 )
+_SERVER_GUARDRAIL_METADATA_KEYS: tuple[str, ...] = (
+    "guardrails",
+    "applied_guardrails",
+)
 
 
 def _raise_wire_body_immutable(*args: Any, **kwargs: Any) -> NoReturn:
@@ -155,19 +159,31 @@ def _strip_item_internal_fields(item: Any) -> Any:
     return updated if updated is not None else item
 
 
-def sanitize_wire_envelope(body: Any) -> tuple[Any, bool]:
+def sanitize_wire_envelope(
+    body: Any,
+    *,
+    preserve_top_level_keys: tuple[str, ...] = (),
+    client_metadata: Optional[Mapping[str, Any]] = None,
+) -> tuple[Any, bool]:
     """Strip known server state at protocol-owned surfaces only.
 
     Removes server-owned top-level context and per-item route-identity/
     provenance sidecars from top-level ``input``/``output`` items. Does not
-    recurse into user or tool structures. Returns ``(body, changed)``.
+    recurse into user or tool structures. ``preserve_top_level_keys`` keeps
+    adapter-required context such as ``litellm_metadata`` available before a
+    non-OpenAI translator runs. When supplied, ``client_metadata`` restores
+    genuine client guardrail fields while removing server-added values.
+    Returns ``(body, changed)``.
     """
     if not isinstance(body, dict):
         return body, False
 
     changed = False
     updated: Optional[dict[str, Any]] = None
-    for key in _SERVER_CONTEXT_KEYS:
+    context_keys = tuple(
+        key for key in _SERVER_CONTEXT_KEYS if key not in preserve_top_level_keys
+    )
+    for key in context_keys:
         if key in body:
             if updated is None:
                 updated = dict(body)
@@ -175,6 +191,27 @@ def sanitize_wire_envelope(body: Any) -> tuple[Any, bool]:
             changed = True
 
     source = updated if updated is not None else body
+    metadata = source.get("metadata")
+    if isinstance(metadata, dict) and client_metadata is not None:
+        sanitized_metadata: Optional[dict[str, Any]] = None
+        for key in _SERVER_GUARDRAIL_METADATA_KEYS:
+            if isinstance(client_metadata, Mapping) and key in client_metadata:
+                client_value = copy.deepcopy(client_metadata[key])
+                if metadata.get(key) != client_value:
+                    if sanitized_metadata is None:
+                        sanitized_metadata = dict(metadata)
+                    sanitized_metadata[key] = client_value
+            elif key in metadata:
+                if sanitized_metadata is None:
+                    sanitized_metadata = dict(metadata)
+                sanitized_metadata.pop(key, None)
+        if sanitized_metadata is not None:
+            if updated is None:
+                updated = dict(body)
+            updated["metadata"] = sanitized_metadata
+            source = updated
+            changed = True
+
     for item_key in ("input", "output"):
         items = source.get(item_key)
         if not isinstance(items, list):
@@ -364,6 +401,7 @@ def compile_openai_responses_wire_body(
     expected_target_family: Any = None,
     endpoint: str = "responses",
     session_identity: Any = None,
+    client_metadata: Optional[Mapping[str, Any]] = None,
     strip_function_output_ciphertext_without_plaintext: Optional[bool] = None,
     drop_codex_request_params_fn: Optional[
         Callable[[dict[str, Any]], tuple[dict[str, Any], list[str]]]
@@ -437,7 +475,7 @@ def compile_openai_responses_wire_body(
     # 6. The sole canonical sanitation traversal. It runs after provenance
     # validation so foreign sidecars cannot be erased before compatibility
     # checks observe them.
-    body, _ = sanitize_wire_envelope(body)
+    body, _ = sanitize_wire_envelope(body, client_metadata=client_metadata)
 
     # Route-owned stream/store shaping is applied before the result is bound,
     # so the returned dict remains the exact serialized provider body.

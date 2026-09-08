@@ -1164,7 +1164,10 @@ async def _perform_codex_auto_agent_alias_candidate_request(
                 sanitize_wire_envelope,
             )
 
-            sanitized_candidate_body, _ = sanitize_wire_envelope(candidate_body)
+            sanitized_candidate_body, _ = sanitize_wire_envelope(
+                candidate_body,
+                preserve_top_level_keys=("litellm_metadata",),
+            )
             if (
                 sanitized_candidate_body is not candidate_body
                 and isinstance(sanitized_candidate_body, dict)
@@ -4335,7 +4338,12 @@ async def _perform_codex_auto_agent_native_openai_request(
     request_body: dict[str, Any],
     custom_headers: Optional[dict[str, str]] = None,
 ) -> Response:
-    is_streaming_request = bool(request_body.get("stream"))
+    # Managed Codex Responses egress is always streamed and unpersisted,
+    # including nested alias candidates that bypass direct-route shaping.
+    request_body = dict(request_body)
+    request_body["stream"] = True
+    request_body["store"] = False
+    is_streaming_request = True
     # The candidate loop attaches this coordinator only for eligible alpha
     # OpenAI capacity-retry requests. Preserve stock hidden transport retries
     # for every native OpenAI request without that shared owner.
@@ -6827,7 +6835,10 @@ async def _perform_codex_auto_agent_openrouter_completion_request(  # noqa: PLR0
             sanitize_wire_envelope,
         )
 
-        sanitized_request_body, _ = sanitize_wire_envelope(request_body)
+        sanitized_request_body, _ = sanitize_wire_envelope(
+            request_body,
+            preserve_top_level_keys=("litellm_metadata",),
+        )
         if sanitized_request_body is not request_body and isinstance(
             sanitized_request_body, dict
         ):

@@ -282,15 +282,27 @@ def _is_openai_responses_function_name_target(
     url: httpx.URL,
     custom_llm_provider: Optional[str],
 ) -> bool:
+    path = str(url.path or "").lower().rstrip("/")
+    if not (
+        path == "responses"
+        or path.endswith("/responses")
+        or "/responses/" in path
+    ):
+        return False
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+        is_openai_responses_egress,
+    )
+
     provider = (
         custom_llm_provider.value
         if isinstance(custom_llm_provider, litellm.LlmProviders)
         else custom_llm_provider
     )
-    if str(provider or "").lower() != litellm.LlmProviders.OPENAI.value:
-        return False
-    path = str(url.path or "").lower().rstrip("/")
-    return path.endswith("/responses") or "/responses/" in path
+    return is_openai_responses_egress(
+        custom_llm_provider=provider,
+        url_path=path,
+        url=url,
+    )
 
 
 def _record_responses_function_name_diagnostics(
@@ -4568,6 +4580,7 @@ async def pass_through_request(  # noqa: PLR0915
     raw_body: Optional[bytes] = None
     responses_function_name_rewrite: Optional[ResponsesFunctionNameRewrite] = None
     compiled_wire_body: Any = None
+    client_metadata: Optional[dict[str, Any]] = None
     _transfer_identity: Optional[dict[str, Any]] = None
     route_custom_headers = dict(custom_headers or {})
     headers: Dict[str, Any] = dict(route_custom_headers)
@@ -4669,6 +4682,13 @@ async def pass_through_request(  # noqa: PLR0915
                 passthrough_logging_metadata=passthrough_logging_metadata,
             )
         )
+        if isinstance(_parsed_body, dict):
+            parsed_metadata = _parsed_body.get("metadata")
+            client_metadata = (
+                copy.deepcopy(parsed_metadata)
+                if isinstance(parsed_metadata, dict)
+                else {}
+            )
         # OpenAI function tool schema normalization is only relevant for OpenAI-like
         # targets (RR-056 #9). Skip expensive recursive walks for other providers.
         _should_normalize_openai_tools = _should_normalize_openai_function_tool_schemas(
@@ -4836,6 +4856,7 @@ async def pass_through_request(  # noqa: PLR0915
                 expected_target_family=expected_target_family or "openai",
                 endpoint=str(url),
                 session_identity=session_identity,
+                client_metadata=client_metadata,
                 drop_codex_request_params_fn=(
                     _drop_unsupported_codex_request_params_from_request_body
                 ),
