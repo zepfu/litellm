@@ -1045,6 +1045,12 @@ one-shot foreground action, not a recurring schedule. A
 `history_observation_failed` result exits nonzero; `no_history_observed` is a
 distinct bounded outcome and exits zero.
 
+Probe option parsing is strict: abbreviated long options are rejected. When
+the exact probe option is present, malformed arguments emit only the fixed
+`ChatGPTNativeHistoryProbeConfigurationInvalid` event; argparse usage text and
+raw option values are suppressed. Normal sidecar invocations retain their
+ordinary argparse diagnostics.
+
 The operation deadline is distinct from the sidecar's cancellation cutoff.
 Startup, observation, and cleanup use the same absolute operation ceiling;
 when SIGINT or SIGTERM is received, the effective cutoff is the earlier of

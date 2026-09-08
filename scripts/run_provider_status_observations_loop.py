@@ -3683,8 +3683,27 @@ def _chatgpt_oracle_browser_binding(  # noqa: PLR0915 - bounded owner lifecycle 
             _remove_chatgpt_oracle_scratch(temp_root)
 
 
-def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
-    parser = argparse.ArgumentParser(description=__doc__)
+class _ChatGPTNativeHistoryProbeArgumentParser(argparse.ArgumentParser):
+    """Parse probe requests without exposing argparse diagnostics."""
+
+    def _print_message(self, message: str, file: Any = None) -> None:
+        del message, file
+
+    def error(self, message: str) -> None:
+        del message
+        raise SystemExit(2)
+
+
+def _build_parser(  # noqa: PLR0915
+    *,
+    suppress_errors: bool = False,
+) -> argparse.ArgumentParser:
+    parser_type = (
+        _ChatGPTNativeHistoryProbeArgumentParser
+        if suppress_errors
+        else argparse.ArgumentParser
+    )
+    parser = parser_type(description=__doc__, allow_abbrev=False)
     parser.add_argument(
         "--apply",
         dest="apply",
@@ -5398,8 +5417,14 @@ def _validate_codex_reset_credit_poll_config_args(args: argparse.Namespace) -> N
         )
 
 
-def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConfig:
-    args = _build_parser().parse_args(argv)
+def parse_config(
+    argv: Optional[Sequence[str]] = None,
+    *,
+    suppress_parser_errors: bool = False,
+) -> ProviderStatusLoopConfig:
+    args = _build_parser(
+        suppress_errors=suppress_parser_errors,
+    ).parse_args(argv)
     _validate_config_args(args)
     chatgpt_conversation_init_account_bindings = (
         _parse_chatgpt_conversation_init_account_bindings(
@@ -17314,7 +17339,7 @@ def _run_chatgpt_native_history_probe_once(
     state: SidecarTaskState,
 ) -> int:
     result = _run_chatgpt_native_history_probe(config, state)
-    _emit(result)
+    _emit_probe_diagnostic_best_effort(result)
     return _chatgpt_native_history_probe_exit_status(result)
 
 
@@ -17322,6 +17347,15 @@ def _emit(payload: Dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(payload, sort_keys=True))
     sys.stdout.write("\n")
     sys.stdout.flush()
+
+
+def _emit_probe_diagnostic_best_effort(payload: Dict[str, Any]) -> bool:
+    """Never let a closed diagnostic stream bypass owner supervision."""
+    try:
+        _emit(payload)
+    except (BrokenPipeError, OSError, ValueError):
+        return False
+    return True
 
 
 def _sidecar_refresh_deadline(
@@ -17576,10 +17610,13 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
 ) -> int:
     native_probe_requested = _chatgpt_native_history_probe_requested(argv)
     try:
-        config = parse_config(argv)
+        config = parse_config(
+            argv,
+            suppress_parser_errors=native_probe_requested,
+        )
     except SystemExit:
         if native_probe_requested:
-            _emit(
+            _emit_probe_diagnostic_best_effort(
                 {
                     "event": "chatgpt_native_history_probe",
                     "observed_at": _utc_timestamp(),
@@ -17595,7 +17632,7 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
         raise
     except Exception as exc:
         if native_probe_requested:
-            _emit(
+            _emit_probe_diagnostic_best_effort(
                 {
                     "event": "chatgpt_native_history_probe",
                     "observed_at": _utc_timestamp(),
@@ -17682,22 +17719,19 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
             except Exception:
                 drained = False
             if not drained:
-                try:
-                    _emit(
-                        {
-                            "event": "provider_status_sidecar_task_error",
-                            "observed_at": _utc_timestamp(),
-                            "environment": config.environment,
-                            "task": "chatgpt_oracle_browser_owner_shutdown",
-                            "error_class": "OracleBrowserCleanupError",
-                            "error_message": (
-                                "Retained Oracle browser owners remained after "
-                                "the bounded shutdown drain."
-                            ),
-                        }
-                    )
-                except (BrokenPipeError, OSError):
-                    pass
+                _emit_probe_diagnostic_best_effort(
+                    {
+                        "event": "provider_status_sidecar_task_error",
+                        "observed_at": _utc_timestamp(),
+                        "environment": config.environment,
+                        "task": "chatgpt_oracle_browser_owner_shutdown",
+                        "error_class": "OracleBrowserCleanupError",
+                        "error_message": (
+                            "Retained Oracle browser owners remained after "
+                            "the bounded shutdown drain."
+                        ),
+                    }
+                )
                 # Keep the admitted state alive while an owner remains pending.
                 # Returning here would abandon the only in-memory supervisor.
                 while True:
