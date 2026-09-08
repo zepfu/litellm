@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, AsyncIterable, AsyncIterator, Awaitable, Callable, Dict, Optional
 
-from starlette.responses import StreamingResponse
+from starlette.responses import Response, StreamingResponse
 
 
 class OpenAIResponsesWireDisposition(str, Enum):
@@ -168,11 +168,21 @@ def _split_sse_blocks(value: bytes) -> tuple[list[bytes], bytes]:
     return blocks, remainder
 
 
-def _parse_sse_block(block: bytes) -> tuple[Optional[str], Optional[dict], bool]:
+def _parse_sse_block(
+    block: bytes,
+) -> tuple[Optional[str], Optional[dict], bool, bool]:
+    """Parse one complete SSE block and flag invalid Responses framing.
+
+    Plain SSE comments/fields without a data payload are valid keep-alives.
+    Once a data payload or native terminal event is present, malformed JSON,
+    non-object JSON, or an event/payload type disagreement is a protocol
+    failure rather than an opaque chunk that can be followed by success.
+    """
+
     try:
         decoded = block.decode("utf-8")
     except UnicodeDecodeError:
-        return None, None, False
+        return None, None, False, True
 
     lines = decoded.replace("\r\n", "\n").splitlines()
     event_line_indexes = [
@@ -192,9 +202,11 @@ def _parse_sse_block(block: bytes) -> tuple[Optional[str], Optional[dict], bool]
     )
     data_lines: list[str] = []
     saw_done = False
+    saw_data_line = False
     for raw_line in relevant_lines:
         line = raw_line.strip()
         if line.startswith("data:"):
+            saw_data_line = True
             payload_text = line.removeprefix("data:").strip()
             if payload_text == "[DONE]":
                 saw_done = True
@@ -202,11 +214,13 @@ def _parse_sse_block(block: bytes) -> tuple[Optional[str], Optional[dict], bool]
                 data_lines.append(payload_text)
 
     payload: Optional[dict] = None
+    malformed = False
     if data_lines:
         try:
             decoded_payload = json.loads("\n".join(data_lines))
         except (TypeError, json.JSONDecodeError):
             decoded_payload = None
+            malformed = True
         if isinstance(decoded_payload, dict):
             payload = decoded_payload
             payload_type = decoded_payload.get("type")
@@ -215,10 +229,22 @@ def _parse_sse_block(block: bytes) -> tuple[Optional[str], Optional[dict], bool]
                 and isinstance(payload_type, str)
                 and event_type != payload_type.strip()
             ):
-                return None, None, saw_done
+                malformed = True
             if event_type is None and isinstance(payload_type, str):
                 event_type = payload_type.strip() or None
-    return event_type, payload, saw_done
+        elif decoded_payload is not None:
+            malformed = True
+    elif saw_data_line and not saw_done:
+        malformed = True
+
+    if event_type in {
+        "response.completed",
+        "response.failed",
+        "response.incomplete",
+    } and _terminal_disposition(event_type, payload) is None:
+        malformed = True
+
+    return event_type, payload, saw_done, malformed
 
 
 def _terminal_block_suffix(
@@ -409,6 +435,21 @@ class OpenAIResponsesWireCoordinator:
             self.trace.commitment = "finalized"
             self.trace.publish_request_commitment()
 
+    async def _drain_source_after_terminal(self) -> None:
+        """Let downstream logging wrappers finish without another provider read.
+
+        The native passthrough chunk processor stops its upstream iterator after
+        yielding the terminal block.  Advancing this outer source to completion
+        resumes its normal post-stream logging/finalization path; it does not
+        read past the provider terminal.
+        """
+
+        try:
+            async for _discarded in self._source:
+                continue
+        except Exception as exc:  # noqa: BLE001
+            self.trace.metadata["post_terminal_source_error"] = type(exc).__name__
+
     def _select_terminal(
         self,
         *,
@@ -474,17 +515,43 @@ class OpenAIResponsesWireCoordinator:
                 self._buffer += bytes(raw_chunk)
                 blocks, self._buffer = _split_sse_blocks(self._buffer)
                 for block in blocks:
-                    event_type, payload, saw_done = _parse_sse_block(block)
+                    event_type, payload, saw_done, malformed = _parse_sse_block(block)
                     if self.trace.terminal_selected:
                         if _terminal_disposition(event_type, payload) is not None:
                             self.trace.duplicate_terminal_suppressed += 1
                         if saw_done:
                             self.trace.upstream_done_suppressed += 1
                         continue
+                    if malformed:
+                        self.trace.metadata["malformed_frame"] = True
+                        async for emitted in self._emit_synthetic_terminal(
+                            disposition=OpenAIResponsesWireDisposition.FAILED,
+                            reason="malformed_sse_frame",
+                        ):
+                            yield emitted
+                        return
                     disposition = _terminal_disposition(event_type, payload)
                     if disposition is not None:
                         if saw_done:
                             self.trace.upstream_done_suppressed += 1
+                        terminal_response_payload = (
+                            payload.get("response")
+                            if isinstance(payload, dict)
+                            else None
+                        )
+                        incomplete_details = (
+                            terminal_response_payload.get("incomplete_details")
+                            if isinstance(terminal_response_payload, dict)
+                            else None
+                        )
+                        if (
+                            disposition
+                            is OpenAIResponsesWireDisposition.INCOMPLETE
+                            and isinstance(incomplete_details, dict)
+                            and incomplete_details.get("reason")
+                            == "upstream_stream_partial_frame"
+                        ):
+                            self.trace.partial_frame_discarded = True
                         terminal_block, partial_prefix_discarded = (
                             _terminal_block_suffix(
                                 block,
@@ -538,10 +605,16 @@ class OpenAIResponsesWireCoordinator:
                             disposition=disposition,
                         ):
                             yield emitted
-                        continue
+                        await self._drain_source_after_terminal()
+                        return
                     if saw_done:
                         self.trace.upstream_done_suppressed += 1
-                        continue
+                        async for emitted in self._emit_synthetic_terminal(
+                            disposition=OpenAIResponsesWireDisposition.INCOMPLETE,
+                            reason="provider_done_before_terminal_event",
+                        ):
+                            yield emitted
+                        return
                     yield block
 
             self._discard_partial_buffer()
@@ -657,6 +730,76 @@ class OpenAIResponsesStreamingResponse(StreamingResponse):
                 self.wire_trace.finalized = True
                 self.wire_trace.commitment = "finalized"
                 self.wire_trace.publish_request_commitment()
+            self.wire_trace.metadata.update(self.wire_trace.snapshot())
+
+
+class OpenAIResponsesBufferedResponse(Response):
+    """Delay native Responses ownership finalization until body delivery."""
+
+    def __init__(
+        self,
+        content: Any = None,
+        *,
+        wire_trace: OpenAIResponsesWireTrace,
+        disposition: OpenAIResponsesWireDisposition,
+        on_disposition: WireDispositionCallback,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(content=content, **kwargs)
+        self.wire_trace = wire_trace
+        self._disposition = disposition
+        self._on_disposition = on_disposition
+        self._finalization_started = False
+
+    async def _finalize(
+        self,
+        disposition: OpenAIResponsesWireDisposition,
+    ) -> None:
+        if self._finalization_started:
+            return
+        self._finalization_started = True
+        self.wire_trace.disposition = disposition
+        self.wire_trace.publish_request_commitment()
+        try:
+            await _await_shielded(self._on_disposition(disposition, self.wire_trace))
+        except Exception as exc:  # noqa: BLE001
+            self.wire_trace.metadata["disposition_callback_error"] = type(
+                exc
+            ).__name__
+        finally:
+            self.wire_trace.finalized = True
+            self.wire_trace.commitment = "finalized"
+            self.wire_trace.publish_request_commitment()
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        async def tracked_send(message: Dict[str, Any]) -> None:
+            await send(message)
+            message_type = message.get("type")
+            if message_type == "http.response.start":
+                self.wire_trace.response_start_sent = True
+                self.wire_trace.commitment = "headers"
+                self.wire_trace.state = OpenAIResponsesWireState.HEADERS_STARTED
+            elif message_type == "http.response.body":
+                self.wire_trace.first_body_sent = True
+                self.wire_trace.terminal_wire_committed = True
+                self.wire_trace.state = OpenAIResponsesWireState.BODY_STARTED
+                self.wire_trace.commitment = "body"
+            self.wire_trace.publish_request_commitment()
+
+        try:
+            await super().__call__(scope, receive, tracked_send)
+        except asyncio.CancelledError:
+            await self._finalize(OpenAIResponsesWireDisposition.CANCELLED)
+            raise
+        except (BrokenPipeError, ConnectionResetError):
+            await self._finalize(OpenAIResponsesWireDisposition.DISCONNECTED)
+            raise
+        except BaseException:
+            await self._finalize(OpenAIResponsesWireDisposition.DISCONNECTED)
+            raise
+        else:
+            await self._finalize(self._disposition)
+        finally:
             self.wire_trace.metadata.update(self.wire_trace.snapshot())
 
 

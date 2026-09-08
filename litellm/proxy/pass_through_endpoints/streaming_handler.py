@@ -1703,7 +1703,11 @@ class PassThroughStreamingHandler:
                             and downstream_chunk_count == 1
                         )
                         yield complete_chunk
-                        continue
+                        # The outer native Responses coordinator owns terminal
+                        # and [DONE] delivery. Resume once so this generator
+                        # can run its normal post-stream logging/finalization,
+                        # then stop before reading another provider chunk.
+                        break
 
                     (
                         chunk_without_done,
@@ -1806,16 +1810,12 @@ class PassThroughStreamingHandler:
                     _consume_responses_lines(responses_terminal_accumulator.finish())
 
                 if responses_sse_event_buffer:
-                    (
-                        chunk_without_done,
-                        held_responses_done_suffix,
-                    ) = PassThroughStreamingHandler._split_trailing_done_chunk(
-                        held_responses_done_suffix + responses_sse_event_buffer
-                    )
+                    # Native Responses partial frames are not client-deliverable
+                    # data. The outer coordinator emits one canonical
+                    # incomplete terminal at EOF; do not concatenate this tail
+                    # with that synthetic event.
                     responses_sse_event_buffer = b""
-                    if chunk_without_done:
-                        _record_responses_wire_chunk(chunk_without_done)
-                        yield chunk_without_done
+                    held_responses_done_suffix = b""
 
                 terminal_chunks: List[bytes] = []
                 if first_emitted_at is not None and not responses_terminal_seen:

@@ -2165,6 +2165,20 @@ async def handle_alias_route(  # noqa: PLR0915
                         if guard.provenance:
                             selection["session_owner_provenance"] = guard.provenance
 
+                        if _is_native_openai_responses_candidate(
+                            request=request,
+                            candidate=candidate,
+                        ):
+                            # Stage legacy affinity before the provider call so
+                            # buffered and streaming Responses paths can commit
+                            # it from the same accepted wire disposition.
+                            _stage_native_openai_responses_affinity_commitment(
+                                request=request,
+                                session_key=selection.get("session_key"),
+                                candidate=candidate,
+                                setter=set_session_affinity_fn,
+                            )
+
                         _dev_fault_plan._raise_if_openai_fault_plan_slot_fails(
                             request,
                             candidate=candidate,
@@ -2373,10 +2387,14 @@ async def handle_alias_route(  # noqa: PLR0915
                                         ),
                                         cooldown_keys=(selection["cooldown_key"],),
                                     )
-                                await set_session_affinity_fn(
-                                    selection.get("session_key"),
-                                    candidate,
-                                )
+                                if not _is_native_openai_responses_candidate(
+                                    request=request,
+                                    candidate=candidate,
+                                ):
+                                    await set_session_affinity_fn(
+                                        selection.get("session_key"),
+                                        candidate,
+                                    )
                                 assert response is not None
                                 attempt_record["attempted_provider_call"] = (
                                     attempted_provider_call
