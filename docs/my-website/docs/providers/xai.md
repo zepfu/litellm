@@ -163,10 +163,10 @@ and proxy redispatch. For direct SDK calls, put system guidance in the
 `input` message sequence yourself; strict mode rejects the unsupported
 parameter and permissive mode drops it.
 
-For supported LiteLLM proxy passthrough routes, custom and namespace tools are
-converted into xAI-compatible function tools before egress. LiteLLM applies
-required tool-description patches, removes unsupported hosted/request fields,
-and restores the original tool and namespace identities in returned tool
+For supported Codex auto-agent proxy routes, LiteLLM converts configured custom
+and namespace tools into xAI-compatible function tools before egress. The route
+applies required tool-description patches, removes unsupported hosted/request
+fields, and restores the original tool and namespace identities in returned tool
 calls. Send the original tool definitions; do not pre-flatten namespace tools.
 
 ### Image Inputs
