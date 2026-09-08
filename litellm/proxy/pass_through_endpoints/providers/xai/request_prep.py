@@ -31,6 +31,9 @@ from litellm.llms.xai.oauth import (
     bind_xai_oauth_snapshot_to_request as _bind_xai_oauth_snapshot_to_request,
 )
 from litellm.llms.xai.oauth import (
+    get_xai_oauth_snapshot_from_request as _get_xai_oauth_snapshot_from_request,
+)
+from litellm.llms.xai.oauth import (
     get_grok_native_oauth_access_token as _get_grok_native_oauth_access_token,
 )
 from litellm.llms.xai.oauth import (
