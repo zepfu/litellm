@@ -138,6 +138,22 @@ tracked separately from logical calls, and telemetry exposes only bounded
 fingerprints for targets, candidates, and account lanes. Non-OpenAI pass-through
 providers bypass this ledger and retain their existing transport behavior.
 
+### Native OpenAI Responses delivered disposition (OPENAI-046)
+
+Native Responses handling keeps provider-stream observations separate from the
+client-visible result. `OpenAIResponsesWireTrace` selects one terminal
+disposition and publishes an immutable post-ASGI snapshot only after response
+delivery completes. The supported delivered outcomes are `completed`,
+`failed`, `incomplete`, `cancelled`, and `disconnected`.
+
+Logging, success/failure callbacks, route rollups, session transfer terminal
+state, and native Responses ownership consume that delivered snapshot. A
+non-`completed` result uses the canonical failure path, so it cannot produce a
+success callback or completed transfer. Provider response usage and cost remain
+attached as evidence when delivered output fails. Provider-stream summaries and
+delivered-stream summaries remain distinct; policy wrappers run inside the wire
+coordinator so policy rejection is represented by the same terminal outcome.
+
 ### Tool-schema normalization gate (issue #9)
 
 - OpenAI function-tool `type: object` `properties` fixes run only for

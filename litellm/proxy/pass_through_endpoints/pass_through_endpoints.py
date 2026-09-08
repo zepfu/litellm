@@ -4193,6 +4193,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                     "method": request.method,
                     "body": _shallow_copy_request_dict(working_body),
                     "headers": request_headers or {},
+                    "_request": request,
                 },
             },
             "call_type": "pass_through_endpoint",
@@ -5633,6 +5634,11 @@ async def pass_through_request(  # noqa: PLR0915
                 span_metadata={"stage": "upstream_wait", "stream": True},
             )
 
+            wire_trace = (
+                OpenAIResponsesWireTrace()
+                if is_native_openai_responses_route
+                else None
+            )
             processed_chunks = PassThroughStreamingHandler.chunk_processor(
                 response=response,
                 request_body=_parsed_body,
@@ -5648,6 +5654,7 @@ async def pass_through_request(  # noqa: PLR0915
                 upstream_wait_completed_at=upstream_wait_completed_at,
                 local_prepare_ms=local_prepare_ms,
                 error_log_context=error_log_context,
+                openai_wire_trace=wire_trace,
             )
             if (
                 responses_function_name_rewrite is not None
@@ -5689,6 +5696,7 @@ async def pass_through_request(  # noqa: PLR0915
                     processed_chunks,
                     upstream_response=response,
                     on_disposition=_on_native_wire_disposition,
+                    trace=wire_trace,
                     model=(
                         str(provider_bound_body.get("model"))
                         if isinstance(provider_bound_body, dict)
@@ -5904,6 +5912,11 @@ async def pass_through_request(  # noqa: PLR0915
         verbose_proxy_logger.debug("response.headers= %s", response.headers)
 
         if _is_streaming_response(response) is True:
+            wire_trace = (
+                OpenAIResponsesWireTrace()
+                if is_native_openai_responses_route
+                else None
+            )
             processed_chunks = PassThroughStreamingHandler.chunk_processor(
                 response=response,
                 request_body=_parsed_body,
@@ -5919,6 +5932,7 @@ async def pass_through_request(  # noqa: PLR0915
                 upstream_wait_completed_at=upstream_wait_completed_at,
                 local_prepare_ms=local_prepare_ms,
                 error_log_context=error_log_context,
+                openai_wire_trace=wire_trace,
             )
             if (
                 responses_function_name_rewrite is not None
@@ -5960,6 +5974,7 @@ async def pass_through_request(  # noqa: PLR0915
                     processed_chunks,
                     upstream_response=response,
                     on_disposition=_on_native_wire_disposition,
+                    trace=wire_trace,
                     model=(
                         str(provider_bound_body.get("model"))
                         if isinstance(provider_bound_body, dict)
@@ -6096,21 +6111,22 @@ async def pass_through_request(  # noqa: PLR0915
             extra_metadata={"stream": False},
         )
         end_time = datetime.now()
-        asyncio.create_task(
-            pass_through_endpoint_logging.pass_through_async_success_handler(
-                httpx_response=response,
-                response_body=response_body,
-                url_route=str(url),
-                result="",
-                start_time=start_time,
-                end_time=end_time,
-                logging_obj=logging_obj,
-                cache_hit=False,
-                request_body=_parsed_body,
-                custom_llm_provider=custom_llm_provider,
-                **kwargs,
+        if not is_native_openai_responses_route:
+            asyncio.create_task(
+                pass_through_endpoint_logging.pass_through_async_success_handler(
+                    httpx_response=response,
+                    response_body=response_body,
+                    url_route=str(url),
+                    result="",
+                    start_time=start_time,
+                    end_time=end_time,
+                    logging_obj=logging_obj,
+                    cache_hit=False,
+                    request_body=_parsed_body,
+                    custom_llm_provider=custom_llm_provider,
+                    **kwargs,
+                )
             )
-        )
         local_finalize_ms = _record_passthrough_duration(
             kwargs,
             metric_key="aawm_local_finalize_ms",
@@ -6158,7 +6174,11 @@ async def pass_through_request(  # noqa: PLR0915
                 publish_transfer_terminal,
             )
 
-            if not stream and _transfer_identity:
+            if (
+                not stream
+                and _transfer_identity
+                and not is_native_openai_responses_route
+            ):
                 await publish_transfer_terminal(_transfer_identity, "completed")
         except Exception:
             verbose_proxy_logger.debug(
@@ -6192,6 +6212,56 @@ async def pass_through_request(  # noqa: PLR0915
                     trace=trace,
                 )
 
+            async def _on_native_wire_delivered(
+                delivered_snapshot: Dict[str, Any],
+            ) -> None:
+                metadata = _ensure_passthrough_metadata(kwargs)
+                metadata["aawm_delivered_wire_disposition"] = dict(
+                    delivered_snapshot
+                )
+                delivered_disposition = str(
+                    delivered_snapshot.get("disposition") or ""
+                ).strip().lower()
+                metadata["aawm_delivered_disposition"] = delivered_disposition
+                transfer_phase = {
+                    "completed": "completed",
+                    "failed": "failed",
+                    "incomplete": "failed",
+                    "cancelled": "cancelled",
+                    "disconnected": "disconnected",
+                }.get(delivered_disposition, "failed")
+                if _transfer_identity:
+                    try:
+                        from litellm.proxy.aawm_session_transfer.hooks import (
+                            publish_transfer_terminal,
+                        )
+
+                        await publish_transfer_terminal(
+                            _transfer_identity,
+                            transfer_phase,
+                        )
+                    except Exception:
+                        verbose_proxy_logger.debug(
+                            "Failed to publish delivered session-transfer phase",
+                            exc_info=True,
+                        )
+                await pass_through_endpoint_logging.pass_through_async_success_handler(
+                    httpx_response=response,
+                    response_body=response_body,
+                    url_route=str(url),
+                    result="",
+                    start_time=start_time,
+                    end_time=end_time,
+                    logging_obj=logging_obj,
+                    cache_hit=False,
+                    request_body=_parsed_body,
+                    custom_llm_provider=custom_llm_provider,
+                    **kwargs,
+                )
+
+            wire_trace.register_post_finalization_callback(
+                _on_native_wire_delivered
+            )
             bind_openai_responses_wire_trace_to_request(request, wire_trace)
             return OpenAIResponsesBufferedResponse(
                 content=content,

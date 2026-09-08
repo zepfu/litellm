@@ -12,7 +12,15 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, AsyncIterable, AsyncIterator, Awaitable, Callable, Dict, Optional
+from typing import (
+    Any,
+    AsyncIterable,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    Optional,
+)
 
 from starlette.responses import Response, StreamingResponse
 
@@ -76,6 +84,29 @@ class OpenAIResponsesWireTrace:
         repr=False,
         compare=False,
     )
+    _post_finalization_callbacks: list[
+        Callable[[Dict[str, Any]], Awaitable[None]]
+    ] = field(
+        default_factory=list,
+        repr=False,
+        compare=False,
+    )
+    _post_finalization_task: Optional[Any] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _finalized_snapshot: Optional[Dict[str, Any]] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _delivered_snapshot: Optional[Dict[str, Any]] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    asgi_delivery_complete: bool = False
 
     def publish_request_commitment(self) -> None:
         request = self._request
@@ -122,6 +153,7 @@ class OpenAIResponsesWireTrace:
             "close_error": self.close_error,
             "finalization_started": self.finalization_started,
             "finalized": self.finalized,
+            "asgi_delivery_complete": self.asgi_delivery_complete,
         }
 
     def record_response_start_delivery(self) -> None:
@@ -159,6 +191,64 @@ class OpenAIResponsesWireTrace:
                 self.state = OpenAIResponsesWireState.BODY_STARTED
         self.publish_request_commitment()
 
+    def register_post_finalization_callback(
+        self,
+        callback: Callable[[Dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        """Register a consumer that runs after final disposition delivery."""
+
+        if self._delivered_snapshot is not None:
+            return
+        self._post_finalization_callbacks.append(callback)
+
+    def record_asgi_delivery_complete(self) -> None:
+        """Freeze the delivered snapshot after the response attempt finishes."""
+
+        self.asgi_delivery_complete = True
+        if self.finalized:
+            delivered_snapshot = dict(
+                self._finalized_snapshot or self.snapshot()
+            )
+            delivered_snapshot["asgi_delivery_complete"] = True
+            self._delivered_snapshot = delivered_snapshot
+            request = self._request
+            state = getattr(request, "state", None)
+            if state is not None:
+                try:
+                    setattr(
+                        state,
+                        "_aawm_openai_responses_delivered_snapshot",
+                        dict(delivered_snapshot),
+                    )
+                except Exception:
+                    pass
+        self.publish_request_commitment()
+
+    async def run_post_finalization_callbacks(self) -> None:
+        """Run terminal consumers against one immutable delivered snapshot."""
+
+        if not self.finalized or not self.asgi_delivery_complete:
+            return
+        if self._post_finalization_task is None:
+            snapshot = dict(
+                self._delivered_snapshot
+                or self._finalized_snapshot
+                or self.snapshot()
+            )
+            callbacks = tuple(self._post_finalization_callbacks)
+
+            async def _run_callbacks() -> None:
+                for callback in callbacks:
+                    try:
+                        await callback(dict(snapshot))
+                    except Exception as exc:  # noqa: BLE001
+                        self.metadata["post_finalization_callback_error"] = (
+                            type(exc).__name__
+                        )
+
+            self._post_finalization_task = asyncio.create_task(_run_callbacks())
+        await _await_shielded(self._post_finalization_task)
+
     async def _finalize_disposition(
         self,
         disposition: OpenAIResponsesWireDisposition,
@@ -186,6 +276,7 @@ class OpenAIResponsesWireTrace:
                 finally:
                     self.finalized = True
                     self.commitment = "finalized"
+                    self._finalized_snapshot = self.snapshot()
                     self.publish_request_commitment()
 
             finalization_task = asyncio.create_task(_run_finalization())
@@ -765,7 +856,7 @@ class OpenAIResponsesStreamingResponse(StreamingResponse):
                         await _await_shielded(
                             finalizer(OpenAIResponsesWireDisposition.DISCONNECTED)
                         )
-                    except Exception as exc:  # noqa: BLE001
+                    except BaseException as exc:  # noqa: BLE001
                         self.wire_trace.metadata[
                             "disposition_callback_error"
                         ] = type(exc).__name__
@@ -775,10 +866,19 @@ class OpenAIResponsesStreamingResponse(StreamingResponse):
                             OpenAIResponsesWireDisposition.DISCONNECTED,
                             self._on_disposition,
                         )
-                    except Exception as exc:  # noqa: BLE001
+                    except BaseException as exc:  # noqa: BLE001
                         self.wire_trace.metadata[
                             "disposition_callback_error"
                         ] = type(exc).__name__
+            self.wire_trace.record_asgi_delivery_complete()
+            try:
+                await _await_shielded(
+                    self.wire_trace.run_post_finalization_callbacks()
+                )
+            except BaseException as exc:  # noqa: BLE001
+                self.wire_trace.metadata[
+                    "post_finalization_callback_error"
+                ] = type(exc).__name__
             self.wire_trace.metadata.update(self.wire_trace.snapshot())
 
 
@@ -835,6 +935,15 @@ class OpenAIResponsesBufferedResponse(Response):
         else:
             await self._finalize(self._disposition)
         finally:
+            self.wire_trace.record_asgi_delivery_complete()
+            try:
+                await _await_shielded(
+                    self.wire_trace.run_post_finalization_callbacks()
+                )
+            except BaseException as exc:  # noqa: BLE001
+                self.wire_trace.metadata[
+                    "post_finalization_callback_error"
+                ] = type(exc).__name__
             self.wire_trace.metadata.update(self.wire_trace.snapshot())
 
 
@@ -843,11 +952,12 @@ def wrap_openai_responses_stream(
     *,
     upstream_response: Any = None,
     on_disposition: Optional[WireDispositionCallback] = None,
+    trace: Optional[OpenAIResponsesWireTrace] = None,
     model: Optional[str] = None,
 ) -> tuple[AsyncIterator[bytes], OpenAIResponsesWireTrace]:
     """Wrap a processed stream and return its iterator plus lifecycle trace."""
 
-    trace = OpenAIResponsesWireTrace()
+    trace = trace or OpenAIResponsesWireTrace()
     coordinator = OpenAIResponsesWireCoordinator(
         source,
         upstream_response=upstream_response,
