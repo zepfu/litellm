@@ -696,6 +696,69 @@ def _classify_codex_fresh_auth_failure(
     return "provider_terminal_error"
 
 
+def _is_managed_xai_oauth_candidate(candidate: Any) -> bool:
+    if not isinstance(candidate, Mapping):
+        return False
+    return (
+        candidate.get("provider") == "xai"
+        and candidate.get("route_family")
+        in {
+            "codex_xai_oauth_responses_adapter",
+            "anthropic_xai_oauth_responses_adapter",
+            "codex_auto_agent_xai_oauth_responses",
+        }
+    )
+
+
+async def _try_managed_xai_oauth_generation_retry(
+    *,
+    request: Any,
+    candidate: Mapping[str, Any],
+    exc: BaseException,
+    attempted_provider_call: bool,
+) -> Optional[Any]:
+    """Accept one changed same-account managed xAI snapshot after a 401."""
+
+    if (
+        not attempted_provider_call
+        or not _is_managed_xai_oauth_candidate(candidate)
+        or _error_signals._extract_adapter_exception_status_code(exc) != 401
+        or (
+            getattr(exc, "_aawm_provider_returned", False) is not True
+            and getattr(exc, "provider_returned", False) is not True
+        )
+        or getattr(exc, "pre_commit_retry_exhausted", False) is True
+    ):
+        return None
+    failure_phase = getattr(exc, "failure_phase", None)
+    if isinstance(failure_phase, str) and (
+        "post_first_byte" in failure_phase
+        or "stream_interrupted" in failure_phase
+        or "post_commit" in failure_phase
+    ):
+        return None
+
+    from litellm.llms.xai.oauth import (
+        bind_xai_oauth_snapshot_to_request,
+        get_xai_oauth_snapshot_from_request,
+        reread_xai_oauth_snapshot_after_401,
+    )
+
+    snapshot = get_xai_oauth_snapshot_from_request(request)
+    if snapshot is None:
+        return None
+    try:
+        refreshed_snapshot = await reread_xai_oauth_snapshot_after_401(snapshot)
+    except Exception:
+        # Missing, malformed, expired, or replaced-account material is not
+        # eligible for recovery; preserve the original provider 401.
+        return None
+    if refreshed_snapshot is None:
+        return None
+    bind_xai_oauth_snapshot_to_request(request, refreshed_snapshot)
+    return refreshed_snapshot
+
+
 def _classify_kimi_invalid_request_failure(
     exc: Exception,
     *,
@@ -960,6 +1023,7 @@ async def handle_alias_route(  # noqa: PLR0915
     native_grok_continuation_transient_provider_attempts = 0
     provider_candidate_attempts = 0
     same_account_transient_attempts_by_slot: dict[Optional[str], int] = {}
+    managed_xai_generation_retry_attempted = False
     request_retry_started_at = time.monotonic()
     request_retry_budget = OpenAIAlphaCapacityRetryBudget()
     token_invalidated_reload_attempts: set[str] = set()
@@ -2604,6 +2668,72 @@ async def handle_alias_route(  # noqa: PLR0915
                             attempted_provider_call=True,
                             request=request,
                         )
+
+                    if (
+                        probe_failure_exc is not None
+                        and not managed_xai_generation_retry_attempted
+                    ):
+                        refreshed_snapshot = (
+                            await _try_managed_xai_oauth_generation_retry(
+                                request=request,
+                                candidate=candidate,
+                                exc=probe_failure_exc,
+                                attempted_provider_call=attempted_provider_call,
+                            )
+                        )
+                        if refreshed_snapshot is not None:
+                            managed_xai_generation_retry_attempted = True
+                            attempt_record["status"] = (
+                                "xai_oauth_generation_changed_retry"
+                            )
+                            attempt_record["failure_phase"] = (
+                                "xai_oauth_generation_refresh"
+                            )
+                            attempt_record["attempted_provider_call"] = (
+                                attempted_provider_call
+                            )
+                            _update_codex_auto_agent_retryable_attempt_record(
+                                attempt_record=attempt_record,
+                                exc=probe_failure_exc,
+                                error_class="token_invalidated",
+                                cooldown_seconds=0.0,
+                                cooldown_scope="none",
+                                alias_model=alias_model,
+                                candidate=candidate,
+                            )
+                            attempt_record["status"] = (
+                                "xai_oauth_generation_changed_retry"
+                            )
+                            attempt_record["failure_phase"] = (
+                                "xai_oauth_generation_refresh"
+                            )
+                            attempt_record["attempted_provider_call"] = (
+                                attempted_provider_call
+                            )
+                            attempt_record["xai_oauth_generation_changed"] = True
+                            attempt_record["xai_oauth_generation"] = (
+                                getattr(refreshed_snapshot, "generation", None)
+                            )
+                            _record_auto_agent_alias_attempt_failure(
+                                alias_family=alias_family,
+                                alias_model=alias_model,
+                                request=request,
+                                prepared_request_body=prepared_request_body,
+                                selection=selection,
+                                attempts=attempts,
+                                attempt_record=attempt_record,
+                                error_class="token_invalidated",
+                                add_alias_metadata_fn=add_alias_metadata_fn,
+                            )
+                            intent.complete(error=probe_failure_exc)
+                            alias_routing_state.publication_intents.remove(intent)
+                            attempt_record = _codex_auto_agent_candidate_public_shape(
+                                candidate,
+                                lane_key=selection.get("lane_key"),
+                                reason="xai_oauth_generation_changed_retry",
+                            )
+                            attempt_record["attempted_provider_call"] = False
+                            continue
 
                     # Resolve the plan AFTER lock release.  If the resolver
                     # raises, the outer BaseException handler cleans up the

@@ -172,6 +172,15 @@ cached snapshot before a later request rebuilds it. Missing, malformed,
 ambiguous-scope, expired, and near-expiry records fail closed; request handling
 does not refresh or write the managed credential file.
 
+For a provider-owned managed xAI `401` before response bytes are committed,
+LiteLLM may reread the exact bound file and scope and retry once on alias,
+direct async, OpenAI passthrough, or Anthropic compatibility routes. The
+reread must produce a changed trusted generation with the same non-secret
+account identity, and the retry reuses the original request body. Unchanged
+generations, a second `401`, missing or unproven account evidence, and
+different-account material are not retried. Native `xai/*` Grok OIDC traffic
+does not use this managed OAuth recovery.
+
 ## Rate-limit handling
 
 For an xAI provider `429`, LiteLLM uses a valid `Retry-After` value first.

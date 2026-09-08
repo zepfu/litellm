@@ -130,6 +130,45 @@ Follow the latest user task exactly. Use the provided tool schemas as the source
 Do NOT Write report/summary/findings/analysis .md files unless EXPLICITLY asked to do. Regardless of a file write-- you need to return findings directly as your final assistant message."""
 
 
+async def _run_managed_xai_oauth_precommit_retry(
+    *,
+    request: Request,
+    api_base: Optional[str],
+    enabled: bool,
+    operation: Callable[[], Awaitable[Any]],
+    on_refresh: Callable[[Any], None],
+) -> Any:
+    """Retry one direct managed xAI operation after a verified 401 rotation."""
+    try:
+        return await operation()
+    except Exception as exc:
+        if not enabled:
+            raise
+        from litellm.llms.xai.oauth import (
+            bind_xai_oauth_snapshot_to_request,
+            get_xai_oauth_snapshot_from_request,
+            reread_xai_oauth_snapshot_after_provider_401,
+        )
+
+        snapshot = get_xai_oauth_snapshot_from_request(request)
+        if snapshot is None:
+            raise
+        refreshed_snapshot = await reread_xai_oauth_snapshot_after_provider_401(
+            snapshot,
+            exc,
+            api_base=api_base,
+        )
+        if refreshed_snapshot is None:
+            raise
+        bind_xai_oauth_snapshot_to_request(request, refreshed_snapshot)
+        on_refresh(refreshed_snapshot)
+        try:
+            return await operation()
+        except Exception as retry_exc:
+            setattr(retry_exc, "pre_commit_retry_exhausted", True)
+            raise
+
+
 def _watermark_endpoint_from_path(*parts: Any) -> str:
     combined = " ".join(
         str(part or "") for part in parts if part is not None
@@ -1235,6 +1274,8 @@ async def _perform_anthropic_responses_adapter_pass_through(
     expected_target_family: Optional[str] = None,
     retryable_upstream_status_codes: Optional[list[int]] = None,
     pass_through_fn: Optional[Callable[..., Awaitable[object]]] = None,
+    managed_xai_oauth_request: bool = False,
+    blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
     use_codex_native_tools: Optional[bool] = None,
     malformed_upstream_url: Optional[object] = None,
     extra_pass_through_kwargs: Optional[Payload] = None,
@@ -1262,6 +1303,16 @@ async def _perform_anthropic_responses_adapter_pass_through(
         "retryable_upstream_status_codes": retry_codes,
         "caller_managed_hidden_retry": use_alias_candidate_probe,
     }
+    managed_xai_oauth_request = bool(
+        managed_xai_oauth_request
+        or config.adapter == _aawm_adapter_config.XAI_OAUTH_RESPONSES.adapter
+    )
+    if managed_xai_oauth_request:
+        pt_kwargs["managed_xai_oauth_request"] = True
+        pt_kwargs["blocked_pass_through_prefixed_headers"] = (
+            blocked_pass_through_prefixed_headers
+            or ["authorization", "api-key", "x-api-key"]
+        )
     if allowed_forward_headers is not None:
         pt_kwargs["allowed_forward_headers"] = allowed_forward_headers
     if allowed_pass_through_prefixed_headers is not None:
@@ -1301,7 +1352,25 @@ async def _perform_anthropic_responses_adapter_pass_through(
             request=request,
         )
         pt_kwargs["custom_headers"] = custom_headers
-    upstream_response = await transport(**pt_kwargs)
+    async def _transport_operation() -> object:
+        return await transport(**pt_kwargs)
+
+    def _refresh_transport_headers(snapshot: Any) -> None:
+        headers = pt_kwargs.get("custom_headers")
+        refreshed_headers = dict(headers) if isinstance(headers, dict) else {}
+        for key in list(refreshed_headers):
+            if str(key).lower() in {"authorization", "api-key", "x-api-key"}:
+                refreshed_headers.pop(key, None)
+        refreshed_headers["authorization"] = f"Bearer {snapshot.access_token}"
+        pt_kwargs["custom_headers"] = refreshed_headers
+
+    upstream_response = await _run_managed_xai_oauth_precommit_retry(
+        request=request,
+        api_base=str(target_url),
+        enabled=managed_xai_oauth_request,
+        operation=_transport_operation,
+        on_refresh=_refresh_transport_headers,
+    )
     return await _finalize_anthropic_responses_adapter_from_config(
         config=config,
         upstream_response=upstream_response,
@@ -1484,6 +1553,7 @@ async def _perform_anthropic_completion_adapter_messages_call(
     fake_stream: bool = False,
     extra_handler_kwargs: Optional[Payload] = None,
     completion_stream_normalizer: Optional[Callable[[Any], Any]] = None,
+    managed_xai_oauth_request: bool = False,
 ) -> Response:
     """Shared completion-adapter messages handler + response branch (RR-054 #9)."""
     from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
@@ -1568,6 +1638,28 @@ async def _perform_anthropic_completion_adapter_messages_call(
             tool_name_mapping=tool_name_mapping,
         )
 
+    def _refresh_completion_credentials(snapshot: Any) -> None:
+        completion_kwargs["api_key"] = snapshot.access_token
+        handler_extra_kwargs["api_key"] = snapshot.access_token
+
+    async def _operation_with_managed_xai_retry() -> object:
+        async def _initial_operation() -> object:
+            if operation_wrapper is not None:
+                return await operation_wrapper(_operation)
+            return await _operation()
+
+        return await _run_managed_xai_oauth_precommit_retry(
+            request=request,
+            api_base=api_base,
+            enabled=bool(
+                managed_xai_oauth_request
+                or config.adapter
+                == _aawm_adapter_config.XAI_OAUTH_COMPLETION.adapter
+            ),
+            operation=_initial_operation,
+            on_refresh=_refresh_completion_credentials,
+        )
+
     litellm_metadata = prepared_request_body.get("litellm_metadata")
     rollup_kwargs = _build_adapted_route_rollup_kwargs(litellm_metadata if isinstance(litellm_metadata, dict) else {})
     _annotate_request_scope_for_adapted_access_log(request, target_url)
@@ -1600,10 +1692,7 @@ async def _perform_anthropic_completion_adapter_messages_call(
     )
 
     try:
-        if operation_wrapper is not None:
-            completion_response = await operation_wrapper(_operation)
-        else:
-            completion_response = await _operation()
+        completion_response = await _operation_with_managed_xai_retry()
         response = _finalize_anthropic_completion_adapter_response(
             completion_response=completion_response,
             stream_flag=stream_flag,
@@ -1692,6 +1781,7 @@ _EXTRACTED_FUNCTION_NAMES: tuple[str, ...] = (
     "_finalize_anthropic_responses_adapter_upstream_response",
     "_finalize_anthropic_responses_adapter_from_config",
     "_perform_anthropic_responses_adapter_pass_through",
+    "_run_managed_xai_oauth_precommit_retry",
     "_perform_normalized_anthropic_completion_adapter_stream",
     "_is_anthropic_messages_response",
     "_finalize_anthropic_completion_adapter_response",
