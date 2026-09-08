@@ -2121,12 +2121,19 @@ def _chatgpt_native_history_probe_requested(
     if os.getenv(CHATGPT_NATIVE_HISTORY_PROBE_ACCOUNT_LABEL_ENV):
         return True
     arguments = sys.argv[1:] if argv is None else argv
-    option = "--chatgpt-native-history-probe-account-label"
-    return any(
-        isinstance(argument, str)
-        and (argument == option or argument.startswith(f"{option}="))
-        for argument in arguments
+    probe_options = (
+        "--chatgpt-native-history-probe-account-label",
+        "--chatgpt-native-history-probe-cooldown-cleared",
     )
+    for argument in arguments:
+        if not isinstance(argument, str) or not argument.startswith("--"):
+            continue
+        option = argument.split("=", 1)[0]
+        if len(option) > 2 and any(
+            option_name.startswith(option) for option_name in probe_options
+        ):
+            return True
+    return False
 
 
 def _parse_chatgpt_conversation_init_account_bindings(
@@ -3703,7 +3710,10 @@ def _build_parser(  # noqa: PLR0915
         if suppress_errors
         else argparse.ArgumentParser
     )
-    parser = parser_type(description=__doc__, allow_abbrev=False)
+    parser = parser_type(
+        description=__doc__,
+        allow_abbrev=not suppress_errors,
+    )
     parser.add_argument(
         "--apply",
         dest="apply",
@@ -17694,27 +17704,27 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
             # before it can be emitted must still reach the bounded drain.
             exit_status = 1
         finally:
-            operation_deadline = (
-                sidecar_state.chatgpt_native_history_probe_operation_deadline
+            fallback_shutdown_deadline = (
+                time.monotonic()
+                + DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS
             )
-            cancellation_deadline = (
-                sidecar_state.chatgpt_oracle_browser_shutdown_deadline
-            )
-            if operation_deadline is not None and cancellation_deadline is not None:
-                shutdown_deadline = min(operation_deadline, cancellation_deadline)
-            elif operation_deadline is not None:
-                shutdown_deadline = operation_deadline
-            elif cancellation_deadline is not None:
-                shutdown_deadline = cancellation_deadline
-            else:
-                shutdown_deadline = (
-                    time.monotonic()
-                    + DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS
-                )
+
+            def _probe_shutdown_deadline() -> float:
+                """Re-read the shared cutoff so cancellation can shorten drain."""
+                deadlines = [
+                    deadline
+                    for deadline in (
+                        sidecar_state.chatgpt_native_history_probe_operation_deadline,
+                        sidecar_state.chatgpt_oracle_browser_shutdown_deadline,
+                    )
+                    if deadline is not None
+                ]
+                return min(deadlines) if deadlines else fallback_shutdown_deadline
+
             try:
                 drained = _drain_pending_chatgpt_oracle_browser_owners(
                     sidecar_state,
-                    deadline=shutdown_deadline,
+                    deadline=_probe_shutdown_deadline(),
                 )
             except Exception:
                 drained = False
@@ -17735,6 +17745,7 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
                 # Keep the admitted state alive while an owner remains pending.
                 # Returning here would abandon the only in-memory supervisor.
                 while True:
+                    shutdown_deadline = _probe_shutdown_deadline()
                     try:
                         _service_pending_chatgpt_oracle_browser_owners(
                             sidecar_state,

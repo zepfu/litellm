@@ -1045,11 +1045,12 @@ one-shot foreground action, not a recurring schedule. A
 `history_observation_failed` result exits nonzero; `no_history_observed` is a
 distinct bounded outcome and exits zero.
 
-Probe option parsing is strict: abbreviated long options are rejected. When
-the exact probe option is present, malformed arguments emit only the fixed
-`ChatGPTNativeHistoryProbeConfigurationInvalid` event; argparse usage text and
-raw option values are suppressed. Normal sidecar invocations retain their
-ordinary argparse diagnostics.
+Probe option parsing is strict: abbreviated probe long options are rejected.
+When an exact or abbreviated probe option is present, malformed arguments emit
+only the fixed `ChatGPTNativeHistoryProbeConfigurationInvalid` event; argparse
+usage text and raw option values are suppressed. Normal sidecar invocations
+retain argparse's ordinary unique long-option abbreviation behavior and
+diagnostics.
 
 The operation deadline is distinct from the sidecar's cancellation cutoff.
 Startup, observation, and cleanup use the same absolute operation ceiling;
@@ -1060,6 +1061,9 @@ ceiling through the existing browser-binding context as the optional keyword
 accept that keyword with a default of `None` for existing callers and
 propagate it through startup and failure cleanup; its effective cleanup
 deadline remains the minimum of the operation ceiling and cancellation cutoff.
+If the initial drain leaves an owner retained, the probe caller recomputes that
+minimum before each subsequent servicing pass; the lifecycle owner still
+enforces the cutoff within its own cleanup plan.
 If a bounded drain cannot prove owner retirement, the admitted sidecar state
 continues supervising retained owners until they retire; it is not released
 while owners remain pending.
