@@ -195,15 +195,16 @@ def inspect_xai_oauth_credential_health(
     """Read and classify xAI OAuth state without locks, writes, or HTTP."""
     resolved_auth_file = Path(auth_file).expanduser()
     resolved_scope = _resolve_scope(scope)
-    resolved_buffer_seconds = _resolve_buffer_seconds(buffer_seconds)
+    refresh_buffer_seconds = _resolve_buffer_seconds(buffer_seconds)
+    route_safety_buffer_seconds = _resolve_route_safety_buffer_seconds()
     try:
         credential = _select_credential_record(
             _read_credential_payload(resolved_auth_file), resolved_scope
         )
         lifecycle = evaluate_xai_oauth_credential_lifecycle(
             credential,
-            route_safety_buffer_seconds=resolved_buffer_seconds,
-            refresh_min_seconds=resolved_buffer_seconds,
+            route_safety_buffer_seconds=route_safety_buffer_seconds,
+            refresh_min_seconds=refresh_buffer_seconds,
         )
         error_class: Optional[str] = None
         error_message: Optional[str] = None
@@ -233,7 +234,7 @@ def inspect_xai_oauth_credential_health(
                 scope=resolved_scope,
             ),
             lifecycle=lifecycle,
-            route_safety_buffer_seconds=resolved_buffer_seconds,
+            route_safety_buffer_seconds=route_safety_buffer_seconds,
         )
     except Exception as exc:
         return _xai_health_summary(
@@ -246,7 +247,7 @@ def inspect_xai_oauth_credential_health(
                 resolved_auth_file,
                 scope=resolved_scope,
             ),
-            route_safety_buffer_seconds=resolved_buffer_seconds,
+            route_safety_buffer_seconds=route_safety_buffer_seconds,
         )
 
 
@@ -448,14 +449,16 @@ def inspect_xai_oauth_refresh_eligibility(
     resolved_auth_file = Path(auth_file).expanduser()
     observed_at = _resolve_wall_now(now)
     resolved_scope = _resolve_scope(scope)
+    refresh_buffer_seconds = max(0, int(buffer_seconds))
+    route_safety_buffer_seconds = _resolve_route_safety_buffer_seconds()
     try:
         payload = _read_credential_payload(resolved_auth_file)
         credential = _select_credential_record(payload, resolved_scope)
         lifecycle = evaluate_xai_oauth_credential_lifecycle(
             credential,
             now=lambda: observed_at,
-            route_safety_buffer_seconds=max(0, int(buffer_seconds)),
-            refresh_min_seconds=max(0, int(buffer_seconds)),
+            route_safety_buffer_seconds=route_safety_buffer_seconds,
+            refresh_min_seconds=refresh_buffer_seconds,
         )
         expires_at = lifecycle.get("expires_at")
         refresh_due_at = lifecycle.get("refresh_due_at")
@@ -494,7 +497,7 @@ def inspect_xai_oauth_refresh_eligibility(
                 scope=resolved_scope,
             ),
             lifecycle=lifecycle,
-            route_safety_buffer_seconds=max(0, int(buffer_seconds)),
+            route_safety_buffer_seconds=route_safety_buffer_seconds,
         )
     except Exception as exc:
         return _eligibility_summary(
@@ -508,14 +511,14 @@ def inspect_xai_oauth_refresh_eligibility(
             usable=False,
             error_class=exc.__class__.__name__,
             error_message=_sanitize_error_message(str(exc)),
-            refresh_threshold_seconds=float(DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS),
+            refresh_threshold_seconds=float(refresh_buffer_seconds),
             refresh_threshold_source="fallback",
             refresh_threshold_degraded=True,
             credential_identity=_credential_identity(
                 resolved_auth_file,
                 scope=resolved_scope,
             ),
-            route_safety_buffer_seconds=max(0, int(buffer_seconds)),
+            route_safety_buffer_seconds=route_safety_buffer_seconds,
         )
 
 
@@ -597,6 +600,16 @@ def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:
     raw_value = os.getenv("AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS") or os.getenv(
         "LITELLM_XAI_OAUTH_REFRESH_BUFFER_SECONDS"
     )
+    if raw_value is None or not raw_value.strip():
+        return DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS
+    try:
+        return max(0, int(raw_value))
+    except ValueError:
+        return DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS
+
+
+def _resolve_route_safety_buffer_seconds() -> int:
+    raw_value = os.getenv("LITELLM_XAI_OAUTH_REFRESH_BUFFER_SECONDS")
     if raw_value is None or not raw_value.strip():
         return DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS
     try:
@@ -698,7 +711,7 @@ def _credential_needs_refresh(
     """
     lifecycle = evaluate_xai_oauth_credential_lifecycle(
         credential,
-        route_safety_buffer_seconds=max(0, int(buffer_seconds)),
+        route_safety_buffer_seconds=_resolve_route_safety_buffer_seconds(),
         refresh_min_seconds=max(0, int(buffer_seconds)),
     )
     return bool(lifecycle["refresh_due"])
