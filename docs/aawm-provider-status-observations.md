@@ -964,6 +964,27 @@ the shared browser session, preserving other sessions and prior observation
 rows. A deferred or failed capture is not fresh evidence and does not replace
 prior rows or establish account coverage.
 
+### Native ChatGPT history observation
+
+`observe_native_chatgpt_history_from_oracle_browser(...)` is a separate,
+attach-only feasibility observer for ordinary Chat history. It requires the
+exact CDP anchor target and the pinned canonical-12 account hash
+`8e92854835c4`, creates one owned page in that browser context, and performs
+one ordinary `https://chatgpt.com/` navigation. It observes at most one native
+`GET /backend-api/conversations` request through CDP
+`Network.requestWillBeSent`, `Network.requestWillBeSentExtraInfo`, and the
+correlated response events. The timeout is capped at 150 seconds and the
+response body budget at 1 MiB (1,048,576 bytes).
+
+The observer never calls the history endpoint directly, supplies guessed
+headers, reads cookies or storage, paginates, requests conversation details,
+retries, or permits model/mutation requests. It returns only route class,
+status, identity-match and request/response-correlation flags, bounded
+response size, fixed field/container/type/count metadata, and model-field
+presence. No URL, conversation ID, title, message, payload, header, token, or
+storage value is returned. If the native index request never appears, the
+result explicitly uses `observation_state=no_history_observed`.
+
 ## Alibaba Token Plan quota polling
 
 The provider-status sidecar can poll the authenticated ModelStudio Token Plan

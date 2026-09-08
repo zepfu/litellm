@@ -21,6 +21,13 @@ canonical account hash. The bound path only verifies an authoritative
 fails closed because this module has no established same-context metadata
 contract to substitute. Live authenticated Oracle-browser proof remains a
 separate acceptance gate.
+
+The native history observer is a separate attach-only, read-only path. It
+performs one ordinary ChatGPT home navigation, observes at most one native
+``GET /backend-api/conversations`` request, and returns structural metadata
+only. It never calls the endpoint directly, supplies guessed headers, reads
+cookies or storage, follows pagination, requests conversation details, or
+sends model/mutation traffic.
 """
 
 from __future__ import annotations
@@ -90,6 +97,12 @@ CHATGPT_CONVERSATION_INIT_BROWSER_CDP_ENDPOINT_ENV = (
 ORACLE_BROWSER_CDP_ENDPOINT_ENV = "ORACLE_BROWSER_CDP_ENDPOINT"
 DEFAULT_ORACLE_BROWSER_CDP_ENDPOINT = "http://127.0.0.1:9222"
 ORACLE_BROWSER_BOUNDARY_NAME = "oracle_browser_cdp_attach"
+CHATGPT_NATIVE_HISTORY_HOME_URL = "https://chatgpt.com/"
+CHATGPT_NATIVE_HISTORY_INDEX_PATH = "/backend-api/conversations"
+CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH = "8e92854835c4"
+CHATGPT_NATIVE_HISTORY_OBSERVER = "chatgpt_native_history"
+CHATGPT_NATIVE_HISTORY_DEFAULT_TIMEOUT_SECONDS = 150.0
+CHATGPT_NATIVE_HISTORY_MAX_RESPONSE_BYTES = 1_048_576
 
 
 # Truncation does not silently claim completeness.
@@ -103,6 +116,40 @@ MAX_PROJECTION_DEPTH = 5
 MAX_PROJECTION_LIST_ITEMS = 200
 MAX_PROJECTION_OBJECT_KEYS = 200
 MAX_SAFE_STRING_LENGTH = 256
+_NATIVE_HISTORY_MAX_INSPECTED_NODES = 512
+_NATIVE_HISTORY_MAX_COUNT = 200
+_NATIVE_HISTORY_FIELD_NAMES = (
+    "conversations",
+    "items",
+    "total",
+    "offset",
+    "limit",
+    "has_missing_conversations",
+)
+_NATIVE_HISTORY_MODEL_FIELD_NAMES = (
+    "model_slug",
+    "requested_model",
+    "default_model_slug",
+    "model",
+    "recorded_model",
+    "recorded_final_model",
+)
+_NATIVE_HISTORY_MODEL_FIELD_ALIASES = {
+    "model_slug": ("model_slug", "modelSlug"),
+    "requested_model": (
+        "requested_model",
+        "requestedModel",
+        "requested_model_slug",
+        "requestedModelSlug",
+    ),
+    "default_model_slug": ("default_model_slug", "defaultModelSlug"),
+    "model": ("model",),
+    "recorded_model": ("recorded_model", "recordedModel"),
+    "recorded_final_model": (
+        "recorded_final_model",
+        "recordedFinalModel",
+    ),
+}
 
 _FORBIDDEN_REQUEST_CONTENT_FIELDS = (
     "messages",
@@ -2852,6 +2899,843 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
         boundary_error = True
 
 
+def _native_history_type_name(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, Mapping):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    return "unsupported"
+
+
+def _native_history_metadata(value: Any, *, present: bool = True) -> Dict[str, Any]:
+    if not present:
+        return {
+            "present": False,
+            "container": "missing",
+            "type": "missing",
+            "count": None,
+        }
+    if isinstance(value, list):
+        return {
+            "present": True,
+            "container": "array",
+            "type": "array",
+            "count": min(len(value), _NATIVE_HISTORY_MAX_COUNT),
+        }
+    if isinstance(value, Mapping):
+        return {
+            "present": True,
+            "container": "object",
+            "type": "object",
+            "count": min(len(value), _NATIVE_HISTORY_MAX_COUNT),
+        }
+    return {
+        "present": True,
+        "container": "scalar",
+        "type": _native_history_type_name(value),
+        "count": None,
+    }
+
+
+def _native_history_fixed_field_value(
+    payload: Any,
+    field_name: str,
+) -> Tuple[bool, Any]:
+    if not isinstance(payload, Mapping):
+        return False, None
+    aliases = {
+        "has_missing_conversations": ("has_missing_conversations", "hasMissingConversations"),
+    }.get(field_name, (field_name,))
+    candidates: List[Mapping[str, Any]] = [payload]
+    for wrapper_name in ("data", "result"):
+        wrapped = payload.get(wrapper_name)
+        if isinstance(wrapped, Mapping):
+            candidates.append(wrapped)
+    for candidate in candidates:
+        for alias in aliases:
+            if alias in candidate:
+                return True, candidate[alias]
+    return False, None
+
+
+def _native_history_model_presence(payload: Any) -> Dict[str, Optional[bool]]:
+    fields: Dict[str, Optional[bool]] = {
+        field_name: False for field_name in _NATIVE_HISTORY_MODEL_FIELD_NAMES
+    }
+    if payload is None:
+        return {field_name: None for field_name in fields}
+    pending: List[Any] = [payload]
+    inspected = 0
+    while pending and inspected < _NATIVE_HISTORY_MAX_INSPECTED_NODES:
+        value = pending.pop()
+        if isinstance(value, Mapping):
+            inspected += 1
+            for field_name in _NATIVE_HISTORY_MODEL_FIELD_NAMES:
+                aliases = _NATIVE_HISTORY_MODEL_FIELD_ALIASES[field_name]
+                if any(alias in value for alias in aliases):
+                    fields[field_name] = True
+            pending.extend(
+                list(value.values())[:MAX_PROJECTION_OBJECT_KEYS]
+            )
+        elif isinstance(value, list):
+            inspected += 1
+            pending.extend(value[:MAX_PROJECTION_LIST_ITEMS])
+    return fields
+
+
+def _native_history_structural_projection(payload: Any) -> Dict[str, Any]:
+    root = _native_history_metadata(payload)
+    field_metadata: Dict[str, Dict[str, Any]] = {}
+    present_count = 0
+    for field_name in _NATIVE_HISTORY_FIELD_NAMES:
+        present, value = _native_history_fixed_field_value(payload, field_name)
+        field_metadata[field_name] = _native_history_metadata(
+            value,
+            present=present,
+        )
+        present_count += int(present)
+    if not isinstance(payload, (Mapping, list)):
+        schema_state = "malformed"
+    elif present_count:
+        schema_state = "recognized"
+    else:
+        schema_state = "unrecognized"
+    return {
+        "root": root,
+        "fields": field_metadata,
+        "schema_state": schema_state,
+    }
+
+
+def _native_history_base_observation(
+    *,
+    page_target_id_matched: bool,
+    request_count: int = 0,
+    history_request_count: int = 0,
+) -> Dict[str, Any]:
+    return {
+        "observer": CHATGPT_NATIVE_HISTORY_OBSERVER,
+        "observation_state": "no_history_observed",
+        "route_class": "none",
+        "http_status": None,
+        "account_identity_verified": False,
+        "account_identity_source": None,
+        "identity_match": False,
+        "request_response_correlated": False,
+        "request_method": None,
+        "request_body_omitted": None,
+        "page_target_id_matched": bool(page_target_id_matched),
+        "request_count": min(max(request_count, 0), _NATIVE_HISTORY_MAX_COUNT),
+        "history_request_count": min(
+            max(history_request_count, 0),
+            _NATIVE_HISTORY_MAX_COUNT,
+        ),
+        "response_bytes": None,
+        "response_content_type": "missing",
+        "retry_after_seconds": None,
+        "browser_challenge": False,
+        "structural_metadata": {
+            "root": _native_history_metadata(None, present=False),
+            "fields": {
+                field_name: _native_history_metadata(None, present=False)
+                for field_name in _NATIVE_HISTORY_FIELD_NAMES
+            },
+            "schema_state": "absent",
+        },
+        "model_field_presence": {
+            field_name: None for field_name in _NATIVE_HISTORY_MODEL_FIELD_NAMES
+        },
+        "failure_reason": "no_history_observed",
+        "warnings": [],
+    }
+
+
+def _native_history_content_type(headers: Any) -> str:
+    if not isinstance(headers, Mapping):
+        return "missing"
+    value = _native_init_header(headers, "content-type")
+    if not isinstance(value, str):
+        return "missing"
+    normalized = value.split(";", 1)[0].strip().lower()
+    if normalized in {"application/json", "application/problem+json"}:
+        return "json"
+    if normalized in {"text/html", "text/plain"}:
+        return "text"
+    return "other"
+
+
+def _native_history_content_length(headers: Any) -> Optional[int]:
+    if not isinstance(headers, Mapping):
+        return None
+    value = _native_init_header(headers, "content-length")
+    if not isinstance(value, str):
+        return None
+    try:
+        length = int(value.strip())
+    except (TypeError, ValueError):
+        return None
+    return length if length >= 0 else None
+
+
+def _native_history_status(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    try:
+        status = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return status if 100 <= status <= 999 else None
+
+
+def _native_history_request_method(value: Any) -> Optional[str]:
+    if value == "GET":
+        return "GET"
+    if isinstance(value, str):
+        return "other"
+    return None
+
+
+def _native_history_failure_for_status(status: Optional[int]) -> Optional[str]:
+    if status is None:
+        return "invalid_status"
+    if 200 <= status < 300 and status not in {204, 206}:
+        return None
+    if status in {401, 403}:
+        return "http_auth"
+    if status == 429:
+        return "http_rate_limited"
+    return "http_error"
+
+
+def _native_history_finalize_observation(
+    capture: Mapping[str, Any],
+    *,
+    expected_account_hash: str,
+    page_target_id_matched: bool,
+    request_count: int,
+    history_request_count: int,
+    max_response_bytes: int,
+    structural: Optional[Mapping[str, Any]] = None,
+    failure_reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    result = _native_history_base_observation(
+        page_target_id_matched=page_target_id_matched,
+        request_count=request_count,
+        history_request_count=history_request_count,
+    )
+    request_hash = capture.get("request_account_hash")
+    extra_hash = capture.get("extra_account_hash")
+    identity_match = (
+        request_hash == expected_account_hash
+        and extra_hash == expected_account_hash
+    )
+    status = _native_history_status(capture.get("status_code"))
+    response_bytes = capture.get("response_bytes")
+    if isinstance(response_bytes, bool) or not isinstance(response_bytes, int):
+        response_bytes = None
+    if response_bytes is not None:
+        response_bytes = min(max(response_bytes, 0), max_response_bytes)
+    result.update(
+        {
+            "observation_state": "history_observed",
+            "route_class": "modern_history_index",
+            "http_status": status,
+            "account_identity_verified": identity_match,
+            "account_identity_source": (
+                CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
+                if request_hash is not None or extra_hash is not None
+                else None
+            ),
+            "identity_match": identity_match,
+            "request_response_correlated": bool(
+                capture.get("response_received")
+                and capture.get("response_request_id")
+                == capture.get("request_id")
+            ),
+            "request_method": _native_history_request_method(
+                capture.get("method")
+            ),
+            "request_body_omitted": capture.get("body_omitted"),
+            "response_bytes": response_bytes,
+            "response_content_type": capture.get(
+                "content_type",
+                "missing",
+            ),
+            "retry_after_seconds": capture.get("retry_after_seconds"),
+            "browser_challenge": bool(capture.get("browser_challenge")),
+        }
+    )
+    if structural is not None:
+        result["structural_metadata"] = dict(structural)
+        result["model_field_presence"] = _native_history_model_presence(
+            capture.get("payload")
+        )
+    else:
+        result["structural_metadata"] = {
+            "root": _native_history_metadata(None, present=False),
+            "fields": {
+                field_name: _native_history_metadata(None, present=False)
+                for field_name in _NATIVE_HISTORY_FIELD_NAMES
+            },
+            "schema_state": "absent",
+        }
+    if failure_reason is None:
+        if capture.get("boundary_reason"):
+            failure_reason = capture["boundary_reason"]
+        elif capture.get("loading_failed"):
+            failure_reason = "history_response_failed"
+        elif not capture.get("response_received"):
+            failure_reason = "history_response_missing"
+        elif not identity_match:
+            failure_reason = (
+                "account_identity_mismatch"
+                if request_hash is not None or extra_hash is not None
+                else "identity_evidence_missing"
+            )
+        elif capture.get("browser_challenge"):
+            failure_reason = "browser_challenge"
+        elif _native_history_failure_for_status(status) is not None:
+            failure_reason = _native_history_failure_for_status(status)
+        elif capture.get("content_type") != "json":
+            failure_reason = "non_json_response"
+    if failure_reason == "no_history_observed":
+        result["observation_state"] = "no_history_observed"
+    result["failure_reason"] = failure_reason
+    return result
+
+
+def _native_history_no_route_observation(
+    *,
+    page_target_id_matched: bool,
+    request_count: int,
+    history_request_count: int,
+    failure_reason: Optional[str],
+    browser_challenge: bool,
+) -> Dict[str, Any]:
+    result = _native_history_base_observation(
+        page_target_id_matched=page_target_id_matched,
+        request_count=request_count,
+        history_request_count=history_request_count,
+    )
+    result["browser_challenge"] = bool(browser_challenge)
+    result["failure_reason"] = failure_reason or "no_history_observed"
+    if failure_reason == "no_history_observed" or failure_reason is None:
+        result["warnings"] = ["no_native_history_index_request"]
+    return result
+
+
+def _capture_native_history_body(
+    session: Any,
+    capture: Dict[str, Any],
+    *,
+    max_response_bytes: int,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[int]]:
+    import base64
+
+    request_id = capture.get("request_id")
+    if not isinstance(request_id, str):
+        return None, "history_response_missing", None
+    try:
+        body = session.send(
+            "Network.getResponseBody",
+            {"requestId": request_id},
+        )
+    except Exception:
+        return None, "response_body_unavailable", None
+    if not isinstance(body, Mapping) or not isinstance(body.get("body"), str):
+        return None, "invalid_response_body", None
+    content = body["body"]
+    try:
+        if body.get("base64Encoded"):
+            estimated = (len(content) * 3) // 4 + 3
+            if estimated > max_response_bytes:
+                return None, "response_too_large", estimated
+            raw_bytes = base64.b64decode(content, validate=True)
+            content = raw_bytes.decode("utf-8")
+        else:
+            raw_bytes = content.encode("utf-8")
+    except (UnicodeDecodeError, ValueError, base64.binascii.Error):
+        return None, "invalid_response_body", None
+    response_bytes = len(raw_bytes)
+    encoded_bytes = capture.get("encoded_data_length")
+    if (
+        isinstance(encoded_bytes, int)
+        and not isinstance(encoded_bytes, bool)
+        and encoded_bytes >= 0
+    ):
+        response_bytes = max(response_bytes, encoded_bytes)
+    content_length = capture.get("content_length")
+    if (
+        isinstance(content_length, int)
+        and not isinstance(content_length, bool)
+        and content_length >= 0
+    ):
+        response_bytes = max(response_bytes, content_length)
+    if response_bytes > max_response_bytes:
+        return None, "response_too_large", response_bytes
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError):
+        return None, "invalid_json", response_bytes
+    # Keep the parsed value only for this bounded in-process projection.
+    capture["payload"] = payload
+    return _native_history_structural_projection(payload), None, response_bytes
+
+
+def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
+    page: Any,
+    *,
+    session: Any,
+    expected_account_hash: str,
+    deadline: float,
+    max_response_bytes: int,
+) -> Mapping[str, Any]:
+    capture: Dict[str, Any] = {}
+    extra_hashes: Dict[str, Optional[str]] = {}
+    boundary_reason: Optional[str] = None
+    browser_challenge = False
+    request_count = 0
+    history_request_count = 0
+    capture_deadline = deadline - min(2.0, _remaining_browser_timeout(deadline) / 5)
+
+    def set_boundary(reason: str) -> None:
+        nonlocal boundary_reason
+        if boundary_reason is None:
+            boundary_reason = reason
+        capture.setdefault("boundary_reason", boundary_reason)
+
+    def is_history_url(url: Any) -> bool:
+        if not isinstance(url, str):
+            return False
+        parsed = urlsplit(url)
+        return (
+            parsed.scheme == "https"
+            and parsed.netloc == "chatgpt.com"
+            and parsed.path == CHATGPT_NATIVE_HISTORY_INDEX_PATH
+        )
+
+    def is_model_or_mutation_path(path: str) -> bool:
+        return (
+            path in {
+                "/backend-api/conversation",
+                "/backend-api/conversation/init",
+                "/backend-api/f/conversation",
+            }
+            or path.startswith("/backend-api/conversation/")
+            or path.startswith("/backend-api/f/conversation/")
+        )
+
+    def guard_request(event: Mapping[str, Any]) -> None:
+        request = event.get("request")
+        if not isinstance(request, Mapping):
+            set_boundary("malformed_request_event")
+            request_id = event.get("requestId")
+            if request_id is not None:
+                session.send(
+                    "Fetch.failRequest",
+                    {
+                        "requestId": request_id,
+                        "errorReason": "BlockedByClient",
+                    },
+                )
+            return
+        url = request.get("url", "")
+        parsed = urlsplit(url if isinstance(url, str) else "")
+        method = str(request.get("method") or "").upper()
+        redirected = event.get("redirectedRequestId")
+        history = is_history_url(url)
+        blocked = False
+        if history:
+            blocked = (
+                method != "GET"
+                or redirected is not None
+                or history_request_count > 1
+            )
+            if method != "GET":
+                set_boundary("history_request_invalid_method")
+            elif redirected is not None:
+                set_boundary("history_request_redirected")
+            elif history_request_count > 1:
+                set_boundary("history_request_limit_exceeded")
+        elif event.get("resourceType") == "Document":
+            home_navigation = (
+                parsed.scheme == "https"
+                and parsed.netloc == "chatgpt.com"
+                and parsed.path == "/"
+                and redirected is None
+            )
+            blocked = not home_navigation
+            if not home_navigation:
+                set_boundary("unexpected_document_navigation")
+        elif method in {"POST", "PUT", "PATCH", "DELETE"}:
+            blocked = True
+            if is_model_or_mutation_path(parsed.path):
+                set_boundary("model_or_mutation_blocked")
+        elif parsed.path.startswith("/backend-api/"):
+            # Detail, message, session, and mutation routes are never needed
+            # for this one-index observation.
+            blocked = True
+        if blocked:
+            session.send(
+                "Fetch.failRequest",
+                {
+                    "requestId": event.get("requestId"),
+                    "errorReason": "BlockedByClient",
+                },
+            )
+        else:
+            session.send(
+                "Fetch.continueRequest",
+                {"requestId": event.get("requestId")},
+            )
+
+    def request_seen(event: Mapping[str, Any]) -> None:
+        nonlocal request_count, history_request_count
+        request_count += 1
+        request = event.get("request")
+        if not isinstance(request, Mapping) or not is_history_url(
+            request.get("url", "")
+        ):
+            return
+        history_request_count += 1
+        if capture:
+            set_boundary("history_request_limit_exceeded")
+            return
+        headers = request.get("headers")
+        capture.update(
+            request_id=event.get("requestId"),
+            method=str(request.get("method") or "").upper() or None,
+            request_account_hash=(
+                _native_init_account_hash(headers)
+                if isinstance(headers, Mapping)
+                else None
+            ),
+            body_omitted=(
+                not request.get("hasPostData", False)
+                and "postData" not in request
+            ),
+        )
+        if capture["method"] != "GET":
+            set_boundary("history_request_invalid_method")
+
+    def extra_seen(event: Mapping[str, Any]) -> None:
+        request_id = event.get("requestId")
+        if not isinstance(request_id, str):
+            return
+        headers = event.get("headers")
+        account_hash = (
+            _native_init_account_hash(headers)
+            if isinstance(headers, Mapping)
+            else None
+        )
+        captured_id = capture.get("request_id")
+        if account_hash is None and request_id != captured_id:
+            return
+        if request_id not in extra_hashes and len(extra_hashes) >= 256:
+            oldest = next(
+                (key for key in extra_hashes if key != captured_id),
+                None,
+            )
+            if oldest is not None:
+                del extra_hashes[oldest]
+        extra_hashes[request_id] = account_hash
+        if request_id == captured_id:
+            capture["extra_account_hash"] = account_hash
+
+    def response_seen(event: Mapping[str, Any]) -> None:
+        nonlocal browser_challenge
+        response = event.get("response")
+        if not isinstance(response, Mapping):
+            set_boundary("malformed_response_event")
+            return
+        headers = response.get("headers")
+        challenged = (
+            isinstance(headers, Mapping)
+            and _native_init_header(headers, "cf-mitigated") == "challenge"
+        )
+        browser_challenge = browser_challenge or challenged
+        request_id = event.get("requestId")
+        if request_id != capture.get("request_id"):
+            return
+        status = _native_history_status(response.get("status"))
+        capture.update(
+            response_received=True,
+            response_request_id=request_id,
+            status_code=status,
+            content_type=_native_history_content_type(headers),
+            content_length=_native_history_content_length(headers),
+            retry_after_seconds=(
+                _native_init_retry_after(headers)
+                if isinstance(headers, Mapping)
+                else None
+            ),
+            browser_challenge=browser_challenge,
+            response_url_valid=is_history_url(response.get("url", "")),
+        )
+        if not capture["response_url_valid"]:
+            set_boundary("history_response_mismatch")
+        elif status is None:
+            set_boundary("invalid_status")
+        elif 300 <= status < 400:
+            set_boundary("history_response_redirected")
+
+    def loading_finished(event: Mapping[str, Any]) -> None:
+        if event.get("requestId") != capture.get("request_id"):
+            return
+        capture["finished"] = True
+        encoded = event.get("encodedDataLength")
+        if (
+            isinstance(encoded, (int, float))
+            and not isinstance(encoded, bool)
+            and encoded >= 0
+        ):
+            capture["encoded_data_length"] = int(encoded)
+
+    def loading_failed(event: Mapping[str, Any]) -> None:
+        if event.get("requestId") == capture.get("request_id"):
+            capture["finished"] = True
+            capture["loading_failed"] = True
+
+    try:
+        session.on("Fetch.requestPaused", guard_request)
+        session.on("Network.requestWillBeSent", request_seen)
+        session.on("Network.requestWillBeSentExtraInfo", extra_seen)
+        session.on("Network.responseReceived", response_seen)
+        session.on("Network.loadingFinished", loading_finished)
+        session.on("Network.loadingFailed", loading_failed)
+        session.send(
+            "Network.enable",
+            {
+                "maxTotalBufferSize": max_response_bytes * 2,
+                "maxResourceBufferSize": max_response_bytes,
+                "maxPostDataSize": 0,
+            },
+        )
+        session.send("Network.setBypassServiceWorker", {"bypass": True})
+        session.send(
+            "Fetch.enable",
+            {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]},
+        )
+        try:
+            page.goto(
+                CHATGPT_NATIVE_HISTORY_HOME_URL,
+                wait_until="commit",
+                timeout=_browser_timeout_milliseconds(
+                    _remaining_browser_timeout(capture_deadline)
+                ),
+            )
+        except Exception:
+            if capture:
+                capture.setdefault("boundary_reason", "home_navigation_failed")
+            else:
+                boundary_reason = boundary_reason or "home_navigation_failed"
+        while True:
+            if capture.get("finished"):
+                capture["extra_account_hash"] = extra_hashes.get(
+                    capture.get("request_id")
+                )
+                if boundary_reason is not None:
+                    capture["boundary_reason"] = boundary_reason
+                request_hash = capture.get("request_account_hash")
+                extra_hash = capture.get("extra_account_hash")
+                if (
+                    request_hash == expected_account_hash
+                    and extra_hash == expected_account_hash
+                    and capture.get("response_received")
+                    and capture.get("response_url_valid")
+                    and capture.get("status_code") is not None
+                    and _native_history_failure_for_status(
+                        capture.get("status_code")
+                    )
+                    is None
+                    and capture.get("content_type") == "json"
+                ):
+                    structural, body_error, response_bytes = (
+                        _capture_native_history_body(
+                            session,
+                            capture,
+                            max_response_bytes=max_response_bytes,
+                        )
+                    )
+                    if response_bytes is not None:
+                        capture["response_bytes"] = response_bytes
+                    return _native_history_finalize_observation(
+                        capture,
+                        expected_account_hash=expected_account_hash,
+                        page_target_id_matched=True,
+                        request_count=request_count,
+                        history_request_count=history_request_count,
+                        max_response_bytes=max_response_bytes,
+                        structural=structural,
+                        failure_reason=body_error,
+                    )
+                return _native_history_finalize_observation(
+                    capture,
+                    expected_account_hash=expected_account_hash,
+                    page_target_id_matched=True,
+                    request_count=request_count,
+                    history_request_count=history_request_count,
+                    max_response_bytes=max_response_bytes,
+                )
+            if browser_challenge:
+                return _native_history_no_route_observation(
+                    page_target_id_matched=True,
+                    request_count=request_count,
+                    history_request_count=history_request_count,
+                    failure_reason=boundary_reason or "browser_challenge",
+                    browser_challenge=True,
+                )
+            if _remaining_browser_timeout(capture_deadline) <= 0:
+                if capture:
+                    capture["boundary_reason"] = (
+                        boundary_reason or "history_response_timeout"
+                    )
+                    capture["extra_account_hash"] = extra_hashes.get(
+                        capture.get("request_id")
+                    )
+                    return _native_history_finalize_observation(
+                        capture,
+                        expected_account_hash=expected_account_hash,
+                        page_target_id_matched=True,
+                        request_count=request_count,
+                        history_request_count=history_request_count,
+                        max_response_bytes=max_response_bytes,
+                    )
+                return _native_history_no_route_observation(
+                    page_target_id_matched=True,
+                    request_count=request_count,
+                    history_request_count=history_request_count,
+                    failure_reason=boundary_reason or "no_history_observed",
+                    browser_challenge=browser_challenge,
+                )
+            try:
+                challenge_visible = bool(
+                    page.evaluate(
+                        "() => [...document.querySelectorAll("
+                        "'form#challenge-form[action*=\"__cf_chl\"],"
+                        "form#challenge-form[action^=\"/cdn-cgi/challenge-platform/\"],"
+                        "#challenge-running')].some(node => {"
+                        "const rect = node.getBoundingClientRect();"
+                        "return rect.width > 0 && rect.height > 0 &&"
+                        "getComputedStyle(node).visibility !== 'hidden';})"
+                    )
+                )
+            except Exception:
+                challenge_visible = False
+            if challenge_visible:
+                browser_challenge = True
+                return _native_history_no_route_observation(
+                    page_target_id_matched=True,
+                    request_count=request_count,
+                    history_request_count=history_request_count,
+                    failure_reason=boundary_reason or "browser_challenge",
+                    browser_challenge=True,
+                )
+            if boundary_reason is not None and not capture:
+                return _native_history_no_route_observation(
+                    page_target_id_matched=True,
+                    request_count=request_count,
+                    history_request_count=history_request_count,
+                    failure_reason=boundary_reason,
+                    browser_challenge=False,
+                )
+            page.wait_for_timeout(
+                min(
+                    50,
+                    _browser_timeout_milliseconds(
+                        _remaining_browser_timeout(capture_deadline)
+                    ),
+                )
+            )
+    finally:
+        # Fetch interception remains installed until the owned target closes.
+        boundary_reason = boundary_reason or "observer_closed"
+
+
+def observe_native_chatgpt_history_from_oracle_browser(
+    *,
+    page_target_id: str,
+    cdp_endpoint: Optional[str] = None,
+    expected_account_hash: str = CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH,
+    timeout_seconds: float = CHATGPT_NATIVE_HISTORY_DEFAULT_TIMEOUT_SECONDS,
+    max_response_bytes: int = CHATGPT_NATIVE_HISTORY_MAX_RESPONSE_BYTES,
+) -> Dict[str, Any]:
+    """Observe one native ChatGPT history index request through Oracle CDP.
+
+    The caller supplies an exact existing CDP page target as a context anchor
+    and the canonical account hash pin. The observer creates one owned page in
+    that context, performs one ordinary ChatGPT home navigation, and returns
+    bounded structural metadata. It never issues a direct history request,
+    reads browser storage, exports headers, follows pagination, or requests
+    conversation details.
+    """
+
+    if expected_account_hash != CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH:
+        raise OracleBrowserBoundaryUnavailable(
+            "Native ChatGPT history requires the pinned inventory account hash."
+        )
+    if not isinstance(timeout_seconds, (int, float)) or isinstance(
+        timeout_seconds,
+        bool,
+    ):
+        raise OracleBrowserBoundaryUnavailable(
+            "Native ChatGPT history timeout is invalid."
+        )
+    if (
+        not isfinite(float(timeout_seconds))
+        or timeout_seconds <= 0
+        or timeout_seconds > CHATGPT_NATIVE_HISTORY_DEFAULT_TIMEOUT_SECONDS
+    ):
+        raise OracleBrowserBoundaryUnavailable(
+            "Native ChatGPT history timeout exceeds the 150-second limit."
+        )
+    if (
+        isinstance(max_response_bytes, bool)
+        or not isinstance(max_response_bytes, int)
+        or max_response_bytes <= 0
+        or max_response_bytes > CHATGPT_NATIVE_HISTORY_MAX_RESPONSE_BYTES
+    ):
+        raise OracleBrowserBoundaryUnavailable(
+            "Native ChatGPT history response budget exceeds the 1 MiB limit."
+        )
+    target_id = _validate_page_target_id(page_target_id)
+    endpoint = cdp_endpoint
+    if endpoint is None:
+        endpoint = os.getenv(CHATGPT_CONVERSATION_INIT_BROWSER_CDP_ENDPOINT_ENV)
+    if endpoint is None:
+        endpoint = os.getenv(ORACLE_BROWSER_CDP_ENDPOINT_ENV)
+    endpoint = str(endpoint or DEFAULT_ORACLE_BROWSER_CDP_ENDPOINT).strip()
+    if not endpoint:
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle browser CDP endpoint is not configured."
+        )
+    deadline = time.monotonic() + float(timeout_seconds)
+    try:
+        return dict(
+            _run_oracle_browser_history_observation_in_worker(
+                cdp_endpoint=endpoint,
+                page_target_id=target_id,
+                expected_account_hash=expected_account_hash,
+                deadline=deadline,
+                max_response_bytes=max_response_bytes,
+            )
+        )
+    except OracleBrowserBoundaryUnavailable:
+        raise
+    except Exception as exc:
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle browser boundary is unavailable for native ChatGPT history."
+        ) from exc
+
+
 class OracleBrowserConversationInitTransport:
     """Observe native init traffic in a dedicated page of Oracle's context.
 
@@ -3072,6 +3956,187 @@ def _oracle_browser_capture_worker(
                 if closed.get("success") is not True:
                     raise OracleBrowserBoundaryUnavailable(
                         "Oracle browser did not close its owned target."
+                    )
+                creation_state.value = 0
+                owned_target.value = b""
+            except Exception:
+                successful = False
+        try:
+            _disconnect_attached_browser(playwright, browser)
+        except Exception:
+            successful = False
+        try:
+            _send_oracle_browser_worker_message(
+                sender,
+                {
+                    "ok": successful,
+                    "result": result if successful else None,
+                },
+            )
+        except Exception:
+            try:
+                _send_oracle_browser_worker_message(
+                    sender,
+                    {"ok": False, "result": None},
+                )
+            except Exception:
+                pass
+        finally:
+            sender.close()
+
+
+def _run_oracle_browser_history_observation_in_worker(
+    *,
+    cdp_endpoint: str,
+    page_target_id: str,
+    expected_account_hash: str,
+    deadline: float,
+    max_response_bytes: int,
+) -> Mapping[str, Any]:
+    context = _oracle_browser_process_context(None)
+    receiver, sender = context.Pipe(duplex=False)
+    private_process_group = context.RawValue("q", 0)
+    owned_target = context.RawArray("c", 256)
+    creation_state = context.RawValue("b", 0)
+    creation_url = "about:blank#oracle-native-history-" + os.urandom(16).hex()
+    cleanup_budget = min(
+        3.0,
+        max(0.0, _remaining_browser_timeout(deadline)) / 4,
+    )
+    capture_deadline = deadline - cleanup_budget
+    process = context.Process(
+        target=_oracle_browser_history_observation_worker,
+        args=(
+            sender,
+            cdp_endpoint,
+            page_target_id,
+            capture_deadline,
+            expected_account_hash,
+            max_response_bytes,
+            private_process_group,
+            owned_target,
+            creation_state,
+            creation_url,
+        ),
+    )
+    try:
+        process.start()
+    except Exception as exc:
+        sender.close()
+        receiver.close()
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle browser history observer worker could not start."
+        ) from exc
+    sender.close()
+    try:
+        message = _receive_oracle_browser_worker_message(receiver, capture_deadline)
+        remaining_seconds = _remaining_browser_timeout(capture_deadline)
+        if remaining_seconds <= 0:
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser history observation timed out."
+            )
+        process.join(remaining_seconds)
+        if process.is_alive():
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser history observer cleanup timed out."
+            )
+        if not isinstance(message, Mapping) or message.get("ok") is not True:
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser history observer is unavailable."
+            )
+        result = message.get("result")
+        if not isinstance(result, Mapping):
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser history observer returned an invalid result."
+            )
+        return dict(result)
+    finally:
+        receiver.close()
+        _terminate_oracle_browser_worker(process, private_process_group.value)
+        process.join(timeout=min(0.1, max(0.0, _remaining_browser_timeout(deadline))))
+        target_id = owned_target.value if creation_state.value == 2 else b""
+        if creation_state.value:
+            _close_owned_oracle_target(
+                cdp_endpoint=cdp_endpoint,
+                target_id=target_id.decode("ascii") if target_id else None,
+                anchor_target_id=page_target_id,
+                creation_url=creation_url,
+                deadline=deadline,
+                playwright_factory=None,
+            )
+
+
+def _oracle_browser_history_observation_worker(
+    sender: Any,
+    cdp_endpoint: str,
+    page_target_id: str,
+    deadline: float,
+    expected_account_hash: str,
+    max_response_bytes: int,
+    private_process_group: Any,
+    owned_target: Any,
+    creation_state: Any,
+    creation_url: str,
+) -> None:
+    _enter_oracle_browser_worker_process_group(private_process_group)
+    playwright = None
+    browser = None
+    target_session = None
+    result = None
+    successful = False
+    try:
+        _raise_if_browser_deadline_expired(deadline)
+        playwright = _start_playwright_from_factory(None)
+        _raise_if_browser_deadline_expired(deadline)
+        browser = playwright.chromium.connect_over_cdp(
+            cdp_endpoint,
+            timeout=_browser_timeout_milliseconds(
+                _remaining_browser_timeout(deadline)
+            ),
+        )
+        _raise_if_browser_deadline_expired(deadline)
+        source_page = _find_existing_chatgpt_page(
+            browser,
+            page_target_id,
+            CHATGPT_NATIVE_HISTORY_HOME_URL,
+            deadline=deadline,
+        )
+        if source_page is None:
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser has no exact bound ChatGPT context anchor "
+                "for native history."
+            )
+        target_session = browser.new_browser_cdp_session()
+        owned_page = _create_owned_oracle_page(
+            target_session,
+            source_page,
+            page_target_id,
+            owned_target,
+            creation_state,
+            creation_url,
+            deadline,
+        )
+        result = _observe_native_history_oracle_page(
+            owned_page,
+            session=owned_page.context.new_cdp_session(owned_page),
+            expected_account_hash=expected_account_hash,
+            deadline=deadline,
+            max_response_bytes=max_response_bytes,
+        )
+        _raise_if_browser_deadline_expired(deadline)
+        successful = True
+    except Exception:
+        successful = False
+    finally:
+        if owned_target.value and target_session is not None:
+            try:
+                closed = target_session.send(
+                    "Target.closeTarget",
+                    {"targetId": owned_target.value.decode("ascii")},
+                )
+                if closed.get("success") is not True:
+                    raise OracleBrowserBoundaryUnavailable(
+                        "Oracle browser did not close its history target."
                     )
                 creation_state.value = 0
                 owned_target.value = b""
