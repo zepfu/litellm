@@ -103,6 +103,15 @@ CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH = "8e92854835c4"
 CHATGPT_NATIVE_HISTORY_OBSERVER = "chatgpt_native_history"
 CHATGPT_NATIVE_HISTORY_DEFAULT_TIMEOUT_SECONDS = 150.0
 CHATGPT_NATIVE_HISTORY_MAX_RESPONSE_BYTES = 1_048_576
+# Shared across the history worker and its parent.  A target stays owned until
+# the close acknowledgement is published; the parent must not reap the worker
+# while the state is still pending.
+_NATIVE_HISTORY_TARGET_NONE = 0
+_NATIVE_HISTORY_TARGET_CREATING = 1
+_NATIVE_HISTORY_TARGET_ATTACHED = 2
+_NATIVE_HISTORY_TARGET_CLEANUP_PENDING = 3
+_NATIVE_HISTORY_TARGET_CLOSED = 4
+_NATIVE_HISTORY_TARGET_CLEANUP_HANDOFF = 5
 
 
 # Truncation does not silently claim completeness.
@@ -4892,6 +4901,8 @@ def _run_oracle_browser_history_observation_in_worker(
             "Oracle browser history observer worker could not start."
         ) from exc
     sender.close()
+    cleanup_confirmed = False
+    cleanup_error: Optional[Exception] = None
     try:
         message = _receive_oracle_browser_worker_message(receiver, capture_deadline)
         if not isinstance(message, Mapping) or message.get("ok") is not True:
@@ -4908,11 +4919,21 @@ def _run_oracle_browser_history_observation_in_worker(
         return dict(result)
     finally:
         receiver.close()
-        try:
+        state = int(creation_state.value)
+        if state in {_NATIVE_HISTORY_TARGET_NONE, _NATIVE_HISTORY_TARGET_CLOSED}:
+            cleanup_confirmed = True
+        else:
             target_id = (
-                owned_target.value if creation_state.value in {2, 3} else b""
+                owned_target.value
+                if state
+                in {
+                    _NATIVE_HISTORY_TARGET_ATTACHED,
+                    _NATIVE_HISTORY_TARGET_CLEANUP_PENDING,
+                    _NATIVE_HISTORY_TARGET_CLEANUP_HANDOFF,
+                }
+                else b""
             )
-            if creation_state.value:
+            try:
                 _close_owned_oracle_target(
                     cdp_endpoint=cdp_endpoint,
                     target_id=target_id.decode("ascii") if target_id else None,
@@ -4921,12 +4942,14 @@ def _run_oracle_browser_history_observation_in_worker(
                     deadline=deadline,
                     playwright_factory=None,
                 )
-        finally:
-            creation_state.value = 0
+                cleanup_confirmed = True
+            except Exception as exc:
+                cleanup_error = exc
+        if cleanup_confirmed:
+            # Publish the acknowledgement before reaping the interception
+            # owner. A failed fallback must leave both values intact.
+            creation_state.value = _NATIVE_HISTORY_TARGET_CLOSED
             owned_target.value = b""
-            # Keep the interception owner alive until exact-target cleanup has
-            # completed. A forced worker reap before Target.closeTarget can
-            # resume requests that were still held by Fetch interception.
             _terminate_oracle_browser_worker(process, private_process_group.value)
             process.join(
                 timeout=min(
@@ -4934,6 +4957,51 @@ def _run_oracle_browser_history_observation_in_worker(
                     max(0.0, _remaining_browser_timeout(deadline)),
                 )
             )
+        else:
+            # Keep the interception owner and target identity published. The
+            # caller receives a bounded failure, while a later owner can
+            # resume exact-target cleanup without a silent release.
+            creation_state.value = _NATIVE_HISTORY_TARGET_CLEANUP_HANDOFF
+        if cleanup_error is not None:
+            raise cleanup_error
+
+
+def _close_native_history_target_from_session(
+    target_session: Any,
+    *,
+    owned_target: Any,
+) -> bool:
+    """Close the published target and require a positive CDP acknowledgement."""
+
+    target_bytes = owned_target.value
+    if not target_bytes:
+        return True
+    try:
+        target_id = target_bytes.decode("ascii")
+    except (UnicodeDecodeError, AttributeError):
+        return False
+    try:
+        result = target_session.send(
+            "Target.closeTarget",
+            {"targetId": target_id},
+        )
+        if isinstance(result, Mapping) and result.get("success") is True:
+            return True
+    except Exception:
+        pass
+    try:
+        target_listing = target_session.send("Target.getTargets")
+    except Exception:
+        return False
+    if not isinstance(target_listing, Mapping):
+        return False
+    targets = target_listing.get("targetInfos", ())
+    if not isinstance(targets, (list, tuple)):
+        return False
+    return not any(
+        isinstance(info, Mapping) and info.get("targetId") == target_id
+        for info in targets
+    )
 
 
 def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded cleanup handshake
@@ -4955,6 +5023,7 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
     target_session = None
     result = None
     successful = False
+    close_confirmed = False
     try:
         _raise_if_browser_deadline_expired(capture_deadline)
         playwright = _start_playwright_from_factory(None)
@@ -5004,26 +5073,28 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
             if target_session is None:
                 close_failed = True
                 successful = False
-                creation_state.value = 3
+                creation_state.value = _NATIVE_HISTORY_TARGET_CLEANUP_PENDING
             else:
-                try:
-                    closed = target_session.send(
-                        "Target.closeTarget",
-                        {"targetId": owned_target.value.decode("ascii")},
-                    )
-                    if closed.get("success") is not True:
-                        raise OracleBrowserBoundaryUnavailable(
-                            "Oracle browser did not close its history target."
-                        )
-                    creation_state.value = 0
+                close_confirmed = _close_native_history_target_from_session(
+                    target_session,
+                    owned_target=owned_target,
+                )
+                if close_confirmed:
+                    creation_state.value = _NATIVE_HISTORY_TARGET_CLOSED
                     owned_target.value = b""
-                except Exception:
+                else:
                     close_failed = True
                     successful = False
-                    # The parent must close the target while this CDP
+                    # The parent may close the target while this CDP
                     # interception owner remains attached.
-                    creation_state.value = 3
-        if not close_failed:
+                    creation_state.value = _NATIVE_HISTORY_TARGET_CLEANUP_PENDING
+        elif creation_state.value == _NATIVE_HISTORY_TARGET_CREATING:
+            close_failed = True
+            successful = False
+            creation_state.value = _NATIVE_HISTORY_TARGET_CLEANUP_PENDING
+        else:
+            close_confirmed = True
+        if close_confirmed:
             try:
                 _disconnect_attached_browser(playwright, browser)
             except Exception:
@@ -5048,19 +5119,34 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
             sender.close()
         if close_failed:
             while (
-                creation_state.value == 3
+                creation_state.value
+                in {
+                    _NATIVE_HISTORY_TARGET_CLEANUP_PENDING,
+                    _NATIVE_HISTORY_TARGET_CLEANUP_HANDOFF,
+                }
                 and _remaining_browser_timeout(cleanup_deadline) > 0
             ):
+                if target_session is not None and _close_native_history_target_from_session(
+                    target_session,
+                    owned_target=owned_target,
+                ):
+                    creation_state.value = _NATIVE_HISTORY_TARGET_CLOSED
+                    owned_target.value = b""
+                    close_confirmed = True
+                    break
                 time.sleep(
                     min(
                         0.01,
                         max(0.0, _remaining_browser_timeout(cleanup_deadline)),
                     )
                 )
-            try:
-                _disconnect_attached_browser(playwright, browser)
-            except Exception:
-                pass
+            if creation_state.value != _NATIVE_HISTORY_TARGET_CLOSED:
+                # Do not detach an interception owner whose target closure was
+                # not acknowledged. The published state/target remain available
+                # for a later cleanup owner; the caller must fail closed.
+                creation_state.value = _NATIVE_HISTORY_TARGET_CLEANUP_HANDOFF
+        if creation_state.value == _NATIVE_HISTORY_TARGET_CLOSED:
+            _disconnect_attached_browser(playwright, browser)
 
 
 def _create_owned_oracle_page(
@@ -5083,7 +5169,7 @@ def _create_owned_oracle_page(
         predicate=lambda page: page.url == creation_url,
         timeout=_browser_timeout_milliseconds(_remaining_browser_timeout(deadline))
     ) as page_event:
-        creation_state.value = 1
+        creation_state.value = _NATIVE_HISTORY_TARGET_CREATING
         created = target_session.send("Target.createTarget", create_options)
         target_id = _validate_page_target_id(created["targetId"])
         if target_id == anchor_target_id:
@@ -5091,7 +5177,7 @@ def _create_owned_oracle_page(
                 "Oracle browser returned the context anchor as an owned target."
             )
         owned_target.value = target_id.encode("ascii")
-        creation_state.value = 2
+        creation_state.value = _NATIVE_HISTORY_TARGET_ATTACHED
     candidate = page_event.value
     if _page_target_id(source_page.context, candidate) != target_id:
         raise OracleBrowserBoundaryUnavailable(
