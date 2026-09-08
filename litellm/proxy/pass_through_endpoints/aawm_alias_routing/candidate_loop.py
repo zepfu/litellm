@@ -317,6 +317,8 @@ _SUPPORTED_REDISPATCH_ERROR_CODES = (
 _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER = (
     "_cursor_session_continuation_failure"
 )
+_CURSOR_RETAINED_TRANSPORT_FAILURE_MARKER = "_cursor_retained_transport_failure"
+_CURSOR_CONTINUATION_EVIDENCE_FIELD = "cursor_continuation_evidence"
 _CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD = "cursor_sanitized_proto_structure"
 _CURSOR_PROTO_STRUCTURE_MAX_DEPTH = 3
 _CURSOR_PROTO_STRUCTURE_MAX_ITEMS = 64
@@ -360,7 +362,10 @@ def _is_cursor_session_continuation_failure(
     return bool(
         isinstance(candidate, Mapping)
         and candidate.get("provider") == "cursor_agent"
-        and getattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, False)
+        and (
+            getattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, False)
+            or getattr(exc, _CURSOR_RETAINED_TRANSPORT_FAILURE_MARKER, False)
+        )
     )
 
 
@@ -1061,7 +1066,6 @@ async def handle_alias_route(  # noqa: PLR0915
     # attempts. Must not reset when the outer candidate-selection loop re-enters.
     native_grok_continuation_transient_provider_attempts = 0
     provider_candidate_attempts = 0
-    request_provider_egress_reached = False
     same_account_transient_attempts_by_slot: dict[Optional[str], int] = {}
     managed_xai_generation_retry_attempted = False
     request_retry_started_at = time.monotonic()
@@ -1179,7 +1183,6 @@ async def handle_alias_route(  # noqa: PLR0915
         attempt_record: dict[str, Any],
         reason: str,
         budget_was_counted: bool,
-        request_provider_egress_reached: bool,
         selection_provider_egress_reached: bool,
     ) -> None:
         """Refund one counted xAI selection and mark its bounded skip outcome."""
@@ -1195,7 +1198,6 @@ async def handle_alias_route(  # noqa: PLR0915
         )
         if (
             budget_was_counted
-            and not request_provider_egress_reached
             and not selection_provider_egress_reached
             and not budget_refunded
         ):
@@ -2315,7 +2317,6 @@ async def handle_alias_route(  # noqa: PLR0915
 
                         async def _perform_candidate_request() -> Response:
                             nonlocal attempted_provider_call
-                            nonlocal request_provider_egress_reached
                             nonlocal selection_provider_egress_reached
                             candidate_is_openai = (
                                 str(candidate.get("provider") or "").strip().lower()
@@ -2425,11 +2426,9 @@ async def handle_alias_route(  # noqa: PLR0915
                                 attempt_record["attempted_provider_call"] = (
                                     attempted_provider_call
                                 )
-                                request_provider_egress_reached, selection_provider_egress_reached = (
-                                    request_provider_egress_reached
-                                    or attempted_provider_call,
+                                selection_provider_egress_reached = (
                                     selection_provider_egress_reached
-                                    or attempted_provider_call,
+                                    or attempted_provider_call
                                 )
                                 if "hidden_logical_retry_count" not in attempt_record:
                                     attempt_record["hidden_logical_retry_count"] = (
@@ -3347,6 +3346,13 @@ async def handle_alias_route(  # noqa: PLR0915
                     failure_exc,
                     candidate=candidate,
                 ):
+                    continuation_evidence = getattr(
+                        failure_exc, _CURSOR_CONTINUATION_EVIDENCE_FIELD, None
+                    )
+                    if isinstance(continuation_evidence, dict):
+                        attempt_record[_CURSOR_CONTINUATION_EVIDENCE_FIELD] = dict(
+                            continuation_evidence
+                        )
                     continuation_error_class = (
                         _classify_codex_auto_agent_retryable_exhaustion(
                             failure_exc,
@@ -3408,10 +3414,11 @@ async def handle_alias_route(  # noqa: PLR0915
                             if replay_safety is not None
                             else True
                         )
-                        provider_candidate_attempts = max(
-                            0,
-                            provider_candidate_attempts - 1,
-                        )
+                        if not attempted_provider_call:
+                            provider_candidate_attempts = max(
+                                0,
+                                provider_candidate_attempts - 1,
+                            )
                         deterministically_ineligible_candidate_keys.add(cooldown_key)
                         last_retryable_exc = failure_exc
                         break
@@ -3856,9 +3863,6 @@ async def handle_alias_route(  # noqa: PLR0915
                         attempt_record=attempt_record,
                         reason=xai_no_io_selection_skip_reason,
                         budget_was_counted=selection_budget_counted,
-                        request_provider_egress_reached=(
-                            request_provider_egress_reached
-                        ),
                         selection_provider_egress_reached=(
                             selection_provider_egress_reached
                         ),
@@ -4250,6 +4254,16 @@ def _resolve_failure_plan(
         exc=exc,
         candidate=candidate,
     )
+    if _is_cursor_session_continuation_failure(exc, candidate=candidate):
+        # This is loss of one retained session, not evidence against unrelated
+        # requests. Bypass the evidence accumulator as well as timed cooldowns.
+        return CooldownPublicationPlan(
+            memory_keys=(),
+            durable_keys=(),
+            duration_seconds=0.0,
+            applied_scope="none",
+            request_local_action=None,
+        )
     if (
         _error_signals._is_codex_auto_agent_candidate_deterministically_ineligible(
             exc

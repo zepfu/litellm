@@ -1912,7 +1912,7 @@ def test_cursor_retained_session_consumes_function_call_output_without_new_run(
     rendered = "\n".join(flushed)
     assert rendered.count("Turns: 1") == 1
     assert "selected@example.com" in rendered
-    with pytest.raises(CursorConnectError, match="missing"):
+    with pytest.raises(CursorConnectError, match="consumed"):
         codex_candidate_calls._peek_cursor_replay_state("resp-retained")
 
 
