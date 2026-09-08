@@ -2701,6 +2701,7 @@ class NativeHistoryCloseRegistration:
     start_state: str = "not_started"
     started: bool = False
     reaped: bool = False
+    scope_reaped_proven: bool = False
 
 
 @dataclass
@@ -2739,6 +2740,7 @@ class NativeHistoryLifecycleRegistration:
     cleanup_plan: Optional[Dict[str, float]] = None
     cleanup_failure: Optional[str] = None
     shutdown_deadline: Optional[float] = None
+    worker_scope_reaped_proven: bool = False
     registration_id: str = ""
 
     def __post_init__(self) -> None:
@@ -5471,29 +5473,31 @@ def _native_history_process_reaped(
     kill_deadline: float,
     reap_deadline: float,
     poll_only: bool = False,
+    scope_reaped_state: Optional[Dict[str, bool]] = None,
 ) -> bool:
     """Retire a worker tree without borrowing a later phase."""
 
     def scope_reaped() -> bool:
-        if getattr(process, "pid", None) is None:
-            return _native_history_process_group_alive(
-                private_process_group,
-                process,
-                private_process_start_time,
-                deadline=(
-                    time.monotonic()
-                    if poll_only
-                    else reap_deadline
-                ),
-            ) is False
+        if (
+            scope_reaped_state is not None
+            and scope_reaped_state.get("proven") is True
+        ):
+            return True
         try:
-            process.join(timeout=0)
-        except (AssertionError, OSError):
-            return False
-        return (
-            not _native_history_process_alive(process)
-            and getattr(process, "exitcode", None) is not None
-            and _native_history_process_group_alive(
+            group_id = int(
+                getattr(private_process_group, "value", private_process_group)
+                or 0
+            )
+        except (TypeError, ValueError):
+            group_id = 0
+        if getattr(process, "pid", None) is None:
+            if group_id <= 0:
+                if scope_reaped_state is not None:
+                    scope_reaped_state["proven"] = True
+                return True
+            if poll_only:
+                return False
+            scope_alive = _native_history_process_group_alive(
                 private_process_group,
                 process,
                 private_process_start_time,
@@ -5503,8 +5507,36 @@ def _native_history_process_reaped(
                     else reap_deadline
                 ),
             )
-            is False
+            if scope_alive is False and scope_reaped_state is not None:
+                scope_reaped_state["proven"] = True
+            return scope_alive is False
+        try:
+            process.join(timeout=0)
+        except (AssertionError, OSError):
+            return False
+        if (
+            _native_history_process_alive(process)
+            or getattr(process, "exitcode", None) is None
+        ):
+            return False
+        if poll_only and group_id > 0:
+            # A post-leader group scan is a blocking inventory operation. In
+            # poll-only servicing, rely on prior sealed scope evidence or the
+            # sidecar's retained role pidfds instead of inventing proof.
+            return False
+        scope_alive = _native_history_process_group_alive(
+            private_process_group,
+            process,
+            private_process_start_time,
+            deadline=(
+                time.monotonic()
+                if poll_only
+                else reap_deadline
+            ),
         )
+        if scope_alive is False and scope_reaped_state is not None:
+            scope_reaped_state["proven"] = True
+        return scope_alive is False
 
     if scope_reaped():
         return True
@@ -5762,6 +5794,18 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
             *,
             phase_poll_only: bool,
         ) -> bool:
+            close_scope = registration.close_registration
+            is_closer = (
+                close_scope is not None
+                and process is close_scope.process
+            )
+            scope_reaped_state = {
+                "proven": (
+                    close_scope.scope_reaped_proven
+                    if is_closer and close_scope is not None
+                    else registration.worker_scope_reaped_proven
+                ),
+            }
             try:
                 lifecycle_capability.terminate_native_history_process_scope(
                     registration_id=registration.registration_id,
@@ -5781,7 +5825,16 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
                 kill_deadline=plan["kill_deadline"],
                 reap_deadline=plan["reap_deadline"],
                 poll_only=phase_poll_only,
+                scope_reaped_state=scope_reaped_state,
             ):
+                if is_closer and close_scope is not None:
+                    close_scope.scope_reaped_proven = bool(
+                        scope_reaped_state["proven"]
+                    )
+                else:
+                    registration.worker_scope_reaped_proven = bool(
+                        scope_reaped_state["proven"]
+                    )
                 return True
             # The browser driver can outlive its multiprocessing leader. Give
             # the owning sidecar a chance to signal its retained role-marked
@@ -5797,7 +5850,7 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
             except Exception as exc:
                 registration.cleanup_failure = str(exc)
                 return False
-            return _native_history_process_reaped(
+            reaped = _native_history_process_reaped(
                 process,
                 private_process_group,
                 private_process_start_time,
@@ -5805,7 +5858,17 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
                 kill_deadline=plan["kill_deadline"],
                 reap_deadline=plan["reap_deadline"],
                 poll_only=True,
+                scope_reaped_state=scope_reaped_state,
             )
+            if is_closer and close_scope is not None:
+                close_scope.scope_reaped_proven = bool(
+                    scope_reaped_state["proven"]
+                )
+            else:
+                registration.worker_scope_reaped_proven = bool(
+                    scope_reaped_state["proven"]
+                )
+            return reaped
 
         close_registration = registration.close_registration
         if close_registration is not None and not close_registration.reaped:
@@ -6233,17 +6296,34 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
         raise OracleBrowserCleanupError(
             "Oracle browser owned-target closer could not start."
         ) from exc
-    try:
-        process.join(timeout=max(0.0, _remaining_browser_timeout(deadline)))
+    scope_reaped_proven = False
+
+    def closer_scope_reaped() -> bool:
+        nonlocal scope_reaped_proven
+        if scope_reaped_proven:
+            return True
         if (
             _native_history_process_alive(process)
             or getattr(process, "exitcode", None) is None
-            or _native_history_process_group_alive(
-                private_process_group,
-                process,
-                private_process_start_time,
-                deadline=deadline,
-            ) is not False
+        ):
+            return False
+        scope_alive = _native_history_process_group_alive(
+            private_process_group,
+            process,
+            private_process_start_time,
+            deadline=deadline,
+        )
+        if scope_alive is False:
+            scope_reaped_proven = True
+            if close_registration is not None:
+                close_registration.scope_reaped_proven = True
+            return True
+        return False
+
+    try:
+        process.join(timeout=max(0.0, _remaining_browser_timeout(deadline)))
+        if (
+            not closer_scope_reaped()
         ):
             _terminate_oracle_browser_worker(
                 process,
@@ -6252,14 +6332,7 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
             )
             process.join(timeout=max(0.0, _remaining_browser_timeout(deadline)))
         if (
-            _native_history_process_alive(process)
-            or getattr(process, "exitcode", None) is None
-            or _native_history_process_group_alive(
-                private_process_group,
-                process,
-                private_process_start_time,
-                deadline=deadline,
-            ) is not False
+            not closer_scope_reaped()
         ):
             if (
                 close_registration is not None
@@ -6284,15 +6357,7 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
             creation_url=creation_url,
         )
     finally:
-        if _native_history_process_alive(process) or (
-            _native_history_process_group_alive(
-                private_process_group,
-                process,
-                private_process_start_time,
-                deadline=deadline,
-            )
-            is not False
-        ):
+        if not closer_scope_reaped():
             _terminate_oracle_browser_worker(
                 process,
                 private_process_group.value,
@@ -6305,15 +6370,7 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
             except (AssertionError, OSError):
                 pass
         if (
-            not _native_history_process_alive(process)
-            and getattr(process, "exitcode", None) is not None
-            and _native_history_process_group_alive(
-                private_process_group,
-                process,
-                private_process_start_time,
-                deadline=deadline,
-            )
-            is False
+            closer_scope_reaped()
             and close_registration is not None
         ):
             close_registration.reaped = True

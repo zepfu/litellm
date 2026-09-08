@@ -813,6 +813,11 @@ after exact-target safety or private-browser termination is authorized.
 Inventory phase expiry does not disable later bounded phases, while the final
 inventory cutoff remains a hard ceiling. Incomplete scans retain explicit
 unresolved inventory diagnostics and cannot become a positive retirement proof.
+An inventory scan becomes terminal evidence only after admission is closed and
+all known browser producers have exited; that sealed evidence remains usable
+for later nonblocking retirement checks. Poll-only servicing never performs a
+new process discovery scan: it signals only retained role-specific pidfds and
+leaves an unknown ownership obligation retained.
 Cleanup uses one shared absolute operation ceiling:
 target-close, cooperative termination, forced termination, reconciliation,
 reaping, and scratch removal may be shortened by shutdown but never restart a
