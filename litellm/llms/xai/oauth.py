@@ -78,6 +78,7 @@ _XAI_UNSUPPORTED_INPUT_ITEM_TYPES = frozenset(
 
 _XAI_CREDENTIAL_MAX_BYTES = 1_048_576
 _GROK_NATIVE_CREDENTIAL_MAX_BYTES = 1_048_576
+_XAI_SNAPSHOT_STATE_ATTR = "_aawm_xai_oauth_snapshots"
 
 
 @dataclass(frozen=True)
@@ -232,6 +233,7 @@ async def prepare_oa_xai_request(
     data: Dict[str, Any],
     *,
     snapshot_out: Optional[MutableMapping[str, Any]] = None,
+    snapshot: Optional[XaiOAuthCredentialSnapshot] = None,
 ) -> bool:
     public_model = data.get("model")
     if not is_oa_xai_model(public_model):
@@ -240,10 +242,32 @@ async def prepare_oa_xai_request(
     upstream_model = resolve_oa_xai_upstream_model(public_model)
     data["model"] = upstream_model
     data["api_base"] = get_secret_str("LITELLM_XAI_OAUTH_API_BASE") or XAI_API_BASE
-    snapshot, credential_resolution = await _get_xai_oauth_snapshot_with_resolution()
+    if (
+        snapshot is not None
+        and snapshot.credential_family != _XAI_MANAGED_SNAPSHOT_FAMILY
+    ):
+        raise ValueError(
+            "Managed xAI OAuth request received the wrong credential snapshot."
+        )
+    if snapshot is None:
+        resolved_snapshot, credential_resolution = (
+            await _get_xai_oauth_snapshot_with_resolution()
+        )
+    else:
+        credential_resolution = await asyncio.to_thread(
+            _resolve_xai_oauth_snapshot_inputs_sync
+        )
+        if (
+            credential_resolution.canonical_auth_file != snapshot.auth_file
+            or credential_resolution.scope != snapshot.scope
+        ):
+            raise ValueError(
+                "Managed xAI OAuth request changed its credential file or scope."
+            )
+        resolved_snapshot = snapshot
     if snapshot_out is not None:
-        snapshot_out["snapshot"] = snapshot
-    data["api_key"] = snapshot.access_token
+        snapshot_out["snapshot"] = resolved_snapshot
+    data["api_key"] = resolved_snapshot.access_token
     data["custom_llm_provider"] = "xai"
     decoded_previous_response_id = _decode_previous_response_id_in_place(data)
     removed_input_items = _drop_xai_unsupported_input_items_in_place(data)
@@ -824,6 +848,135 @@ async def get_xai_oauth_snapshot() -> XaiOAuthCredentialSnapshot:
 async def get_xai_oauth_access_token() -> str:
     snapshot = await get_xai_oauth_snapshot()
     return snapshot.access_token
+
+
+async def reread_xai_oauth_snapshot_after_401(
+    snapshot: XaiOAuthCredentialSnapshot,
+) -> Optional[XaiOAuthCredentialSnapshot]:
+    """Load one changed, same-account managed generation for a bounded retry."""
+
+    if (
+        snapshot.credential_family != _XAI_MANAGED_SNAPSHOT_FAMILY
+        or snapshot.account_identity is None
+    ):
+        return None
+    current = await _get_xai_oauth_snapshot_for_path(
+        credential_path=snapshot.auth_file,
+        scope=snapshot.scope,
+        force_reload=True,
+    )
+    if current.generation == snapshot.generation:
+        return None
+    if (
+        current.account_identity is None
+        or current.account_identity != snapshot.account_identity
+    ):
+        return None
+    return current
+
+
+def _xai_oauth_exception_status_code(exc: BaseException) -> Optional[int]:
+    for source in (exc, getattr(exc, "response", None)):
+        for attribute in ("status_code", "code"):
+            value = getattr(source, attribute, None)
+            if isinstance(value, int):
+                return value
+            try:
+                if value is not None:
+                    return int(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _xai_oauth_response_matches_api_base(
+    exc: BaseException,
+    api_base: Optional[str],
+) -> bool:
+    if not isinstance(api_base, str) or not api_base.strip():
+        return False
+    response = getattr(exc, "response", None)
+    if not isinstance(response, httpx.Response) or response.status_code != 401:
+        return False
+    try:
+        expected_host = httpx.URL(api_base).host
+        response_request = response.request
+        response_host = response_request.url.host if response_request else None
+    except Exception:
+        return False
+    return expected_host is not None and expected_host == response_host
+
+
+def is_xai_oauth_precommit_provider_401(
+    exc: BaseException,
+    *,
+    api_base: Optional[str] = None,
+) -> bool:
+    """Return whether a managed xAI 401 is eligible for one pre-commit retry."""
+
+    if (
+        _xai_oauth_exception_status_code(exc) != 401
+        or getattr(exc, "pre_commit_retry_exhausted", False) is True
+    ):
+        return False
+    failure_phase = getattr(exc, "failure_phase", None)
+    if isinstance(failure_phase, str) and (
+        "post_first_byte" in failure_phase
+        or "stream_interrupted" in failure_phase
+        or "post_commit" in failure_phase
+    ):
+        return False
+    if (
+        getattr(exc, "_aawm_provider_returned", False) is True
+        or getattr(exc, "provider_returned", False) is True
+    ):
+        return True
+    return _xai_oauth_response_matches_api_base(exc, api_base)
+
+
+async def reread_xai_oauth_snapshot_after_provider_401(
+    snapshot: XaiOAuthCredentialSnapshot,
+    exc: BaseException,
+    *,
+    api_base: Optional[str] = None,
+) -> Optional[XaiOAuthCredentialSnapshot]:
+    """Return a verified replacement snapshot for an eligible provider 401."""
+
+    if not is_xai_oauth_precommit_provider_401(exc, api_base=api_base):
+        return None
+    try:
+        return await reread_xai_oauth_snapshot_after_401(snapshot)
+    except Exception:
+        return None
+
+
+def bind_xai_oauth_snapshot_to_request(
+    request: Any,
+    snapshot: XaiOAuthCredentialSnapshot,
+) -> None:
+    state = getattr(request, "state", None)
+    if state is None:
+        return
+    snapshots = getattr(state, _XAI_SNAPSHOT_STATE_ATTR, None)
+    if not isinstance(snapshots, dict):
+        snapshots = {}
+        setattr(state, _XAI_SNAPSHOT_STATE_ATTR, snapshots)
+    snapshots[snapshot.credential_family] = snapshot
+
+
+def get_xai_oauth_snapshot_from_request(
+    request: Any,
+    *,
+    credential_family: str = _XAI_MANAGED_SNAPSHOT_FAMILY,
+) -> Optional[XaiOAuthCredentialSnapshot]:
+    state = getattr(request, "state", None)
+    snapshots = getattr(state, _XAI_SNAPSHOT_STATE_ATTR, None)
+    if not isinstance(snapshots, Mapping):
+        return None
+    snapshot = snapshots.get(credential_family)
+    return (
+        snapshot if isinstance(snapshot, XaiOAuthCredentialSnapshot) else None
+    )
 
 
 async def _get_xai_oauth_access_token_with_resolution(

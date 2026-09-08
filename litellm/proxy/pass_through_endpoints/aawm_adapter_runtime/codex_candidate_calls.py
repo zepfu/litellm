@@ -4998,6 +4998,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
     try:
         oa_xai_context = await BaseOpenAIPassThroughHandler._prepare_openai_oa_xai_context(
             endpoint=endpoint,
+            request=request,
             request_body=adapted_request_body,
         )
     except Exception as exc:
