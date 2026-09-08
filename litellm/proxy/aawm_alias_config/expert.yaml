@@ -8,7 +8,7 @@ aliases:
         priority: 100
 
       - provider: openai
-        model: gpt-5.6-terra
+        model: gpt-6-astra
         route_family: codex_responses
         priority: 0
-        reasoning_effort: max
+        reasoning_effort: low

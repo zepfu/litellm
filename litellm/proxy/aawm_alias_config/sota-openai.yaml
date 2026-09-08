@@ -1,11 +1,11 @@
-# Temporary litellm-alpha stabilization mapping for ``sota-openai``.
+# OpenAI state-of-the-art alias.
 defaults: {}
 
 aliases:
   - name: sota-openai
     candidates:
       - provider: openai
-        model: gpt-5.6-sol
+        model: gpt-6-astra
         route_family: codex_responses
         priority: 100
-        reasoning_effort: medium
+        reasoning_effort: high

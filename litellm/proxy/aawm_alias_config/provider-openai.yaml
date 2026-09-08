@@ -23,5 +23,11 @@ aliases:
       - provider: openai
         model: gpt-5.6-sol
         route_family: codex_responses
+        priority: 80
+        reasoning_effort: low
+
+      - provider: openai
+        model: gpt-6-astra
+        route_family: codex_responses
         priority: 0
         reasoning_effort: low
