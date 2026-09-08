@@ -3234,6 +3234,12 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         _emit_adapted_route_access_log,
         _record_adapted_completed_route_rollup_turn,
     )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.tool_call_restore import (
+        _restore_adapted_namespace_tool_calls_in_response_body,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_request_policy.codex_tool_policy import (
+        _adapt_codex_namespace_tools_to_functions_from_request_body,
+    )
 
     if candidate.get("route_family") != "codex_cursor_agent_aiserver_adapter":
         raise ValueError(
@@ -3381,15 +3387,11 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
                 await retained_session.aclose()
         else:
             await retained_session.aclose()
-        restore_namespace = globals().get(
-            "_restore_adapted_namespace_tool_calls_in_response_body"
+        response_body, _ = _restore_adapted_namespace_tool_calls_in_response_body(
+            response_body,
+            request_body=restoration_request_body,
+            adapter_model=adapter_model,
         )
-        if callable(restore_namespace):
-            response_body, _ = restore_namespace(
-                response_body,
-                request_body=restoration_request_body,
-                adapter_model=adapter_model,
-            )
         _record_adapted_completed_route_rollup_turn(
             rollup_kwargs,
             adapter_label="Cursor Agent",
@@ -3499,15 +3501,11 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             tools=request_tools if isinstance(request_tools, list) else [],
             retained_session=result.retained_session,
         )
-    restore_namespace = globals().get(
-        "_restore_adapted_namespace_tool_calls_in_response_body"
+    response_body, _ = _restore_adapted_namespace_tool_calls_in_response_body(
+        response_body,
+        request_body=restoration_request_body,
+        adapter_model=adapter_model,
     )
-    if callable(restore_namespace):
-        response_body, _ = restore_namespace(
-            response_body,
-            request_body=restoration_request_body,
-            adapter_model=adapter_model,
-        )
     _record_adapted_completed_route_rollup_turn(
         rollup_kwargs,
         adapter_label="Cursor Agent",
