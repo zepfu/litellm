@@ -15,7 +15,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
 
 DEFAULT_XAI_OAUTH_AUTH_FILE = "~/.litellm/xai/oauth-auth.json"
 DEFAULT_XAI_OAUTH_LOCK_FILE = "~/.litellm/xai/oauth-auth.json.lock"
@@ -38,7 +38,7 @@ XAI_GROK_SCOPE_ENV_VARS = (
     "LITELLM_XAI_OAUTH_SCOPE",
 )
 
-AuthPathValue = str | os.PathLike[str]
+AuthPathValue = Union[str, os.PathLike[str]]
 ValueGetter = Callable[[str], Any]
 
 
