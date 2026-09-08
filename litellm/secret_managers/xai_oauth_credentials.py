@@ -24,7 +24,6 @@ DEFAULT_XAI_OAUTH_LOCK_FILE = "~/.litellm/xai/oauth-auth.json.lock"
 DEFAULT_XAI_OAUTH_SCOPE = (
     "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
 )
-XAI_OAUTH_IDENTITY_STATE_KEY = "_litellm_xai_identity"
 
 XAI_OAUTH_AUTH_FILE_ENV_VARS = (
     "LITELLM_XAI_OAUTH_AUTH_FILE",
@@ -344,10 +343,13 @@ def _account_identity_value(value: Any) -> Optional[str | int]:
     return None
 
 
-def credential_account_evidence(
-    record: Optional[Mapping[str, Any]],
-) -> dict[str, str | int]:
-    """Return the normalized, non-token fields used by existing identity pins."""
+def credential_account_identity(
+    record: Optional[Mapping[str, Any]] = None,
+    *,
+    scope: Optional[str] = None,
+) -> Optional[str]:
+    """Return a stable nonsecret identity only when account evidence is present."""
+
     account_evidence: dict[str, Any] = {}
     if isinstance(record, Mapping):
         for field_name in (
@@ -358,27 +360,8 @@ def credential_account_evidence(
             value = _account_identity_value(record.get(field_name))
             if value is not None:
                 account_evidence[field_name] = value
-    return account_evidence
-
-
-def credential_account_identity(
-    record: Optional[Mapping[str, Any]] = None,
-    *,
-    scope: Optional[str] = None,
-) -> Optional[str]:
-    """Return a stable nonsecret identity only when account evidence is present."""
-    account_evidence = credential_account_evidence(record)
     if not account_evidence:
         return None
-    if isinstance(record, Mapping) and XAI_OAUTH_IDENTITY_STATE_KEY in record:
-        state = record[XAI_OAUTH_IDENTITY_STATE_KEY]
-        if (
-            not isinstance(state, Mapping)
-            or state.get("version") != 1
-            or state.get("status") != "verified"
-            or state.get("account_fields") != account_evidence
-        ):
-            return None
 
     context: dict[str, Any] = {}
     if isinstance(record, Mapping):

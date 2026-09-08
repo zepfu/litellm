@@ -125,7 +125,7 @@ def select_xai_oauth_account_record(
 def build_xai_oauth_selected_account(
     record: XaiOAuthAccountRecord,
 ) -> XaiOAuthSelectedAccount:
-    """Build safe account identity for a selected record."""
+    """Build a server-owned identity for the selected credential record."""
 
     return XaiOAuthSelectedAccount(
         record=record,
@@ -203,14 +203,14 @@ def _xai_oauth_snapshot_matches_selected_account(
     expected_identity = _clean_string(
         getattr(selected.record, "expected_account_identity", None)
     )
+    if expected_identity is None:
+        # Legacy files need no added account metadata; this binds only the
+        # configured record, not a proven upstream account.
+        return selected.record.legacy
     snapshot_identity = _clean_string(
         getattr(snapshot, "account_identity", None)
     )
-    return (
-        expected_identity is not None
-        and snapshot_identity is not None
-        and snapshot_identity == expected_identity
-    )
+    return snapshot_identity == expected_identity
 
 
 def preserve_xai_oauth_candidate_context(
@@ -219,7 +219,7 @@ def preserve_xai_oauth_candidate_context(
     selected: XaiOAuthSelectedAccount,
     snapshot: Any = None,
 ) -> None:
-    """Keep verified account state out of public candidate dictionaries."""
+    """Keep server-owned account state out of public candidate dictionaries."""
 
     key = _xai_oauth_candidate_context_key(candidate)
     state = getattr(request, "state", None)
@@ -371,7 +371,10 @@ def get_bound_xai_oauth_selected_account(
     selected = getattr(state, _XAI_OAUTH_SELECTED_ACCOUNT_STATE, None)
     if not isinstance(selected, XaiOAuthSelectedAccount):
         return None
-    if selected.record.expected_account_identity is None:
+    if (
+        selected.record.expected_account_identity is None
+        and not selected.record.legacy
+    ):
         return None
     try:
         current_record = select_xai_oauth_account_record(label=selected.label)
@@ -421,19 +424,12 @@ def get_or_bind_xai_oauth_selected_account(
 async def get_xai_oauth_snapshot_for_selected_account(
     selected: XaiOAuthSelectedAccount,
 ) -> Any:
-    """Load the exact selected record and prove its configured identity pin."""
+    """Load the exact selected record and enforce any configured identity pin."""
 
     from litellm.llms.xai.oauth import get_xai_oauth_snapshot_for_record
 
     snapshot = await get_xai_oauth_snapshot_for_record(selected.record)
-    expected_identity = selected.record.expected_account_identity
-    actual_identity = _clean_string(getattr(snapshot, "account_identity", None))
-    if actual_identity is None:
-        raise XaiOAuthIdentityMismatchError(
-            "Managed xAI OAuth credential does not expose a verified account "
-            f"identity for record '{selected.label}'."
-        )
-    if expected_identity is not None and actual_identity != expected_identity:
+    if not _xai_oauth_snapshot_matches_selected_account(snapshot, selected):
         raise XaiOAuthIdentityMismatchError(
             "Managed xAI OAuth credential identity does not match the configured "
             f"record '{selected.label}'."
@@ -459,25 +455,11 @@ async def get_or_bind_xai_oauth_selected_account_and_snapshot(
         get_xai_oauth_snapshot_from_request,
     )
 
-    record = selected_account.record
     snapshot = get_xai_oauth_snapshot_from_request(request)
-    snapshot_identity = _clean_string(
-        getattr(snapshot, "account_identity", None)
-    )
-    expected_identity = _clean_string(
-        getattr(record, "expected_account_identity", None)
-    )
     if (
         snapshot is not None
-        and (
-            getattr(snapshot, "credential_family", None) != "xai_oauth"
-            or getattr(snapshot, "auth_file", None) != record.auth_path
-            or getattr(snapshot, "scope", None) != record.scope
-            or snapshot_identity is None
-            or (
-                expected_identity is not None
-                and snapshot_identity != expected_identity
-            )
+        and not _xai_oauth_snapshot_matches_selected_account(
+            snapshot, selected_account
         )
     ):
         clear_xai_oauth_snapshot_from_request(request)
@@ -502,28 +484,27 @@ async def resolve_xai_oauth_selected_account_identity(
     *,
     snapshot: Any = None,
 ) -> XaiOAuthSelectedAccount:
-    """Resolve legacy account identity from one immutable credential snapshot."""
+    """Use existing account evidence without requiring it in legacy records."""
 
     loaded_snapshot = (
         snapshot
         if snapshot is not None
         else await get_xai_oauth_snapshot_for_selected_account(selected)
     )
-    actual_identity = _clean_string(
-        getattr(loaded_snapshot, "account_identity", None)
-    )
-    if actual_identity is None:
-        raise XaiOAuthIdentityMismatchError(
-            "Managed xAI OAuth credential does not expose a verified account "
-            f"identity for record '{selected.label}'."
-        )
-    expected_identity = selected.record.expected_account_identity
-    if expected_identity is not None and actual_identity != expected_identity:
+    if not _xai_oauth_snapshot_matches_selected_account(
+        loaded_snapshot, selected
+    ):
         raise XaiOAuthIdentityMismatchError(
             "Managed xAI OAuth credential identity does not match the configured "
             f"record '{selected.label}'."
         )
-    if expected_identity is not None:
+    actual_identity = _clean_string(
+        getattr(loaded_snapshot, "account_identity", None)
+    )
+    if (
+        selected.record.expected_account_identity is not None
+        or actual_identity is None
+    ):
         return selected
     return build_xai_oauth_selected_account(
         replace(selected.record, expected_account_identity=actual_identity)
@@ -795,19 +776,8 @@ def validated_xai_oauth_server_account_metadata(
     snapshot = get_xai_oauth_snapshot_from_request(request)
     if selected is None or snapshot is None:
         return None
-    expected_identity = _clean_string(
-        getattr(selected.record, "expected_account_identity", None)
-    )
-    snapshot_identity = _clean_string(
-        getattr(snapshot, "account_identity", None)
-    )
     if (
-        expected_identity is None
-        or snapshot_identity is None
-        or snapshot_identity != expected_identity
-        or getattr(snapshot, "credential_family", None) != "xai_oauth"
-        or getattr(snapshot, "auth_file", None) != selected.record.auth_path
-        or getattr(snapshot, "scope", None) != selected.record.scope
+        not _xai_oauth_snapshot_matches_selected_account(snapshot, selected)
         or label != selected.label
     ):
         return None

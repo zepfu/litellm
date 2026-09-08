@@ -172,23 +172,22 @@ cached snapshot before a later request rebuilds it. Missing, malformed,
 ambiguous-scope, expired, and near-expiry records fail closed; request handling
 does not refresh or write the managed credential file.
 
-Managed account selection resolves the non-secret account identity from the same
-credential snapshot whose token is sent. The legacy single-file configuration is
-therefore not assigned a file-only account lane: token rotation preserves the
-account lane, while replacing account A with account B produces a new lane.
-If the snapshot cannot prove an account identity, the request fails closed.
-Explicit inventory records continue to use their configured
-`expected_account_identity` pin. Account identity metadata is server-derived;
-caller-supplied metadata cannot select or replace it.
+Managed account selection uses the same credential snapshot whose token is
+sent. Existing single-file credentials need no new account fields, ID-token
+verification, or metadata publication. When account evidence is absent, the
+legacy configuration retains its server-selected file/scope record lane;
+that lane is not proof of an upstream account identity and cannot detect an
+account replacement within the same record. Existing account fields, when
+present, still distinguish account lanes. Explicit inventory records enforce
+their configured `expected_account_identity` pin. Caller-supplied metadata
+cannot select or replace the server binding.
 
-The managed credential writer can bootstrap a verified subject from an existing
-xAI ID token without refreshing it. It preserves established account hashes and
-quarantines every account field while identity verification is pending or has
-detected a subject mismatch. Rotated tokens are retained, but quarantined
-credentials remain unavailable to requests; a refresh cannot silently rebind an
-existing account to a different subject. See
-[credential maintenance](../../../../docs/aawm-oauth-credential-maintenance.md#managed-xai-verified-account-identity)
-for verification, recovery, and sidecar activation boundaries.
+Direct managed Responses requests reserve the selected record before sending.
+The transport renews that reservation, while the handler retains promotion
+until response validation succeeds. Streams promote only after a validated
+terminal response and complete consumption; failure or cancellation releases
+the reservation and finalizes transfer status without running deferred success
+callbacks. Upstream headers alone do not establish ownership.
 
 For a provider-owned managed xAI `401` before response bytes are committed,
 LiteLLM may reread the exact bound file and scope and retry once on alias,

@@ -18,6 +18,7 @@ Do NOT import ``llm_passthrough_endpoints`` at module scope.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 from dataclasses import dataclass
 from typing import (
@@ -42,6 +43,10 @@ from litellm.llms.xai.route_descriptors import (
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
     bind_codex_collaboration_tool_identities,
     normalize_codex_collaboration_dispatch_body,
+)
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.deferred_success import (
+    finalize_deferred_failure,
+    finalize_deferred_success,
 )
 from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
     load_text_watermark_config,
@@ -934,6 +939,29 @@ class BaseOpenAIPassThroughHandler:
                             request=request,
                         )
         session_owner_lease = _sa.get_request_session_owner_lease(request)
+        defer_managed_xai_promotion = (
+            managed_xai_oauth_request
+            and canonical_managed_oa_xai_request_body is not None
+            and rt.is_openai_responses_endpoint_fn(endpoint)
+        )
+        managed_xai_response = None
+
+        async def _fail_managed_xai_response(
+            cause: Optional[BaseException],
+            *,
+            phase: str = "failed",
+        ) -> None:
+            if not defer_managed_xai_promotion:
+                return
+            if isinstance(cause, asyncio.CancelledError):
+                phase = "cancelled"
+            elif isinstance(
+                cause, (GeneratorExit, BrokenPipeError, ConnectionResetError)
+            ):
+                phase = "disconnected"
+            elif isinstance(cause, (TimeoutError, httpx.TimeoutException)):
+                phase = "timed_out"
+            await finalize_deferred_failure(managed_xai_response, phase=phase)
 
         try:
             if grok_native_oauth_request and isinstance(extra_headers, dict):
@@ -968,6 +996,7 @@ class BaseOpenAIPassThroughHandler:
                     egress_credential_family=egress_credential_family,
                     expected_target_family=expected_target_family,
                     managed_xai_oauth_request=managed_xai_oauth_request,
+                    defer_session_owner_promotion=defer_managed_xai_promotion,
                     blocked_pass_through_prefixed_headers=(
                         ["authorization", "api-key", "x-api-key"]
                         if managed_xai_oauth_request
@@ -1020,6 +1049,7 @@ class BaseOpenAIPassThroughHandler:
                     user_api_key_dict,
                     custom_body=endpoint_custom_body,
                 )
+            managed_xai_response = response
             status_code = getattr(response, "status_code", None)
             if (
                 isinstance(status_code, int)
@@ -1027,41 +1057,84 @@ class BaseOpenAIPassThroughHandler:
                 and canonical_managed_oa_xai_request_body is not None
                 and rt.is_openai_responses_endpoint_fn(endpoint)
             ):
+                from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+                    _aawm_run_with_session_owner_lease_renewal,
+                )
+
                 provider_bound_body = (
                     endpoint_custom_body
                     if isinstance(endpoint_custom_body, dict)
                     else {}
                 )
-                response = await rt.validate_codex_auto_agent_responses_payload_fn(
-                    response,
-                    adapter_model=str(
-                        provider_bound_body.get("model")
-                        or canonical_managed_oa_xai_request_body.get("model")
-                        or "unknown-model"
+                response = await _aawm_run_with_session_owner_lease_renewal(
+                    request=request,
+                    operation=lambda: rt.validate_codex_auto_agent_responses_payload_fn(
+                        response,
+                        adapter_model=str(
+                            provider_bound_body.get("model")
+                            or canonical_managed_oa_xai_request_body.get("model")
+                            or "unknown-model"
+                        ),
+                        adapter="direct_managed_xai_responses",
+                        adapter_label="xAI OAuth",
+                        request_body=canonical_managed_oa_xai_request_body,
                     ),
-                    adapter="direct_managed_xai_responses",
-                    adapter_label="xAI OAuth",
-                    request_body=canonical_managed_oa_xai_request_body,
                 )
-        except Exception:
-            await _sa.finalize_session_owner_lease_on_failure(session_owner_lease)
+        except BaseException as exc:
+            try:
+                await _sa.finalize_session_owner_lease_on_failure(session_owner_lease)
+            finally:
+                await _fail_managed_xai_response(exc)
             raise
 
         status_code = getattr(response, "status_code", None)
         if isinstance(status_code, int) and 200 <= status_code < 300:
-            promote_result = await _sa.finalize_session_owner_lease_on_success(
-                session_owner_lease,
-                attributes=(
-                    session_owner_lease.attributes
-                    if session_owner_lease is not None
-                    else None
-                ),
-            )
+            if defer_managed_xai_promotion:
+                async def _complete_managed_xai_success() -> None:
+                    await finalize_deferred_success(response)
+
+                if _sa.bind_deferred_session_owner_lease_to_streaming_response(
+                    response,
+                    request=request,
+                    lease=session_owner_lease,
+                    failure_phase="session_owner_direct_managed_xai_stream_promote",
+                    on_success=_complete_managed_xai_success,
+                    on_failure=lambda cause: _fail_managed_xai_response(
+                        cause,
+                        phase="disconnected" if cause is None else "failed",
+                    ),
+                ):
+                    return response
+            try:
+                promote_result = await _sa.finalize_session_owner_lease_on_success(
+                    session_owner_lease,
+                    attributes=(
+                        session_owner_lease.attributes
+                        if session_owner_lease is not None
+                        else None
+                    ),
+                )
+            except BaseException as exc:
+                if defer_managed_xai_promotion:
+                    try:
+                        await _sa.finalize_session_owner_lease_on_failure(
+                            session_owner_lease
+                        )
+                    finally:
+                        await _fail_managed_xai_response(exc)
+                raise
             if promote_result is not None and promote_result.outcome in {
                 _sa.SessionOwnerMutationOutcome.CONFLICT,
                 _sa.SessionOwnerMutationOutcome.ERROR,
                 _sa.SessionOwnerMutationOutcome.NOT_HELD,
             }:
+                if defer_managed_xai_promotion:
+                    try:
+                        await _sa.finalize_session_owner_lease_on_failure(
+                            session_owner_lease
+                        )
+                    finally:
+                        await _fail_managed_xai_response(None)
                 _sa.raise_session_owner_redispatch_required(
                     session_identity=(
                         session_owner_lease.session_identity
@@ -1072,8 +1145,13 @@ class BaseOpenAIPassThroughHandler:
                     failure_phase="session_owner_direct_openai_promote",
                     request=request,
                 )
+            if defer_managed_xai_promotion:
+                await _complete_managed_xai_success()
         else:
-            await _sa.finalize_session_owner_lease_on_failure(session_owner_lease)
+            try:
+                await _sa.finalize_session_owner_lease_on_failure(session_owner_lease)
+            finally:
+                await _fail_managed_xai_response(None)
         return response
 
 
