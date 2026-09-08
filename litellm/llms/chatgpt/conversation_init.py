@@ -120,6 +120,7 @@ _NATIVE_HISTORY_CLEANUP_RESERVE_SECONDS = 10.0
 _NATIVE_HISTORY_TERM_GRACE_SECONDS = 1.0
 _NATIVE_HISTORY_KILL_GRACE_SECONDS = 1.0
 _NATIVE_HISTORY_REAP_GRACE_SECONDS = 1.0
+_NATIVE_HISTORY_MAX_PROCESS_INVENTORY_ENTRIES = 4096
 
 
 # Truncation does not silently claim completeness.
@@ -2737,6 +2738,7 @@ class NativeHistoryLifecycleRegistration:
     target_resolution: Optional[NativeHistoryTargetProof] = None
     cleanup_plan: Optional[Dict[str, float]] = None
     cleanup_failure: Optional[str] = None
+    shutdown_deadline: Optional[float] = None
     registration_id: str = ""
 
     def __post_init__(self) -> None:
@@ -2778,6 +2780,15 @@ class NativeHistoryLifecycleCapability(Protocol):
         self,
         registration: NativeHistoryLifecycleRegistration,
     ) -> None:
+        ...
+
+    def prepare_native_history_cleanup_plan(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        *,
+        cleanup_deadline: float,
+        operation_deadline: float,
+    ) -> Mapping[str, float]:
         ...
 
     def terminate_owned_browser(
@@ -4720,6 +4731,8 @@ def observe_native_chatgpt_history_from_oracle_browser(
             "retain_native_history",
             "release_native_history",
             "retire_native_history",
+            "prepare_native_history_cleanup_plan",
+            "terminate_native_history_process_scope",
             "terminate_owned_browser",
             "bind_native_history_endpoint",
         )
@@ -5274,6 +5287,8 @@ def _native_history_cleanup_phase_plan(
         float(operation_deadline),
         float(cleanup_deadline),
     )
+    if registration.shutdown_deadline is not None:
+        ceiling = min(ceiling, float(registration.shutdown_deadline))
     now = time.monotonic()
     if registration.cleanup_plan is None:
         start = min(now, ceiling)
@@ -5331,18 +5346,25 @@ def _native_history_process_group_member_count(group_id: int) -> Optional[int]:
     if os.name != "posix" or group_id <= 0:
         return 0
     count = 0
+    inspected = 0
+    inspection_failed = False
     try:
         entries = Path("/proc").iterdir()
         for entry in entries:
             if not entry.name.isdigit():
                 continue
+            inspected += 1
+            if inspected > _NATIVE_HISTORY_MAX_PROCESS_INVENTORY_ENTRIES:
+                return None
             try:
                 fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
                 if int(fields[2]) == group_id:
                     count += 1
             except (OSError, ValueError, IndexError):
-                continue
+                inspection_failed = True
     except OSError:
+        return None
+    if inspection_failed:
         return None
     return count
 
@@ -5554,6 +5576,11 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
             )
             return False
 
+        lifecycle_capability.prepare_native_history_cleanup_plan(
+            registration,
+            cleanup_deadline=cleanup_deadline,
+            operation_deadline=operation_deadline,
+        )
         plan = _native_history_cleanup_phase_plan(
             registration,
             cleanup_deadline,
@@ -5581,6 +5608,11 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
         promote_closer_proof()
 
         if registration.target_resolution is None:
+            plan = _native_history_cleanup_phase_plan(
+                registration,
+                cleanup_deadline,
+                operation_deadline,
+            )
             if (
                 state == _NATIVE_HISTORY_TARGET_NONE
                 and registration.start_state in {"not_started", "failed"}
@@ -5636,6 +5668,11 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
         close_registration = registration.close_registration
 
         if registration.target_resolution is None:
+            plan = _native_history_cleanup_phase_plan(
+                registration,
+                cleanup_deadline,
+                operation_deadline,
+            )
             try:
                 if lifecycle_capability.terminate_owned_browser(
                     term_deadline=plan["term_deadline"],
@@ -5700,6 +5737,17 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
             *,
             phase_poll_only: bool,
         ) -> bool:
+            try:
+                lifecycle_capability.terminate_native_history_process_scope(
+                    registration_id=registration.registration_id,
+                    term_deadline=plan["term_deadline"],
+                    kill_deadline=plan["kill_deadline"],
+                    reap_deadline=plan["reap_deadline"],
+                    poll_only=phase_poll_only,
+                )
+            except Exception as exc:
+                registration.cleanup_failure = str(exc)
+                return False
             if _native_history_process_reaped(
                 process,
                 private_process_group,
@@ -5736,6 +5784,11 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
 
         close_registration = registration.close_registration
         if close_registration is not None and not close_registration.reaped:
+            plan = _native_history_cleanup_phase_plan(
+                registration,
+                cleanup_deadline,
+                operation_deadline,
+            )
             if not worker_tree_reaped(
                 close_registration.process,
                 close_registration.private_process_group,
@@ -5753,6 +5806,11 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
             close_registration.reaped = True
             close_registration.reap_ack.set()
 
+        plan = _native_history_cleanup_phase_plan(
+            registration,
+            cleanup_deadline,
+            operation_deadline,
+        )
         if not worker_tree_reaped(
             registration.process,
             registration.private_process_group,

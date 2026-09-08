@@ -807,9 +807,11 @@ scratch remover until their own process retirement is proven. Descendant
 discovery retains live pidfd identities and role-specific markers installed in
 each native-history worker before Playwright launch; a historical numeric
 parent or process group never authorizes adoption or termination after leader
-identity is lost. Incomplete bounded scans retain explicit unresolved inventory
-diagnostics and cannot become a positive retirement proof. Cleanup uses one
-shared absolute operation ceiling:
+identity is lost. Browser-owner signals exclude the role-marked observer and
+closer scopes; those retained pidfds are retired only after exact-target
+safety or private-browser termination is authorized. Incomplete bounded scans
+retain explicit unresolved inventory diagnostics and cannot become a positive
+retirement proof. Cleanup uses one shared absolute operation ceiling:
 target-close, cooperative termination, forced termination, reconciliation,
 reaping, and scratch removal may be shortened by shutdown but never restart a
 deadline or create a recovery allowance. A failed target proof, release
