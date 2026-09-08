@@ -1322,14 +1322,31 @@ Relevant environment variables:
 - `AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS`: minimum seconds between poll
   attempts (default `600`).
 - `AAWM_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_PCT`: minimum percentage-point
-  gap in comparable fresh weekly remaining quota required for fresh OpenAI
-  account dispatches to prefer the less-depleted account (default `10`).
+  pool spread in comparable fresh weekly remaining quota required for fresh
+  OpenAI account dispatches to prefer the highest remaining account (default
+  `10`). Ties and incomparable observations retain inventory order.
+- `AAWM_CODEX_OAUTH_QUOTA_OBSERVATION_ENVIRONMENT`: exact shared Codex quota
+  producer scope. When unset, the consumer uses its runtime environment;
+  explicitly empty scope disables comparison. Dev and alpha Compose both
+  default to the provider-status sidecar's `AAWM_LITELLM_ENVIRONMENT` value
+  (`dev` by default). Override both consumers together if the producer changes.
+  Runtime environment labels and session-ownership namespaces are unchanged.
 - `AAWM_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS`: HTTP timeout.
 - `AAWM_CODEX_USAGE_URL`: live usage poll URL (defaults to `/wham/usage`).
 - `AAWM_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS`: max attempts per scheduled run.
 - `AAWM_CODEX_RESET_CREDIT_POLL_RETRY_BACKOFF_SECONDS`: retry backoff base.
 - `AAWM_CODEX_QUOTA_DSN`: optional Postgres DSN used only for direct Codex
   quota persistence; falls back to the general sidecar DSN when unset.
+
+Fresh account selection freezes one observation view for the entire consulted
+account set, refreshing that set together when hydration is due. Weekly
+comparison requires current reset provenance and the requested quota family;
+accounts may have different reset timestamps. Shared polls reflect account
+usage across dev and alpha, not either process's request counts. Local
+response-derived observations can still supply hard quota exclusions but do
+not substitute for missing shared weekly comparison evidence. The comparison
+policy and per-attempt audit contract are documented in
+[model management](my-website/docs/proxy/model_management.md#managed-codex-oauth-account-failover).
 
 The detail parser reads `credits[]` with `status`, `reset_type`, `granted_at`,
 `expires_at`, `redeem_started_at`, and `redeemed_at` when present. Each visible

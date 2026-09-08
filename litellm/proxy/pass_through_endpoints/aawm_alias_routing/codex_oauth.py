@@ -1568,6 +1568,9 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         session_affinity as _sa,
     )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_build import (
+        _codex_auto_agent_request_has_continuation_state,
+    )
     from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
         _merge_litellm_metadata,
         _safe_set_request_parsed_body,
@@ -1594,7 +1597,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
 
     candidate_template: dict[str, Any] = {
         "provider": CODEX_AUTO_AGENT_NATIVE_PROVIDER,
-        "model": model or "codex_native",
+        "model": model,
         "route_family": "codex_responses",
         "last_resort": False,
         "selection_priority": 100,
@@ -1664,7 +1667,29 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     if session_identity is not None and not planned_portable_failover:
         owner_record, _cache_key, owner_error = await _sa.get_session_owner_record(
             session_identity=session_identity,
+            request=request,
+            wait_for_foreign_reservation=True,
         )
+        if owner_error is not None:
+            _sa.raise_session_owner_redispatch_required(
+                session_identity=session_identity,
+                alias_model=model,
+                failure_phase="session_owner_redis_unavailable",
+                message="Session ownership could not be verified before account selection.",
+                guard=_sa.SessionOwnerGuardResult(
+                    decision=_sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                    session_identity=session_identity,
+                    cache_key=_cache_key,
+                    mismatch_reason=owner_error,
+                    provenance=_sa.build_session_owner_provenance(
+                        session_identity=session_identity,
+                        decision="redispatch_required",
+                        mismatch_reason=owner_error,
+                        cache_key=_cache_key,
+                    ),
+                ),
+                request=request,
+            )
         if owner_error is None and isinstance(owner_record, dict):
             owner_affinity = _direct_codex_oauth_affinity_from_session_owner(
                 _sa.owner_record_as_affinity_hint(
@@ -1741,7 +1766,13 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     diagnostic_skipped = _redact_codex_oauth_account_diagnostics(skipped)
 
     selected_state = _selection._select_first_available_codex_oauth_account_state(
-        states
+        states,
+        bypass_reason=(
+            "account_pinned" if affinity is not None else
+            "ordinary_continuation"
+            if _codex_auto_agent_request_has_continuation_state(body)
+            and not planned_portable_failover else None
+        ),
     )
 
     if selected_state is None:
@@ -1837,10 +1868,6 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 else "direct_inventory_first_available"
             )
         )
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_build import (
-        _codex_auto_agent_request_has_continuation_state,
-    )
-
     selection_state = {
         **selected_state,
         "selection_reason": selection_reason,
