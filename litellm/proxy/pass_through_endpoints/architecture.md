@@ -149,7 +149,8 @@ Hidden-retry metadata derives the logical retry count from actual logical
 sends during the retry operation: the request-ledger send delta minus the
 initial send. A denied reservation is recorded separately as
 `reservation_denied` with no provider-call attempt and cannot become a logical
-retry. Transport connection failures remain separate evidence.
+retry. Transport connection attempts remain separate evidence; the legacy
+failure-named projection remains available for existing consumers.
 
 ### Tool-schema normalization gate (issue #9)
 

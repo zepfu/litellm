@@ -187,7 +187,7 @@ from .aawm_adapter_runtime.provider_call_ledger import (
     get_request_provider_call_ledger,
     get_request_provider_call_ledger_snapshot,
     publish_reservation_metadata,
-    record_transport_connection_failure,
+    record_transport_connection_attempt,
     register_active_upstream_response,
     clear_active_upstream_response,
 )
@@ -1826,8 +1826,16 @@ def _record_passthrough_hidden_retry_metadata(
             attempt_record["logical_provider_send_count"] = (
                 logical_provider_send_count
             )
+        transport_connection_attempts = getattr(
+            request_ledger,
+            "transport_connection_attempts",
+            getattr(request_ledger, "transport_connection_failures", 0),
+        )
+        metadata["aawm_passthrough_hidden_connection_attempts"] = (
+            transport_connection_attempts
+        )
         metadata["aawm_passthrough_hidden_connection_failures"] = (
-            request_ledger.transport_connection_failures
+            transport_connection_attempts
         )
     attempts.append(attempt_record)
 
@@ -4810,6 +4818,10 @@ async def pass_through_request(  # noqa: PLR0915
             ledger_snapshot = get_request_provider_call_ledger_snapshot(request)
             if ledger_snapshot is None:
                 ledger_snapshot = openai_call_ledger.snapshot()
+            transport_connection_attempts = ledger_snapshot.get(
+                "transport_connection_attempts",
+                ledger_snapshot.get("transport_connection_failures", 0),
+            )
             setattr(
                 request_state,
                 "aawm_openai_send_ledger_snapshot",
@@ -4822,8 +4834,13 @@ async def pass_through_request(  # noqa: PLR0915
             )
             setattr(
                 request_state,
+                "aawm_openai_transport_connection_attempts",
+                transport_connection_attempts,
+            )
+            setattr(
+                request_state,
                 "aawm_openai_transport_connection_failures",
-                ledger_snapshot["transport_connection_failures"],
+                transport_connection_attempts,
             )
         retry_metadata = _ensure_passthrough_metadata(kwargs)
         setattr(
@@ -5324,7 +5341,7 @@ async def pass_through_request(  # noqa: PLR0915
                         follow_redirects=False,
                     )
                 except (httpx.ConnectError, httpx.ConnectTimeout):
-                    record_transport_connection_failure(request)
+                    record_transport_connection_attempt(request)
                     raise
                 register_active_upstream_response(request, response)
                 return response
