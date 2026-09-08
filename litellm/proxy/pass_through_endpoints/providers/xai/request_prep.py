@@ -25,9 +25,6 @@ from litellm.llms.xai.oauth import (
     build_grok_native_oauth_metadata as _build_grok_native_oauth_metadata,
 )
 from litellm.llms.xai.oauth import (
-    get_xai_oauth_snapshot_from_request as _get_xai_oauth_snapshot_from_request,
-)
-from litellm.llms.xai.oauth import (
     clear_xai_oauth_snapshot_from_request as _clear_xai_oauth_snapshot_from_request,
 )
 from litellm.llms.xai.oauth import (
@@ -625,17 +622,15 @@ async def _prepare_oa_xai_passthrough_request(  # noqa: PLR0915
     snapshot_out: dict[str, Any] = {}
     prepare_fn = runtime.prepare_oa_xai_request
     selected_account = None
+    request_snapshot = None
     if request is not None and runtime.is_oa_xai_model(request_body.get("model")):
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
-            get_or_bind_xai_oauth_selected_account,
+            get_or_bind_xai_oauth_selected_account_and_snapshot,
         )
 
-        selected_account = get_or_bind_xai_oauth_selected_account(request)
-    request_snapshot = (
-        _get_xai_oauth_snapshot_from_request(request)
-        if request is not None
-        else None
-    )
+        selected_account, request_snapshot = (
+            await get_or_bind_xai_oauth_selected_account_and_snapshot(request)
+        )
     if selected_account is not None and request_snapshot is not None:
         selected_record = getattr(selected_account, "record", None)
         selected_auth_path = getattr(selected_record, "auth_path", None)

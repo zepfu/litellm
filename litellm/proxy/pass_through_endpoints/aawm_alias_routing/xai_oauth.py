@@ -366,6 +366,62 @@ async def get_xai_oauth_snapshot_for_selected_account(
     return snapshot
 
 
+async def get_or_bind_xai_oauth_selected_account_and_snapshot(
+    request: Request,
+    *,
+    selected_account: Optional[XaiOAuthSelectedAccount] = None,
+) -> tuple[XaiOAuthSelectedAccount, Any]:
+    """Resolve and bind one account together with its exact credential snapshot."""
+
+    if selected_account is None:
+        selected_account = get_or_bind_xai_oauth_selected_account(request)
+    if not isinstance(selected_account, XaiOAuthSelectedAccount):
+        raise ValueError("Managed xAI OAuth account selection is invalid.")
+
+    from litellm.llms.xai.oauth import (
+        bind_xai_oauth_snapshot_to_request,
+        clear_xai_oauth_snapshot_from_request,
+        get_xai_oauth_snapshot_from_request,
+    )
+
+    record = selected_account.record
+    snapshot = get_xai_oauth_snapshot_from_request(request)
+    snapshot_identity = _clean_string(
+        getattr(snapshot, "account_identity", None)
+    )
+    expected_identity = _clean_string(
+        getattr(record, "expected_account_identity", None)
+    )
+    if (
+        snapshot is not None
+        and (
+            getattr(snapshot, "credential_family", None) != "xai_oauth"
+            or getattr(snapshot, "auth_file", None) != record.auth_path
+            or getattr(snapshot, "scope", None) != record.scope
+            or snapshot_identity is None
+            or (
+                expected_identity is not None
+                and snapshot_identity != expected_identity
+            )
+        )
+    ):
+        clear_xai_oauth_snapshot_from_request(request)
+        snapshot = None
+
+    if snapshot is None:
+        snapshot = await get_xai_oauth_snapshot_for_selected_account(
+            selected_account
+        )
+
+    selected_account = await resolve_xai_oauth_selected_account_identity(
+        selected_account,
+        snapshot=snapshot,
+    )
+    setattr(request.state, _XAI_OAUTH_SELECTED_ACCOUNT_STATE, selected_account)
+    bind_xai_oauth_snapshot_to_request(request, snapshot)
+    return selected_account, snapshot
+
+
 async def resolve_xai_oauth_selected_account_identity(
     selected: XaiOAuthSelectedAccount,
     *,
@@ -623,7 +679,12 @@ async def resolve_xai_oauth_direct_continuation_account(
         selected = build_xai_oauth_selected_account(
             select_xai_oauth_account_record(label=owner_label)
         )
-        selected = await resolve_xai_oauth_selected_account_identity(selected)
+        selected, _snapshot = (
+            await get_or_bind_xai_oauth_selected_account_and_snapshot(
+                request,
+                selected_account=selected,
+            )
+        )
     except Exception as exc:  # noqa: BLE001
         _raise_xai_oauth_direct_continuation_redispatch(
             request=request,
@@ -669,27 +730,15 @@ def xai_oauth_selected_account_metadata(
         "xai_oauth_record_identity": selected.account_hash,
         "xai_oauth_scope_identity": selected.scope_identity,
     }
-    verified_identity = _clean_string(
-        selected.record.expected_account_identity
-    )
-    if verified_identity is not None:
-        metadata["xai_oauth_verified_account_identity"] = verified_identity
     return metadata
-
-
-def _is_xai_oauth_account_identity(value: Optional[str]) -> bool:
-    return bool(
-        value is not None
-        and len(value) == len("sha256:") + 64
-        and value.startswith("sha256:")
-        and all(character in "0123456789abcdef" for character in value[7:])
-    )
 
 
 def validated_xai_oauth_server_account_metadata(
     metadata: Mapping[str, Any],
+    *,
+    request: Any = None,
 ) -> Optional[dict[str, str | bool]]:
-    """Return inventory-proven observation metadata or reject the payload."""
+    """Return request-bound observation metadata or reject the payload."""
 
     if metadata.get("xai_oauth_server_account_binding") is not True:
         return None
@@ -698,9 +747,6 @@ def validated_xai_oauth_server_account_metadata(
     scope_identity = _clean_string(metadata.get("xai_oauth_scope_identity"))
     lane_key = _clean_string(metadata.get("xai_oauth_lane_key"))
     record_identity = _clean_string(metadata.get("xai_oauth_record_identity"))
-    verified_identity = _clean_string(
-        metadata.get("xai_oauth_verified_account_identity")
-    )
     if not all(
         (
             label,
@@ -711,27 +757,30 @@ def validated_xai_oauth_server_account_metadata(
         )
     ):
         return None
-    assert label is not None
-    try:
-        current_record = select_xai_oauth_account_record(label=label)
-    except XaiOAuthInventoryError:
+    if request is None:
         return None
-    if current_record.expected_account_identity is None:
-        if not _is_xai_oauth_account_identity(verified_identity):
-            return None
-        selected = build_xai_oauth_selected_account(
-            replace(
-                current_record,
-                expected_account_identity=verified_identity,
-            )
-        )
-    else:
-        if (
-            verified_identity is not None
-            and verified_identity != current_record.expected_account_identity
-        ):
-            return None
-        selected = build_xai_oauth_selected_account(current_record)
+    from litellm.llms.xai.oauth import get_xai_oauth_snapshot_from_request
+
+    selected = get_bound_xai_oauth_selected_account(request)
+    snapshot = get_xai_oauth_snapshot_from_request(request)
+    if selected is None or snapshot is None:
+        return None
+    expected_identity = _clean_string(
+        getattr(selected.record, "expected_account_identity", None)
+    )
+    snapshot_identity = _clean_string(
+        getattr(snapshot, "account_identity", None)
+    )
+    if (
+        expected_identity is None
+        or snapshot_identity is None
+        or snapshot_identity != expected_identity
+        or getattr(snapshot, "credential_family", None) != "xai_oauth"
+        or getattr(snapshot, "auth_file", None) != selected.record.auth_path
+        or getattr(snapshot, "scope", None) != selected.record.scope
+        or label != selected.label
+    ):
+        return None
     expected = xai_oauth_selected_account_metadata(selected)
     if (
         account_hash != expected["xai_oauth_account_hash"]
@@ -750,6 +799,7 @@ __all__ = [
     "configured_xai_oauth_records",
     "get_bound_xai_oauth_selected_account",
     "get_or_bind_xai_oauth_selected_account",
+    "get_or_bind_xai_oauth_selected_account_and_snapshot",
     "get_xai_oauth_snapshot_for_selected_account",
     "is_managed_xai_oauth_candidate",
     "preserve_xai_oauth_candidate_context",

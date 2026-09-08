@@ -758,21 +758,42 @@ def _looks_like_xai_grok_oidc_rate_limit_context(context: Dict[str, Any]) -> boo
 
 def _validated_xai_oauth_server_account_metadata(
     metadata: Dict[str, Any],
+    *,
+    kwargs: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, str | bool]]:
-    """Accept only an inventory-proven managed xAI account binding."""
+    """Accept only a request-bound managed xAI account binding."""
 
     try:
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
             validated_xai_oauth_server_account_metadata,
         )
 
-        return validated_xai_oauth_server_account_metadata(metadata)
+        request = None
+        if isinstance(kwargs, dict):
+            litellm_params = kwargs.get("litellm_params")
+            if isinstance(litellm_params, dict):
+                proxy_server_request = litellm_params.get(
+                    "proxy_server_request"
+                )
+                if isinstance(proxy_server_request, dict):
+                    request = proxy_server_request.get("_request")
+        return validated_xai_oauth_server_account_metadata(
+            metadata,
+            request=request,
+        )
     except Exception:  # noqa: BLE001
         return None
 
 
-def _extract_xai_oauth_account_hash(metadata: Dict[str, Any]) -> Optional[str]:
-    server_metadata = _validated_xai_oauth_server_account_metadata(metadata)
+def _extract_xai_oauth_account_hash(
+    metadata: Dict[str, Any],
+    *,
+    kwargs: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    server_metadata = _validated_xai_oauth_server_account_metadata(
+        metadata,
+        kwargs=kwargs,
+    )
     value = (
         server_metadata.get("xai_oauth_account_hash")
         if isinstance(server_metadata, dict)
@@ -905,7 +926,10 @@ def _extract_xai_header_rate_limit_observations(  # noqa: PLR0915
     server_account_metadata = (
         None
         if native
-        else _validated_xai_oauth_server_account_metadata(metadata)
+        else _validated_xai_oauth_server_account_metadata(
+            metadata,
+            kwargs=kwargs,
+        )
     )
     if not native and server_account_metadata is None:
         return []

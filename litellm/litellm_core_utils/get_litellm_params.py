@@ -54,7 +54,6 @@ _XAI_OAUTH_AUTHORITATIVE_METADATA_KEYS = frozenset(
         "xai_oauth_lane_key",
         "xai_oauth_record_identity",
         "xai_oauth_scope_identity",
-        "xai_oauth_verified_account_identity",
         "xai_responses_previous_response_id_decoded",
         "codex_unsupported_input_item_removed_count",
         "codex_unsupported_input_item_types_removed",
