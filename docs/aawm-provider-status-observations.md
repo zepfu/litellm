@@ -1045,13 +1045,15 @@ one-shot foreground action, not a recurring schedule. A
 `history_observation_failed` result exits nonzero; `no_history_observed` is a
 distinct bounded outcome and exits zero.
 
-When a request triggers `model_or_mutation_blocked`, `blocked_request` records
-the first blocking branch (`mutating_method` or `model_or_mutation_path`), a
-fixed HTTP method, resource type, origin category, and route family. Categories
-distinguish existing bootstrap-read paths, model/mutation paths, other backend
-or API paths, and unclassified paths without returning the path itself.
-Unknown methods and resource types become `other`. This diagnostic does not
-allow additional traffic or change the request guard.
+Unknown mutating requests remain blocked without ending observation of
+already-permitted reads. Known model and conversation-mutation paths still
+stop observation; no additional route or method is permitted or retried.
+`blocked_request` records the first blocking branch (`mutating_method` or
+`model_or_mutation_path`), a fixed HTTP method, resource type, origin category,
+and route family. Categories distinguish existing bootstrap-read paths,
+model/mutation paths, other backend or API paths, and unclassified paths
+without returning the path itself. Unknown methods and resource types become
+`other`.
 
 `ChatGPTNativeHistoryProbeCleanupFailed` events include `cleanup_subreason`,
 an allowlisted code matched against existing fixed lifecycle failure messages.

@@ -4508,9 +4508,9 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             if not home_navigation:
                 set_boundary("unexpected_document_navigation")
         elif method in {"POST", "PUT", "PATCH", "DELETE"}:
+            # Reject this request without stopping unrelated permitted reads.
             blocked = True
             mutation_block_branch = "mutating_method"
-            set_boundary("model_or_mutation_blocked")
         elif (
             parsed.netloc == "chatgpt.com"
             and (
@@ -4530,11 +4530,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             blocked = True
             mutation_block_branch = mutation_block_branch or "model_or_mutation_path"
             set_boundary("model_or_mutation_blocked")
-        if (
-            mutation_block_branch is not None
-            and boundary_reason == "model_or_mutation_blocked"
-            and "blocked_request" not in capture
-        ):
+        if mutation_block_branch is not None and "blocked_request" not in capture:
             if parsed.scheme == "https" and parsed.netloc == "chatgpt.com":
                 origin_category = "chatgpt"
             elif parsed.scheme == "https":
