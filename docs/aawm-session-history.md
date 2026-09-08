@@ -2792,7 +2792,7 @@ For a native Grok request with a live server-owned session lease, LiteLLM
 replaces the outbound `x-grok-session-id` with a domain-separated SHA-256
 digest of that lease identity. This provider-safe value overrides every
 caller-supplied session header or metadata value without exposing the raw
-internal identity. Direct and Anthropic-native requests without an
+internal identity. Raw `/grok/*`, direct, and Anthropic-native requests without an
 authoritative lease retain the legacy header and conversation-id resolution
 above. Caller metadata alone
 never establishes owner binding, and parent, child, and auto-review identity
