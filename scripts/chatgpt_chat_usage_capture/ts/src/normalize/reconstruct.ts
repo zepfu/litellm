@@ -31,7 +31,9 @@ const TERMINAL_STATUSES = new Set([
 interface GraphNode {
   key: string;
   record: MessageRecord;
-  branchRoot: string;
+  branchRoot: string | null;
+  ownerKey: string | null;
+  userLinked: boolean;
 }
 
 interface NodeGroup {
@@ -47,6 +49,16 @@ interface AttemptGraph {
   parents: Map<string, Set<string>>;
 }
 
+interface PromptContext {
+  user: MessageRecord;
+  branchRoots: string[];
+}
+
+interface GenerationCandidates {
+  ids: Set<string>;
+  ambiguous: boolean;
+}
+
 export function reconstructAttempts(
   messages: ReadonlyArray<MessageRecord>,
   options: {
@@ -57,78 +69,84 @@ export function reconstructAttempts(
 ): ReconstructedAttempt[] {
   const normalized = deduplicateMessages(messages);
   const graph = buildGraph(normalized);
-  const attempts: ReconstructedAttempt[] = [];
-  const claimed = new Set<string>();
-  const claimedEvidenceMessageIds = new Set<string>();
+  const views = sortedMessages(normalized)
+    .filter((item) => item.role === "user")
+    .map((user) => ({ user, nodes: descendantsForUser(user, graph) }));
+  const nodes = normalizeOwnership(views, graph);
+  const groups = groupsForNodes(nodes, graph);
+  const contexts = new Map<NodeGroup, PromptContext[]>();
+  const promptOwners = new Map<NodeGroup, MessageRecord[]>();
 
-  for (const user of sortedMessages(normalized).filter((item) => item.role === "user")) {
-    const descendants = descendantsForUser(user, graph, claimedEvidenceMessageIds);
-    const groups = groupsForUser(user, descendants, graph);
-    if (groups.length === 0) {
-      groups.push({
+  for (const view of views) {
+    const viewNodes = new Map(view.nodes.map((node) => [node.key, node]));
+    const visibleGroups = new Map<NodeGroup, NodeGroup>();
+    for (const group of groups) {
+      const visibleNodes = group.nodes
+        .map((node) => viewNodes.get(node.key))
+        .filter((node): node is GraphNode => node !== undefined);
+      if (visibleNodes.length === 0) {
+        continue;
+      }
+      const context = contexts.get(group) ?? [];
+      context.push({
+        user: view.user,
+        branchRoots: uniqueStrings(visibleNodes.map((node) => node.branchRoot)),
+      });
+      contexts.set(group, context);
+      visibleGroups.set({ ...group, nodes: visibleNodes }, group);
+    }
+    if (visibleGroups.size === 0) {
+      const group: NodeGroup = {
         identityBasis: "provisional",
-        identityKey: `prompt:${user.messageId}`,
+        identityKey: JSON.stringify(["prompt", view.user.messageId]),
         nodes: [],
         branchRoot: null,
-      });
+      };
+      groups.push(group);
+      contexts.set(group, [{ user: view.user, branchRoots: [] }]);
+      visibleGroups.set(group, group);
     }
-    const promptGroup = promptEvidenceGroupFor(user, groups, graph);
-    for (const group of groups) {
-      const attempt = buildAttempt(
-        user,
-        group,
-        options,
-        shouldUsePromptEvidence(group, promptGroup),
-      );
-      for (const node of group.nodes) {
-        claimedEvidenceMessageIds.add(node.record.messageId);
-      }
-      if (!claimed.has(attempt.attemptId)) {
-        claimed.add(attempt.attemptId);
-        attempts.push(attempt);
-      }
+    const selected = promptEvidenceGroupFor(view.user, [...visibleGroups.keys()], graph);
+    const group = selected ? visibleGroups.get(selected) : undefined;
+    if (group) {
+      const owners = promptOwners.get(group) ?? [];
+      owners.push(view.user);
+      promptOwners.set(group, owners);
     }
   }
-
-  const orphanNodes = normalized
-    .filter(
-      (item) =>
-        (item.role === "assistant" || item.role === "tool") &&
-        !claimedMessageIds(attempts).has(item.messageId),
-    )
-    .map((item) => graph.byKey.get(item.nodeId ?? item.messageId))
-    .filter((item): item is GraphNode => item !== undefined);
-  for (const group of groupsForOrphans(orphanNodes, graph)) {
-    const attempt = buildAttempt(null, group, options, false);
-    if (!claimed.has(attempt.attemptId)) {
-      claimed.add(attempt.attemptId);
-      attempts.push(attempt);
-    }
-  }
-
-  return attempts.sort(compareAttempts);
+  return groups.map((group) => {
+    const groupContexts = contexts.get(group) ?? [];
+    const owners = promptOwners.get(group) ?? [];
+    const prompt = groupContexts.length === 1 && owners.length === 1
+      ? owners[0] ?? null
+      : null;
+    return buildAttempt(groupContexts, group, options, prompt);
+  }).sort(compareAttempts);
 }
 
 function buildAttempt(
-  user: MessageRecord | null,
+  contexts: PromptContext[],
   group: NodeGroup,
   options: {
     scope: LedgerScope;
     conversationId: string;
     mapping: ModelMappingVersion;
   },
-  usePromptEvidence: boolean,
+  user: MessageRecord | null,
 ): ReconstructedAttempt {
+  const usePromptEvidence = user !== null;
   const nodes = sortedNodes(group.nodes);
   const final = finalAnswer(nodes);
   const generationIds = uniqueStrings(nodes.map((node) => node.record.generationId));
   const requestIds = uniqueStrings(nodes.map((node) => node.record.requestId));
-  const promptKey = user
-    ? `${options.conversationId}:${user.messageId}:${group.branchRoot ?? group.identityKey}`
-    : null;
+  const promptKeys = contexts.flatMap((context) =>
+    (context.branchRoots.length > 0 ? context.branchRoots : [group.identityKey])
+      .map((branch) => stableId("prompt", options.conversationId, context.user.messageId, branch)),
+  );
+  const branchRoots = uniqueStrings(nodes.map((node) => node.branchRoot));
   const aliases: Array<[string, string]> = [
-    ...(promptKey ? [["prompt", promptKey] as [string, string]] : []),
-    ...(group.branchRoot ? [["branch", `${options.conversationId}:${group.branchRoot}`] as [string, string]] : []),
+    ...promptKeys.map((key) => ["prompt", key] as [string, string]),
+    ...branchRoots.map((branch) => ["branch", `${options.conversationId}:${branch}`] as [string, string]),
     ...generationIds.map((id) => ["generation", `${options.conversationId}:${id}`] as [string, string]),
     ...requestIds.map((id) => ["request", `${options.conversationId}:${id}`] as [string, string]),
     ...nodes.map((node) => [
@@ -137,7 +155,7 @@ function buildAttempt(
     ] as [string, string]),
   ];
   const identityBasis = group.identityBasis;
-  const identityKey = `${options.conversationId}|${identityBasis}|${group.identityKey}`;
+  const identityKey = JSON.stringify([options.conversationId, identityBasis, group.identityKey]);
   const attemptId = stableId(scopeKey(options.scope), identityKey);
   const requestedModelRaw = usePromptEvidence ? user?.requestedModelRaw ?? null : null;
   const requestedModeRaw = usePromptEvidence ? user?.requestedModeRaw ?? null : null;
@@ -186,8 +204,12 @@ function buildAttempt(
   );
   const generationStarted = generationStartedFor(nodes);
   const outcome = outcomeFor(nodes, final, generationStarted);
-  const surface = surfaceFor([...(user ? [user] : []), ...nodes.map((node) => node.record)]);
-  const origin = originFor([...(user ? [user] : []), ...nodes.map((node) => node.record)]);
+  const contextualRecords = [
+    ...contexts.map((context) => context.user),
+    ...nodes.map((node) => node.record),
+  ];
+  const surface = surfaceFor(contextualRecords);
+  const origin = originFor(contextualRecords);
   const warnings: string[] = [];
   if (identityBasis === "unresolved") {
     warnings.push("unresolved_linkage");
@@ -195,7 +217,7 @@ function buildAttempt(
   if (group.identityBasis === "provisional") {
     warnings.push("provisional_identity");
   }
-  if (user && !usePromptEvidence && hasGenerationSpecificIdentity(group)) {
+  if (contexts.length > 0 && !usePromptEvidence && hasGenerationSpecificIdentity(group)) {
     warnings.push("prompt_evidence_not_linked");
   }
   if (!final && generationStarted) {
@@ -232,7 +254,7 @@ function buildAttempt(
     origin,
     aliases,
     evidenceMessageIds: [
-      ...(user ? [user.messageId] : []),
+      ...contexts.map((context) => context.user.messageId),
       ...nodes.map((node) => node.record.messageId),
     ].sort(),
     revision: 1,
@@ -245,8 +267,9 @@ function buildGraph(messages: ReadonlyArray<MessageRecord>): AttemptGraph {
   const byKey = new Map<string, GraphNode>();
   for (const record of messages) {
     const key = record.nodeId ?? record.messageId;
-    byKey.set(key, { key, record, branchRoot: key });
-    byKey.set(record.messageId, { key, record, branchRoot: key });
+    const node = { key, record, branchRoot: key, ownerKey: null, userLinked: false };
+    byKey.set(key, node);
+    byKey.set(record.messageId, node);
   }
   const children = new Map<string, Set<string>>();
   for (const node of new Set(byKey.values())) {
@@ -282,17 +305,12 @@ function buildGraph(messages: ReadonlyArray<MessageRecord>): AttemptGraph {
 function descendantsForUser(
   user: MessageRecord,
   graph: AttemptGraph,
-  claimedEvidenceMessageIds: ReadonlySet<string>,
 ): GraphNode[] {
   const userNode = graph.byKey.get(user.nodeId ?? user.messageId);
   if (!userNode) {
     return [];
   }
-  const candidates = graphNodes(graph).filter(
-    (node) =>
-      node.key !== userNode.key &&
-      !claimedEvidenceMessageIds.has(node.record.messageId),
-  );
+  const candidates = graphNodes(graph).filter((node) => node.key !== userNode.key);
   const roots = new Set(
     childNeighbors(userNode, candidates, graph)
       .filter((node) => node.record.role !== "user")
@@ -319,21 +337,63 @@ function descendantsForUser(
     }
     queue.sort();
   }
-  const branchRoots = new Map<string, string>();
+  const branchRoots = new Map<string, string | null>();
   for (const node of output) {
     branchRoots.set(
       node.key,
-      roots.has(node.key) ? node.key : branchRootFor(node, output, roots, graph),
+      branchRootFor(node, output, roots, graph),
     );
   }
   return output.map((node) => ({
     ...node,
-    branchRoot: branchRoots.get(node.key) ?? node.key,
+    branchRoot: branchRoots.get(node.key) ?? null,
   }));
 }
 
-function groupsForUser(
-  user: MessageRecord,
+function normalizeOwnership(
+  views: ReadonlyArray<{ user: MessageRecord; nodes: GraphNode[] }>,
+  graph: AttemptGraph,
+): GraphNode[] {
+  const evidence = new Map<string, GraphNode>();
+  const owners = new Map<string, Set<string>>();
+  const branches = new Map<string, Set<string | null>>();
+  const ambiguous = new Set<string>();
+  for (const { user, nodes } of views) {
+    for (const node of nodes) {
+      evidence.set(node.key, { ...node, userLinked: true });
+      const nodeOwners = owners.get(node.key) ?? new Set<string>();
+      nodeOwners.add(JSON.stringify(["user", user.messageId, node.branchRoot]));
+      owners.set(node.key, nodeOwners);
+      const nodeBranches = branches.get(node.key) ?? new Set<string | null>();
+      nodeBranches.add(node.branchRoot);
+      branches.set(node.key, nodeBranches);
+      if (node.branchRoot === null) {
+        ambiguous.add(node.key);
+      }
+    }
+  }
+  const orphans = graphNodes(graph).filter((node) =>
+    !evidence.has(node.key) && ["assistant", "tool"].includes(node.record.role ?? ""),
+  );
+  const componentRoots = connectedComponentRoots(orphans, graph);
+  for (const node of orphans) {
+    const root = componentRoots.get(node.key)!;
+    evidence.set(node.key, node);
+    owners.set(node.key, new Set([JSON.stringify(["orphan", root])]));
+    branches.set(node.key, new Set([root]));
+  }
+  return [...evidence.values()].map((node) => ({
+    ...node,
+    branchRoot: branches.get(node.key)?.has(null)
+      ? null
+      : singleString([...(branches.get(node.key) ?? [])]),
+    ownerKey: !ambiguous.has(node.key) && owners.get(node.key)?.size === 1
+      ? [...owners.get(node.key)!][0]!
+      : null,
+  }));
+}
+
+function groupsForNodes(
   nodes: GraphNode[],
   graph: AttemptGraph,
 ): NodeGroup[] {
@@ -353,11 +413,12 @@ function groupsForUser(
       if (node.record.generationId === generationId) {
         return true;
       }
-      const linkedGenerations = generationLinks.get(node.key);
+      const linkedGenerations = generationLinks.get(node.key)!;
       return (
         node.record.generationId === null &&
-        linkedGenerations?.size === 1 &&
-        linkedGenerations.has(generationId)
+        !linkedGenerations.ambiguous &&
+        linkedGenerations.ids.size === 1 &&
+        linkedGenerations.ids.has(generationId)
       );
     });
     if (groupNodes.length > 0) {
@@ -371,224 +432,209 @@ function groupsForUser(
     }
   }
 
-  const requestCandidates = nodes.filter(
-    (node) => !assigned.has(node.key) && (generationLinks.get(node.key)?.size ?? 0) <= 1,
+  const unresolved = new Set(nodes.filter((node) => {
+    const linked = generationLinks.get(node.key);
+    return node.record.generationId === null &&
+      (node.ownerKey === null || linked?.ambiguous || (linked?.ids.size ?? 0) > 1);
+  }).map((node) => node.key));
+  const requestCandidates = nodes.filter((node) =>
+    !assigned.has(node.key) && !unresolved.has(node.key),
   );
-  const requestBranches = requestGroupsFor(requestCandidates);
-  for (const seeds of requestBranches) {
-    const { branchRoot, record: { requestId } } = seeds[0]!;
-    const groupNodes = expandIdentityGroup(
-      seeds,
-      requestCandidates.filter((node) => !assigned.has(node.key)),
-      graph,
-      (node) =>
-        node.branchRoot === branchRoot &&
-        (node.record.requestId === requestId || node.record.requestId === null),
-    );
-    groupNodes.forEach((node) => assigned.add(node.key));
-    groups.push({
-      identityBasis: "request",
-      identityKey: JSON.stringify([requestId, branchRoot]),
-      nodes: groupNodes,
-      branchRoot,
-    });
-  }
-
-  const remaining = nodes.filter((node) => !assigned.has(node.key));
-  const byBranch = new Map<string, GraphNode[]>();
-  for (const node of remaining) {
-    const existing = byBranch.get(node.branchRoot) ?? [];
-    existing.push(node);
-    byBranch.set(node.branchRoot, existing);
-  }
-  for (const [branchRoot, branchNodes] of [...byBranch.entries()].sort(([left], [right]) => left.localeCompare(right))) {
-    groups.push({
-      identityBasis: branchNodes.some((node) => (generationLinks.get(node.key)?.size ?? 0) > 1)
-        ? "unresolved"
-        : "provisional",
-      identityKey: `${user.messageId}:${branchRoot}:${branchNodes.map((node) => node.record.messageId).sort().join(",")}`,
-      nodes: branchNodes,
-      branchRoot,
-    });
-  }
-  return groups.sort((left, right) => left.identityKey.localeCompare(right.identityKey));
-}
-
-function groupsForOrphans(
-  nodes: GraphNode[],
-  graph: AttemptGraph,
-): NodeGroup[] {
-  const componentRoots = connectedComponentRoots(nodes, graph);
-  const normalizedNodes = nodes.map((node) => ({
-    ...node,
-    branchRoot: componentRoots.get(node.key) ?? node.branchRoot,
-  }));
-  const groups: NodeGroup[] = [];
-  const assigned = new Set<string>();
-  const generationLinks = generationLinksFor(normalizedNodes, graph);
-  for (const generationId of uniqueStrings(normalizedNodes.map((node) => node.record.generationId))) {
-    const groupNodes = normalizedNodes.filter((node) => {
-      if (assigned.has(node.key)) {
-        return false;
-      }
-      if (node.record.generationId === generationId) {
-        return true;
-      }
-      const linkedGenerations = generationLinks.get(node.key);
-      return (
-        node.record.generationId === null &&
-        linkedGenerations?.size === 1 &&
-        linkedGenerations.has(generationId)
-      );
-    });
-    if (groupNodes.length > 0) {
-      groupNodes.forEach((node) => assigned.add(node.key));
-      groups.push({
-        identityBasis: "generation",
-        identityKey: generationId,
-        nodes: groupNodes,
-        branchRoot: singleString(groupNodes.map((node) => node.branchRoot)),
-      });
-    }
-  }
-
-  const requestCandidates = normalizedNodes.filter(
-    (node) => !assigned.has(node.key) && (generationLinks.get(node.key)?.size ?? 0) <= 1,
-  );
-  const requestGroups = requestGroupsFor(requestCandidates);
-  for (const seeds of requestGroups) {
-    const { branchRoot, record: { requestId } } = seeds[0]!;
-    const groupNodes = expandIdentityGroup(
-      seeds,
-      requestCandidates.filter((node) => !assigned.has(node.key)),
-      graph,
-      (node) =>
-        node.branchRoot === branchRoot &&
-        (node.record.requestId === requestId || node.record.requestId === null),
-    );
-    if (groupNodes.length === 0) {
-      continue;
-    }
-    groupNodes.forEach((node) => assigned.add(node.key));
-    groups.push({
-      identityBasis: "request",
-      identityKey: JSON.stringify([requestId, branchRoot]),
-      nodes: groupNodes,
-      branchRoot,
-    });
-  }
-
-  const remaining = new Map<string, GraphNode[]>();
-  for (const node of normalizedNodes) {
-    if (assigned.has(node.key)) {
-      continue;
-    }
-    const existing = remaining.get(node.branchRoot) ?? [];
-    existing.push(node);
-    remaining.set(node.branchRoot, existing);
-  }
-  for (const [branchRoot, branchNodes] of [...remaining.entries()].sort(([left], [right]) =>
-    left.localeCompare(right),
-  )) {
-    groups.push({
-      identityBasis: "unresolved",
-      identityKey: `unresolved:${branchRoot}:${branchNodes
-        .map((node) => node.record.messageId)
-        .sort()
-        .join(",")}`,
-      nodes: branchNodes,
-      branchRoot,
-    });
-  }
-  return groups.sort((left, right) => left.identityKey.localeCompare(right.identityKey));
-}
-
-function requestGroupsFor(nodes: GraphNode[]): GraphNode[][] {
-  const groups = new Map<string, GraphNode[]>();
-  for (const node of nodes) {
+  const componentRoots = connectedComponentRoots(requestCandidates, graph);
+  const requestGroups = new Map<string, NodeGroup>();
+  const requestOwners = new Map<string, string>();
+  for (const node of requestCandidates) {
     if (node.record.requestId === null) {
       continue;
     }
-    const key = JSON.stringify([node.branchRoot, node.record.requestId]);
-    const group = groups.get(key) ?? [];
-    group.push(node);
-    groups.set(key, group);
+    const key = JSON.stringify([node.ownerKey, componentRoots.get(node.key), node.record.requestId]);
+    const group = requestGroups.get(key) ?? {
+      identityBasis: "request",
+      identityKey: key,
+      nodes: [],
+      branchRoot: node.branchRoot,
+    };
+    group.nodes.push(node);
+    requestGroups.set(key, group);
+    requestOwners.set(node.key, key);
   }
-  return [...groups.entries()]
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([, group]) => group);
-}
-
-function expandIdentityGroup(
-  seeds: GraphNode[],
-  candidates: GraphNode[],
-  graph: AttemptGraph,
-  accepts: (node: GraphNode) => boolean,
-): GraphNode[] {
-  const byKey = new Map(candidates.map((node) => [node.key, node]));
-  const output = new Map<string, GraphNode>();
-  const queue = [...seeds].sort((left, right) => left.key.localeCompare(right.key));
-  while (queue.length > 0) {
-    const node = byKey.get(queue.shift()!.key);
-    if (!node || output.has(node.key) || !accepts(node)) {
+  // Candidate owners are immutable: request iteration cannot consume a bridge.
+  for (const node of requestCandidates) {
+    if (node.record.requestId !== null) {
       continue;
     }
-    output.set(node.key, node);
-    for (const candidate of graphNeighbors(node, candidates, graph)) {
-      if (!output.has(candidate.key)) {
-        queue.push(candidate);
-      }
+    const owners = nearestOwnersFor(node, requestCandidates, requestOwners, graph);
+    if (owners.size === 1) {
+      requestGroups.get([...owners][0]!)!.nodes.push(node);
+    } else if (owners.size > 1) {
+      unresolved.add(node.key);
     }
-    queue.sort((left, right) => left.key.localeCompare(right.key));
   }
-  return sortedNodes([...output.values()]);
+  for (const group of requestGroups.values()) {
+    group.nodes.forEach((node) => assigned.add(node.key));
+    groups.push(group);
+  }
+
+  const remaining = nodes.filter((node) => !assigned.has(node.key));
+  const residualRoots = connectedComponentRoots(remaining, graph);
+  const residualGroups = new Map<string, NodeGroup>();
+  for (const node of remaining) {
+    const root = residualRoots.get(node.key)!;
+    const key = JSON.stringify([node.ownerKey, root]);
+    const group = residualGroups.get(key) ?? {
+      identityBasis: "provisional",
+      identityKey: key,
+      nodes: [],
+      branchRoot: node.branchRoot,
+    };
+    if (!node.userLinked || unresolved.has(node.key)) {
+      group.identityBasis = "unresolved";
+    }
+    group.nodes.push(node);
+    residualGroups.set(key, group);
+  }
+  for (const group of residualGroups.values()) {
+    group.identityKey = JSON.stringify([
+      group.identityKey,
+      group.nodes.map((node) => node.record.messageId).sort(),
+    ]);
+    group.branchRoot = singleString(group.nodes.map((node) => node.branchRoot));
+    groups.push(group);
+  }
+  return groups.sort((left, right) => left.identityKey.localeCompare(right.identityKey));
+}
+
+function nearestOwnersFor(
+  node: GraphNode,
+  candidates: GraphNode[],
+  owners: ReadonlyMap<string, string>,
+  graph: AttemptGraph,
+): Set<string> {
+  const result = new Set<string>();
+  for (const direction of ["parents", "children"] as const) {
+    const visited = new Set<string>();
+    const queue = [node];
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      if (visited.has(current.key)) {
+        continue;
+      }
+      visited.add(current.key);
+      const owner = owners.get(current.key);
+      if (owner !== undefined) {
+        result.add(owner);
+        continue;
+      }
+      if (direction === "children" && isTerminalNode(current)) {
+        continue;
+      }
+      queue.push(...linkedNodes(current, candidates, graph, [direction])
+        .filter((neighbor) =>
+          !(direction === "parents" && isTerminalNode(neighbor)) &&
+          (neighbor.ownerKey === node.ownerKey || neighbor.ownerKey === null ||
+            neighbor.record.generationId !== null),
+        ));
+    }
+  }
+  return result;
 }
 
 function generationLinksFor(
   nodes: GraphNode[],
   graph: AttemptGraph,
-): Map<string, Set<string>> {
-  const links = new Map<string, Set<string>>();
+): Map<string, GenerationCandidates> {
+  const links = new Map<string, GenerationCandidates>();
   for (const node of nodes) {
     if (node.record.generationId !== null) {
       continue;
     }
-    const generations = new Set<string>();
-    const candidates = nodes.filter((candidate) => candidate.branchRoot === node.branchRoot);
-    // A terminal/original response cannot borrow a later regeneration's ID.
-    // Forward linkage requires positive fragment evidence; backward linkage
-    // stops at terminal responses and conflicting fallback request identities.
+    const result: GenerationCandidates = {
+      ids: new Set(),
+      ambiguous: node.ownerKey === null,
+    };
+    links.set(node.key, result);
+    if (result.ambiguous) {
+      continue;
+    }
+    const uncertainIds = new Set<string>();
+    // Terminal originals stop forward linkage. Missing continuation evidence
+    // is uncertainty, not proof of either a new attempt or a later owner.
     for (const direction of ["parents", "children"] as const) {
       const visited = new Set<string>();
-      const queue = [node];
+      const queue = [{ node, uncertain: false }];
       while (queue.length > 0) {
-        const current = queue.shift()!;
-        if (visited.has(current.key)) {
+        const { node: current, uncertain } = queue.shift()!;
+        const key = JSON.stringify([current.key, uncertain]);
+        if (visited.has(key)) {
           continue;
         }
-        visited.add(current.key);
+        visited.add(key);
         if (current.record.generationId !== null) {
-          generations.add(current.record.generationId);
+          (uncertain ? uncertainIds : result.ids).add(current.record.generationId);
           continue;
         }
-        if (direction === "children" && !isGenerationFragment(current)) {
+        if (direction === "children" && isTerminalNode(current)) {
           continue;
         }
-        for (const candidate of linkedNodes(current, candidates, graph, [direction])) {
-          if (
-            visited.has(candidate.key) ||
-            (direction === "parents" && isTerminalNode(candidate)) ||
-            (node.record.requestId !== null &&
-              candidate.record.requestId !== null &&
-              candidate.record.requestId !== node.record.requestId)
-          ) {
+        for (const candidate of linkedNodes(current, nodes, graph, [direction])) {
+          if (direction === "parents" && isTerminalNode(candidate)) {
             continue;
           }
-          queue.push(candidate);
+          const ownershipConflict = candidate.record.generationId === null &&
+            candidate.ownerKey !== node.ownerKey;
+          if (ownershipConflict && candidate.ownerKey !== null) {
+            continue;
+          }
+          const requestConflict = node.record.requestId !== null &&
+            candidate.record.requestId !== null &&
+            candidate.record.requestId !== node.record.requestId;
+          if (requestConflict && candidate.record.generationId === null) {
+            continue;
+          }
+          queue.push({
+            node: candidate,
+            uncertain: uncertain || requestConflict || ownershipConflict ||
+              (direction === "children" && !isGenerationFragment(current)),
+          });
         }
       }
     }
-    links.set(node.key, generations);
+    result.ambiguous ||= result.ids.size > 1 ||
+      [...uncertainIds].some((id) => !result.ids.has(id));
+  }
+
+  const boundaries = new Map<string, string>();
+  for (const node of nodes) {
+    if (node.record.generationId !== null) {
+      boundaries.set(node.key, JSON.stringify(["generation", node.record.generationId]));
+      continue;
+    }
+    const result = links.get(node.key)!;
+    if (node.record.requestId !== null || result.ambiguous) {
+      boundaries.set(node.key, !result.ambiguous && result.ids.size === 1
+        ? JSON.stringify(["generation", [...result.ids][0]])
+        : JSON.stringify([
+          result.ambiguous ? "unresolved" : "request",
+          node.ownerKey,
+          node.record.requestId ?? node.key,
+        ]));
+    }
+  }
+  // A sole generation candidate cannot consume a fragment that also borders
+  // a different request owner or unresolved evidence.
+  for (const node of nodes) {
+    if (node.record.generationId !== null || node.record.requestId !== null) {
+      continue;
+    }
+    const result = links.get(node.key)!;
+    if (result.ambiguous || result.ids.size !== 1) {
+      continue;
+    }
+    const expected = JSON.stringify(["generation", [...result.ids][0]]);
+    const candidates = nearestOwnersFor(node, nodes, boundaries, graph);
+    if (candidates.size !== 1 || !candidates.has(expected)) {
+      result.ambiguous = true;
+    }
   }
   return links;
 }
@@ -650,6 +696,7 @@ function connectedComponentRoots(
   nodes: GraphNode[],
   graph: AttemptGraph,
 ): Map<string, string> {
+  const byKey = new Map(nodes.map((node) => [node.key, node]));
   const remaining = new Set(nodes.map((node) => node.key));
   const roots = new Map<string, string>();
   for (const seed of [...remaining].sort()) {
@@ -665,12 +712,12 @@ function connectedComponentRoots(
       }
       remaining.delete(key);
       component.push(key);
-      const node = graph.byKey.get(key);
+      const node = byKey.get(key);
       if (!node) {
         continue;
       }
       for (const neighbor of graphNeighbors(node, nodes, graph)) {
-        if (remaining.has(neighbor.key)) {
+        if (remaining.has(neighbor.key) && neighbor.ownerKey === node.ownerKey) {
           queue.push(neighbor.key);
         }
       }
@@ -688,24 +735,29 @@ function promptEvidenceGroupFor(
   groups: NodeGroup[],
   graph: AttemptGraph,
 ): NodeGroup | null {
+  const eligible = (group: NodeGroup | null | undefined): NodeGroup | null =>
+    group && (group.nodes.length === 0 ||
+      group.identityBasis === "generation" || group.identityBasis === "request")
+      ? group
+      : null;
   if (user.generationId !== null) {
     const generationGroups = groups.filter((group) =>
       group.nodes.some((node) => node.record.generationId === user.generationId),
     );
-    return generationGroups.length === 1 ? generationGroups[0] ?? null : null;
+    return generationGroups.length === 1 ? eligible(generationGroups[0]) : null;
   }
   if (user.requestId !== null) {
     const requestGroups = groups.filter((group) =>
       group.nodes.some((node) => node.record.requestId === user.requestId),
     );
-    return requestGroups.length === 1 ? requestGroups[0] ?? null : null;
+    return requestGroups.length === 1 ? eligible(requestGroups[0]) : null;
   }
-  if (groups.length === 1) {
-    return groups[0] ?? null;
+  if (groups.length === 1 && groups[0]?.nodes.length === 0) {
+    return eligible(groups[0]);
   }
 
   // Identity strength does not identify the original response. Prefer graph
-  // precedence, then strictly ordered sibling evidence; never break ties by ID.
+  // precedence across all groups, then strictly ordered sibling evidence.
   const nodes = groups.flatMap((group) => group.nodes);
   const predecessors = new Map(groups.map((group) => [group, new Set<NodeGroup>()]));
   for (const group of groups) {
@@ -718,7 +770,7 @@ function promptEvidenceGroupFor(
   }
   const roots = groups.filter((group) => predecessors.get(group)!.size === 0);
   if (roots.length === 1) {
-    return roots[0] ?? null;
+    return eligible(roots[0]);
   }
   const observed = roots.map((group) => ({
     group,
@@ -744,7 +796,7 @@ function promptEvidenceGroupFor(
       return null;
     }
   }
-  return first.group;
+  return eligible(first.group);
 }
 
 function descendantsOfGroup(
@@ -763,16 +815,6 @@ function descendantsOfGroup(
     queue.push(...childNeighbors(node, nodes, graph));
   }
   return visited;
-}
-
-function shouldUsePromptEvidence(
-  group: NodeGroup,
-  promptGroup: NodeGroup | null,
-): boolean {
-  return group === promptGroup &&
-    (group.nodes.length === 0 ||
-      ((group.identityBasis === "generation" || group.identityBasis === "request") &&
-        hasGenerationSpecificIdentity(group)));
 }
 
 function hasGenerationSpecificIdentity(group: NodeGroup): boolean {
@@ -969,9 +1011,10 @@ function branchRootFor(
   nodes: GraphNode[],
   roots: Set<string>,
   graph: AttemptGraph,
-): string {
+): string | null {
   const queue = [node];
   const visited = new Set<string>();
+  const reachableRoots = new Set<string>();
   while (queue.length > 0) {
     const current = queue.shift()!;
     if (visited.has(current.key)) {
@@ -979,15 +1022,15 @@ function branchRootFor(
     }
     visited.add(current.key);
     if (roots.has(current.key)) {
-      return current.key;
+      reachableRoots.add(current.key);
     }
-    for (const neighbor of graphNeighbors(current, nodes, graph)) {
+    for (const neighbor of linkedNodes(current, nodes, graph, ["parents"])) {
       if (!visited.has(neighbor.key)) {
         queue.push(neighbor);
       }
     }
   }
-  return node.key;
+  return reachableRoots.size === 1 ? [...reachableRoots][0]! : null;
 }
 
 function graphNodes(graph: AttemptGraph): GraphNode[] {
@@ -1002,10 +1045,6 @@ function deduplicateMessages(messages: ReadonlyArray<MessageRecord>): MessageRec
     byId.set(message.messageId, message);
   }
   return [...byId.values()];
-}
-
-function claimedMessageIds(attempts: ReadonlyArray<AttemptRecord>): Set<string> {
-  return new Set(attempts.flatMap((attempt) => attempt.evidenceMessageIds));
 }
 
 function uniqueStrings(values: ReadonlyArray<string | null>): string[] {

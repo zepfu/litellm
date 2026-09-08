@@ -34,6 +34,23 @@ model/time to a later regeneration. Missing/tied sibling timestamps, ambiguous
 explicit prompt IDs, and reused requests across sibling generation anchors do
 not create prompt attribution.
 
+The grouping pass collects all forward user views and orphan evidence before
+building attempts. Identical generation IDs therefore retain final/model
+evidence from disconnected components and multiple user views. Conflicting
+user associations withhold prompt-derived fields but retain all contextual
+surface/origin evidence.
+
+Generation and request candidates are resolved against immutable owner sets.
+Request-free bridges with multiple owners, multiple user/branch roots, and
+unsupported continuation-versus-regeneration relations remain unresolved.
+Unresolved identity does not erase observed generation activity. Request
+fallback uses actual residual connectivity as well as the owner and request
+tuple; request equality cannot connect disjoint evidence. Prompt ownership is
+resolved once across all identity classes, including earlier unresolved or
+provisional evidence, before projecting the requested model and submission time.
+Synthesized prompt aliases use the existing tuple-hashing helper so their
+unambiguous identity also satisfies the storage token contract.
+
 The new `src/counting/index.ts` is the package-internal export surface for a
 future bounded worker. It deliberately does not define a transport protocol or
 connect a live runtime. No `ledger/store.ts`, SQLite package dependency,
