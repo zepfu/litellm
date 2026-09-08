@@ -150,7 +150,7 @@ def parse_codex_collaboration_text_frame(value: Any) -> str:
         "text",
     }:
         raise CodexCollaborationDispatchError("unknown_representation")
-    if decoded.get("cfg047") is not COLLABORATION_FRAME_VERSION:
+    if decoded.get("cfg047") != COLLABORATION_FRAME_VERSION:
         raise CodexCollaborationDispatchError("unknown_representation")
     if decoded.get("encoding") != COLLABORATION_TEXT_ENCODING:
         raise CodexCollaborationDispatchError("unknown_representation")
@@ -522,17 +522,6 @@ def _normalize_agent_message_item(item: dict[str, Any]) -> tuple[dict[str, Any],
     if not isinstance(content, list):
         return item, False
 
-    if content and isinstance(content[0], dict):
-        first_type = content[0].get("type")
-        first_text = content[0].get("text")
-        if (
-            first_type in {"input_text", "text"}
-            and isinstance(first_text, str)
-            and first_text.startswith("Message Type: ")
-            and len(content) != 1
-        ):
-            raise CodexCollaborationDispatchError("invalid_envelope")
-
     encrypted_parts = [
         part
         for part in content
@@ -575,6 +564,16 @@ def _normalize_agent_message_item(item: dict[str, Any]) -> tuple[dict[str, Any],
             }
         ]
         return normalized_item, True
+
+    if len(content) != 1:
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") not in {"input_text", "text"}:
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text.startswith("Message Type: "):
+                raise CodexCollaborationDispatchError("invalid_envelope")
 
     if len(content) == 1 and isinstance(content[0], dict):
         visible_part = content[0]
