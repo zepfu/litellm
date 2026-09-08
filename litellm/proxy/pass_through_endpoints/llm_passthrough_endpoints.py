@@ -3503,6 +3503,11 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
 
     is_usage_limit = error_class == "usage_limit_reached"
     is_token_invalidated = error_class == "token_invalidated"
+    if is_token_invalidated:
+        # Codex only emits this trusted 401 after the selected token reached
+        # the upstream Responses endpoint, even when the wrapper omits its
+        # provider-returned marker.
+        attempted_provider_call = True
     cooldown_seconds = (
         _aawm_codex_oauth.direct_codex_usage_limit_retry_after_seconds(exc)
         if is_usage_limit
@@ -3563,12 +3568,108 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
     retry_attempt_record["replay_safety"] = (
         "replay_safe" if account_failover_replay_safe else "replay_unsafe"
     )
+    authenticated_token_pin = (
+        selection.get("selection_reason")
+        == "authenticated_continuation_token_pin"
+    )
     _aawm_dev_fault_plan.note_direct_openai_managed_failure(
         request,
         request_body,
         selection=selection,
         attempt_record=injected_attempt_record,
     )
+
+    def _raise_authenticated_continuation_unavailable(
+        *,
+        failure_phase: Optional[str] = None,
+    ) -> None:
+        retry_attempt_record["status"] = (
+            "terminal_authenticated_continuation_unavailable"
+        )
+        retry_attempt_record["failover_decision"] = "terminal"
+        retry_attempt_record["terminal_reason"] = (
+            retry_attempt_record.get("account_failover_rejection_reason")
+            or "authenticated_continuation_unavailable"
+        )
+        _aawm_attempt_records._mark_auto_agent_alias_request_terminal_failure(
+            request,
+            retry_attempt_record,
+        )
+        attempts = _aawm_dev_fault_plan._direct_attempts(request)
+        if all(
+            attempt is not retry_attempt_record for attempt in attempts
+        ):
+            attempts.append(retry_attempt_record)
+        finalized_body = _aawm_dev_fault_plan._add_direct_openai_managed_metadata(
+            request_body,
+            request=request,
+            selection=selection,
+            attempts=attempts,
+        )
+        _safe_set_request_parsed_body(request, finalized_body)
+        _aawm_dev_fault_plan.note_direct_openai_managed_terminal_exhaustion(
+            request,
+            request_body,
+            selection=selection,
+        )
+        finalized_metadata = finalized_body.get("litellm_metadata")
+        if not isinstance(finalized_metadata, dict):
+            finalized_metadata = {}
+        audit_events = [
+            event
+            for event in (
+                finalized_metadata.get("aawm_alias_routing_audit_events")
+            )
+            or []
+            if isinstance(event, dict)
+        ]
+        skipped_candidates = finalized_metadata.get(
+            "codex_auto_agent_skipped_candidates"
+        )
+        if not isinstance(skipped_candidates, list):
+            skipped_candidates = selection.get("skipped")
+        _aawm_selection._raise_codex_auto_agent_authenticated_continuation_unavailable(
+            candidate=candidate if isinstance(candidate, dict) else {},
+            lane_key=selection.get("lane_key"),
+            cooldown_seconds=round(float(cooldown_seconds), 3),
+            alias_model=str(
+                selection.get("alias_model")
+                or request_body.get("model")
+                or "codex_native"
+            ),
+            error_class=retry_attempt_record.get("error_class") or error_class,
+            cooldown_scope=(
+                "none"
+                if is_token_invalidated
+                else retry_attempt_record.get("cooldown_scope")
+            ),
+            retry_after_seconds=retry_attempt_record.get(
+                "retry_after_seconds"
+            ),
+            error_tokens=set(retry_attempt_record.get("error_tokens") or ()),
+            error_status_code=retry_attempt_record.get("error_status_code"),
+            error_type=retry_attempt_record.get("error_type"),
+            error_code=retry_attempt_record.get("error_code"),
+            failure_phase=(
+                failure_phase
+                or retry_attempt_record.get("failure_phase")
+                or "authenticated_continuation_unavailable"
+            ),
+            attempted_provider_call=bool(
+                retry_attempt_record.get(
+                    "attempted_provider_call",
+                    attempted_provider_call,
+                )
+            ),
+            audit_events=audit_events,
+            attempts=attempts,
+            skipped_candidates=skipped_candidates,
+            terminal_reset=selection.get("terminal_reset"),
+            account_failover_rejection_reason=retry_attempt_record.get(
+                "account_failover_rejection_reason"
+            ),
+        )
+
     if is_token_invalidated and isinstance(candidate, dict):
         account_label = str(candidate.get("codex_oauth_account_label") or "")
         account_hash = str(candidate.get("codex_oauth_account_hash") or "")
@@ -3636,6 +3737,10 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
         and has_continuation_state
         and not account_failover_replay_safe
     ):
+        if authenticated_token_pin:
+            _raise_authenticated_continuation_unavailable(
+                failure_phase="token_invalidated_continuation",
+            )
         session_identity = selection.get("canonical_session_identity")
         if not isinstance(session_identity, str):
             session_identity = _sa.resolve_canonical_session_identity(
@@ -3686,6 +3791,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
                 "continuation replay is not safe."
             ),
             request=request,
+            attempted_provider_call=attempted_provider_call,
         )
     retry_planned = (
         isinstance(candidate, dict)
@@ -3699,7 +3805,10 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             has_previous_response_id=bool(
                 request_body.get("previous_response_id")
             ),
-            account_failover_replay_safe=account_failover_replay_safe,
+            has_account_bound_state=authenticated_token_pin,
+            account_failover_replay_safe=(
+                False if authenticated_token_pin else account_failover_replay_safe
+            ),
             provider_status_code=retry_attempt_record["error_status_code"],
         )
     )
@@ -3719,6 +3828,8 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             or "account_failover_exhausted"
         )
     if not retry_planned:
+        if authenticated_token_pin:
+            _raise_authenticated_continuation_unavailable()
         return None
 
     retry_is_safe_continuation = (
