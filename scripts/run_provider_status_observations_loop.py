@@ -3591,8 +3591,8 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             DEFAULT_CHATGPT_CONVERSATION_INIT_URL,
         ),
         help=(
-            "Documented ChatGPT conversation-init URL for the current POST "
-            "no-body contract. The sidecar does not fetch this URL. Defaults "
+            "Documented ChatGPT conversation-init URL for native exchange "
+            "evidence. The sidecar does not fetch this URL. Defaults "
             "to AAWM_CHATGPT_CONVERSATION_INIT_URL or "
             "https://chatgpt.com/backend-api/conversation/init."
         ),
@@ -14133,7 +14133,8 @@ def _chatgpt_conversation_init_poll_summary(
         "last_good_state_retained": False,
         "collector_source": collector_source,
         "request_method": "POST",
-        "request_body_omitted": True,
+        "request_body_omitted": None,
+        "request_body_omission_status": "not_observed",
         "has_model_message": False,
         "has_conversation_content": False,
         "coverage_mode": coverage_mode,
@@ -14181,6 +14182,7 @@ def _new_chatgpt_conversation_init_account_coverage(
         "retry_after_seconds": None,
         "telemetry_class": None,
         "telemetry_status": None,
+        "request_body_omitted": None,
         "error_class": None,
         "error_message": None,
     }
@@ -14455,6 +14457,27 @@ def _chatgpt_account_coverage_status(success_count: int, total_count: int) -> st
     return "partial" if success_count else "failed"
 
 
+def _chatgpt_request_body_omission_summary(
+    values: Sequence[Any],
+) -> tuple[Optional[bool], str]:
+    observed = [value for value in values if isinstance(value, bool)]
+    if not observed:
+        return None, "not_observed"
+    if all(value == observed[0] for value in observed):
+        return observed[0], "observed"
+    return None, "mixed"
+
+
+def _chatgpt_native_capture_request_body_omitted(
+    collector_summary: Mapping[str, Any],
+) -> Optional[bool]:
+    native_capture = collector_summary.get("native_capture")
+    if not isinstance(native_capture, Mapping):
+        return None
+    request_body_omitted = native_capture.get("request_body_omitted")
+    return request_body_omitted if isinstance(request_body_omitted, bool) else None
+
+
 def _stamp_chatgpt_conversation_init_account_hash(
     payloads: Sequence[tuple[Any, ...]],
     *,
@@ -14566,6 +14589,9 @@ def _collect_bound_chatgpt_conversation_init_account(
             )
             coverage["telemetry_class"] = collector_summary.get("telemetry_class")
             coverage["telemetry_status"] = collector_summary.get("telemetry_status")
+            coverage["request_body_omitted"] = (
+                _chatgpt_native_capture_request_body_omitted(collector_summary)
+            )
             coverage["account_identity_verified"] = bool(
                 collector_summary.get("account_identity_verified")
             )
@@ -14815,6 +14841,15 @@ def _run_chatgpt_conversation_init_bound_poll(  # noqa: PLR0915
     )
     summary["capture_coverage_status"] = capture_status
     summary["persistence_coverage_status"] = persistence_status
+    (
+        summary["request_body_omitted"],
+        summary["request_body_omission_status"],
+    ) = _chatgpt_request_body_omission_summary(
+        [
+            coverage.get("request_body_omitted")
+            for coverage in summary["account_coverage"]
+        ]
+    )
     if not records:
         summary["coverage_status"] = "no_enabled_accounts"
     elif not config.apply:
@@ -14872,6 +14907,10 @@ def _run_chatgpt_conversation_init_poll_task(  # noqa: PLR0915
             )
             summary.update(parser_summary)
             summary["observation_count"] = len(payloads)
+            body_omitted = summary.get("request_body_omitted")
+            summary["request_body_omission_status"] = (
+                "observed" if isinstance(body_omitted, bool) else "not_observed"
+            )
             summary["capture_coverage_status"] = (
                 "legacy_file_snapshot" if payloads else "no_current_snapshot"
             )
@@ -15543,6 +15582,31 @@ def _required_one_shot_refresh_failures(
     return failures
 
 
+_CHATGPT_CONVERSATION_INIT_OPTIONAL_DEGRADED_STATUSES = frozenset(
+    {
+        "inventory_unavailable",
+        "partial",
+        "failed",
+        "database_write_failed",
+        "database_write_skipped",
+    }
+)
+
+
+def _optional_one_shot_event_failed(event: Mapping[str, Any]) -> bool:
+    if event.get("error_class"):
+        return True
+    if event.get("event") != "chatgpt_conversation_init_poll":
+        return False
+    return any(
+        event.get(field) in _CHATGPT_CONVERSATION_INIT_OPTIONAL_DEGRADED_STATUSES
+        for field in (
+            "capture_coverage_status",
+            "persistence_coverage_status",
+        )
+    )
+
+
 def _build_one_shot_status_event(
     config: ProviderStatusLoopConfig,
     events: Sequence[Mapping[str, Any]],
@@ -15559,7 +15623,7 @@ def _build_one_shot_status_event(
     ]
     failures = _required_one_shot_refresh_failures(events)
     optional_failures = [
-        event for event in optional_events if event.get("error_class")
+        event for event in optional_events if _optional_one_shot_event_failed(event)
     ]
     return {
         "event": "provider_status_sidecar_one_shot_status",

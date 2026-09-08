@@ -856,6 +856,15 @@ retained old snapshot is never counted as a fresh bound capture.
 Bound telemetry reports `capture_coverage_status` separately from
 `persistence_coverage_status`; `fresh_capture_count` counts only current
 identity-verified bound captures, so legacy file rereads leave it at zero.
+The aggregate `request_body_omitted` is null until native capture evidence is
+available; `request_body_omission_status` is `not_observed`, `observed`, or
+`mixed`. Per-account `account_coverage` entries expose the corresponding
+nullable native-capture value without retaining request bodies. In one-shot
+status, bound capture or persistence coverage of `partial`, `failed`,
+`inventory_unavailable`, `database_write_failed`, or
+`database_write_skipped` degrades optional health. Persistence
+`not_applied` is intentional dry-run behavior and does not degrade health;
+required refresh failures still control the one-shot exit code.
 
 Relevant environment variables:
 
