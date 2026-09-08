@@ -30,7 +30,6 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTED_ERROR_CLASS,
-    CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_COOLDOWN_SECONDS,
     CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS,
     CODEX_AUTO_AGENT_NVIDIA_PROVIDER,
     normalize_nvidia_completion_adapter_model_name,
@@ -2735,7 +2734,7 @@ class TestKimiMetadata:
 
 
 class TestCooldownScope:
-    def test_cursor_retained_session_marker_is_candidate_scoped_before_provider_call(
+    def test_cursor_retained_session_marker_is_request_scoped_before_provider_call(
         self,
     ) -> None:
         exc = _FakeExc(
@@ -2762,7 +2761,7 @@ class TestCooldownScope:
                 CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS,
                 candidate=_CURSOR_CANDIDATE,
             )
-            == "candidate"
+            == "none"
         )
         assert (
             _get_codex_auto_agent_cooldown_seconds(
@@ -2770,8 +2769,7 @@ class TestCooldownScope:
                 candidate=_CURSOR_CANDIDATE,
                 attempted_provider_call=False,
             )
-            == CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_COOLDOWN_SECONDS
-            == 300.0
+            == 0.0
         )
 
     def test_cursor_marker_requires_cursor_provider_and_unmarked_local_defect_stays_none(
