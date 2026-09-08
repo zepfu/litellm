@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -601,21 +602,49 @@ class PgLedger:
         self.lock_timeout_ms = lock_timeout_ms
         self.statement_timeout_ms = statement_timeout_ms
 
-    def connect(self) -> psycopg.Connection:
-        conn = psycopg.connect(self.dsn)
-        conn.execute(
-            "SELECT set_config('application_name', %s, false)",
-            (self.application_name,),
-        )
-        conn.execute(
-            "SELECT set_config('lock_timeout', %s, true)",
-            (f"{self.lock_timeout_ms}ms",),
-        )
-        conn.execute(
-            "SELECT set_config('statement_timeout', %s, true)",
-            (f"{self.statement_timeout_ms}ms",),
-        )
-        return conn
+    def connect(self, *, deadline_at: Optional[datetime] = None) -> psycopg.Connection:
+        """Open a connection, bounding establishment and session setup when requested."""
+        deadline = _utc_datetime(deadline_at, "deadline_at") if deadline_at is not None else None
+        connect_timeout: Optional[int] = None
+        if deadline is not None:
+            remaining = (deadline - datetime.now().astimezone()).total_seconds()
+            if remaining <= 0:
+                raise LedgerError("collector database deadline has expired")
+            connect_timeout = max(1, math.ceil(remaining))
+        kwargs = {"connect_timeout": connect_timeout} if connect_timeout is not None else {}
+        conn = psycopg.connect(self.dsn, **kwargs)
+        try:
+            if deadline is not None:
+                _assert_before_deadline(deadline)
+            conn.execute(
+                "SELECT set_config('application_name', %s, false)",
+                (self.application_name,),
+            )
+            if deadline is not None:
+                remaining_ms = _remaining_deadline_ms(deadline)
+                conn.execute(
+                    "SELECT set_config('lock_timeout', %s, true)",
+                    (f"{min(self.lock_timeout_ms, remaining_ms)}ms",),
+                )
+                remaining_ms = _remaining_deadline_ms(deadline)
+                conn.execute(
+                    "SELECT set_config('statement_timeout', %s, true)",
+                    (f"{min(self.statement_timeout_ms, remaining_ms)}ms",),
+                )
+                _assert_before_deadline(deadline)
+            else:
+                conn.execute(
+                    "SELECT set_config('lock_timeout', %s, true)",
+                    (f"{self.lock_timeout_ms}ms",),
+                )
+                conn.execute(
+                    "SELECT set_config('statement_timeout', %s, true)",
+                    (f"{self.statement_timeout_ms}ms",),
+                )
+            return conn
+        except BaseException:
+            conn.close()
+            raise
 
     def ensure_schema(self) -> None:
         sql = MIGRATION_PATH.read_text(encoding="utf-8")
@@ -3767,6 +3796,20 @@ def _utc_datetime(value: Any, field_name: str) -> datetime:
     if not isinstance(value, datetime):
         raise LedgerError(f"{field_name} must be a datetime")
     return ensure_utc(value)
+
+
+def _assert_before_deadline(deadline_at: datetime) -> None:
+    if datetime.now().astimezone() >= deadline_at:
+        raise LedgerError("collector database deadline has expired")
+
+
+def _remaining_deadline_ms(deadline_at: datetime) -> int:
+    remaining_ms = int(
+        (deadline_at - datetime.now().astimezone()).total_seconds() * 1000
+    )
+    if remaining_ms <= 0:
+        raise LedgerError("collector database deadline has expired")
+    return max(1, remaining_ms)
 
 
 def _optional_token(value: Any) -> Optional[str]:

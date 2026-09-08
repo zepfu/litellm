@@ -802,17 +802,18 @@ class PgCollectorState:
             wire_page_commit_id, "pageCommitId"
         ) != safe_commit:
             raise LedgerError("collector page commit identity conflicts with its payload")
-        derived_operations = self._derive_ingest_operations(
-            wire_payload,
-            default_run_id=safe_run,
-        )
-        actual_operations = tuple(ingest_operations) + tuple(derived_operations)
         derived_candidates = self._derive_candidate_mutations(wire_payload)
         actual_candidates = (
             tuple(candidate_mutations) + tuple(derived_candidates)
             if candidate_mutations
             else tuple(derived_candidates)
         )
+        derived_operations = self._derive_ingest_operations(
+            wire_payload,
+            default_run_id=safe_run,
+            candidate_mutations=actual_candidates,
+        )
+        actual_operations = tuple(ingest_operations) + tuple(derived_operations)
         derived_coverage = self._derive_coverage_mutations(wire_payload)
         actual_coverage = (
             tuple(coverage_mutations) + tuple(derived_coverage)
@@ -1587,7 +1588,7 @@ class PgCollectorState:
                     ),
                     identified AS (
                         SELECT scoped_attempts.*,
-                               (
+                               COALESCE(
                                    alias_values.generation_alias_count > 1
                                    OR (
                                        alias_values.generation_alias_count <> 1
@@ -1596,11 +1597,13 @@ class PgCollectorState:
                                            OR component_generation_keys.contested_association
                                            OR component_generation_keys.contradictory_generation_claims
                                        )
-                                   )
+                                   ),
+                                   FALSE
                                ) AS ambiguous_generation_component,
-                               (
+                               COALESCE(
                                    alias_values.generation_alias_count = 1
-                                   OR component_generation_keys.generation_key_count = 1
+                                   OR component_generation_keys.generation_key_count = 1,
+                                   FALSE
                                ) AS canonical_generation_known,
                                CASE
                                    WHEN alias_values.generation_alias_count = 1
@@ -1630,7 +1633,7 @@ class PgCollectorState:
                                  scoped_attempts.canonical_scope_key
                          AND alias_values.scope_key = scoped_attempts.scope_key
                          AND alias_values.attempt_id = scoped_attempts.attempt_id
-                        JOIN strong_components
+                        LEFT JOIN strong_components
                           ON strong_components.canonical_scope_key =
                                  scoped_attempts.canonical_scope_key
                          AND strong_components.scope_key = scoped_attempts.scope_key
@@ -1984,12 +1987,6 @@ class PgCollectorState:
         )
         safe_outcome = _token(outcome, "outcome") if outcome is not None else None
         safe_summary = _safe_terminal_summary(summary)
-        self._close_owned_snapshots(
-            account=lease.collector_account_id,
-            profile=lease.profile_id,
-            run_id=safe_run,
-            fencing_token=safe_fence,
-        )
         with self.ledger.connect() as conn, conn.cursor() as cur:
             self._require_active_lease(
                 cur,
@@ -2073,12 +2070,6 @@ class PgCollectorState:
         )
         safe_outcome = _token(outcome, "outcome") if outcome is not None else None
         safe_summary = _safe_terminal_summary(summary)
-        self._close_owned_snapshots(
-            account=lease.collector_account_id,
-            profile=lease.profile_id,
-            run_id=safe_run,
-            fencing_token=safe_fence,
-        )
         with self.ledger.connect() as conn, conn.cursor() as cur:
             self._require_active_lease(
                 cur,
@@ -2451,6 +2442,7 @@ class PgCollectorState:
         payload: Mapping[str, Any],
         *,
         default_run_id: Optional[str] = None,
+        candidate_mutations: Sequence[Mapping[str, Any]] = (),
     ) -> tuple[Mapping[str, Any], ...]:
         explicit = payload.get("ingestOperations", payload.get("operations"))
         operations: list[Mapping[str, Any]] = []
@@ -2486,23 +2478,18 @@ class PgCollectorState:
             for section in (payload.get("discovery"), payload.get("page"))
             if isinstance(section, Mapping)
         ]
-        # The worker emits an explicit observation mutation for every
-        # canonical page.  It carries discovery candidates that are no longer
-        # embedded in the checkpoint, so retain it whenever present.  Older
-        # callers without that mutation use the canonical section as a
-        # compatibility fallback.
-        has_explicit_observations = "observations" in payload
-        observations = payload.get("observations", ())
-        if not has_explicit_observations:
-            observations = ()
-            for section in canonical_sections:
-                operations.append(
-                    PgCollectorState._canonical_observation_operation(
-                        section,
-                        source_map=source_map,
-                        default_run_id=default_run_id,
-                    )
+        # Discovery/page are the canonical wire records.  Always derive the
+        # ledger observation from those records; an undeclared top-level
+        # ``observations`` field must not suppress page evidence.
+        for section in canonical_sections:
+            operations.append(
+                PgCollectorState._canonical_observation_operation(
+                    section,
+                    source_map=source_map,
+                    default_run_id=default_run_id,
+                    candidate_mutations=candidate_mutations,
                 )
+            )
         attempts = payload.get("attempts", ())
         if attempts is not None:
             if not isinstance(attempts, Sequence) or isinstance(attempts, (str, bytes)):
@@ -2517,22 +2504,6 @@ class PgCollectorState:
                         **dict(attempt),
                     }
                 )
-        if observations is not None:
-            if not isinstance(observations, Sequence) or isinstance(
-                observations, (str, bytes)
-            ):
-                raise LedgerError("collector observations are not an array")
-            for observation in observations:
-                if not isinstance(observation, Mapping):
-                    raise LedgerError("collector observation is not an object")
-                observation_payload = observation.get("payload", observation)
-                operations.append(
-                    {
-                        "kind": "observation",
-                        **dict(source_map),
-                        "payload": observation_payload,
-                    }
-                )
         return tuple(operations)
 
     @staticmethod
@@ -2541,6 +2512,7 @@ class PgCollectorState:
         *,
         source_map: Mapping[str, Any],
         default_run_id: Optional[str],
+        candidate_mutations: Sequence[Mapping[str, Any]],
     ) -> Mapping[str, Any]:
         section_source = dict(source_map)
         for key in (
@@ -2589,6 +2561,7 @@ class PgCollectorState:
                     checkpoint,
                     coverage=section.get("coverage"),
                     warnings=section.get("warnings"),
+                    candidate_mutations=candidate_mutations,
                 ),
             }
         return {
@@ -2946,14 +2919,18 @@ class PgCollectorState:
             if requested_deadline <= created_at:
                 raise LedgerError("collector read snapshot deadline has expired")
             snapshot_deadline = min(snapshot_deadline, requested_deadline)
-        conn = self.ledger.connect()
+        conn: Optional[psycopg.Connection] = None
         try:
+            self._remaining_snapshot_ms(snapshot_deadline, created_at=created_at)
+            conn = self.ledger.connect(deadline_at=snapshot_deadline)
             # PgLedger.connect() opens a setup transaction. Roll it back before
             # starting the bounded repeatable-read snapshot so the transaction-
             # local timeout settings apply to the actual read.
             self._remaining_snapshot_ms(snapshot_deadline, created_at=created_at)
             conn.rollback()
+            self._remaining_snapshot_ms(snapshot_deadline, created_at=created_at)
             conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            self._remaining_snapshot_ms(snapshot_deadline, created_at=created_at)
             safe_snapshot = uuid4().hex
             snapshot = _ReadSnapshot(
                 safe_snapshot,
@@ -2999,10 +2976,11 @@ class PgCollectorState:
             self._snapshots[safe_snapshot] = snapshot
             return snapshot, True
         except BaseException:
-            try:
-                conn.rollback()
-            finally:
-                conn.close()
+            if conn is not None:
+                try:
+                    conn.rollback()
+                finally:
+                    conn.close()
             raise
 
     def _reuse_snapshot(
@@ -3395,17 +3373,25 @@ def _discovery_observation_payload(
     *,
     coverage: Any = None,
     warnings: Any = None,
+    candidate_mutations: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
-    queue = checkpoint.get("candidateQueue", ())
-    items = (
-        [
-            candidate.get("summary", candidate)
-            for candidate in queue
-            if isinstance(candidate, Mapping)
-        ]
-        if isinstance(queue, Sequence) and not isinstance(queue, (str, bytes))
-        else []
-    )
+    items: list[Mapping[str, Any]] = []
+    for mutation in candidate_mutations:
+        if not isinstance(mutation, Mapping):
+            continue
+        if mutation.get("queueKind") != "candidate":
+            continue
+        if mutation.get("operation") != "replace":
+            continue
+        payload = mutation.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        candidate = payload.get("candidate", payload)
+        if not isinstance(candidate, Mapping):
+            continue
+        summary = candidate.get("summary", candidate)
+        if isinstance(summary, Mapping):
+            items.append(dict(summary))
     pagination_state = checkpoint.get("paginationState", "unknown")
     coverage = (
         "validated_page"
@@ -3761,7 +3747,10 @@ def _nested_state_keys(key: str, field_name: str) -> Optional[set[str]]:
             return STATE_SCOPE_COVERAGE_KEYS
         return STATE_TRIGGER_KEYS
     if key == "olderHistoryAudit":
-        if "historyCoverage" in field_name or field_name.endswith(".coverage"):
+        if (
+            "historyCoverage" in field_name
+            and not field_name.endswith((".active", ".archived"))
+        ) or field_name.endswith(".coverage"):
             return STATE_AUDIT_AGGREGATE_KEYS
         return STATE_AUDIT_RESULT_KEYS
     if key == "coverage" and "historyCoverage" in field_name:
