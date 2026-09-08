@@ -1045,6 +1045,19 @@ one-shot foreground action, not a recurring schedule. A
 `history_observation_failed` result exits nonzero; `no_history_observed` is a
 distinct bounded outcome and exits zero.
 
+`ChatGPTNativeHistoryProbeCleanupFailed` events include `cleanup_subreason`,
+an allowlisted code matched against existing fixed lifecycle failure messages.
+Unrecognized failures report `unknown`; exception text is never emitted.
+When a reaped target closer has not confirmed cleanup, `target_closer_*` codes
+identify its last operation or failed response check, including CDP connection,
+target listing, target matching, close acknowledgment, and absence verification.
+After close acknowledgment, the closer checks validated target listings until
+the exact owned target disappears or its existing deadline expires. It sends
+the close request once; invalid listings fail without claiming target absence.
+The closer shares only a numeric stage; no CDP payload or target data is added.
+The event precedes the final retained-owner drain, so it does not report final
+retirement or imply that cleanup has completed.
+
 Probe option parsing is strict: abbreviated probe long options are rejected.
 When an exact or abbreviated probe option is present, malformed arguments emit
 only the fixed `ChatGPTNativeHistoryProbeConfigurationInvalid` event; argparse
@@ -1116,11 +1129,31 @@ match the selected account's configured profile. Recovery is one-shot and does
 not enable authentication recovery in the recurring scheduler. Failure events
 retain the selected configured profile for account attribution.
 
+The sidecar retains one bridge owner across runs, services unfinished child
+cleanup before admitting another account, and closes that owner on one-shot,
+recovery, and signal-driven exits. Cleanup uses a five-second cutoff with
+time reserved for forced termination and reaping. Cleanup failures remain
+failures even when the worker has already committed its final receipt.
+Unreaped children keep the exiting sidecar in nonadmitting supervision until
+retirement is proven. Worker-requested cancellation shares one terminal cutoff
+across its durable commit, acknowledgment, and cleanup.
+
 The bridge reports `history_contract=unavailable` when the native history
 preparer or capability contract is not available. That state is not an empty
 successful history and does not advance a completed per-model count. Native
 reader activation, schema provisioning, deployment, and fresh per-account
 row verification remain separate gates.
+
+Capability inventories may describe unavailable operations alongside verified
+ones. Each requested operation and archive scope still requires its own
+manifest evidence; a missing optional capability does not disable other
+verified history operations. A ready inventory requires at least one verified
+operation and archive scope.
+
+History checkpoints retain the worker's account envelope, discovery scopes,
+account pause state, queue coverage, and nullable opaque queue cursor in the
+existing checkpoint JSON field. Candidate and revisit rows remain separately
+paged; the database state counter remains the authoritative CAS version.
 
 ## Alibaba Token Plan quota polling
 

@@ -145,3 +145,24 @@ See:
 - `docs/privacy-threat-model.md`
 - `docs/known-limitations.md`
 - `docs/acceptance-results.md`
+
+## Sidecar Worker Checkpoints
+
+The sidecar worker entrypoint is `dist/src/worker/main.js --stdio-v1`.
+It reads one durable candidate/revisit queue page per run. The history header's
+`nextCursor` is the opaque PostgreSQL keyset cursor, committed with the next
+checkpoint; exhaustion resets it to `null`. Queue rows remain durable until
+their detail commits are acknowledged. Discovery payloads and checkpoint
+headers exclude `candidateQueue`; explicit candidate mutations own those rows.
+Partial queue hydration keeps collection and older-history audit coverage
+incomplete, including when unresolved work has moved into the revisit queue.
+
+Retained observations are newest-first. Fresh detail/message pages take
+precedence over retained status/model metadata, while missing graph links are
+filled from older observations. A saved message cursor is reused when the
+conversation revision still matches. Explicit terminal `truncated: false`
+clears transport pagination truncation, not independent coverage warnings.
+
+Terminal request capacity remains three operations: schedule load, schedule
+CAS, and finish acknowledgment. Byte reservation uses the existing 64 KiB
+state-field limit plus framing overhead, not six maximum-size history frames.

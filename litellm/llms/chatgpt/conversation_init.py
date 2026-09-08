@@ -45,6 +45,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import IntEnum
 from pathlib import Path
 from typing import (
     Any,
@@ -2666,6 +2667,40 @@ class OracleBrowserCleanupError(OracleBrowserBoundaryUnavailable):
     """Native-history cleanup could not be proven within its deadline."""
 
 
+class _OracleTargetCloserStage(IntEnum):
+    UNKNOWN = 0
+    PROCESS_GROUP_SETUP = 1
+    ROLE_MARKER_SETUP = 2
+    DEADLINE_CHECK = 3
+    PLAYWRIGHT_START = 4
+    CDP_CONNECT = 5
+    CDP_SESSION = 6
+    INITIAL_LISTING = 7
+    INITIAL_LISTING_INVALID = 8
+    INITIAL_TARGETS_INVALID = 9
+    TARGET_MATCH = 10
+    TARGET_MATCH_NOT_UNIQUE = 11
+    TARGET_LOOKUP = 12
+    TARGET_MISSING = 13
+    CLOSE_REQUEST = 14
+    CLOSE_NOT_ACKNOWLEDGED = 15
+    ABSENCE_LISTING = 16
+    ABSENCE_LISTING_INVALID = 17
+    ABSENCE_TARGETS_INVALID = 18
+    TARGET_ABSENCE_CHECK = 19
+    TARGET_STILL_PRESENT = 20
+
+
+_ORACLE_TARGET_CLOSER_FAILURE_MESSAGES = {
+    stage: f"Oracle browser owned-target cleanup failed at {stage.name.lower()}."
+    for stage in _OracleTargetCloserStage
+}
+CHATGPT_NATIVE_HISTORY_CLOSER_FAILURE_SUBREASONS = {
+    message: f"target_closer_{stage.name.lower()}"
+    for stage, message in _ORACLE_TARGET_CLOSER_FAILURE_MESSAGES.items()
+}
+
+
 @dataclass(frozen=True)
 class NativeHistoryTargetProof:
     """Authoritative proof that one owned target is absent after close."""
@@ -2702,6 +2737,7 @@ class NativeHistoryCloseRegistration:
     started: bool = False
     reaped: bool = False
     scope_reaped_proven: bool = False
+    failure_stage: Any = None
 
 
 @dataclass
@@ -6256,6 +6292,7 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
     private_process_group = context.RawValue("q", 0)
     private_process_start_time = context.RawValue("q", 0)
     target_proof = context.RawValue("b", False)
+    failure_stage = context.RawValue("i", _OracleTargetCloserStage.UNKNOWN)
     driver_done = context.Event()
     reap_ack = context.Event()
     role_marker = (
@@ -6282,6 +6319,7 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
             driver_done,
             lifecycle_registration is not None,
             lifecycle_registration is not None,
+            failure_stage,
         ),
     )
     close_registration: Optional[NativeHistoryCloseRegistration] = None
@@ -6295,6 +6333,7 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
             reap_ack=reap_ack,
             target_id=target_id,
             creation_url=creation_url,
+            failure_stage=failure_stage,
         )
         lifecycle_capability.register_native_history_closer(
             lifecycle_registration,
@@ -6366,7 +6405,12 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
             reap_ack.set()
         if not target_proof.value:
             raise OracleBrowserBoundaryUnavailable(
-                "Oracle browser owned-target cleanup was not confirmed."
+                _ORACLE_TARGET_CLOSER_FAILURE_MESSAGES.get(
+                    failure_stage.value,
+                    _ORACLE_TARGET_CLOSER_FAILURE_MESSAGES[
+                        _OracleTargetCloserStage.UNKNOWN
+                    ],
+                )
             )
         return NativeHistoryTargetProof(
             target_id=target_id,
@@ -6394,7 +6438,7 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
             reap_ack.set()
 
 
-def _oracle_browser_close_target_worker(
+def _oracle_browser_close_target_worker(  # noqa: PLR0915 - fixed closer phase diagnostics
     cdp_endpoint: str,
     target_id: Optional[str],
     anchor_target_id: str,
@@ -6408,31 +6452,45 @@ def _oracle_browser_close_target_worker(
     driver_done: Any,
     require_target_present: bool,
     require_target_absence: bool,
+    failure_stage: Any = None,
 ) -> None:
+    def record_stage(stage: _OracleTargetCloserStage) -> None:
+        if failure_stage is not None:
+            failure_stage.value = stage
+
+    record_stage(_OracleTargetCloserStage.PROCESS_GROUP_SETUP)
     _enter_oracle_browser_worker_process_group(
         private_process_group,
         private_process_start_time,
     )
     # Install the role marker before Playwright launches its driver. The
     # sidecar uses this marker plus pidfds, never a stale parent PID.
+    record_stage(_OracleTargetCloserStage.ROLE_MARKER_SETUP)
     os.environ[CHATGPT_NATIVE_HISTORY_ROLE_ENV] = role_marker
     playwright = None
     browser = None
     try:
+        record_stage(_OracleTargetCloserStage.DEADLINE_CHECK)
         _raise_if_browser_deadline_expired(deadline)
+        record_stage(_OracleTargetCloserStage.PLAYWRIGHT_START)
         playwright = _start_playwright_from_factory(playwright_factory)
+        record_stage(_OracleTargetCloserStage.CDP_CONNECT)
         browser = playwright.chromium.connect_over_cdp(
             cdp_endpoint,
             timeout=_browser_timeout_milliseconds(
                 _remaining_browser_timeout(deadline)
             ),
         )
+        record_stage(_OracleTargetCloserStage.CDP_SESSION)
         session = browser.new_browser_cdp_session()
         # Only this published target may be closed; never close the browser.
+        record_stage(_OracleTargetCloserStage.INITIAL_LISTING)
         target_listing = session.send("Target.getTargets")
+        record_stage(_OracleTargetCloserStage.INITIAL_LISTING_INVALID)
         if not isinstance(target_listing, Mapping):
             return
         targets = target_listing.get("targetInfos")
+        record_stage(_OracleTargetCloserStage.INITIAL_TARGETS_INVALID)
         if not isinstance(targets, (list, tuple)):
             return
         if any(
@@ -6445,6 +6503,7 @@ def _oracle_browser_close_target_worker(
         if target_id is None:
             # A lost createTarget reply is recoverable only by the unique URL
             # assigned before creation, never by host, page title, or account.
+            record_stage(_OracleTargetCloserStage.TARGET_MATCH)
             matches = [
                 info.get("targetId")
                 for info in targets
@@ -6454,39 +6513,59 @@ def _oracle_browser_close_target_worker(
                 and info.get("targetId") != anchor_target_id
             ]
             if len(matches) != 1 or not isinstance(matches[0], str):
+                record_stage(_OracleTargetCloserStage.TARGET_MATCH_NOT_UNIQUE)
                 return
             target_id = matches[0]
+        record_stage(_OracleTargetCloserStage.TARGET_LOOKUP)
         if not any(
             isinstance(info, Mapping) and info.get("targetId") == target_id
             for info in targets
         ):
+            record_stage(_OracleTargetCloserStage.TARGET_MISSING)
             target_proof.value = not require_target_present
             return
+        record_stage(_OracleTargetCloserStage.CLOSE_REQUEST)
         result = session.send("Target.closeTarget", {"targetId": target_id})
         if not isinstance(result, Mapping) or result.get("success") is not True:
+            record_stage(_OracleTargetCloserStage.CLOSE_NOT_ACKNOWLEDGED)
             return
         if not require_target_absence:
             target_proof.value = True
             return
-        post_close_listing = session.send("Target.getTargets")
-        if not isinstance(post_close_listing, Mapping):
-            return
-        if "targetInfos" not in post_close_listing:
-            return
-        post_close_targets = post_close_listing["targetInfos"]
-        if not isinstance(post_close_targets, (list, tuple)):
-            return
-        if any(
-            not isinstance(info, Mapping)
-            or not isinstance(info.get("targetId"), str)
-            or not info.get("targetId")
-            for info in post_close_targets
-        ):
-            return
-        target_proof.value = not any(
-            isinstance(info, Mapping) and info.get("targetId") == target_id
-            for info in post_close_targets
-        )
+        record_stage(_OracleTargetCloserStage.DEADLINE_CHECK)
+        # Close acknowledgment can precede removal from the target listing.
+        while True:
+            _raise_if_browser_deadline_expired(deadline)
+            record_stage(_OracleTargetCloserStage.ABSENCE_LISTING)
+            post_close_listing = session.send("Target.getTargets")
+            record_stage(_OracleTargetCloserStage.ABSENCE_LISTING_INVALID)
+            if not isinstance(post_close_listing, Mapping):
+                return
+            if "targetInfos" not in post_close_listing:
+                return
+            post_close_targets = post_close_listing["targetInfos"]
+            record_stage(_OracleTargetCloserStage.ABSENCE_TARGETS_INVALID)
+            if not isinstance(post_close_targets, (list, tuple)):
+                return
+            if any(
+                not isinstance(info, Mapping)
+                or not isinstance(info.get("targetId"), str)
+                or not info.get("targetId")
+                for info in post_close_targets
+            ):
+                return
+            record_stage(_OracleTargetCloserStage.TARGET_ABSENCE_CHECK)
+            target_proof.value = not any(
+                isinstance(info, Mapping) and info.get("targetId") == target_id
+                for info in post_close_targets
+            )
+            if target_proof.value:
+                return
+            record_stage(_OracleTargetCloserStage.TARGET_STILL_PRESENT)
+            remaining_seconds = _remaining_browser_timeout(deadline)
+            if remaining_seconds <= 0:
+                return
+            time.sleep(min(remaining_seconds, 0.05))
     except Exception:
         target_proof.value = False
     finally:

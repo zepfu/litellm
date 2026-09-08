@@ -83,58 +83,31 @@ export async function runBoundedCollector(
   );
   let initial = header;
   if (header !== null) {
-    let cursor: string | null = null;
-    const seenCursors = new Set<string>();
-    let hydrated = header;
-    let queueComplete = false;
-    for (let page = 0; page < bounds.maxRequests; page += 1) {
-      let candidatePage: Awaited<ReturnType<WorkerBridge["loadState"]>>;
-      try {
-        candidatePage = await bridgeCall(() =>
-          context.bridge.loadState({
-            kind: "candidates",
-            cursor,
-            limit: 256,
-            expectedStateVersion: header.stateVersionCounter,
-          }),
-        );
-      } catch (error) {
-        if (
-          error instanceof BoundedWorkerError &&
-          error.code === "bounds_exceeded"
-        ) {
-          queueWarnings.push("candidate_queue_hydration_incomplete");
-          break;
-        }
-        throw error;
-      }
-      if (candidatePage === null) {
-        queueWarnings.push("candidate_queue_hydration_incomplete");
-        break;
-      }
-      hydrated = candidatePage;
-      if (candidatePage.hasMore === false) {
-        queueComplete = true;
-        break;
-      }
-      if (
-        candidatePage.hasMore !== true ||
-        typeof candidatePage.nextCursor !== "string" ||
-        candidatePage.nextCursor.trim() === "" ||
-        seenCursors.has(candidatePage.nextCursor)
-      ) {
-        queueWarnings.push("candidate_queue_hydration_incomplete");
-        break;
-      }
-      seenCursors.add(candidatePage.nextCursor);
-      cursor = candidatePage.nextCursor;
+    const cursor = header.nextCursor ?? null;
+    const candidatePage = await bridgeCall(() =>
+      context.bridge.loadState({
+        kind: "candidates",
+        cursor,
+        limit: 256,
+        expectedStateVersion: header.stateVersionCounter,
+      }),
+    );
+    if (
+      candidatePage === null ||
+      (candidatePage.hasMore !== true && candidatePage.hasMore !== false) ||
+      (candidatePage.hasMore === true &&
+        (typeof candidatePage.nextCursor !== "string" ||
+          candidatePage.nextCursor.trim() === "" ||
+          candidatePage.nextCursor === cursor)) ||
+      (candidatePage.hasMore === false && candidatePage.nextCursor != null)
+    ) {
+      throw new BoundedWorkerError("protocol_invalid", false, true);
     }
-    initial = hydrated;
-    if (!queueComplete) {
+    initial = candidatePage;
+    // Leave unread rows durable and advance on the next checkpoint commit.
+    // A terminal tail page does not prove that earlier pending rows are gone.
+    if (cursor !== null || candidatePage.hasMore) {
       queueCoverage = "partial";
-      if (!queueWarnings.includes("candidate_queue_hydration_incomplete")) {
-        queueWarnings.push("candidate_queue_hydration_incomplete");
-      }
     }
   }
   if (initial !== null && initial.queueCoverage !== "complete") {
@@ -220,6 +193,7 @@ export async function runBoundedCollector(
     ...context.request,
     scope: context.scope,
     mapping: context.mapping,
+    queueCoverage,
     loadConversationMetadata: async (
       conversationId,
     ): Promise<HistoryMetadataPage | null> => {
@@ -435,17 +409,22 @@ export async function runBoundedCollector(
       };
     },
     onDiscoveryPageCommit: async (page) => {
+      const { candidateQueue: _candidateQueue, ...checkpoint } = page.checkpoint;
+      const discovery = { ...page, checkpoint };
       const source = sourceFor(
         context.envelope.runId,
         `discovery:${page.checkpoint.scope}:${page.checkpoint.pagesFetched}`,
         page.scanStartedAt,
       );
       const mutation = {
-        pageCommitId: stablePageCommitId("discovery", context.envelope.runId, page),
+        pageCommitId: stablePageCommitId("discovery", context.envelope.runId, {
+          discovery,
+          candidateMutations: store.pendingQueueMutationsSnapshot(),
+        }),
         conversationId: `${page.checkpoint.accountId}:discovery:${page.checkpoint.scope}`,
         scopes: [page.checkpoint.scope],
         source,
-        discovery: page,
+        discovery,
       } satisfies BridgePageMutation;
       await commitMutation(mutation, store.pendingQueueMutationsSnapshot());
     },

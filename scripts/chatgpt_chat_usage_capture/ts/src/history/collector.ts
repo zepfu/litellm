@@ -373,6 +373,10 @@ export class HistoryCollector {
     );
     const revisits = this.options.store.listRevisits();
     const coverage = this.buildCoverage(scopeResults, conversations, warnings);
+    if (this.options.queueCoverage === "partial") {
+      coverage.overall = "partial";
+      coverage.gaps.push("candidate_queue_incomplete");
+    }
     const status =
       !blocked && coverage.overall === "complete" && revisits.length === 0
         ? "complete"
@@ -465,6 +469,13 @@ export class HistoryCollector {
         isOlderHistoryAuditCandidate(candidate.summary, requestedRange.start)
       ) {
         auditConversationIds.add(candidate.summary.conversationId);
+      }
+    }
+    if (priorAudit.enabled) {
+      for (const revisit of this.options.store.listRevisits()) {
+        if (revisit.scopes.includes(scope)) {
+          auditConversationIds.add(revisit.conversationId);
+        }
       }
     }
     let auditExhausted = false;
@@ -1146,7 +1157,7 @@ export class HistoryCollector {
     }
 
     const messages = messagesBeforeExclusiveEnd(
-      dedupeMessages([...retainedMessages, ...detail.messages]),
+      dedupeMessages([...detail.messages, ...retainedMessages]),
       implicitUpperBound ? requestedRange.end : null,
     );
     detail = { ...detail, messages };
@@ -1184,10 +1195,10 @@ export class HistoryCollector {
         existingRevisit,
         {
           continuation:
-            detail.continuation ??
             (savedContinuationRevision === continuationRevision
               ? savedContinuation
-              : null),
+              : null) ??
+            detail.continuation,
           continuationRevision,
         },
       );
@@ -1402,9 +1413,12 @@ export class HistoryCollector {
       }
       detailPagesFetched += 1;
       pageNumber += 1;
-      messages.push(...messagesBeforeExclusiveEnd(page.items, rangeEnd));
+      const mergedMessages = dedupeMessages([
+        ...messagesBeforeExclusiveEnd(page.items, rangeEnd),
+        ...messages,
+      ]);
+      messages.splice(0, messages.length, ...mergedMessages);
       warnings.push(...page.warnings);
-      const mergedMessages = dedupeMessages(messages);
       const pageRevisitReason = messagePageRevisitReason(page);
       const malformedPage =
         page.paginationState === "contradictory"
@@ -2015,17 +2029,24 @@ export class HistoryCollector {
       }
       const conversationIds =
         auditedConversationIds.get(coverage.scope) ?? new Set<string>();
-      const incomplete = [...conversationIds].some((conversationId) => {
-        const conversation = conversations.find(
-          (item) => item.summary.conversationId === conversationId,
-        );
-        return (
-          conversation === undefined ||
-          conversation.coverage !== "complete" ||
-          conversation.revisit !== null ||
-          !this.committedCompleteConversationIds.has(conversationId)
-        );
-      });
+      for (const revisit of this.options.store.listRevisits()) {
+        if (revisit.scopes.includes(coverage.scope)) {
+          conversationIds.add(revisit.conversationId);
+        }
+      }
+      const incomplete =
+        this.options.queueCoverage === "partial" ||
+        [...conversationIds].some((conversationId) => {
+          const conversation = conversations.find(
+            (item) => item.summary.conversationId === conversationId,
+          );
+          return (
+            conversation === undefined ||
+            conversation.coverage !== "complete" ||
+            conversation.revisit !== null ||
+            !this.committedCompleteConversationIds.has(conversationId)
+          );
+        });
       const checkpoint = this.options.store.loadDiscovery(coverage.scope);
       if (!incomplete) {
         const auditState: OlderHistoryAuditState = {
@@ -2573,7 +2594,7 @@ export function dedupeMessages(messages: MessageRecord[]): MessageRecord[] {
       byId.set(message.messageId, message);
       continue;
     }
-    // Message pages can omit graph links that were present in the detail mapping.
+    // Inputs are newest-first; older observations can fill missing graph links.
     byId.set(message.messageId, {
       ...previous,
       nodeId: previous.nodeId === previous.messageId

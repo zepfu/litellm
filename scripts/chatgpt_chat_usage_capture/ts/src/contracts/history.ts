@@ -277,6 +277,8 @@ export interface HistoryCollectionOptions {
   loadConversationMetadata?: (
     conversationId: string,
   ) => Promise<HistoryMetadataPage | null>;
+  /** A bounded durable queue page cannot prove whole-queue completion. */
+  queueCoverage?: "complete" | "partial";
 }
 
 export interface ScopeCoverageResult {

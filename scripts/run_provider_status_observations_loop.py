@@ -145,6 +145,7 @@ from litellm.llms.cursor_agent.usage import (
 )
 from litellm.llms.chatgpt.conversation_init import (
     CHATGPT_CONVERSATION_INIT_DEFAULT_URL,
+    CHATGPT_NATIVE_HISTORY_CLOSER_FAILURE_SUBREASONS,
     CHATGPT_NATIVE_HISTORY_ROLE_ENV,
     CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH,
     ChatGPTConversationInitError,
@@ -17839,6 +17840,11 @@ def _run_chatgpt_usage_bridge_task(
     profile_filter: Optional[str] = None,
     authentication_recovery_requested: bool = False,
 ) -> Optional[Dict[str, Any]]:
+    bridge = state.chatgpt_usage_bridge_owner
+    if bridge is not None:
+        state.chatgpt_usage_bridge_cleanup_errors = bridge.reap_pending()
+    if not state.chatgpt_usage_bridge_admitting:
+        return None
     if not force and not config.chatgpt_usage_bridge_enabled:
         return None
     last_attempt = state.chatgpt_usage_bridge_last_attempt_monotonic
@@ -18018,8 +18024,13 @@ def _run_chatgpt_usage_bridge_accounts(
         task_state.chatgpt_usage_bridge_owner = bridge
     results: list[Dict[str, Any]] = []
     for account_id, bound_scope in bindings.items():
+        if not task_state.chatgpt_usage_bridge_admitting:
+            break
         configured_profile = str(bound_scope["profile_id"] or account_id)
         try:
+            task_state.chatgpt_usage_bridge_cleanup_errors = bridge.reap_pending()
+            if task_state.chatgpt_usage_bridge_cleanup_errors:
+                raise RuntimeError("ChatGPT usage bridge cleanup is incomplete")
             selected_profile = _chatgpt_usage_bridge_selected_profile(
                 account_id,
                 bound_scope,
@@ -18051,6 +18062,52 @@ def _run_chatgpt_usage_bridge_accounts(
                 )
             )
     return results
+
+
+def _stop_chatgpt_usage_bridge(state: SidecarTaskState) -> None:
+    state.chatgpt_usage_bridge_admitting = False
+    bridge = state.chatgpt_usage_bridge_owner
+    if bridge is not None:
+        bridge.request_shutdown()
+
+
+def _close_chatgpt_usage_bridge(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+) -> List[str]:
+    _stop_chatgpt_usage_bridge(state)
+    bridge = state.chatgpt_usage_bridge_owner
+    if bridge is None:
+        return []
+    try:
+        errors = bridge.close()
+    except Exception as exc:
+        errors = [f"bridge cleanup failed: {type(exc).__name__}"]
+    state.chatgpt_usage_bridge_cleanup_errors = errors
+    if errors:
+        _emit(
+            {
+                "event": "chatgpt_usage_bridge_cleanup",
+                "observed_at": _utc_timestamp(),
+                "environment": config.environment,
+                "ok": False,
+                "error_class": "ChatGPTUsageBridgeCleanupFailed",
+                "error_count": len(errors),
+            }
+        )
+        # Keep the nonadmitting owner alive until its retained children retire.
+        pending_errors = errors
+        retry_delay = 1.0
+        while pending_errors:
+            time.sleep(retry_delay)
+            try:
+                pending_errors = bridge.reap_pending()
+            except Exception as exc:
+                pending_errors = [f"bridge cleanup failed: {type(exc).__name__}"]
+            state.chatgpt_usage_bridge_cleanup_errors = pending_errors
+            retry_delay = min(5.0, retry_delay * 2)
+    state.chatgpt_usage_bridge_owner = None
+    return errors
 
 
 def _chatgpt_usage_bridge_selected_profile(
@@ -18430,6 +18487,31 @@ _CHATGPT_NATIVE_HISTORY_PROBE_OBSERVATION_KEYS = frozenset(
         "warnings",
     }
 )
+_CHATGPT_NATIVE_HISTORY_PROBE_CLEANUP_SUBREASONS = {
+    **CHATGPT_NATIVE_HISTORY_CLOSER_FAILURE_SUBREASONS,
+    "Native ChatGPT history lifecycle registration failed.": "native_registration_failed",
+    "Native ChatGPT history abort control failed.": "native_abort_control_failed",
+    "Native ChatGPT history finalization control failed.": "native_finalization_control_failed",
+    "Native ChatGPT history release control failed.": "native_release_control_failed",
+    "Native ChatGPT history worker start is still in progress.": "native_worker_start_pending",
+    "Native ChatGPT history target ownership could not be closed.": "native_target_close_unproven",
+    "Native ChatGPT history closer was not reaped.": "native_closer_not_reaped",
+    "Native ChatGPT history interception worker was not reaped.": "native_worker_not_reaped",
+    "Native ChatGPT history cleanup could not be proven.": "native_cleanup_unproven",
+    "Native ChatGPT history cleanup failed.": "native_cleanup_failed",
+    "Oracle browser owned-target closer is already registered.": "target_closer_already_registered",
+    "Oracle browser owned-target closer could not start.": "target_closer_start_failed",
+    "Oracle browser target was closed but its closer remains active.": "target_closer_still_active",
+    "Oracle browser owned-target closer was not reaped.": "target_closer_not_reaped",
+    "Oracle browser owned-target cleanup was not confirmed.": "target_cleanup_unproven",
+    "Oracle browser owner process inventory remains unknown.": "browser_inventory_unknown",
+    "Oracle browser owner process cleanup remains unproven.": "browser_cleanup_unproven",
+    "Oracle browser scratch remover could not start.": "scratch_remover_start_failed",
+    "Oracle browser scratch cleanup deadline expired.": "scratch_cleanup_deadline_expired",
+    "Oracle browser scratch cleanup remains pending.": "scratch_cleanup_pending",
+    "Oracle browser scratch cleanup failed.": "scratch_cleanup_failed",
+    "Oracle browser lifecycle cleanup remains pending.": "browser_lifecycle_cleanup_pending",
+}
 
 
 def _set_chatgpt_native_history_probe_failure(
@@ -18657,6 +18739,15 @@ def _run_chatgpt_native_history_probe(  # noqa: PLR0915 - bounded one-shot probe
         error_class, telemetry_class = _chatgpt_native_history_probe_exception_class(
             exc
         )
+        if isinstance(exc, OracleBrowserCleanupError):
+            message = exc.args[0] if len(exc.args) == 1 else None
+            event["cleanup_subreason"] = (
+                _CHATGPT_NATIVE_HISTORY_PROBE_CLEANUP_SUBREASONS.get(
+                    message, "unknown"
+                )
+                if isinstance(message, str)
+                else "unknown"
+            )
         _set_chatgpt_native_history_probe_failure(
             event,
             error_class=error_class,
@@ -18920,8 +19011,8 @@ def _next_sidecar_wake_delay(
 
 def _run_explicit_chatgpt_usage_bridge_recovery(
     config: ProviderStatusLoopConfig,
+    recovery_state: SidecarTaskState,
 ) -> Dict[str, Any]:
-    recovery_state = SidecarTaskState()
     try:
         recovery_event = _run_chatgpt_usage_bridge_task(
             config,
@@ -19056,6 +19147,7 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
         nonlocal stopping
         stopping = True
         if sidecar_state is not None:
+            _stop_chatgpt_usage_bridge(sidecar_state)
             if sidecar_state.chatgpt_oracle_browser_shutdown_deadline is None:
                 sidecar_state.chatgpt_oracle_browser_shutdown_deadline = (
                     time.monotonic()
@@ -19166,11 +19258,6 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
     if not _setup_schema_before_loop(config) and config.once:
         return 1
 
-    if config.chatgpt_usage_bridge_recovery_account is not None:
-        recovery_event = _run_explicit_chatgpt_usage_bridge_recovery(config)
-        _emit(recovery_event)
-        return 0 if recovery_event.get("ok") is True else 1
-
     sidecar_state = SidecarTaskState()
     _admit_sidecar_task_state(sidecar_state)
     signal.signal(signal.SIGINT, _stop)
@@ -19234,7 +19321,43 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
         _release_sidecar_task_state(sidecar_state)
         return drained
 
-    while not stopping:
+    try:
+        if config.chatgpt_usage_bridge_recovery_account is not None:
+            recovery_event = _run_explicit_chatgpt_usage_bridge_recovery(
+                config,
+                sidecar_state,
+            )
+            _emit(recovery_event)
+            exit_code = 0 if recovery_event.get("ok") is True else 1
+        else:
+            exit_code = _run_sidecar_loop(
+                config,
+                sidecar_state,
+                should_stop=lambda: stopping,
+            )
+    finally:
+        try:
+            cleanup_errors = _close_chatgpt_usage_bridge(config, sidecar_state)
+        finally:
+            drained = _shutdown_and_wait()
+    if not config.once and config.chatgpt_usage_bridge_recovery_account is None:
+        _emit(
+            {
+                "event": "provider_status_observations_stopped",
+                "observed_at": _utc_timestamp(),
+                "environment": config.environment,
+            }
+        )
+    return 1 if cleanup_errors or not drained else exit_code
+
+
+def _run_sidecar_loop(
+    config: ProviderStatusLoopConfig,
+    sidecar_state: SidecarTaskState,
+    *,
+    should_stop: Callable[[], bool],
+) -> int:
+    while not should_stop():
         now = time.monotonic()
         generic_cycle_deadline = sidecar_state.next_generic_cycle_due_monotonic
         if generic_cycle_deadline is None:
@@ -19253,7 +19376,7 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
             _sleep_until_next_sidecar_deadline(
                 config,
                 sidecar_state,
-                should_stop=lambda: stopping,
+                should_stop=should_stop,
             )
             continue
 
@@ -19274,7 +19397,6 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
                 }
             )
             if config.once:
-                _shutdown_and_wait()
                 return 1
         try:
             sidecar_events = run_due_sidecar_tasks(config, sidecar_state)
@@ -19293,7 +19415,6 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
                 }
             )
             if config.once:
-                _shutdown_and_wait()
                 return 1
 
         if config.once:
@@ -19302,28 +19423,15 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
                 sidecar_events,
             )
             _emit(one_shot_status)
-            drained = _shutdown_and_wait()
-            return (
-                1
-                if one_shot_status["required_failure_count"] or not drained
-                else 0
-            )
+            return 1 if one_shot_status["required_failure_count"] else 0
 
         _sleep_until_next_sidecar_deadline(
             config,
             sidecar_state,
-            should_stop=lambda: stopping,
+            should_stop=should_stop,
         )
 
-    drained = _shutdown_and_wait()
-    _emit(
-        {
-            "event": "provider_status_observations_stopped",
-            "observed_at": _utc_timestamp(),
-            "environment": config.environment,
-        }
-    )
-    return 0 if drained else 1
+    return 0
 
 
 if __name__ == "__main__":

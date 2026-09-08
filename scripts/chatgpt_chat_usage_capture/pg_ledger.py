@@ -827,20 +827,23 @@ class PgLedger:
             yield conn
         except BaseException:
             try:
-                if (
-                    deadline is not None
-                    and _remaining_deadline_seconds(deadline, operation) > 0
-                ):
-                    try:
+                try:
+                    if (
+                        deadline is not None
+                        and _remaining_deadline_seconds(deadline, operation) > 0
+                    ):
                         self.rollback_with_deadline(
                             conn,
                             deadline_at=deadline,
                             operation=operation,
                         )
-                    except BaseException:
-                        pass
+                except BaseException:
+                    pass
             finally:
-                conn.close()
+                try:
+                    conn.close()
+                except BaseException:
+                    pass
             raise
         else:
             try:
@@ -917,7 +920,11 @@ class PgLedger:
                     raise LedgerError("collector database deadline has expired")
                 with selectors.DefaultSelector() as selector:
                     selector.register(pgconn.socket, events)
-                    if not selector.select(timeout=remaining):
+                    if not selector.select(
+                        timeout=min(0.1, remaining)
+                        if operation is not None
+                        else remaining
+                    ) and operation is None:
                         raise LedgerError("collector database deadline has expired")
         finally:
             if pgconn is not None:
@@ -4583,16 +4590,20 @@ def _wait_operation(
                     raise LedgerError("collector database deadline has expired")
                 selector.register(socket, int(wait))
                 try:
-                    ready = selector.select(timeout=remaining)
+                    ready = selector.select(
+                        timeout=min(0.1, remaining)
+                        if operation is not None
+                        else remaining
+                    )
                 finally:
                     selector.unregister(socket)
                 if not ready:
-                    raise LedgerError("collector database deadline has expired")
+                    continue
                 _check_operation(operation)
                 wait = generator.send(waiting.Ready(ready[0][1]))
     except StopIteration as exc:
-        if monotonic() >= wait_deadline:
-            raise LedgerError("collector database deadline has expired") from None
+        # A completed COMMIT must reach the caller for receipt adoption.
+        # The next operation (and the bridge after adoption) checks the cutoff.
         return exc.value
     except BaseException:
         try:
