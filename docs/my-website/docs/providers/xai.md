@@ -302,11 +302,11 @@ terminal event and deferred session-owner promotion. LiteLLM does not replay
 already forwarded text as executable calls or buffer an unbounded response
 to repair it.
 
-Native Grok and managed xAI Responses streams bind the upstream read-timeout
-terminalizer before output-guard wrapping and validation. A post-first-byte
-timeout therefore emits the standard terminal failure event and records the
-route rollup without treating the interrupted stream as a successful
-completion.
+Codex auto-agent native Grok and managed xAI Responses streams bind the shared
+final-wire coordinator immediately after transport, before output-guard
+wrapping and validation. ASGI delivery, terminal selection, `[DONE]` ordering,
+and upstream closure therefore share one lifecycle. A post-first-byte timeout
+emits one standard terminal failure event and cannot re-enter provider fallback.
 
 ## Responses API Instructions
 

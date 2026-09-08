@@ -317,6 +317,44 @@ class PassThroughStreamingHandler:
         )
 
     @staticmethod
+    def _is_xai_responses_route(
+        *,
+        endpoint_type: EndpointType,
+        url_route: str,
+        custom_llm_provider: Optional[str],
+    ) -> bool:
+        provider_name = (
+            custom_llm_provider.value
+            if isinstance(custom_llm_provider, litellm.LlmProviders)
+            else custom_llm_provider
+        )
+        return (
+            endpoint_type == EndpointType.OPENAI
+            and provider_name == litellm.LlmProviders.XAI.value
+            and OpenAIPassthroughLoggingHandler.is_openai_responses_route(url_route)
+        )
+
+    @staticmethod
+    def _is_responses_wire_owned_stream(
+        *,
+        response: Any,
+        endpoint_type: EndpointType,
+        url_route: str,
+        custom_llm_provider: Optional[str],
+    ) -> bool:
+        """Recognize xAI streams owned by the shared final-wire coordinator."""
+        if not PassThroughStreamingHandler._is_xai_responses_route(
+            endpoint_type=endpoint_type,
+            url_route=url_route,
+            custom_llm_provider=custom_llm_provider,
+        ):
+            return False
+        extensions = getattr(response, "extensions", None)
+        return isinstance(extensions, dict) and (
+            extensions.get("aawm_responses_wire_owned") is True
+        )
+
+    @staticmethod
     def _stamp_encrypted_reasoning_in_responses_sse_chunk(
         chunk: bytes,
         *,
@@ -1450,6 +1488,12 @@ class PassThroughStreamingHandler:
             )
             is_fork_owned_responses_stream = (
                 PassThroughStreamingHandler._is_openai_responses_stream(
+                    endpoint_type=endpoint_type,
+                    url_route=url_route,
+                    custom_llm_provider=custom_llm_provider,
+                )
+                or PassThroughStreamingHandler._is_responses_wire_owned_stream(
+                    response=response,
                     endpoint_type=endpoint_type,
                     url_route=url_route,
                     custom_llm_provider=custom_llm_provider,

@@ -870,6 +870,7 @@ _HOST_FUNCTION_NAMES = (
     "_perform_codex_auto_agent_grok_native_responses_request",
     "_perform_codex_auto_agent_oa_xai_responses_request",
     "_maybe_wrap_xai_passthrough_responses_stream",
+    "_bind_xai_responses_wire_stream",
     "_bind_responses_stream_timeout_terminalizer",
     "_validate_codex_auto_agent_openrouter_responses_stream",
     "_perform_codex_auto_agent_openrouter_responses_request",
@@ -1089,6 +1090,48 @@ def _maybe_wrap_xai_passthrough_responses_stream(
         source_response=response,
         request_context=request_context,
     )
+
+
+def _bind_xai_responses_wire_stream(
+    response: StreamingResponse,
+    *,
+    request: Request,
+    adapter_model: str,
+) -> StreamingResponse:
+    """Bind xAI Responses to the shared ASGI-aware final-wire coordinator."""
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        OpenAIResponsesStreamingResponse,
+        bind_openai_responses_wire_trace_to_request,
+        wrap_openai_responses_stream,
+    )
+
+    if isinstance(response, OpenAIResponsesStreamingResponse):
+        return response
+
+    source = getattr(response, "body_iterator", None)
+    if source is None:
+        return response
+    upstream_response = getattr(response, "_aawm_upstream_response", None)
+    if upstream_response is None:
+        upstream_response = response
+    processed_chunks, wire_trace = wrap_openai_responses_stream(
+        source,
+        upstream_response=upstream_response,
+        model=adapter_model,
+    )
+    bind_openai_responses_wire_trace_to_request(request, wire_trace)
+    wire_response = OpenAIResponsesStreamingResponse(
+        processed_chunks,
+        wire_trace=wire_trace,
+        headers=dict(response.headers),
+        status_code=response.status_code,
+        media_type=response.media_type or "text/event-stream",
+        background=getattr(response, "background", None),
+    )
+    for name, value in vars(response).items():
+        if name.startswith("_aawm_"):
+            setattr(wire_response, name, value)
+    return wire_response
 
 
 # ── CFG-004: encrypted reasoning detection ─────────────────────────
@@ -4941,6 +4984,7 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
             ],
             caller_managed_hidden_retry=True,
             defer_session_owner_promotion=True,
+            responses_wire_owned=True,
         )
     except Exception as exc:
         if _grok_native_candidate_unavailable_detail(exc) is not None:
@@ -4971,6 +5015,11 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
             provider="grok",
             intake_context=grok_intake_context,
             rollup_kwargs=grok_rollup_kwargs,
+        )
+        response = _bind_xai_responses_wire_stream(
+            response,
+            request=request,
+            adapter_model=grok_adapter_model,
         )
     response = _maybe_wrap_xai_passthrough_responses_stream(
         response,
@@ -5066,6 +5115,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             ],
             caller_managed_hidden_retry=True,
             defer_session_owner_promotion=True,
+            responses_wire_owned=True,
         )
     except Exception as exc:
         if _xai_oauth_candidate_unavailable_detail(exc) is not None:
@@ -5098,6 +5148,11 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             provider="xai",
             intake_context=xai_intake_context,
             rollup_kwargs=xai_rollup_kwargs,
+        )
+        response = _bind_xai_responses_wire_stream(
+            response,
+            request=request,
+            adapter_model=xai_adapter_model,
         )
     response = _maybe_wrap_xai_passthrough_responses_stream(
         response,
