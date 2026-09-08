@@ -33,6 +33,10 @@ from litellm.secret_managers.credential_error_sanitizer import (
     DEFAULT_SECRET_FIELD_NAMES,
     sanitize_credential_error_message,
 )
+from litellm.secret_managers.xai_oauth_credentials import (
+    resolve_xai_oauth_scope,
+    select_xai_oauth_credential_record,
+)
 
 DEFAULT_GROK_OIDC_SCOPE = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
 DEFAULT_GROK_OIDC_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
@@ -543,14 +547,14 @@ def repair_grok_oidc_auth_file_metadata(
 
 
 def _resolve_scope(scope: Optional[str]) -> str:
-    if isinstance(scope, str) and scope.strip():
-        return scope.strip()
-    env_scope = os.getenv("LITELLM_XAI_GROK_OAUTH_SCOPE") or os.getenv(
-        "LITELLM_XAI_OAUTH_SCOPE"
-    )
-    if isinstance(env_scope, str) and env_scope.strip():
-        return env_scope.strip()
-    return DEFAULT_GROK_OIDC_SCOPE
+    return resolve_xai_oauth_scope(
+        scope,
+        env_names=(
+            "LITELLM_XAI_GROK_OAUTH_SCOPE",
+            "LITELLM_XAI_OAUTH_SCOPE",
+        ),
+        default_scope=DEFAULT_GROK_OIDC_SCOPE,
+    ).scope
 
 
 def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:
@@ -633,18 +637,11 @@ def _read_credential_payload(credential_path: Path) -> Dict[str, Any]:
 
 
 def _select_credential_record(payload: Mapping[str, Any], scope: str) -> Dict[str, Any]:
-    if isinstance(payload, dict) and _looks_like_credential_record(payload):
-        return payload
-
-    scoped_record = payload.get(scope)
-    if isinstance(scoped_record, dict):
-        return scoped_record
-
-    for value in payload.values():
-        if isinstance(value, dict) and _looks_like_credential_record(value):
-            return value
-
-    raise ValueError("Grok OIDC auth file does not contain a usable credential record.")
+    return select_xai_oauth_credential_record(
+        payload,
+        scope,
+        provider_label="Grok OIDC",
+    )
 
 
 def _looks_like_credential_record(value: Mapping[str, Any]) -> bool:

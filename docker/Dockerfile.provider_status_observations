@@ -40,6 +40,7 @@ COPY litellm/secret_managers/credential_error_sanitizer.py /app/litellm/secret_m
 COPY litellm/secret_managers/credential_file_lock.py /app/litellm/secret_managers/credential_file_lock.py
 COPY litellm/secret_managers/credential_file_metadata.py /app/litellm/secret_managers/credential_file_metadata.py
 COPY litellm/secret_managers/credential_file_write.py /app/litellm/secret_managers/credential_file_write.py
+COPY litellm/secret_managers/xai_oauth_credentials.py /app/litellm/secret_managers/xai_oauth_credentials.py
 # Grok native OIDC auth-path resolver (pure-stdlib).
 COPY litellm/secret_managers/grok_oidc_auth_path.py /app/litellm/secret_managers/grok_oidc_auth_path.py
 # Codex OAuth credential inventory (pure-stdlib).
