@@ -57,6 +57,7 @@ from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.cohere im
 )
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.provider_call_ledger import (
     ProviderCallLedgerExhausted,
+    ProviderCallReplayBlocked,
     bind_openai_candidate_context,
     get_request_provider_call_ledger,
 )
@@ -1119,7 +1120,47 @@ async def handle_alias_route(  # noqa: PLR0915
             candidate=candidate,
         )
         terminal_exc: Optional[HTTPException] = None
-        if preserve_upstream_failure:
+        if isinstance(exc, ProviderCallReplayBlocked) or getattr(
+            exc,
+            "aawm_openai_wire_replay_blocked",
+            False,
+        ):
+            source_detail = copy.deepcopy(getattr(exc, "detail", None))
+            if source_detail is None:
+                source_detail = {
+                    "error": {
+                        "message": str(exc),
+                        "type": "openai_wire_replay_blocked",
+                        "code": "aawm_openai_wire_replay_blocked",
+                        "retryable": False,
+                    }
+                }
+            terminal_exc = HTTPException(
+                status_code=(
+                    _extract_adapter_exception_status_code(exc)
+                    or status.HTTP_409_CONFLICT
+                ),
+                detail=source_detail,
+                headers=_passthrough_helpers._get_passthrough_terminal_wire_headers(
+                    exc
+                ),
+            )
+            for field in (
+                "attempted_provider_call",
+                "aawm_openai_wire_replay_blocked",
+                "wire_commitment",
+                "ledger_snapshot",
+                "failure_phase",
+                "code",
+                "message",
+                "param",
+                "type",
+            ):
+                if hasattr(exc, field):
+                    setattr(terminal_exc, field, getattr(exc, field))
+            setattr(terminal_exc, "attempted_provider_call", False)
+            setattr(terminal_exc, "aawm_openai_wire_replay_blocked", True)
+        elif preserve_upstream_failure:
             source_exc = exc
             wire_headers = _passthrough_helpers._get_passthrough_terminal_wire_headers(
                 source_exc
@@ -2016,7 +2057,14 @@ async def handle_alias_route(  # noqa: PLR0915
                                     attempt_record[
                                         "transport_connection_failures"
                                     ] = request_ledger.transport_connection_failures
-                                if ordinals or perform_exc is None:
+                                if request_ledger is not None:
+                                    # Ledger-owned OpenAI sends are evidenced only
+                                    # by a reservation delta; a provider-shaped
+                                    # exception alone is not proof of egress.
+                                    attempted_provider_call = bool(
+                                        ordinals or perform_exc is None
+                                    )
+                                elif perform_exc is None:
                                     attempted_provider_call = True
                                 else:
                                     explicit_attempted_provider_call = getattr(
@@ -2037,10 +2085,6 @@ async def handle_alias_route(  # noqa: PLR0915
                                                 perform_exc,
                                                 "_aawm_provider_returned",
                                                 False,
-                                            )
-                                            or isinstance(
-                                                perform_exc,
-                                                ProxyException,
                                             )
                                         )
                                 attempt_record["attempted_provider_call"] = (
@@ -2611,6 +2655,45 @@ async def handle_alias_route(  # noqa: PLR0915
                 # --- failure handling (post-release) ---------------------------
                 failure_exc = probe_failure_exc
                 assert failure_exc is not None
+                if isinstance(failure_exc, ProviderCallReplayBlocked) or getattr(
+                    failure_exc,
+                    "aawm_openai_wire_replay_blocked",
+                    False,
+                ):
+                    attempt_record["status"] = "terminal_openai_wire_replay_blocked"
+                    attempt_record["failure_phase"] = "openai_wire_replay_blocked"
+                    attempt_record["attempted_provider_call"] = False
+                    attempt_record["wire_commitment"] = getattr(
+                        failure_exc,
+                        "wire_commitment",
+                        None,
+                    )
+                    _record_auto_agent_alias_attempt_failure(
+                        alias_family=alias_family,
+                        alias_model=alias_model,
+                        request=request,
+                        prepared_request_body=prepared_request_body,
+                        selection=selection,
+                        attempts=attempts,
+                        attempt_record=attempt_record,
+                        error_class="openai_wire_replay_blocked",
+                        add_alias_metadata_fn=add_alias_metadata_fn,
+                    )
+                    _raise_terminal_alias_failure(
+                        failure_exc,
+                        extra_fields={
+                            "wire_commitment": getattr(
+                                failure_exc,
+                                "wire_commitment",
+                                None,
+                            ),
+                            "request_call_ledger": getattr(
+                                failure_exc,
+                                "ledger_snapshot",
+                                None,
+                            ),
+                        },
+                    )
                 if isinstance(failure_exc, ProviderCallLedgerExhausted) or getattr(
                     failure_exc,
                     "aawm_call_ledger_exhausted",

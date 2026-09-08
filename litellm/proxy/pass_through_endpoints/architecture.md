@@ -138,6 +138,13 @@ tracked separately from logical calls, and telemetry exposes only bounded
 fingerprints for targets, candidates, and account lanes. Non-OpenAI pass-through
 providers bypass this ledger and retain their existing transport behavior.
 
+The Responses wire owner remains the authority for request-monotonic
+commitment. Replay denial occurs before response touch or reservation, consumes
+no logical-call ordinal, and preserves the already committed response during
+cleanup. Hidden retry counts for OpenAI derive from actual ledger reservations, while
+`transport_connection_failures` counts only caught connection failures; neither
+value is inferred from denied reservations or retry-metadata record counts.
+
 ### Tool-schema normalization gate (issue #9)
 
 - OpenAI function-tool `type: object` `properties` fixes run only for
