@@ -396,6 +396,19 @@ def _normalize_function_tool(
     if parts is None:
         return tool, False
     _, function, name, parameters = parts
+    explicit_namespaces = [
+        namespace
+        for namespace in (tool.get("namespace"), function.get("namespace"))
+        if namespace is not None
+    ]
+    if any(
+        not isinstance(namespace, str)
+        or namespace not in _COLLABORATION_NAMESPACES
+        for namespace in explicit_namespaces
+    ) or len(set(explicit_namespaces)) > 1:
+        # Foreign, V1, malformed, or conflicting namespace evidence is
+        # outside this normalizer's ownership.
+        return tool, False
     target_name = _targeted_tool_name(
         name=name,
         namespace=_tool_namespace(tool, function),
@@ -601,10 +614,12 @@ def _normalize_agent_message_item(item: dict[str, Any]) -> tuple[dict[str, Any],
         envelope = _parse_collaboration_envelope(visible_text)
         if envelope is None:
             raise CodexCollaborationDispatchError("invalid_envelope")
-        _message_type, task_name, sender, payload_offset = envelope
+        message_type, task_name, sender, payload_offset = envelope
         if payload_offset != len(visible_text):
             raise CodexCollaborationDispatchError("invalid_envelope")
         _validate_envelope_identity(item, task_name=task_name, sender=sender)
+        if message_type == "FINAL_ANSWER":
+            raise CodexCollaborationDispatchError("invalid_envelope")
         payload = payload_part.get("encrypted_content")
         if not isinstance(payload, str) or not payload:
             raise CodexCollaborationDispatchError("invalid_envelope")

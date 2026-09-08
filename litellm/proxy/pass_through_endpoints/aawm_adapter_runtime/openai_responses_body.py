@@ -33,6 +33,9 @@ from litellm.types.utils import all_litellm_params
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.direct_openai_function_call_history import (
     normalize_direct_openai_legacy_function_call_history_ids,
 )
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+    _NormalizedCodexAgentMessage,
+)
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
     PROVENANCE_ITEM_FIELD,
     ROUTE_IDENTITY_FIELD,
@@ -155,7 +158,11 @@ def _strip_item_internal_fields(item: Any) -> Any:
     for key in (ROUTE_IDENTITY_FIELD, _PROVENANCE_ITEM_FIELD):
         if key in item:
             if updated is None:
-                updated = dict(item)
+                updated = (
+                    _NormalizedCodexAgentMessage(item)
+                    if isinstance(item, _NormalizedCodexAgentMessage)
+                    else dict(item)
+                )
             updated.pop(key, None)
     return updated if updated is not None else item
 
