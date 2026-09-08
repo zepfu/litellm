@@ -61,6 +61,10 @@ from types import FunctionType
 
 _HOST_FUNCTION_NAMES = (
     "_is_codex_auto_agent_malformed_tool_call_text_output",
+    "_raise_codex_auto_agent_invalid_responses_shape",
+    "_is_responses_shaped_body",
+    "_responses_item_has_valid_content_part",
+    "_responses_output_item_is_structurally_valid",
     "_validate_alias_candidate_responses_stream_if_needed",
     "_build_malformed_intake_context_for_anthropic_responses_adapter",
     "_is_codex_auto_agent_empty_success_responses_body",
@@ -76,6 +80,17 @@ _HOST_FUNCTION_NAMES = (
     "_validate_codex_auto_agent_responses_payload",
 )
 
+_RESPONSES_VALID_STATUSES = frozenset(
+    {
+        "cancelled",
+        "completed",
+        "failed",
+        "in_progress",
+        "incomplete",
+        "queued",
+    }
+)
+
 
 def install(host_globals: dict) -> None:
     """Rebind moved functions to host_globals for live lookup.
@@ -85,6 +100,7 @@ def install(host_globals: dict) -> None:
     rebound object is published to both this module and the host module.
     """
     _mod = globals()
+    host_globals["_RESPONSES_VALID_STATUSES"] = _RESPONSES_VALID_STATUSES
     for _name in _HOST_FUNCTION_NAMES:
         _obj = _mod[_name]
         _rebound = FunctionType(
@@ -471,10 +487,80 @@ def _raise_codex_auto_agent_invalid_responses_shape(
     raise exc
 
 
+def _responses_item_has_valid_content_part(part: Any) -> bool:
+    if not isinstance(part, dict):
+        return False
+    part_type = part.get("type")
+    if not isinstance(part_type, str) or not part_type.strip():
+        return False
+    if part_type in {"output_text", "text"}:
+        return isinstance(part.get("text"), str)
+    return True
+
+
+def _responses_output_item_is_structurally_valid(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    item_type = item.get("type")
+    item_id = item.get("id")
+    if (
+        not isinstance(item_type, str)
+        or not item_type.strip()
+        or not isinstance(item_id, str)
+        or not item_id.strip()
+    ):
+        return False
+    item_status = item.get("status")
+    if item_status is not None and item_status not in _RESPONSES_VALID_STATUSES:
+        return False
+
+    if item_type == "message":
+        content = item.get("content")
+        if not isinstance(content, list) or not all(
+            _responses_item_has_valid_content_part(part) for part in content
+        ):
+            return False
+    elif item_type == "function_call":
+        if any(
+            not isinstance(item.get(field), str) or not item[field].strip()
+            for field in ("call_id", "name", "arguments")
+        ):
+            return False
+    elif item_type == "function_call_output":
+        if (
+            not isinstance(item.get("call_id"), str)
+            or not item["call_id"].strip()
+            or "output" not in item
+        ):
+            return False
+    elif item_type == "reasoning":
+        summary = item.get("summary")
+        if summary is not None and (
+            not isinstance(summary, list)
+            or not all(
+                isinstance(part, dict)
+                and isinstance(part.get("text"), str)
+                for part in summary
+            )
+        ):
+            return False
+    return True
+
+
 def _is_responses_shaped_body(response_body: Any) -> bool:
-    return (
-        isinstance(response_body, dict)
-        and response_body.get("object") == "response"
+    if not isinstance(response_body, dict):
+        return False
+    if response_body.get("object") != "response":
+        return False
+    response_id = response_body.get("id")
+    if not isinstance(response_id, str) or not response_id.strip():
+        return False
+    status = response_body.get("status")
+    if status not in _RESPONSES_VALID_STATUSES:
+        return False
+    output = response_body.get("output")
+    return isinstance(output, list) and all(
+        _responses_output_item_is_structurally_valid(item) for item in output
     )
 
 
@@ -690,14 +776,6 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 adapter_label=adapter_label,
                 stream_event_summaries=event_summaries,
             )
-        if not _is_responses_shaped_body(response_body):
-            _raise_codex_auto_agent_invalid_responses_shape(
-                response_body=response_body,
-                adapter_model=adapter_model,
-                adapter=adapter,
-                adapter_label=adapter_label,
-                stream_event_summaries=event_summaries,
-            )
         response_changed = identity_changed
         repaired_body = (
             _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body(  # noqa: F821
@@ -754,6 +832,14 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 intake_context=intake_context,
                 stream_event_summaries=event_summaries,
             )
+        if not _is_responses_shaped_body(response_body):
+            _raise_codex_auto_agent_invalid_responses_shape(
+                response_body=response_body,
+                adapter_model=adapter_model,
+                adapter=adapter,
+                adapter_label=adapter_label,
+                stream_event_summaries=event_summaries,
+            )
         if response_changed:
             reconstructed = StreamingResponse(
                 _responses_sse_from_repaired_response_body(  # noqa: F821
@@ -804,8 +890,12 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 adapter=adapter,
                 adapter_label=adapter_label,
             )
-        if not _is_responses_shaped_body(response_body):
-            _raise_codex_auto_agent_invalid_responses_shape(
+        if (
+            isinstance(response_body, dict)
+            and _is_failed_responses_body(response_body)  # noqa: F821
+            and not is_repetitive_output_loop_failure(response_body)
+        ):
+            _raise_codex_auto_agent_failed_responses_payload(
                 response_body=response_body,
                 adapter_model=adapter_model,
                 adapter=adapter,
@@ -818,17 +908,6 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             )
             identity_changed = preserved_body is not response_body
             response_body = preserved_body
-        if (
-            isinstance(response_body, dict)
-            and _is_failed_responses_body(response_body)  # noqa: F821
-            and not is_repetitive_output_loop_failure(response_body)
-        ):
-            _raise_codex_auto_agent_failed_responses_payload(
-                response_body=response_body,
-                adapter_model=adapter_model,
-                adapter=adapter,
-                adapter_label=adapter_label,
-            )
         if isinstance(response_body, dict):
             repaired_body = (
                 _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body(  # noqa: F821
@@ -880,6 +959,13 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                     adapter_label=adapter_label,
                     intake_context=intake_context,
                 )
+            if not _is_responses_shaped_body(response_body):
+                _raise_codex_auto_agent_invalid_responses_shape(
+                    response_body=response_body,
+                    adapter_model=adapter_model,
+                    adapter=adapter,
+                    adapter_label=adapter_label,
+                )
             # Serialize identity repairs even when no unrelated repair flag is set.
             if (
                 identity_changed
@@ -893,4 +979,11 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                     status_code=response.status_code,
                     headers=dict(response.headers),
                 )
+        if not isinstance(response_body, dict):
+            _raise_codex_auto_agent_invalid_responses_shape(
+                response_body=response_body,
+                adapter_model=adapter_model,
+                adapter=adapter,
+                adapter_label=adapter_label,
+            )
     return response

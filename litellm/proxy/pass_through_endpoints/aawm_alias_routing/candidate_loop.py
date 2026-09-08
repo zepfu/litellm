@@ -2000,6 +2000,24 @@ async def handle_alias_route(  # noqa: PLR0915
                                     status_code=None,
                                 )
                             raise
+                        deferred_session_owner_stream = False
+                        if getattr(
+                            response,
+                            "_aawm_session_owner_promotion_deferred",
+                            False,
+                        ):
+                            deferred_session_owner_stream = (
+                                sa.bind_deferred_session_owner_lease_to_streaming_response(
+                                    response,
+                                    request=request,
+                                    lease=session_owner_lease,
+                                    attributes=owner_attributes,
+                                    candidate=candidate,
+                                    failure_phase=(
+                                        "session_owner_stream_promote"
+                                    ),
+                                )
+                            )
                         is_auto_review = (
                             alias_model in {"codex-auto-review", "auto-review"}
                             or sa.get_request_codex_auto_review_parent_session_identity(
@@ -2007,13 +2025,15 @@ async def handle_alias_route(  # noqa: PLR0915
                             )
                             is not None
                         )
-                        if is_auto_review:
+                        if deferred_session_owner_stream:
+                            finalize_result = None
+                        elif is_auto_review:
                             finalize_result = (
                                 await sa.finalize_codex_auto_review_lease_on_success(
                                     session_owner_lease
                                 )
                             )
-                        else:
+                        elif not deferred_session_owner_stream:
                             # Authoritative success: promote reserved -> owned.
                             finalize_result = (
                                 await sa.finalize_session_owner_lease_on_success(

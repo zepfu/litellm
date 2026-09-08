@@ -5598,21 +5598,22 @@ async def pass_through_request(  # noqa: PLR0915
             extra_metadata={"stream": False},
         )
         end_time = datetime.now()
-        asyncio.create_task(
-            pass_through_endpoint_logging.pass_through_async_success_handler(
-                httpx_response=response,
-                response_body=response_body,
-                url_route=str(url),
-                result="",
-                start_time=start_time,
-                end_time=end_time,
-                logging_obj=logging_obj,
-                cache_hit=False,
-                request_body=_parsed_body,
-                custom_llm_provider=custom_llm_provider,
-                **kwargs,
+        if not defer_session_owner_promotion:
+            asyncio.create_task(
+                pass_through_endpoint_logging.pass_through_async_success_handler(
+                    httpx_response=response,
+                    response_body=response_body,
+                    url_route=str(url),
+                    result="",
+                    start_time=start_time,
+                    end_time=end_time,
+                    logging_obj=logging_obj,
+                    cache_hit=False,
+                    request_body=_parsed_body,
+                    custom_llm_provider=custom_llm_provider,
+                    **kwargs,
+                )
             )
-        )
         local_finalize_ms = _record_passthrough_duration(
             kwargs,
             metric_key="aawm_local_finalize_ms",
@@ -5651,7 +5652,11 @@ async def pass_through_request(  # noqa: PLR0915
                 publish_transfer_terminal,
             )
 
-            if not stream and _transfer_identity:
+            if (
+                not defer_session_owner_promotion
+                and not stream
+                and _transfer_identity
+            ):
                 await publish_transfer_terminal(_transfer_identity, "completed")
         except Exception:
             verbose_proxy_logger.debug(

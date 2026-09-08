@@ -2111,9 +2111,15 @@ def _cursor_replay_stock_codex_function_call_item(
     )
 
 
-def _cursor_replay_stock_codex_full_history_input(
+def _cursor_replay_stock_codex_full_history_input(  # noqa: PLR0915
     request_body: dict[str, Any],
 ) -> _CursorReplayValidationResult:
+    """Accept only the bounded stock full-history replay grammar.
+
+    The supported shape is one user-bearing history with exactly one
+    ``function_call`` immediately followed by exactly one completed
+    ``function_call_output``. Other stock history variants fail closed.
+    """
     input_items = request_body.get("input")
     continuation_rejection = _cursor_replay_continuation_identifier_rejection(
         input_items,
@@ -2676,6 +2682,96 @@ def _cursor_replay_provider_neutral_tools(
     return _CursorReplayValidationResult(value=provider_neutral_tools)
 
 
+def _cursor_replay_build_stored_history_input(
+    replay_state: dict[str, Any],
+    request_body: dict[str, Any],
+) -> _CursorReplayValidationResult:
+    messages = replay_state.get("messages")
+    if not isinstance(messages, list):
+        return _cursor_replay_rejected(
+            "fresh_body_copy",
+            "messages_container",
+        )
+    messages_continuation_rejection = (
+        _cursor_replay_continuation_identifier_rejection(
+            messages,
+            stage="fresh_body_copy",
+        )
+    )
+    if messages_continuation_rejection is not None:
+        return _CursorReplayValidationResult(
+            value=None,
+            rejection=messages_continuation_rejection,
+        )
+    if not messages:
+        return _cursor_replay_rejected(
+            "fresh_body_copy",
+            "messages_empty",
+        )
+    if any(
+        str(_cursor_as_mapping(message).get("role") or "").strip().lower()
+        not in {"system", "developer", "user", "assistant", "tool"}
+        for message in messages
+    ):
+        return _cursor_replay_rejected(
+            "fresh_body_copy",
+            "message_role",
+        )
+    if not any(
+        str(_cursor_as_mapping(message).get("role") or "").strip().lower()
+        == "user"
+        and bool(
+            _cursor_response_content_text(
+                _cursor_as_mapping(message).get("content")
+            ).strip()
+        )
+        for message in messages
+    ):
+        return _cursor_replay_rejected(
+            "fresh_body_copy",
+            "empty_user_text",
+        )
+    try:
+        from litellm.llms.openai.responses.count_tokens.transformation import (
+            OpenAICountTokensConfig,
+        )
+
+        replayed_input, instructions = (
+            OpenAICountTokensConfig.messages_to_responses_input(messages)
+        )
+    except Exception:  # noqa: BLE001
+        return _cursor_replay_rejected(
+            "fresh_body_copy",
+            "message_conversion",
+        )
+    if not isinstance(replayed_input, list):
+        return _cursor_replay_rejected(
+            "fresh_body_copy",
+            "replayed_input_container",
+        )
+
+    # Stored history can end with an unresolved call because the current
+    # request carries its outputs. Merge those outputs before the sole
+    # authoritative closed-graph check.
+    output_result = _cursor_replay_function_call_output_items(request_body)
+    if output_result.rejection is not None:
+        return output_result
+    combined_input = [*replayed_input, *output_result.value]
+    graph_result = _cursor_replay_unresolved_function_call_ids(
+        combined_input,
+        stage="fresh_body_copy",
+    )
+    if graph_result.rejection is not None:
+        return graph_result
+    return _CursorReplayValidationResult(
+        value={
+            "input": combined_input,
+            "instructions": instructions,
+            "tools": replay_state.get("tools"),
+        }
+    )
+
+
 def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
     request_body: Any,
     *,
@@ -2706,7 +2802,6 @@ def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
     )
     registry_state: Optional[dict[str, Any]] = None
     replayed_input: Optional[list[dict[str, Any]]] = None
-    output_items: Optional[list[dict[str, Any]]] = None
     instructions: Optional[str] = None
     replay_tools_source: Any = None
     if not isinstance(replay_state, dict):
@@ -2760,98 +2855,29 @@ def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
                 "retained_session_present",
             )
 
-        messages = replay_state.get("messages")
-        if not isinstance(messages, list):
-            return _cursor_replay_build_rejected(
-                "fresh_body_copy",
-                "messages_container",
-            )
-        messages_continuation_rejection = (
-            _cursor_replay_continuation_identifier_rejection(
-                messages,
-                stage="fresh_body_copy",
-            )
+        stored_history_result = _cursor_replay_build_stored_history_input(
+            replay_state,
+            request_body,
         )
-        if messages_continuation_rejection is not None:
+        if stored_history_result.rejection is not None:
             return _CursorReplayFreshDispatchBuildResult(
                 body=None,
-                rejection=messages_continuation_rejection,
+                rejection=stored_history_result.rejection,
             )
-        if not messages:
-            return _cursor_replay_build_rejected(
-                "fresh_body_copy",
-                "messages_empty",
-            )
-        if any(
-            str(_cursor_as_mapping(message).get("role") or "").strip().lower()
-            not in {"system", "developer", "user", "assistant", "tool"}
-            for message in messages
-        ):
-            return _cursor_replay_build_rejected(
-                "fresh_body_copy",
-                "message_role",
-            )
-        if not any(
-            str(_cursor_as_mapping(message).get("role") or "").strip().lower()
-            == "user"
-            and bool(
-                _cursor_response_content_text(
-                    _cursor_as_mapping(message).get("content")
-                ).strip()
-            )
-            for message in messages
-        ):
-            return _cursor_replay_build_rejected(
-                "fresh_body_copy",
-                "empty_user_text",
-            )
-        try:
-            from litellm.llms.openai.responses.count_tokens.transformation import (
-                OpenAICountTokensConfig,
-            )
+        stored_history = stored_history_result.value
+        replayed_input = stored_history["input"]
+        instructions = stored_history["instructions"]
+        replay_tools_source = stored_history["tools"]
 
-            replayed_input, instructions = (
-                OpenAICountTokensConfig.messages_to_responses_input(messages)
-            )
-        except Exception:  # noqa: BLE001
-            return _cursor_replay_build_rejected(
-                "fresh_body_copy",
-                "message_conversion",
-            )
-        if not isinstance(replayed_input, list):
-            return _cursor_replay_build_rejected(
-                "fresh_body_copy",
-                "replayed_input_container",
-            )
-        unresolved_result = _cursor_replay_unresolved_function_call_ids(
-            replayed_input,
-            stage="fresh_body_copy",
+    final_graph_result = _cursor_replay_unresolved_function_call_ids(
+        replayed_input or [],
+        stage="fresh_body_copy",
+    )
+    if final_graph_result.rejection is not None:
+        return _CursorReplayFreshDispatchBuildResult(
+            body=None,
+            rejection=final_graph_result.rejection,
         )
-        if unresolved_result.rejection is not None:
-            return _CursorReplayFreshDispatchBuildResult(
-                body=None,
-                rejection=unresolved_result.rejection,
-            )
-        unresolved_call_ids = unresolved_result.value
-        output_result = _cursor_replay_function_call_output_items(request_body)
-        if output_result.rejection is not None:
-            return _CursorReplayFreshDispatchBuildResult(
-                body=None,
-                rejection=output_result.rejection,
-            )
-        output_items = output_result.value
-
-        for output_index, output_item in enumerate(output_items):
-            call_id = output_item["call_id"]
-            if call_id not in unresolved_call_ids:
-                return _cursor_replay_build_rejected(
-                    "fresh_body_copy",
-                    "unresolved_call_id",
-                    item_index=output_index,
-                    item=output_item,
-                )
-            unresolved_call_ids.remove(call_id)
-        replay_tools_source = replay_state.get("tools")
 
     replay_tools_result = _cursor_replay_provider_neutral_tools(replay_tools_source)
     if replay_tools_result.rejection is not None:
@@ -2863,10 +2889,7 @@ def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
 
     try:
         fresh_body = copy.deepcopy(request_body)
-        fresh_body["input"] = [
-            *replayed_input,
-            *(output_items or []),
-        ]
+        fresh_body["input"] = replayed_input
         fresh_body["tools"] = replay_tools
     except Exception:  # noqa: BLE001
         return _cursor_replay_build_rejected(
@@ -4632,7 +4655,7 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
         route_family="codex_auto_agent_grok_native_responses",
         resolved_model=grok_prepared_body.get("model") or request_body.get("model"),
     )
-    return await _validate_codex_auto_agent_responses_payload(
+    validated_response = await _validate_codex_auto_agent_responses_payload(
         response,
         adapter_model=str(grok_prepared_body.get("model") or request_body.get("model") or "unknown-model"),
         adapter="codex_auto_agent_grok_native_responses",
@@ -4646,6 +4669,9 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
         ),
         request_body=request_body,
     )
+    if getattr(validated_response, "body_iterator", None) is not None:
+        setattr(validated_response, "_aawm_session_owner_promotion_deferred", True)
+    return validated_response
 
 
 async def _perform_codex_auto_agent_oa_xai_responses_request(
@@ -4721,7 +4747,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         resolved_model=oa_xai_prepared_body.get("model")
         or canonical_request_body.get("model"),
     )
-    return await _validate_codex_auto_agent_responses_payload(
+    validated_response = await _validate_codex_auto_agent_responses_payload(
         response,
         adapter_model=str(oa_xai_prepared_body.get("model") or canonical_request_body.get("model") or "unknown-model"),
         adapter="codex_auto_agent_xai_oauth_responses",
@@ -4735,6 +4761,9 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         ),
         request_body=canonical_request_body,
     )
+    if getattr(validated_response, "body_iterator", None) is not None:
+        setattr(validated_response, "_aawm_session_owner_promotion_deferred", True)
+    return validated_response
 
 
 def _bind_responses_stream_timeout_terminalizer(

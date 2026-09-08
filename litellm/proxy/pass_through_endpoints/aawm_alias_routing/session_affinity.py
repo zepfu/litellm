@@ -3142,6 +3142,127 @@ async def finalize_request_session_owner_lease(
     return result
 
 
+def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
+    response: Any,
+    *,
+    request: Any,
+    lease: Optional[SessionOwnerLease],
+    attributes: Optional[Mapping[str, Any]] = None,
+    candidate: Optional[Mapping[str, Any]] = None,
+    failure_phase: str = "session_owner_stream_promote",
+) -> bool:
+    """Finalize a deferred lease only after the complete stream outcome.
+
+    Alias candidate validation can return a bounded-peeked stream before its
+    terminal Responses event is available. Keep that reservation pending until
+    clean EOF; release it on iterator error, cancellation, or early close.
+    """
+
+    from fastapi.responses import StreamingResponse
+
+    _ = request
+    if not isinstance(response, StreamingResponse):
+        return False
+    if getattr(
+        response,
+        "_aawm_session_owner_deferred_finalizer_bound",
+        False,
+    ):
+        return True
+    original_iterator = getattr(response, "body_iterator", None)
+    if original_iterator is None:
+        return False
+
+    finalized = False
+
+    async def _finalize(success: bool) -> None:
+        nonlocal finalized
+        if finalized:
+            return
+        finalized = True
+
+        async def _run() -> None:
+            try:
+                if success:
+                    result = await finalize_session_owner_lease_on_success(
+                        lease,
+                        attributes=attributes,
+                        candidate=candidate,
+                    )
+                    if result is not None and result.outcome in {
+                        SessionOwnerMutationOutcome.CONFLICT,
+                        SessionOwnerMutationOutcome.ERROR,
+                        SessionOwnerMutationOutcome.NOT_HELD,
+                    }:
+                        await finalize_session_owner_lease_on_failure(lease)
+                        verbose_proxy_logger.warning(
+                            "Deferred session-owner promotion did not commit "
+                            "after stream EOF phase=%s outcome=%s",
+                            failure_phase,
+                            result.outcome.value,
+                        )
+                else:
+                    await finalize_session_owner_lease_on_failure(lease)
+            except BaseException:
+                try:
+                    await finalize_session_owner_lease_on_failure(lease)
+                except BaseException:
+                    verbose_proxy_logger.debug(
+                        "Deferred session-owner lease release failed phase=%s",
+                        failure_phase,
+                        exc_info=True,
+                    )
+                verbose_proxy_logger.warning(
+                    "Deferred session-owner lease finalization failed phase=%s",
+                    failure_phase,
+                    exc_info=True,
+                )
+
+        await asyncio.shield(asyncio.create_task(_run()))
+
+    completed = False
+
+    async def _wrapped_iterator() -> Any:
+        nonlocal completed
+        try:
+            async for chunk in original_iterator:
+                yield chunk
+            completed = True
+            await _finalize(True)
+        except BaseException:
+            if not completed:
+                await _finalize(False)
+            raise
+        finally:
+            if not completed:
+                await _finalize(False)
+            close = getattr(original_iterator, "aclose", None)
+            if callable(close):
+                try:
+                    await close()
+                except BaseException:
+                    verbose_proxy_logger.debug(
+                        "Failed to close deferred session-owner stream iterator",
+                        exc_info=True,
+                    )
+
+    wrapped_iterator = _wrapped_iterator()
+    response.body_iterator = wrapped_iterator
+    setattr(response, "_aawm_session_owner_deferred_finalizer_bound", True)
+
+    original_stream_response = getattr(response, "stream_response", None)
+    if callable(original_stream_response):
+
+        async def _stream_response_with_finalizer(send: Any) -> None:
+            try:
+                await original_stream_response(send)
+            finally:
+                await wrapped_iterator.aclose()
+
+        response.stream_response = _stream_response_with_finalizer
+    return True
+
+
 def extract_account_identity_from_context(
     *,
     request: Any = None,
