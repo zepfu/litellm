@@ -761,17 +761,11 @@ def _extract_xai_oauth_account_hash(metadata: Dict[str, Any]) -> Optional[str]:
 
 
 def _extract_xai_grok_oidc_account_hash(metadata: Dict[str, Any]) -> Optional[str]:
-    for key in ("xai_grok_oidc_account_hash", "grok_oidc_account_hash", "provider_account_hash"):
+    for key in ("xai_grok_oidc_account_hash", "grok_oidc_account_hash"):
         value = _clean_non_empty_string(metadata.get(key))
         if value:
             return value
-    for key in (
-        "xai_grok_oidc_account_id",
-        "grok_oidc_account_id",
-        "provider_account_id",
-        "organization_id",
-        "org_id",
-    ):
+    for key in ("xai_grok_oidc_account_id", "grok_oidc_account_id"):
         value = _clean_non_empty_string(metadata.get(key))
         if value:
             return _short_hash(value.encode("utf-8"))

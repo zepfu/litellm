@@ -20,6 +20,7 @@ import os
 import random
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Optional
 
 import httpx
@@ -243,36 +244,44 @@ def _parse_xai_rate_limit_reset_wait_seconds(
     text = str(value).strip()
     if not text:
         return None
+    current_epoch = time.time() if now_epoch is None else now_epoch
     match = _XAI_RATE_LIMIT_DURATION_RE.fullmatch(text)
-    if match is None:
-        return None
-    try:
-        numeric_value = float(match.group("value"))
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(numeric_value) or numeric_value < 0:
-        return None
+    if match is not None:
+        try:
+            numeric_value = float(match.group("value"))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(numeric_value) or numeric_value < 0:
+            return None
 
-    unit = (match.group("unit") or "").lower()
-    if unit:
-        multiplier = {
-            "ms": 0.001,
-            "s": 1.0,
-            "m": 60.0,
-            "h": 3600.0,
-            "d": 86400.0,
-        }[unit]
-        wait_seconds = numeric_value * multiplier
-    elif numeric_value >= 1_000_000_000_000:
-        reset_epoch_seconds = numeric_value / 1000.0
-        wait_seconds = reset_epoch_seconds - (time.time() if now_epoch is None else now_epoch)
-    elif numeric_value >= 1_000_000_000:
-        wait_seconds = numeric_value - (time.time() if now_epoch is None else now_epoch)
+        unit = (match.group("unit") or "").lower()
+        if unit:
+            multiplier = {
+                "ms": 0.001,
+                "s": 1.0,
+                "m": 60.0,
+                "h": 3600.0,
+                "d": 86400.0,
+            }[unit]
+            wait_seconds = numeric_value * multiplier
+        elif numeric_value >= 1_000_000_000_000:
+            wait_seconds = (numeric_value / 1000.0) - current_epoch
+        elif numeric_value >= 1_000_000_000:
+            wait_seconds = numeric_value - current_epoch
+        else:
+            # xAI has emitted both epoch timestamps and short duration values.
+            # Treat small unitless values as durations; bounded validation below
+            # prevents them from becoming durable cooldowns.
+            wait_seconds = numeric_value
     else:
-        # xAI has emitted both epoch timestamps and short duration values.
-        # Treat small unitless values as durations; absurd values are bounded
-        # below rather than being allowed to become durable cooldowns.
-        wait_seconds = numeric_value
+        try:
+            iso_text = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+            parsed_at = datetime.fromisoformat(iso_text)
+        except (TypeError, ValueError):
+            return None
+        if parsed_at.tzinfo is None:
+            parsed_at = parsed_at.replace(tzinfo=timezone.utc)
+        wait_seconds = parsed_at.timestamp() - current_epoch
 
     if not math.isfinite(wait_seconds) or wait_seconds < 0:
         return None
@@ -303,28 +312,41 @@ def _is_xai_rate_limit_candidate(
     return False
 
 
+def _xai_rate_limit_status_code(
+    exc: Any,
+    candidate: Optional[dict[str, Any]],
+) -> Optional[int]:
+    for source in (candidate, exc, getattr(exc, "response", None)):
+        if source is None:
+            continue
+        for key in ("status_code", "statusCode", "http_status", "httpStatus"):
+            value = source.get(key) if isinstance(source, Mapping) else getattr(source, key, None)
+            try:
+                if value is not None:
+                    return int(value)
+            except (TypeError, ValueError):
+                continue
+    return _extract_adapter_exception_status_code(exc)
+
+
 def _parse_xai_rate_limit_header_wait_seconds(
     exc: Any,
     *,
     candidate: Optional[dict[str, Any]] = None,
 ) -> Optional[float]:
-    if not _is_xai_rate_limit_candidate(exc, candidate):
+    if not _is_xai_rate_limit_candidate(exc, candidate) or _xai_rate_limit_status_code(exc, candidate) != 429:
         return None
     headers = _extract_adapter_upstream_headers(exc)
+    now_epoch = time.time()
     retry_after_value = _get_adapter_header_value(headers, "Retry-After")
     if retry_after_value is not None:
-        try:
-            retry_after = float(retry_after_value)
-        except (TypeError, ValueError):
-            retry_after = None
-        if (
-            retry_after is not None
-            and math.isfinite(retry_after)
-            and 0.0 <= retry_after <= _xai_rate_limit_max_wait_seconds()
-        ):
+        retry_after = _parse_xai_rate_limit_reset_wait_seconds(
+            retry_after_value,
+            now_epoch=now_epoch,
+        )
+        if retry_after is not None:
             return max(1.0, retry_after)
 
-    now_epoch = time.time()
     waits_by_scope: dict[str, float] = {}
     for scope, header_names in _XAI_RATE_LIMIT_RESET_HEADERS.items():
         for header_name in header_names:
@@ -2827,18 +2849,23 @@ def _parse_codex_auto_agent_header_wait_seconds(
 ) -> Optional[float]:
     headers = _extract_adapter_upstream_headers(exc)
     is_xai_candidate = _is_xai_rate_limit_candidate(exc, candidate)
+    is_xai_429 = is_xai_candidate and _xai_rate_limit_status_code(exc, candidate) == 429
     xai_wait = _parse_xai_rate_limit_header_wait_seconds(
         exc,
         candidate=candidate,
     )
     if xai_wait is not None:
         return xai_wait
-    if is_xai_candidate and (
+    if is_xai_429 and (
         _get_adapter_header_value(headers, "Retry-After") is not None
         or any(
             _get_adapter_header_value(headers, header_name) is not None
             for header_names in _XAI_RATE_LIMIT_RESET_HEADERS.values()
             for header_name in header_names
+        )
+        or any(
+            _get_adapter_header_value(headers, header_name) is not None
+            for header_name in ("x-ratelimit-reset", "x-rate-limit-reset")
         )
     ):
         return None
@@ -3154,6 +3181,7 @@ _HOST_FUNCTION_NAMES = (
     "_is_codex_auto_agent_retryable_exhaustion",
     "plan_responses_pre_commit_retry",
     "_parse_xai_rate_limit_reset_wait_seconds",
+    "_xai_rate_limit_status_code",
     "_parse_xai_rate_limit_header_wait_seconds",
     "_parse_codex_auto_agent_header_wait_seconds",
     "_get_codex_auto_agent_cooldown_seconds",
