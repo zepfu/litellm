@@ -1441,6 +1441,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
         state: dict[str, Any],
         *,
         event_summaries: list[dict[str, Any]],
+        reject_malformed_tool_text: bool = False,
     ) -> StreamingResponse:
         original_iterator = target.body_iterator
         upstream_cleanup = getattr(target, _STREAM_CLEANUP_ATTR, None)
@@ -1522,6 +1523,27 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             if isinstance(response_payload, dict):
                 terminal_response = response_payload
                 state["terminal_status"] = response_payload.get("status")
+                if (
+                    reject_malformed_tool_text
+                    and not state.get("invalid")
+                    and event_type in {"response.completed", "response.done"}
+                    and response_payload.get("status") == "completed"
+                    and not _responses_body_is_unsuccessful(response_payload)
+                    and _is_codex_auto_agent_malformed_tool_call_text_output(
+                        response_payload
+                    )
+                ):
+                    # Forwarded text cannot be safely rewritten into new calls.
+                    # Reject before its success terminal or owner promotion.
+                    _invalidate_stream(target, state, "malformed_tool_call_text")
+                    _raise_codex_auto_agent_malformed_tool_call_text_payload(
+                        response_body=response_payload,
+                        adapter_model=adapter_model,
+                        adapter=adapter,
+                        adapter_label=adapter_label,
+                        intake_context=intake_context,
+                        stream_event_summaries=event_summaries,
+                    )
             else:
                 terminal_response = None
                 state["terminal_status"] = None
@@ -1626,21 +1648,20 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             nonlocal decoder_failed
             try:
                 async for raw_chunk in original_iterator:
-                    yield raw_chunk
-                    if decoder_failed:
-                        continue
-                    try:
-                        if isinstance(raw_chunk, bytes):
-                            chunk_text = decoder.decode(raw_chunk)
-                        elif isinstance(raw_chunk, bytearray):
-                            chunk_text = decoder.decode(bytes(raw_chunk))
+                    if not decoder_failed:
+                        try:
+                            if isinstance(raw_chunk, bytes):
+                                chunk_text = decoder.decode(raw_chunk)
+                            elif isinstance(raw_chunk, bytearray):
+                                chunk_text = decoder.decode(bytes(raw_chunk))
+                            else:
+                                chunk_text = str(raw_chunk)
+                        except UnicodeDecodeError:
+                            decoder_failed = True
+                            _invalidate_stream(target, state, "malformed_sse_event")
                         else:
-                            chunk_text = str(raw_chunk)
-                    except UnicodeDecodeError:
-                        decoder_failed = True
-                        _invalidate_stream(target, state, "malformed_sse_event")
-                        continue
-                    _consume_sse_text(chunk_text)
+                            _consume_sse_text(chunk_text)
+                    yield raw_chunk
 
                 if not decoder_failed:
                     try:
@@ -1862,6 +1883,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 validated_response,
                 validation_state,
                 event_summaries=event_summaries,
+                reject_malformed_tool_text=True,
             )
             return validated_response
         validation_state = _validated_stream_state()
