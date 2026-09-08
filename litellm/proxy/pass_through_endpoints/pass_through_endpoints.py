@@ -149,6 +149,7 @@ from .aawm_adapter_runtime.repetitive_output import (
     maybe_wrap_passthrough_responses_stream,
 )
 from .aawm_adapter_runtime.openai_responses_wire import (
+    OpenAIResponsesBufferedResponse,
     OpenAIResponsesStreamingResponse,
     OpenAIResponsesWireDisposition,
     OpenAIResponsesWireTrace,
@@ -4562,6 +4563,19 @@ async def _aawm_session_owner_on_upstream_result(
     success: bool,
 ) -> None:
     sa = _session_affinity_mod()
+    if not success:
+        state = getattr(request, "state", None)
+        if state is not None:
+            try:
+                # A failed candidate must not leave its staged legacy affinity
+                # attached to a later candidate in the same alias request.
+                setattr(
+                    state,
+                    "_aawm_native_openai_responses_affinity_commitment",
+                    None,
+                )
+            except Exception:
+                pass
     if success:
         await sa.finalize_request_session_owner_lease(
             request,
@@ -4610,6 +4624,7 @@ async def _finalize_native_openai_responses_owner_wire_disposition(
             except Exception:
                 pass
     try:
+        lease = sa.get_request_session_owner_lease(request)
         result = await sa.finalize_session_owner_lease_on_wire_disposition(
             request,
             disposition=disposition.value,
@@ -4632,6 +4647,23 @@ async def _finalize_native_openai_responses_owner_wire_disposition(
                 and outcome in expected_outcomes
             )
         )
+        if (
+            disposition is OpenAIResponsesWireDisposition.COMPLETED
+            and result is None
+            and (
+                lease is None
+                or getattr(lease, "promoted", False)
+                or (
+                    not getattr(lease, "held_reservation", False)
+                    and getattr(lease, "decision", None)
+                    == sa.SessionOwnerGuardDecision.COMPATIBLE_OWNER.value
+                )
+            )
+        ):
+            # Compatible durable owners intentionally have no request-local
+            # reservation to promote. Treat that no-op as an established owner
+            # so legacy affinity is not discarded as a false finalization error.
+            owner_finalized = True
         if result is not None and outcome not in expected_outcomes:
             verbose_proxy_logger.warning(
                 "Native OpenAI Responses owner finalization returned outcome=%s "
@@ -6049,22 +6081,6 @@ async def pass_through_request(  # noqa: PLR0915
                     url, getattr(getattr(request, "url", None), "path", None)
                 ),
             )
-        if is_native_openai_responses_route:
-            response_status = (
-                response_body.get("status")
-                if isinstance(response_body, dict)
-                else None
-            )
-            if str(response_status or "").lower() == "completed":
-                disposition = OpenAIResponsesWireDisposition.COMPLETED
-            elif str(response_status or "").lower() == "failed":
-                disposition = OpenAIResponsesWireDisposition.FAILED
-            else:
-                disposition = OpenAIResponsesWireDisposition.INCOMPLETE
-            await _finalize_native_openai_responses_owner_wire_disposition(
-                request=request,
-                disposition=disposition,
-            )
         passthrough_logging_payload["response_body"] = response_body
         capture_passthrough_shape(
             mode="nonstream",
@@ -6150,6 +6166,41 @@ async def pass_through_request(  # noqa: PLR0915
                 exc_info=True,
             )
         _publish_openai_send_telemetry()
+        if is_native_openai_responses_route:
+            response_status = (
+                response_body.get("status")
+                if isinstance(response_body, dict)
+                else None
+            )
+            if str(response_status or "").lower() == "completed":
+                disposition = OpenAIResponsesWireDisposition.COMPLETED
+            elif str(response_status or "").lower() == "failed":
+                disposition = OpenAIResponsesWireDisposition.FAILED
+            else:
+                disposition = OpenAIResponsesWireDisposition.INCOMPLETE
+
+            wire_trace = OpenAIResponsesWireTrace()
+            wire_trace.metadata["buffered_response_disposition"] = disposition.value
+
+            async def _on_native_wire_disposition(
+                final_disposition: OpenAIResponsesWireDisposition,
+                trace: OpenAIResponsesWireTrace,
+            ) -> None:
+                await _finalize_native_openai_responses_owner_wire_disposition(
+                    request=request,
+                    disposition=final_disposition,
+                    trace=trace,
+                )
+
+            bind_openai_responses_wire_trace_to_request(request, wire_trace)
+            return OpenAIResponsesBufferedResponse(
+                content=content,
+                wire_trace=wire_trace,
+                disposition=disposition,
+                on_disposition=_on_native_wire_disposition,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
         return Response(
             content=content,
             status_code=response.status_code,
