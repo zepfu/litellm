@@ -319,36 +319,12 @@ _RESET_KEYS = (
     "resetsAt",
 )
 _MALFORMED_FIELDS_KEY = "_malformed_fields"
-_USAGE_NUMBER_FIELD_NAMES = frozenset(
-    {
-        "remaining",
-        "remaining_count",
-        "left",
-        "limit",
-        "quota",
-        "max",
-        "total",
-        "used",
-        "usage",
-        "consumed",
-    }
+_USAGE_NUMBER_FIELD_ALIASES = (
+    *_REMAINING_KEYS,
+    *_LIMIT_KEYS,
+    *_USED_KEYS,
 )
 _NAMED_USAGE_COLLECTIONS = frozenset({"model_limits", "limits_progress"})
-_NORMALIZED_IDENTITY_FIELD_NAMES = frozenset(
-    {
-        "feature",
-        "feature_id",
-        "feature_slug",
-        "model",
-        "model_slug",
-        "slug",
-        "id",
-        "name",
-        "key",
-        "code",
-        "type",
-    }
-)
 _CONVERSATION_INIT_MARKERS = {
     "model_limits",
     "limits_progress",
@@ -1388,6 +1364,7 @@ def _redact_mapping(
     *,
     depth: int,
     parent_key: Optional[str] = None,
+    collection_entry: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], int]:
     redacted_count = 0
     payload: Dict[str, Any] = {}
@@ -1396,30 +1373,34 @@ def _redact_mapping(
     items = list(mapping.items())[:MAX_PROJECTION_OBJECT_KEYS]
     parent_normalized = _normalize_key(parent_key) if parent_key else ""
     identity_container = parent_normalized in _ACCOUNT_IDENTITY_CONTAINERS
-    entry_like = any(
-        _normalize_key(key) in _NORMALIZED_IDENTITY_FIELD_NAMES
-        for key in mapping
+    scalar_map = (
+        parent_normalized in _NAMED_USAGE_COLLECTIONS
+        and not collection_entry
+        and all(
+            not isinstance(value, (Mapping, list)) for value in mapping.values()
+        )
     )
     for key, value in items:
         name = str(key)
         normalized = _normalize_key(name)
-        child_parent_key = name
         if (
-            parent_normalized in _NAMED_USAGE_COLLECTIONS
-            and not entry_like
-            and not isinstance(value, (Mapping, list))
+            _is_secret_key(name, value)
+            or _is_pii_field_name(name)
+            or normalized in _ACCOUNT_IDENTITY_KEYS
+            or (identity_container and normalized == "id")
+            or (identity_container and normalized == "name")
+            or _is_unsafe_mapping_key(name)
         ):
-            child_parent_key = "remaining"
+            schema[_schema_key_for_redaction(name)] = {"kind": "redacted"}
+            redacted_count += 1
+            continue
+        child_parent_key = "remaining" if scalar_map else name
         malformed_usage_field = _malformed_usage_field(
             child_parent_key,
             value,
         )
         if malformed_usage_field is not None:
-            if (
-                parent_normalized in _NAMED_USAGE_COLLECTIONS
-                and child_parent_key == "remaining"
-                and normalized not in _USAGE_NUMBER_FIELD_NAMES
-            ):
+            if scalar_map:
                 marker = {_MALFORMED_FIELDS_KEY: [child_parent_key]}
                 marker_schema = {
                     _MALFORMED_FIELDS_KEY: {
@@ -1448,21 +1429,15 @@ def _redact_mapping(
                 malformed_fields.append(malformed_usage_field)
             redacted_count += 1
             continue
-        if (
-            _is_secret_key(name, value)
-            or _is_pii_field_name(name)
-            or normalized in _ACCOUNT_IDENTITY_KEYS
-            or (identity_container and normalized == "id")
-            or (identity_container and normalized == "name")
-            or _is_unsafe_mapping_key(name)
-        ):
-            schema[_schema_key_for_redaction(name)] = {"kind": "redacted"}
-            redacted_count += 1
-            continue
         redacted_value, node, nested_redacted = _redact_value(
             value,
             depth=depth + 1,
             parent_key=child_parent_key,
+            collection_entry=(
+                parent_normalized in _NAMED_USAGE_COLLECTIONS
+                and isinstance(value, Mapping)
+                and not scalar_map
+            ),
         )
         redacted_count += nested_redacted
         schema[name] = node
@@ -1488,6 +1463,7 @@ def _redact_value(
     *,
     depth: int,
     parent_key: Optional[str] = None,
+    collection_entry: bool = False,
 ) -> Tuple[Any, Dict[str, Any], int]:
     if depth > MAX_PROJECTION_DEPTH:
         return None, {"kind": "truncated"}, 0
@@ -1528,6 +1504,7 @@ def _redact_value(
             value,
             depth=depth,
             parent_key=parent_key,
+            collection_entry=collection_entry,
         )
         fingerprint = _schema_fingerprint(nested_schema)
         object_node: Dict[str, Any] = {
@@ -1558,6 +1535,10 @@ def _redact_value(
                 item,
                 depth=depth + 1,
                 parent_key=parent_key,
+                collection_entry=(
+                    _normalize_key(parent_key) in _NAMED_USAGE_COLLECTIONS
+                    and isinstance(item, Mapping)
+                ),
             )
             redacted += nested_redacted
             item_kinds.append(str(item_node.get("kind") or "unknown"))
@@ -1983,7 +1964,7 @@ def _entry_has_malformed_usage_fields(entry: Mapping[str, Any]) -> bool:
         return False
     return any(
         isinstance(field_name, str)
-        and _normalize_key(field_name) in _USAGE_NUMBER_FIELD_NAMES
+        and _is_usage_number_field_name(field_name)
         for field_name in marker
     )
 
@@ -2196,11 +2177,19 @@ def _malformed_usage_field(
     value: Any,
 ) -> Optional[str]:
     normalized = _normalize_key(field_name) if field_name else ""
-    if normalized not in _USAGE_NUMBER_FIELD_NAMES:
+    if not _is_usage_number_field_name(normalized):
         return None
     if value is None or _parse_usage_number(value) is not None:
         return None
     return normalized
+
+
+def _is_usage_number_field_name(field_name: str) -> bool:
+    normalized = _normalize_key(field_name)
+    return any(
+        normalized == _normalize_key(alias)
+        for alias in _USAGE_NUMBER_FIELD_ALIASES
+    )
 
 
 def _finite_float(value: Any) -> Optional[float]:
