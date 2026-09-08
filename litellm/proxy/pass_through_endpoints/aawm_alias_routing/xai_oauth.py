@@ -40,6 +40,10 @@ _ANTHROPIC_NONPORTABLE_CONTENT_BLOCK_TYPES = frozenset(
         "tool_result",
     }
 )
+_ANTHROPIC_NONPORTABLE_TOOL_BLOCK_SUFFIXES = (
+    "_tool_use",
+    "_tool_result",
+)
 
 
 @dataclass(frozen=True)
@@ -428,6 +432,15 @@ def bind_xai_oauth_selected_account_to_request(
     setattr(request.state, _XAI_OAUTH_SELECTED_ACCOUNT_STATE, selected)
 
 
+def _is_anthropic_nonportable_content_block_type(block_type: str) -> bool:
+    normalized_block_type = block_type.strip().casefold()
+    return (
+        normalized_block_type in _ANTHROPIC_NONPORTABLE_CONTENT_BLOCK_TYPES
+        or normalized_block_type.startswith("mcp_")
+        or normalized_block_type.endswith(_ANTHROPIC_NONPORTABLE_TOOL_BLOCK_SUFFIXES)
+    )
+
+
 def _anthropic_xai_oauth_rollover_body_is_fresh(
     request_body: Mapping[str, Any],
 ) -> bool:
@@ -453,11 +466,7 @@ def _anthropic_xai_oauth_rollover_body_is_fresh(
             normalized_block_type = block_type.strip().casefold()
             if not normalized_block_type:
                 return False
-            if (
-                normalized_block_type
-                in _ANTHROPIC_NONPORTABLE_CONTENT_BLOCK_TYPES
-                or normalized_block_type.startswith("mcp_")
-            ):
+            if _is_anthropic_nonportable_content_block_type(normalized_block_type):
                 return False
             signature = block.get("signature")
             if isinstance(signature, str):
