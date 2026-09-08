@@ -7,6 +7,12 @@ import type {
   MessageRecord,
   PaginationState,
 } from "./records.js";
+import type {
+  IngestContext,
+  LedgerScope,
+  ModelMappingVersion,
+  ReconstructedAttempt,
+} from "../ledger/types.js";
 
 export const HISTORY_STATE_VERSION = 1;
 export const DEFAULT_BACKFILL_DAYS = 14;
@@ -167,6 +173,7 @@ export interface HistoryDiscoveryPageCommit {
   checkpoint: DiscoveryCheckpoint;
   identity: IdentityRecord;
   scanStartedAt: string;
+  source?: IngestContext;
 }
 
 export interface HistoryPageCommit {
@@ -178,12 +185,35 @@ export interface HistoryPageCommit {
   scopes: HistoryScope[];
   detail: ConversationDetailProjection | null;
   messages: MessageRecord[];
+  retainedAttempts?: ReconstructedAttempt[];
   coverage: AcquiredConversation["coverage"];
   warnings: string[];
   pageKind: "detail" | "messages";
   pageNumber: number;
   nextContinuation: string | null;
   revisit: RevisitEntry | null;
+  accountState: HistoryAccountState;
+  source?: IngestContext;
+}
+
+/**
+ * A parent-owned retained-history page. Snapshot and coverage fields are
+ * preserved so a bounded or incomplete read cannot become false complete data.
+ */
+export interface HistoryMetadataPage {
+  summary?: ConversationSummary;
+  items?: Array<Record<string, unknown>>;
+  messages?: MessageRecord[];
+  attempts?: ReconstructedAttempt[];
+  source?: IngestContext;
+  schemaVersion?: string;
+  coverageDetails?: Record<string, unknown>;
+  snapshotId?: string | null;
+  nextCursor?: string | null;
+  hasMore?: boolean;
+  coverage?: "complete" | "partial" | "unknown";
+  truncated?: boolean;
+  warnings?: string[];
 }
 
 export interface HistoryReader {
@@ -224,6 +254,8 @@ export interface HistoryCollectionRequest {
 export interface HistoryCollectionOptions {
   accountId: string;
   store: HistoryCheckpointStore;
+  /** Clear a durable history pause only after explicit verified recovery. */
+  recoverAuthentication?: boolean;
   clock?: { now(): Date };
   defaultBackfillDays?: number;
   overlapMs?: number;
@@ -237,6 +269,14 @@ export interface HistoryCollectionOptions {
   onPageCommit?: (
     page: HistoryPageCommit,
   ) => Promise<void> | void;
+  onAccountStateCommit?: (
+    state: HistoryAccountState,
+  ) => Promise<void> | void;
+  scope?: LedgerScope;
+  mapping?: ModelMappingVersion;
+  loadConversationMetadata?: (
+    conversationId: string,
+  ) => Promise<HistoryMetadataPage | null>;
 }
 
 export interface ScopeCoverageResult {

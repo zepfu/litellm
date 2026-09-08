@@ -517,6 +517,27 @@ class _ReadSnapshot:
     owner_run_id: str
     owner_profile: str
     owner_fencing_token: int
+    operation: Any = None
+
+
+def _operation_deadline(
+    operation: Any = None,
+    *,
+    explicit: Optional[datetime] = None,
+) -> Optional[datetime]:
+    if operation is None:
+        return ensure_utc(explicit) if explicit is not None else None
+    if not bool(getattr(operation, "ignore_cancel", False)):
+        checker = getattr(operation, "check", None)
+        if callable(checker):
+            checker()
+    operation_deadline = getattr(operation, "deadline_at", None)
+    if not isinstance(operation_deadline, datetime):
+        raise LedgerError("collector operation deadline is required")
+    normalized = ensure_utc(operation_deadline)
+    if explicit is None:
+        return normalized
+    return min(normalized, ensure_utc(explicit))
 
 
 class PgCollectorState:
@@ -538,11 +559,16 @@ class PgCollectorState:
         *,
         collector_account_id: str,
         profile_id: str,
+        operation: Any = None,
     ) -> tuple[Optional[CollectorStateHeader], CandidatePage]:
         """Load only the durable header; queue reads are explicit and versioned."""
         account = _account(collector_account_id)
         profile = _token(profile_id, "profile_id")
-        with self.ledger.connect() as conn, conn.cursor() as cur:
+        _operation_deadline(operation)
+        with self.ledger.session(operation=operation) as conn, self.ledger.cursor(
+            conn,
+            operation=operation,
+        ) as cur:
             self._lock_state_authority(cur, account, profile)
             header = self._load_header(cur, account, profile)
         return header, CandidatePage(
@@ -561,6 +587,7 @@ class PgCollectorState:
         checkpoint: Optional[Mapping[str, Any]],
         active_trigger: Optional[Mapping[str, Any]],
         lease: CollectorLease,
+        operation: Any = None,
     ) -> CollectorStateHeader:
         account = _account(collector_account_id)
         profile = _token(profile_id, "profile_id")
@@ -570,11 +597,15 @@ class PgCollectorState:
             "activeTrigger": active_trigger,
         }
         self.assert_safe_record(payload)
+        _operation_deadline(operation)
         _validate_state_field("scheduleTransition", schedule_transition, STATE_SCHEDULE_KEYS)
         _validate_state_field("checkpoint", checkpoint, STATE_CHECKPOINT_KEYS)
         _validate_state_field("activeTrigger", active_trigger, STATE_TRIGGER_KEYS)
         now = datetime.now(timezone.utc)
-        with self.ledger.connect() as conn, conn.cursor() as cur:
+        with self.ledger.session(operation=operation) as conn, self.ledger.cursor(
+            conn,
+            operation=operation,
+        ) as cur:
             self._require_active_lease(
                 cur,
                 account=account,
@@ -640,14 +671,19 @@ class PgCollectorState:
         scope: LedgerScope,
         ttl_seconds: int,
         expected_binding: Optional[LedgerBinding] = None,
+        operation: Any = None,
     ) -> CollectorLease:
         account = _account(collector_account_id)
         profile = _token(profile_id, "profile_id")
         if ttl_seconds <= 0 or ttl_seconds > 3600:
             raise LedgerError("collector lease ttl is outside the supported range")
+        _operation_deadline(operation)
         now = datetime.now(timezone.utc)
         expires = datetime.fromtimestamp(now.timestamp() + ttl_seconds, timezone.utc)
-        with self.ledger.connect() as conn, conn.cursor() as cur:
+        with self.ledger.session(operation=operation) as conn, self.ledger.cursor(
+            conn,
+            operation=operation,
+        ) as cur:
             self._lock_lease_authority(cur, profile)
             binding = self._binding_for_scope(cur, scope, account, expected_binding)
             cur.execute(
@@ -700,12 +736,22 @@ class PgCollectorState:
             )
             return CollectorLease(profile, account, next_token, expires, binding)
 
-    def heartbeat_lease(self, *, lease: CollectorLease, ttl_seconds: int) -> CollectorLease:
+    def heartbeat_lease(
+        self,
+        *,
+        lease: CollectorLease,
+        ttl_seconds: int,
+        operation: Any = None,
+    ) -> CollectorLease:
         if ttl_seconds <= 0 or ttl_seconds > 3600:
             raise LedgerError("collector lease ttl is outside the supported range")
+        _operation_deadline(operation)
         now = datetime.now(timezone.utc)
         expires = datetime.fromtimestamp(now.timestamp() + ttl_seconds, timezone.utc)
-        with self.ledger.connect() as conn, conn.cursor() as cur:
+        with self.ledger.session(operation=operation) as conn, self.ledger.cursor(
+            conn,
+            operation=operation,
+        ) as cur:
             self._require_active_lease(
                 cur,
                 account=lease.collector_account_id,
@@ -735,8 +781,12 @@ class PgCollectorState:
             lease.binding,
         )
 
-    def release_lease(self, *, lease: CollectorLease) -> None:
-        with self.ledger.connect() as conn, conn.cursor() as cur:
+    def release_lease(self, *, lease: CollectorLease, operation: Any = None) -> None:
+        _operation_deadline(operation)
+        with self.ledger.session(operation=operation) as conn, self.ledger.cursor(
+            conn,
+            operation=operation,
+        ) as cur:
             self._require_active_lease(
                 cur,
                 account=lease.collector_account_id,
@@ -896,7 +946,9 @@ class PgCollectorState:
         coverage_mutations: Sequence[Mapping[str, Any]] = (),
         expected_state_version: Optional[int] = None,
         trigger_id: Optional[str] = None,
+        operation: Any = None,
     ) -> PageAck:
+        _operation_deadline(operation)
         prepared = self._prepare_page_commit(
             lease=lease,
             run_id=run_id,
@@ -909,7 +961,10 @@ class PgCollectorState:
             trigger_id=trigger_id,
         )
         acknowledgment: Optional[PageAck] = None
-        with self.ledger.connect() as conn, conn.cursor() as cur:
+        with self.ledger.session(operation=operation) as conn, self.ledger.cursor(
+            conn,
+            operation=operation,
+        ) as cur:
             self._require_active_lease(
                 cur,
                 account=prepared.account,
@@ -958,12 +1013,14 @@ class PgCollectorState:
                     scope,
                     binding,
                     prepared.ingest_operations,
+                    operation=operation,
                 )
                 self._apply_coverage_mutations(
                     cur,
                     scope,
                     binding,
                     prepared.coverage_mutations,
+                    operation=operation,
                 )
                 next_state = self._publish_checkpoint(
                     cur,
@@ -1040,6 +1097,7 @@ class PgCollectorState:
         run_id: str,
         profile_id: str,
         lease_fencing_token: int,
+        operation: Any = None,
     ) -> Mapping[str, Any]:
         account = _account(collector_account_id)
         conversation = _token(conversation_id, "conversation_id")
@@ -1047,12 +1105,17 @@ class PgCollectorState:
             raise LedgerError("collector metadata cursor requires a snapshot")
         if limit <= 0 or limit > MAX_QUEUE_PAGE:
             raise LedgerError("conversation metadata limit is outside the supported range")
+        snapshot_deadline = _operation_deadline(
+            operation,
+            explicit=deadline_at,
+        )
         snapshot, _ = self._get_snapshot(
             account=account,
             profile=profile_id,
             kind="metadata",
             snapshot_id=snapshot_id,
-            deadline_at=deadline_at,
+            deadline_at=snapshot_deadline,
+            operation=operation,
             owner_run_id=run_id,
             owner_profile=profile_id,
             owner_fencing_token=lease_fencing_token,
@@ -1120,6 +1183,7 @@ class PgCollectorState:
                     """,
                     (account, conversation),
                     deadline_at=snapshot.deadline_at,
+                    operation=snapshot.operation,
                 )
                 total = int(cur.fetchone()[0])
                 self._refresh_snapshot_timeout(snapshot)
@@ -1158,6 +1222,7 @@ class PgCollectorState:
                         limit + 1,
                     ),
                     deadline_at=snapshot.deadline_at,
+                    operation=snapshot.operation,
                 )
                 rows = cur.fetchall()
             has_more = len(rows) > limit
@@ -1208,18 +1273,24 @@ class PgCollectorState:
         run_id: str,
         profile_id: str,
         lease_fencing_token: int,
+        operation: Any = None,
     ) -> Mapping[str, Any]:
         account = _account(collector_account_id)
         if cursor is not None and snapshot_id is None:
             raise LedgerError("collector report cursor requires a snapshot")
         if limit <= 0 or limit > MAX_QUEUE_PAGE:
             raise LedgerError("report snapshot limit is outside the supported range")
+        snapshot_deadline = _operation_deadline(
+            operation,
+            explicit=deadline_at,
+        )
         snapshot, _ = self._get_snapshot(
             account=account,
             profile=profile_id,
             kind="report",
             snapshot_id=snapshot_id,
-            deadline_at=deadline_at,
+            deadline_at=snapshot_deadline,
+            operation=operation,
             owner_run_id=run_id,
             owner_profile=profile_id,
             owner_fencing_token=lease_fencing_token,
@@ -1286,6 +1357,7 @@ class PgCollectorState:
                     """,
                     (account,),
                     deadline_at=snapshot.deadline_at,
+                    operation=snapshot.operation,
                 )
                 total_attempts = int(cur.fetchone()[0])
                 self._refresh_snapshot_timeout(snapshot)
@@ -1301,6 +1373,7 @@ class PgCollectorState:
                     """,
                     (account,),
                     deadline_at=snapshot.deadline_at,
+                    operation=snapshot.operation,
                 )
                 open_gaps = int(cur.fetchone()[0])
                 self._refresh_snapshot_timeout(snapshot)
@@ -1314,6 +1387,7 @@ class PgCollectorState:
                     """,
                     (account,),
                     deadline_at=snapshot.deadline_at,
+                    operation=snapshot.operation,
                 )
                 scope_rows = cur.fetchall()
                 self._refresh_snapshot_timeout(snapshot)
@@ -1333,6 +1407,7 @@ class PgCollectorState:
                     """,
                     (account, MAX_QUEUE_PAGE),
                     deadline_at=snapshot.deadline_at,
+                    operation=snapshot.operation,
                 )
                 gap_rows = cur.fetchall()
                 self._refresh_snapshot_timeout(snapshot)
@@ -1763,6 +1838,7 @@ class PgCollectorState:
                         limit + 1,
                     ),
                     deadline_at=snapshot.deadline_at,
+                    operation=snapshot.operation,
                 )
                 rows = cur.fetchall()
             has_more = len(rows) > limit
@@ -1838,12 +1914,17 @@ class PgCollectorState:
         limit: int = 64,
         cursor: Optional[str] = None,
         expected_state_version: Optional[int] = None,
+        operation: Any = None,
     ) -> CandidatePage:
         account = _account(collector_account_id)
         profile = _token(profile_id, "profile_id")
         if limit <= 0 or limit > MAX_QUEUE_PAGE:
             raise LedgerError("candidate read limit is outside the supported range")
-        with self.ledger.connect() as conn, conn.cursor() as cur:
+        _operation_deadline(operation)
+        with self.ledger.session(operation=operation) as conn, self.ledger.cursor(
+            conn,
+            operation=operation,
+        ) as cur:
             self._lock_state_authority(cur, account, profile)
             header = self._load_header(cur, account, profile, lock=True)
             current_version = header.state_version if header is not None else 0
@@ -1901,12 +1982,17 @@ class PgCollectorState:
         lease: CollectorLease,
         mutations: Sequence[Mapping[str, Any]],
         expected_state_version: Optional[int] = None,
+        operation: Any = None,
     ) -> CollectorStateHeader:
         if len(mutations) > MAX_QUEUE_PAGE:
             raise LedgerError("candidate mutation batch exceeds the supported bound")
         if expected_state_version is None:
             raise LedgerError("collector state version is required")
-        with self.ledger.connect() as conn, conn.cursor() as cur:
+        _operation_deadline(operation)
+        with self.ledger.session(operation=operation) as conn, self.ledger.cursor(
+            conn,
+            operation=operation,
+        ) as cur:
             self._require_active_lease(
                 cur,
                 account=lease.collector_account_id,
@@ -1987,6 +2073,7 @@ class PgCollectorState:
         trigger_id: Optional[str] = None,
         outcome: Optional[str] = None,
         summary: Optional[Mapping[str, Any]] = None,
+        operation: Any = None,
     ) -> CollectorStateHeader:
         if expected_state_version is None:
             raise LedgerError("collector state version is required")
@@ -2000,7 +2087,11 @@ class PgCollectorState:
         )
         safe_outcome = _token(outcome, "outcome") if outcome is not None else None
         safe_summary = _safe_terminal_summary(summary)
-        with self.ledger.connect() as conn, conn.cursor() as cur:
+        _operation_deadline(operation)
+        with self.ledger.session(operation=operation) as conn, self.ledger.cursor(
+            conn,
+            operation=operation,
+        ) as cur:
             self._require_active_lease(
                 cur,
                 account=lease.collector_account_id,
@@ -2070,6 +2161,7 @@ class PgCollectorState:
         trigger_id: Optional[str] = None,
         outcome: Optional[str] = None,
         summary: Optional[Mapping[str, Any]] = None,
+        operation: Any = None,
     ) -> CollectorStateHeader:
         if expected_state_version is None:
             raise LedgerError("collector state version is required")
@@ -2083,7 +2175,11 @@ class PgCollectorState:
         )
         safe_outcome = _token(outcome, "outcome") if outcome is not None else None
         safe_summary = _safe_terminal_summary(summary)
-        with self.ledger.connect() as conn, conn.cursor() as cur:
+        _operation_deadline(operation)
+        with self.ledger.session(operation=operation) as conn, self.ledger.cursor(
+            conn,
+            operation=operation,
+        ) as cur:
             self._require_active_lease(
                 cur,
                 account=lease.collector_account_id,
@@ -2651,9 +2747,16 @@ class PgCollectorState:
         scope: LedgerScope,
         binding: LedgerBinding,
         operations: Sequence[Mapping[str, Any]],
+        *,
+        operation: Any = None,
     ) -> dict[str, int]:
         """Apply metadata-only operations through the current ledger page."""
-        page = PgLedgerPage(self.ledger, cur.connection, expected_binding=binding)
+        page = PgLedgerPage(
+            self.ledger,
+            cur.connection,
+            expected_binding=binding,
+            operation=operation,
+        )
         accepted = 0
         for operation in operations:
             kind = str(operation["kind"])
@@ -2806,6 +2909,8 @@ class PgCollectorState:
         scope: LedgerScope,
         binding: LedgerBinding,
         mutations: Sequence[Mapping[str, Any]],
+        *,
+        operation: Any = None,
     ) -> None:
         if not mutations:
             return
@@ -2835,7 +2940,13 @@ class PgCollectorState:
                         "seenAt": mutation.get("seenAt"),
                     }
                 )
-        self._apply_ingest_operations(cur, scope, binding, operations)
+        self._apply_ingest_operations(
+            cur,
+            scope,
+            binding,
+            operations,
+            operation=operation,
+        )
 
     def _apply_candidate_mutation(
         self,
@@ -2908,6 +3019,7 @@ class PgCollectorState:
         owner_run_id: str,
         owner_profile: str,
         owner_fencing_token: int,
+        operation: Any = None,
     ) -> tuple[_ReadSnapshot, bool]:
         safe_owner_run = _token(owner_run_id, "run_id")
         safe_owner_profile = _token(owner_profile, "profile_id")
@@ -2922,6 +3034,7 @@ class PgCollectorState:
                 snapshot_id=snapshot_id,
                 owner_run_id=safe_owner_run,
                 owner_fencing_token=safe_owner_fence,
+                operation=operation,
             )
         requested_deadline = (
             ensure_utc(deadline_at) if deadline_at is not None else None
@@ -2935,7 +3048,10 @@ class PgCollectorState:
         conn: Optional[psycopg.Connection] = None
         try:
             self._remaining_snapshot_ms(snapshot_deadline, created_at=created_at)
-            conn = self.ledger.connect(deadline_at=snapshot_deadline)
+            conn = self.ledger.connect(
+                deadline_at=snapshot_deadline,
+                operation=operation,
+            )
             # PgLedger.connect() opens a setup transaction. Roll it back before
             # starting the bounded repeatable-read snapshot so the transaction-
             # local timeout settings apply to the actual read.
@@ -2943,12 +3059,14 @@ class PgCollectorState:
             self.ledger.rollback_with_deadline(
                 conn,
                 deadline_at=snapshot_deadline,
+                operation=operation,
             )
             self._remaining_snapshot_ms(snapshot_deadline, created_at=created_at)
             self.ledger.command_with_deadline(
                 conn,
                 "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
                 deadline_at=snapshot_deadline,
+                operation=operation,
             )
             self._remaining_snapshot_ms(snapshot_deadline, created_at=created_at)
             safe_snapshot = uuid4().hex
@@ -2963,6 +3081,7 @@ class PgCollectorState:
                 safe_owner_run,
                 safe_owner_profile,
                 safe_owner_fence,
+                operation,
             )
             self._refresh_snapshot_timeout(snapshot)
             with conn.cursor() as cur:
@@ -2980,6 +3099,7 @@ class PgCollectorState:
                     """,
                     (safe_owner_profile, account),
                     deadline_at=snapshot_deadline,
+                    operation=operation,
                 )
                 owner_row = cur.fetchone()
             active_trigger = (
@@ -3011,6 +3131,7 @@ class PgCollectorState:
         snapshot_id: str,
         owner_run_id: str,
         owner_fencing_token: int,
+        operation: Any = None,
     ) -> tuple[_ReadSnapshot, bool]:
         safe_snapshot = _token(snapshot_id, "snapshot_id")
         snapshot = self._snapshots.get(safe_snapshot)
@@ -3031,6 +3152,8 @@ class PgCollectorState:
             self.close_snapshot(safe_snapshot)
             raise LedgerError("collector read snapshot expired")
         try:
+            if operation is not None:
+                snapshot.operation = operation
             self._refresh_snapshot_timeout(snapshot)
         except BaseException:
             self.close_snapshot(safe_snapshot)
@@ -3066,6 +3189,7 @@ class PgCollectorState:
                 "SELECT set_config('statement_timeout', %s, true)",
                 (f"{min(self.ledger.statement_timeout_ms, remaining_ms)}ms",),
                 deadline_at=snapshot.deadline_at,
+                operation=snapshot.operation,
             )
             remaining_ms = self._remaining_snapshot_ms(snapshot.deadline_at)
             self.ledger.execute_with_deadline(
@@ -3073,6 +3197,7 @@ class PgCollectorState:
                 "SELECT set_config('lock_timeout', %s, true)",
                 (f"{min(self.ledger.lock_timeout_ms, remaining_ms)}ms",),
                 deadline_at=snapshot.deadline_at,
+                operation=snapshot.operation,
             )
 
     @staticmethod
