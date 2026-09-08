@@ -181,6 +181,15 @@ Explicit inventory records continue to use their configured
 `expected_account_identity` pin. Account identity metadata is server-derived;
 caller-supplied metadata cannot select or replace it.
 
+The managed credential writer can bootstrap a verified subject from an existing
+xAI ID token without refreshing it. It preserves established account hashes and
+quarantines every account field while identity verification is pending or has
+detected a subject mismatch. Rotated tokens are retained, but quarantined
+credentials remain unavailable to requests; a refresh cannot silently rebind an
+existing account to a different subject. See
+[credential maintenance](../../../../docs/aawm-oauth-credential-maintenance.md#managed-xai-verified-account-identity)
+for verification, recovery, and sidecar activation boundaries.
+
 For a provider-owned managed xAI `401` before response bytes are committed,
 LiteLLM may reread the exact bound file and scope and retry once on alias,
 direct async, OpenAI passthrough, or Anthropic compatibility routes. The
