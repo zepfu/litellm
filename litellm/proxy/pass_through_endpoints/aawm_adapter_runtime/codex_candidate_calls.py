@@ -3365,6 +3365,8 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
     )
     from litellm.proxy.pass_through_endpoints.aawm_request_policy.codex_tool_policy import (
         _adapt_codex_namespace_tools_to_functions_from_request_body,
+        _catalog_namespace_adapter_key,
+        _namespace_child_name_allowed,
     )
 
     if candidate.get("route_family") != "codex_cursor_agent_aiserver_adapter":
@@ -3446,11 +3448,16 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         restoration_request_body,
         adapter_model=adapter_model,
     )
-    if namespace_by_name.get("wait_agent") == "collaboration":
-        argument_schemas = _advertised_namespace_tool_argument_schemas(
-            restoration_request_body
-        )
-        wait_schema = argument_schemas.get("wait_agent", {})
+    argument_schemas = _advertised_namespace_tool_argument_schemas(
+        restoration_request_body
+    )
+    for tool_name, namespace in namespace_by_name.items():
+        if (
+            _catalog_namespace_adapter_key(namespace) != "collaboration"
+            or not _namespace_child_name_allowed(tool_name, {"wait_agent"})
+        ):
+            continue
+        wait_schema = argument_schemas.get(tool_name, {})
         wait_properties = wait_schema.get("properties")
         if isinstance(wait_properties, dict):
             timeout_schema = wait_properties.get("timeout_ms")

@@ -125,8 +125,9 @@ definitions. Bounded full-history replay preserves a function call's optional
 namespace as a nonempty string without surrounding whitespace, alongside its
 original name, arguments, and call ID.
 
-For stock `collaboration.wait_agent`, Cursor's build/restoration copies narrow
-`timeout_ms` from `number` to `integer` to match the client's integer parser.
+For stock `collaboration.wait_agent` and its supported namespace/tool aliases,
+Cursor's build/restoration copies narrow `timeout_ms` from `number` to `integer`
+to match the client's integer parser without changing the advertised names.
 Finite integral protobuf values are returned as JSON integers; fractional values
 and unrelated numeric arguments are not coerced. Canonical replay tool
 definitions remain unchanged.
