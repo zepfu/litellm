@@ -23,6 +23,9 @@ class ResponsesAdapterRoutePlan:
     client_requested_stream: bool
     perform_kwargs: Payload = field(default_factory=dict)
     handle_exception: Optional[Callable[[Exception], None]] = None
+    retry_after_exception: Optional[
+        Callable[[Exception], Awaitable[Optional["ResponsesAdapterRoutePlan"]]]
+    ] = None
 
 
 @dataclass(frozen=True)
@@ -37,6 +40,9 @@ class CompletionAdapterRoutePlan:
     client_requested_stream: bool
     perform_kwargs: Payload = field(default_factory=dict)
     handle_exception: Optional[Callable[[Exception], None]] = None
+    retry_after_exception: Optional[
+        Callable[[Exception], Awaitable[Optional["CompletionAdapterRoutePlan"]]]
+    ] = None
 
 
 ResponsesPrepare = Callable[..., Awaitable[ResponsesAdapterRoutePlan]]
@@ -69,20 +75,36 @@ async def run_responses_adapter_route(
         adapter_model=adapter_model,
         use_alias_candidate_probe=use_alias_candidate_probe,
     )
-    try:
+
+    async def perform_plan(route_plan: ResponsesAdapterRoutePlan) -> RouteResult:
         return await perform(
-            config=plan.config,
+            config=route_plan.config,
             request=request,
             user_api_key_dict=user_api_key_dict,
-            translated_request_body=plan.translated_request_body,
+            translated_request_body=route_plan.translated_request_body,
             adapter_model=adapter_model,
-            target_url=plan.target_url,
-            custom_headers=plan.custom_headers,
-            client_requested_stream=plan.client_requested_stream,
+            target_url=route_plan.target_url,
+            custom_headers=route_plan.custom_headers,
+            client_requested_stream=route_plan.client_requested_stream,
             use_alias_candidate_probe=use_alias_candidate_probe,
-            **plan.perform_kwargs,
+            **route_plan.perform_kwargs,
         )
+
+    try:
+        return await perform_plan(plan)
     except Exception as exc:
+        retry_plan = (
+            await plan.retry_after_exception(exc)
+            if plan.retry_after_exception is not None
+            else None
+        )
+        if retry_plan is not None:
+            try:
+                return await perform_plan(retry_plan)
+            except Exception as retry_exc:
+                if retry_plan.handle_exception is not None:
+                    retry_plan.handle_exception(retry_exc)
+                raise
         if plan.handle_exception is not None:
             plan.handle_exception(exc)
         raise
@@ -112,19 +134,35 @@ async def run_completion_adapter_route(
         adapter_model=adapter_model,
         use_alias_candidate_probe=use_alias_candidate_probe,
     )
-    try:
+
+    async def perform_plan(route_plan: CompletionAdapterRoutePlan) -> RouteResult:
         return await perform(
-            config=plan.config,
+            config=route_plan.config,
             request=request,
-            prepared_request_body=plan.prepared_request_body,
+            prepared_request_body=route_plan.prepared_request_body,
             adapter_model=adapter_model,
-            target_url=plan.target_url,
-            api_key=plan.api_key,
-            api_base=plan.api_base,
-            client_requested_stream=plan.client_requested_stream,
-            **plan.perform_kwargs,
+            target_url=route_plan.target_url,
+            api_key=route_plan.api_key,
+            api_base=route_plan.api_base,
+            client_requested_stream=route_plan.client_requested_stream,
+            **route_plan.perform_kwargs,
         )
+
+    try:
+        return await perform_plan(plan)
     except Exception as exc:
+        retry_plan = (
+            await plan.retry_after_exception(exc)
+            if plan.retry_after_exception is not None
+            else None
+        )
+        if retry_plan is not None:
+            try:
+                return await perform_plan(retry_plan)
+            except Exception as retry_exc:
+                if retry_plan.handle_exception is not None:
+                    retry_plan.handle_exception(retry_exc)
+                raise
         if plan.handle_exception is not None:
             plan.handle_exception(exc)
         raise

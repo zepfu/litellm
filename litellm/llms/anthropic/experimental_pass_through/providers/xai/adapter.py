@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, NoReturn, Optional, Protocol
 
+from litellm.llms.xai.oauth import (
+    XaiOAuthCredentialSnapshot,
+    bind_xai_oauth_snapshot_to_request,
+    get_xai_oauth_snapshot_from_request,
+    reread_xai_oauth_snapshot_after_provider_401,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     adapter_config,
     adapter_driver,
@@ -78,6 +84,38 @@ async def _prepare_passthrough_request(
     return await runtime.prepare_passthrough_request(request_body, **kwargs)
 
 
+async def _reread_xai_oauth_snapshot_for_retry(
+    *,
+    request: object,
+    exc: Exception,
+    api_base: str,
+    use_alias_candidate_probe: bool,
+) -> Optional[XaiOAuthCredentialSnapshot]:
+    if use_alias_candidate_probe:
+        return None
+    snapshot = get_xai_oauth_snapshot_from_request(request)
+    if snapshot is None:
+        return None
+    refreshed_snapshot = await reread_xai_oauth_snapshot_after_provider_401(
+        snapshot,
+        exc,
+        api_base=api_base,
+    )
+    if refreshed_snapshot is None:
+        return None
+    bind_xai_oauth_snapshot_to_request(request, refreshed_snapshot)
+    return refreshed_snapshot
+
+
+def _with_xai_oauth_snapshot(
+    request_body: Payload,
+    snapshot: XaiOAuthCredentialSnapshot,
+) -> Payload:
+    updated_request_body = dict(request_body)
+    updated_request_body["api_key"] = snapshot.access_token
+    return updated_request_body
+
+
 async def prepare_responses_route(
     *,
     runtime: Runtime,
@@ -145,7 +183,7 @@ async def prepare_responses_route(
         if use_alias_candidate_probe and runtime.unavailable_detail(exc) is not None:
             runtime.raise_candidate_unavailable(exc)
 
-    return adapter_driver.ResponsesAdapterRoutePlan(
+    plan = adapter_driver.ResponsesAdapterRoutePlan(
         config=adapter_config.XAI_OAUTH_RESPONSES,
         translated_request_body=translated_request_body,
         target_url=target_url,
@@ -160,6 +198,31 @@ async def prepare_responses_route(
         handle_exception=handle_exception,
     )
 
+    async def retry_after_exception(
+        exc: Exception,
+    ) -> Optional[adapter_driver.ResponsesAdapterRoutePlan]:
+        refreshed_snapshot = await _reread_xai_oauth_snapshot_for_retry(
+            request=request,
+            exc=exc,
+            api_base=target_base_url,
+            use_alias_candidate_probe=use_alias_candidate_probe,
+        )
+        if refreshed_snapshot is None:
+            return None
+        return replace(
+            plan,
+            translated_request_body=_with_xai_oauth_snapshot(
+                plan.translated_request_body,
+                refreshed_snapshot,
+            ),
+            custom_headers=runtime.assemble_headers(
+                api_key=refreshed_snapshot.access_token,
+                request=request,
+            ),
+        )
+
+    return replace(plan, retry_after_exception=retry_after_exception)
+
 
 async def prepare_completion_route(
     *,
@@ -170,7 +233,6 @@ async def prepare_completion_route(
     use_alias_candidate_probe: bool = False,
 ) -> adapter_driver.CompletionAdapterRoutePlan:
     """Build the complete xAI OAuth completion route plan."""
-    _ = request, use_alias_candidate_probe
     config = adapter_config.XAI_OAUTH_COMPLETION
     client_requested_stream = bool(prepared_request_body.get("stream"))
     prepared_request_body = runtime.prepare_completion_body(
@@ -206,7 +268,7 @@ async def prepare_completion_route(
         credential_family=config.credential_family,
         expected_target_family=config.expected_target_family,
     )
-    return adapter_driver.CompletionAdapterRoutePlan(
+    plan = adapter_driver.CompletionAdapterRoutePlan(
         config=config,
         prepared_request_body=prepared_request_body,
         target_url=target_url,
@@ -215,3 +277,25 @@ async def prepare_completion_route(
         client_requested_stream=client_requested_stream,
         perform_kwargs={"custom_llm_provider": runtime.provider},
     )
+
+    async def retry_after_exception(
+        exc: Exception,
+    ) -> Optional[adapter_driver.CompletionAdapterRoutePlan]:
+        refreshed_snapshot = await _reread_xai_oauth_snapshot_for_retry(
+            request=request,
+            exc=exc,
+            api_base=target_base_url,
+            use_alias_candidate_probe=use_alias_candidate_probe,
+        )
+        if refreshed_snapshot is None:
+            return None
+        return replace(
+            plan,
+            prepared_request_body=_with_xai_oauth_snapshot(
+                plan.prepared_request_body,
+                refreshed_snapshot,
+            ),
+            api_key=refreshed_snapshot.access_token,
+        )
+
+    return replace(plan, retry_after_exception=retry_after_exception)
