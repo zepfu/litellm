@@ -1722,6 +1722,11 @@ class SidecarTaskState:
     cursor_agent_usage_last_attempt_monotonic: Optional[float] = None
     chatgpt_conversation_init_last_attempt_monotonic: Optional[float] = None
     chatgpt_usage_bridge_last_attempt_monotonic: Optional[float] = None
+    chatgpt_usage_bridge_owner: Optional[Any] = None
+    chatgpt_usage_bridge_admitting: bool = True
+    chatgpt_usage_bridge_cleanup_errors: List[str] = dataclass_field(
+        default_factory=list
+    )
     chatgpt_conversation_init_cooldown_until_monotonic_by_session: Dict[
         str, float
     ] = dataclass_field(default_factory=dict)
@@ -16184,6 +16189,7 @@ def _run_chatgpt_usage_bridge_task(
         results = _run_chatgpt_usage_bridge_accounts(
             config,
             bindings,
+            task_state=state,
             profile_filter=profile_filter,
             authentication_recovery_requested=authentication_recovery_requested,
         )
@@ -16295,6 +16301,7 @@ def _run_chatgpt_usage_bridge_accounts(
     config: ProviderStatusLoopConfig,
     bindings: Mapping[str, Mapping[str, Optional[str]]],
     *,
+    task_state: SidecarTaskState,
     profile_filter: Optional[str],
     authentication_recovery_requested: bool,
 ) -> list[Dict[str, Any]]:
@@ -16316,51 +16323,53 @@ def _run_chatgpt_usage_bridge_accounts(
         lock_timeout_ms=config.db_lock_timeout_ms,
         statement_timeout_ms=config.db_statement_timeout_ms,
     )
-    bridge = TsWorkerBridge(
-        PgCollectorState(ledger),
-        BridgeConfig.from_runtime(
-            node_executable=config.chatgpt_usage_bridge_node_executable,
-            worker_root=config.chatgpt_usage_bridge_worker_root,
-            mapping=dict(DEFAULT_MODEL_MAPPING),
-        ),
-    )
+    if not task_state.chatgpt_usage_bridge_admitting:
+        raise RuntimeError("ChatGPT usage bridge owner is retiring")
+    bridge = task_state.chatgpt_usage_bridge_owner
+    if bridge is None:
+        bridge = TsWorkerBridge(
+            PgCollectorState(ledger),
+            BridgeConfig.from_runtime(
+                node_executable=config.chatgpt_usage_bridge_node_executable,
+                worker_root=config.chatgpt_usage_bridge_worker_root,
+                mapping=dict(DEFAULT_MODEL_MAPPING),
+            ),
+        )
+        task_state.chatgpt_usage_bridge_owner = bridge
     results: list[Dict[str, Any]] = []
-    try:
-        for account_id, bound_scope in bindings.items():
-            configured_profile = str(bound_scope["profile_id"] or account_id)
-            try:
-                selected_profile = _chatgpt_usage_bridge_selected_profile(
+    for account_id, bound_scope in bindings.items():
+        configured_profile = str(bound_scope["profile_id"] or account_id)
+        try:
+            selected_profile = _chatgpt_usage_bridge_selected_profile(
+                account_id,
+                bound_scope,
+                profile_filter=profile_filter,
+            )
+            scope = LedgerScope(
+                collector_account_id=account_id,
+                provider=str(bound_scope["provider"] or "openai"),
+                provider_user_id=bound_scope["provider_user_id"],
+                workspace_id=bound_scope["workspace_id"],
+                quota_owner_id=bound_scope["quota_owner_id"],
+                surface=str(bound_scope["surface"] or "chat"),
+            )
+            result = bridge.run_once(
+                collector_account_id=account_id,
+                profile_id=selected_profile,
+                scope=scope,
+                authentication_recovery_requested=(
+                    authentication_recovery_requested
+                )
+            )
+            results.append(_chatgpt_usage_bridge_result(account_id, result))
+        except Exception as exc:
+            results.append(
+                _chatgpt_usage_bridge_failure(
                     account_id,
-                    bound_scope,
-                    profile_filter=profile_filter,
+                    exc,
+                    profile_id=configured_profile,
                 )
-                scope = LedgerScope(
-                    collector_account_id=account_id,
-                    provider=str(bound_scope["provider"] or "openai"),
-                    provider_user_id=bound_scope["provider_user_id"],
-                    workspace_id=bound_scope["workspace_id"],
-                    quota_owner_id=bound_scope["quota_owner_id"],
-                    surface=str(bound_scope["surface"] or "chat"),
-                )
-                result = bridge.run_once(
-                    collector_account_id=account_id,
-                    profile_id=selected_profile,
-                    scope=scope,
-                    authentication_recovery_requested=(
-                        authentication_recovery_requested
-                    ),
-                )
-                results.append(_chatgpt_usage_bridge_result(account_id, result))
-            except Exception as exc:
-                results.append(
-                    _chatgpt_usage_bridge_failure(
-                        account_id,
-                        exc,
-                        profile_id=configured_profile,
-                    )
-                )
-    finally:
-        bridge.close()
+            )
     return results
 
 

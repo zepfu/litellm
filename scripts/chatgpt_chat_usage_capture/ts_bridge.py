@@ -36,6 +36,7 @@ MAX_REQUEST_ID_LENGTH = 128
 MAX_CURSOR_BYTES = 512
 MAX_JSON_DEPTH = 32
 DEFAULT_CHILD_TTL_SECONDS = 3600
+TERMINAL_CLEANUP_SECONDS = 5
 DEFAULT_WORKER_ROOT = "/app/scripts/chatgpt_chat_usage_capture/ts"
 DEFAULT_MODEL_MAPPING = {
     "version": "initial-unmapped",
@@ -75,7 +76,7 @@ _HISTORY_STATUS_RANK = {
     "unavailable": 2,
     "blocked": 3,
 }
-_IDENTITY_AUTH_STATES = frozenset({"ready", "verified"})
+_IDENTITY_AUTH_STATES = frozenset({"ready"})
 _UNAVAILABLE_CAPABILITY_STATES = frozenset(
     {
         "disabled",
@@ -203,6 +204,9 @@ class BridgeOperationContext:
     run_id: Optional[str] = None
     collector_account_id: Optional[str] = None
     profile_id: Optional[str] = None
+    terminal_deadline_monotonic: Optional[float] = None
+    terminal_deadline_at: Optional[datetime] = None
+    ignore_cancel: bool = False
 
     @property
     def cancelled(self) -> bool:
@@ -226,6 +230,24 @@ class BridgeOperationContext:
                 retryable=True,
             )
 
+    def terminal(self) -> "BridgeOperationContext":
+        deadline_monotonic = self.terminal_deadline_monotonic
+        deadline_at = self.terminal_deadline_at
+        if deadline_monotonic is None or deadline_at is None:
+            deadline_monotonic = self.deadline_monotonic
+            deadline_at = self.deadline_at
+        return BridgeOperationContext(
+            deadline_monotonic=deadline_monotonic,
+            deadline_at=deadline_at,
+            cancel_event=self.cancel_event,
+            run_id=self.run_id,
+            collector_account_id=self.collector_account_id,
+            profile_id=self.profile_id,
+            terminal_deadline_monotonic=deadline_monotonic,
+            terminal_deadline_at=deadline_at,
+            ignore_cancel=True,
+        )
+
 
 HistoryPreparer = Callable[
     [LedgerScope, str, str, BridgeOperationContext],
@@ -244,8 +266,10 @@ class _Child:
     total_bytes: int
     request_count: int
     deadline_monotonic: float
+    terminal_deadline_monotonic: float
     read_buffer: bytearray = field(default_factory=bytearray)
     ready_frames: Deque[bytes] = field(default_factory=deque)
+    write_failed: bool = False
 
 
 @dataclass
@@ -300,6 +324,8 @@ class TsWorkerBridge:
         )
         try:
             result = callback(*args, **kwargs)
+        except (KeyboardInterrupt, SystemExit):
+            raise
         except BaseException:
             self._check_operation(
                 operation,
@@ -323,18 +349,32 @@ class TsWorkerBridge:
         context: _RunContext,
         callback: Callable[..., Any],
         *args: Any,
+        operation: Optional[BridgeOperationContext] = None,
         on_result: Optional[Callable[[Any], None]] = None,
         check_cancel: bool = True,
         **kwargs: Any,
     ) -> Any:
+        active_operation = operation or context.operation
         return self._call_with_deadline(
-            context.child.deadline_monotonic,
+            active_operation.deadline_monotonic,
             callback,
             *args,
-            operation=context.operation,
+            operation=active_operation,
             on_result=on_result,
             check_cancel=check_cancel,
             **kwargs,
+        )
+
+    @staticmethod
+    def _adopt_loaded_state_version(
+        context: _RunContext,
+        value: Any,
+    ) -> None:
+        if not isinstance(value, tuple) or not value:
+            return
+        header = value[0]
+        context.state_version = (
+            int(header.state_version) if header is not None else 0
         )
 
     @staticmethod
@@ -379,17 +419,25 @@ class TsWorkerBridge:
             _verified_scope_if_complete(requested_scope)
         run_id = str(uuid4())
         deadline_monotonic = time.monotonic() + self.config.child_ttl_seconds
+        deadline_at = datetime.now(timezone.utc) + timedelta(
+            seconds=self.config.child_ttl_seconds
+        )
+        terminal_deadline_monotonic = (
+            deadline_monotonic + TERMINAL_CLEANUP_SECONDS
+        )
+        terminal_deadline_at = deadline_at + timedelta(
+            seconds=TERMINAL_CLEANUP_SECONDS
+        )
         cancel_event = threading.Event()
         operation = BridgeOperationContext(
             deadline_monotonic=deadline_monotonic,
-            deadline_at=(
-                datetime.now(timezone.utc)
-                + timedelta(seconds=self.config.child_ttl_seconds)
-            ),
+            deadline_at=deadline_at,
             cancel_event=cancel_event,
             run_id=run_id,
             collector_account_id=account,
             profile_id=profile,
+            terminal_deadline_monotonic=terminal_deadline_monotonic,
+            terminal_deadline_at=terminal_deadline_at,
         )
         lease: Optional[CollectorLease] = None
         lease_holder: list[CollectorLease] = []
@@ -397,7 +445,18 @@ class TsWorkerBridge:
         context: Optional[_RunContext] = None
         observed_at = seen_at or datetime.now(timezone.utc)
         key = (account, profile)
-        result: dict[str, Any]
+        result: dict[str, Any] = {
+            "ok": False,
+            "status": "failed",
+            "collectorAccountId": account,
+            "profileId": profile,
+            "runId": run_id,
+            "errorCode": "history_reader_failed",
+            "retryable": True,
+            "coverageIncomplete": True,
+        }
+        control_error: Optional[BaseException] = None
+        control_traceback = None
 
         try:
             operation.check()
@@ -439,6 +498,11 @@ class TsWorkerBridge:
                 self.state.load_state,
                 collector_account_id=account,
                 profile_id=profile,
+                operation=context.operation,
+                on_result=lambda value: self._adopt_loaded_state_version(
+                    context,
+                    value,
+                ),
             )
             context.state_version = header.state_version if header is not None else 0
             self._send_start_run(
@@ -460,40 +524,62 @@ class TsWorkerBridge:
                     code="history_reader_failed",
                     retryable=True,
                 )
-        except Exception as exc:
-            result = _failure_result(
-                account=account,
-                profile=profile,
-                run_id=run_id,
-                error=exc,
-                context=context,
-            )
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                control_error = exc
+                control_traceback = exc.__traceback__
+            else:
+                result = _failure_result(
+                    account=account,
+                    profile=profile,
+                    run_id=run_id,
+                    error=exc,
+                    context=context,
+                )
             cancel_event.set()
             if context is not None:
                 context.cancelled = True
                 cancel_signal_error = self._send_parent_cancel(
                     context,
                     reason=_failure_code(exc),
+                    operation=operation.terminal(),
                 )
                 if cancel_signal_error is not None:
                     context.cleanup_errors.append(cancel_signal_error)
-                cancel_error = self._cancel_state(context, exc)
+                cancel_error = self._cancel_state(
+                    context,
+                    exc,
+                    operation=operation.terminal(),
+                )
                 if cancel_error is not None:
                     context.cleanup_errors.append(cancel_error)
             elif lease is not None:
-                lease_error = self._release_lease_quietly(lease)
+                lease_error = self._release_lease_quietly(
+                    lease,
+                    operation=operation.terminal(),
+                )
                 if lease_error is not None:
                     result = _with_cleanup_failure(result, [lease_error])
         finally:
             if context is not None:
                 context.cleanup_errors.extend(
-                    self._close_tracked_snapshots(context)
+                    self._close_tracked_snapshots(
+                        context,
+                        operation=operation.terminal(),
+                    )
                 )
-                cleanup_error = self._close_prepared_history(context)
+                cleanup_error = self._close_prepared_history(
+                    context,
+                    operation=operation.terminal(),
+                )
                 if cleanup_error is not None:
                     context.cleanup_errors.append(cleanup_error)
             if child is not None:
-                reap_error = self._reap(key=key, child=child)
+                reap_error = self._reap(
+                    key=key,
+                    child=child,
+                    deadline_monotonic=operation.terminal().deadline_monotonic,
+                )
                 if reap_error is not None:
                     if context is not None:
                         context.cleanup_errors.append(reap_error)
@@ -501,6 +587,8 @@ class TsWorkerBridge:
                         result = _with_cleanup_failure(result, [reap_error])
             if context is not None and context.cleanup_errors:
                 result = _with_cleanup_failure(result, context.cleanup_errors)
+        if control_error is not None:
+            raise control_error.with_traceback(control_traceback)
         return result
 
     def _capture_or_initialize_binding(
@@ -538,10 +626,13 @@ class TsWorkerBridge:
             )
         bootstrapped_scope = self._call_with_deadline(
             operation.deadline_monotonic,
-            bootstrapper,
+            lambda candidate_scope, observed_at: bootstrapper(
+                candidate_scope,
+                observed_at,
+                operation,
+            ),
             scope,
             seen_at,
-            operation,
             operation=operation,
         )
         if not isinstance(bootstrapped_scope, LedgerScope):
@@ -601,6 +692,7 @@ class TsWorkerBridge:
             0,
             0,
             deadline_monotonic,
+            deadline_monotonic + TERMINAL_CLEANUP_SECONDS,
         )
         with self._lock:
             self._children[key] = child
@@ -893,6 +985,11 @@ class TsWorkerBridge:
             self.state.load_state,
             collector_account_id=context.collector_account_id,
             profile_id=context.profile_id,
+            operation=context.operation,
+            on_result=lambda value: self._adopt_loaded_state_version(
+                context,
+                value,
+            ),
         )
         state_version = header.state_version if header is not None else 0
         if kind == "header":
@@ -921,6 +1018,12 @@ class TsWorkerBridge:
                 limit=limit,
                 cursor=_optional_cursor(payload.get("cursor")),
                 expected_state_version=expected,
+                operation=context.operation,
+                on_result=lambda value: setattr(
+                    context,
+                    "state_version",
+                    int(value.state_version),
+                ),
             )
             return {
                 "stateVersion": candidates.state_version,
@@ -944,6 +1047,11 @@ class TsWorkerBridge:
             self.state.load_state,
             collector_account_id=context.collector_account_id,
             profile_id=context.profile_id,
+            operation=context.operation,
+            on_result=lambda value: self._adopt_loaded_state_version(
+                context,
+                value,
+            ),
         )
         expected_for_pg: Optional[int] = expected
         if current is None and expected == 0:
@@ -986,6 +1094,14 @@ class TsWorkerBridge:
                 )
             elif active is not None:
                 raise BridgeProtocolError("schedule active trigger is invalid")
+        def adopt_state_commit(value: Any) -> None:
+            context.state_version = int(value.state_version)
+            if kind == "schedule" and active_trigger is not None:
+                context.trigger_id = _metadata_token(
+                    active_trigger.get("triggerId"),
+                    "triggerId",
+                )
+
         header = self._call_context(
             context,
             self.state.compare_and_set_state,
@@ -996,6 +1112,8 @@ class TsWorkerBridge:
             checkpoint=checkpoint,
             active_trigger=active_trigger,
             lease=context.lease,
+            operation=context.operation,
+            on_result=adopt_state_commit,
         )
         context.state_version = header.state_version
         if kind == "schedule" and active_trigger is not None:
@@ -1079,6 +1197,11 @@ class TsWorkerBridge:
             self.state.load_state,
             collector_account_id=context.collector_account_id,
             profile_id=context.profile_id,
+            operation=context.operation,
+            on_result=lambda value: self._adopt_loaded_state_version(
+                context,
+                value,
+            ),
         )
         if header is None:
             raise BridgeProtocolError(
@@ -1103,6 +1226,7 @@ class TsWorkerBridge:
             self.state.ledger.capture_binding,
             context.scope,
             seen_at=datetime.now(timezone.utc),
+            operation=context.operation,
         )
         if (
             binding.scope_key != context.lease.binding.scope_key
@@ -1146,37 +1270,31 @@ class TsWorkerBridge:
                 retryable=True,
             )
         archive_scope = payload.get("archiveScope", payload.get("scope"))
-        if archive_scope is not None:
-            native_history = _first_value(
-                context.capability_manifest or {},
-                "nativeHistory",
-                "native_history",
-                "history",
+        archived = payload.get("archived")
+        if archived is not None and not isinstance(archived, bool):
+            raise BridgeProtocolError(
+                "history request archived flag is invalid",
+                code="history_contract_unavailable",
+                retryable=True,
             )
-            archive_scopes = (
-                _first_value(
-                    native_history,
-                    "archiveScopes",
-                    "archive_scopes",
-                    "scopes",
-                )
-                if isinstance(native_history, Mapping)
-                else None
+        implied_scope = "archived" if archived else "active"
+        if archive_scope is None:
+            archive_scope = implied_scope
+        elif (
+            not isinstance(archive_scope, str)
+            or archive_scope not in {"active", "archived"}
+            or (archived is not None and archive_scope != implied_scope)
+        ):
+            raise BridgeProtocolError(
+                "history request archive scope is invalid",
+                code="history_contract_unavailable",
+                retryable=True,
             )
-            if (
-                not isinstance(archive_scope, str)
-                or not isinstance(archive_scopes, list)
-                or archive_scope not in archive_scopes
-            ):
-                raise BridgeProtocolError(
-                    "history request archive scope is unavailable",
-                    code="history_contract_unavailable",
-                    retryable=True,
-                )
         if not _capability_is_available(
             context.capabilities,
             context.capability_manifest,
             str(required_capability),
+            archive_scope=str(archive_scope),
         ):
             raise BridgeProtocolError(
                 "requested history capability is unavailable",
@@ -1253,12 +1371,13 @@ class TsWorkerBridge:
             limit=_bounded_limit(payload.get("limit"), default=32),
             cursor=_optional_cursor(payload.get("cursor")),
             snapshot_id=_optional_cursor(payload.get("snapshotId")),
-            deadline_at=_wall_deadline(context.child),
+            deadline_at=context.operation.deadline_at,
             run_id=context.run_id,
             profile_id=context.profile_id,
             lease_fencing_token=context.lease.lease_fencing_token,
+            operation=context.operation,
+            on_result=lambda value: self._track_snapshot(context, payload, value),
         )
-        self._track_snapshot(context, payload, result)
         _assert_bounded_safe(result, max_bytes=self.config.max_frame_bytes)
         return dict(result)
 
@@ -1303,6 +1422,10 @@ class TsWorkerBridge:
             canonical_payload.get("coverageMutations"),
             field_name="page commit coverageMutations",
         )
+        def adopt_page_ack(value: Any) -> None:
+            if isinstance(value, PageAck):
+                context.state_version = int(value.state_version)
+
         ack: PageAck = self._call_context(
             context,
             self.state.commit_history_page,
@@ -1316,6 +1439,8 @@ class TsWorkerBridge:
             ingest_operations=ingest_operations,
             candidate_mutations=candidate_mutations,
             coverage_mutations=coverage_mutations,
+            operation=context.operation,
+            on_result=adopt_page_ack,
         )
         context.state_version = int(ack.state_version)
         return {
@@ -1337,12 +1462,13 @@ class TsWorkerBridge:
             limit=_bounded_limit(payload.get("limit"), default=256),
             cursor=_optional_cursor(payload.get("cursor")),
             snapshot_id=_optional_cursor(payload.get("snapshotId")),
-            deadline_at=_wall_deadline(context.child),
+            deadline_at=context.operation.deadline_at,
             run_id=context.run_id,
             profile_id=context.profile_id,
             lease_fencing_token=context.lease.lease_fencing_token,
+            operation=context.operation,
+            on_result=lambda value: self._track_snapshot(context, payload, value),
         )
-        self._track_snapshot(context, payload, result)
         _assert_bounded_safe(result, max_bytes=self.config.max_frame_bytes)
         return dict(result)
 
@@ -1366,6 +1492,11 @@ class TsWorkerBridge:
                 code="state_conflict",
                 retryable=True,
             )
+        def adopt_finish(value: Any) -> None:
+            context.state_version = int(value.state_version)
+            context.finish_outcome = outcome
+            context.finished = True
+
         header = self._call_context(
             context,
             self.state.finish_run,
@@ -1375,6 +1506,8 @@ class TsWorkerBridge:
             trigger_id=trigger_id,
             outcome=outcome,
             summary=summary,
+            operation=context.operation,
+            on_result=adopt_finish,
         )
         context.state_version = header.state_version
         context.finish_outcome = outcome
@@ -1397,9 +1530,16 @@ class TsWorkerBridge:
             )
         context.operation.cancel_event.set()
         context.cancelled = True
+        terminal_operation = context.operation.terminal()
+        def adopt_cancel(value: Any) -> None:
+            context.state_version = int(value.state_version)
+            context.finish_outcome = outcome
+            context.cancelled = True
+
         header = self._call_context(
             context,
             self.state.cancel,
+            operation=terminal_operation,
             check_cancel=False,
             lease=context.lease,
             run_id=context.run_id,
@@ -1407,6 +1547,7 @@ class TsWorkerBridge:
             trigger_id=trigger_id,
             outcome=outcome,
             summary=summary,
+            on_result=adopt_cancel,
         )
         context.state_version = header.state_version
         context.finish_outcome = outcome
@@ -1434,6 +1575,7 @@ class TsWorkerBridge:
         context: _RunContext,
         *,
         reason: str,
+        operation: Optional[BridgeOperationContext] = None,
     ) -> Optional[str]:
         if context.child.process.poll() is not None:
             return None
@@ -1459,7 +1601,16 @@ class TsWorkerBridge:
         }
         context.child.request_count += 1
         try:
-            self._write_frame(context.child, message, enforce_deadline=False)
+            self._write_frame(
+                context.child,
+                message,
+                enforce_deadline=False,
+                deadline_monotonic=(
+                    operation.deadline_monotonic
+                    if operation is not None
+                    else context.child.terminal_deadline_monotonic
+                ),
+            )
         except Exception as exc:
             return f"parent cancellation signal failed: {type(exc).__name__}"
         return None
@@ -1468,16 +1619,31 @@ class TsWorkerBridge:
         self,
         context: _RunContext,
         error: BaseException,
+        *,
+        operation: Optional[BridgeOperationContext] = None,
     ) -> Optional[str]:
         summary = {
-            "errorCode": _failure_code(error),
+            "reason": _failure_code(error),
             "coverageIncomplete": True,
         }
-        cleanup_errors = self._close_tracked_snapshots(context)
+        active_operation = operation or context.operation.terminal()
+        cleanup_errors = self._close_tracked_snapshots(
+            context,
+            operation=active_operation,
+        )
+        if context.finished or context.finish_outcome is not None:
+            return "; ".join(cleanup_errors) if cleanup_errors else None
+
+        def adopt_cancel_state(value: Any) -> None:
+            context.state_version = int(value.state_version)
+            context.finish_outcome = "cancelled_after_start"
+            context.cancelled = True
+
         try:
             self._call_context(
                 context,
                 self.state.cancel,
+                operation=active_operation,
                 check_cancel=False,
                 lease=context.lease,
                 run_id=context.run_id,
@@ -1485,13 +1651,17 @@ class TsWorkerBridge:
                 trigger_id=context.trigger_id,
                 outcome="cancelled_after_start",
                 summary=summary,
+                on_result=adopt_cancel_state,
             )
         except Exception as exc:
+            if context.finish_outcome is not None:
+                return "; ".join(cleanup_errors) if cleanup_errors else None
             try:
-                self._call_context(
-                    context,
+                self._call_with_deadline(
+                    active_operation.deadline_monotonic,
                     self.state.release_lease,
                     lease=context.lease,
+                    operation=active_operation,
                     check_cancel=False,
                 )
             except Exception as release_exc:
@@ -1511,7 +1681,12 @@ class TsWorkerBridge:
         if isinstance(value, Mapping):
             context.prepared_history = value
 
-    def _close_prepared_history(self, context: _RunContext) -> Optional[str]:
+    def _close_prepared_history(
+        self,
+        context: _RunContext,
+        *,
+        operation: Optional[BridgeOperationContext] = None,
+    ) -> Optional[str]:
         prepared = context.prepared_history
         if not isinstance(prepared, Mapping):
             return None
@@ -1533,9 +1708,18 @@ class TsWorkerBridge:
             or not registration_id
         ):
             return "native history lifecycle registration is invalid"
-        context.operation.cancel_event.set()
+        active_operation = operation or context.operation.terminal()
+        cleanup_failure = getattr(registration, "cleanup_failure", None)
+        if cleanup_failure:
+            reason = "native history registration retained a cleanup failure"
+            try:
+                retain(registration, reason)
+            except Exception as exc:
+                return f"{reason}; retention failed: {type(exc).__name__}"
+            return reason
+        active_operation.cancel_event.set()
         try:
-            completed = bool(cleanup(context.child.deadline_monotonic))
+            completed = bool(cleanup(active_operation.deadline_monotonic))
         except Exception as exc:
             reason = f"native history retirement failed: {type(exc).__name__}"
             try:
@@ -1579,15 +1763,22 @@ class TsWorkerBridge:
         ):
             context.snapshot_ids.add(next_snapshot)
 
-    def _close_tracked_snapshots(self, context: _RunContext) -> list[str]:
+    def _close_tracked_snapshots(
+        self,
+        context: _RunContext,
+        *,
+        operation: Optional[BridgeOperationContext] = None,
+    ) -> list[str]:
         errors: list[str] = []
+        active_operation = operation or context.operation.terminal()
         for snapshot_id in tuple(context.snapshot_ids):
             closed = False
             try:
-                self._call_context(
-                    context,
+                self._call_with_deadline(
+                    active_operation.deadline_monotonic,
                     self.state.close_snapshot,
                     snapshot_id,
+                    operation=active_operation,
                     check_cancel=False,
                 )
                 closed = True
@@ -1600,9 +1791,23 @@ class TsWorkerBridge:
                     context.snapshot_ids.discard(snapshot_id)
         return errors
 
-    def _release_lease_quietly(self, lease: CollectorLease) -> Optional[str]:
+    def _release_lease_quietly(
+        self,
+        lease: CollectorLease,
+        *,
+        operation: Optional[BridgeOperationContext] = None,
+    ) -> Optional[str]:
         try:
-            self.state.release_lease(lease=lease)
+            if operation is None:
+                self.state.release_lease(lease=lease)
+            else:
+                self._call_with_deadline(
+                    operation.deadline_monotonic,
+                    self.state.release_lease,
+                    lease=lease,
+                    operation=operation,
+                    check_cancel=False,
+                )
         except Exception as exc:
             return f"lease release failed: {type(exc).__name__}"
         return None
@@ -1613,7 +1818,14 @@ class TsWorkerBridge:
         message: Mapping[str, Any],
         *,
         enforce_deadline: bool = True,
+        deadline_monotonic: Optional[float] = None,
     ) -> None:
+        if child.write_failed:
+            raise BridgeProtocolError(
+                "worker stdin is in a failed frame state",
+                code="history_reader_failed",
+                retryable=True,
+            )
         remaining_total = self.config.max_total_bytes - child.total_bytes
         if remaining_total <= 0:
             raise BridgeProtocolError(
@@ -1634,6 +1846,8 @@ class TsWorkerBridge:
                 retryable=True,
             )
         fd = child.process.stdin.fileno()
+        child.total_bytes += len(encoded)
+        write_reserved = True
         selector = selectors.DefaultSelector()
         view = memoryview(encoded)
         try:
@@ -1643,7 +1857,18 @@ class TsWorkerBridge:
                     self._check_deadline(child)
                     timeout = self._remaining_timeout(child)
                 else:
-                    timeout = 0.25
+                    terminal_deadline = (
+                        deadline_monotonic
+                        if deadline_monotonic is not None
+                        else child.terminal_deadline_monotonic
+                    )
+                    timeout = max(0.0, terminal_deadline - time.monotonic())
+                    if timeout <= 0:
+                        raise BridgeProtocolError(
+                            "worker terminal write deadline exceeded",
+                            code="bounds_exceeded",
+                            retryable=True,
+                        )
                 events = selector.select(timeout)
                 if not events:
                     raise BridgeProtocolError(
@@ -1668,7 +1893,10 @@ class TsWorkerBridge:
                         retryable=True,
                     )
                 view = view[written:]
-            child.total_bytes += len(encoded)
+        except BaseException:
+            if write_reserved:
+                child.write_failed = True
+            raise
         finally:
             selector.close()
 
@@ -1802,10 +2030,22 @@ class TsWorkerBridge:
     def _remaining_timeout(self, child: _Child) -> float:
         return max(0.0, child.deadline_monotonic - time.monotonic())
 
-    def _reap(self, *, key: tuple[str, str], child: _Child) -> Optional[str]:
+    def _reap(
+        self,
+        *,
+        key: tuple[str, str],
+        child: _Child,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Optional[str]:
         process = child.process
         resolved = False
         failure: Optional[str] = None
+        terminal_deadline = min(
+            child.terminal_deadline_monotonic,
+            deadline_monotonic
+            if deadline_monotonic is not None
+            else child.terminal_deadline_monotonic,
+        )
 
         def wait_for_retirement(deadline: float) -> bool:
             while True:
@@ -1833,14 +2073,11 @@ class TsWorkerBridge:
 
         try:
             _terminate_process_group(process, child.process_group_id)
-            if not wait_for_retirement(time.monotonic() + 0.5):
+            if not wait_for_retirement(terminal_deadline):
                 _kill_process_group(process, child.process_group_id)
-                resolved = wait_for_retirement(time.monotonic() + 1.0)
+                resolved = wait_for_retirement(terminal_deadline)
             else:
                 resolved = True
-            if not resolved:
-                _kill_process_group(process, child.process_group_id)
-                resolved = wait_for_retirement(time.monotonic() + 0.5)
             if not resolved:
                 failure = failure or "worker process group retirement was not proven"
         except Exception as exc:
@@ -1857,12 +2094,16 @@ class TsWorkerBridge:
                     self._children.pop(key, None)
         return None if resolved else failure or "worker retirement was not proven"
 
-    def close(self) -> None:
+    def close(self) -> list[str]:
         """Boundedly reap every child still owned by this bridge."""
         with self._lock:
             children = list(self._children.items())
+        errors: list[str] = []
         for key, child in children:
-            self._reap(key=key, child=child)
+            error = self._reap(key=key, child=child)
+            if error is not None:
+                errors.append(error)
+        return errors
 
 
 def _process_group_exists(process_group_id: int) -> bool:
@@ -2059,7 +2300,7 @@ def _assert_prepared_history_record(prepared: Any) -> None:
             )
         _assert_bounded_safe(value, max_bytes=MAX_FRAME_BYTES)
     reader = prepared.get("readHistory")
-    if reader is not None and not callable(reader):
+    if not callable(reader):
         raise BridgeProtocolError(
             "native history reader is invalid",
             code="history_contract_unavailable",
@@ -2067,9 +2308,21 @@ def _assert_prepared_history_record(prepared: Any) -> None:
         )
     capability = prepared.get("lifecycleCapability")
     registration = prepared.get("lifecycleRegistration")
-    if (capability is None) != (registration is None):
+    if capability is None or registration is None:
         raise BridgeProtocolError(
             "native history lifecycle owner is incomplete",
+            code="history_contract_unavailable",
+            retryable=True,
+        )
+    if (
+        not callable(getattr(capability, "retire_native_history", None))
+        or not callable(getattr(capability, "retain_native_history", None))
+        or not callable(getattr(registration, "cleanup_callback", None))
+        or not isinstance(getattr(registration, "registration_id", None), str)
+        or not getattr(registration, "registration_id", "").strip()
+    ):
+        raise BridgeProtocolError(
+            "native history lifecycle registration is invalid",
             code="history_contract_unavailable",
             retryable=True,
         )
@@ -2355,6 +2608,8 @@ def _capability_is_available(
     capabilities: Optional[Mapping[str, Any]],
     manifest: Optional[Mapping[str, Any]],
     required_capability: str,
+    *,
+    archive_scope: str = "active",
 ) -> bool:
     if capabilities is None or manifest is None:
         return False
@@ -2362,16 +2617,75 @@ def _capability_is_available(
         return False
     if not _manifest_operation_is_available(manifest, required_capability):
         return False
+    if not _manifest_archive_scope_is_available(
+        manifest,
+        required_capability,
+        archive_scope,
+    ):
+        return False
     if required_capability == "index":
         return (
             bool(capabilities.get("indexScopes"))
-            and "active" in capabilities["indexScopes"]
+            and archive_scope in capabilities["indexScopes"]
         )
     if required_capability == "modern_detail":
         return capabilities.get("modernDetail") not in _UNAVAILABLE_CAPABILITY_STATES
     if required_capability == "messages":
         return capabilities.get("pagination") not in _UNAVAILABLE_CAPABILITY_STATES
     return False
+
+
+def _manifest_archive_scope_is_available(
+    manifest: Mapping[str, Any],
+    required_capability: str,
+    archive_scope: str,
+) -> bool:
+    if archive_scope not in {"active", "archived"}:
+        return False
+    native_history = _first_value(
+        manifest,
+        "nativeHistory",
+        "native_history",
+        "history",
+    )
+    if not isinstance(native_history, Mapping):
+        return False
+    archive_scopes = _first_value(
+        native_history,
+        "archiveScopes",
+        "archive_scopes",
+        "scopes",
+    )
+    if not isinstance(archive_scopes, list) or archive_scope not in archive_scopes:
+        return False
+    operation_claims = _first_value(
+        native_history,
+        "operationClaims",
+        "operation_claims",
+        "operations",
+    )
+    if not isinstance(operation_claims, Mapping):
+        return False
+    claim = _first_value(
+        operation_claims,
+        required_capability,
+        *_HISTORY_OPERATION_ALIASES.get(required_capability, ()),
+    )
+    if isinstance(claim, Mapping):
+        claimed_scopes = _first_value(
+            claim,
+            "archiveScopes",
+            "archive_scopes",
+            "scopes",
+            "availableScopes",
+            "available_scopes",
+        )
+        if claimed_scopes is not None:
+            return (
+                isinstance(claimed_scopes, list)
+                and archive_scope in claimed_scopes
+            )
+    return True
 
 
 def _manifest_operation_is_available(
@@ -2692,8 +3006,10 @@ def _preflight_json_value(  # noqa: PLR0915 - bounded recursive JSON walk
             add(4 if current else 5, current_path)
             return
         if isinstance(current, int):
-            bits = abs(current).bit_length()
-            decimal_digits = max(1, int(bits * 0.302) + 2)
+            bits = current.bit_length()
+            # 30103/100000 is a conservative upper bound for log10(2);
+            # bit_length() avoids allocating a copy of attacker-sized ints.
+            decimal_digits = max(1, (bits * 30103 + 99_999) // 100_000)
             add(decimal_digits + (1 if current < 0 else 0), current_path)
             return
         if isinstance(current, float):
@@ -2702,7 +3018,7 @@ def _preflight_json_value(  # noqa: PLR0915 - bounded recursive JSON walk
                     f"JSON number is not finite at {current_path}",
                     code="protocol_invalid",
                 )
-            add(32, current_path)
+            add(len(repr(current)), current_path)
             return
         if isinstance(current, Mapping):
             marker = id(current)

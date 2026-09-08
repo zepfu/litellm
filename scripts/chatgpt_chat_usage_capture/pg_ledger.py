@@ -588,6 +588,44 @@ class LedgerError(RuntimeError):
     pass
 
 
+class _OperationCursor:
+    """Cursor proxy that applies the caller-owned operation deadline to SQL."""
+
+    def __init__(
+        self,
+        ledger: "PgLedger",
+        cursor: psycopg.Cursor,
+        operation: Any = None,
+    ) -> None:
+        self._ledger = ledger
+        self._cursor = cursor
+        self._operation = operation
+
+    def execute(
+        self,
+        query: Any,
+        params: Any = None,
+        **kwargs: Any,
+    ) -> "_OperationCursor":
+        if self._operation is None:
+            self._cursor.execute(query, params, **kwargs)
+            return self
+        deadline = _operation_deadline(self._operation, None)
+        if deadline is None:
+            raise LedgerError("collector database deadline is required")
+        self._ledger.execute_with_deadline(
+            self._cursor,
+            query,
+            params,
+            deadline_at=deadline,
+            operation=self._operation,
+        )
+        return self
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._cursor, name)
+
+
 class PgLedger:
     """Source-only contract; database work happens only in explicit methods."""
 
@@ -604,11 +642,17 @@ class PgLedger:
         self.lock_timeout_ms = lock_timeout_ms
         self.statement_timeout_ms = statement_timeout_ms
 
-    def connect(self, *, deadline_at: Optional[datetime] = None) -> psycopg.Connection:
+    def connect(
+        self,
+        *,
+        deadline_at: Optional[datetime] = None,
+        operation: Any = None,
+    ) -> psycopg.Connection:
         """Open a connection, bounding establishment and session setup when requested."""
-        deadline = _utc_datetime(deadline_at, "deadline_at") if deadline_at is not None else None
+        deadline = _operation_deadline(operation, deadline_at)
+        _check_operation(operation)
         conn = (
-            self._connect_with_deadline(deadline)
+            self._connect_with_deadline(deadline, operation=operation)
             if deadline is not None
             else psycopg.connect(self.dsn)
         )
@@ -620,22 +664,25 @@ class PgLedger:
                         "SELECT set_config('application_name', %s, false)",
                         (self.application_name,),
                         deadline_at=deadline,
+                        operation=operation,
                     )
-                    remaining_ms = _remaining_deadline_ms(deadline)
+                    remaining_ms = _remaining_deadline_ms(deadline, operation)
                     self.execute_with_deadline(
                         cur,
                         "SELECT set_config('lock_timeout', %s, true)",
                         (f"{min(self.lock_timeout_ms, remaining_ms)}ms",),
                         deadline_at=deadline,
+                        operation=operation,
                     )
-                    remaining_ms = _remaining_deadline_ms(deadline)
+                    remaining_ms = _remaining_deadline_ms(deadline, operation)
                     self.execute_with_deadline(
                         cur,
                         "SELECT set_config('statement_timeout', %s, true)",
                         (f"{min(self.statement_timeout_ms, remaining_ms)}ms",),
                         deadline_at=deadline,
+                        operation=operation,
                     )
-                    _assert_before_deadline(deadline)
+                    _assert_before_deadline(deadline, operation)
             else:
                 with conn.cursor() as cur:
                     cur.execute(
@@ -662,9 +709,13 @@ class PgLedger:
         params: Any = None,
         *,
         deadline_at: datetime,
+        operation: Any = None,
     ) -> psycopg.Cursor:
         """Execute one cursor operation under the caller-owned absolute deadline."""
-        deadline = _utc_datetime(deadline_at, "deadline_at")
+        deadline = _operation_deadline(operation, deadline_at)
+        if deadline is None:
+            raise LedgerError("collector database deadline is required")
+        _check_operation(operation)
         connection = cursor.connection
         try:
             with connection.lock:
@@ -672,6 +723,7 @@ class PgLedger:
                     cursor._execute_gen(query, params),
                     connection.pgconn.socket,
                     deadline,
+                    operation=operation,
                 )
         except LedgerError:
             connection.close()
@@ -683,15 +735,20 @@ class PgLedger:
         connection: psycopg.Connection,
         *,
         deadline_at: datetime,
+        operation: Any = None,
     ) -> None:
         """Rollback without allowing a stalled server response to outlive the deadline."""
-        deadline = _utc_datetime(deadline_at, "deadline_at")
+        deadline = _operation_deadline(operation, deadline_at)
+        if deadline is None:
+            raise LedgerError("collector database deadline is required")
+        _check_operation(operation)
         try:
             with connection.lock:
                 _wait_operation(
                     connection._rollback_gen(),
                     connection.pgconn.socket,
                     deadline,
+                    operation=operation,
                 )
         except LedgerError:
             connection.close()
@@ -703,28 +760,112 @@ class PgLedger:
         command: Any,
         *,
         deadline_at: datetime,
+        operation: Any = None,
     ) -> None:
         """Run a protocol command without implicit transaction setup."""
-        deadline = _utc_datetime(deadline_at, "deadline_at")
+        deadline = _operation_deadline(operation, deadline_at)
+        if deadline is None:
+            raise LedgerError("collector database deadline is required")
+        _check_operation(operation)
         try:
             with connection.lock:
                 _wait_operation(
                     connection._exec_command(command),
                     connection.pgconn.socket,
                     deadline,
+                    operation=operation,
                 )
         except LedgerError:
             connection.close()
             raise
 
-    def _connect_with_deadline(self, deadline_at: datetime) -> psycopg.Connection:
+    def commit_with_deadline(
+        self,
+        connection: psycopg.Connection,
+        *,
+        deadline_at: datetime,
+        operation: Any = None,
+    ) -> None:
+        """Commit one owned transaction under the caller's absolute deadline."""
+        deadline = _operation_deadline(operation, deadline_at)
+        if deadline is None:
+            raise LedgerError("collector database deadline is required")
+        _check_operation(operation)
+        try:
+            with connection.lock:
+                _wait_operation(
+                    connection._commit_gen(),
+                    connection.pgconn.socket,
+                    deadline,
+                    operation=operation,
+                )
+        except LedgerError:
+            connection.close()
+            raise
+
+    @contextmanager
+    def session(self, *, operation: Any = None) -> Iterator[psycopg.Connection]:
+        """Own one connection and bound its commit or rollback cleanup."""
+        deadline = _operation_deadline(operation, None)
+        conn = self.connect(deadline_at=deadline, operation=operation)
+        try:
+            yield conn
+        except BaseException:
+            try:
+                if (
+                    deadline is not None
+                    and _remaining_deadline_seconds(deadline, operation) > 0
+                ):
+                    try:
+                        self.rollback_with_deadline(
+                            conn,
+                            deadline_at=deadline,
+                            operation=operation,
+                        )
+                    except BaseException:
+                        pass
+            finally:
+                conn.close()
+            raise
+        else:
+            try:
+                if deadline is not None:
+                    self.commit_with_deadline(
+                        conn,
+                        deadline_at=deadline,
+                        operation=operation,
+                    )
+                else:
+                    conn.commit()
+            finally:
+                conn.close()
+
+    @contextmanager
+    def cursor(
+        self,
+        connection: psycopg.Connection,
+        *,
+        operation: Any = None,
+    ) -> Iterator[_OperationCursor]:
+        with connection.cursor() as cursor:
+            yield _OperationCursor(self, cursor, operation)
+
+    def _connect_with_deadline(
+        self,
+        deadline_at: datetime,
+        *,
+        operation: Any = None,
+    ) -> psycopg.Connection:
         """Create one libpq connection while retaining ownership through timeout."""
-        deadline = _utc_datetime(deadline_at, "deadline_at")
-        wait_deadline = monotonic() + _remaining_deadline_seconds(deadline)
+        deadline = _operation_deadline(operation, deadline_at)
+        if deadline is None:
+            raise LedgerError("collector database deadline is required")
+        wait_deadline = _operation_wait_deadline(deadline, operation)
         pgconn: Any = None
         try:
             pgconn = pq.PGconn.connect_start(self.dsn.encode("utf-8"))
             while True:
+                _check_operation(operation)
                 status = pq.PollingStatus(pgconn.connect_poll())
                 if monotonic() >= wait_deadline:
                     raise LedgerError("collector database deadline has expired")
@@ -783,14 +924,20 @@ class PgLedger:
         scope: Optional[LedgerScope] = None,
         seen_at: Optional[datetime] = None,
         expected_binding: Optional[LedgerBinding] = None,
+        operation: Any = None,
     ) -> Iterator["PgLedgerPage"]:
         """Open one page write transaction; provider/network work stays outside."""
         if scope is not None and expected_binding is None:
             raise LedgerError("expected_binding is required for scoped writes")
         safe_scope = _normalize_scope(scope) if scope is not None else None
         safe_seen_at = _utc_datetime(seen_at, "seen_at") if seen_at is not None else None
-        with self.connect() as conn:
-            page = PgLedgerPage(self, conn, expected_binding=expected_binding)
+        with self.session(operation=operation) as conn:
+            page = PgLedgerPage(
+                self,
+                conn,
+                expected_binding=expected_binding,
+                operation=operation,
+            )
             if safe_scope is not None:
                 page.bind_scope(
                     safe_scope,
@@ -801,12 +948,21 @@ class PgLedger:
 
     page_transaction = transaction
 
-    def capture_binding(self, scope: LedgerScope, *, seen_at: datetime) -> LedgerBinding:
+    def capture_binding(
+        self,
+        scope: LedgerScope,
+        *,
+        seen_at: datetime,
+        operation: Any = None,
+    ) -> LedgerBinding:
         """Capture the current binding fence before an external/network read."""
         safe_scope = _normalize_scope(scope)
         _utc_datetime(seen_at, "seen_at")
         key = scope_key(safe_scope)
-        with self.connect() as conn, conn.cursor() as cur:
+        with self.session(operation=operation) as conn, self.cursor(
+            conn,
+            operation=operation,
+        ) as cur:
             cur.execute(
                 """
                 SELECT scope_key, binding_generation, binding_state
@@ -830,11 +986,17 @@ class PgLedger:
             identity_state=_scope_identity_state(safe_scope),
         )
 
-    def initialize_binding(self, scope: LedgerScope, *, seen_at: datetime) -> LedgerBinding:
+    def initialize_binding(
+        self,
+        scope: LedgerScope,
+        *,
+        seen_at: datetime,
+        operation: Any = None,
+    ) -> LedgerBinding:
         """Create the first binding for a collector, or refresh that same scope."""
         safe_scope = _normalize_scope(scope)
         safe_seen_at = _utc_datetime(seen_at, "seen_at")
-        with self.transaction() as page:
+        with self.transaction(operation=operation) as page:
             return page.bind_scope(
                 safe_scope,
                 seen_at=safe_seen_at,
@@ -847,11 +1009,15 @@ class PgLedger:
         *,
         expected_binding: LedgerBinding,
         seen_at: datetime,
+        operation: Any = None,
     ) -> LedgerBinding:
         """Explicitly refine a fenced binding to a newly verified scope."""
         safe_scope = _normalize_scope(scope)
         safe_seen_at = _utc_datetime(seen_at, "seen_at")
-        with self.transaction(expected_binding=expected_binding) as page:
+        with self.transaction(
+            expected_binding=expected_binding,
+            operation=operation,
+        ) as page:
             return page.bind_scope(
                 safe_scope,
                 seen_at=safe_seen_at,
@@ -1517,15 +1683,22 @@ class PgLedgerPage:
         conn: psycopg.Connection,
         *,
         expected_binding: Optional[LedgerBinding] = None,
+        operation: Any = None,
     ) -> None:
         self.ledger = ledger
         self.conn = conn
         self._bindings: dict[str, LedgerBinding] = {}
         self._expected_binding = expected_binding
+        self.operation = operation
 
     @staticmethod
     def assert_safe_record(value: Any) -> None:
         assert_no_secrets(value)
+
+    @contextmanager
+    def _cursor(self) -> Iterator[_OperationCursor]:
+        with self.ledger.cursor(self.conn, operation=self.operation) as cursor:
+            yield cursor
 
     def bind_scope(
         self,
@@ -1566,7 +1739,7 @@ class PgLedgerPage:
             or expected.binding_state != "active"
         ):
             raise LedgerError("scope binding fence does not match the requested scope")
-        with self.conn.cursor() as cur:
+        with self._cursor() as cur:
             _lock_scope_registry(cur)
             _assert_active_binding(
                 cur,
@@ -1631,7 +1804,7 @@ class PgLedgerPage:
             raise LedgerError("scope binding changed; refine it explicitly")
         if cached is not None and cached.scope_key == key:
             return cached
-        with self.conn.cursor() as cur:
+        with self._cursor() as cur:
             _lock_scope_registry(cur)
             cur.execute(
                 """
@@ -1781,7 +1954,7 @@ class PgLedgerPage:
             {"payload": stable_payload, "provenance": fingerprint_provenance}
         )
         observed_at = safe_context.observed_at
-        with self.conn.cursor() as cur:
+        with self._cursor() as cur:
             _lock_scope(cur, binding.scope_key)
             prior = _latest_observation(cur, binding.scope_key, safe_context)
             current = _current_observation(cur, binding.scope_key, safe_context)
@@ -2025,7 +2198,7 @@ class PgLedgerPage:
         )
         binding = self.bind_scope(safe_scope, seen_at=safe_context.observed_at)
         observed_at = safe_context.observed_at
-        with self.conn.cursor() as cur:
+        with self._cursor() as cur:
             lineage_keys = _scope_lineage(cur, binding.scope_key)
             _lock_scope_lineage(cur, lineage_keys)
             resolution = _resolve_attempt_identity(
@@ -2309,7 +2482,7 @@ class PgLedgerPage:
         )
         binding = self.bind_scope(safe_scope, seen_at=safe_seen_at)
         gap_id = stable_id(binding.scope_key, safe_source_kind, safe_source_id, safe_reason)
-        with self.conn.cursor() as cur:
+        with self._cursor() as cur:
             _lock_scope(cur, binding.scope_key)
             cur.execute(
                 """
@@ -2375,7 +2548,7 @@ class PgLedgerPage:
             )
         )
         binding = self.bind_scope(safe_scope, seen_at=safe_seen_at)
-        with self.conn.cursor() as cur:
+        with self._cursor() as cur:
             _lock_scope(cur, binding.scope_key)
             cur.execute(
                 """
@@ -3919,25 +4092,104 @@ def _utc_datetime(value: Any, field_name: str) -> datetime:
     return ensure_utc(value)
 
 
-def _assert_before_deadline(deadline_at: datetime) -> None:
+def _operation_deadline(
+    operation: Any,
+    deadline_at: Optional[datetime],
+) -> Optional[datetime]:
+    explicit = (
+        _utc_datetime(deadline_at, "deadline_at")
+        if deadline_at is not None
+        else None
+    )
+    if operation is None:
+        return explicit
+    operation_deadline = getattr(operation, "deadline_at", None)
+    if operation_deadline is None:
+        raise LedgerError("collector operation deadline is required")
+    normalized = _utc_datetime(operation_deadline, "operation.deadline_at")
+    if explicit is None:
+        return normalized
+    return min(explicit, normalized)
+
+
+def _check_operation(operation: Any) -> None:
+    if operation is None:
+        return
+    if not bool(getattr(operation, "ignore_cancel", False)):
+        checker = getattr(operation, "check", None)
+        if callable(checker):
+            checker()
+        else:
+            cancel_event = getattr(operation, "cancel_event", None)
+            if cancel_event is not None and cancel_event.is_set():
+                raise LedgerError("collector operation was cancelled")
+    deadline_monotonic = getattr(operation, "deadline_monotonic", None)
+    if isinstance(deadline_monotonic, (int, float)) and not isinstance(
+        deadline_monotonic,
+        bool,
+    ):
+        if monotonic() >= deadline_monotonic:
+            raise LedgerError("collector database deadline has expired")
+
+
+def _assert_before_deadline(deadline_at: datetime, operation: Any = None) -> None:
+    operation_wall_deadline = getattr(operation, "deadline_at", None)
+    if (
+        isinstance(operation_wall_deadline, datetime)
+        and ensure_utc(deadline_at) == ensure_utc(operation_wall_deadline)
+    ):
+        _check_operation(operation)
+        return
     if datetime.now().astimezone() >= deadline_at:
         raise LedgerError("collector database deadline has expired")
 
 
-def _remaining_deadline_seconds(deadline_at: datetime) -> float:
-    remaining = (deadline_at - datetime.now().astimezone()).total_seconds()
+def _remaining_deadline_seconds(
+    deadline_at: datetime,
+    operation: Any = None,
+) -> float:
+    if operation is not None:
+        remaining = _operation_wait_deadline(deadline_at, operation) - monotonic()
+    else:
+        remaining = (deadline_at - datetime.now().astimezone()).total_seconds()
     if remaining <= 0:
         raise LedgerError("collector database deadline has expired")
     return remaining
 
 
-def _wait_operation(generator: Any, socket: int, deadline_at: datetime) -> Any:
+def _operation_wait_deadline(
+    deadline_at: datetime,
+    operation: Any = None,
+) -> float:
+    operation_deadline = getattr(operation, "deadline_monotonic", None)
+    operation_wall_deadline = getattr(operation, "deadline_at", None)
+    if (
+        isinstance(operation_deadline, (int, float))
+        and not isinstance(operation_deadline, bool)
+        and isinstance(operation_wall_deadline, datetime)
+        and ensure_utc(deadline_at) == ensure_utc(operation_wall_deadline)
+    ):
+        if monotonic() >= operation_deadline:
+            raise LedgerError("collector database deadline has expired")
+        return float(operation_deadline)
+    return monotonic() + _remaining_deadline_seconds(deadline_at)
+
+
+def _wait_operation(
+    generator: Any,
+    socket: int,
+    deadline_at: datetime,
+    *,
+    operation: Any = None,
+) -> Any:
     """Consume one Psycopg operation generator with an owned absolute deadline."""
-    wait_deadline = monotonic() + _remaining_deadline_seconds(deadline_at)
+    wait_deadline = _operation_wait_deadline(deadline_at, operation)
     try:
+        _check_operation(operation)
         wait = next(generator)
         with selectors.DefaultSelector() as selector:
             while True:
+                _check_operation(operation)
                 remaining = wait_deadline - monotonic()
                 if remaining <= 0:
                     raise LedgerError("collector database deadline has expired")
@@ -3948,6 +4200,7 @@ def _wait_operation(generator: Any, socket: int, deadline_at: datetime) -> Any:
                     selector.unregister(socket)
                 if not ready:
                     raise LedgerError("collector database deadline has expired")
+                _check_operation(operation)
                 wait = generator.send(waiting.Ready(ready[0][1]))
     except StopIteration as exc:
         if monotonic() >= wait_deadline:
@@ -3961,10 +4214,8 @@ def _wait_operation(generator: Any, socket: int, deadline_at: datetime) -> Any:
         raise
 
 
-def _remaining_deadline_ms(deadline_at: datetime) -> int:
-    remaining_ms = int(
-        (deadline_at - datetime.now().astimezone()).total_seconds() * 1000
-    )
+def _remaining_deadline_ms(deadline_at: datetime, operation: Any = None) -> int:
+    remaining_ms = int(_remaining_deadline_seconds(deadline_at, operation) * 1000)
     if remaining_ms <= 0:
         raise LedgerError("collector database deadline has expired")
     return remaining_ms
