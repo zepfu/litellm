@@ -815,14 +815,13 @@ function messageFromNode(
     requestId: sanitizeToken(metadata.request_id),
     surface: conversationSurface,
     origin:
-      sanitizeToken(metadata.origin) ??
       (metadata.imported === true
         ? "imported"
         : metadata.from_copy === true
           ? "copied"
           : metadata.from_shared === true
             ? "shared"
-            : null),
+            : sanitizeToken(metadata.origin)),
     metadata,
   };
 }

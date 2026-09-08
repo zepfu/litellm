@@ -68,7 +68,9 @@ complete only when reached through the capability-approved legacy route.
 Modern mapping-only responses without `page_info` remain partial/unknown with
 no continuation, so they cannot be mistaken for complete history. Message
 metadata flags `imported` and `from_copy` project to `imported` and `copied`
-origins, respectively, and remain excluded from ordinary Chat accounting.
+origins, respectively, before any benign `origin` label; shared provenance is
+handled the same way. These flags remain excluded from ordinary Chat
+accounting.
 
 ### Identity
 
