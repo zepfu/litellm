@@ -2554,32 +2554,6 @@ def _cursor_replay_canonicalize_stock_web_search(
     return dict(tool)
 
 
-_CURSOR_REPLAY_NAMESPACE_TOOL_NAMES = {
-    "collaboration": frozenset(
-        {
-            "followup_task",
-            "interrupt_agent",
-            "list_agents",
-            "send_message",
-            "spawn_agent",
-            "wait_agent",
-        }
-    ),
-    "multi_agent_v1": frozenset(
-        {
-            "close_agent",
-            "resume_agent",
-            "send_input",
-            "spawn_agent",
-            "wait_agent",
-        }
-    ),
-}
-_CURSOR_REPLAY_NAMESPACE_NAME_ALIASES = {
-    "functions.collaboration": "collaboration",
-    "functions.multi_agent_v1": "multi_agent_v1",
-}
-_CURSOR_REPLAY_NAMESPACE_CHILD_NAME_ALIASES = {"wait": "wait_agent"}
 _CURSOR_REPLAY_NAMESPACE_ALLOWED_KEYS = frozenset(
     {"type", "name", "description", "tools"}
 )
@@ -2600,6 +2574,7 @@ def _cursor_replay_canonicalize_stock_namespace(
     *,
     tool_adapter: Any,
 ) -> Optional[dict[str, Any]]:
+    """Validate function namespaces when the SDK lacks a namespace variant."""
     if set(tool) - _CURSOR_REPLAY_NAMESPACE_ALLOWED_KEYS:
         return None
     if tool.get("type") != "namespace":
@@ -2607,14 +2582,6 @@ def _cursor_replay_canonicalize_stock_namespace(
 
     raw_namespace_name = tool.get("name")
     if not isinstance(raw_namespace_name, str) or not raw_namespace_name.strip():
-        return None
-    namespace_name = raw_namespace_name.strip()
-    namespace_key = _CURSOR_REPLAY_NAMESPACE_NAME_ALIASES.get(
-        namespace_name,
-        namespace_name,
-    )
-    allowed_child_names = _CURSOR_REPLAY_NAMESPACE_TOOL_NAMES.get(namespace_key)
-    if allowed_child_names is None:
         return None
 
     description = tool.get("description")
@@ -2638,15 +2605,9 @@ def _cursor_replay_canonicalize_stock_namespace(
         if not isinstance(raw_child_name, str) or not raw_child_name.strip():
             return None
         child_name = raw_child_name.strip()
-        canonical_child_name = _CURSOR_REPLAY_NAMESPACE_CHILD_NAME_ALIASES.get(
-            child_name,
-            child_name,
-        )
-        if canonical_child_name not in allowed_child_names:
+        if child_name in seen_child_names:
             return None
-        if canonical_child_name in seen_child_names:
-            return None
-        seen_child_names.add(canonical_child_name)
+        seen_child_names.add(child_name)
 
         if "defer_loading" in child and not isinstance(
             child["defer_loading"],
