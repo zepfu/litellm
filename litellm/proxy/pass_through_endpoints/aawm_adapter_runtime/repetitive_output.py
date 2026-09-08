@@ -14,7 +14,7 @@ import unicodedata
 from collections import deque
 from dataclasses import dataclass
 from itertools import islice
-from typing import TYPE_CHECKING, Any, AsyncIterator, Mapping, Optional
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Mapping, Optional
 
 from fastapi import HTTPException
 
@@ -47,6 +47,8 @@ _VISIBLE_PART_TYPES = frozenset({"output_text", "text"})
 _TOKEN_KEEP = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_./")
 WRAPPED_STREAM_ATTR = "_aawm_repetitive_output_guard_wrapped"
 OUTPUT_GUARD_CONTEXT_ATTR = "_aawm_output_guard_request_context"
+_STREAM_CLEANUP_ATTR = "_aawm_streaming_response_cleanup"
+_STREAM_CLEANUP_CALLBACKS_ATTR = "_aawm_stream_cleanup_callbacks"
 
 
 def _event_type(event: Any) -> str:
@@ -440,6 +442,132 @@ async def _close_upstream_response(upstream_response: Any) -> None:
         await result
 
 
+async def _close_stream_resource(resource: Any, message: str) -> None:
+    try:
+        await _close_upstream_response(resource)
+    except BaseException:
+        verbose_proxy_logger.debug(message, exc_info=True)
+
+
+class _CleanupBoundAsyncIterator:
+    """Make cleanup run even when an async generator is closed before start."""
+
+    def __init__(
+        self,
+        iterator: Any,
+        cleanup: Optional[Callable[[], Awaitable[None]]] = None,
+        *,
+        on_start: Optional[Callable[[], None]] = None,
+    ) -> None:
+        self._iterator = iterator.__aiter__()
+        self._cleanup = cleanup
+        self._on_start = on_start
+        self._started = False
+        self._closed = False
+        callbacks = getattr(cleanup, _STREAM_CLEANUP_CALLBACKS_ATTR, None)
+        if not isinstance(callbacks, tuple) and callable(cleanup):
+            callbacks = (cleanup,)
+        if isinstance(callbacks, tuple):
+            setattr(self, _STREAM_CLEANUP_CALLBACKS_ATTR, callbacks)
+
+    def __aiter__(self) -> "_CleanupBoundAsyncIterator":
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._closed:
+            raise StopAsyncIteration
+        if not self._started:
+            self._started = True
+            if self._on_start is not None:
+                self._on_start()
+        try:
+            return await self._iterator.__anext__()
+        except StopAsyncIteration:
+            await self.aclose()
+            raise
+        except BaseException:
+            await self.aclose()
+            raise
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            close = getattr(self._iterator, "aclose", None)
+            if callable(close):
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+        except BaseException:
+            verbose_proxy_logger.debug(
+                "Failed to close cleanup-bound stream iterator",
+                exc_info=True,
+            )
+        finally:
+            if self._cleanup is not None:
+                try:
+                    await self._cleanup()
+                except BaseException:
+                    verbose_proxy_logger.debug(
+                        "Failed to close cleanup-bound stream resources",
+                        exc_info=True,
+                    )
+
+
+def _compose_stream_cleanups(
+    *cleanups: Any,
+) -> Optional[Callable[[], Awaitable[None]]]:
+    """Combine response-owned cleanup callbacks without duplicate execution."""
+    callbacks = _flatten_stream_cleanups(*cleanups)
+    if not callbacks:
+        return None
+
+    cleaned = False
+
+    async def _cleanup() -> None:
+        nonlocal cleaned
+        if cleaned:
+            return
+        cleaned = True
+        for callback in callbacks:
+            try:
+                result = callback()
+                if inspect.isawaitable(result):
+                    await result
+            except BaseException:
+                verbose_proxy_logger.debug(
+                    "Failed to close inherited passthrough stream resources",
+                    exc_info=True,
+                )
+
+    setattr(_cleanup, _STREAM_CLEANUP_CALLBACKS_ATTR, tuple(callbacks))
+    return _cleanup
+
+
+def _flatten_stream_cleanups(*cleanups: Any) -> list[Callable[[], Any]]:
+    """Return unique callbacks from possibly nested cleanup compositions."""
+    callbacks: list[Callable[[], Any]] = []
+    seen: set[int] = set()
+    for cleanup in cleanups:
+        if isinstance(cleanup, tuple):
+            candidates = cleanup
+        elif callable(cleanup):
+            nested = getattr(cleanup, _STREAM_CLEANUP_CALLBACKS_ATTR, None)
+            candidates = nested if isinstance(nested, tuple) else (cleanup,)
+        else:
+            continue
+        for candidate in candidates:
+            if not callable(candidate):
+                continue
+            marker = id(candidate)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            callbacks.append(candidate)
+    return callbacks
+
+
 def _terminal_metadata(
     *,
     match: VisibleTextRepetitionMatch,
@@ -542,12 +670,13 @@ def _build_repetitive_output_failed_chunks(
     return _encode_response_failed_sse(local_payload)
 
 
-async def wrap_responses_sse_with_repetitive_output_guard(
+async def _iterate_responses_sse_with_repetitive_output_guard(  # noqa: PLR0915
     body_iterator: Any,
     *,
     policy: OutputGuardPolicy,
     request_context: OutputGuardRequestContext,
     upstream_response: Any = None,
+    upstream_cleanup: Optional[Callable[[], Awaitable[None]]] = None,
     retry_fn: Any = None,
     failover_fn: Any = None,
 ) -> AsyncIterator[bytes]:
@@ -556,8 +685,10 @@ async def wrap_responses_sse_with_repetitive_output_guard(
     detector = VisibleTextRepetitionDetector(policy)
     extractor = VisibleOutputTextExtractor()
     yielded_visible = False
-    aborted = False
     closed_upstream = False
+    closed_body_iterator = False
+    closed_sse_iterator = False
+    closed_inherited_resources = False
     sse_iter = _iter_sse_event_blocks_with_separator(body_iterator)
 
     async def _abort_upstream() -> None:
@@ -565,7 +696,42 @@ async def wrap_responses_sse_with_repetitive_output_guard(
         if closed_upstream:
             return
         closed_upstream = True
-        await _close_upstream_response(upstream_response)
+        try:
+            await _close_upstream_response(upstream_response)
+        except BaseException:
+            verbose_proxy_logger.debug(
+                "Failed to close repetitive Responses upstream response",
+                exc_info=True,
+            )
+
+    async def _close_resource(resource: Any, message: str) -> None:
+        await _close_stream_resource(resource, message)
+
+    async def _close_stream_resources() -> None:
+        nonlocal closed_body_iterator, closed_inherited_resources, closed_sse_iterator
+        if not closed_sse_iterator:
+            closed_sse_iterator = True
+            await _close_resource(
+                sse_iter,
+                "Failed to close repetitive Responses SSE iterator",
+            )
+        if not closed_body_iterator:
+            closed_body_iterator = True
+            await _close_resource(
+                body_iterator,
+                "Failed to close repetitive Responses body iterator",
+            )
+        await _abort_upstream()
+        if not closed_inherited_resources:
+            closed_inherited_resources = True
+            if upstream_cleanup is not None:
+                try:
+                    await upstream_cleanup()
+                except BaseException:
+                    verbose_proxy_logger.debug(
+                        "Failed to close inherited repetitive Responses resources",
+                        exc_info=True,
+                    )
 
     try:
         async for event_block, had_separator in sse_iter:
@@ -582,11 +748,8 @@ async def wrap_responses_sse_with_repetitive_output_guard(
                 if match is not None:
                     break
             if match is not None:
-                aborted = True
                 visible_delta_forwarded = yielded_visible
-                await _abort_upstream()
-                await _close_upstream_response(sse_iter)
-                await _close_upstream_response(body_iterator)
+                await _close_stream_resources()
                 if visible_delta_forwarded:
                     verbose_proxy_logger.warning(
                         "CFG-025 aborted repetitive Responses stream policy=%s "
@@ -613,9 +776,63 @@ async def wrap_responses_sse_with_repetitive_output_guard(
             if block_has_visible:
                 yielded_visible = True
     finally:
-        await _close_upstream_response(sse_iter)
-        if aborted:
-            await _abort_upstream()
+        await _close_stream_resources()
+
+
+def wrap_responses_sse_with_repetitive_output_guard(
+    body_iterator: Any,
+    *,
+    policy: OutputGuardPolicy,
+    request_context: OutputGuardRequestContext,
+    upstream_response: Any = None,
+    upstream_cleanup: Optional[Callable[[], Awaitable[None]]] = None,
+    retry_fn: Any = None,
+    failover_fn: Any = None,
+) -> AsyncIterator[bytes]:
+    """Return a guarded iterator for ``_iter_sse_event_blocks_with_separator``.
+
+    ``VisibleTextRepetitionDetector`` remains in the inner iterator; this
+    outer owner also handles close-before-first-read cleanup.
+    """
+    started = False
+
+    def _mark_started() -> None:
+        nonlocal started
+        started = True
+
+    async def _close_unstarted_resources() -> None:
+        if started:
+            return
+        await _close_stream_resource(
+            body_iterator,
+            "Failed to close unstarted repetitive Responses body iterator",
+        )
+        await _close_stream_resource(
+            upstream_response,
+            "Failed to close unstarted repetitive Responses upstream response",
+        )
+        if upstream_cleanup is not None:
+            try:
+                await upstream_cleanup()
+            except BaseException:
+                verbose_proxy_logger.debug(
+                    "Failed to close unstarted inherited Responses resources",
+                    exc_info=True,
+                )
+
+    return _CleanupBoundAsyncIterator(
+        _iterate_responses_sse_with_repetitive_output_guard(
+            body_iterator,
+            policy=policy,
+            request_context=request_context,
+            upstream_response=upstream_response,
+            upstream_cleanup=upstream_cleanup,
+            retry_fn=retry_fn,
+            failover_fn=failover_fn,
+        ),
+        _close_unstarted_resources,
+        on_start=_mark_started,
+    )
 
 
 def _resolve_output_guard_policy(request_context: OutputGuardRequestContext) -> Optional[OutputGuardPolicy]:
@@ -638,6 +855,7 @@ def maybe_wrap_passthrough_responses_stream(
     *,
     request_context: OutputGuardRequestContext,
     upstream_response: Any = None,
+    upstream_cleanup: Optional[Callable[[], Awaitable[None]]] = None,
     retry_fn: Any = None,
     failover_fn: Any = None,
     policy: Optional[OutputGuardPolicy] = None,
@@ -658,6 +876,7 @@ def maybe_wrap_passthrough_responses_stream(
         policy=selected,
         request_context=request_context,
         upstream_response=upstream_response,
+        upstream_cleanup=upstream_cleanup,
         retry_fn=retry_fn,
         failover_fn=failover_fn,
     )
@@ -709,6 +928,12 @@ def inherit_or_wrap_passthrough_streaming_response(
     inherit_deferred_success_holder(response, source_response=source_response)
     if not isinstance(response, StreamingResponse):
         return response
+    inherited_cleanup = _compose_stream_cleanups(
+        getattr(response, _STREAM_CLEANUP_ATTR, None),
+        getattr(source_response, _STREAM_CLEANUP_ATTR, None),
+    )
+    if inherited_cleanup is not None:
+        setattr(response, _STREAM_CLEANUP_ATTR, inherited_cleanup)
     context = request_context or getattr(response, OUTPUT_GUARD_CONTEXT_ATTR, None)
     if context is None and source_response is not None:
         context = getattr(source_response, OUTPUT_GUARD_CONTEXT_ATTR, None)
@@ -721,10 +946,22 @@ def inherit_or_wrap_passthrough_streaming_response(
             request_context=context,
             wrapped=True,
         )
+    iterator_callbacks = _flatten_stream_cleanups(
+        getattr(iterator, _STREAM_CLEANUP_CALLBACKS_ATTR, None),
+    )
+    iterator_callback_ids = {id(callback) for callback in iterator_callbacks}
+    guard_cleanup = _compose_stream_cleanups(
+        *(
+            callback
+            for callback in _flatten_stream_cleanups(inherited_cleanup)
+            if id(callback) not in iterator_callback_ids
+        )
+    )
     wrapped_iter = maybe_wrap_passthrough_responses_stream(
         iterator,
         request_context=context,
         upstream_response=upstream_response,
+        upstream_cleanup=guard_cleanup,
     )
     if wrapped_iter is iterator:
         return bind_output_guard_to_streaming_response(
@@ -738,6 +975,8 @@ def inherit_or_wrap_passthrough_streaming_response(
         status_code=response.status_code,
         media_type=response.media_type or "text/event-stream",
     )
+    if inherited_cleanup is not None:
+        setattr(guarded, _STREAM_CLEANUP_ATTR, inherited_cleanup)
     inherit_deferred_success_holder(guarded, source_response=response)
     return bind_output_guard_to_streaming_response(
         guarded,
