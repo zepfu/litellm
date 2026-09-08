@@ -1002,6 +1002,16 @@ until the bridge owner integrates the executable entrypoint. The history
 reader remains disabled until authenticated native-contract evidence is
 verified; packaging does not activate collection or schema changes.
 
+The image also packages the metadata-only usage-ledger closure from
+`__init__.py`, `models.py`, `pg_ledger.py`, `privacy.py`, and `timeutil.py`,
+plus `scripts/apply_chatgpt_usage_ledger_2026_09_08.sql`. It excludes the
+legacy standalone Python collector, API, and SQLite ledger. The migration is
+packaged for the parent-owned activation step and is not applied by image
+build or ordinary sidecar startup. `pg_collector_state.py` and the Python
+worker bridge are intentionally absent until their accepted source paths are
+published; their absence means packaging remains not ready for count
+activation.
+
 Polling uses a 600-second default cadence. `Retry-After` and backoff apply to
 the shared browser session, preserving other sessions and prior observation
 rows. A deferred or failed capture is not fresh evidence and does not replace

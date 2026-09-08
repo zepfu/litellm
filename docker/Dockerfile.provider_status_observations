@@ -72,6 +72,7 @@ COPY scripts/kimi_oauth_refresh.py /app/scripts/kimi_oauth_refresh.py
 COPY scripts/nous_oauth_refresh.py /app/scripts/nous_oauth_refresh.py
 COPY scripts/cursor_agent_auth_refresh.py /app/scripts/cursor_agent_auth_refresh.py
 COPY scripts/run_provider_status_observations_loop.py /app/scripts/run_provider_status_observations_loop.py
+COPY scripts/apply_chatgpt_usage_ledger_2026_09_08.sql /app/scripts/apply_chatgpt_usage_ledger_2026_09_08.sql
 COPY litellm/secret_managers/credential_error_sanitizer.py /app/litellm/secret_managers/credential_error_sanitizer.py
 COPY litellm/secret_managers/credential_file_lock.py /app/litellm/secret_managers/credential_file_lock.py
 COPY litellm/secret_managers/credential_file_metadata.py /app/litellm/secret_managers/credential_file_metadata.py
@@ -93,6 +94,14 @@ COPY litellm/llms/cursor_agent/connect.py /app/litellm/llms/cursor_agent/connect
 COPY litellm/llms/cursor_agent/usage.py /app/litellm/llms/cursor_agent/usage.py
 # Stdlib ChatGPT conversation-init observer (pure-stdlib).
 COPY litellm/llms/chatgpt/conversation_init.py /app/litellm/llms/chatgpt/conversation_init.py
+# Metadata-only D1-752 usage ledger closure and migration artifact.
+# pg_collector_state.py and the Python worker bridge join after their owners
+# publish accepted source; their absence is intentional, not runtime readiness.
+COPY scripts/chatgpt_chat_usage_capture/__init__.py /app/scripts/chatgpt_chat_usage_capture/__init__.py
+COPY scripts/chatgpt_chat_usage_capture/models.py /app/scripts/chatgpt_chat_usage_capture/models.py
+COPY scripts/chatgpt_chat_usage_capture/pg_ledger.py /app/scripts/chatgpt_chat_usage_capture/pg_ledger.py
+COPY scripts/chatgpt_chat_usage_capture/privacy.py /app/scripts/chatgpt_chat_usage_capture/privacy.py
+COPY scripts/chatgpt_chat_usage_capture/timeutil.py /app/scripts/chatgpt_chat_usage_capture/timeutil.py
 RUN touch \
     /app/scripts/__init__.py \
     /app/litellm/__init__.py \
