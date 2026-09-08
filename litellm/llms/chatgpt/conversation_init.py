@@ -6532,31 +6532,40 @@ def _oracle_browser_close_target_worker(  # noqa: PLR0915 - fixed closer phase d
         if not require_target_absence:
             target_proof.value = True
             return
-        record_stage(_OracleTargetCloserStage.ABSENCE_LISTING)
-        post_close_listing = session.send("Target.getTargets")
-        record_stage(_OracleTargetCloserStage.ABSENCE_LISTING_INVALID)
-        if not isinstance(post_close_listing, Mapping):
-            return
-        if "targetInfos" not in post_close_listing:
-            return
-        post_close_targets = post_close_listing["targetInfos"]
-        record_stage(_OracleTargetCloserStage.ABSENCE_TARGETS_INVALID)
-        if not isinstance(post_close_targets, (list, tuple)):
-            return
-        if any(
-            not isinstance(info, Mapping)
-            or not isinstance(info.get("targetId"), str)
-            or not info.get("targetId")
-            for info in post_close_targets
-        ):
-            return
-        record_stage(_OracleTargetCloserStage.TARGET_ABSENCE_CHECK)
-        target_proof.value = not any(
-            isinstance(info, Mapping) and info.get("targetId") == target_id
-            for info in post_close_targets
-        )
-        if not target_proof.value:
+        record_stage(_OracleTargetCloserStage.DEADLINE_CHECK)
+        # Close acknowledgment can precede removal from the target listing.
+        while True:
+            _raise_if_browser_deadline_expired(deadline)
+            record_stage(_OracleTargetCloserStage.ABSENCE_LISTING)
+            post_close_listing = session.send("Target.getTargets")
+            record_stage(_OracleTargetCloserStage.ABSENCE_LISTING_INVALID)
+            if not isinstance(post_close_listing, Mapping):
+                return
+            if "targetInfos" not in post_close_listing:
+                return
+            post_close_targets = post_close_listing["targetInfos"]
+            record_stage(_OracleTargetCloserStage.ABSENCE_TARGETS_INVALID)
+            if not isinstance(post_close_targets, (list, tuple)):
+                return
+            if any(
+                not isinstance(info, Mapping)
+                or not isinstance(info.get("targetId"), str)
+                or not info.get("targetId")
+                for info in post_close_targets
+            ):
+                return
+            record_stage(_OracleTargetCloserStage.TARGET_ABSENCE_CHECK)
+            target_proof.value = not any(
+                isinstance(info, Mapping) and info.get("targetId") == target_id
+                for info in post_close_targets
+            )
+            if target_proof.value:
+                return
             record_stage(_OracleTargetCloserStage.TARGET_STILL_PRESENT)
+            remaining_seconds = _remaining_browser_timeout(deadline)
+            if remaining_seconds <= 0:
+                return
+            time.sleep(min(remaining_seconds, 0.05))
     except Exception:
         target_proof.value = False
     finally:

@@ -1051,6 +1051,9 @@ Unrecognized failures report `unknown`; exception text is never emitted.
 When a reaped target closer has not confirmed cleanup, `target_closer_*` codes
 identify its last operation or failed response check, including CDP connection,
 target listing, target matching, close acknowledgment, and absence verification.
+After close acknowledgment, the closer checks validated target listings until
+the exact owned target disappears or its existing deadline expires. It sends
+the close request once; invalid listings fail without claiming target absence.
 The closer shares only a numeric stage; no CDP payload or target data is added.
 The event precedes the final retained-owner drain, so it does not report final
 retirement or imply that cleanup has completed.
