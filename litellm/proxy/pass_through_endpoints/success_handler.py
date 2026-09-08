@@ -20,6 +20,7 @@ from litellm.litellm_core_utils.litellm_logging import (
 )
 from litellm.proxy._types import PassThroughEndpointLoggingResultValues
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_delivered_disposition import (
+    annotate_delivered_wire_failure,
     get_delivered_wire_disposition,
 )
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
@@ -120,6 +121,31 @@ class PassThroughEndpointLogging:
             metadata = {}
             litellm_params["metadata"] = metadata
         return metadata
+
+    @staticmethod
+    def _sync_failure_logging_evidence(
+        *,
+        logging_obj: LiteLLMLoggingObj,
+        kwargs: dict,
+    ) -> None:
+        model_call_details = getattr(logging_obj, "model_call_details", None)
+        if not isinstance(model_call_details, dict):
+            return
+
+        for key in (
+            "litellm_params",
+            "standard_logging_object",
+            "response_cost",
+            "model",
+            "custom_llm_provider",
+            "passthrough_logging_payload",
+            "call_type",
+            "litellm_call_id",
+            "completion_start_time",
+            "combined_usage_object",
+        ):
+            if key in kwargs:
+                model_call_details[key] = kwargs[key]
 
     @staticmethod
     def _sanitize_anthropic_rate_limit_headers(
@@ -573,7 +599,7 @@ class PassThroughEndpointLogging:
             ):
                 current_kwargs["response_cost"] = existing.get("response_cost")
 
-    async def _handle_logging(
+    async def _handle_logging(  # noqa: PLR0915
         self,
         logging_obj: LiteLLMLoggingObj,
         standard_logging_response_object: Union[
@@ -588,6 +614,13 @@ class PassThroughEndpointLogging:
         **kwargs,
     ):
         """Run pass-through logging hooks using the same callback contracts as normal LiteLLM success handling."""
+        delivered_wire_disposition = get_delivered_wire_disposition(kwargs)
+        if (
+            isinstance(delivered_wire_disposition, dict)
+            and delivered_wire_disposition.get("delivered_disposition") != "completed"
+        ):
+            return
+
         call_type = getattr(logging_obj, "call_type", "pass_through_endpoint")
         current_kwargs = dict(kwargs)
         current_kwargs.setdefault("standard_callback_dynamic_params", {})
@@ -973,28 +1006,56 @@ class PassThroughEndpointLogging:
             kwargs=kwargs,
         )
 
-        delivered_wire_disposition = None
-        try:
-            delivered_wire_disposition = get_delivered_wire_disposition(kwargs)
-        except Exception:
-            delivered_wire_disposition = None
+        delivered_wire_disposition = get_delivered_wire_disposition(kwargs)
         delivered_disposition = (
             delivered_wire_disposition.get("delivered_disposition")
             if isinstance(delivered_wire_disposition, dict)
             else None
         )
-        if delivered_disposition in {"failed", "cancelled", "disconnected"}:
-            return
-
-        if delivered_disposition == "incomplete":
+        if (
+            isinstance(delivered_wire_disposition, dict)
+            and delivered_disposition != "completed"
+        ):
+            failure_disposition = delivered_disposition or "unknown"
+            metadata = self._ensure_metadata(kwargs)
+            metadata["aawm_delivered_wire_disposition"] = dict(
+                delivered_wire_disposition
+            )
+            metadata["aawm_delivered_disposition"] = failure_disposition
+            metadata["aawm_route_rollup_turn_suppressed"] = True
             record_aawm_route_rollup_failure(
                 kwargs,
-                message="delivered_disposition=incomplete",
-                status="Incomplete",
+                message=f"delivered_disposition={failure_disposition}",
+                status=(
+                    "Incomplete"
+                    if failure_disposition == "incomplete"
+                    else "Failed"
+                ),
             )
-            metadata = kwargs.get("litellm_params", {}).get("metadata")
-            if isinstance(metadata, dict):
-                metadata["aawm_route_rollup_turn_suppressed"] = True
+            self._sync_failure_logging_evidence(
+                logging_obj=logging_obj,
+                kwargs=kwargs,
+            )
+            delivered_failure = annotate_delivered_wire_failure(
+                RuntimeError(
+                    "OpenAI Responses delivered disposition="
+                    f"{failure_disposition}"
+                ),
+                delivered_disposition=failure_disposition,
+            )
+            try:
+                await logging_obj.async_failure_handler(
+                    exception=delivered_failure,
+                    traceback_exception=None,
+                    start_time=start_time,
+                    end_time=end_time,
+                )
+            except Exception as logging_exc:
+                verbose_proxy_logger.exception(
+                    "Pass-through delivered-disposition failure logging failed: %s",
+                    str(logging_exc),
+                )
+            return
 
         # Attach any validated Codex auto-review decision to private callback
         # kwargs (and record the rollup turn) BEFORE sync/async success

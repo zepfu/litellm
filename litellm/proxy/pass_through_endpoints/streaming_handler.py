@@ -33,6 +33,7 @@ from litellm.proxy.aawm_session_transfer.registry import (
     safe_record_chunks,
 )
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_delivered_disposition import (
+    annotate_delivered_wire_failure,
     get_delivered_wire_disposition,
 )
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
@@ -3015,6 +3016,15 @@ class PassThroughStreamingHandler:
             handler_branch_state,
             "async_success_handler",
         )
+        delivered_wire_disposition = get_delivered_wire_disposition(kwargs)
+        if (
+            isinstance(delivered_wire_disposition, dict)
+            and delivered_wire_disposition.get("delivered_disposition") != "completed"
+        ):
+            return PassThroughStreamingHandler._set_streaming_handler_branch(
+                handler_branch_state,
+                "delivered_disposition_failure",
+            )
         await litellm_logging_obj.async_success_handler(
             result=standard_logging_response_object,
             start_time=start_time,
@@ -3134,6 +3144,11 @@ class PassThroughStreamingHandler:
             error_payload=error_payload if isinstance(error_payload, dict) else None,
             message=sanitized_message,
         )
+        if delivered_disposition:
+            annotate_delivered_wire_failure(
+                failure_exc,
+                delivered_disposition=delivered_disposition,
+            )
         failure_context = {
             "failure_kind": classification,
             "stream_failure_stage": "responses_stream_failed",
@@ -3229,7 +3244,7 @@ class PassThroughStreamingHandler:
         metadata["aawm_stream_terminal_emitted"] = True
 
     @staticmethod
-    async def _route_streaming_logging_to_handler(
+    async def _route_streaming_logging_to_handler(  # noqa: PLR0915
         litellm_logging_obj: LiteLLMLoggingObj,
         passthrough_success_handler_obj: PassThroughEndpointLogging,
         url_route: str,
@@ -3328,10 +3343,10 @@ class PassThroughStreamingHandler:
                     custom_llm_provider=custom_llm_provider,
                 )
                 and (
-                    terminal_event_type == "response.failed"
+                    terminal_event_type in {"response.failed", "response.incomplete"}
                     or (
                         isinstance(terminal_payload, dict)
-                        and terminal_payload.get("status") == "failed"
+                        and terminal_payload.get("status") in {"failed", "incomplete"}
                     )
                 )
             )
@@ -3352,14 +3367,33 @@ class PassThroughStreamingHandler:
                 if isinstance(wire_disposition, dict)
                 else None
             )
+            delivered_failure_disposition = None
+            if (
+                isinstance(wire_disposition, dict)
+                and wire_disposition_value != "completed"
+            ):
+                delivered_failure_disposition = (
+                    wire_disposition_value or "unknown"
+                )
+            if (
+                delivered_failure_disposition is None
+                and synthetic_terminal_event_type == "response.incomplete"
+            ):
+                delivered_failure_disposition = "incomplete"
+            if (
+                delivered_failure_disposition is None
+                and (
+                    terminal_event_type == "response.incomplete"
+                    or (
+                        isinstance(terminal_payload, dict)
+                        and terminal_payload.get("status") == "incomplete"
+                    )
+                )
+            ):
+                delivered_failure_disposition = "incomplete"
             if wire_disposition is not None:
                 metadata["aawm_delivered_wire_disposition"] = wire_disposition
-            if wire_disposition_value in {
-                "failed",
-                "incomplete",
-                "cancelled",
-                "disconnected",
-            }:
+            if delivered_failure_disposition is not None:
                 responses_failed = True
             if responses_failed:
                 await PassThroughStreamingHandler._finalize_failed_responses_stream(
@@ -3373,7 +3407,7 @@ class PassThroughStreamingHandler:
                     terminal_event_type=terminal_event_type,
                     terminal_payload=terminal_payload,
                     handler_branch_state=handler_branch_state,
-                    delivered_disposition=wire_disposition_value,
+                    delivered_disposition=delivered_failure_disposition,
                 )
                 return
             if synthetic_terminal_event_type == "response.incomplete":

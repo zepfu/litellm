@@ -17,6 +17,23 @@ _TRANSFER_PHASES = {
 }
 
 
+def annotate_delivered_wire_failure(
+    exception: Exception,
+    *,
+    delivered_disposition: str,
+) -> Exception:
+    """Mark failure logging as retaining provider response evidence."""
+
+    normalized_disposition = str(delivered_disposition or "").strip().lower()
+    setattr(exception, "_aawm_preserve_response_evidence", True)
+    setattr(
+        exception,
+        "delivered_disposition",
+        normalized_disposition or "unknown",
+    )
+    return exception
+
+
 def _request_from_kwargs(kwargs: Any) -> Any:
     if not isinstance(kwargs, dict):
         return None

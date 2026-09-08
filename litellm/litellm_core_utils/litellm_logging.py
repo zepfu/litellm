@@ -3003,12 +3003,20 @@ class Logging(LiteLLMLoggingBaseClass):
         if not hasattr(self, "model_call_details"):
             self.model_call_details = {}
 
+        preserve_response_evidence = (
+            getattr(exception, "_aawm_preserve_response_evidence", False) is True
+        )
+        preserved_response_cost = self.model_call_details.get("response_cost")
+        preserved_standard_logging_object = self.model_call_details.get(
+            "standard_logging_object"
+        )
         self.model_call_details["log_event_type"] = "failed_api_call"
         self.model_call_details["exception"] = exception
         self.model_call_details["traceback_exception"] = traceback_exception
         self.model_call_details["end_time"] = end_time
         self.model_call_details.setdefault("original_response", None)
-        self.model_call_details["response_cost"] = 0
+        if not preserve_response_evidence or preserved_response_cost is None:
+            self.model_call_details["response_cost"] = 0
 
         if hasattr(exception, "headers") and isinstance(exception.headers, dict):
             self.model_call_details.setdefault("litellm_params", {})
@@ -3019,18 +3027,50 @@ class Logging(LiteLLMLoggingBaseClass):
 
         ## STANDARDIZED LOGGING PAYLOAD
 
+        failure_standard_logging_object = get_standard_logging_object_payload(
+            kwargs=self.model_call_details,
+            init_response_obj={},
+            start_time=start_time,
+            end_time=end_time,
+            logging_obj=self,
+            status="failure",
+            error_str=str(exception),
+            original_exception=exception,
+            standard_built_in_tools_params=self.standard_built_in_tools_params,
+        )
+        if (
+            preserve_response_evidence
+            and isinstance(failure_standard_logging_object, dict)
+            and isinstance(preserved_standard_logging_object, dict)
+        ):
+            for key in (
+                "response",
+                "response_cost",
+                "total_tokens",
+                "prompt_tokens",
+                "completion_tokens",
+                "custom_llm_provider",
+                "model",
+                "metadata",
+                "hidden_params",
+                "model_map_information",
+                "cost_breakdown",
+            ):
+                if key in preserved_standard_logging_object:
+                    failure_standard_logging_object[key] = (
+                        preserved_standard_logging_object[key]
+                    )
+            failure_metadata = failure_standard_logging_object.get("metadata")
+            preserved_metadata = preserved_standard_logging_object.get("metadata")
+            if isinstance(failure_metadata, dict) and isinstance(
+                preserved_metadata, dict
+            ):
+                failure_standard_logging_object["metadata"] = {
+                    **preserved_metadata,
+                    **failure_metadata,
+                }
         self.model_call_details["standard_logging_object"] = (
-            get_standard_logging_object_payload(
-                kwargs=self.model_call_details,
-                init_response_obj={},
-                start_time=start_time,
-                end_time=end_time,
-                logging_obj=self,
-                status="failure",
-                error_str=str(exception),
-                original_exception=exception,
-                standard_built_in_tools_params=self.standard_built_in_tools_params,
-            )
+            failure_standard_logging_object
         )
         return start_time, end_time
 
