@@ -1045,6 +1045,12 @@ one-shot foreground action, not a recurring schedule. A
 `history_observation_failed` result exits nonzero; `no_history_observed` is a
 distinct bounded outcome and exits zero.
 
+`ChatGPTNativeHistoryProbeCleanupFailed` events include `cleanup_subreason`,
+an allowlisted code matched against existing fixed lifecycle failure messages.
+Unrecognized failures report `unknown`; exception text is never emitted.
+The event precedes the final retained-owner drain, so it does not report final
+retirement or imply that cleanup has completed.
+
 Probe option parsing is strict: abbreviated probe long options are rejected.
 When an exact or abbreviated probe option is present, malformed arguments emit
 only the fixed `ChatGPTNativeHistoryProbeConfigurationInvalid` event; argparse

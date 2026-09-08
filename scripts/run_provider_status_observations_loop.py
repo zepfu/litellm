@@ -17978,6 +17978,30 @@ _CHATGPT_NATIVE_HISTORY_PROBE_OBSERVATION_KEYS = frozenset(
         "warnings",
     }
 )
+_CHATGPT_NATIVE_HISTORY_PROBE_CLEANUP_SUBREASONS = {
+    "Native ChatGPT history lifecycle registration failed.": "native_registration_failed",
+    "Native ChatGPT history abort control failed.": "native_abort_control_failed",
+    "Native ChatGPT history finalization control failed.": "native_finalization_control_failed",
+    "Native ChatGPT history release control failed.": "native_release_control_failed",
+    "Native ChatGPT history worker start is still in progress.": "native_worker_start_pending",
+    "Native ChatGPT history target ownership could not be closed.": "native_target_close_unproven",
+    "Native ChatGPT history closer was not reaped.": "native_closer_not_reaped",
+    "Native ChatGPT history interception worker was not reaped.": "native_worker_not_reaped",
+    "Native ChatGPT history cleanup could not be proven.": "native_cleanup_unproven",
+    "Native ChatGPT history cleanup failed.": "native_cleanup_failed",
+    "Oracle browser owned-target closer is already registered.": "target_closer_already_registered",
+    "Oracle browser owned-target closer could not start.": "target_closer_start_failed",
+    "Oracle browser target was closed but its closer remains active.": "target_closer_still_active",
+    "Oracle browser owned-target closer was not reaped.": "target_closer_not_reaped",
+    "Oracle browser owned-target cleanup was not confirmed.": "target_cleanup_unproven",
+    "Oracle browser owner process inventory remains unknown.": "browser_inventory_unknown",
+    "Oracle browser owner process cleanup remains unproven.": "browser_cleanup_unproven",
+    "Oracle browser scratch remover could not start.": "scratch_remover_start_failed",
+    "Oracle browser scratch cleanup deadline expired.": "scratch_cleanup_deadline_expired",
+    "Oracle browser scratch cleanup remains pending.": "scratch_cleanup_pending",
+    "Oracle browser scratch cleanup failed.": "scratch_cleanup_failed",
+    "Oracle browser lifecycle cleanup remains pending.": "browser_lifecycle_cleanup_pending",
+}
 
 
 def _set_chatgpt_native_history_probe_failure(
@@ -18205,6 +18229,15 @@ def _run_chatgpt_native_history_probe(  # noqa: PLR0915 - bounded one-shot probe
         error_class, telemetry_class = _chatgpt_native_history_probe_exception_class(
             exc
         )
+        if isinstance(exc, OracleBrowserCleanupError):
+            message = exc.args[0] if len(exc.args) == 1 else None
+            event["cleanup_subreason"] = (
+                _CHATGPT_NATIVE_HISTORY_PROBE_CLEANUP_SUBREASONS.get(
+                    message, "unknown"
+                )
+                if isinstance(message, str)
+                else "unknown"
+            )
         _set_chatgpt_native_history_probe_failure(
             event,
             error_class=error_class,
