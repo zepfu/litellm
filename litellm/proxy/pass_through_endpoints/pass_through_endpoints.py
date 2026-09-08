@@ -185,8 +185,9 @@ from .aawm_adapter_runtime.provider_call_ledger import (
     ensure_openai_wire_replay_allowed,
     get_or_create_openai_provider_call_ledger,
     get_request_provider_call_ledger,
+    get_request_provider_call_ledger_snapshot,
     publish_reservation_metadata,
-    record_transport_connection_failure,
+    record_transport_connection_attempt,
     register_active_upstream_response,
     clear_active_upstream_response,
 )
@@ -1780,6 +1781,7 @@ def _record_passthrough_hidden_retry_metadata(
     failure_classification: Optional[str] = None,
     request: Optional[Request] = None,
     logical_provider_call_start: Optional[int] = None,
+    reservation_rejected: bool = False,
 ) -> None:
     if not isinstance(kwargs, dict):
         return
@@ -1795,17 +1797,27 @@ def _record_passthrough_hidden_retry_metadata(
         "max_attempts": max_attempts,
         "failure_class": failure_class,
         "wait_seconds": round(wait_seconds, 3),
-        "attempt_kind": "logical_provider_send_retry",
+        "attempt_kind": (
+            "reservation_denied"
+            if reservation_rejected
+            else "logical_provider_send_retry"
+        ),
     }
+    if reservation_rejected:
+        attempt_record["attempted_provider_call"] = False
     if status_code is not None:
         attempt_record["status_code"] = status_code
     if failure_classification is not None:
         attempt_record["failure_classification"] = failure_classification
 
     logical_provider_send_count: Optional[int] = None
-    if request is not None and logical_provider_call_start is not None:
-        request_ledger = get_request_provider_call_ledger(request)
-        if request_ledger is not None:
+    request_ledger = (
+        get_request_provider_call_ledger(request)
+        if request is not None
+        else None
+    )
+    if request_ledger is not None:
+        if logical_provider_call_start is not None:
             logical_provider_send_count = max(
                 0,
                 request_ledger.logical_provider_calls
@@ -1814,6 +1826,17 @@ def _record_passthrough_hidden_retry_metadata(
             attempt_record["logical_provider_send_count"] = (
                 logical_provider_send_count
             )
+        transport_connection_attempts = getattr(
+            request_ledger,
+            "transport_connection_attempts",
+            getattr(request_ledger, "transport_connection_failures", 0),
+        )
+        metadata["aawm_passthrough_hidden_connection_attempts"] = (
+            transport_connection_attempts
+        )
+        metadata["aawm_passthrough_hidden_connection_failures"] = (
+            transport_connection_attempts
+        )
     attempts.append(attempt_record)
 
     if logical_provider_send_count is not None:
@@ -1823,12 +1846,24 @@ def _record_passthrough_hidden_retry_metadata(
             1
             for record in attempts
             if isinstance(record, dict)
+            and record.get("attempt_kind") == "logical_provider_send_retry"
             and str(record.get("failure_class") or "").strip().lower()
             != "success"
         )
     metadata["aawm_passthrough_hidden_retry_count"] = retry_count
     metadata["aawm_passthrough_hidden_logical_retry_count"] = retry_count
     if final_outcome is not None:
+        if logical_provider_send_count is not None:
+            if final_outcome.startswith("success"):
+                final_outcome = (
+                    "success_after_retry" if retry_count > 0 else "success"
+                )
+            elif final_outcome.startswith("failed"):
+                final_outcome = (
+                    "failed_after_retry"
+                    if retry_count > 0
+                    else "failed_without_retry"
+                )
         metadata["aawm_passthrough_hidden_retry_final_outcome"] = final_outcome
     if failure_classification is not None:
         metadata[
@@ -2116,6 +2151,18 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         failure_classification=failure_classification,
                         request=request,
                         logical_provider_call_start=logical_provider_call_start,
+                        reservation_rejected=bool(
+                            getattr(
+                                terminal_exception,
+                                "aawm_call_ledger_exhausted",
+                                False,
+                            )
+                            or getattr(
+                                terminal_exception,
+                                "aawm_openai_wire_replay_blocked",
+                                False,
+                            )
+                        ),
                     )
                     _mark_passthrough_hidden_retry_budget_exhausted(
                         kwargs,
@@ -2164,6 +2211,14 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     failure_classification=failure_classification,
                     request=request,
                     logical_provider_call_start=logical_provider_call_start,
+                    reservation_rejected=bool(
+                        getattr(exc, "aawm_call_ledger_exhausted", False)
+                        or getattr(
+                            exc,
+                            "aawm_openai_wire_replay_blocked",
+                            False,
+                        )
+                    ),
                 )
                 raise
 
@@ -2204,6 +2259,14 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     failure_classification=failure_classification,
                     request=request,
                     logical_provider_call_start=logical_provider_call_start,
+                    reservation_rejected=bool(
+                        getattr(exc, "aawm_call_ledger_exhausted", False)
+                        or getattr(
+                            exc,
+                            "aawm_openai_wire_replay_blocked",
+                            False,
+                        )
+                    ),
                 )
                 _mark_passthrough_hidden_retry_budget_exhausted(
                     kwargs,
@@ -4654,6 +4717,53 @@ async def _aawm_run_with_session_owner_lease_renewal(
         )
 
 
+def _bind_grok_native_oauth_owner_session_header_after_owner_guard(
+    *,
+    request: Request,
+    headers: Dict[str, Any],
+    url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+    egress_credential_family: Optional[str],
+    expected_target_family: Optional[str],
+) -> Dict[str, Any]:
+    """Bind raw Grok egress headers after the request owner is authoritative."""
+
+    provider_families = {
+        str(value).casefold()
+        for value in (
+            custom_llm_provider,
+            egress_credential_family,
+            expected_target_family,
+        )
+        if value is not None
+    }
+    if "xai" not in provider_families:
+        return headers
+
+    request_path = str(getattr(getattr(request, "url", None), "path", "") or "")
+    target_host = str(getattr(url, "host", "") or "").casefold()
+    is_grok_route = request_path == "/grok" or request_path.startswith(
+        "/grok/"
+    )
+    is_grok_target = target_host == "cli-chat-proxy.grok.com" or target_host.endswith(
+        ".grok.com"
+    )
+    if not (is_grok_route or is_grok_target):
+        return headers
+
+    # Header forwarding is intentionally resolved before the owner guard. The
+    # provider helper is called only after that guard so caller session B cannot
+    # survive when the server reserved owner A.
+    from litellm.proxy.pass_through_endpoints.providers.xai.request_prep import (
+        _bind_grok_native_oauth_owner_session_header,
+    )
+
+    return _bind_grok_native_oauth_owner_session_header(
+        headers,
+        request=request,
+    )
+
+
 async def pass_through_request(  # noqa: PLR0915
     request: Request,
     target: str,
@@ -4753,7 +4863,13 @@ async def pass_through_request(  # noqa: PLR0915
         if request_state is None:
             return
         if openai_call_ledger is not None:
-            ledger_snapshot = openai_call_ledger.snapshot()
+            ledger_snapshot = get_request_provider_call_ledger_snapshot(request)
+            if ledger_snapshot is None:
+                ledger_snapshot = openai_call_ledger.snapshot()
+            transport_connection_attempts = ledger_snapshot.get(
+                "transport_connection_attempts",
+                ledger_snapshot.get("transport_connection_failures", 0),
+            )
             setattr(
                 request_state,
                 "aawm_openai_send_ledger_snapshot",
@@ -4766,8 +4882,13 @@ async def pass_through_request(  # noqa: PLR0915
             )
             setattr(
                 request_state,
+                "aawm_openai_transport_connection_attempts",
+                transport_connection_attempts,
+            )
+            setattr(
+                request_state,
                 "aawm_openai_transport_connection_failures",
-                ledger_snapshot["transport_connection_failures"],
+                transport_connection_attempts,
             )
         retry_metadata = _ensure_passthrough_metadata(kwargs)
         setattr(
@@ -5268,7 +5389,7 @@ async def pass_through_request(  # noqa: PLR0915
                         follow_redirects=False,
                     )
                 except (httpx.ConnectError, httpx.ConnectTimeout):
-                    record_transport_connection_failure(request)
+                    record_transport_connection_attempt(request)
                     raise
                 register_active_upstream_response(request, response)
                 return response
@@ -5289,6 +5410,14 @@ async def pass_through_request(  # noqa: PLR0915
                     else None
                 ),
                 defer_session_owner_promotion=defer_session_owner_promotion,
+            )
+            headers = _bind_grok_native_oauth_owner_session_header_after_owner_guard(
+                request=request,
+                headers=headers,
+                url=url,
+                custom_llm_provider=custom_llm_provider,
+                egress_credential_family=egress_credential_family,
+                expected_target_family=expected_target_family,
             )
             upstream_wait_started_at = datetime.now()
             try:
@@ -5539,6 +5668,14 @@ async def pass_through_request(  # noqa: PLR0915
                 else None
             ),
             defer_session_owner_promotion=defer_session_owner_promotion,
+        )
+        headers = _bind_grok_native_oauth_owner_session_header_after_owner_guard(
+            request=request,
+            headers=headers,
+            url=url,
+            custom_llm_provider=custom_llm_provider,
+            egress_credential_family=egress_credential_family,
+            expected_target_family=expected_target_family,
         )
         upstream_wait_started_at = datetime.now()
 
