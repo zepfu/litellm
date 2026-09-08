@@ -201,43 +201,13 @@ export function buildUsageReport(
       output.uncertain.ambiguousWindowMembership += 1;
       continue;
     }
-    if (
-      attempt.scope.providerUserId === null ||
-      attempt.scope.workspaceId === null ||
-      attempt.scope.quotaOwnerId === null
-    ) {
-      output.uncertain.unknownOwnership += 1;
+    const eligibility = classifyAttempt(attempt);
+    if (eligibility.disposition === "uncertain") {
+      output.uncertain[eligibility.reason] += 1;
       continue;
     }
-    if (attempt.surface !== "chat") {
-      output.excluded.nonChatSurface += 1;
-      continue;
-    }
-    if (
-      attempt.origin !== null &&
-      ["shared", "imported", "copied"].includes(attempt.origin)
-    ) {
-      output.excluded.excludedOrigin += 1;
-      continue;
-    }
-    if (attempt.quarantine?.state === "quarantined") {
-      output.uncertain.quarantined += 1;
-      continue;
-    }
-    if (
-      attempt.quarantine === undefined ||
-      attempt.identityBasis === "unresolved" ||
-      attempt.warnings.includes("unresolved_linkage")
-    ) {
-      output.uncertain.unresolvedIdentity += 1;
-      continue;
-    }
-    if (attempt.outcome === "rejected_before_start") {
-      output.excluded.rejectedBeforeStart += 1;
-      continue;
-    }
-    if (!attempt.generationStarted && !attempt.completedAnswer) {
-      output.uncertain.nonGenerationActivity += 1;
+    if (eligibility.disposition === "excluded") {
+      output.excluded[eligibility.reason] += 1;
       continue;
     }
 
@@ -288,34 +258,104 @@ function addActivityMetrics(
 ): void {
   const asOfMs = asOf.getTime();
   const periods = [
-    { metric: activity.last24h, durationMs: 24 * 60 * 60 * 1000 },
-    { metric: activity.last7d, durationMs: 7 * 24 * 60 * 60 * 1000 },
+    {
+      metric: activity.last24h,
+      start: new Date(asOfMs - 24 * 60 * 60 * 1000).toISOString(),
+      end: asOf.toISOString(),
+    },
+    {
+      metric: activity.last7d,
+      start: new Date(asOfMs - 7 * 24 * 60 * 60 * 1000).toISOString(),
+      end: asOf.toISOString(),
+    },
   ];
 
   for (const attempt of attempts) {
     if (!attempt.generationStarted && !attempt.completedAnswer) {
       continue;
     }
-
-    const attemptMs = new Date(attempt.attemptTime ?? "").getTime();
-    if (!Number.isFinite(attemptMs)) {
-      for (const { metric } of periods) {
-        metric.uncertain += 1;
-      }
-      continue;
-    }
-
-    for (const { metric, durationMs } of periods) {
-      if (attemptMs < asOfMs - durationMs || attemptMs > asOfMs) {
+    const eligibility = classifyAttempt(attempt);
+    for (const { metric, start, end } of periods) {
+      const membership = intervalMembership({
+        window: { start, end },
+        time: {
+          attemptTime: attempt.attemptTime,
+          earliestPossibleAt: attempt.earliestPossibleAt,
+          latestPossibleAt: attempt.latestPossibleAt,
+        },
+      });
+      if (membership === "out") {
         metric.excluded += 1;
-      } else {
-        metric.count += 1;
-        if (attempt.completedAnswer) {
-          metric.completed += 1;
-        }
+        continue;
+      }
+      if (membership !== "in") {
+        metric.uncertain += 1;
+        continue;
+      }
+      if (eligibility.disposition === "uncertain") {
+        metric.uncertain += 1;
+        continue;
+      }
+      if (eligibility.disposition === "excluded") {
+        metric.excluded += 1;
+        continue;
+      }
+      metric.count += 1;
+      if (attempt.completedAnswer) {
+        metric.completed += 1;
       }
     }
   }
+}
+
+type AttemptEligibility =
+  | { disposition: "definite" }
+  | {
+      disposition: "uncertain";
+      reason: keyof UsageUncertainty;
+    }
+  | {
+      disposition: "excluded";
+      reason: keyof UsageExclusions;
+    };
+
+function classifyAttempt(attempt: ReconstructedAttempt): AttemptEligibility {
+  if (
+    attempt.scope.providerUserId === null ||
+    attempt.scope.workspaceId === null ||
+    attempt.scope.quotaOwnerId === null
+  ) {
+    return { disposition: "uncertain", reason: "unknownOwnership" };
+  }
+  if (attempt.surface !== "chat" || attempt.scope.surface !== "chat") {
+    return { disposition: "excluded", reason: "nonChatSurface" };
+  }
+  const origin = attempt.origin?.toLowerCase() ?? null;
+  if (
+    origin === "shared" ||
+    origin === "imported" ||
+    origin === "copied" ||
+    origin === "true"
+  ) {
+    return { disposition: "excluded", reason: "excludedOrigin" };
+  }
+  if (attempt.quarantine?.state === "quarantined") {
+    return { disposition: "uncertain", reason: "quarantined" };
+  }
+  if (
+    attempt.quarantine === undefined ||
+    attempt.identityBasis === "unresolved" ||
+    attempt.warnings.includes("unresolved_linkage")
+  ) {
+    return { disposition: "uncertain", reason: "unresolvedIdentity" };
+  }
+  if (attempt.outcome === "rejected_before_start") {
+    return { disposition: "excluded", reason: "rejectedBeforeStart" };
+  }
+  if (!attempt.generationStarted && !attempt.completedAnswer) {
+    return { disposition: "uncertain", reason: "nonGenerationActivity" };
+  }
+  return { disposition: "definite" };
 }
 
 function validateSnapshot(snapshot: UsageReportSnapshot): void {
