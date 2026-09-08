@@ -4578,6 +4578,10 @@ def _oauth_refresh_observation_metadata(event: Mapping[str, Any]) -> Dict[str, A
         "refresh_threshold_seconds",
         "credential_identity",
         "credential_generation",
+        "identity_bootstrap_needed",
+        "identity_subject_present",
+        "identity_verified",
+        "identity_bootstrapped",
         "structurally_valid",
         "access_available",
         "refresh_possible",
@@ -13414,6 +13418,7 @@ def _run_oauth_refresh_schedule(
     eligibility_inspector_kwargs: Optional[Mapping[str, Any]] = None,
     preserve_failure_when_not_due: bool = False,
     clear_failure_on_usable_identity_change: bool = False,
+    identity_bootstrap_call: Optional[Callable[[], Mapping[str, Any]]] = None,
 ) -> tuple[
     Dict[str, Any],
     Dict[str, Any],
@@ -13481,14 +13486,24 @@ def _run_oauth_refresh_schedule(
         schedule.last_actual_attempt_at = _scheduler_timestamp(wall_now)
         schedule.actual_attempt_count += 1
 
-    should_call = (
+    token_refresh_call = (
         (force or bool(pre.get("eligible")))
         and not actual_throttled
         and not terminal_blocked
     )
+    identity_only_call = (
+        not token_refresh_call
+        and bool(pre.get("identity_bootstrap_needed"))
+        and identity_bootstrap_call is not None
+    )
+    should_call = token_refresh_call or identity_only_call
     if should_call:
         try:
-            operation_summary = refresh_call(on_token_endpoint_attempt)
+            if identity_only_call:
+                assert identity_bootstrap_call is not None
+                operation_summary = identity_bootstrap_call()
+            else:
+                operation_summary = refresh_call(on_token_endpoint_attempt)
         except Exception as exc:
             operation_summary = {
                 "attempted": True,
@@ -13878,6 +13893,18 @@ def _run_xai_oauth_refresh_task(
             http_timeout_seconds=config.xai_oauth_http_timeout_seconds,
             on_token_endpoint_attempt=callback,
         ),
+        identity_bootstrap_call=lambda: xai_oauth_refresh.refresh_xai_oauth_auth_file(
+            config.xai_oauth_auth_file,
+            scope=config.xai_oauth_scope,
+            buffer_seconds=config.xai_oauth_refresh_buffer_seconds,
+            force=False,
+            lock_file=_resolve_xai_oauth_sidecar_lock_file(
+                config.xai_oauth_lock_file,
+                config.xai_oauth_auth_file,
+            ),
+            http_timeout_seconds=config.xai_oauth_http_timeout_seconds,
+            identity_only=True,
+        ),
         force=config.xai_oauth_force_refresh,
         attempt_interval_seconds=config.xai_oauth_refresh_interval_seconds,
         eligibility_cadence_seconds=config.interval_seconds,
@@ -13902,6 +13929,10 @@ def _run_xai_oauth_refresh_task(
         or config.xai_oauth_auth_file_source,
         "scope_source": summary.get("scope_source")
         or config.xai_oauth_scope_source,
+        "identity_bootstrap_needed": final.get("identity_bootstrap_needed"),
+        "identity_subject_present": final.get("identity_subject_present"),
+        "identity_verified": summary.get("identity_verified"),
+        "identity_bootstrapped": bool(summary.get("identity_bootstrapped")),
         "expires_at": final.get("expires_at") or summary.get("expires_at"),
         "error_class": _redacted_summary_field(summary.get("error_class")),
         "error_message": _redacted_failure_message(summary.get("error_message")),

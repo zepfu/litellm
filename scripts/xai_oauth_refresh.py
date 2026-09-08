@@ -12,6 +12,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Lock
+from time import monotonic as _monotonic
 from typing import Any, Callable, Dict, Iterator, Mapping, MutableMapping, Optional, Tuple
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
@@ -50,16 +52,27 @@ DEFAULT_XAI_OAUTH_AUTH_FILE = _FOUNDATION_DEFAULT_XAI_OAUTH_AUTH_FILE
 DEFAULT_XAI_OAUTH_LOCK_FILE = _FOUNDATION_DEFAULT_XAI_OAUTH_LOCK_FILE
 DEFAULT_XAI_OAUTH_SCOPE = _FOUNDATION_DEFAULT_XAI_OAUTH_SCOPE
 DEFAULT_XAI_OAUTH_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
+DEFAULT_XAI_OAUTH_ISSUER = "https://auth.x.ai"
+DEFAULT_XAI_OAUTH_JWKS_URL = "https://auth.x.ai/.well-known/jwks.json"
+DEFAULT_XAI_OAUTH_ID_TOKEN_ALGORITHM = "ES256"
 DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS = 300
 DEFAULT_XAI_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_XAI_OAUTH_AUTH_FILE_MODE = 0o600
 DEFAULT_XAI_OAUTH_ERROR_MESSAGE_LIMIT = 500
 _XAI_OAUTH_MAX_AUTH_FILE_BYTES = 1_048_576
+_XAI_OAUTH_MAX_ID_TOKEN_BYTES = 64 * 1024
+_XAI_OAUTH_MAX_JWKS_BYTES = 256 * 1024
+_XAI_OAUTH_MAX_JWKS_KEYS = 16
+_XAI_OAUTH_JWKS_CACHE_TTL_SECONDS = 300.0
+_XAI_OAUTH_MAX_SUBJECT_LENGTH = 512
+_XAI_OAUTH_IDENTITY_FIELDS = ("id_token", "subject")
 
 _XAI_OAUTH_TERMINAL_REFRESH_ERROR_CLASSES = frozenset(
     {"invalid_grant", "refresh_token_reused"}
 )
 _XAI_OAUTH_RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 425, 429})
+_XAI_OAUTH_JWKS_CACHE: Optional[Tuple[float, Dict[str, Any]]] = None
+_XAI_OAUTH_JWKS_CACHE_LOCK = Lock()
 
 # Keep historical module alias; redaction lives in secret_managers.
 _SECRET_FIELD_NAMES = DEFAULT_SECRET_FIELD_NAMES
@@ -71,6 +84,25 @@ class XaiOAuthRefreshError(ValueError):
     def __init__(self, error_class: str, message: str) -> None:
         self.error_class = error_class
         super().__init__(message)
+
+
+class XaiOAuthIdentityError(XaiOAuthRefreshError):
+    """A sanitized xAI OAuth identity verification failure."""
+
+
+class _NoRedirectHandler(urllib_request.HTTPRedirectHandler):
+    """Prevent identity-key requests from following redirects."""
+
+    def redirect_request(
+        self,
+        req: urllib_request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
 
 
 def _issued_lifetime_seconds(
@@ -209,6 +241,8 @@ class XaiOAuthRefreshSummary:
     refresh_due_at: Optional[str] = None
     route_unusable_at: Optional[str] = None
     route_safety_buffer_seconds: Optional[float] = None
+    identity_verified: Optional[bool] = None
+    identity_bootstrapped: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -241,6 +275,8 @@ class XaiOAuthRefreshSummary:
             "refresh_due_at": self.refresh_due_at,
             "route_unusable_at": self.route_unusable_at,
             "route_safety_buffer_seconds": self.route_safety_buffer_seconds,
+            "identity_verified": self.identity_verified,
+            "identity_bootstrapped": self.identity_bootstrapped,
         }
 
 
@@ -308,6 +344,10 @@ def inspect_xai_oauth_credential_health(
             credential_generation=credential_generation,
             auth_file_source=resolution.auth_file_source,
             scope_source=resolution.scope_source,
+            identity_bootstrap_needed=_xai_identity_bootstrap_needed(credential),
+            identity_subject_present=(
+                _clean_xai_identity_subject(credential.get("subject")) is not None
+            ),
             lifecycle=lifecycle,
             route_safety_buffer_seconds=route_safety_buffer_seconds,
         )
@@ -334,6 +374,8 @@ def _xai_health_summary(
     credential_generation: Optional[str] = None,
     auth_file_source: Optional[str] = None,
     scope_source: Optional[str] = None,
+    identity_bootstrap_needed: bool = False,
+    identity_subject_present: bool = False,
     lifecycle: Optional[Mapping[str, Any]] = None,
     route_safety_buffer_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
@@ -352,6 +394,8 @@ def _xai_health_summary(
         "credential_generation": credential_generation,
         "auth_file_source": auth_file_source,
         "scope_source": scope_source,
+        "identity_bootstrap_needed": identity_bootstrap_needed,
+        "identity_subject_present": identity_subject_present,
         "structurally_valid": lifecycle.get("structurally_valid"),
         "access_available": lifecycle.get("access_available"),
         "refresh_possible": lifecycle.get("refresh_possible"),
@@ -409,7 +453,7 @@ def _write_private_file_text(path: Path, content: str, *, mode: int = 0o600) -> 
     )
 
 
-def refresh_xai_oauth_auth_file(
+def refresh_xai_oauth_auth_file(  # noqa: PLR0915
     auth_file: str | Path,
     *,
     scope: Optional[str] = None,
@@ -421,8 +465,9 @@ def refresh_xai_oauth_auth_file(
     client_secret: Optional[str] = None,
     http_timeout_seconds: float = DEFAULT_XAI_OAUTH_HTTP_TIMEOUT_SECONDS,
     on_token_endpoint_attempt: Optional[Callable[[], None]] = None,
+    identity_only: bool = False,
 ) -> Dict[str, Any]:
-    """Refresh a managed xAI OAuth auth file when near expiry or forced."""
+    """Refresh or identity-bootstrap a managed xAI OAuth auth file."""
 
     resolved_auth_file = Path(auth_file).expanduser()
     resolved_scope = _resolve_scope(scope)
@@ -432,6 +477,7 @@ def refresh_xai_oauth_auth_file(
     credential: Optional[MutableMapping[str, Any]] = None
     lifecycle: Optional[Mapping[str, Any]] = None
     credential_generation: Optional[str] = None
+    published_refresh = False
 
     try:
         resolution = resolve_xai_oauth_credentials(
@@ -470,14 +516,83 @@ def refresh_xai_oauth_auth_file(
                 lifecycle.get("expires_at")
             )
 
-            if not force and not lifecycle["refresh_due"]:
+            identity_verified: Optional[bool] = None
+            identity_bootstrapped = False
+            identity_error: Optional[XaiOAuthIdentityError] = None
+            refresh_due = bool(lifecycle["refresh_due"])
+            identity_requested = identity_only or (
+                not force
+                and not refresh_due
+                and _xai_identity_bootstrap_needed(credential)
+            )
+            if identity_requested:
+                try:
+                    subject_to_persist, identity_verified = (
+                        _resolve_xai_identity_subject(
+                            credential,
+                            refreshed=None,
+                            scope=resolved_scope,
+                            client_id=client_id,
+                            http_timeout_seconds=http_timeout_seconds,
+                        )
+                    )
+                    if subject_to_persist is not None:
+                        credential["subject"] = subject_to_persist
+                        _write_credential_payload(resolved_auth_file, raw_payload)
+                        identity_bootstrapped = True
+                        (
+                            published_payload,
+                            published_stat_result,
+                        ) = _read_credential_payload_with_stat(
+                            resolved_read_auth_file
+                        )
+                        credential = _select_credential_record(
+                            published_payload,
+                            resolved_scope,
+                        )
+                        credential_generation = _credential_generation(
+                            resolved_read_auth_file,
+                            credential,
+                            scope=resolved_scope,
+                            stat_result=published_stat_result,
+                        )
+                        lifecycle = evaluate_xai_oauth_credential_lifecycle(
+                            credential,
+                            route_safety_buffer_seconds=route_safety_buffer_seconds,
+                            refresh_min_seconds=resolved_buffer_seconds,
+                        )
+                        threshold, threshold_source, threshold_degraded = (
+                            _credential_refresh_threshold_metadata(
+                                credential,
+                                min_seconds=resolved_buffer_seconds,
+                            )
+                        )
+                except XaiOAuthIdentityError as exc:
+                    identity_error = exc
+                except Exception as exc:
+                    identity_error = XaiOAuthIdentityError(
+                        "identity_persist_failed",
+                        "xAI OAuth identity could not be persisted.",
+                    )
+                    identity_error.__cause__ = exc
+
+            if identity_only or not force and not refresh_due:
                 return XaiOAuthRefreshSummary(
                     attempted=False,
                     refreshed=False,
                     skipped=True,
                     auth_file=str(resolved_auth_file),
                     scope=resolved_scope,
-                    expires_at=current_expires_at,
+                    expires_at=_format_expires_at(lifecycle.get("expires_at"))
+                    or current_expires_at,
+                    error_class=(
+                        identity_error.error_class if identity_error is not None else None
+                    ),
+                    error_message=(
+                        _sanitize_error_message(str(identity_error))
+                        if identity_error is not None
+                        else None
+                    ),
                     auth_degraded=threshold_degraded,
                     refresh_threshold_seconds=threshold,
                     refresh_threshold_source=threshold_source,
@@ -486,6 +601,8 @@ def refresh_xai_oauth_auth_file(
                     credential_generation=credential_generation,
                     auth_file_source=resolution.auth_file_source,
                     scope_source=resolution.scope_source,
+                    identity_verified=identity_verified,
+                    identity_bootstrapped=identity_bootstrapped,
                     **_lifecycle_summary_fields(
                         lifecycle,
                         route_safety_buffer_seconds=route_safety_buffer_seconds,
@@ -499,9 +616,14 @@ def refresh_xai_oauth_auth_file(
                 client_secret=client_secret,
                 http_timeout_seconds=http_timeout_seconds,
                 on_token_endpoint_attempt=on_token_endpoint_attempt,
+                scope=resolved_scope,
             )
             _update_credential_record(credential, refreshed)
+            identity_candidate = dict(credential)
+            for field_name in _XAI_OAUTH_IDENTITY_FIELDS:
+                credential.pop(field_name, None)
             _write_credential_payload(resolved_auth_file, raw_payload)
+            published_refresh = True
             _published_payload, published_stat_result = (
                 _read_credential_payload_with_stat(resolved_read_auth_file)
             )
@@ -509,12 +631,68 @@ def refresh_xai_oauth_auth_file(
                 _published_payload,
                 resolved_scope,
             )
+            credential = published_credential
             credential_generation = _credential_generation(
                 resolved_read_auth_file,
                 published_credential,
                 scope=resolved_scope,
                 stat_result=published_stat_result,
             )
+
+            try:
+                subject_to_persist, identity_verified = _resolve_xai_identity_subject(
+                    identity_candidate,
+                    refreshed=refreshed,
+                    scope=resolved_scope,
+                    client_id=client_id,
+                    http_timeout_seconds=http_timeout_seconds,
+                )
+                restored_id_token = _xai_identity_token_for_record(
+                    identity_candidate,
+                    refreshed,
+                )
+                if restored_id_token is not None:
+                    credential["id_token"] = restored_id_token
+                restored_subject = _clean_xai_identity_subject(
+                    identity_candidate.get("subject")
+                )
+                if subject_to_persist is not None:
+                    credential["subject"] = subject_to_persist
+                elif restored_subject is not None:
+                    credential["subject"] = restored_subject
+                preserve_existing_identity = (
+                    identity_verified is None
+                    and restored_subject is not None
+                    and restored_id_token is None
+                )
+                if identity_verified or preserve_existing_identity:
+                    _write_credential_payload(resolved_auth_file, _published_payload)
+                    identity_bootstrapped = subject_to_persist is not None
+            except XaiOAuthIdentityError as exc:
+                identity_error = exc
+            except Exception as exc:
+                identity_error = XaiOAuthIdentityError(
+                    "identity_persist_failed",
+                    "xAI OAuth identity could not be persisted.",
+                )
+                identity_error.__cause__ = exc
+
+            if identity_bootstrapped:
+                (
+                    _published_payload,
+                    published_stat_result,
+                ) = _read_credential_payload_with_stat(resolved_read_auth_file)
+                published_credential = _select_credential_record(
+                    _published_payload,
+                    resolved_scope,
+                )
+                credential = published_credential
+                credential_generation = _credential_generation(
+                    resolved_read_auth_file,
+                    published_credential,
+                    scope=resolved_scope,
+                    stat_result=published_stat_result,
+                )
             lifecycle = evaluate_xai_oauth_credential_lifecycle(
                 credential,
                 route_safety_buffer_seconds=route_safety_buffer_seconds,
@@ -541,6 +719,16 @@ def refresh_xai_oauth_auth_file(
                 credential_generation=credential_generation,
                 auth_file_source=resolution.auth_file_source,
                 scope_source=resolution.scope_source,
+                error_class=(
+                    identity_error.error_class if identity_error is not None else None
+                ),
+                error_message=(
+                    _sanitize_error_message(str(identity_error))
+                    if identity_error is not None
+                    else None
+                ),
+                identity_verified=identity_verified,
+                identity_bootstrapped=identity_bootstrapped,
                 **_lifecycle_summary_fields(
                     lifecycle,
                     route_safety_buffer_seconds=route_safety_buffer_seconds,
@@ -561,7 +749,7 @@ def refresh_xai_oauth_auth_file(
         error_class, error_message = _refresh_error_summary(exc)
         return XaiOAuthRefreshSummary(
             attempted=True,
-            refreshed=False,
+            refreshed=published_refresh,
             skipped=False,
             auth_file=str(resolved_auth_file),
             scope=resolved_scope,
@@ -667,6 +855,10 @@ def inspect_xai_oauth_refresh_eligibility(
             credential_generation=credential_generation,
             auth_file_source=resolution.auth_file_source,
             scope_source=resolution.scope_source,
+            identity_bootstrap_needed=_xai_identity_bootstrap_needed(credential),
+            identity_subject_present=(
+                _clean_xai_identity_subject(credential.get("subject")) is not None
+            ),
             lifecycle=lifecycle,
             route_safety_buffer_seconds=route_safety_buffer_seconds,
         )
@@ -717,6 +909,8 @@ def _eligibility_summary(
     refresh_threshold_seconds: Optional[float] = None,
     refresh_threshold_source: Optional[str] = None,
     refresh_threshold_degraded: bool = False,
+    identity_bootstrap_needed: bool = False,
+    identity_subject_present: bool = False,
 ) -> Dict[str, Any]:
     lifecycle = lifecycle or {}
     return {
@@ -733,6 +927,8 @@ def _eligibility_summary(
         "credential_generation": credential_generation,
         "auth_file_source": auth_file_source,
         "scope_source": scope_source,
+        "identity_bootstrap_needed": identity_bootstrap_needed,
+        "identity_subject_present": identity_subject_present,
         "structurally_valid": lifecycle.get("structurally_valid"),
         "access_available": lifecycle.get("access_available"),
         "refresh_possible": lifecycle.get("refresh_possible"),
@@ -781,6 +977,372 @@ def _resolve_scope(scope: Optional[str]) -> str:
     if isinstance(env_scope, str) and env_scope.strip():
         return env_scope.strip()
     return DEFAULT_XAI_OAUTH_SCOPE
+
+
+def _resolve_xai_oauth_client_configuration(
+    credential: Mapping[str, Any],
+    scope: str,
+    explicit_client_id: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Resolve one trusted client/audience pair from server configuration."""
+    configured: list[tuple[str, str]] = []
+    resolved_scope = _clean_oauth_string(scope)
+    if resolved_scope is None:
+        raise XaiOAuthRefreshError(
+            "credential_configuration_error",
+            "xAI OAuth identity verification requires a configured scope.",
+        )
+
+    scope_prefix, separator, scope_client_id = resolved_scope.partition("::")
+    if separator:
+        if (
+            scope_prefix != DEFAULT_XAI_OAUTH_ISSUER
+            or not scope_client_id
+            or "::" in scope_client_id
+        ):
+            raise XaiOAuthRefreshError(
+                "credential_configuration_error",
+                "xAI OAuth scope has an invalid trusted client configuration.",
+            )
+        configured.append(("scope", scope_client_id))
+    elif resolved_scope.startswith(f"{DEFAULT_XAI_OAUTH_ISSUER}::"):
+        raise XaiOAuthRefreshError(
+            "credential_configuration_error",
+            "xAI OAuth scope has an invalid trusted client configuration.",
+        )
+
+    for source, value in (
+        ("client_id", explicit_client_id),
+        ("oidc_client_id", credential.get("oidc_client_id")),
+        ("client_id", credential.get("client_id")),
+    ):
+        cleaned = _clean_oauth_string(value)
+        if cleaned is not None:
+            configured.append((source, cleaned))
+
+    if not configured:
+        raise XaiOAuthRefreshError(
+            "credential_configuration_error",
+            "xAI OAuth refresh requires a configured client identifier.",
+        )
+
+    trusted_client_id = configured[0][1]
+    if any(value != trusted_client_id for _source, value in configured[1:]):
+        raise XaiOAuthRefreshError(
+            "credential_configuration_error",
+            "xAI OAuth scope and client configuration disagree.",
+        )
+    return trusted_client_id, trusted_client_id
+
+
+def _load_xai_pyjwt() -> Any:
+    try:
+        import jwt
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise XaiOAuthIdentityError(
+            "identity_verification_unavailable",
+            "xAI OAuth identity verification is unavailable.",
+        ) from exc
+    if not callable(getattr(jwt, "decode", None)) or not callable(
+        getattr(jwt, "get_unverified_header", None)
+    ):
+        raise XaiOAuthIdentityError(
+            "identity_verification_unavailable",
+            "xAI OAuth identity verification is unavailable.",
+        )
+    return jwt
+
+
+def _read_xai_jwks_response(response: Any) -> bytes:
+    headers = getattr(response, "headers", None)
+    content_length = headers.get("Content-Length") if headers is not None else None
+    if content_length is not None:
+        try:
+            if int(content_length) > _XAI_OAUTH_MAX_JWKS_BYTES:
+                raise XaiOAuthIdentityError(
+                    "identity_jwks_invalid",
+                    "xAI OAuth identity key set is too large.",
+                )
+        except (TypeError, ValueError):
+            pass
+    body = response.read(_XAI_OAUTH_MAX_JWKS_BYTES + 1)
+    if not isinstance(body, bytes) or len(body) > _XAI_OAUTH_MAX_JWKS_BYTES:
+        raise XaiOAuthIdentityError(
+            "identity_jwks_invalid",
+            "xAI OAuth identity key set is too large.",
+        )
+    return body
+
+
+def _invalidate_xai_jwks_cache() -> None:
+    global _XAI_OAUTH_JWKS_CACHE
+    with _XAI_OAUTH_JWKS_CACHE_LOCK:
+        _XAI_OAUTH_JWKS_CACHE = None
+
+
+def _fetch_xai_oauth_jwks(  # noqa: PLR0915
+    http_timeout_seconds: float,
+) -> Dict[str, Any]:
+    global _XAI_OAUTH_JWKS_CACHE
+    cached_at: Optional[float]
+    cached_keys: Optional[Dict[str, Any]]
+    with _XAI_OAUTH_JWKS_CACHE_LOCK:
+        if _XAI_OAUTH_JWKS_CACHE is None:
+            cached_at = None
+            cached_keys = None
+        else:
+            cached_at, cached_keys = _XAI_OAUTH_JWKS_CACHE
+            if _monotonic() - cached_at >= _XAI_OAUTH_JWKS_CACHE_TTL_SECONDS:
+                cached_at = None
+                cached_keys = None
+        if cached_at is not None and cached_keys is not None:
+            return dict(cached_keys)
+
+    request = urllib_request.Request(
+        DEFAULT_XAI_OAUTH_JWKS_URL,
+        headers={"accept": "application/json"},
+        method="GET",
+    )
+    try:
+        opener = urllib_request.build_opener(_NoRedirectHandler())
+        with opener.open(request, timeout=http_timeout_seconds) as response:
+            response_status = int(getattr(response, "status", 200))
+            response_url = getattr(response, "geturl", lambda: None)()
+            if response_url not in {None, DEFAULT_XAI_OAUTH_JWKS_URL}:
+                raise XaiOAuthIdentityError(
+                    "identity_jwks_redirect",
+                    "xAI OAuth identity key set redirected unexpectedly.",
+                )
+            response_body = _read_xai_jwks_response(response)
+    except XaiOAuthIdentityError:
+        raise
+    except urllib_error.HTTPError as exc:
+        raise XaiOAuthIdentityError(
+            "identity_jwks_http_error",
+            "xAI OAuth identity key set request failed.",
+        ) from exc
+    except (urllib_error.URLError, TimeoutError, OSError) as exc:
+        raise XaiOAuthIdentityError(
+            "identity_jwks_transport_error",
+            "xAI OAuth identity key set request failed.",
+        ) from exc
+
+    if response_status < 200 or response_status >= 300:
+        raise XaiOAuthIdentityError(
+            "identity_jwks_http_error",
+            "xAI OAuth identity key set request failed.",
+        )
+    try:
+        payload = json.loads(response_body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise XaiOAuthIdentityError(
+            "identity_jwks_invalid",
+            "xAI OAuth identity key set is invalid.",
+        ) from exc
+    keys = payload.get("keys") if isinstance(payload, Mapping) else None
+    if not isinstance(keys, list) or not keys or len(keys) > _XAI_OAUTH_MAX_JWKS_KEYS:
+        raise XaiOAuthIdentityError(
+            "identity_jwks_invalid",
+            "xAI OAuth identity key set is invalid.",
+        )
+
+    jwt = _load_xai_pyjwt()
+    parsed_keys: Dict[str, Any] = {}
+    for jwk in keys:
+        if not isinstance(jwk, Mapping):
+            raise XaiOAuthIdentityError(
+                "identity_jwks_invalid",
+                "xAI OAuth identity key set is invalid.",
+            )
+        kid = _clean_oauth_string(jwk.get("kid"))
+        if (
+            kid is None
+            or jwk.get("kty") != "EC"
+            or jwk.get("crv") != "P-256"
+            or jwk.get("alg") not in {None, DEFAULT_XAI_OAUTH_ID_TOKEN_ALGORITHM}
+            or jwk.get("use") not in {None, "sig"}
+            or kid in parsed_keys
+        ):
+            raise XaiOAuthIdentityError(
+                "identity_jwks_invalid",
+                "xAI OAuth identity key set is invalid.",
+            )
+        try:
+            parsed_keys[kid] = jwt.algorithms.ECAlgorithm.from_jwk(
+                json.dumps(jwk, sort_keys=True, separators=(",", ":"))
+            )
+        except Exception as exc:
+            raise XaiOAuthIdentityError(
+                "identity_jwks_invalid",
+                "xAI OAuth identity key set is invalid.",
+            ) from exc
+
+    with _XAI_OAUTH_JWKS_CACHE_LOCK:
+        _XAI_OAUTH_JWKS_CACHE = (_monotonic(), dict(parsed_keys))
+    return parsed_keys
+
+
+def _clean_xai_identity_subject(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    if not value or len(value) > _XAI_OAUTH_MAX_SUBJECT_LENGTH:
+        return None
+    if value != value.strip() or any(
+        ord(character) < 32 or ord(character) == 127 for character in value
+    ):
+        return None
+    return value
+
+
+def _verified_xai_id_token_subject(
+    id_token: Any,
+    *,
+    audience: str,
+    http_timeout_seconds: float,
+) -> str:
+    if not isinstance(id_token, str) or not id_token.strip():
+        raise XaiOAuthIdentityError(
+            "identity_token_missing",
+            "xAI OAuth identity token is missing.",
+        )
+    if len(id_token.encode("utf-8")) > _XAI_OAUTH_MAX_ID_TOKEN_BYTES:
+        raise XaiOAuthIdentityError(
+            "identity_token_invalid",
+            "xAI OAuth identity token is invalid.",
+        )
+
+    jwt = _load_xai_pyjwt()
+    try:
+        header = jwt.get_unverified_header(id_token)
+    except Exception as exc:
+        raise XaiOAuthIdentityError(
+            "identity_token_invalid",
+            "xAI OAuth identity token is invalid.",
+        ) from exc
+    if not isinstance(header, Mapping):
+        raise XaiOAuthIdentityError(
+            "identity_token_invalid",
+            "xAI OAuth identity token is invalid.",
+        )
+    if header.get("alg") != DEFAULT_XAI_OAUTH_ID_TOKEN_ALGORITHM:
+        raise XaiOAuthIdentityError(
+            "identity_token_invalid",
+            "xAI OAuth identity token uses an unsupported algorithm.",
+        )
+    kid = _clean_oauth_string(header.get("kid"))
+    if kid is None:
+        raise XaiOAuthIdentityError(
+            "identity_token_invalid",
+            "xAI OAuth identity token has no trusted key identifier.",
+        )
+
+    jwks = _fetch_xai_oauth_jwks(http_timeout_seconds)
+    key = jwks.get(kid)
+    if key is None:
+        _invalidate_xai_jwks_cache()
+        key = _fetch_xai_oauth_jwks(http_timeout_seconds).get(kid)
+    if key is None:
+        raise XaiOAuthIdentityError(
+            "identity_key_unavailable",
+            "xAI OAuth identity token key is unavailable.",
+        )
+
+    try:
+        claims = jwt.decode(
+            id_token,
+            key=key,
+            algorithms=[DEFAULT_XAI_OAUTH_ID_TOKEN_ALGORITHM],
+            audience=audience,
+            issuer=DEFAULT_XAI_OAUTH_ISSUER,
+            leeway=60,
+            options={
+                "require": ["exp", "iat", "iss", "aud", "sub"],
+                "verify_signature": True,
+            },
+        )
+    except Exception as exc:
+        raise XaiOAuthIdentityError(
+            "identity_verification_failed",
+            "xAI OAuth identity token verification failed.",
+        ) from exc
+    if not isinstance(claims, Mapping):
+        raise XaiOAuthIdentityError(
+            "identity_verification_failed",
+            "xAI OAuth identity token verification failed.",
+        )
+
+    aud = claims.get("aud")
+    if isinstance(aud, list) and len(aud) > 1 and claims.get("azp") != audience:
+        raise XaiOAuthIdentityError(
+            "identity_verification_failed",
+            "xAI OAuth identity token verification failed.",
+        )
+    subject = _clean_xai_identity_subject(claims.get("sub"))
+    if subject is None:
+        raise XaiOAuthIdentityError(
+            "identity_verification_failed",
+            "xAI OAuth identity token has no valid subject.",
+        )
+    return subject
+
+
+def _xai_identity_token_for_record(
+    credential: Mapping[str, Any],
+    refreshed: Optional[Mapping[str, Any]],
+) -> Optional[str]:
+    if refreshed is not None and "id_token" in refreshed:
+        return _clean_oauth_string(refreshed.get("id_token"))
+    return _clean_oauth_string(credential.get("id_token"))
+
+
+def _xai_identity_bootstrap_needed(credential: Mapping[str, Any]) -> bool:
+    return (
+        _clean_oauth_string(credential.get("id_token")) is not None
+        and _clean_xai_identity_subject(credential.get("subject")) is None
+    )
+
+
+def _resolve_xai_identity_subject(
+    credential: Mapping[str, Any],
+    *,
+    refreshed: Optional[Mapping[str, Any]],
+    scope: str,
+    client_id: Optional[str],
+    http_timeout_seconds: float,
+) -> Tuple[Optional[str], Optional[bool]]:
+    existing_subject = _clean_xai_identity_subject(credential.get("subject"))
+    id_token = _xai_identity_token_for_record(credential, refreshed)
+    if id_token is None:
+        if existing_subject is not None:
+            return None, None
+        raise XaiOAuthIdentityError(
+            "identity_token_missing",
+            "xAI OAuth identity token is missing.",
+        )
+
+    _trusted_client_id, trusted_audience = _resolve_xai_oauth_client_configuration(
+        credential,
+        scope,
+        client_id,
+    )
+    verified_subject = _verified_xai_id_token_subject(
+        id_token,
+        audience=trusted_audience,
+        http_timeout_seconds=http_timeout_seconds,
+    )
+    if "subject" in credential and existing_subject is None:
+        raise XaiOAuthIdentityError(
+            "identity_mismatch",
+            "xAI OAuth identity does not match the stored identity.",
+        )
+    if existing_subject is not None and existing_subject != verified_subject:
+        raise XaiOAuthIdentityError(
+            "identity_mismatch",
+            "xAI OAuth identity does not match the stored identity.",
+        )
+    if existing_subject == verified_subject:
+        return None, True
+    return verified_subject, True
 
 
 def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:
@@ -1128,6 +1690,7 @@ def _refresh_credential_record(
     client_secret: Optional[str],
     http_timeout_seconds: float,
     on_token_endpoint_attempt: Optional[Callable[[], None]] = None,
+    scope: Optional[str] = None,
 ) -> Mapping[str, Any]:
     refresh_token = _clean_oauth_string(credential.get("refresh_token"))
     if refresh_token is None:
@@ -1136,16 +1699,11 @@ def _refresh_credential_record(
             "xAI OAuth credential cannot be refreshed without a refresh token.",
         )
 
-    resolved_client_id = (
-        _clean_oauth_string(client_id)
-        or _clean_oauth_string(credential.get("oidc_client_id"))
-        or _clean_oauth_string(credential.get("client_id"))
+    resolved_client_id, _trusted_audience = _resolve_xai_oauth_client_configuration(
+        credential,
+        _resolve_scope(scope),
+        client_id,
     )
-    if resolved_client_id is None:
-        raise XaiOAuthRefreshError(
-            "credential_configuration_error",
-            "xAI OAuth refresh requires a configured client identifier.",
-        )
 
     resolved_token_endpoint = (
         _clean_oauth_string(token_endpoint)
