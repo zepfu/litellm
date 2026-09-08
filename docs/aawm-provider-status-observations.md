@@ -115,20 +115,6 @@ Relevant environment variables:
 - `AAWM_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS`: minimum seconds between
   inspections; defaults to `3600`.
 
-For managed xAI OAuth, passive inspection is explicitly not a refresh-success
-signal. It records local-file health and usability in separate metadata and
-never sets `last_success_at`. When a scheduled refresh failure belongs to the
-same stable `credential_identity` and `credential_generation`, the passive row
-retains degraded refresh-state and sanitized scheduler error evidence even if
-the old access credential is locally usable. A differing generation is reread
-once to reject a stale snapshot, and the replacement is accepted only when its
-stable identity still matches. Only a successful actual refresh or a confirmed
-different usable generation clears the failed state and either exact terminal
-suppression class, `invalid_grant` or `refresh_token_reused`. A failed refresh
-also remains authoritative through later not-due scheduler cycles that make no
-token-endpoint attempt. Other xAI refresh errors remain retryable and do not
-receive terminal suppression.
-
 ## Cursor Agent Auth Refresh
 
 The sidecar owns automatic maintenance of the Cursor Agent credential in
@@ -214,14 +200,6 @@ degraded fallback threshold, and is reported as degraded. A malformed or
 unreadable credential is reported as malformed and unusable until recovery.
 Inspection and operation errors are bounded and redacted before they enter
 events or persisted auth observations.
-
-Managed xAI lifecycle metadata is produced by the same evaluator for request
-readiness, refresh eligibility, and passive health. Sanitized observations may
-include `structurally_valid`, `access_available`, `refresh_possible`,
-`route_usable`, `route_unusable`, `refresh_due`, `terminal_unrefreshable`,
-`lifecycle_state`, `route_unusable_reason`, `route_unusable_at`, and
-`route_safety_buffer_seconds`. `refresh_due` and `route_usable` remain separate
-signals, so proactive refresh does not create a request outage.
 
 The pre-refresh inspection and post-refresh inspection are both retained in
 the scheduler evidence. The post-refresh file is authoritative when a helper
@@ -503,13 +481,6 @@ threshold input. Valid lifetime metadata uses
 `max(300, issued_lifetime_seconds * 0.5)`; missing or malformed lifetime
 metadata uses the `300`-second degraded fallback.
 
-Managed xAI's omitted lock option is derived from the canonical resolved auth
-file and uses its `.lock` sibling. Distinct custom auth files therefore do not
-serialize each other, while relative or symlink aliases for one file share one
-lock identity. An explicit lock value is accepted only when it resolves to that
-canonical sibling; arbitrary paths are rejected before the refresh writer reads
-or mutates credentials.
-
 Rendered native defaults:
 
 - `AAWM_GROK_OIDC_REFRESH_ENABLED=1`
@@ -567,10 +538,8 @@ read-only file/scope resolver. It checks every supplied path and scope value for
 agreement before selecting the documented precedence winner. A resolved
 `credential_identity` is a nonsecret hash of the canonical auth-file target and
 exact scope only; it is stable across token rotation and does not contain raw
-paths, credential fields, or filesystem metadata. The separate nonsecret
-`credential_generation` digest includes only published file metadata and safe
-lifecycle fields, never token values. Configuration conflicts return sanitized
-errors without selecting an identity or contacting the provider.
+paths, credential fields, or filesystem metadata. Configuration conflicts return
+sanitized errors without selecting an identity or contacting the provider.
 
 Combined credential/process health requires **both** credential records to have:
 
@@ -830,6 +799,27 @@ This path has two cooperating pieces:
   never reads Oracle cookies, and never ships `authenticator.py`,
   `common_utils.py`, or `httpx`.
 
+Native history capture is admitted only through the live sidecar
+`SidecarTaskState` that owns the private Oracle helper. The owner publishes its
+endpoint and anchor binding before registering a history worker, rejects
+borrowed or stale bindings, and retains each worker, exact-target closer, and
+scratch remover until their own process retirement is proven. Descendant
+discovery retains live pidfd identities and role-specific markers installed in
+each native-history worker before Playwright launch; a historical numeric
+parent or process group never authorizes adoption or termination after leader
+identity is lost. Incomplete bounded scans retain explicit unresolved inventory
+diagnostics and cannot become a positive retirement proof. Cleanup uses one
+shared absolute operation ceiling:
+target-close, cooperative termination, forced termination, reconciliation,
+reaping, and scratch removal may be shortened by shutdown but never restart a
+deadline or create a recovery allowance. A failed target proof, release
+channel, or final descendant inventory remains an attributable cleanup failure;
+it is never reported as successful history or as an empty conversation set.
+Shutdown captures its cutoff at cancellation (or one-shot shutdown entry),
+closes admission, requests abort for all published owners, and keeps that same
+state servicing retained owners until safety and retirement are proven. The
+stopped event is emitted only after the owner registry is empty.
+
 The sidecar image packages `conversation_init.py`, the owned
 `scripts/chatgpt_oracle_browser_session.mjs` helper, and pinned Playwright with
 Chromium shared libraries/Xvfb, `rsync`, and `xauth`; it does not download another
@@ -995,104 +985,111 @@ the shared browser session, preserving other sessions and prior observation
 rows. A deferred or failed capture is not fresh evidence and does not replace
 prior rows or establish account coverage.
 
-## ChatGPT usage ledger storage
+### Native ChatGPT history observation
 
-`scripts/chatgpt_chat_usage_capture/pg_ledger.py` defines a source-only,
-metadata-only PostgreSQL contract for ordinary-Chat usage. Construction does
-not resolve a DSN, connect, activate a schedule, or write. Callers must
-explicitly invoke `PgLedger.ensure_schema()` or apply
-`scripts/apply_chatgpt_usage_ledger_2026_09_08.sql`.
+`observe_native_chatgpt_history_from_oracle_browser(...)` is a separate,
+attach-only feasibility observer for ordinary Chat history. It requires the
+nonserialized lifecycle capability supplied by the private profile owner, the
+owner's persistent supervised registry, the exact CDP endpoint and anchor
+target, and the pinned canonical-12 account hash `8e92854835c4`, creates one
+owned page in that browser context, and performs one ordinary
+`https://chatgpt.com/` navigation. The observer first rejects a capability whose
+CDP endpoint or anchor target does not match the owner. Cleanup uses one
+absolute operation deadline with reserved phase budgets for target close,
+termination, reaping, and scratch removal. It observes at most one native
+`GET /backend-api/conversations` request through CDP
+`Network.requestWillBeSent`, `Network.requestWillBeSentExtraInfo`, and the
+correlated response events. The timeout is capped at 150 seconds and the
+response body budget at 1 MiB (1,048,576 bytes).
 
-The adapter accepts the versioned `chatgpt-chat-history-v1` transfer contract.
-Observation, attempt, provenance, coverage, and alias inputs are projected
-through fixed allowlists before any database write. The envelope preserves
-coverage/quarantine state, requested, recorded-final, and resolved raw model
-evidence separately, and keeps bounded `items`, `messages`, and `mapping`
-collections after recursive content sanitization. Unknown fields are also
-represented by bounded structural counts and provenance. Secret-like values,
-content, titles, credentials, browser state, and unallowlisted metadata are
-rejected or dropped before persistence.
-Opaque pagination cursors retain their exact bounded value, not identifier
-normalization. A page must contain a supported collection before it can
-establish completeness; a missing collection is not an empty collection.
-A rejected non-null cursor, malformed collection, unsupported transfer, or
-incomplete projection cannot establish exhaustion. Flat and nested
-quarantine indicators combine conservatively. Truncation paths preserve root,
-indexed, and sanitized mapping-key forms; rejected path records retain explicit
-incompleteness without retaining unsafe text. Privacy diagnostics use structural
-positions, never caller paths, rejected keys, or conversion exception text.
+A bare or borrowed CDP endpoint is rejected before worker creation or
+navigation. The profile owner registers the interception worker, target
+creation fence, and independent exact-target closer before starting them.
+Success requires a no-create acknowledgement or confirmed target absence,
+worker/closer reaping, and private helper/scratch cleanup. Unresolved cleanup
+ownership remains in the long-lived sidecar registry and is reported as a
+cleanup failure; it is never treated as a successful observation.
 
-Verified identities converge by
-provider/provider-user/workspace/quota-owner/surface; an unverified identity
-remains collector-local. Identical projection fingerprints deduplicate;
-changed evidence appends an immutable revision. Alias collisions become
-coverage gaps rather than silently merging attempts.
-Identity is tracked through versioned collector-to-scope bindings. A collector
-binding is a generation fence: capture it before network work and pass the
-expected binding to the page transaction; a stale generation is rejected
-instead of silently rebinding the collector, and one page cannot switch scopes
-without an explicit new fence. Refinement can fill missing identity components
-but cannot drop or change any known provider, user, workspace, quota owner, or
-surface. Compatible refinements retire and redirect prior scopes while
-preserving their attempts and aliases; readers follow those redirects so
-retained history remains visible under the active collector binding. Strong
-generation aliases establish generation identity. Message, branch, request,
-and prompt associations cannot override different generation anchors. Distinct
-generations sharing an association retain their independent generation aliases;
-only the contested association is withheld. An unanchored observation cannot
-use that association to select one generation. Multiple different generation
-anchors on one input are contradictory, not a compound identity.
-Request or prompt matches alone never establish equivalence between different
-attempts, even when there is only one current candidate; merging requires
-positive generation, message, branch, or retained-retirement evidence.
-Alias preflight includes every proposed donor's aliases. Contested associations
-retain coverage-gap evidence before donor retirement.
-Active attempts with stronger identity evidence can retire weaker provisional
-aliases. Retirement records retain the successor's physical scope and attempt
-ID. Aliasless replays consult that retained proof across compatible scope
-lineage; matching live attempt IDs alone do not establish equivalence.
-Duplicate current fingerprints advance the current projection's observation
-watermark. Differing older evidence remains non-current without advancing that
-watermark; an exact fingerprint/timestamp/source/schema/collector replay adds
-no further revision, but a fresh recurrence can become current. All accepted
-sightings retain collector provenance. Validated identity can strengthen
-without replacing fresher outcome, model, or time evidence. Equal-time
-contradictions retain quarantine; local revision numbers and physical keys
-cannot clear it. Quarantined input cannot transfer aliases or retire attempts.
-Safe source identity/time/outcome tokens remain in revision JSONB separately
-from interpreted classifications, including unknown tokens.
+The observer never calls the history endpoint directly, supplies guessed
+headers, reads cookies or storage, paginates, requests conversation details,
+retries, or permits model/mutation requests. It allows only the existing
+frontend bootstrap/init request policy around the ordinary navigation. It
+returns only route class, status, identity-match and request/response-
+correlation flags, bounded response size, fixed field/container/type/count
+metadata, fixed model/updated-time/pagination presence/type counters, and
+model-field presence. Counts include explicit truncation/lower-bound and
+unknown-absence metadata. No URL, conversation ID, title, message, payload,
+header, token, or storage value is returned. If the native index request never
+appears, the result explicitly uses `observation_state=no_history_observed`;
+auth, throttle, challenge, identity, boundary, and body failures use an
+explicit failed observation state and preserve only a safe retry-after value.
 
-The migration bootstrap creates generation 1 only for collectors with no
-existing binding, selecting one deterministic legacy scope per collector. It
-is therefore idempotent across reruns and preserves later active or retired
-generations. Quarantined attempts remain auditable but are not definite usage
-evidence; count readers must keep them out of definite totals while exposing
-the retained uncertainty for reconciliation.
+The sidecar has an explicit opt-in entrypoint for this observer. Before
+execution, the parent must verify that the bound browser session has no active
+conversation-history cooldown, then supply both
+`--chatgpt-native-history-probe-account-label account1` (or the matching
+`AAWM_CHATGPT_NATIVE_HISTORY_PROBE_ACCOUNT_LABEL` environment value) and
+`--chatgpt-native-history-probe-cooldown-cleared` (or
+`AAWM_CHATGPT_NATIVE_HISTORY_PROBE_COOLDOWN_CLEARED=1`) together with an
+Oracle profile binding for that exact label. The label must resolve to exactly
+one enabled Codex OAuth inventory record whose pinned account hash is
+`8e92854835c4`; a CDP-only binding is rejected because native history requires
+the private profile owner's supervised lifecycle capability. This action runs
+before provider observations, schema setup, and all other sidecar tasks,
+performs no database setup or persistence, and uses one 150-second operation
+budget including startup, observation, and owner cleanup. It emits one
+structural observation event with the existing fixed classification fields
+only; preflight and boundary failures use fixed classes and never echo raw
+labels, URLs, identifiers, headers, content, or exception text. It is a
+one-shot foreground action, not a recurring schedule. A
+`history_observation_failed` result exits nonzero; `no_history_observed` is a
+distinct bounded outcome and exits zero.
 
-`count_attempts(account, model_family=..., window_start=..., window_end=...)`
-uses one PostgreSQL statement snapshot, resolves retired scopes to the
-canonical scope owned by the active collector binding, counts only
-non-tombstoned ordinary Chat attempts with generation evidence, and returns
-separate requested, recorded-final, and resolved raw-model/family maps. It does
-not count provider charges or capacity snapshots. Definite totals use exact
-timestamps or fully contained evidence intervals; crossing intervals and
-one-sided bounds are reported as `ambiguous` or `unknown_time`, never assigned
-to a window by fallback timestamp selection. Unknown and excluded counters keep
-ambiguous or unknown-time activity but omit rows proven outside the window. The
-result also exposes excluded non-Chat/shared activity, unknown
-identity/surface/origin/model classes, uncertain outcomes, and observed model
-mismatches. A nongeneration record connected to multiple distinct generation
-identities contributes unknown identity, not another definite attempt; the
-known generations remain independently countable. Anchored generations do not
-connect separate unanchored components. Equal-time conflicting projections
-remain uncertain under the same policy as ingestion.
-Contested request and prompt associations also make an unanchored component
-uncertain immediately, without waiting for its next observation. These weak
-associations never merge components or select a generation for counting.
+Probe option parsing is strict: abbreviated probe long options are rejected.
+When an exact or abbreviated probe option is present, malformed arguments emit
+only the fixed `ChatGPTNativeHistoryProbeConfigurationInvalid` event; argparse
+usage text and raw option values are suppressed. Normal sidecar invocations
+retain argparse's ordinary unique long-option abbreviation behavior and
+diagnostics.
 
-These tables are independent of `rate_limit_observations`, which remains the
-capacity-only observation store. Source delivery requires separate operational
-integration and database activation.
+The operation deadline is distinct from the sidecar's cancellation cutoff.
+Startup, observation, and cleanup use the same absolute operation ceiling;
+when SIGINT or SIGTERM is received, the effective cutoff is the earlier of
+that ceiling and the cancellation cutoff. The native probe caller passes the
+ceiling through the existing browser-binding context as the optional keyword
+`operation_deadline=<absolute monotonic deadline>`. The lifecycle binding must
+accept that keyword with a default of `None` for existing callers and
+propagate it through startup and failure cleanup; its effective cleanup
+deadline remains the minimum of the operation ceiling and cancellation cutoff.
+If the initial drain leaves an owner retained, the probe caller recomputes that
+minimum before each subsequent servicing pass; the lifecycle owner still
+enforces the cutoff within its own cleanup plan.
+If a bounded drain cannot prove owner retirement, the admitted sidecar state
+continues supervising retained owners until they retire; it is not released
+while owners remain pending.
+
+Parent-run shape (replace only the profile path and deployment-specific
+executable paths):
+
+```bash
+AAWM_CHATGPT_NATIVE_HISTORY_PROBE_ACCOUNT_LABEL=account1 \
+AAWM_CHATGPT_NATIVE_HISTORY_PROBE_COOLDOWN_CLEARED=1 \
+AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS='{"account1":{"oracle_profile_path":"/path/to/operator-approved-profile"}}' \
+AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE=/path/to/node \
+AAWM_CHATGPT_ORACLE_PACKAGE_DIR=/path/to/oracle-package \
+AAWM_CHATGPT_ORACLE_CHROME_EXECUTABLE=/path/to/chrome \
+python3 scripts/run_provider_status_observations_loop.py \
+  --chatgpt-native-history-probe-account-label account1 \
+  --chatgpt-native-history-probe-cooldown-cleared
+```
+
+The parent must also provide the explicit Codex OAuth inventory containing the
+enabled `account1` record pinned to `8e92854835c4`, and `xvfb-run` when no
+`DISPLAY` is available. The profile, node, package, and Chrome paths are
+runtime prerequisites, not fallback discovery inputs. This command must be
+run only after the parent checks that no other process owns the browser session
+or has an active conversation-history cooldown.
+
 ## Alibaba Token Plan quota polling
 
 The provider-status sidecar can poll the authenticated ModelStudio Token Plan
@@ -1419,32 +1416,12 @@ Relevant environment variables:
 - `AAWM_CODEX_RESET_CREDIT_POLL_ENABLED`: enables the scheduled poll.
 - `AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS`: minimum seconds between poll
   attempts (default `600`).
-- `AAWM_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_PCT`: minimum percentage-point
-  pool spread in comparable fresh weekly remaining quota required for fresh
-  OpenAI account dispatches to prefer the highest remaining account (default
-  `10`). Ties and incomparable observations retain inventory order.
-- `AAWM_CODEX_OAUTH_QUOTA_OBSERVATION_ENVIRONMENT`: exact shared Codex quota
-  producer scope. When unset, the consumer uses its runtime environment;
-  explicitly empty scope disables comparison. Dev and alpha Compose both
-  default to the provider-status sidecar's `AAWM_LITELLM_ENVIRONMENT` value
-  (`dev` by default). Override both consumers together if the producer changes.
-  Runtime environment labels and session-ownership namespaces are unchanged.
 - `AAWM_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS`: HTTP timeout.
 - `AAWM_CODEX_USAGE_URL`: live usage poll URL (defaults to `/wham/usage`).
 - `AAWM_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS`: max attempts per scheduled run.
 - `AAWM_CODEX_RESET_CREDIT_POLL_RETRY_BACKOFF_SECONDS`: retry backoff base.
 - `AAWM_CODEX_QUOTA_DSN`: optional Postgres DSN used only for direct Codex
   quota persistence; falls back to the general sidecar DSN when unset.
-
-Fresh account selection freezes one observation view for the entire consulted
-account set, refreshing that set together when hydration is due. Weekly
-comparison requires current reset provenance and the requested quota family;
-accounts may have different reset timestamps. Shared polls reflect account
-usage across dev and alpha, not either process's request counts. Local
-response-derived observations can still supply hard quota exclusions but do
-not substitute for missing shared weekly comparison evidence. The comparison
-policy and per-attempt audit contract are documented in
-[model management](my-website/docs/proxy/model_management.md#managed-codex-oauth-account-failover).
 
 The detail parser reads `credits[]` with `status`, `reset_type`, `granted_at`,
 `expires_at`, `redeem_started_at`, and `redeemed_at` when present. Each visible
@@ -1499,11 +1476,10 @@ The detail endpoint is undocumented and provider-owned; shape may change without
 With `--once`, enabled `grok_oidc_refresh`, per-account
 `codex_oauth_refresh`, `xai_oauth_refresh`, and `nous_oauth_refresh` events
 are required tasks. A successful refresh or successful no-op/skipped refresh
-satisfies the task. For managed xAI OAuth and Nous Portal OAuth, a later cycle
-that skips because the previous attempt returned `invalid_grant` /
-`refresh_token_reused` on the same credential identity is a successful skip,
-not a second token-endpoint call. Any required failure returns a non-zero
-process status.
+satisfies the task. For Nous Portal OAuth, a later cycle that skips because
+the previous attempt returned `invalid_grant` / `refresh_token_reused` on the
+same credential identity is a successful skip, not a second token-endpoint
+call. Any required failure returns a non-zero process status.
 Telemetry, metadata repair, passive health, Kimi work, and aggregate events
 are optional; their failures are reported as optional degradation without
 changing the required exit status. Native Grok OIDC, managed xAI OAuth, and

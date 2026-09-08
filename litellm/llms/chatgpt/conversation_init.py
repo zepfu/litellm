@@ -102,6 +102,7 @@ CHATGPT_NATIVE_HISTORY_HOME_URL = "https://chatgpt.com/"
 CHATGPT_NATIVE_HISTORY_INDEX_PATH = "/backend-api/conversations"
 CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH = "8e92854835c4"
 CHATGPT_NATIVE_HISTORY_OBSERVER = "chatgpt_native_history"
+CHATGPT_NATIVE_HISTORY_ROLE_ENV = "AAWM_CHATGPT_NATIVE_HISTORY_ROLE"
 CHATGPT_NATIVE_HISTORY_DEFAULT_TIMEOUT_SECONDS = 150.0
 CHATGPT_NATIVE_HISTORY_MAX_RESPONSE_BYTES = 1_048_576
 # Shared across the history worker and its parent.  A target stays owned until
@@ -119,6 +120,7 @@ _NATIVE_HISTORY_CLEANUP_RESERVE_SECONDS = 10.0
 _NATIVE_HISTORY_TERM_GRACE_SECONDS = 1.0
 _NATIVE_HISTORY_KILL_GRACE_SECONDS = 1.0
 _NATIVE_HISTORY_REAP_GRACE_SECONDS = 1.0
+_NATIVE_HISTORY_MAX_PROCESS_INVENTORY_ENTRIES = 4096
 
 
 # Truncation does not silently claim completeness.
@@ -2690,13 +2692,16 @@ class NativeHistoryCloseRegistration:
 
     process: Any
     private_process_group: Any
+    private_process_start_time: Any
     target_proof: Any
     driver_done: Any
     reap_ack: Any
     target_id: Optional[str]
     creation_url: str
+    start_state: str = "not_started"
     started: bool = False
     reaped: bool = False
+    scope_reaped_proven: bool = False
 
 
 @dataclass
@@ -2705,11 +2710,13 @@ class NativeHistoryLifecycleRegistration:
 
     process: Any
     private_process_group: Any
+    private_process_start_time: Any
     creation_state: Any
     owned_target: Any
     creation_url: str
     abort_event: Any
     release_event: Any
+    release_control_state: Any
     creation_gate: Any
     creation_settled: Any
     creation_issued: Any
@@ -2720,17 +2727,20 @@ class NativeHistoryLifecycleRegistration:
     target_close_budget: float
     finalization_gate: Any = None
     finalizing: bool = False
-    cleanup_callback: Optional[Callable[[float], Any]] = None
+    cleanup_callback: Optional[Callable[..., Any]] = None
     close_registration: Optional[NativeHistoryCloseRegistration] = None
     start_state: str = "not_started"
     released: bool = False
     release_authorized: bool = False
+    release_control_failed: bool = False
     retired: bool = False
+    worker_retirement_proven: bool = False
     release_proof: Optional[NativeHistoryReleaseProof] = None
     target_resolution: Optional[NativeHistoryTargetProof] = None
     cleanup_plan: Optional[Dict[str, float]] = None
-    cleanup_recovery_used: bool = False
     cleanup_failure: Optional[str] = None
+    shutdown_deadline: Optional[float] = None
+    worker_scope_reaped_proven: bool = False
     registration_id: str = ""
 
     def __post_init__(self) -> None:
@@ -2774,7 +2784,24 @@ class NativeHistoryLifecycleCapability(Protocol):
     ) -> None:
         ...
 
-    def terminate_owned_browser(self, deadline: float) -> bool:
+    def prepare_native_history_cleanup_plan(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        *,
+        cleanup_deadline: float,
+        operation_deadline: float,
+    ) -> Mapping[str, float]:
+        ...
+
+    def terminate_owned_browser(
+        self,
+        *,
+        term_deadline: float,
+        kill_deadline: float,
+        reap_deadline: float,
+        final_deadline: float,
+        poll_only: bool = False,
+    ) -> bool:
         ...
 
     def bind_native_history_endpoint(
@@ -4706,6 +4733,8 @@ def observe_native_chatgpt_history_from_oracle_browser(
             "retain_native_history",
             "release_native_history",
             "retire_native_history",
+            "prepare_native_history_cleanup_plan",
+            "terminate_native_history_process_scope",
             "terminate_owned_browser",
             "bind_native_history_endpoint",
         )
@@ -4869,6 +4898,7 @@ def _run_oracle_browser_capture_in_worker(
     context = _oracle_browser_process_context(playwright_factory)
     receiver, sender = context.Pipe(duplex=False)
     private_process_group = context.RawValue("q", 0)
+    private_process_start_time = context.RawValue("q", 0)
     owned_target = context.RawArray("c", 256)
     # Publish the state last so a kill cannot expose a partially copied ID.
     creation_state = context.RawValue("b", 0)
@@ -4886,6 +4916,7 @@ def _run_oracle_browser_capture_in_worker(
             capture_deadline,
             playwright_factory,
             private_process_group,
+            private_process_start_time,
             expected_account_hash,
             owned_target,
             creation_state,
@@ -4920,7 +4951,11 @@ def _run_oracle_browser_capture_in_worker(
         return _coerce_browser_response(message.get("result"))
     finally:
         receiver.close()
-        _terminate_oracle_browser_worker(process, private_process_group.value)
+        _terminate_oracle_browser_worker(
+            process,
+            private_process_group.value,
+            private_process_start_time,
+        )
         process.join(timeout=min(0.1, max(0.0, _remaining_browser_timeout(deadline))))
         target_id = owned_target.value if creation_state.value == 2 else b""
         if creation_state.value:
@@ -4942,12 +4977,16 @@ def _oracle_browser_capture_worker(
     deadline: float,
     playwright_factory: Optional[Callable[[], Any]],
     private_process_group: Any,
+    private_process_start_time: Any,
     expected_account_hash: str,
     owned_target: Any,
     creation_state: Any,
     creation_url: str,
 ) -> None:
-    _enter_oracle_browser_worker_process_group(private_process_group)
+    _enter_oracle_browser_worker_process_group(
+        private_process_group,
+        private_process_start_time,
+    )
     playwright = None
     browser = None
     owned_page = None
@@ -5051,6 +5090,7 @@ def _run_oracle_browser_history_observation_in_worker(  # noqa: PLR0915 - bounde
     context = _oracle_browser_process_context(None)
     receiver, sender = context.Pipe(duplex=False)
     private_process_group = context.RawValue("q", 0)
+    private_process_start_time = context.RawValue("q", 0)
     owned_target = context.RawArray("c", 256)
     creation_state = context.RawValue("b", 0)
     creation_issued = context.RawValue("b", False)
@@ -5058,7 +5098,10 @@ def _run_oracle_browser_history_observation_in_worker(  # noqa: PLR0915 - bounde
     creation_settled = context.Event()
     abort_event = context.Event()
     release_event = context.Event()
+    release_control_failed = context.RawValue("b", False)
     creation_url = "about:blank#oracle-native-history-" + os.urandom(16).hex()
+    registration_id = "native-history-" + os.urandom(16).hex()
+    role_marker = "history-observer:" + registration_id
     target_close_budget = min(
         _NATIVE_HISTORY_CLEANUP_RESERVE_SECONDS,
         max(0.0, target_close_budget),
@@ -5082,6 +5125,8 @@ def _run_oracle_browser_history_observation_in_worker(  # noqa: PLR0915 - bounde
             expected_account_hash,
             max_response_bytes,
             private_process_group,
+            private_process_start_time,
+            role_marker,
             owned_target,
             creation_state,
             creation_url,
@@ -5090,16 +5135,19 @@ def _run_oracle_browser_history_observation_in_worker(  # noqa: PLR0915 - bounde
             creation_settled,
             abort_event,
             release_event,
+            release_control_failed,
         ),
     )
     registration = NativeHistoryLifecycleRegistration(
         process=process,
         private_process_group=private_process_group,
+        private_process_start_time=private_process_start_time,
         creation_state=creation_state,
         owned_target=owned_target,
         creation_url=creation_url,
         abort_event=abort_event,
         release_event=release_event,
+        release_control_state=release_control_failed,
         creation_gate=creation_gate,
         creation_settled=creation_settled,
         creation_issued=creation_issued,
@@ -5109,13 +5157,15 @@ def _run_oracle_browser_history_observation_in_worker(  # noqa: PLR0915 - bounde
         operation_start=operation_start,
         target_close_budget=target_close_budget,
         finalization_gate=context.Lock(),
+        registration_id=registration_id,
     )
-    registration.cleanup_callback = lambda cleanup_deadline: (
+    registration.cleanup_callback = lambda cleanup_deadline, poll_only=False: (
         _finalize_native_history_registration(
             registration,
             lifecycle_capability,
             cleanup_deadline=cleanup_deadline,
             operation_deadline=deadline,
+            poll_only=poll_only,
         )
     )
     try:
@@ -5147,6 +5197,7 @@ def _run_oracle_browser_history_observation_in_worker(  # noqa: PLR0915 - bounde
                 message = _receive_oracle_browser_worker_message(
                     receiver,
                     capture_deadline,
+                    should_stop=registration.abort_event.is_set,
                 )
                 if not isinstance(message, Mapping) or message.get("ok") is not True:
                     raise OracleBrowserBoundaryUnavailable(
@@ -5174,6 +5225,10 @@ def _run_oracle_browser_history_observation_in_worker(  # noqa: PLR0915 - bounde
             cleanup_error = OracleBrowserCleanupError(
                 registration.cleanup_failure
                 or "Native ChatGPT history cleanup could not be proven."
+            )
+        elif registration.cleanup_failure is not None:
+            cleanup_error = OracleBrowserCleanupError(
+                registration.cleanup_failure
             )
     except Exception as exc:
         cleanup_error = (
@@ -5225,73 +5280,318 @@ def _native_history_wait_for_release(
 def _native_history_cleanup_phase_plan(
     registration: NativeHistoryLifecycleRegistration,
     cleanup_deadline: float,
+    operation_deadline: float,
 ) -> Dict[str, float]:
-    """Allocate one bounded cleanup slice and resume it on later calls."""
+    """Allocate one immutable cleanup plan and only clamp it earlier."""
 
+    ceiling = min(
+        float(registration.deadline),
+        float(operation_deadline),
+        float(cleanup_deadline),
+    )
+    if registration.shutdown_deadline is not None:
+        ceiling = min(ceiling, float(registration.shutdown_deadline))
     now = time.monotonic()
-    requested_deadline = max(now, float(cleanup_deadline))
     if registration.cleanup_plan is None:
+        start = min(now, ceiling)
         reserve = min(
             _NATIVE_HISTORY_CLEANUP_RESERVE_SECONDS,
             max(0.0, registration.target_close_budget),
-            max(0.0, requested_deadline - now),
+            max(0.0, ceiling - start),
         )
-        if reserve <= 0:
-            reserve = min(
-                _NATIVE_HISTORY_CLEANUP_RESERVE_SECONDS,
-                max(0.1, registration.target_close_budget),
+        end = start + reserve
+        registration.cleanup_plan = {
+            "target_close_deadline": start + reserve / 3,
+            "term_deadline": start + reserve / 2,
+            "kill_deadline": start + reserve * 2 / 3,
+            "reap_deadline": start + reserve * 5 / 6,
+            "final_deadline": end,
+        }
+    else:
+        for phase_name, phase_deadline in list(registration.cleanup_plan.items()):
+            registration.cleanup_plan[phase_name] = min(
+                phase_deadline,
+                ceiling,
             )
-        end = now + reserve
-        registration.cleanup_plan = {
-            "target_close_deadline": now + reserve / 3,
-            "term_deadline": now + reserve / 2,
-            "kill_deadline": now + reserve * 2 / 3,
-            "reap_deadline": now + reserve * 5 / 6,
-            "final_deadline": end,
-        }
-    elif (
-        now >= registration.cleanup_plan["final_deadline"]
-        and not registration.cleanup_recovery_used
-        and requested_deadline > now
-    ):
-        # A transferred owner may perform one cleanup-only recovery slice
-        # after the operation deadline. Capture is never restarted.
-        registration.cleanup_recovery_used = True
-        reserve = min(
-            _NATIVE_HISTORY_CLEANUP_RESERVE_SECONDS,
-            max(0.1, requested_deadline - now),
-        )
-        end = now + reserve
-        registration.cleanup_plan = {
-            "target_close_deadline": now + reserve / 3,
-            "term_deadline": now + reserve / 2,
-            "kill_deadline": now + reserve * 2 / 3,
-            "reap_deadline": now + reserve * 5 / 6,
-            "final_deadline": end,
-        }
     return registration.cleanup_plan
+
+
+def _native_history_process_start_time(pid: Any) -> Optional[int]:
+    try:
+        process_id = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if os.name != "posix" or process_id <= 0:
+        return None
+    try:
+        fields = Path(f"/proc/{process_id}/stat").read_text().rsplit(
+            ")",
+            1,
+        )[1].split()
+        return int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _native_history_process_identity_matches(
+    pid: Any,
+    start_time: Any,
+) -> bool:
+    try:
+        expected = int(getattr(start_time, "value", start_time) or 0)
+    except (TypeError, ValueError):
+        return False
+    return expected > 0 and _native_history_process_start_time(pid) == expected
+
+
+def _native_history_process_group_member_count(
+    group_id: int,
+    *,
+    deadline: Optional[float] = None,
+) -> Optional[int]:
+    if os.name != "posix" or group_id <= 0:
+        return 0
+    count = 0
+    inspected = 0
+    inspection_failed = False
+    if deadline is not None and time.monotonic() >= deadline:
+        return None
+    try:
+        entries = Path("/proc").iterdir()
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+            inspected += 1
+            if inspected > _NATIVE_HISTORY_MAX_PROCESS_INVENTORY_ENTRIES:
+                return None
+            try:
+                fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+                if int(fields[2]) == group_id:
+                    count += 1
+            except (OSError, ValueError, IndexError):
+                inspection_failed = True
+    except OSError:
+        return None
+    if inspection_failed:
+        return None
+    return count
+
+
+def _native_history_process_group_alive(
+    group: Any,
+    process: Any,
+    private_process_start_time: Any,
+    *,
+    deadline: Optional[float] = None,
+) -> Optional[bool]:
+    try:
+        group_id = int(getattr(group, "value", group) or 0)
+    except (TypeError, ValueError):
+        return False
+    process_id = getattr(process, "pid", None)
+    if os.name != "posix" or group_id <= 0:
+        return False
+    identity_matches = (
+        group_id == process_id
+        and _native_history_process_identity_matches(
+            group_id,
+            private_process_start_time,
+        )
+    )
+    if not identity_matches:
+        member_count = _native_history_process_group_member_count(
+            group_id,
+            deadline=deadline,
+        )
+        if member_count == 0:
+            return False
+        return None
+    try:
+        os.killpg(group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+def _signal_native_history_worker(
+    process: Any,
+    private_process_group: Any,
+    private_process_start_time: Any,
+    signal_number: int,
+) -> None:
+    try:
+        group_id = int(getattr(private_process_group, "value", private_process_group) or 0)
+    except (TypeError, ValueError):
+        group_id = 0
+    if (
+        os.name == "posix"
+        and group_id > 0
+        and group_id != os.getpgrp()
+        and _native_history_process_identity_matches(
+            getattr(process, "pid", None),
+            private_process_start_time,
+        )
+    ):
+        try:
+            os.killpg(group_id, signal_number)
+        except OSError:
+            pass
+    try:
+        if _native_history_process_alive(process):
+            process.send_signal(signal_number)
+    except AttributeError:
+        try:
+            if signal_number == signal.SIGKILL:
+                process.kill()
+            else:
+                process.terminate()
+        except (AttributeError, OSError):
+            pass
+    except OSError:
+        pass
+
+
+def _native_history_process_alive(process: Any) -> bool:
+    try:
+        return bool(process.is_alive())
+    except (AssertionError, OSError, ValueError):
+        return False
 
 
 def _native_history_process_reaped(
     process: Any,
     private_process_group: Any,
-    deadline: float,
+    private_process_start_time: Any,
+    *,
+    term_deadline: float,
+    kill_deadline: float,
+    reap_deadline: float,
+    poll_only: bool = False,
+    scope_reaped_state: Optional[Dict[str, bool]] = None,
 ) -> bool:
-    """Join a history child, escalating only within the shared deadline."""
+    """Retire a worker tree without borrowing a later phase."""
 
-    if getattr(process, "pid", None) is None:
-        return True
-    try:
-        process.join(timeout=max(0.0, _remaining_browser_timeout(deadline)))
-    except (AssertionError, OSError):
-        return False
-    if process.is_alive() or getattr(process, "exitcode", None) is None:
-        _terminate_oracle_browser_worker(process, private_process_group.value)
+    def direct_child_reaped() -> bool:
+        if getattr(process, "pid", None) is None:
+            return True
         try:
-            process.join(timeout=max(0.0, _remaining_browser_timeout(deadline)))
+            process.join(timeout=0)
         except (AssertionError, OSError):
             return False
-    return not process.is_alive() and getattr(process, "exitcode", None) is not None
+        return (
+            not _native_history_process_alive(process)
+            and getattr(process, "exitcode", None) is not None
+        )
+
+    def scope_reaped() -> bool:
+        # A capability-level scope proof covers descendants, but never
+        # substitutes for reaping this directly owned multiprocessing child.
+        if not direct_child_reaped():
+            return False
+        if (
+            scope_reaped_state is not None
+            and scope_reaped_state.get("proven") is True
+        ):
+            return True
+        try:
+            group_id = int(
+                getattr(private_process_group, "value", private_process_group)
+                or 0
+            )
+        except (TypeError, ValueError):
+            group_id = 0
+        if getattr(process, "pid", None) is None:
+            if group_id <= 0:
+                if scope_reaped_state is not None:
+                    scope_reaped_state["proven"] = True
+                return True
+            if poll_only:
+                return False
+            scope_alive = _native_history_process_group_alive(
+                private_process_group,
+                process,
+                private_process_start_time,
+                deadline=(
+                    time.monotonic()
+                    if poll_only
+                    else reap_deadline
+                ),
+            )
+            if scope_alive is False and scope_reaped_state is not None:
+                scope_reaped_state["proven"] = True
+            return scope_alive is False
+        if poll_only and group_id > 0:
+            # A post-leader group scan is a blocking inventory operation. In
+            # poll-only servicing, rely on prior sealed scope evidence or the
+            # sidecar's retained role pidfds instead of inventing proof.
+            return False
+        scope_alive = _native_history_process_group_alive(
+            private_process_group,
+            process,
+            private_process_start_time,
+            deadline=(
+                time.monotonic()
+                if poll_only
+                else reap_deadline
+            ),
+        )
+        if scope_alive is False and scope_reaped_state is not None:
+            scope_reaped_state["proven"] = True
+        return scope_alive is False
+
+    if scope_reaped():
+        return True
+    now = time.monotonic()
+    if now < term_deadline:
+        _signal_native_history_worker(
+            process,
+            private_process_group,
+            private_process_start_time,
+            signal.SIGTERM,
+        )
+        if poll_only:
+            return scope_reaped()
+        try:
+            process.join(timeout=max(0.0, term_deadline - time.monotonic()))
+        except (AssertionError, OSError):
+            return False
+        if scope_reaped():
+            return True
+    if poll_only:
+        # Poll-only servicing may not restart the TERM grace window. Once its
+        # cutoff passes, escalate immediately and only observe retirement.
+        _signal_native_history_worker(
+            process,
+            private_process_group,
+            private_process_start_time,
+            signal.SIGKILL,
+        )
+        return scope_reaped()
+    _signal_native_history_worker(
+        process,
+        private_process_group,
+        private_process_start_time,
+        signal.SIGKILL,
+    )
+    if not poll_only and time.monotonic() < kill_deadline:
+        try:
+            process.join(timeout=max(0.0, kill_deadline - time.monotonic()))
+        except (AssertionError, OSError):
+            return False
+    if scope_reaped():
+        return True
+    if not poll_only and time.monotonic() < reap_deadline:
+        try:
+            process.join(timeout=max(0.0, reap_deadline - time.monotonic()))
+        except (AssertionError, OSError):
+            return False
+    return scope_reaped()
 
 
 def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle finalizer
@@ -5300,18 +5600,36 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
     *,
     cleanup_deadline: float,
     operation_deadline: float,
+    poll_only: bool = False,
 ) -> bool:
     """Close, authorize release, and retire one history operation."""
 
-    gate = registration.finalization_gate
-    if gate is not None:
-        try:
-            if not gate.acquire(blocking=False):
-                return False
-        except (TypeError, OSError, ValueError):
-            return False
     try:
         registration.abort_event.set()
+    except (OSError, ValueError):
+        registration.cleanup_failure = (
+            "Native ChatGPT history abort control failed."
+        )
+    gate = registration.finalization_gate
+    gate_acquired = False
+    if gate is not None:
+        try:
+            gate_acquired = bool(gate.acquire(False))
+            if not gate_acquired:
+                return False
+        except (TypeError, OSError, ValueError):
+            registration.cleanup_failure = (
+                "Native ChatGPT history finalization control failed."
+            )
+            try:
+                lifecycle_capability.retain_native_history(
+                    registration,
+                    registration.cleanup_failure,
+                )
+            except Exception:
+                pass
+            return False
+    try:
         if registration.start_state == "starting":
             registration.cleanup_failure = (
                 "Native ChatGPT history worker start is still in progress."
@@ -5322,33 +5640,43 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
             )
             return False
 
+        lifecycle_capability.prepare_native_history_cleanup_plan(
+            registration,
+            cleanup_deadline=cleanup_deadline,
+            operation_deadline=operation_deadline,
+        )
         plan = _native_history_cleanup_phase_plan(
             registration,
             cleanup_deadline,
-        )
-        reap_deadline = min(
-            max(plan["reap_deadline"], time.monotonic()),
-            max(operation_deadline, plan["reap_deadline"]),
+            operation_deadline,
         )
         state = int(registration.creation_state.value)
         close_registration = registration.close_registration
 
-        # A closer may have published target safety before its own driver was
-        # reaped. Promote that proof once and never create a second closer for
-        # the same target.
-        if (
-            close_registration is not None
-            and bool(close_registration.target_proof.value)
-        ):
+        def promote_closer_proof() -> None:
+            nonlocal state
+            closer = registration.close_registration
+            if closer is None or not bool(closer.target_proof.value):
+                return
             registration.target_resolution = NativeHistoryTargetProof(
-                target_id=close_registration.target_id,
+                target_id=closer.target_id,
                 anchor_target_id=registration.anchor_target_id,
                 creation_url=registration.creation_url,
             )
             registration.creation_state.value = _NATIVE_HISTORY_TARGET_CLOSED
             state = _NATIVE_HISTORY_TARGET_CLOSED
 
+        # A closer may have published target safety before its own driver was
+        # reaped. Promote that proof once and never create a second closer for
+        # the same target.
+        promote_closer_proof()
+
         if registration.target_resolution is None:
+            plan = _native_history_cleanup_phase_plan(
+                registration,
+                cleanup_deadline,
+                operation_deadline,
+            )
             if (
                 state == _NATIVE_HISTORY_TARGET_NONE
                 and registration.start_state in {"not_started", "failed"}
@@ -5372,49 +5700,51 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
                     creation_url=registration.creation_url,
                 )
             else:
-                target_bytes = registration.owned_target.value
-                target_id = None
-                if target_bytes:
+                if not poll_only and time.monotonic() < plan["target_close_deadline"]:
+                    target_bytes = registration.owned_target.value
+                    target_id = None
+                    if target_bytes:
+                        try:
+                            target_id = target_bytes.decode("ascii")
+                        except (UnicodeDecodeError, AttributeError):
+                            target_id = None
                     try:
-                        target_id = target_bytes.decode("ascii")
-                    except (UnicodeDecodeError, AttributeError):
-                        target_id = None
-                try:
-                    proof = _close_owned_oracle_target(
-                        cdp_endpoint=registration.cdp_endpoint,
-                        target_id=target_id,
-                        anchor_target_id=registration.anchor_target_id,
-                        creation_url=registration.creation_url,
-                        deadline=plan["target_close_deadline"],
-                        playwright_factory=None,
-                        lifecycle_capability=lifecycle_capability,
-                        lifecycle_registration=registration,
-                    )
-                    registration.target_resolution = proof
-                    registration.creation_state.value = (
-                        _NATIVE_HISTORY_TARGET_CLOSED
-                    )
-                    state = _NATIVE_HISTORY_TARGET_CLOSED
-                except Exception as exc:
-                    registration.cleanup_failure = str(exc)
-                    close_registration = registration.close_registration
-                    if (
-                        close_registration is not None
-                        and bool(close_registration.target_proof.value)
-                    ):
-                        registration.target_resolution = NativeHistoryTargetProof(
-                            target_id=close_registration.target_id,
+                        proof = _close_owned_oracle_target(
+                            cdp_endpoint=registration.cdp_endpoint,
+                            target_id=target_id,
                             anchor_target_id=registration.anchor_target_id,
                             creation_url=registration.creation_url,
+                            deadline=plan["target_close_deadline"],
+                            playwright_factory=None,
+                            lifecycle_capability=lifecycle_capability,
+                            lifecycle_registration=registration,
                         )
+                        registration.target_resolution = proof
                         registration.creation_state.value = (
                             _NATIVE_HISTORY_TARGET_CLOSED
                         )
                         state = _NATIVE_HISTORY_TARGET_CLOSED
+                    except Exception as exc:
+                        registration.cleanup_failure = str(exc)
+                    promote_closer_proof()
+                    close_registration = registration.close_registration
+
+        close_registration = registration.close_registration
 
         if registration.target_resolution is None:
+            plan = _native_history_cleanup_phase_plan(
+                registration,
+                cleanup_deadline,
+                operation_deadline,
+            )
             try:
-                if lifecycle_capability.terminate_owned_browser(reap_deadline):
+                if lifecycle_capability.terminate_owned_browser(
+                    term_deadline=plan["term_deadline"],
+                    kill_deadline=plan["kill_deadline"],
+                    reap_deadline=plan["reap_deadline"],
+                    final_deadline=plan["final_deadline"],
+                    poll_only=poll_only,
+                ):
                     registration.creation_state.value = (
                         _NATIVE_HISTORY_TARGET_BROWSER_TERMINATED
                     )
@@ -5464,12 +5794,111 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
             registration.released = True
             registration.release_proof = release_proof
 
+        def worker_tree_reaped(
+            process: Any,
+            private_process_group: Any,
+            private_process_start_time: Any,
+            *,
+            phase_poll_only: bool,
+        ) -> bool:
+            close_scope = registration.close_registration
+            is_closer = (
+                close_scope is not None
+                and process is close_scope.process
+            )
+            scope_reaped_state = {
+                "proven": (
+                    close_scope.scope_reaped_proven
+                    if is_closer and close_scope is not None
+                    else registration.worker_scope_reaped_proven
+                ),
+            }
+            try:
+                scope_proof = bool(
+                    lifecycle_capability.terminate_native_history_process_scope(
+                        registration_id=registration.registration_id,
+                        term_deadline=plan["term_deadline"],
+                        kill_deadline=plan["kill_deadline"],
+                        reap_deadline=plan["reap_deadline"],
+                        poll_only=phase_poll_only,
+                    )
+                )
+            except Exception as exc:
+                registration.cleanup_failure = str(exc)
+                return False
+            if scope_proof:
+                # Retain the actual owner result even when the directly owned
+                # multiprocessing child still needs a later join.
+                scope_reaped_state["proven"] = True
+                if is_closer and close_scope is not None:
+                    close_scope.scope_reaped_proven = True
+                else:
+                    registration.worker_scope_reaped_proven = True
+            if _native_history_process_reaped(
+                process,
+                private_process_group,
+                private_process_start_time,
+                term_deadline=plan["term_deadline"],
+                kill_deadline=plan["kill_deadline"],
+                reap_deadline=plan["reap_deadline"],
+                poll_only=phase_poll_only,
+                scope_reaped_state=scope_reaped_state,
+            ):
+                if is_closer and close_scope is not None:
+                    close_scope.scope_reaped_proven = bool(
+                        scope_reaped_state["proven"]
+                    )
+                else:
+                    registration.worker_scope_reaped_proven = bool(
+                        scope_reaped_state["proven"]
+                    )
+                return True
+            # The browser driver can outlive its multiprocessing leader. Give
+            # the owning sidecar a chance to signal its retained role-marked
+            # pidfds before declaring the worker tree unreaped.
+            try:
+                lifecycle_capability.terminate_owned_browser(
+                    term_deadline=plan["term_deadline"],
+                    kill_deadline=plan["kill_deadline"],
+                    reap_deadline=plan["reap_deadline"],
+                    final_deadline=plan["final_deadline"],
+                    poll_only=phase_poll_only,
+                )
+            except Exception as exc:
+                registration.cleanup_failure = str(exc)
+                return False
+            reaped = _native_history_process_reaped(
+                process,
+                private_process_group,
+                private_process_start_time,
+                term_deadline=plan["term_deadline"],
+                kill_deadline=plan["kill_deadline"],
+                reap_deadline=plan["reap_deadline"],
+                poll_only=True,
+                scope_reaped_state=scope_reaped_state,
+            )
+            if is_closer and close_scope is not None:
+                close_scope.scope_reaped_proven = bool(
+                    scope_reaped_state["proven"]
+                )
+            else:
+                registration.worker_scope_reaped_proven = bool(
+                    scope_reaped_state["proven"]
+                )
+            return reaped
+
         close_registration = registration.close_registration
         if close_registration is not None and not close_registration.reaped:
-            if not _native_history_process_reaped(
+            plan = _native_history_cleanup_phase_plan(
+                registration,
+                cleanup_deadline,
+                operation_deadline,
+            )
+            if not worker_tree_reaped(
                 close_registration.process,
                 close_registration.private_process_group,
-                reap_deadline,
+                close_registration.private_process_start_time,
+                phase_poll_only=poll_only,
             ):
                 registration.cleanup_failure = (
                     "Native ChatGPT history closer was not reaped."
@@ -5482,10 +5911,16 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
             close_registration.reaped = True
             close_registration.reap_ack.set()
 
-        if not _native_history_process_reaped(
+        plan = _native_history_cleanup_phase_plan(
+            registration,
+            cleanup_deadline,
+            operation_deadline,
+        )
+        if not worker_tree_reaped(
             registration.process,
             registration.private_process_group,
-            reap_deadline,
+            registration.private_process_start_time,
+            phase_poll_only=poll_only,
         ):
             registration.cleanup_failure = (
                 "Native ChatGPT history interception worker was not reaped."
@@ -5495,10 +5930,26 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
                 registration.cleanup_failure,
             )
             return False
+        registration.worker_retirement_proven = True
+        release_control_state = registration.release_control_state
+        registration.release_control_failed = bool(
+            registration.release_control_failed
+            or (
+                release_control_state is not None
+                and bool(release_control_state.value)
+            )
+        )
+        if registration.release_control_failed:
+            registration.cleanup_failure = (
+                "Native ChatGPT history release control failed."
+            )
+            lifecycle_capability.retain_native_history(
+                registration,
+                registration.cleanup_failure,
+            )
         registration.owned_target.value = b""
         lifecycle_capability.retire_native_history(registration)
         registration.retired = True
-        registration.cleanup_failure = None
         return True
     except Exception as exc:
         registration.cleanup_failure = str(exc)
@@ -5508,7 +5959,7 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
         )
         return False
     finally:
-        if gate is not None:
+        if gate is not None and gate_acquired:
             try:
                 gate.release()
             except (RuntimeError, OSError, ValueError):
@@ -5524,6 +5975,8 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
     expected_account_hash: str,
     max_response_bytes: int,
     private_process_group: Any,
+    private_process_start_time: Any,
+    role_marker: str,
     owned_target: Any,
     creation_state: Any,
     creation_url: str,
@@ -5532,8 +5985,16 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
     creation_settled: Any,
     abort_event: Any,
     release_event: Any,
+    release_control_failed: Any,
 ) -> None:
-    _enter_oracle_browser_worker_process_group(private_process_group)
+    _enter_oracle_browser_worker_process_group(
+        private_process_group,
+        private_process_start_time,
+    )
+    # Install the role marker before Playwright launches any driver process.
+    # The marker is inherited by the actual browser driver and lets the owner
+    # retain its pidfd after this worker exits.
+    os.environ[CHATGPT_NATIVE_HISTORY_ROLE_ENV] = role_marker
     playwright = None
     browser = None
     target_session = None
@@ -5646,6 +6107,13 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
                 _disconnect_attached_browser(playwright, browser)
             except Exception:
                 pass
+        else:
+            # A broken release channel cannot authorize detachment. Keep the
+            # interception session and browser references parked until the
+            # owner proves target safety and retires this worker directly.
+            release_control_failed.value = True
+            while True:
+                time.sleep(0.05)
 
 
 def _create_native_history_owned_page(
@@ -5764,13 +6232,6 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
     lifecycle_registration: Optional[NativeHistoryLifecycleRegistration] = None,
 ) -> NativeHistoryTargetProof:
     """Give exact-target cleanup its own bounded, killable driver."""
-    _raise_if_browser_deadline_expired(deadline)
-    if target_id == anchor_target_id:
-        raise OracleBrowserBoundaryUnavailable(
-            "Oracle browser cleanup cannot close the context anchor."
-        )
-    if target_id is not None:
-        _validate_page_target_id(target_id)
     if lifecycle_registration is not None:
         existing = lifecycle_registration.close_registration
         if existing is not None:
@@ -5780,17 +6241,31 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
                     anchor_target_id=anchor_target_id,
                     creation_url=creation_url,
                 )
-            if not existing.reaped:
-                raise OracleBrowserCleanupError(
-                    "Oracle browser owned-target closer is still active."
-                )
-            lifecycle_registration.close_registration = None
+            raise OracleBrowserCleanupError(
+                "Oracle browser owned-target closer is already registered."
+            )
+    _raise_if_browser_deadline_expired(deadline)
+    if target_id == anchor_target_id:
+        raise OracleBrowserBoundaryUnavailable(
+            "Oracle browser cleanup cannot close the context anchor."
+        )
+    if target_id is not None:
+        _validate_page_target_id(target_id)
     _raise_if_browser_deadline_expired(deadline)
     context = _oracle_browser_process_context(playwright_factory)
     private_process_group = context.RawValue("q", 0)
+    private_process_start_time = context.RawValue("q", 0)
     target_proof = context.RawValue("b", False)
     driver_done = context.Event()
     reap_ack = context.Event()
+    role_marker = (
+        "history-closer:"
+        + (
+            lifecycle_registration.registration_id
+            if lifecycle_registration is not None
+            else os.urandom(16).hex()
+        )
+    )
     process = context.Process(
         target=_oracle_browser_close_target_worker,
         args=(
@@ -5801,6 +6276,8 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
             deadline,
             playwright_factory,
             private_process_group,
+            private_process_start_time,
+            role_marker,
             target_proof,
             driver_done,
             lifecycle_registration is not None,
@@ -5812,34 +6289,68 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
         close_registration = NativeHistoryCloseRegistration(
             process=process,
             private_process_group=private_process_group,
+            private_process_start_time=private_process_start_time,
             target_proof=target_proof,
             driver_done=driver_done,
             reap_ack=reap_ack,
             target_id=target_id,
             creation_url=creation_url,
         )
-        lifecycle_registration.close_registration = close_registration
         lifecycle_capability.register_native_history_closer(
             lifecycle_registration,
             close_registration,
         )
     try:
         if close_registration is not None:
-            close_registration.started = True
+            close_registration.start_state = "starting"
         process.start()
+        if close_registration is not None:
+            close_registration.start_state = "started"
+            close_registration.started = True
     except Exception as exc:
         if close_registration is not None:
-            close_registration.reaped = True
-            reap_ack.set()
+            close_registration.start_state = "failed"
         raise OracleBrowserCleanupError(
             "Oracle browser owned-target closer could not start."
         ) from exc
+    scope_reaped_proven = False
+
+    def closer_scope_reaped() -> bool:
+        nonlocal scope_reaped_proven
+        if scope_reaped_proven:
+            return True
+        if (
+            _native_history_process_alive(process)
+            or getattr(process, "exitcode", None) is None
+        ):
+            return False
+        scope_alive = _native_history_process_group_alive(
+            private_process_group,
+            process,
+            private_process_start_time,
+            deadline=deadline,
+        )
+        if scope_alive is False:
+            scope_reaped_proven = True
+            if close_registration is not None:
+                close_registration.scope_reaped_proven = True
+            return True
+        return False
+
     try:
         process.join(timeout=max(0.0, _remaining_browser_timeout(deadline)))
-        if process.is_alive() or getattr(process, "exitcode", None) is None:
-            _terminate_oracle_browser_worker(process, private_process_group.value)
+        if (
+            not closer_scope_reaped()
+        ):
+            _terminate_oracle_browser_worker(
+                process,
+                private_process_group.value,
+                private_process_start_time,
+            )
             process.join(timeout=max(0.0, _remaining_browser_timeout(deadline)))
-        if process.is_alive() or getattr(process, "exitcode", None) is None:
+        if (
+            not closer_scope_reaped()
+        ):
             if (
                 close_registration is not None
                 and bool(close_registration.target_proof.value)
@@ -5863,15 +6374,22 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
             creation_url=creation_url,
         )
     finally:
-        if process.is_alive():
-            _terminate_oracle_browser_worker(process, private_process_group.value)
+        if not closer_scope_reaped():
+            _terminate_oracle_browser_worker(
+                process,
+                private_process_group.value,
+                private_process_start_time,
+            )
             try:
                 process.join(
                     timeout=max(0.0, _remaining_browser_timeout(deadline))
                 )
             except (AssertionError, OSError):
                 pass
-        if not process.is_alive() and close_registration is not None:
+        if (
+            closer_scope_reaped()
+            and close_registration is not None
+        ):
             close_registration.reaped = True
             reap_ack.set()
 
@@ -5884,12 +6402,20 @@ def _oracle_browser_close_target_worker(
     deadline: float,
     playwright_factory: Optional[Callable[[], Any]],
     private_process_group: Any,
+    private_process_start_time: Any,
+    role_marker: str,
     target_proof: Any,
     driver_done: Any,
     require_target_present: bool,
     require_target_absence: bool,
 ) -> None:
-    _enter_oracle_browser_worker_process_group(private_process_group)
+    _enter_oracle_browser_worker_process_group(
+        private_process_group,
+        private_process_start_time,
+    )
+    # Install the role marker before Playwright launches its driver. The
+    # sidecar uses this marker plus pidfds, never a stale parent PID.
+    os.environ[CHATGPT_NATIVE_HISTORY_ROLE_ENV] = role_marker
     playwright = None
     browser = None
     try:
@@ -5973,6 +6499,7 @@ def _oracle_browser_close_target_worker(
 def _receive_oracle_browser_worker_message(
     receiver: Any,
     deadline: float,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> Mapping[str, Any]:
     pipe_buffer = bytearray()
     payload = bytearray()
@@ -5981,6 +6508,7 @@ def _receive_oracle_browser_worker_message(
             receiver,
             pipe_buffer,
             deadline,
+            should_stop=should_stop,
         )
         if not frame:
             break
@@ -6006,6 +6534,7 @@ def _read_oracle_browser_worker_frame(
     receiver: Any,
     pipe_buffer: bytearray,
     deadline: float,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> bytes:
     try:
         pipe_fd = receiver.fileno()
@@ -6019,6 +6548,7 @@ def _read_oracle_browser_worker_frame(
         pipe_buffer,
         4,
         deadline,
+        should_stop=should_stop,
     )
     frame_length = int.from_bytes(pipe_buffer[:4], byteorder="big", signed=True)
     del pipe_buffer[:4]
@@ -6031,6 +6561,7 @@ def _read_oracle_browser_worker_frame(
         pipe_buffer,
         frame_length,
         deadline,
+        should_stop=should_stop,
     )
     frame = bytes(pipe_buffer[:frame_length])
     del pipe_buffer[:frame_length]
@@ -6042,8 +6573,13 @@ def _fill_oracle_browser_pipe_buffer(
     pipe_buffer: bytearray,
     required_bytes: int,
     deadline: float,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> None:
     while len(pipe_buffer) < required_bytes:
+        if should_stop is not None and should_stop():
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser conversation-init capture was aborted."
+            )
         remaining_seconds = _remaining_browser_timeout(deadline)
         if remaining_seconds <= 0:
             raise OracleBrowserBoundaryUnavailable(
@@ -6054,16 +6590,14 @@ def _fill_oracle_browser_pipe_buffer(
                 [pipe_fd],
                 [],
                 [],
-                remaining_seconds,
+                min(remaining_seconds, 0.1),
             )
         except (OSError, ValueError) as exc:
             raise OracleBrowserBoundaryUnavailable(
                 "Oracle browser boundary worker pipe is unavailable."
             ) from exc
         if not readable:
-            raise OracleBrowserBoundaryUnavailable(
-                "Oracle browser conversation-init capture timed out."
-            )
+            continue
         try:
             chunk = os.read(pipe_fd, 65536)
         except BlockingIOError:
@@ -6102,14 +6636,28 @@ def _oracle_browser_process_context(
     return multiprocessing.get_context("spawn")
 
 
-def _enter_oracle_browser_worker_process_group(private_process_group: Any) -> None:
+def _enter_oracle_browser_worker_process_group(
+    private_process_group: Any,
+    private_process_start_time: Optional[Any] = None,
+) -> None:
     if os.name == "posix":
         # Fail before starting the driver unless cleanup owns an isolated group.
         os.setsid()
         private_process_group.value = os.getpgrp()
+        if private_process_start_time is not None:
+            start_time = _native_history_process_start_time(os.getpid())
+            if start_time is None:
+                raise RuntimeError(
+                    "Oracle browser worker identity could not be established."
+                )
+            private_process_start_time.value = start_time
 
 
-def _terminate_oracle_browser_worker(process: Any, private_process_group: int) -> None:
+def _terminate_oracle_browser_worker(
+    process: Any,
+    private_process_group: int,
+    private_process_start_time: Optional[Any] = None,
+) -> None:
     process_id = getattr(process, "pid", None)
     if (
         os.name == "posix"
@@ -6117,26 +6665,35 @@ def _terminate_oracle_browser_worker(process: Any, private_process_group: int) -
         and private_process_group == process_id
         and private_process_group > 0
         and private_process_group != os.getpgrp()
+        and private_process_start_time is not None
+        and _native_history_process_identity_matches(
+            process_id,
+            private_process_start_time,
+        )
     ):
         try:
             # The driver can survive its leader; group cleanup is unconditional.
             os.killpg(private_process_group, signal.SIGKILL)
         except OSError:
             pass
-    if not process.is_alive():
+    try:
+        process_alive = process.is_alive()
+    except (AssertionError, OSError, ValueError):
+        process_alive = False
+    if not process_alive:
         return
     kill = getattr(process, "kill", None)
     if callable(kill):
         try:
             kill()
             return
-        except OSError:
+        except (AssertionError, OSError, ValueError):
             pass
     terminate = getattr(process, "terminate", None)
     if callable(terminate):
         try:
             terminate()
-        except OSError:
+        except (AssertionError, OSError, ValueError):
             pass
 
 
