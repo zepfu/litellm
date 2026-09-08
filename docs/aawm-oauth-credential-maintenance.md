@@ -103,6 +103,12 @@ keyed by credential family, resolved file, and scope. File metadata checks and
 reads run off the request event loop. A fingerprint change or route-safety
 deadline evicts the cached snapshot before a later request rebuilds it.
 
+`AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS` is the writer's early-refresh lead
+time. `LITELLM_XAI_OAUTH_REFRESH_BUFFER_SECONDS` is the consumer route-safety
+buffer. They are intentionally independent: sidecar status reports route
+usability using the consumer value while scheduling refresh from the writer
+value.
+
 For a provider-returned managed `401` before response bytes are committed,
 alias routing, direct LiteLLM async routes, OpenAI passthrough, and Anthropic
 Messages passthrough can make one recovery attempt. The retry uses the exact
