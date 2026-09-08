@@ -1990,6 +1990,7 @@ def _chatgpt_oracle_required_env_path(name: str) -> str:
 
 def _chatgpt_oracle_startup_argv(
     binding: ChatGPTConversationInitAccountBinding,
+    temp_root: Path,
 ) -> List[str]:
     if binding.oracle_profile_path is None:
         raise RuntimeError("Oracle profile binding is missing its profile path.")
@@ -2221,8 +2222,11 @@ def _chatgpt_oracle_browser_binding(
         process: Optional[subprocess.Popen] = None
         try:
             try:
+                child_env = os.environ.copy()
+                child_env["TMPDIR"] = str(temp_root)
                 process = subprocess.Popen(
-                    _chatgpt_oracle_startup_argv(binding),
+                    _chatgpt_oracle_startup_argv(binding, temp_root),
+                    env=child_env,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
