@@ -30,6 +30,9 @@ from typing import Any, Callable, Mapping, NoReturn, Optional
 
 from litellm.types.utils import all_litellm_params
 
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+    normalize_codex_collaboration_dispatch_body,
+)
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.direct_openai_function_call_history import (
     normalize_direct_openai_legacy_function_call_history_ids,
 )
@@ -431,6 +434,9 @@ def compile_openai_responses_wire_body(
 
     # 1. Legacy function-history id normalization (direct + alias contract).
     body = normalize_direct_openai_legacy_function_call_history_ids(body)
+
+    # 1.5 Codex collaboration schema/assignment normalization before egress guard.
+    body = normalize_codex_collaboration_dispatch_body(body)
 
     # 2. Resolved-model unsupported Codex request-parameter removal.
     dropped_params: tuple[str, ...] = ()

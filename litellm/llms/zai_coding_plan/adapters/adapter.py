@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from typing import Any, Iterable, Optional, cast
 
 from litellm.llms.zai_coding_plan.chat.transformation import (
@@ -21,12 +20,6 @@ from litellm.responses.litellm_completion_transformation.transformation import (
 from litellm.types.llms.openai import ResponsesAPIOptionalRequestParams
 
 ZAI_CODING_PLAN_CREDENTIAL_SENTINEL = "canonical-zai-coding-plan-credential"
-_CODEX_AGENT_MESSAGE_EMPTY_PAYLOAD_PATTERN = re.compile(
-    r"\AMessage Type: (?:NEW_TASK|MESSAGE)\n"
-    r"Task name: [^\n]+\n"
-    r"Sender: [^\n]+\n"
-    r"Payload:\n?\Z"
-)
 _ZAI_CODING_PLAN_SUPPORTED_TOOL_TYPES = frozenset({"function"})
 
 
@@ -306,60 +299,20 @@ def _add_adapter_metadata(
 def _restore_codex_agent_message_payloads(
     request_body: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Restore only explicit Codex collaboration task payloads."""
+    """Normalize Codex collaboration assignments through the shared owner."""
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+        restore_codex_agent_message_payloads_for_openai_egress,
+    )
 
-    input_items = request_body.get("input")
-    if not isinstance(input_items, list):
+    updated_body = restore_codex_agent_message_payloads_for_openai_egress(
+        request_body,
+    )
+    if updated_body is request_body or updated_body.get("input") is request_body.get(
+        "input",
+    ):
         return request_body, {}
-
-    restored_count = 0
-    restored_chars = 0
-    updated_items: list[Any] = []
-    for item in input_items:
-        if not isinstance(item, dict) or item.get("type") != "agent_message":
-            updated_items.append(item)
-            continue
-        content = item.get("content")
-        if not isinstance(content, list) or len(content) != 2:
-            updated_items.append(item)
-            continue
-        visible_part, payload_part = content
-        if not isinstance(visible_part, dict) or not isinstance(payload_part, dict):
-            updated_items.append(item)
-            continue
-        visible_text = visible_part.get("text")
-        payload = payload_part.get("encrypted_content")
-        if (
-            visible_part.get("type") not in {"input_text", "text"}
-            or not isinstance(visible_text, str)
-            or _CODEX_AGENT_MESSAGE_EMPTY_PAYLOAD_PATTERN.fullmatch(visible_text) is None
-            or payload_part.get("type") != "encrypted_content"
-            or not isinstance(payload, str)
-            or not payload
-        ):
-            updated_items.append(item)
-            continue
-
-        separator = "" if visible_text.endswith("\n") else "\n"
-        updated_item = dict(item)
-        updated_item["content"] = [
-            {
-                "type": visible_part["type"],
-                "text": f"{visible_text}{separator}{payload}",
-            }
-        ]
-        updated_items.append(updated_item)
-        restored_count += 1
-        restored_chars += len(payload)
-
-    if restored_count == 0:
-        return request_body, {}
-    updated_body = dict(request_body)
-    updated_body["input"] = updated_items
     return updated_body, {
-        "zai_coding_plan_codex_agent_task_payload_restored": True,
-        "zai_coding_plan_codex_agent_task_payload_restored_count": restored_count,
-        "zai_coding_plan_codex_agent_task_payload_restored_chars": restored_chars,
+        "zai_coding_plan_codex_agent_task_payload_normalized": True,
     }
 
 
