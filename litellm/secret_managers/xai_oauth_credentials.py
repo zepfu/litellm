@@ -15,7 +15,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
 
 DEFAULT_XAI_OAUTH_AUTH_FILE = "~/.litellm/xai/oauth-auth.json"
 DEFAULT_XAI_OAUTH_LOCK_FILE = "~/.litellm/xai/oauth-auth.json.lock"
@@ -38,7 +38,7 @@ XAI_GROK_SCOPE_ENV_VARS = (
     "LITELLM_XAI_OAUTH_SCOPE",
 )
 
-AuthPathValue = str | os.PathLike[str]
+AuthPathValue = Union[str, os.PathLike[str]]
 ValueGetter = Callable[[str], Any]
 
 
@@ -78,6 +78,7 @@ def _clean_string(value: Any) -> Optional[str]:
 
 
 def _expand_path(value: str) -> Path:
+    # Preserve lexical parent traversal for the secure O_NOFOLLOW credential open.
     return Path(value).expanduser()
 
 
@@ -124,7 +125,7 @@ def resolve_xai_oauth_auth_path(
     if configured_paths:
         selected_path = configured_paths[0][1]
         if any(
-            path.resolve(strict=False) != selected_path.resolve(strict=False)
+            path != selected_path
             for _source, path in configured_paths[1:]
         ):
             sources = ", ".join(source for source, _path in configured_paths)

@@ -761,6 +761,21 @@ def _validated_xai_oauth_server_account_metadata(
         return None
 
 
+def _validated_xai_oauth_server_account_metadata(
+    metadata: Dict[str, Any],
+) -> Optional[Dict[str, str | bool]]:
+    """Accept only an inventory-proven managed xAI account binding."""
+
+    try:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+            validated_xai_oauth_server_account_metadata,
+        )
+
+        return validated_xai_oauth_server_account_metadata(metadata)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _extract_xai_oauth_account_hash(metadata: Dict[str, Any]) -> Optional[str]:
     server_metadata = _validated_xai_oauth_server_account_metadata(metadata)
     value = (
@@ -864,6 +879,64 @@ def _extract_xai_oauth_billing_period_end(
             return parsed, source
 
     return None, None
+
+
+def _resolve_xai_header_rate_limit_account_context(
+    *,
+    context: Dict[str, Any],
+    metadata: Dict[str, Any],
+    native: bool,
+) -> Optional[
+    Tuple[
+        Optional[str],
+        Optional[str],
+        Dict[str, Any],
+        Dict[str, Any],
+    ]
+]:
+    if native:
+        return (
+            _extract_xai_grok_oidc_account_hash(metadata),
+            (
+                _clean_non_empty_string(metadata.get("grok_model_override"))
+                or _clean_non_empty_string(metadata.get("model_group"))
+                or (
+                    _clean_non_empty_string(context.get("model"))
+                    if context.get("model") != "unknown"
+                    else None
+                )
+            ),
+            {},
+            {},
+        )
+
+    server_account_metadata = _validated_xai_oauth_server_account_metadata(
+        metadata
+    )
+    if server_account_metadata is None:
+        return None
+    account_hash = str(server_account_metadata["xai_oauth_account_hash"])
+    scope_identity = str(server_account_metadata["xai_oauth_scope_identity"])
+    account_label = str(server_account_metadata["xai_oauth_account_label"])
+    account_lane = str(server_account_metadata["xai_oauth_lane_key"])
+    model = _clean_non_empty_string(metadata.get("xai_oauth_public_model")) or (
+        _clean_non_empty_string(context.get("model"))
+        if context.get("model") != "unknown"
+        else None
+    )
+    return (
+        account_hash,
+        model,
+        {"xai_oauth_scope_identity": scope_identity},
+        {
+            "xai_oauth_server_account_binding": True,
+            "account_identity_source": "xai_oauth_inventory_record",
+            "account_label": account_label,
+            "account_hash": account_hash,
+            "account_lane": account_lane,
+            "scope_identity": scope_identity,
+        },
+    )
 
 
 def _extract_xai_header_rate_limit_observations(

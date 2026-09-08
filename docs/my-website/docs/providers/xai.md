@@ -254,8 +254,9 @@ failures retain the generic proxy retry policy.
 
 For a provider-returned managed `oa_xai/*` HTTP `401` before response bytes are
 committed, LiteLLM can reread the configured credential and make one retry on
-alias routes, direct async SDK routes, and OpenAI passthrough. The reread must
-produce a new credential generation with the same derived non-secret account
+alias routes, direct async SDK routes, OpenAI passthrough, and Anthropic
+Messages passthrough. The reread must produce a new credential generation with
+the same derived non-secret account
 identity. Client IDs and OAuth scope are not account proof by themselves.
 An unchanged, expired, malformed, unproven-account, or different-account
 credential is not retried, and native `xai/*` Grok OIDC traffic does not use
