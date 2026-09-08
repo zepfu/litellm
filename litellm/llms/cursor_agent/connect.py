@@ -2894,8 +2894,19 @@ class CursorAgentRetainedSession:
         self.pending = bytearray()
         self._buffered_frames: List[CursorConnectProtoFrame] = []
         self._external_exec_requests: Dict[str, Dict[str, Any]] = {}
+        self._response_stream_ended = False
+        self._result_bytes_written = False
+        self._provider_progress_observed = False
+        self._pending_result_prefix: Optional[int] = None
         self._closed = False
         self._wait_closed_started = False
+
+    @property
+    def continuation_evidence(self) -> Dict[str, bool]:
+        return {
+            "result_bytes_written": self._result_bytes_written,
+            "provider_progress_observed": self._provider_progress_observed,
+        }
 
     @property
     def can_continue(self) -> bool:
@@ -2946,6 +2957,9 @@ class CursorAgentRetainedSession:
         *,
         timeout: Optional[float] = None,
     ) -> "CursorAgentRunResult":
+        self._result_bytes_written = False
+        self._provider_progress_observed = False
+        self._pending_result_prefix = None
         if self._closed:
             raise CursorConnectError(
                 "Cursor Agent retained continuation session is closed.",
@@ -2974,8 +2988,10 @@ class CursorAgentRetainedSession:
                 )
             requests.append((exec_request, output))
 
+        self._raise_for_buffered_terminal()
         for call_id, _output in outputs:
             self._external_exec_requests.pop(str(call_id), None)
+        self._pending_result_prefix = len(self.pending)
         for exec_request, output in requests:
             for client_message in _encode_external_exec_terminal_result(
                 exec_request,
@@ -2990,8 +3006,45 @@ class CursorAgentRetainedSession:
             result.retained_session = self
         return result
 
+    def _raise_for_buffered_terminal(self) -> None:
+        for frame in self._buffered_frames:
+            if frame.is_end_stream:
+                _raise_for_connect_end_stream(frame.payload)
+                raise CursorConnectError(
+                    "Cursor Agent Connect ended before the external tool result.",
+                    status_code=502,
+                )
+            fields = _decode_proto_fields(frame.payload)
+            if isinstance(_proto_last_field(fields, 5, wire_type=2), bytes):
+                raise CursorConnectProtocolError(
+                    "Cursor Agent aborted a local exec request."
+                )
+            if isinstance(_proto_last_field(fields, 7, wire_type=2), bytes):
+                raise CursorConnectProtocolError(
+                    "Cursor Agent requested an unsupported interactive client response."
+                )
+            interaction = _proto_last_field(fields, 1, wire_type=2)
+            if isinstance(interaction, bytes) and isinstance(
+                _proto_last_field(
+                    _decode_proto_fields(interaction),
+                    14,
+                    wire_type=2,
+                ),
+                bytes,
+            ):
+                raise CursorConnectError(
+                    "Cursor Agent turn ended before the external tool result.",
+                    status_code=502,
+                )
+        if self._response_stream_ended:
+            raise CursorConnectError(
+                "Cursor Agent HTTP/2 stream ended before the external tool result.",
+                status_code=502,
+            )
+
     async def _flush_pending(self) -> None:
         while True:
+            pending_before = len(self.pending)
             outbound = CursorAgentConnectClient._flush_h2_request_data(
                 self.connection,
                 self.stream_id,
@@ -2999,6 +3052,15 @@ class CursorAgentRetainedSession:
             )
             if not outbound:
                 return
+            if self._pending_result_prefix is not None:
+                consumed = pending_before - len(self.pending)
+                if consumed > self._pending_result_prefix:
+                    # Count the write handoff even if the transport raises:
+                    # it cannot establish that no result bytes escaped.
+                    self._result_bytes_written = True
+                    self._pending_result_prefix = None
+                else:
+                    self._pending_result_prefix -= consumed
             self.writer.write(outbound)
             await self.writer.drain()
 
@@ -3144,6 +3206,7 @@ class CursorAgentRetainedSession:
 
             from h2 import events as h2_events
 
+            boundary_reached = False
             for event in self.connection.receive_data(incoming):
                 if isinstance(event, h2_events.ResponseReceived):
                     response_headers = CursorAgentConnectClient._h2_response_headers(
@@ -3159,6 +3222,8 @@ class CursorAgentRetainedSession:
                         self.pending.clear()
                     continue
                 if isinstance(event, h2_events.DataReceived):
+                    if self._result_bytes_written and event.data:
+                        self._provider_progress_observed = True
                     self.connection.acknowledge_received_data(
                         event.flow_controlled_length,
                         event.stream_id,
@@ -3171,13 +3236,17 @@ class CursorAgentRetainedSession:
                         continue
                     frames = self.decoder.feed(event.data)
                     for index, frame in enumerate(frames):
+                        if boundary_reached:
+                            self._buffered_frames.extend(frames[index:])
+                            break
                         if self._handle_frame(
                             frame,
                             result,
                             stop_on_tool_call=stop_on_tool_call,
                         ):
                             self._buffered_frames.extend(frames[index + 1 :])
-                            return result
+                            boundary_reached = True
+                            break
                     continue
                 if isinstance(event, h2_events.TrailersReceived):
                     trailer_headers = CursorAgentConnectClient._h2_response_headers(
@@ -3200,12 +3269,14 @@ class CursorAgentRetainedSession:
                         )
                     continue
                 if isinstance(event, h2_events.StreamEnded):
+                    self._response_stream_ended = True
                     provider_response_error = self._provider_response_error()
                     if provider_response_error is not None:
                         raise provider_response_error
                     self.decoder.finish()
                     result.validate_terminal()
-                    return result
+                    boundary_reached = True
+                    continue
                 if isinstance(event, h2_events.StreamReset):
                     raise CursorConnectError(
                         "Cursor Agent HTTP/2 stream was reset "
@@ -3218,6 +3289,10 @@ class CursorAgentRetainedSession:
                         f"(error_code={event.error_code}).",
                         status_code=502,
                     )
+            # receive_data has already consumed the entire bounded read. Drain
+            # its control events and retain every later frame before pausing.
+            if boundary_reached:
+                return result
 
     async def start(
         self,
