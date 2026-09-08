@@ -839,6 +839,27 @@ This path has two cooperating pieces:
   never reads Oracle cookies, and never ships `authenticator.py`,
   `common_utils.py`, or `httpx`.
 
+Native history capture is admitted only through the live sidecar
+`SidecarTaskState` that owns the private Oracle helper. The owner publishes its
+endpoint and anchor binding before registering a history worker, rejects
+borrowed or stale bindings, and retains each worker, exact-target closer, and
+scratch remover until their own process retirement is proven. Descendant
+discovery retains live pidfd identities and role-specific markers installed in
+each native-history worker before Playwright launch; a historical numeric
+parent or process group never authorizes adoption or termination after leader
+identity is lost. Incomplete bounded scans retain explicit unresolved inventory
+diagnostics and cannot become a positive retirement proof. Cleanup uses one
+shared absolute operation ceiling:
+target-close, cooperative termination, forced termination, reconciliation,
+reaping, and scratch removal may be shortened by shutdown but never restart a
+deadline or create a recovery allowance. A failed target proof, release
+channel, or final descendant inventory remains an attributable cleanup failure;
+it is never reported as successful history or as an empty conversation set.
+Shutdown captures its cutoff at cancellation (or one-shot shutdown entry),
+closes admission, requests abort for all published owners, and keeps that same
+state servicing retained owners until safety and retirement are proven. The
+stopped event is emitted only after the owner registry is empty.
+
 The sidecar image packages `conversation_init.py`, the owned
 `scripts/chatgpt_oracle_browser_session.mjs` helper, and pinned Playwright with
 Chromium shared libraries/Xvfb, `rsync`, and `xauth`; it does not download another
@@ -1003,6 +1024,176 @@ Polling uses a 600-second default cadence. `Retry-After` and backoff apply to
 the shared browser session, preserving other sessions and prior observation
 rows. A deferred or failed capture is not fresh evidence and does not replace
 prior rows or establish account coverage.
+
+### Native ChatGPT history observation
+
+`observe_native_chatgpt_history_from_oracle_browser(...)` is a separate,
+attach-only feasibility observer for ordinary Chat history. It requires the
+nonserialized lifecycle capability supplied by the private profile owner, the
+owner's persistent supervised registry, the exact CDP endpoint and anchor
+target, and the pinned canonical-12 account hash `8e92854835c4`, creates one
+owned page in that browser context, and performs one ordinary
+`https://chatgpt.com/` navigation. The observer first rejects a capability whose
+CDP endpoint or anchor target does not match the owner. Cleanup uses one
+absolute operation deadline with reserved phase budgets for target close,
+termination, reaping, and scratch removal. It observes at most one native
+`GET /backend-api/conversations` request through CDP
+`Network.requestWillBeSent`, `Network.requestWillBeSentExtraInfo`, and the
+correlated response events. The timeout is capped at 150 seconds and the
+response body budget at 1 MiB (1,048,576 bytes).
+
+A bare or borrowed CDP endpoint is rejected before worker creation or
+navigation. The profile owner registers the interception worker, target
+creation fence, and independent exact-target closer before starting them.
+Success requires a no-create acknowledgement or confirmed target absence,
+worker/closer reaping, and private helper/scratch cleanup. Unresolved cleanup
+ownership remains in the long-lived sidecar registry and is reported as a
+cleanup failure; it is never treated as a successful observation.
+
+The observer never calls the history endpoint directly, supplies guessed
+headers, reads cookies or storage, paginates, requests conversation details,
+retries, or permits model/mutation requests. It allows only the existing
+frontend bootstrap/init request policy around the ordinary navigation. It
+returns only route class, status, identity-match and request/response-
+correlation flags, bounded response size, fixed field/container/type/count
+metadata, fixed model/updated-time/pagination presence/type counters, and
+model-field presence. Counts include explicit truncation/lower-bound and
+unknown-absence metadata. No URL, conversation ID, title, message, payload,
+header, token, or storage value is returned. If the native index request never
+appears, the result explicitly uses `observation_state=no_history_observed`;
+auth, throttle, challenge, identity, boundary, and body failures use an
+explicit failed observation state and preserve only a safe retry-after value.
+
+The sidecar has an explicit opt-in entrypoint for this observer. Before
+execution, the parent must verify that the bound browser session has no active
+conversation-history cooldown, then supply both
+`--chatgpt-native-history-probe-account-label account1` (or the matching
+`AAWM_CHATGPT_NATIVE_HISTORY_PROBE_ACCOUNT_LABEL` environment value) and
+`--chatgpt-native-history-probe-cooldown-cleared` (or
+`AAWM_CHATGPT_NATIVE_HISTORY_PROBE_COOLDOWN_CLEARED=1`) together with an
+Oracle profile binding for that exact label. The label must resolve to exactly
+one enabled Codex OAuth inventory record whose pinned account hash is
+`8e92854835c4`; a CDP-only binding is rejected because native history requires
+the private profile owner's supervised lifecycle capability. This action runs
+before provider observations, schema setup, and all other sidecar tasks,
+performs no database setup or persistence, and uses one 150-second operation
+budget including startup, observation, and owner cleanup. It emits one
+structural observation event with the existing fixed classification fields
+only; preflight and boundary failures use fixed classes and never echo raw
+labels, URLs, identifiers, headers, content, or exception text. It is a
+one-shot foreground action, not a recurring schedule. A
+`history_observation_failed` result exits nonzero; `no_history_observed` is a
+distinct bounded outcome and exits zero.
+
+`ChatGPTNativeHistoryProbeCleanupFailed` events include `cleanup_subreason`,
+an allowlisted code matched against existing fixed lifecycle failure messages.
+Unrecognized failures report `unknown`; exception text is never emitted.
+When a reaped target closer has not confirmed cleanup, `target_closer_*` codes
+identify its last operation or failed response check, including CDP connection,
+target listing, target matching, close acknowledgment, and absence verification.
+After close acknowledgment, the closer checks validated target listings until
+the exact owned target disappears or its existing deadline expires. It sends
+the close request once; invalid listings fail without claiming target absence.
+The closer shares only a numeric stage; no CDP payload or target data is added.
+The event precedes the final retained-owner drain, so it does not report final
+retirement or imply that cleanup has completed.
+
+Probe option parsing is strict: abbreviated probe long options are rejected.
+When an exact or abbreviated probe option is present, malformed arguments emit
+only the fixed `ChatGPTNativeHistoryProbeConfigurationInvalid` event; argparse
+usage text and raw option values are suppressed. Normal sidecar invocations
+retain argparse's ordinary unique long-option abbreviation behavior and
+diagnostics.
+
+The operation deadline is distinct from the sidecar's cancellation cutoff.
+Startup, observation, and cleanup use the same absolute operation ceiling;
+when SIGINT or SIGTERM is received, the effective cutoff is the earlier of
+that ceiling and the cancellation cutoff. The native probe caller passes the
+ceiling through the existing browser-binding context as the optional keyword
+`operation_deadline=<absolute monotonic deadline>`. The lifecycle binding must
+accept that keyword with a default of `None` for existing callers and
+propagate it through startup and failure cleanup; its effective cleanup
+deadline remains the minimum of the operation ceiling and cancellation cutoff.
+If the initial drain leaves an owner retained, the probe caller recomputes that
+minimum before each subsequent servicing pass; the lifecycle owner still
+enforces the cutoff within its own cleanup plan.
+If a bounded drain cannot prove owner retirement, the admitted sidecar state
+continues supervising retained owners until they retire; it is not released
+while owners remain pending.
+
+Parent-run shape (replace only the profile path and deployment-specific
+executable paths):
+
+```bash
+AAWM_CHATGPT_NATIVE_HISTORY_PROBE_ACCOUNT_LABEL=account1 \
+AAWM_CHATGPT_NATIVE_HISTORY_PROBE_COOLDOWN_CLEARED=1 \
+AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS='{"account1":{"oracle_profile_path":"/path/to/operator-approved-profile"}}' \
+AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE=/path/to/node \
+AAWM_CHATGPT_ORACLE_PACKAGE_DIR=/path/to/oracle-package \
+AAWM_CHATGPT_ORACLE_CHROME_EXECUTABLE=/path/to/chrome \
+python3 scripts/run_provider_status_observations_loop.py \
+  --chatgpt-native-history-probe-account-label account1 \
+  --chatgpt-native-history-probe-cooldown-cleared
+```
+
+The parent must also provide the explicit Codex OAuth inventory containing the
+enabled `account1` record pinned to `8e92854835c4`, and `xvfb-run` when no
+`DISPLAY` is available. The profile, node, package, and Chrome paths are
+runtime prerequisites, not fallback discovery inputs. This command must be
+run only after the parent checks that no other process owns the browser session
+or has an active conversation-history cooldown.
+
+## ChatGPT usage bridge
+
+The optional ChatGPT usage bridge runs the bounded TypeScript history worker
+through the existing provider-status sidecar and writes account/model
+observations to the PostgreSQL collector ledger. It is disabled by default and
+does not send model messages. The Python parent launches exactly:
+
+```text
+<node executable> <worker root>/dist/src/worker/main.js --stdio-v1
+```
+
+`AAWM_CHATGPT_USAGE_BRIDGE_WORKER_ROOT` must point to the packaged worker
+project root; the default image path is
+`/app/scripts/chatgpt_chat_usage_capture/ts`. The worker-root setting is a
+filesystem path, not a URL or a profile directory. The sidecar passes the
+explicit `initial-unmapped` model mapping seed until an approved mapping
+version is configured by the integrated collector.
+
+Recurring bridge runs use the configured account/profile binding and never
+retarget a run to an arbitrary profile. The explicit
+`--chatgpt-usage-bridge-authentication-recovery-account` action may include
+`--chatgpt-usage-bridge-authentication-recovery-profile`, but that profile must
+match the selected account's configured profile. Recovery is one-shot and does
+not enable authentication recovery in the recurring scheduler. Failure events
+retain the selected configured profile for account attribution.
+
+The sidecar retains one bridge owner across runs, services unfinished child
+cleanup before admitting another account, and closes that owner on one-shot,
+recovery, and signal-driven exits. Cleanup uses a five-second cutoff with
+time reserved for forced termination and reaping. Cleanup failures remain
+failures even when the worker has already committed its final receipt.
+Unreaped children keep the exiting sidecar in nonadmitting supervision until
+retirement is proven. Worker-requested cancellation shares one terminal cutoff
+across its durable commit, acknowledgment, and cleanup.
+
+The bridge reports `history_contract=unavailable` when the native history
+preparer or capability contract is not available. That state is not an empty
+successful history and does not advance a completed per-model count. Native
+reader activation, schema provisioning, deployment, and fresh per-account
+row verification remain separate gates.
+
+Capability inventories may describe unavailable operations alongside verified
+ones. Each requested operation and archive scope still requires its own
+manifest evidence; a missing optional capability does not disable other
+verified history operations. A ready inventory requires at least one verified
+operation and archive scope.
+
+History checkpoints retain the worker's account envelope, discovery scopes,
+account pause state, queue coverage, and nullable opaque queue cursor in the
+existing checkpoint JSON field. Candidate and revisit rows remain separately
+paged; the database state counter remains the authoritative CAS version.
 
 ## Alibaba Token Plan quota polling
 

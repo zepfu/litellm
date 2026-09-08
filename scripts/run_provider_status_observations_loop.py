@@ -21,6 +21,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import urllib.error
@@ -147,9 +148,21 @@ from litellm.llms.cursor_agent.usage import (
 )
 from litellm.llms.chatgpt.conversation_init import (
     CHATGPT_CONVERSATION_INIT_DEFAULT_URL,
+    CHATGPT_NATIVE_HISTORY_CLOSER_FAILURE_SUBREASONS,
+    CHATGPT_NATIVE_HISTORY_ROLE_ENV,
+    CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH,
     ChatGPTConversationInitError,
+    OracleBrowserCleanupError,
+    NativeHistoryCloseRegistration,
+    NativeHistoryLifecycleCapability,
+    NativeHistoryLifecycleRegistration,
+    NativeHistoryReleaseProof,
+    _NATIVE_HISTORY_CLEANUP_RESERVE_SECONDS,
+    _NATIVE_HISTORY_TARGET_BROWSER_TERMINATED,
+    _NATIVE_HISTORY_TARGET_NO_CREATE,
     collect_conversation_init_observations,
     collect_conversation_init_snapshot_from_oracle_browser,
+    observe_native_chatgpt_history_from_oracle_browser,
 )
 
 
@@ -161,6 +174,9 @@ PROVIDER_FAILURE_MESSAGE_LIMIT = 240
 _CHATGPT_COLLECTION_STATE_VALUES = frozenset(
     {"absent_unknown", "empty_unknown", "present", "partial", "malformed"}
 )
+_SIDECAR_STATE_ADMISSION_TOKEN = object()
+_ACTIVE_SIDECAR_TASK_STATE: Optional["SidecarTaskState"] = None
+_SIDECAR_STATE_ADMISSION_LOCK = threading.Lock()
 _CHATGPT_COLLECTION_DIAGNOSTIC_COUNT_LIMIT = 800
 DEFAULT_GROK_OIDC_LOCK_FILE = "/home/zepfu/.grok/auth.json.lock"
 GROK_SIDECAR_NATIVE_AUTH_FILE_ENV_VARS = GROK_OIDC_AUTH_FILE_ENV_VARS
@@ -398,8 +414,26 @@ DEFAULT_CHATGPT_CONVERSATION_INIT_SOURCE_PATH = (
 )
 DEFAULT_CHATGPT_CONVERSATION_INIT_URL = CHATGPT_CONVERSATION_INIT_DEFAULT_URL
 DEFAULT_CHATGPT_CONVERSATION_INIT_BROWSER_TIMEOUT_SECONDS = 30.0
+DEFAULT_CHATGPT_NATIVE_HISTORY_PROBE_TIMEOUT_SECONDS = 150.0
 CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV = (
     "AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS"
+)
+CHATGPT_NATIVE_HISTORY_PROBE_ACCOUNT_LABEL_ENV = (
+    "AAWM_CHATGPT_NATIVE_HISTORY_PROBE_ACCOUNT_LABEL"
+)
+CHATGPT_NATIVE_HISTORY_PROBE_COOLDOWN_CLEARED_ENV = (
+    "AAWM_CHATGPT_NATIVE_HISTORY_PROBE_COOLDOWN_CLEARED"
+)
+DEFAULT_CHATGPT_USAGE_BRIDGE_ENABLED = False
+DEFAULT_CHATGPT_USAGE_BRIDGE_INTERVAL_SECONDS = 600.0
+DEFAULT_CHATGPT_USAGE_BRIDGE_WORKER_ROOT = (
+    "/app/scripts/chatgpt_chat_usage_capture/ts"
+)
+CHATGPT_USAGE_BRIDGE_RECOVERY_ACCOUNT_ENV = (
+    "AAWM_CHATGPT_USAGE_BRIDGE_AUTHENTICATION_RECOVERY_ACCOUNT"
+)
+CHATGPT_USAGE_BRIDGE_RECOVERY_PROFILE_ENV = (
+    "AAWM_CHATGPT_USAGE_BRIDGE_AUTHENTICATION_RECOVERY_PROFILE"
 )
 CHATGPT_ORACLE_NODE_EXECUTABLE_ENV = "AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE"
 CHATGPT_ORACLE_PACKAGE_DIR_ENV = "AAWM_CHATGPT_ORACLE_PACKAGE_DIR"
@@ -413,6 +447,9 @@ DEFAULT_CHATGPT_ORACLE_STARTUP_TIMEOUT_SECONDS = 45.0
 # for the helper and its owned process group to exit normally.
 DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS = 35.0
 DEFAULT_CHATGPT_ORACLE_FORCE_TERMINATION_TIMEOUT_SECONDS = 5.0
+CHATGPT_ORACLE_MAX_PROCESS_INVENTORY_ENTRIES = 4096
+CHATGPT_ORACLE_MAX_PROCESS_INVENTORY_ROUNDS = 64
+CHATGPT_ORACLE_STARTUP_WAKE_INTERVAL_SECONDS = 0.25
 MAX_CHATGPT_ORACLE_STARTUP_LINE_BYTES = 1024
 DEFAULT_GROK_BILLING_POLL_ENABLED = False
 DEFAULT_GROK_BILLING_POLL_INTERVAL_SECONDS = 600.0
@@ -1448,6 +1485,11 @@ class ChatGPTConversationInitResolvedBinding:
 
     cdp_endpoint: str
     page_target_id: str
+    lifecycle_capability: Optional[NativeHistoryLifecycleCapability] = dataclass_field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -1592,6 +1634,20 @@ class ProviderStatusLoopConfig:
     chatgpt_conversation_init_account_bindings: Optional[
         Dict[str, "ChatGPTConversationInitAccountBinding"]
     ] = None
+    chatgpt_native_history_probe_account_label: Optional[str] = None
+    chatgpt_native_history_probe_cooldown_cleared: bool = False
+    chatgpt_usage_bridge_enabled: bool = DEFAULT_CHATGPT_USAGE_BRIDGE_ENABLED
+    chatgpt_usage_bridge_interval_seconds: float = (
+        DEFAULT_CHATGPT_USAGE_BRIDGE_INTERVAL_SECONDS
+    )
+    chatgpt_usage_bridge_node_executable: str = os.getenv(
+        "AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE", "node"
+    )
+    chatgpt_usage_bridge_worker_root: str = (
+        DEFAULT_CHATGPT_USAGE_BRIDGE_WORKER_ROOT
+    )
+    chatgpt_usage_bridge_recovery_account: Optional[str] = None
+    chatgpt_usage_bridge_recovery_profile: Optional[str] = None
     grok_billing_url: str = DEFAULT_GROK_BILLING_URL
     grok_billing_client_version: Optional[str] = None
     grok_billing_client_version_source: Optional[str] = None
@@ -1698,6 +1754,12 @@ class SidecarTaskState:
     xai_reset_poll_last_attempt_monotonic: Optional[float] = None
     cursor_agent_usage_last_attempt_monotonic: Optional[float] = None
     chatgpt_conversation_init_last_attempt_monotonic: Optional[float] = None
+    chatgpt_usage_bridge_last_attempt_monotonic: Optional[float] = None
+    chatgpt_usage_bridge_owner: Optional[Any] = None
+    chatgpt_usage_bridge_admitting: bool = True
+    chatgpt_usage_bridge_cleanup_errors: List[str] = dataclass_field(
+        default_factory=list
+    )
     chatgpt_conversation_init_cooldown_until_monotonic_by_session: Dict[
         str, float
     ] = dataclass_field(default_factory=dict)
@@ -1723,6 +1785,54 @@ class SidecarTaskState:
     optional_poll_futures: Dict[str, Future[Any]] = dataclass_field(
         default_factory=dict
     )
+    pending_chatgpt_oracle_browser_owners: Dict[str, Any] = dataclass_field(
+        default_factory=dict
+    )
+    pending_chatgpt_oracle_browser_owners_lock: Any = dataclass_field(
+        default_factory=threading.RLock,
+        repr=False,
+    )
+    chatgpt_oracle_browser_owners_stopping: bool = False
+    chatgpt_native_history_probe_operation_deadline: Optional[float] = None
+    chatgpt_oracle_browser_shutdown_deadline: Optional[float] = None
+    chatgpt_oracle_browser_owners_admission: Any = dataclass_field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+
+def _admit_sidecar_task_state(state: SidecarTaskState) -> None:
+    """Admit only the state owned by the foreground sidecar lifecycle."""
+    global _ACTIVE_SIDECAR_TASK_STATE
+    with _SIDECAR_STATE_ADMISSION_LOCK:
+        if (
+            _ACTIVE_SIDECAR_TASK_STATE is not None
+            and _ACTIVE_SIDECAR_TASK_STATE is not state
+        ):
+            raise RuntimeError("Another sidecar task state is already active.")
+        state.chatgpt_oracle_browser_owners_admission = (
+            _SIDECAR_STATE_ADMISSION_TOKEN
+        )
+        _ACTIVE_SIDECAR_TASK_STATE = state
+
+
+def _sidecar_task_state_is_admitted(state: Any) -> bool:
+    with _SIDECAR_STATE_ADMISSION_LOCK:
+        return bool(
+            isinstance(state, SidecarTaskState)
+            and state is _ACTIVE_SIDECAR_TASK_STATE
+            and state.chatgpt_oracle_browser_owners_admission
+            is _SIDECAR_STATE_ADMISSION_TOKEN
+        )
+
+
+def _release_sidecar_task_state(state: SidecarTaskState) -> None:
+    global _ACTIVE_SIDECAR_TASK_STATE
+    with _SIDECAR_STATE_ADMISSION_LOCK:
+        if _ACTIVE_SIDECAR_TASK_STATE is state:
+            _ACTIVE_SIDECAR_TASK_STATE = None
+        state.chatgpt_oracle_browser_owners_admission = None
 
 
 _OAUTH_TERMINAL_REFRESH_ERROR_CLASSES = frozenset(
@@ -2076,6 +2186,28 @@ def _env_int(name: str, default: int) -> int:
     return int(raw_value)
 
 
+def _chatgpt_native_history_probe_requested(
+    argv: Optional[Sequence[str]],
+) -> bool:
+    """Detect probe intent without parsing or echoing untrusted config values."""
+    if os.getenv(CHATGPT_NATIVE_HISTORY_PROBE_ACCOUNT_LABEL_ENV):
+        return True
+    arguments = sys.argv[1:] if argv is None else argv
+    probe_options = (
+        "--chatgpt-native-history-probe-account-label",
+        "--chatgpt-native-history-probe-cooldown-cleared",
+    )
+    for argument in arguments:
+        if not isinstance(argument, str) or not argument.startswith("--"):
+            continue
+        option = argument.split("=", 1)[0]
+        if len(option) > 2 and any(
+            option_name.startswith(option) for option_name in probe_options
+        ):
+            return True
+    return False
+
+
 def _parse_chatgpt_conversation_init_account_bindings(
     raw_value: Optional[str],
 ) -> Optional[Dict[str, ChatGPTConversationInitAccountBinding]]:
@@ -2212,8 +2344,10 @@ def _chatgpt_oracle_startup_argv(
     return argv
 
 
-def _read_chatgpt_oracle_startup_binding(
+def _read_chatgpt_oracle_startup_binding(  # noqa: PLR0915 - bounded startup parser
     process: subprocess.Popen,
+    *,
+    shutdown_deadline_getter: Optional[Callable[[], Optional[float]]] = None,
 ) -> ChatGPTConversationInitResolvedBinding:
     stdout = process.stdout
     if stdout is None:
@@ -2221,17 +2355,35 @@ def _read_chatgpt_oracle_startup_binding(
     deadline = time.monotonic() + DEFAULT_CHATGPT_ORACLE_STARTUP_TIMEOUT_SECONDS
     buffer = bytearray()
     while True:
-        remaining = deadline - time.monotonic()
+        effective_deadline = deadline
+        if shutdown_deadline_getter is not None:
+            try:
+                shutdown_deadline = shutdown_deadline_getter()
+            except Exception:
+                shutdown_deadline = None
+            if shutdown_deadline is not None:
+                effective_deadline = min(
+                    effective_deadline,
+                    float(shutdown_deadline),
+                )
+        remaining = effective_deadline - time.monotonic()
         if remaining <= 0:
             raise RuntimeError("Oracle browser helper startup timed out.")
         try:
-            readable, _, _ = select.select([stdout], [], [], remaining)
+            readable, _, _ = select.select(
+                [stdout],
+                [],
+                [],
+                min(remaining, CHATGPT_ORACLE_STARTUP_WAKE_INTERVAL_SECONDS),
+            )
+        except InterruptedError:
+            continue
         except (OSError, ValueError) as exc:
             raise RuntimeError(
                 "Oracle browser helper startup stream failed."
             ) from exc
         if not readable:
-            raise RuntimeError("Oracle browser helper startup timed out.")
+            continue
         try:
             chunk = os.read(
                 stdout.fileno(),
@@ -2303,65 +2455,567 @@ def _signal_chatgpt_oracle_process_group(
         pass
 
 
-def _chatgpt_oracle_owned_handles(
-    process: subprocess.Popen, temp_root: str, handles: Dict[int, int],
+def _record_chatgpt_oracle_owned_pid(
+    pid: int,
+    handle: int,
+    handles: Dict[int, int],
+    known_process_roles: Optional[Dict[int, str]],
+    *,
+    role: str,
+    known_process_start_times: Optional[Dict[int, int]] = None,
+    process_start_time: Optional[int] = None,
 ) -> None:
-    marker = f"{CHATGPT_ORACLE_OWNER_ENV}={temp_root}".encode()
-    candidates: Dict[int, tuple[int, int]] = {}
+    handles[pid] = handle
+    if known_process_roles is not None:
+        known_process_roles[pid] = role
+    if known_process_start_times is not None and process_start_time is not None:
+        known_process_start_times[pid] = process_start_time
+
+
+@dataclass(frozen=True)
+class _ChatGPTOracleProcessCandidate:
+    """A markerless process observed under an identity-bound predecessor."""
+
+    parent_pid: int
+    parent_start_time: Optional[int]
+    process_start_time: Optional[int]
+    handle: int
+
+
+def _chatgpt_oracle_process_stat(
+    pid: int,
+) -> Optional[tuple[int, int]]:
     try:
-        if process.returncode is None and process.pid not in handles:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(
+            ")",
+            1,
+        )[1].split()
+        return int(fields[1]), int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _close_chatgpt_oracle_pidfd(handle: int) -> None:
+    try:
+        os.close(handle)
+    except (OSError, ValueError):
+        pass
+
+
+def _chatgpt_oracle_registration_driver_role(role: Optional[str]) -> bool:
+    return isinstance(role, str) and role.startswith(
+        (
+            "history_observer_driver",
+            "history_closer_driver",
+        )
+    )
+
+
+def _chatgpt_oracle_process_role(
+    environment: Sequence[bytes],
+    process_markers: Mapping[bytes, str],
+) -> Optional[str]:
+    for marker, candidate_role in process_markers.items():
+        if marker in environment and candidate_role != "oracle_owner":
+            return candidate_role
+    return next(
+        (
+            candidate_role
+            for marker, candidate_role in process_markers.items()
+            if marker in environment
+        ),
+        None,
+    )
+
+
+def _add_chatgpt_oracle_owner_handle(
+    process: subprocess.Popen,
+    handles: Dict[int, int],
+    known_process_roles: Optional[Dict[int, str]],
+    known_process_start_times: Optional[Dict[int, int]],
+) -> None:
+    try:
+        if process.poll() is not None or process.pid in handles:
+            return
+    except (OSError, ValueError):
+        return
+    try:
+        handle = os.pidfd_open(process.pid)
+    except ProcessLookupError:
+        return
+    process_stat = _chatgpt_oracle_process_stat(process.pid)
+    _record_chatgpt_oracle_owned_pid(
+        process.pid,
+        handle,
+        handles,
+        known_process_roles,
+        role="oracle_helper",
+        known_process_start_times=known_process_start_times,
+        process_start_time=(
+            process_stat[1] if process_stat is not None else None
+        ),
+    )
+
+
+def _scan_chatgpt_oracle_process_candidates(  # noqa: PLR0915 - bounded inventory
+    process_markers: Mapping[bytes, str],
+    handles: Dict[int, int],
+    candidates: Dict[int, _ChatGPTOracleProcessCandidate],
+    known_process_roles: Optional[Dict[int, str]],
+    known_process_start_times: Optional[Dict[int, int]],
+    deadline: Optional[float],
+) -> tuple[bool, Dict[str, str]]:
+    inventory_complete = True
+    unresolved: Dict[str, str] = {}
+    try:
+        entries = Path("/proc").iterdir()
+    except OSError as exc:
+        return False, {"procfs": exc.__class__.__name__}
+    inspected = 0
+    for entry in entries:
+        if deadline is not None and time.monotonic() >= deadline:
+            inventory_complete = False
+            unresolved["__deadline__"] = "process_discovery_deadline_expired"
+            break
+        if not entry.name.isdigit() or int(entry.name) in handles:
+            continue
+        inspected += 1
+        if inspected > CHATGPT_ORACLE_MAX_PROCESS_INVENTORY_ENTRIES:
+            inventory_complete = False
+            unresolved["__entry_limit__"] = "process_discovery_entry_limit"
+            break
+        pid = int(entry.name)
+        handle: Optional[int] = None
+        process_start_time: Optional[int] = None
+        try:
+            handle = os.pidfd_open(pid)
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+            parent_pid = int(fields[1])
+            process_start_time = int(fields[19])
+            parent_stat = _chatgpt_oracle_process_stat(parent_pid)
+            parent_start_time = (
+                parent_stat[1] if parent_stat is not None else None
+            )
             try:
-                handles[process.pid] = os.pidfd_open(process.pid)
-            except ProcessLookupError:
-                pass
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit() or int(entry.name) in handles:
-                continue
-            pid = int(entry.name)
-            handle: Optional[int] = None
-            try:
-                handle = os.pidfd_open(pid)
-                fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
-                parent_pid = int(fields[1])
-                try:
-                    with (entry / "environ").open("rb") as environ:
-                        marked = marker in environ.read(1_048_576).split(b"\0")
-                except OSError:
-                    marked = False
-                if marked:
-                    handles[pid] = handle
-                else:
-                    candidates[pid] = (parent_pid, handle)
+                with (entry / "environ").open("rb") as environ:
+                    environment = environ.read(1_048_576).split(b"\0")
+            except OSError:
+                # Keep the observed parent identity with the candidate. A
+                # numeric parent PID by itself is never enough for adoption.
+                candidates[pid] = _ChatGPTOracleProcessCandidate(
+                    parent_pid=parent_pid,
+                    parent_start_time=parent_start_time,
+                    process_start_time=process_start_time,
+                    handle=handle,
+                )
                 handle = None
-            except (OSError, ValueError, IndexError):
+                continue
+            role = _chatgpt_oracle_process_role(
+                environment,
+                process_markers,
+            )
+            if role is not None:
+                if parent_start_time is None:
+                    inventory_complete = False
+                    unresolved[str(pid)] = (
+                        "predecessor_identity_unavailable"
+                    )
+                _record_chatgpt_oracle_owned_pid(
+                    pid,
+                    handle,
+                    handles,
+                    known_process_roles,
+                    role=role,
+                    known_process_start_times=known_process_start_times,
+                    process_start_time=process_start_time,
+                )
+            else:
+                candidates[pid] = _ChatGPTOracleProcessCandidate(
+                    parent_pid=parent_pid,
+                    parent_start_time=parent_start_time,
+                    process_start_time=process_start_time,
+                    handle=handle,
+                )
+            handle = None
+        except ProcessLookupError:
+            # The process exited between /proc enumeration and pidfd_open.
+            pass
+        except (OSError, ValueError, IndexError) as exc:
+            role = None
+            try:
+                with (entry / "environ").open("rb") as environ:
+                    role = _chatgpt_oracle_process_role(
+                        environ.read(1_048_576).split(b"\0"),
+                        process_markers,
+                    )
+            except OSError:
                 pass
-            finally:
+            if role is not None:
+                inventory_complete = False
+                unresolved[str(pid)] = (
+                    f"{role}:metadata_{exc.__class__.__name__}"
+                )
                 if handle is not None:
-                    os.close(handle)
-        # Sandbox children may hide environ, but still have an owned parent.
+                    _record_chatgpt_oracle_owned_pid(
+                        pid,
+                        handle,
+                        handles,
+                        known_process_roles,
+                        role=role,
+                    )
+                    handle = None
+            else:
+                # Without a readable owner marker or parent relationship this
+                # entry is not attributable to the private owner. Preserve the
+                # diagnostic without turning unrelated /proc restrictions into
+                # an owned-scope retirement failure.
+                unresolved[f"unrelated:{pid}"] = exc.__class__.__name__
+        finally:
+            if handle is not None:
+                os.close(handle)
+    return inventory_complete, unresolved
+
+
+def _adopt_chatgpt_oracle_descendants(  # noqa: PLR0915 - bounded inventory adoption
+    candidates: Dict[int, _ChatGPTOracleProcessCandidate],
+    handles: Dict[int, int],
+    known_process_roles: Optional[Dict[int, str]],
+    known_process_start_times: Optional[Dict[int, int]],
+    unresolved_inventory: Optional[Dict[str, str]] = None,
+    deadline: Optional[float] = None,
+) -> tuple[bool, Dict[str, str]]:
+    # Sandbox children may hide environ, but only an identity-valid parent
+    # relationship observed at discovery can establish ownership. Historical
+    # numeric ancestry is not enough because the PID may already be reused.
+    inventory_complete = True
+    unresolved: Dict[str, str] = {}
+    rounds = 0
+    while candidates:
+        if deadline is not None and time.monotonic() >= deadline:
+            inventory_complete = False
+            unresolved["__deadline__"] = "process_adoption_deadline_expired"
+            break
+        rounds += 1
+        if rounds > CHATGPT_ORACLE_MAX_PROCESS_INVENTORY_ROUNDS:
+            inventory_complete = False
+            unresolved["__round_limit__"] = "process_adoption_round_limit"
+            break
+        children: list[tuple[int, str]] = []
+        for pid, candidate in candidates.items():
+            parent = candidate.parent_pid
+            if parent not in handles:
+                continue
+            try:
+                ready, _, _ = select.select([handles[parent]], [], [], 0)
+            except (OSError, ValueError):
+                inventory_complete = False
+                unresolved[str(pid)] = "predecessor_pidfd_unreadable"
+                continue
+            parent_stat = _chatgpt_oracle_process_stat(parent)
+            child_stat = _chatgpt_oracle_process_stat(pid)
+            if candidate.parent_start_time is None:
+                inventory_complete = False
+                unresolved[str(pid)] = "predecessor_identity_unavailable"
+                continue
+            if (
+                known_process_start_times is None
+                or known_process_start_times.get(parent)
+                != candidate.parent_start_time
+            ):
+                inventory_complete = False
+                unresolved[str(pid)] = "predecessor_identity_mismatch"
+                continue
+            if child_stat is not None and (
+                child_stat[1] != candidate.process_start_time
+            ):
+                inventory_complete = False
+                unresolved[str(pid)] = "candidate_identity_mismatch"
+                continue
+            if ready:
+                # The pidfd proves that the observed predecessor, rather than
+                # a reused numeric PID, owned the candidate at discovery.
+                children.append(
+                    (
+                        pid,
+                        known_process_roles.get(parent)
+                        if known_process_roles is not None
+                        else None,
+                    )
+                )
+                continue
+            if (
+                parent_stat is None
+                or parent_stat[1] != candidate.parent_start_time
+                or child_stat is None
+                or child_stat[0] != parent
+            ):
+                inventory_complete = False
+                unresolved[str(pid)] = "predecessor_identity_mismatch"
+                continue
+            parent_role = (
+                known_process_roles.get(parent)
+                if known_process_roles is not None
+                else None
+            )
+            children.append(
+                (
+                    pid,
+                    parent_role
+                    if _chatgpt_oracle_registration_driver_role(parent_role)
+                    else "descendant",
+                )
+            )
+        if not children:
+            break
+        for pid, parent_role in children:
+            candidate = candidates.pop(pid)
+            if unresolved_inventory is not None:
+                unresolved_inventory.pop(str(pid), None)
+            _record_chatgpt_oracle_owned_pid(
+                pid,
+                candidate.handle,
+                handles,
+                known_process_roles,
+                role=(
+                    parent_role
+                    if _chatgpt_oracle_registration_driver_role(parent_role)
+                    else "descendant"
+                ),
+                known_process_start_times=known_process_start_times,
+                process_start_time=candidate.process_start_time,
+            )
+    # Resolve the remaining candidate graph independently of /proc ordering.
+    # An unrelated child may be enumerated before its unrelated parent; that
+    # chain must remain unrelated rather than poisoning the owned inventory.
+    resolutions: Dict[int, tuple[str, Optional[str]]] = {}
+    identity_failures = {
+        "candidate_identity_mismatch",
+        "predecessor_identity_mismatch",
+        "predecessor_pidfd_unreadable",
+        "predecessor_identity_unavailable",
+    }
+
+    def resolve_candidate(  # noqa: PLR0915 - bounded graph resolver
+        pid: int,
+    ) -> tuple[str, Optional[str]]:
+        existing = resolutions.get(pid)
+        if existing is not None:
+            return existing
+        path: list[int] = []
+        path_index: Dict[int, int] = {}
+        current = pid
         while True:
-            children = []
-            for pid, (parent, _) in candidates.items():
-                parent_handle = handles.get(parent)
-                if parent_handle is not None and not select.select(
-                    [parent_handle], [], [], 0
-                )[0]:
-                    children.append(pid)
-            if not children:
+            if current in resolutions:
                 break
-            for pid in children:
-                _, handle = candidates.pop(pid)
-                handles[pid] = handle
-    finally:
-        for _, handle in candidates.values():
-            os.close(handle)
+            cycle_index = path_index.get(current)
+            if cycle_index is not None:
+                for cycle_pid in path[cycle_index:]:
+                    resolutions[cycle_pid] = ("unresolved", "candidate_cycle")
+                path = path[:cycle_index]
+                break
+            candidate = candidates.get(current)
+            if candidate is None:
+                break
+            path_index[current] = len(path)
+            path.append(current)
+            if unresolved.get(str(current)) in identity_failures:
+                break
+            parent = candidate.parent_pid
+            if parent not in candidates or parent in resolutions:
+                break
+            current = parent
+
+        for candidate_pid in reversed(path):
+            if candidate_pid in resolutions:
+                continue
+            candidate = candidates[candidate_pid]
+            prior_reason = unresolved.get(str(candidate_pid))
+            if prior_reason in identity_failures:
+                result = "unresolved", prior_reason
+            else:
+                parent = candidate.parent_pid
+                if parent in handles:
+                    parent_start_time = (
+                        known_process_start_times.get(parent)
+                        if known_process_start_times is not None
+                        else None
+                    )
+                    if (
+                        candidate.parent_start_time is None
+                        or parent_start_time != candidate.parent_start_time
+                    ):
+                        result = "unresolved", "predecessor_identity_mismatch"
+                    else:
+                        parent_role = (
+                            known_process_roles.get(parent)
+                            if known_process_roles is not None
+                            else None
+                        )
+                        result = (
+                            "owned",
+                            parent_role
+                            if _chatgpt_oracle_registration_driver_role(
+                                parent_role
+                            )
+                            else "descendant",
+                        )
+                elif parent in candidates:
+                    parent_status, parent_role = resolutions.get(
+                        parent,
+                        ("unresolved", "predecessor_candidate_unresolved"),
+                    )
+                    if parent_status == "unrelated":
+                        result = "unrelated", None
+                    elif parent_status != "owned":
+                        result = "unresolved", parent_role or (
+                            "predecessor_candidate_unresolved"
+                        )
+                    else:
+                        predecessor = candidates[parent]
+                        if (
+                            candidate.parent_start_time is None
+                            or predecessor.process_start_time is None
+                            or candidate.parent_start_time
+                            != predecessor.process_start_time
+                        ):
+                            result = "unresolved", "predecessor_identity_mismatch"
+                        else:
+                            result = "owned", parent_role
+                else:
+                    result = "unrelated", None
+            resolutions[candidate_pid] = result
+        return resolutions.get(pid, ("unresolved", "candidate_cycle"))
+
+    def retain_owned_candidate(pid: int) -> None:
+        chain: list[int] = []
+        current = pid
+        while current in candidates:
+            chain.append(current)
+            parent = candidates[current].parent_pid
+            if (
+                parent not in candidates
+                or resolutions.get(parent, ("", None))[0] != "owned"
+            ):
+                break
+            current = parent
+        for candidate_pid in reversed(chain):
+            candidate = candidates.pop(candidate_pid)
+            reason = unresolved.get(
+                str(candidate_pid),
+            ) or "owned_descendant_inventory_unresolved"
+            unresolved[str(candidate_pid)] = reason
+            _record_chatgpt_oracle_owned_pid(
+                candidate_pid,
+                candidate.handle,
+                handles,
+                known_process_roles,
+                role=resolutions[candidate_pid][1] or "descendant",
+                known_process_start_times=known_process_start_times,
+                process_start_time=candidate.process_start_time,
+            )
+
+    for pid in list(candidates):
+        status, _ = resolve_candidate(pid)
+        if status == "owned":
+            inventory_complete = False
+            retain_owned_candidate(pid)
+
+    for pid, candidate in list(candidates.items()):
+        status, reason = resolutions.get(
+            pid,
+            ("unresolved", "owned_descendant_identity_unresolved"),
+        )
+        candidates.pop(pid, None)
+        if status == "unrelated":
+            # No marker or identity-bound predecessor links this candidate to
+            # the private owner. Preserve only the unrelated diagnostic.
+            if unresolved_inventory is not None:
+                unresolved_inventory.pop(str(pid), None)
+            unresolved.pop(str(pid), None)
+            unresolved[f"unrelated:{pid}"] = "unattributed_candidate"
+        else:
+            inventory_complete = False
+            unresolved[str(pid)] = reason or (
+                "owned_descendant_identity_unresolved"
+            )
+        _close_chatgpt_oracle_pidfd(candidate.handle)
+    return inventory_complete, unresolved
+
+
+def _chatgpt_oracle_owned_handles(
+    process: subprocess.Popen,
+    temp_root: str,
+    handles: Dict[int, int],
+    deadline: Optional[float] = None,
+    known_process_roles: Optional[Dict[int, str]] = None,
+    known_process_start_times: Optional[Dict[int, int]] = None,
+) -> bool:
+    return _chatgpt_oracle_owned_handles_with_markers(
+        process,
+        temp_root,
+        handles,
+        deadline=deadline,
+        known_process_roles=known_process_roles,
+        known_process_start_times=known_process_start_times,
+    )[0]
+
+
+def _chatgpt_oracle_owned_handles_with_markers(
+    process: subprocess.Popen,
+    temp_root: str,
+    handles: Dict[int, int],
+    deadline: Optional[float] = None,
+    known_process_roles: Optional[Dict[int, str]] = None,
+    known_process_start_times: Optional[Dict[int, int]] = None,
+    process_markers: Optional[Mapping[bytes, str]] = None,
+    unresolved_inventory: Optional[Dict[str, str]] = None,
+) -> tuple[bool, Dict[str, str]]:
+    markers = dict(process_markers or {})
+    owner_marker = f"{CHATGPT_ORACLE_OWNER_ENV}={temp_root}".encode()
+    markers.setdefault(owner_marker, "oracle_owner")
+    candidates: Dict[int, _ChatGPTOracleProcessCandidate] = {}
+    inventory_complete = True
+    unresolved: Dict[str, str] = {}
+    _add_chatgpt_oracle_owner_handle(
+        process,
+        handles,
+        known_process_roles,
+        known_process_start_times,
+    )
+    scan_complete, scan_unresolved = _scan_chatgpt_oracle_process_candidates(
+        markers,
+        handles,
+        candidates,
+        known_process_roles,
+        known_process_start_times,
+        deadline,
+    )
+    inventory_complete = inventory_complete and scan_complete
+    unresolved.update(scan_unresolved)
+    adopt_complete, adopt_unresolved = _adopt_chatgpt_oracle_descendants(
+        candidates,
+        handles,
+        known_process_roles,
+        known_process_start_times,
+        unresolved,
+        deadline,
+    )
+    inventory_complete = inventory_complete and adopt_complete
+    unresolved.update(adopt_unresolved)
+    if candidates:
+        for candidate in candidates.values():
+            _close_chatgpt_oracle_pidfd(candidate.handle)
+        candidates.clear()
+    if unresolved_inventory is not None:
+        unresolved_inventory.update(unresolved)
+    return inventory_complete, unresolved
 
 
 def _signal_chatgpt_oracle_handles(handles: Dict[int, int], sig: int) -> None:
     for handle in handles.values():
         try:
             signal.pidfd_send_signal(handle, sig)
-        except ProcessLookupError:
+        except (OSError, ValueError):
             pass
 
 
@@ -2383,6 +3037,1317 @@ def _remove_chatgpt_oracle_scratch(temp_root: str) -> None:
         raise RuntimeError("Oracle browser scratch cleanup timed out.") from exc
     if result != 0 or Path(temp_root).exists():
         raise RuntimeError("Oracle browser scratch cleanup failed.")
+
+
+def _remove_chatgpt_oracle_scratch_bounded(
+    temp_root: str,
+    deadline: float,
+) -> bool:
+    if not Path(temp_root).exists():
+        return True
+    remover: Optional[subprocess.Popen] = None
+    try:
+        remover = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import shutil,sys; shutil.rmtree(sys.argv[1])",
+                temp_root,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        remover.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except (OSError, subprocess.TimeoutExpired):
+        if remover is not None:
+            try:
+                remover.kill()
+                remover.wait(timeout=0)
+            except (OSError, subprocess.TimeoutExpired, ValueError):
+                return False
+        return False
+    return remover.returncode == 0 and not Path(temp_root).exists()
+
+
+class _ChatGPTOracleBrowserOwner:
+    """Own one private Oracle helper and any history children it spawned."""
+
+    def __init__(
+        self,
+        process: subprocess.Popen,
+        temp_root: str,
+        pending_registry: Dict[str, Any],
+        pending_registry_lock: Any,
+        supervisor_state: Optional[SidecarTaskState] = None,
+        operation_deadline: Optional[float] = None,
+    ) -> None:
+        self.process = process
+        self.temp_root = temp_root
+        self.pending_registry = pending_registry
+        self.pending_registry_lock = pending_registry_lock
+        self.supervisor_state = supervisor_state
+        self.original_helper_pid = process.pid
+        self.owner_id = "oracle-owner-" + uuid.uuid4().hex
+        self.cdp_endpoint = ""
+        self.anchor_target_id = ""
+        self.registrations: Dict[str, NativeHistoryLifecycleRegistration] = {}
+        self.handles: Dict[int, int] = {}
+        self.known_process_roles: Dict[int, str] = {}
+        self.known_process_start_times: Dict[int, int] = {}
+        if isinstance(process.pid, int):
+            self.known_process_roles[process.pid] = "oracle_helper"
+            process_stat = _chatgpt_oracle_process_stat(process.pid)
+            if process_stat is not None:
+                self.known_process_start_times[process.pid] = process_stat[1]
+        self.browser_discovery_complete = False
+        self.browser_inventory_cutoff_reached = False
+        self.browser_inventory_sealed = False
+        self.browser_terminal_inventory: Dict[int, int] = {}
+        self.inventory_unresolved: Dict[str, str] = {}
+        self.native_scope_inventory: Dict[str, Dict[int, int]] = {}
+        self.browser_termination_proven = False
+        self.helper_termination_requested = False
+        self.cleanup_error: Optional[str] = None
+        self.history_cleanup_failure: Optional[str] = None
+        self.transferred = False
+        self.closing = False
+        self.published = False
+        self.bound = False
+        self.operation_deadline: Optional[float] = (
+            float(operation_deadline)
+            if operation_deadline is not None
+            else None
+        )
+        self.history_deadline: Optional[float] = None
+        self.shutdown_deadline: Optional[float] = None
+        self.scratch_remover: Optional[subprocess.Popen] = None
+        self.scratch_remover_handle: Optional[int] = None
+        self.scratch_removal_attempted = False
+        self.scratch_deleted = False
+        self.scratch_cleanup_error: Optional[str] = None
+        self.cleanup_plan: Optional[Dict[str, float]] = None
+        self.cleanup_gate = threading.Lock()
+
+    def publish(self) -> None:
+        """Publish this concrete owner before any history worker can start."""
+
+        with self.pending_registry_lock:
+            if self.published:
+                return
+            if self.pending_registry.get(self.owner_id) not in (None, self):
+                raise RuntimeError("Oracle browser owner registration collision.")
+            self.pending_registry[self.owner_id] = self
+            self.published = True
+
+    def bind(self, *, cdp_endpoint: str, anchor_target_id: str) -> None:
+        with self.pending_registry_lock:
+            if self.closing or self.transferred:
+                raise RuntimeError("Oracle browser lifecycle authority is closing.")
+            if not cdp_endpoint or not anchor_target_id:
+                raise RuntimeError("Oracle browser lifecycle binding is incomplete.")
+            if self.bound and (
+                self.cdp_endpoint != cdp_endpoint
+                or self.anchor_target_id != anchor_target_id
+            ):
+                raise RuntimeError("Oracle browser lifecycle binding changed.")
+            self.cdp_endpoint = cdp_endpoint
+            self.anchor_target_id = anchor_target_id
+            self.bound = True
+
+    def _original_helper_usable(self) -> bool:
+        if not isinstance(self.original_helper_pid, int):
+            return False
+        try:
+            return self.process.poll() is None
+        except (OSError, ValueError):
+            return False
+
+    @staticmethod
+    def _process_reaped(process: Any) -> bool:
+        if getattr(process, "pid", None) is None:
+            return True
+        try:
+            return not process.is_alive() and process.exitcode is not None
+        except (AssertionError, OSError):
+            return False
+
+    def register(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+    ) -> None:
+        with self.pending_registry_lock:
+            if (
+                self.transferred
+                or self.closing
+                or registration.finalizing
+                or not self.published
+                or self.supervisor_state is None
+                or self.supervisor_state.chatgpt_oracle_browser_owners_stopping
+            ):
+                raise RuntimeError(
+                    "Native history lifecycle owner is not accepting work."
+                )
+            if self.pending_registry.get(self.owner_id) is not self:
+                raise RuntimeError(
+                    "Native history lifecycle owner is not supervised."
+                )
+            if not self.bound:
+                raise RuntimeError(
+                    "Native history lifecycle owner has no validated binding."
+                )
+            if not self._original_helper_usable():
+                raise RuntimeError(
+                    "Native history lifecycle helper is no longer usable."
+                )
+            if registration.registration_id in self.registrations:
+                raise RuntimeError("Native history lifecycle was registered twice.")
+            if registration.cdp_endpoint != self.cdp_endpoint:
+                raise RuntimeError(
+                    "Native history CDP endpoint does not match lifecycle owner."
+                )
+            if registration.anchor_target_id != self.anchor_target_id:
+                raise RuntimeError(
+                    "Native history anchor target does not match lifecycle owner."
+                )
+            self.registrations[registration.registration_id] = registration
+            if self.operation_deadline is None:
+                self.operation_deadline = registration.deadline
+            else:
+                self.operation_deadline = min(
+                    self.operation_deadline,
+                    registration.deadline,
+                )
+            if self.history_deadline is None:
+                self.history_deadline = registration.deadline
+            else:
+                self.history_deadline = min(
+                    self.history_deadline,
+                    registration.deadline,
+                )
+            if registration.cleanup_callback is None:
+                registration.cleanup_callback = (
+                    lambda _deadline, poll_only=False: False
+                )
+
+    def register_closer(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        closer: NativeHistoryCloseRegistration,
+    ) -> None:
+        with self.pending_registry_lock:
+            if self.registrations.get(
+                registration.registration_id
+            ) is not registration:
+                raise RuntimeError("Native history closer has no lifecycle owner.")
+            existing = registration.close_registration
+            if existing is closer:
+                return
+            if existing is not None:
+                raise RuntimeError("Native history closer is already active.")
+            registration.close_registration = closer
+
+    def retain(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        reason: str,
+    ) -> None:
+        with self.pending_registry_lock:
+            if self.registrations.get(
+                registration.registration_id
+            ) is not registration:
+                raise RuntimeError(
+                    "Native history retention has no registered owner."
+                )
+            registration.cleanup_failure = reason
+
+    def release(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        *,
+        proof: NativeHistoryReleaseProof,
+    ) -> None:
+        with self.pending_registry_lock:
+            registered = self.registrations.get(registration.registration_id)
+            if registered is not registration:
+                if (
+                    registration.release_authorized
+                    and registration.release_proof == proof
+                ):
+                    return
+                raise RuntimeError(
+                    "Native history release has no registered owner."
+                )
+            if not isinstance(proof, NativeHistoryReleaseProof):
+                raise RuntimeError("Native history release proof is invalid.")
+            if proof.registration_id != registration.registration_id:
+                raise RuntimeError("Native history release proof owner mismatch.")
+            if (
+                proof.anchor_target_id != registration.anchor_target_id
+                or proof.creation_url != registration.creation_url
+            ):
+                raise RuntimeError("Native history release proof binding mismatch.")
+            if proof.kind == "target_close_and_absence_proven":
+                resolution = registration.target_resolution
+                if resolution is None or (
+                    resolution.target_id != proof.target_id
+                    or resolution.anchor_target_id != proof.anchor_target_id
+                    or resolution.creation_url != proof.creation_url
+                ):
+                    raise RuntimeError("Native history target proof is not valid.")
+            elif proof.kind == "no_create_acknowledged":
+                if (
+                    int(registration.creation_state.value)
+                    != _NATIVE_HISTORY_TARGET_NO_CREATE
+                ):
+                    raise RuntimeError("Native history no-create proof is not valid.")
+            elif proof.kind == "owned_browser_termination_proven":
+                if (
+                    int(registration.creation_state.value)
+                    != _NATIVE_HISTORY_TARGET_BROWSER_TERMINATED
+                ):
+                    raise RuntimeError(
+                        "Native history browser-termination proof is not valid."
+                    )
+            else:
+                raise RuntimeError("Native history release proof kind is invalid.")
+            if registration.release_authorized:
+                if registration.release_proof == proof:
+                    return
+                raise RuntimeError("Native history release proof changed.")
+            registration.released = True
+            registration.release_proof = proof
+            registration.release_authorized = True
+            try:
+                registration.release_event.set()
+            except (OSError, ValueError):
+                registration.release_control_failed = True
+                release_control_state = registration.release_control_state
+                if release_control_state is not None:
+                    release_control_state.value = True
+                registration.cleanup_failure = (
+                    "Native ChatGPT history release control failed."
+                )
+
+    def retire(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+    ) -> None:
+        with self.pending_registry_lock:
+            if self.registrations.get(registration.registration_id) is not registration:
+                if registration.retired:
+                    return
+                raise RuntimeError("Native history retirement has no owner.")
+            if not registration.release_authorized:
+                raise RuntimeError("Native history release was not authorized.")
+            closer = registration.close_registration
+            if not registration.worker_retirement_proven or (
+                closer is not None and not closer.reaped
+            ):
+                raise RuntimeError("Native history retirement is incomplete.")
+            if registration.cleanup_failure is not None:
+                self.history_cleanup_failure = registration.cleanup_failure
+            registration.retired = True
+            self.registrations.pop(registration.registration_id, None)
+
+    def _cleanup_registration(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        deadline: float,
+    ) -> bool:
+        callback = registration.cleanup_callback
+        if callback is None or callback is self._cleanup_registration:
+            return False
+        return bool(callback(deadline))
+
+    def _reconcile_owned_browser_handles(
+        self,
+        deadline: float,
+        *,
+        final_inventory_deadline: Optional[float] = None,
+    ) -> bool:
+        if self.browser_inventory_sealed:
+            return True
+        if self.browser_inventory_cutoff_reached:
+            return False
+        now = time.monotonic()
+        if (
+            final_inventory_deadline is not None
+            and now >= final_inventory_deadline
+        ):
+            # A completed scan cannot prove that a known process did not spawn
+            # an unseen child after the scan. Retained pidfds remain useful for
+            # identity-bound polling, but they do not convert expired
+            # discovery uncertainty into a retirement proof.
+            self.browser_discovery_complete = False
+            self.browser_inventory_cutoff_reached = True
+            self.inventory_unresolved["__deadline__"] = (
+                "process_discovery_final_deadline_expired"
+            )
+            return False
+        # A phase deadline only prevents a blocking scan in that phase. Do not
+        # latch the final inventory cutoff or erase a valid terminal result;
+        # later phases may still perform their own bounded reconciliation.
+        if deadline is not None and now >= deadline:
+            return False
+        self._retain_registered_history_process_handles()
+        admission_closed = (
+            self.closing
+            or self.transferred
+            or (
+                self.supervisor_state is not None
+                and self.supervisor_state.chatgpt_oracle_browser_owners_stopping
+            )
+        )
+        # A final scan is only a sealing scan when every known producer was
+        # already observed exited before enumeration began. If the scan finds
+        # a newly live browser, a later pass must retire it and rescan.
+        producers_exited_before_scan = (
+            final_inventory_deadline is not None
+            and admission_closed
+            and self._browser_producers_exited()
+        )
+        browser_pids_before_scan = set(self._browser_process_handles())
+        unresolved: Dict[str, str] = {}
+        try:
+            inventory_complete, discovered_unresolved = (
+                _chatgpt_oracle_owned_handles_with_markers(
+                    self.process,
+                    self.temp_root,
+                    self.handles,
+                    deadline=deadline,
+                    known_process_roles=self.known_process_roles,
+                    known_process_start_times=self.known_process_start_times,
+                    process_markers=self._owned_process_markers(),
+                    unresolved_inventory=unresolved,
+                )
+            )
+            unresolved.update(discovered_unresolved)
+        except (OSError, ValueError, TimeoutError) as exc:
+            self.browser_discovery_complete = False
+            self.inventory_unresolved = {
+                "__scan__": exc.__class__.__name__,
+                **unresolved,
+            }
+            return False
+        if not inventory_complete:
+            self.browser_discovery_complete = False
+        else:
+            self.browser_discovery_complete = True
+        self.inventory_unresolved = unresolved
+        browser_pids_after_scan = set(self._browser_process_handles())
+        newly_live_browser = False
+        newly_discovered_browser = bool(
+            browser_pids_after_scan - browser_pids_before_scan
+        )
+        for pid in browser_pids_after_scan - browser_pids_before_scan:
+            handle = self.handles.get(pid)
+            if handle is None:
+                continue
+            try:
+                if not select.select([handle], [], [], 0)[0]:
+                    newly_live_browser = True
+                    break
+            except (OSError, ValueError):
+                newly_live_browser = True
+                break
+        if (
+            final_inventory_deadline is not None
+            and self.browser_discovery_complete
+            and not self._owned_inventory_is_unresolved()
+            and admission_closed
+            and producers_exited_before_scan
+            and not newly_discovered_browser
+            and not newly_live_browser
+        ):
+            # Drivers are intentionally excluded from this scope and remain
+            # owned by their native-history registration until target safety
+            # is proven. Producer exit was established before this scan.
+            self.browser_terminal_inventory = {
+                pid: self.known_process_start_times[pid]
+                for pid in self._browser_process_handles()
+                if pid in self.known_process_start_times
+            }
+            if self.original_helper_pid in self.browser_terminal_inventory:
+                self.browser_inventory_sealed = True
+        return self.browser_discovery_complete
+
+    def _retain_registered_history_process_handles(self) -> None:
+        for registration in self.registrations.values():
+            process_specs = [
+                (
+                    registration.process,
+                    f"history_observer_driver:{registration.registration_id}",
+                )
+            ]
+            closer = registration.close_registration
+            if closer is not None:
+                process_specs.append(
+                    (
+                        closer.process,
+                        f"history_closer_driver:{registration.registration_id}",
+                    )
+                )
+            for process, role in process_specs:
+                pid = getattr(process, "pid", None)
+                if not isinstance(pid, int) or pid <= 0 or pid in self.handles:
+                    continue
+                try:
+                    handle = os.pidfd_open(pid)
+                except (OSError, ValueError):
+                    continue
+                process_stat = _chatgpt_oracle_process_stat(pid)
+                _record_chatgpt_oracle_owned_pid(
+                    pid,
+                    handle,
+                    self.handles,
+                    self.known_process_roles,
+                    role=role,
+                    known_process_start_times=self.known_process_start_times,
+                    process_start_time=(
+                        process_stat[1] if process_stat is not None else None
+                    ),
+                )
+
+    def _owned_process_markers(self) -> Dict[bytes, str]:
+        """Return exact role markers inherited by native-history drivers."""
+        markers: Dict[bytes, str] = {}
+        for registration in self.registrations.values():
+            registration_id = registration.registration_id
+            markers[
+                (
+                    f"{CHATGPT_NATIVE_HISTORY_ROLE_ENV}="
+                    f"history-observer:{registration_id}"
+                ).encode()
+            ] = f"history_observer_driver:{registration_id}"
+            closer = registration.close_registration
+            if closer is not None:
+                markers[
+                    (
+                        f"{CHATGPT_NATIVE_HISTORY_ROLE_ENV}="
+                        f"history-closer:{registration_id}"
+                    ).encode()
+                ] = f"history_closer_driver:{registration_id}"
+        markers[
+            f"{CHATGPT_ORACLE_OWNER_ENV}={self.temp_root}".encode()
+        ] = "oracle_owner"
+        return markers
+
+    def _browser_process_handles(self) -> Dict[int, int]:
+        """Return only helper/browser scope; history drivers have their owner."""
+
+        return {
+            pid: handle
+            for pid, handle in self.handles.items()
+            if not _chatgpt_oracle_registration_driver_role(
+                self.known_process_roles.get(pid)
+            )
+        }
+
+    def _history_process_handles(self) -> Dict[int, int]:
+        return {
+            pid: handle
+            for pid, handle in self.handles.items()
+            if _chatgpt_oracle_registration_driver_role(
+                self.known_process_roles.get(pid)
+            )
+        }
+
+    def _registration_process_handles(
+        self,
+        registration_id: str,
+    ) -> Dict[int, int]:
+        prefixes = (
+            f"history_observer_driver:{registration_id}",
+            f"history_closer_driver:{registration_id}",
+        )
+        return {
+            pid: handle
+            for pid, handle in self._history_process_handles().items()
+            if isinstance(self.known_process_roles.get(pid), str)
+            and self.known_process_roles[pid].startswith(prefixes)
+        }
+
+    def _owned_inventory_is_unresolved(self) -> bool:
+        return any(
+            not key.startswith("unrelated:")
+            for key in self.inventory_unresolved
+        )
+
+    def _browser_producers_exited(self) -> bool:
+        """Return whether every known browser producer has exited."""
+
+        browser_handles = self._browser_process_handles()
+        if self.original_helper_pid not in browser_handles:
+            return False
+        try:
+            if self.process.poll() is None:
+                return False
+            return all(
+                bool(select.select([handle], [], [], 0)[0])
+                for handle in browser_handles.values()
+            )
+        except (OSError, ValueError):
+            return False
+
+    def _wait_for_owned_handles(
+        self,
+        deadline: float,
+        *,
+        poll_only: bool = False,
+        handles: Optional[Mapping[int, int]] = None,
+    ) -> bool:
+        pending = set(
+            (
+                handles
+                if handles is not None
+                else self._browser_process_handles()
+            ).values()
+        )
+        while pending:
+            if poll_only:
+                try:
+                    ready, _, _ = select.select(list(pending), [], [], 0)
+                except (OSError, ValueError):
+                    return False
+                pending.difference_update(ready)
+                return not pending
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                return False
+            try:
+                ready, _, _ = select.select(list(pending), [], [], remaining)
+            except (OSError, ValueError):
+                return False
+            pending.difference_update(ready)
+        return True
+
+    def _owned_handles_reaped(self) -> bool:
+        if self.browser_inventory_cutoff_reached:
+            return False
+        if not self.browser_inventory_sealed:
+            return False
+        if self._owned_inventory_is_unresolved():
+            return False
+        try:
+            if self.process.poll() is None:
+                return False
+        except (OSError, ValueError):
+            return False
+        try:
+            browser_handles = self._browser_process_handles()
+            if set(browser_handles) != set(self.browser_terminal_inventory):
+                return False
+            if any(
+                self.known_process_start_times.get(pid) != start_time
+                for pid, start_time in self.browser_terminal_inventory.items()
+            ):
+                return False
+            return all(
+                bool(select.select([handle], [], [], 0)[0])
+                for handle in browser_handles.values()
+            )
+        except (OSError, ValueError):
+            return False
+
+    def _owner_cleanup_plan(
+        self,
+        deadline: float,
+        *,
+        target_close_budget: float = _NATIVE_HISTORY_CLEANUP_RESERVE_SECONDS,
+    ) -> Dict[str, float]:
+        ceiling = float(deadline)
+        for candidate in (self.operation_deadline, self.history_deadline):
+            if candidate is not None:
+                ceiling = min(ceiling, candidate)
+        if self.shutdown_deadline is not None:
+            ceiling = min(ceiling, self.shutdown_deadline)
+        now = time.monotonic()
+        if self.cleanup_plan is None:
+            start = min(now, ceiling)
+            reserve = min(
+                _NATIVE_HISTORY_CLEANUP_RESERVE_SECONDS,
+                max(0.0, target_close_budget),
+                max(0.0, ceiling - start),
+            )
+            self.cleanup_plan = {
+                "target_close_deadline": start + reserve / 3,
+                "term_deadline": start + reserve / 2,
+                "kill_deadline": start + reserve * 2 / 3,
+                "reap_deadline": start + reserve * 5 / 6,
+                "final_deadline": start + reserve,
+            }
+        else:
+            for phase_name, phase_deadline in list(self.cleanup_plan.items()):
+                self.cleanup_plan[phase_name] = min(phase_deadline, ceiling)
+        return self.cleanup_plan
+
+    def prepare_native_history_cleanup_plan(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        *,
+        cleanup_deadline: float,
+        operation_deadline: float,
+    ) -> Mapping[str, float]:
+        with self.pending_registry_lock:
+            if (
+                self.registrations.get(registration.registration_id)
+                is not registration
+            ):
+                raise RuntimeError(
+                    "Native history cleanup plan has no registered owner."
+                )
+            if self.shutdown_deadline is not None:
+                registration.shutdown_deadline = min(
+                    float(registration.shutdown_deadline)
+                    if registration.shutdown_deadline is not None
+                    else float(self.shutdown_deadline),
+                    float(self.shutdown_deadline),
+                )
+        plan = self._owner_cleanup_plan(
+            min(float(cleanup_deadline), float(operation_deadline)),
+            target_close_budget=registration.target_close_budget,
+        )
+        registration.cleanup_plan = plan
+        return plan
+
+    def terminate_native_history_process_scope(
+        self,
+        *,
+        registration_id: str,
+        term_deadline: float,
+        kill_deadline: float,
+        reap_deadline: float,
+        poll_only: bool = False,
+    ) -> bool:
+        if not self.cleanup_gate.acquire(False):
+            return False
+        try:
+            if not poll_only:
+                # Registration publishes the direct worker objects before
+                # their pidfds are necessarily in the owner map. Discover
+                # those handles on the first admitted cleanup pass.
+                self._retain_registered_history_process_handles()
+                self._reconcile_owned_browser_handles(term_deadline)
+            handles = self._registration_process_handles(registration_id)
+            if self.browser_discovery_complete and not (
+                self._owned_inventory_is_unresolved()
+            ):
+                self.native_scope_inventory[registration_id] = {
+                    pid: self.known_process_start_times[pid]
+                    for pid in handles
+                    if pid in self.known_process_start_times
+                }
+            else:
+                self.native_scope_inventory.pop(registration_id, None)
+            if not handles:
+                # A missing handle set is not retirement proof. Discovery is
+                # deliberately skipped in poll-only servicing, so the owner
+                # must retain the obligation for a later admitted pass.
+                return False
+            if poll_only:
+                _signal_chatgpt_oracle_handles(handles, signal.SIGTERM)
+                if time.monotonic() < term_deadline:
+                    return False
+                # Poll-only servicing never restarts TERM grace or waits for a
+                # later phase deadline. Escalate at its absolute cutoff and
+                # leave only nonblocking retirement observation to callers.
+                _signal_chatgpt_oracle_handles(handles, signal.SIGKILL)
+                scope_inventory = self.native_scope_inventory.get(
+                    registration_id,
+                    {},
+                )
+                if not scope_inventory or set(handles) != set(scope_inventory):
+                    return False
+                if any(
+                    self.known_process_start_times.get(pid) != start_time
+                    for pid, start_time in scope_inventory.items()
+                ):
+                    return False
+                return all(
+                    bool(select.select([handle], [], [], 0)[0])
+                    for handle in handles.values()
+                )
+            _signal_chatgpt_oracle_handles(handles, signal.SIGTERM)
+            if time.monotonic() < term_deadline:
+                self._wait_for_owned_handles(
+                    term_deadline,
+                    handles=handles,
+                )
+            handles = self._registration_process_handles(registration_id)
+            _signal_chatgpt_oracle_handles(handles, signal.SIGKILL)
+            if time.monotonic() < kill_deadline:
+                self._wait_for_owned_handles(
+                    kill_deadline,
+                    handles=handles,
+                )
+            handles = self._registration_process_handles(registration_id)
+            if time.monotonic() < reap_deadline:
+                self._wait_for_owned_handles(
+                    reap_deadline,
+                    handles=handles,
+                )
+            scope_inventory = self.native_scope_inventory.get(
+                registration_id,
+                {},
+            )
+            if not scope_inventory or set(handles) != set(scope_inventory):
+                return False
+            if any(
+                self.known_process_start_times.get(pid) != start_time
+                for pid, start_time in scope_inventory.items()
+            ):
+                return False
+            return all(
+                bool(select.select([handle], [], [], 0)[0])
+                for handle in handles.values()
+            )
+        except (OSError, ValueError):
+            return False
+        finally:
+            self.cleanup_gate.release()
+
+    def _terminate_owned_browser(  # noqa: PLR0915 - bounded browser cleanup
+        self,
+        *,
+        term_deadline: float,
+        kill_deadline: float,
+        reap_deadline: float,
+        final_deadline: float,
+        poll_only: bool = False,
+    ) -> bool:
+        """Terminate the helper tree and prove all owned descendants exited."""
+
+        if self.browser_termination_proven:
+            return True
+        if not self.helper_termination_requested:
+            try:
+                if self.process.stdin is not None:
+                    self.process.stdin.close()
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                self.cleanup_error = _redacted_failure_message(str(exc))
+            self.helper_termination_requested = True
+
+        # Reconcile both before and after each signal. A driver can spawn a
+        # descendant between scans; no positive retirement proof is allowed
+        # until the final bounded inventory has been reconciled.
+        browser_handles = self._browser_process_handles()
+        if not poll_only:
+            self._reconcile_owned_browser_handles(
+                term_deadline,
+                final_inventory_deadline=final_deadline,
+            )
+        if self._owned_handles_reaped():
+            self.browser_termination_proven = True
+            return True
+        _signal_chatgpt_oracle_handles(browser_handles, signal.SIGTERM)
+        if poll_only:
+            if time.monotonic() < term_deadline:
+                return False
+            # KILL is due at the end of the TERM grace period. The later
+            # deadlines are observation cutoffs, not a renewed grace window.
+            _signal_chatgpt_oracle_handles(
+                self._browser_process_handles(),
+                signal.SIGKILL,
+            )
+            if self._owned_handles_reaped():
+                self.browser_termination_proven = True
+                return True
+            return False
+        if not poll_only and time.monotonic() < term_deadline:
+            self._wait_for_owned_handles(
+                term_deadline,
+                poll_only=False,
+                handles=browser_handles,
+            )
+        if self._reconcile_owned_browser_handles(
+            kill_deadline,
+            final_inventory_deadline=final_deadline,
+        ):
+            _signal_chatgpt_oracle_handles(
+                self._browser_process_handles(),
+                signal.SIGTERM,
+            )
+        self._reconcile_owned_browser_handles(
+            final_deadline,
+            final_inventory_deadline=final_deadline,
+        )
+        if self._owned_handles_reaped():
+            if self._owned_handles_reaped():
+                self.browser_termination_proven = True
+                return True
+
+        self._reconcile_owned_browser_handles(
+            kill_deadline,
+            final_inventory_deadline=final_deadline,
+        )
+        _signal_chatgpt_oracle_handles(
+            self._browser_process_handles(),
+            signal.SIGKILL,
+        )
+        if not poll_only and time.monotonic() < kill_deadline:
+            self._wait_for_owned_handles(
+                kill_deadline,
+                poll_only=False,
+                handles=self._browser_process_handles(),
+            )
+        self._reconcile_owned_browser_handles(
+            reap_deadline,
+            final_inventory_deadline=final_deadline,
+        )
+        _signal_chatgpt_oracle_handles(
+            self._browser_process_handles(),
+            signal.SIGKILL,
+        )
+        if not poll_only and time.monotonic() < reap_deadline:
+            self._wait_for_owned_handles(
+                reap_deadline,
+                poll_only=False,
+                handles=self._browser_process_handles(),
+            )
+
+        # Leave a bounded reconciliation slice after the final wait. This
+        # catches descendants created by a driver that exited during KILL.
+        if not self._reconcile_owned_browser_handles(
+            final_deadline,
+            final_inventory_deadline=final_deadline,
+        ):
+            self.cleanup_error = (
+                "Oracle browser owner process inventory remains unknown."
+            )
+            return False
+        _signal_chatgpt_oracle_handles(
+            self._browser_process_handles(),
+            signal.SIGKILL,
+        )
+        if poll_only:
+            if self._owned_handles_reaped():
+                self.browser_termination_proven = True
+                return True
+            return False
+        final_wait_deadline = max(
+            time.monotonic(),
+            final_deadline
+            - min(0.25, max(0.0, final_deadline - time.monotonic()) / 3),
+        )
+        if time.monotonic() < final_wait_deadline:
+            self._wait_for_owned_handles(
+                final_wait_deadline,
+                poll_only=False,
+                handles=self._browser_process_handles(),
+            )
+        if not self._reconcile_owned_browser_handles(
+            final_deadline,
+            final_inventory_deadline=final_deadline,
+        ):
+            self.cleanup_error = (
+                "Oracle browser owner process inventory remains unknown."
+            )
+            return False
+        _signal_chatgpt_oracle_handles(
+            self._browser_process_handles(),
+            signal.SIGKILL,
+        )
+        if time.monotonic() < final_deadline:
+            self._wait_for_owned_handles(
+                final_deadline,
+                poll_only=False,
+                handles=self._browser_process_handles(),
+            )
+        if self._reconcile_owned_browser_handles(
+            final_deadline,
+            final_inventory_deadline=final_deadline,
+        ) and self._owned_handles_reaped():
+            self.browser_termination_proven = True
+            return True
+        self.cleanup_error = (
+            "Oracle browser owner process cleanup remains unproven."
+        )
+        return False
+
+    def terminate_owned_browser(
+        self,
+        *,
+        term_deadline: float,
+        kill_deadline: float,
+        reap_deadline: float,
+        final_deadline: float,
+        poll_only: bool = False,
+    ) -> bool:
+        if not self.cleanup_gate.acquire(False):
+            return False
+        try:
+            return self._terminate_owned_browser(
+                term_deadline=term_deadline,
+                kill_deadline=kill_deadline,
+                reap_deadline=reap_deadline,
+                final_deadline=final_deadline,
+                poll_only=poll_only,
+            )
+        finally:
+            self.cleanup_gate.release()
+
+    def _cleanup_owner(self, deadline: float, *, poll_only: bool = False) -> bool:
+        if not self.cleanup_gate.acquire(False):
+            return False
+        try:
+            with self.pending_registry_lock:
+                self.closing = True
+            plan = self._owner_cleanup_plan(deadline)
+            if not self.browser_termination_proven:
+                self._terminate_owned_browser(
+                    term_deadline=plan["term_deadline"],
+                    kill_deadline=plan["kill_deadline"],
+                    reap_deadline=plan["reap_deadline"],
+                    final_deadline=plan["final_deadline"],
+                    poll_only=poll_only,
+                )
+            if not self.browser_termination_proven:
+                return False
+            try:
+                if any(
+                    not select.select([handle], [], [], 0)[0]
+                    for handle in self._history_process_handles().values()
+                ):
+                    return False
+            except (OSError, ValueError):
+                return False
+            for handle in self.handles.values():
+                try:
+                    os.close(handle)
+                except OSError:
+                    pass
+            self.handles.clear()
+            if not self._start_scratch_remover(plan["final_deadline"]):
+                self.cleanup_error = (
+                    self.cleanup_error
+                    or "Oracle browser scratch remover could not start."
+                )
+                return False
+            if not self._wait_for_scratch_remover(
+                plan["final_deadline"],
+                poll_only=poll_only,
+            ):
+                self.cleanup_error = (
+                    self.scratch_cleanup_error
+                    or "Oracle browser scratch cleanup remains pending."
+                )
+                return False
+            for stream in (self.process.stdout, self.process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+            return True
+        finally:
+            self.cleanup_gate.release()
+
+    def _start_scratch_remover(self, deadline: float) -> bool:
+        """Start one remover only after private-browser termination is proven."""
+
+        if self.scratch_deleted:
+            return True
+        if self.scratch_remover is not None:
+            return True
+        if self.scratch_removal_attempted:
+            return False
+        self.scratch_removal_attempted = True
+        if not Path(self.temp_root).exists():
+            self.scratch_deleted = True
+            return True
+        if time.monotonic() >= deadline:
+            self.scratch_cleanup_error = (
+                "Oracle browser scratch cleanup deadline expired."
+            )
+            return False
+        try:
+            remover = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import shutil,sys; shutil.rmtree(sys.argv[1])",
+                    self.temp_root,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            self.scratch_cleanup_error = _redacted_failure_message(str(exc))
+            return False
+        self.scratch_remover = remover
+        self.scratch_remover_handle = None
+        try:
+            self.scratch_remover_handle = os.pidfd_open(remover.pid)
+        except OSError as exc:
+            self.scratch_cleanup_error = _redacted_failure_message(str(exc))
+        return True
+
+    def _wait_for_scratch_remover(
+        self,
+        deadline: float,
+        *,
+        poll_only: bool = False,
+    ) -> bool:
+        remover = self.scratch_remover
+        if remover is None:
+            return self.scratch_deleted
+        if remover.poll() is None:
+            if poll_only or time.monotonic() >= deadline:
+                return False
+            try:
+                remover.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+        if remover.poll() is None:
+            return False
+        handle = self.scratch_remover_handle
+        if handle is not None:
+            try:
+                os.close(handle)
+            except OSError:
+                pass
+        self.scratch_remover = None
+        self.scratch_remover_handle = None
+        self.scratch_deleted = remover.returncode == 0 and not Path(
+            self.temp_root
+        ).exists()
+        if not self.scratch_deleted:
+            self.scratch_cleanup_error = (
+                "Oracle browser scratch cleanup failed."
+            )
+        return self.scratch_deleted
+
+    def finalize(self, deadline: float) -> bool:
+        with self.pending_registry_lock:
+            self.closing = True
+            registrations = list(self.registrations.values())
+            for registration in registrations:
+                registration.finalizing = True
+                try:
+                    registration.abort_event.set()
+                except (OSError, ValueError):
+                    registration.cleanup_failure = (
+                        "Native ChatGPT history abort control failed."
+                    )
+        for registration in registrations:
+            callback = registration.cleanup_callback
+            if callback is None:
+                continue
+            try:
+                callback(deadline, poll_only=False)
+            except Exception as exc:
+                registration.cleanup_failure = str(exc)
+        with self.pending_registry_lock:
+            has_registrations = bool(self.registrations)
+            if has_registrations:
+                self.transferred = True
+                self.published = True
+                return False
+        if self.shutdown_deadline is not None:
+            deadline = min(float(deadline), self.shutdown_deadline)
+        completed = self._cleanup_owner(deadline, poll_only=False)
+        if completed:
+            with self.pending_registry_lock:
+                self.pending_registry.pop(self.owner_id, None)
+                self.published = False
+        return completed
+
+    def request_shutdown(self, *, deadline: Optional[float] = None) -> None:
+        with self.pending_registry_lock:
+            self.closing = True
+            if deadline is not None:
+                self.shutdown_deadline = (
+                    float(deadline)
+                    if self.shutdown_deadline is None
+                    else min(self.shutdown_deadline, float(deadline))
+                )
+            for registration in self.registrations.values():
+                registration.finalizing = True
+                if self.shutdown_deadline is not None:
+                    registration.shutdown_deadline = (
+                        self.shutdown_deadline
+                        if registration.shutdown_deadline is None
+                        else min(
+                            registration.shutdown_deadline,
+                            self.shutdown_deadline,
+                        )
+                    )
+                try:
+                    registration.abort_event.set()
+                except (OSError, ValueError):
+                    registration.cleanup_failure = (
+                        "Native ChatGPT history abort control failed."
+                    )
+
+    def service_pending(
+        self,
+        *,
+        deadline: Optional[float] = None,
+    ) -> bool:
+        now = time.monotonic()
+        with self.pending_registry_lock:
+            registrations = list(self.registrations.values())
+            operation_deadline = self.operation_deadline
+            if operation_deadline is None:
+                operation_deadline = self.history_deadline
+
+            def release_control_failed(
+                registration: NativeHistoryLifecycleRegistration,
+            ) -> bool:
+                state = registration.release_control_state
+                return bool(
+                    registration.release_control_failed
+                    or (state is not None and bool(state.value))
+                )
+
+            needs_cleanup = any(
+                registration.cleanup_failure is not None
+                or registration.abort_event.is_set()
+                or registration.released
+                or release_control_failed(registration)
+                or (
+                    operation_deadline is not None
+                    and now >= operation_deadline
+                )
+                for registration in registrations
+            )
+            needs_cleanup = needs_cleanup or self.closing or self.transferred
+            needs_cleanup = needs_cleanup or bool(
+                self.cleanup_error
+                or self.scratch_remover
+                or self.scratch_cleanup_error
+                or self.handles
+            )
+            if not needs_cleanup:
+                return False
+            cleanup_deadline = float(deadline) if deadline is not None else (
+                operation_deadline
+                or self.history_deadline
+                or now
+            )
+            if self.shutdown_deadline is not None:
+                cleanup_deadline = min(
+                    cleanup_deadline,
+                    self.shutdown_deadline,
+                )
+            for registration in registrations:
+                registration.finalizing = True
+        for registration in registrations:
+            callback = registration.cleanup_callback
+            if callback is None:
+                continue
+            try:
+                callback(cleanup_deadline, poll_only=True)
+            except Exception as exc:
+                registration.cleanup_failure = str(exc)
+        with self.pending_registry_lock:
+            if self.registrations:
+                return False
+        completed = self._cleanup_owner(cleanup_deadline, poll_only=True)
+        if completed:
+            with self.pending_registry_lock:
+                self.pending_registry.pop(self.owner_id, None)
+                self.published = False
+        return completed
+
+
+class _ChatGPTOracleBrowserLifecycleCapability:
+    """Nonserialized lifecycle authority tied to one private profile owner."""
+
+    def __init__(self, owner: _ChatGPTOracleBrowserOwner) -> None:
+        self.owner = owner
+
+    def register_native_history(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+    ) -> None:
+        self.owner.register(registration)
+
+    def register_native_history_closer(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        closer: NativeHistoryCloseRegistration,
+    ) -> None:
+        self.owner.register_closer(registration, closer)
+
+    def retain_native_history(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        reason: str,
+    ) -> None:
+        self.owner.retain(registration, reason)
+
+    def release_native_history(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        *,
+        proof: NativeHistoryReleaseProof,
+    ) -> None:
+        self.owner.release(registration, proof=proof)
+
+    def retire_native_history(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+    ) -> None:
+        self.owner.retire(registration)
+
+    def prepare_native_history_cleanup_plan(
+        self,
+        registration: NativeHistoryLifecycleRegistration,
+        *,
+        cleanup_deadline: float,
+        operation_deadline: float,
+    ) -> Mapping[str, float]:
+        return self.owner.prepare_native_history_cleanup_plan(
+            registration,
+            cleanup_deadline=cleanup_deadline,
+            operation_deadline=operation_deadline,
+        )
+
+    def terminate_native_history_process_scope(
+        self,
+        *,
+        registration_id: str,
+        term_deadline: float,
+        kill_deadline: float,
+        reap_deadline: float,
+        poll_only: bool = False,
+    ) -> bool:
+        return self.owner.terminate_native_history_process_scope(
+            registration_id=registration_id,
+            term_deadline=term_deadline,
+            kill_deadline=kill_deadline,
+            reap_deadline=reap_deadline,
+            poll_only=poll_only,
+        )
+
+    def terminate_owned_browser(
+        self,
+        *,
+        term_deadline: float,
+        kill_deadline: float,
+        reap_deadline: float,
+        final_deadline: float,
+        poll_only: bool = False,
+    ) -> bool:
+        return self.owner.terminate_owned_browser(
+            term_deadline=term_deadline,
+            kill_deadline=kill_deadline,
+            reap_deadline=reap_deadline,
+            final_deadline=final_deadline,
+            poll_only=poll_only,
+        )
+
+    def bind_native_history_endpoint(
+        self,
+        *,
+        cdp_endpoint: str,
+        anchor_target_id: str,
+    ) -> None:
+        self.owner.bind(
+            cdp_endpoint=cdp_endpoint,
+            anchor_target_id=anchor_target_id,
+        )
 
 
 def _cleanup_chatgpt_oracle_process(
@@ -2430,9 +4395,91 @@ def _cleanup_chatgpt_oracle_process(
                     stream.close()
 
 
+def _service_pending_chatgpt_oracle_browser_owners(
+    state: SidecarTaskState,
+    *,
+    deadline: Optional[float] = None,
+) -> None:
+    with state.pending_chatgpt_oracle_browser_owners_lock:
+        owners = list(state.pending_chatgpt_oracle_browser_owners.items())
+    for owner_id, owner in owners:
+        try:
+            completed = owner.service_pending(deadline=deadline)
+        except Exception as exc:
+            owner.cleanup_error = _redacted_failure_message(str(exc))
+            completed = False
+        if completed:
+            with state.pending_chatgpt_oracle_browser_owners_lock:
+                state.pending_chatgpt_oracle_browser_owners.pop(owner_id, None)
+
+
+def _drain_pending_chatgpt_oracle_browser_owners(
+    state: SidecarTaskState,
+    *,
+    deadline: Optional[float] = None,
+) -> bool:
+    """Give retained browser owners one bounded shutdown cleanup window."""
+
+    operation_limit = (
+        time.monotonic() + DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS
+        if deadline is None
+        else float(deadline)
+    )
+    state.chatgpt_oracle_browser_owners_stopping = True
+    state.chatgpt_oracle_browser_shutdown_deadline = (
+        operation_limit
+        if state.chatgpt_oracle_browser_shutdown_deadline is None
+        else min(
+            state.chatgpt_oracle_browser_shutdown_deadline,
+            operation_limit,
+        )
+    )
+    def effective_shutdown_deadline() -> float:
+        current_cutoff = state.chatgpt_oracle_browser_shutdown_deadline
+        return min(
+            operation_limit,
+            float(current_cutoff)
+            if current_cutoff is not None
+            else operation_limit,
+        )
+
+    shutdown_deadline = effective_shutdown_deadline()
+    with state.pending_chatgpt_oracle_browser_owners_lock:
+        owners = list(state.pending_chatgpt_oracle_browser_owners.values())
+    for owner in owners:
+        owner.request_shutdown(deadline=shutdown_deadline)
+    while True:
+        # The shared cancellation cutoff can be tightened by the outer
+        # supervisor while this drain is servicing owners. Never let an inner
+        # pass extend that original operation limit.
+        shutdown_deadline = effective_shutdown_deadline()
+        with state.pending_chatgpt_oracle_browser_owners_lock:
+            owners = list(state.pending_chatgpt_oracle_browser_owners.values())
+        for owner in owners:
+            owner.request_shutdown(deadline=shutdown_deadline)
+        _service_pending_chatgpt_oracle_browser_owners(
+            state,
+            deadline=shutdown_deadline,
+        )
+        with state.pending_chatgpt_oracle_browser_owners_lock:
+            pending = bool(state.pending_chatgpt_oracle_browser_owners)
+        if not pending:
+            return True
+        shutdown_deadline = effective_shutdown_deadline()
+        remaining = shutdown_deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.1, remaining))
+
+
 @contextmanager
-def _chatgpt_oracle_browser_binding(
+def _chatgpt_oracle_browser_binding(  # noqa: PLR0915 - bounded owner lifecycle binding
     binding: ChatGPTConversationInitAccountBinding,
+    *,
+    history_task_state: Optional[SidecarTaskState] = None,
+    pending_lifecycle_registry: Optional[Dict[str, Any]] = None,
+    pending_lifecycle_registry_lock: Optional[Any] = None,
+    operation_deadline: Optional[float] = None,
 ) -> Iterator[ChatGPTConversationInitResolvedBinding]:
     if binding.oracle_profile_path is None:
         if binding.cdp_endpoint is None or binding.page_target_id is None:
@@ -2455,6 +4502,22 @@ def _chatgpt_oracle_browser_binding(
         raise RuntimeError("Oracle process-handle supervision is unavailable.") from exc
     process: Optional[subprocess.Popen] = None
     temp_root = tempfile.mkdtemp(prefix="aawm-oracle-owner-")
+    owner: Optional[_ChatGPTOracleBrowserOwner] = None
+    supervised_history = _sidecar_task_state_is_admitted(history_task_state)
+    if history_task_state is not None and not supervised_history:
+        raise RuntimeError(
+            "Native history requires the admitted foreground sidecar state."
+        )
+    registry = (
+        history_task_state.pending_chatgpt_oracle_browser_owners
+        if supervised_history
+        else {}
+    )
+    registry_lock = (
+        history_task_state.pending_chatgpt_oracle_browser_owners_lock
+        if supervised_history
+        else threading.RLock()
+    )
     try:
         private_home = Path(temp_root)
         # Keep Chrome's desktop/config state separate from the sidecar user's home.
@@ -2481,16 +4544,114 @@ def _chatgpt_oracle_browser_binding(
             )
         except OSError as exc:
             raise RuntimeError("Oracle browser helper could not be started.") from exc
-        yield _read_chatgpt_oracle_startup_binding(process)
+        owner = _ChatGPTOracleBrowserOwner(
+            process,
+            temp_root,
+            registry,
+            registry_lock,
+            history_task_state if supervised_history else None,
+            operation_deadline=operation_deadline,
+        )
+        # Publish the concrete owner before consuming startup output. Any
+        # later history registration must resolve through this exact owner.
+        if supervised_history:
+            owner.publish()
+
+        def startup_deadline() -> Optional[float]:
+            deadlines = [
+                candidate
+                for candidate in (
+                    owner.operation_deadline if owner is not None else None,
+                    owner.shutdown_deadline if owner is not None else None,
+                )
+                if candidate is not None
+            ]
+            return min(deadlines) if deadlines else None
+
+        resolved = _read_chatgpt_oracle_startup_binding(
+            process,
+            shutdown_deadline_getter=startup_deadline,
+        )
+        owner.bind(
+            cdp_endpoint=resolved.cdp_endpoint,
+            anchor_target_id=resolved.page_target_id,
+        )
+        capability = _ChatGPTOracleBrowserLifecycleCapability(owner)
+        yield ChatGPTConversationInitResolvedBinding(
+            cdp_endpoint=resolved.cdp_endpoint,
+            page_target_id=resolved.page_target_id,
+            lifecycle_capability=(
+                capability if supervised_history else None
+            ),
+        )
     finally:
-        if process is not None:
+        if owner is not None and owner.transferred:
+            pass
+        elif owner is not None:
+            deadlines = [
+                registration.deadline
+                for registration in owner.registrations.values()
+            ]
+            if owner.operation_deadline is not None:
+                deadlines.append(owner.operation_deadline)
+            if owner.history_deadline is not None:
+                deadlines.append(owner.history_deadline)
+            if operation_deadline is not None:
+                deadlines.append(float(operation_deadline))
+            cleanup_deadline = (
+                min(deadlines)
+                if deadlines
+                else time.monotonic()
+                + DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS
+            )
+            completed = owner.finalize(cleanup_deadline)
+            if not completed and supervised_history:
+                with owner.pending_registry_lock:
+                    transferred_already = (
+                        owner.pending_registry.get(owner.owner_id) is owner
+                    )
+                if not transferred_already:
+                    owner.transferred = True
+                    owner.published = True
+                    with owner.pending_registry_lock:
+                        owner.pending_registry[owner.owner_id] = owner
+            if not completed:
+                raise OracleBrowserCleanupError(
+                    owner.cleanup_error
+                    or "Oracle browser lifecycle cleanup remains pending."
+                )
+        elif process is not None:
+            # An owner is created immediately after Popen. This branch only
+            # covers a failure before that publication point.
             _cleanup_chatgpt_oracle_process(process, temp_root)
         else:
             _remove_chatgpt_oracle_scratch(temp_root)
 
 
-def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
-    parser = argparse.ArgumentParser(description=__doc__)
+class _ChatGPTNativeHistoryProbeArgumentParser(argparse.ArgumentParser):
+    """Parse probe requests without exposing argparse diagnostics."""
+
+    def _print_message(self, message: str, file: Any = None) -> None:
+        del message, file
+
+    def error(self, message: str) -> None:
+        del message
+        raise SystemExit(2)
+
+
+def _build_parser(  # noqa: PLR0915
+    *,
+    suppress_errors: bool = False,
+) -> argparse.ArgumentParser:
+    parser_type = (
+        _ChatGPTNativeHistoryProbeArgumentParser
+        if suppress_errors
+        else argparse.ArgumentParser
+    )
+    parser = parser_type(
+        description=__doc__,
+        allow_abbrev=not suppress_errors,
+    )
     parser.add_argument(
         "--apply",
         dest="apply",
@@ -3662,6 +5823,99 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "legacy file-only conversation-init polling."
         ),
     )
+    parser.add_argument(
+        "--chatgpt-native-history-probe-account-label",
+        default=os.getenv("AAWM_CHATGPT_NATIVE_HISTORY_PROBE_ACCOUNT_LABEL"),
+        help=(
+            "Run one supervised native-history observation for the exact Codex "
+            "OAuth inventory label and skip all other sidecar work. Requires a "
+            "profile binding for pinned account 8e92854835c4."
+        ),
+    )
+    parser.add_argument(
+        "--chatgpt-native-history-probe-cooldown-cleared",
+        dest="chatgpt_native_history_probe_cooldown_cleared",
+        action="store_true",
+        default=_env_bool(
+            CHATGPT_NATIVE_HISTORY_PROBE_COOLDOWN_CLEARED_ENV,
+            False,
+        ),
+        help=(
+            "Require the parent/operator to verify that the bound browser "
+            "session has no active conversation-history cooldown before the "
+            "one-shot probe starts. Defaults to "
+            f"{CHATGPT_NATIVE_HISTORY_PROBE_COOLDOWN_CLEARED_ENV} or false."
+        ),
+    )
+    chatgpt_usage_bridge_group = parser.add_mutually_exclusive_group()
+    chatgpt_usage_bridge_group.add_argument(
+        "--chatgpt-usage-bridge-enabled",
+        dest="chatgpt_usage_bridge_enabled",
+        action="store_true",
+        default=_env_bool(
+            "AAWM_CHATGPT_USAGE_BRIDGE_ENABLED",
+            DEFAULT_CHATGPT_USAGE_BRIDGE_ENABLED,
+        ),
+        help=(
+            "Run the bounded ChatGPT usage worker bridge. Disabled by default. "
+            "Defaults to AAWM_CHATGPT_USAGE_BRIDGE_ENABLED or false."
+        ),
+    )
+    chatgpt_usage_bridge_group.add_argument(
+        "--no-chatgpt-usage-bridge",
+        dest="chatgpt_usage_bridge_enabled",
+        action="store_false",
+        help="Disable the ChatGPT usage worker bridge.",
+    )
+    parser.add_argument(
+        "--chatgpt-usage-bridge-interval-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_CHATGPT_USAGE_BRIDGE_INTERVAL_SECONDS",
+            DEFAULT_CHATGPT_USAGE_BRIDGE_INTERVAL_SECONDS,
+        ),
+        help=(
+            "Minimum seconds between ChatGPT usage bridge attempts. Defaults "
+            "to AAWM_CHATGPT_USAGE_BRIDGE_INTERVAL_SECONDS or 600."
+        ),
+    )
+    parser.add_argument(
+        "--chatgpt-usage-bridge-node-executable",
+        default=os.getenv("AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE", "node"),
+        help=(
+            "Node executable for the bounded worker. Defaults to "
+            "AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE or node."
+        ),
+    )
+    parser.add_argument(
+        "--chatgpt-usage-bridge-worker-root",
+        default=os.getenv(
+            "AAWM_CHATGPT_USAGE_BRIDGE_WORKER_ROOT",
+            DEFAULT_CHATGPT_USAGE_BRIDGE_WORKER_ROOT,
+        ),
+        help=(
+            "Bounded worker project root. The bridge launches "
+            "dist/src/worker/main.js beneath this root. Defaults to "
+            "AAWM_CHATGPT_USAGE_BRIDGE_WORKER_ROOT or the packaged image path."
+        ),
+    )
+    parser.add_argument(
+        "--chatgpt-usage-bridge-authentication-recovery-account",
+        default=os.getenv(CHATGPT_USAGE_BRIDGE_RECOVERY_ACCOUNT_ENV),
+        help=(
+            "Run one explicit ChatGPT authentication-recovery bridge action for "
+            "this configured account label, then exit. This never enables "
+            "recovery in the recurring sidecar loop."
+        ),
+    )
+    parser.add_argument(
+        "--chatgpt-usage-bridge-authentication-recovery-profile",
+        default=os.getenv(CHATGPT_USAGE_BRIDGE_RECOVERY_PROFILE_ENV),
+        help=(
+            "Optional profile label for the explicit ChatGPT authentication "
+            "recovery action. Requires an account label."
+        ),
+    )
 
     codex_credit_group = parser.add_mutually_exclusive_group()
     codex_credit_group.add_argument(
@@ -3842,6 +6096,7 @@ def _validate_config_args(args: argparse.Namespace) -> None:
     _validate_xai_reset_poll_config_args(args)
     _validate_cursor_agent_usage_config_args(args)
     _validate_chatgpt_conversation_init_config_args(args)
+    _validate_chatgpt_usage_bridge_config_args(args)
     _validate_observability_anomaly_scan_config_args(args)
     _validate_codex_reset_credit_poll_config_args(args)
 
@@ -4100,6 +6355,39 @@ def _validate_chatgpt_conversation_init_config_args(
         )
     if not str(args.chatgpt_conversation_init_url).strip():
         raise SystemExit("--chatgpt-conversation-init-url must not be empty")
+    label = args.chatgpt_native_history_probe_account_label
+    if label is not None and not str(label).strip():
+        raise SystemExit(
+            "--chatgpt-native-history-probe-account-label must not be empty"
+        )
+
+
+def _validate_chatgpt_usage_bridge_config_args(
+    args: argparse.Namespace,
+) -> None:
+    if args.chatgpt_usage_bridge_interval_seconds <= 0:
+        raise SystemExit(
+            "--chatgpt-usage-bridge-interval-seconds must be greater than 0"
+        )
+    if not str(args.chatgpt_usage_bridge_node_executable).strip():
+        raise SystemExit("--chatgpt-usage-bridge-node-executable must not be empty")
+    if not str(args.chatgpt_usage_bridge_worker_root).strip():
+        raise SystemExit("--chatgpt-usage-bridge-worker-root must not be empty")
+    recovery_account = args.chatgpt_usage_bridge_authentication_recovery_account
+    recovery_profile = args.chatgpt_usage_bridge_authentication_recovery_profile
+    if recovery_profile is not None and not str(recovery_account or "").strip():
+        raise SystemExit(
+            "--chatgpt-usage-bridge-authentication-recovery-profile requires "
+            "--chatgpt-usage-bridge-authentication-recovery-account"
+        )
+    if recovery_account is not None and not str(recovery_account).strip():
+        raise SystemExit(
+            "--chatgpt-usage-bridge-authentication-recovery-account must not be empty"
+        )
+    if recovery_profile is not None and not str(recovery_profile).strip():
+        raise SystemExit(
+            "--chatgpt-usage-bridge-authentication-recovery-profile must not be empty"
+        )
 
 
 def _validate_grok_billing_config_args(args: argparse.Namespace) -> None:
@@ -4177,8 +6465,14 @@ def _validate_codex_reset_credit_poll_config_args(args: argparse.Namespace) -> N
         )
 
 
-def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConfig:
-    args = _build_parser().parse_args(argv)
+def parse_config(
+    argv: Optional[Sequence[str]] = None,
+    *,
+    suppress_parser_errors: bool = False,
+) -> ProviderStatusLoopConfig:
+    args = _build_parser(
+        suppress_errors=suppress_parser_errors,
+    ).parse_args(argv)
     _validate_config_args(args)
     chatgpt_conversation_init_account_bindings = (
         _parse_chatgpt_conversation_init_account_bindings(
@@ -4253,6 +6547,26 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         grok_oidc_http_timeout_seconds=args.grok_oidc_http_timeout_seconds,
         codex_oauth_refresh_enabled=args.codex_oauth_refresh_enabled,
         codex_oauth_inventory=codex_oauth_inventory,
+        chatgpt_usage_bridge_enabled=args.chatgpt_usage_bridge_enabled,
+        chatgpt_usage_bridge_interval_seconds=(
+            args.chatgpt_usage_bridge_interval_seconds
+        ),
+        chatgpt_usage_bridge_node_executable=str(
+            args.chatgpt_usage_bridge_node_executable
+        ).strip(),
+        chatgpt_usage_bridge_worker_root=str(
+            args.chatgpt_usage_bridge_worker_root
+        ).strip(),
+        chatgpt_usage_bridge_recovery_account=(
+            str(args.chatgpt_usage_bridge_authentication_recovery_account).strip()
+            if args.chatgpt_usage_bridge_authentication_recovery_account is not None
+            else None
+        ),
+        chatgpt_usage_bridge_recovery_profile=(
+            str(args.chatgpt_usage_bridge_authentication_recovery_profile).strip()
+            if args.chatgpt_usage_bridge_authentication_recovery_profile is not None
+            else None
+        ),
         codex_auth_file=resolved_codex_auth_file,
         codex_auth_file_source=resolved_codex_auth_file_source,
         codex_lock_file=args.codex_lock_file,
@@ -4351,6 +6665,14 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         ).strip(),
         chatgpt_conversation_init_account_bindings=(
             chatgpt_conversation_init_account_bindings
+        ),
+        chatgpt_native_history_probe_account_label=(
+            str(args.chatgpt_native_history_probe_account_label).strip()
+            if args.chatgpt_native_history_probe_account_label is not None
+            else None
+        ),
+        chatgpt_native_history_probe_cooldown_cleared=(
+            args.chatgpt_native_history_probe_cooldown_cleared
         ),
         grok_billing_url=args.grok_billing_url,
         grok_billing_client_version=args.grok_billing_client_version,
@@ -15245,6 +17567,7 @@ def _collect_bound_chatgpt_conversation_init_account(
     binding: ChatGPTConversationInitAccountBinding,
     *,
     observed_at: datetime,
+    history_task_state: SidecarTaskState,
 ) -> tuple[List[tuple[Any, ...]], Dict[str, Any]]:
     coverage = _new_chatgpt_conversation_init_account_coverage(
         record,
@@ -15289,7 +17612,10 @@ def _collect_bound_chatgpt_conversation_init_account(
             dir=str(source_parent),
         ) as snapshot_dir:
             snapshot_path = str(Path(snapshot_dir) / "snapshot.json")
-            with _chatgpt_oracle_browser_binding(binding) as resolved_binding:
+            with _chatgpt_oracle_browser_binding(
+                binding,
+                history_task_state=history_task_state,
+            ) as resolved_binding:
                 collector_summary = (
                     collect_conversation_init_snapshot_from_oracle_browser(
                         snapshot_path,
@@ -15478,6 +17804,7 @@ def _run_chatgpt_conversation_init_bound_poll(  # noqa: PLR0915
             record,
             binding,
             observed_at=observed_at,
+            history_task_state=state,
         )
         capture_completed_monotonic = time.monotonic()
 
@@ -16104,6 +18431,361 @@ def _run_observability_anomaly_scan_task(
     }
 
 
+def _run_chatgpt_usage_bridge_task(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+    force: bool = False,
+    account_filter: Optional[str] = None,
+    profile_filter: Optional[str] = None,
+    authentication_recovery_requested: bool = False,
+) -> Optional[Dict[str, Any]]:
+    bridge = state.chatgpt_usage_bridge_owner
+    if bridge is not None:
+        state.chatgpt_usage_bridge_cleanup_errors = bridge.reap_pending()
+    if not state.chatgpt_usage_bridge_admitting:
+        return None
+    if not force and not config.chatgpt_usage_bridge_enabled:
+        return None
+    last_attempt = state.chatgpt_usage_bridge_last_attempt_monotonic
+    if (
+        not force
+        and last_attempt is not None
+        and now_monotonic - last_attempt
+        < config.chatgpt_usage_bridge_interval_seconds
+    ):
+        return None
+    state.chatgpt_usage_bridge_last_attempt_monotonic = now_monotonic
+    observed_at = datetime.now(timezone.utc)
+    summary: Dict[str, Any] = {
+        "attempted": True,
+        "ok": False,
+        "coverage_incomplete": True,
+        "history_contract": "unavailable",
+        "error_class": None,
+        "error_message": None,
+        "account_count": 0,
+        "successful_account_count": 0,
+        "failed_account_count": 0,
+        "results": [],
+        "authentication_recovery_requested": authentication_recovery_requested,
+    }
+    try:
+        bindings = _load_chatgpt_usage_bridge_bindings(account_filter)
+        results = _run_chatgpt_usage_bridge_accounts(
+            config,
+            bindings,
+            task_state=state,
+            profile_filter=profile_filter,
+            authentication_recovery_requested=authentication_recovery_requested,
+        )
+
+        statuses = {
+            str(result.get("history_contract"))
+            for result in results
+            if result.get("history_contract")
+        }
+        if "unavailable" in statuses:
+            history_contract = "unavailable"
+        elif "blocked" in statuses:
+            history_contract = "blocked"
+        elif statuses and statuses == {"ready"}:
+            history_contract = "ready"
+        else:
+            history_contract = "unknown"
+        summary["ok"] = bool(results) and all(
+            bool(result.get("ok")) for result in results
+        )
+        summary["coverage_incomplete"] = any(
+            bool(result.get("coverage_incomplete", True)) for result in results
+        )
+        summary["history_contract"] = history_contract
+        summary["account_count"] = len(results)
+        summary["successful_account_count"] = sum(
+            1 for result in results if bool(result.get("ok"))
+        )
+        summary["failed_account_count"] = len(results) - int(
+            summary["successful_account_count"]
+        )
+        summary["results"] = results
+    except Exception as exc:
+        summary["ok"] = False
+        summary["error_class"] = exc.__class__.__name__
+        summary["error_message"] = _redacted_failure_message(str(exc))
+    return {
+        "event": "chatgpt_usage_bridge",
+        "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+        "environment": config.environment,
+        **summary,
+    }
+
+
+def _load_chatgpt_usage_bridge_bindings(
+    account_filter: Optional[str],
+) -> Dict[str, Dict[str, Optional[str]]]:
+    raw_bindings = os.getenv("AAWM_CHATGPT_USAGE_BRIDGE_ACCOUNT_BINDINGS", "")
+    parsed = json.loads(raw_bindings or "{}")
+    if not isinstance(parsed, dict) or not parsed:
+        raise ValueError(
+            "AAWM_CHATGPT_USAGE_BRIDGE_ACCOUNT_BINDINGS must be a nonempty JSON object"
+        )
+    bindings: Dict[str, Dict[str, Optional[str]]] = {}
+    allowed = {
+        "provider",
+        "providerUserId",
+        "workspaceId",
+        "quotaOwnerId",
+        "surface",
+        "profileId",
+    }
+    for account_id, raw_scope in parsed.items():
+        if not isinstance(account_id, str) or not account_id.strip():
+            raise ValueError("bridge account id must be a nonempty string")
+        if not isinstance(raw_scope, dict):
+            raise ValueError("bridge account scope must be an object")
+        if set(raw_scope) - allowed:
+            raise ValueError("bridge account scope contains an unsupported field")
+        account_key = account_id.strip()
+        bindings[account_key] = {
+            "provider": _chatgpt_usage_bridge_binding_value(
+                raw_scope.get("provider"),
+                "provider",
+            )
+            or "openai",
+            "provider_user_id": _chatgpt_usage_bridge_binding_value(
+                raw_scope.get("providerUserId"),
+                "providerUserId",
+            ),
+            "workspace_id": _chatgpt_usage_bridge_binding_value(
+                raw_scope.get("workspaceId"),
+                "workspaceId",
+            ),
+            "quota_owner_id": _chatgpt_usage_bridge_binding_value(
+                raw_scope.get("quotaOwnerId"),
+                "quotaOwnerId",
+            ),
+            "surface": _chatgpt_usage_bridge_binding_value(
+                raw_scope.get("surface"),
+                "surface",
+            )
+            or "chat",
+            "profile_id": _chatgpt_usage_bridge_binding_value(
+                raw_scope.get("profileId"),
+                "profileId",
+            )
+            or account_key,
+        }
+    if account_filter is None:
+        return bindings
+    account_key = account_filter.strip()
+    if account_key not in bindings:
+        raise ValueError("requested ChatGPT recovery account is not configured")
+    return {account_key: bindings[account_key]}
+
+
+def _run_chatgpt_usage_bridge_accounts(
+    config: ProviderStatusLoopConfig,
+    bindings: Mapping[str, Mapping[str, Optional[str]]],
+    *,
+    task_state: SidecarTaskState,
+    profile_filter: Optional[str],
+    authentication_recovery_requested: bool,
+) -> list[Dict[str, Any]]:
+    from scripts.chatgpt_chat_usage_capture.pg_collector_state import (
+        PgCollectorState,
+    )
+    from scripts.chatgpt_chat_usage_capture.pg_ledger import LedgerScope, PgLedger
+    from scripts.chatgpt_chat_usage_capture.ts_bridge import (
+        DEFAULT_MODEL_MAPPING,
+        BridgeConfig,
+        TsWorkerBridge,
+    )
+
+    ledger = PgLedger(
+        _resolve_codex_quota_dsn(config),
+        application_name=(
+            f"{probes._provider_status_db_application_name()}-chatgpt-usage-bridge"
+        ),
+        lock_timeout_ms=config.db_lock_timeout_ms,
+        statement_timeout_ms=config.db_statement_timeout_ms,
+    )
+    if not task_state.chatgpt_usage_bridge_admitting:
+        raise RuntimeError("ChatGPT usage bridge owner is retiring")
+    bridge = task_state.chatgpt_usage_bridge_owner
+    if bridge is None:
+        bridge = TsWorkerBridge(
+            PgCollectorState(ledger),
+            BridgeConfig.from_runtime(
+                node_executable=config.chatgpt_usage_bridge_node_executable,
+                worker_root=config.chatgpt_usage_bridge_worker_root,
+                mapping=dict(DEFAULT_MODEL_MAPPING),
+            ),
+        )
+        task_state.chatgpt_usage_bridge_owner = bridge
+    results: list[Dict[str, Any]] = []
+    for account_id, bound_scope in bindings.items():
+        if not task_state.chatgpt_usage_bridge_admitting:
+            break
+        configured_profile = str(bound_scope["profile_id"] or account_id)
+        try:
+            task_state.chatgpt_usage_bridge_cleanup_errors = bridge.reap_pending()
+            if task_state.chatgpt_usage_bridge_cleanup_errors:
+                raise RuntimeError("ChatGPT usage bridge cleanup is incomplete")
+            selected_profile = _chatgpt_usage_bridge_selected_profile(
+                account_id,
+                bound_scope,
+                profile_filter=profile_filter,
+            )
+            scope = LedgerScope(
+                collector_account_id=account_id,
+                provider=str(bound_scope["provider"] or "openai"),
+                provider_user_id=bound_scope["provider_user_id"],
+                workspace_id=bound_scope["workspace_id"],
+                quota_owner_id=bound_scope["quota_owner_id"],
+                surface=str(bound_scope["surface"] or "chat"),
+            )
+            result = bridge.run_once(
+                collector_account_id=account_id,
+                profile_id=selected_profile,
+                scope=scope,
+                authentication_recovery_requested=(
+                    authentication_recovery_requested
+                )
+            )
+            results.append(_chatgpt_usage_bridge_result(account_id, result))
+        except Exception as exc:
+            results.append(
+                _chatgpt_usage_bridge_failure(
+                    account_id,
+                    exc,
+                    profile_id=configured_profile,
+                )
+            )
+    return results
+
+
+def _stop_chatgpt_usage_bridge(state: SidecarTaskState) -> None:
+    state.chatgpt_usage_bridge_admitting = False
+    bridge = state.chatgpt_usage_bridge_owner
+    if bridge is not None:
+        bridge.request_shutdown()
+
+
+def _close_chatgpt_usage_bridge(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+) -> List[str]:
+    _stop_chatgpt_usage_bridge(state)
+    bridge = state.chatgpt_usage_bridge_owner
+    if bridge is None:
+        return []
+    try:
+        errors = bridge.close()
+    except Exception as exc:
+        errors = [f"bridge cleanup failed: {type(exc).__name__}"]
+    state.chatgpt_usage_bridge_cleanup_errors = errors
+    if errors:
+        _emit(
+            {
+                "event": "chatgpt_usage_bridge_cleanup",
+                "observed_at": _utc_timestamp(),
+                "environment": config.environment,
+                "ok": False,
+                "error_class": "ChatGPTUsageBridgeCleanupFailed",
+                "error_count": len(errors),
+            }
+        )
+        # Keep the nonadmitting owner alive until its retained children retire.
+        pending_errors = errors
+        retry_delay = 1.0
+        while pending_errors:
+            time.sleep(retry_delay)
+            try:
+                pending_errors = bridge.reap_pending()
+            except Exception as exc:
+                pending_errors = [f"bridge cleanup failed: {type(exc).__name__}"]
+            state.chatgpt_usage_bridge_cleanup_errors = pending_errors
+            retry_delay = min(5.0, retry_delay * 2)
+    state.chatgpt_usage_bridge_owner = None
+    return errors
+
+
+def _chatgpt_usage_bridge_selected_profile(
+    account_id: str,
+    bound_scope: Mapping[str, Optional[str]],
+    *,
+    profile_filter: Optional[str],
+) -> str:
+    configured_profile = str(bound_scope["profile_id"] or account_id)
+    if profile_filter is None:
+        return configured_profile
+    requested_profile = _chatgpt_usage_bridge_binding_value(
+        profile_filter,
+        "profile_filter",
+    )
+    if requested_profile != configured_profile:
+        raise ValueError(
+            "requested ChatGPT usage bridge profile does not match the "
+            f"configured profile for account '{account_id}'"
+        )
+    return configured_profile
+
+
+def _chatgpt_usage_bridge_binding_value(value: Any, field_name: str) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"bridge binding field {field_name} must be a string")
+    normalized = value.strip()
+    return normalized or None
+
+
+def _chatgpt_usage_bridge_result(
+    account_id: str,
+    result: Mapping[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "account_id": account_id,
+        "ok": bool(result.get("ok")),
+        "status": result.get("status"),
+        "run_id": result.get("runId"),
+        "profile_id": result.get("profileId"),
+        "coverage_incomplete": bool(result.get("coverageIncomplete", True)),
+        "history_contract": result.get("historyContract") or "unknown",
+        "history_reason": result.get("historyReason"),
+        "retry_after_ms": result.get("retryAfterMs"),
+        "state_version": result.get("stateVersion"),
+        "requests": result.get("requests"),
+        "error_code": result.get("errorCode"),
+        "retryable": result.get("retryable"),
+    }
+
+
+def _chatgpt_usage_bridge_failure(
+    account_id: str,
+    error: BaseException,
+    *,
+    profile_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "account_id": account_id,
+        "ok": False,
+        "status": "failed",
+        "run_id": None,
+        "profile_id": profile_id,
+        "coverage_incomplete": True,
+        "history_contract": "unavailable",
+        "history_reason": "account_run_failed",
+        "retry_after_ms": None,
+        "state_version": None,
+        "requests": 0,
+        "error_code": error.__class__.__name__,
+        "retryable": True,
+        "error_message": _redacted_failure_message(str(error)),
+    }
+
+
 SIDECAR_OPTIONAL_POLL_DEADLINE_SECONDS = 0.05
 SIDECAR_OPTIONAL_POLL_MAX_WORKERS = 1
 _SIDECAR_MAX_WAKE_DELAY_SECONDS = 86_400.0
@@ -16143,6 +18825,7 @@ def run_due_sidecar_tasks(
     now = time.monotonic() if now_monotonic is None else now_monotonic
     wall_now = _normalize_scheduler_wall_now(now_wall)
     events: list[Dict[str, Any]] = []
+    _service_pending_chatgpt_oracle_browser_owners(state)
     required_runners = {
         _run_grok_oidc_metadata_repair_task,
         _run_grok_oidc_refresh_task,
@@ -16168,6 +18851,7 @@ def run_due_sidecar_tasks(
             _run_chatgpt_conversation_init_poll_task,
             "chatgpt_conversation_init_poll",
         ),
+        (_run_chatgpt_usage_bridge_task, "chatgpt_usage_bridge"),
         (_run_alibaba_quota_poll_task, "alibaba_quota_poll"),
         (_run_grok_billing_poll_task, "grok_billing_poll"),
         (_run_xai_reset_poll_task, "xai_reset_poll"),
@@ -16308,6 +18992,11 @@ _CHATGPT_CONVERSATION_INIT_OPTIONAL_DEGRADED_STATUSES = frozenset(
 def _optional_one_shot_event_failed(event: Mapping[str, Any]) -> bool:
     if event.get("error_class"):
         return True
+    if event.get("event") == "chatgpt_usage_bridge":
+        return (
+            event.get("ok") is not True
+            or int(event.get("failed_account_count") or 0) > 0
+        )
     if event.get("event") != "chatgpt_conversation_init_poll":
         return False
     return any(
@@ -16361,10 +19050,335 @@ def _build_one_shot_status_event(
     }
 
 
+_CHATGPT_NATIVE_HISTORY_PROBE_OBSERVATION_STATES = frozenset(
+    {
+        "history_observed",
+        "history_observation_failed",
+        "no_history_observed",
+    }
+)
+_CHATGPT_NATIVE_HISTORY_PROBE_OBSERVATION_KEYS = frozenset(
+    {
+        "observer",
+        "observation_state",
+        "route_class",
+        "http_status",
+        "account_identity_verified",
+        "account_identity_source",
+        "identity_match",
+        "request_response_correlated",
+        "request_method",
+        "request_body_omitted",
+        "page_target_id_matched",
+        "request_count",
+        "request_count_truncated",
+        "request_count_is_lower_bound",
+        "history_request_count",
+        "history_request_count_truncated",
+        "history_request_count_is_lower_bound",
+        "response_bytes",
+        "response_content_type",
+        "retry_after_seconds",
+        "browser_challenge",
+        "structural_metadata",
+        "model_field_presence",
+        "field_presence_type_counts",
+        "traversal",
+        "failure_reason",
+        "warnings",
+    }
+)
+_CHATGPT_NATIVE_HISTORY_PROBE_CLEANUP_SUBREASONS = {
+    **CHATGPT_NATIVE_HISTORY_CLOSER_FAILURE_SUBREASONS,
+    "Native ChatGPT history lifecycle registration failed.": "native_registration_failed",
+    "Native ChatGPT history abort control failed.": "native_abort_control_failed",
+    "Native ChatGPT history finalization control failed.": "native_finalization_control_failed",
+    "Native ChatGPT history release control failed.": "native_release_control_failed",
+    "Native ChatGPT history worker start is still in progress.": "native_worker_start_pending",
+    "Native ChatGPT history target ownership could not be closed.": "native_target_close_unproven",
+    "Native ChatGPT history closer was not reaped.": "native_closer_not_reaped",
+    "Native ChatGPT history interception worker was not reaped.": "native_worker_not_reaped",
+    "Native ChatGPT history cleanup could not be proven.": "native_cleanup_unproven",
+    "Native ChatGPT history cleanup failed.": "native_cleanup_failed",
+    "Oracle browser owned-target closer is already registered.": "target_closer_already_registered",
+    "Oracle browser owned-target closer could not start.": "target_closer_start_failed",
+    "Oracle browser target was closed but its closer remains active.": "target_closer_still_active",
+    "Oracle browser owned-target closer was not reaped.": "target_closer_not_reaped",
+    "Oracle browser owned-target cleanup was not confirmed.": "target_cleanup_unproven",
+    "Oracle browser owner process inventory remains unknown.": "browser_inventory_unknown",
+    "Oracle browser owner process cleanup remains unproven.": "browser_cleanup_unproven",
+    "Oracle browser scratch remover could not start.": "scratch_remover_start_failed",
+    "Oracle browser scratch cleanup deadline expired.": "scratch_cleanup_deadline_expired",
+    "Oracle browser scratch cleanup remains pending.": "scratch_cleanup_pending",
+    "Oracle browser scratch cleanup failed.": "scratch_cleanup_failed",
+    "Oracle browser lifecycle cleanup remains pending.": "browser_lifecycle_cleanup_pending",
+}
+
+
+def _set_chatgpt_native_history_probe_failure(
+    event: Dict[str, Any],
+    *,
+    error_class: str,
+    telemetry_class: str,
+) -> None:
+    event["error_class"] = error_class
+    event["telemetry_class"] = telemetry_class
+
+
+def _chatgpt_native_history_probe_exception_class(exc: BaseException) -> tuple[
+    str, str
+]:
+    if isinstance(exc, OracleBrowserCleanupError):
+        return "ChatGPTNativeHistoryProbeCleanupFailed", "cleanup"
+    if isinstance(exc, TimeoutError):
+        return "ChatGPTNativeHistoryProbeDeadlineExceeded", "timeout"
+    if isinstance(exc, ChatGPTConversationInitError):
+        return "ChatGPTNativeHistoryProbeBoundaryUnavailable", "boundary"
+    return "ChatGPTNativeHistoryProbeFailed", "internal"
+
+
+def _sanitize_chatgpt_native_history_probe_observation(
+    value: Any,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    state = value.get("observation_state")
+    if state not in _CHATGPT_NATIVE_HISTORY_PROBE_OBSERVATION_STATES:
+        return None
+    return {
+        key: value[key]
+        for key in _CHATGPT_NATIVE_HISTORY_PROBE_OBSERVATION_KEYS
+        if key in value
+    }
+
+
+def _chatgpt_native_history_probe_exit_status(
+    event: Mapping[str, Any],
+) -> int:
+    if event.get("error_class"):
+        return 1
+    observation = event.get("observation")
+    if not isinstance(observation, Mapping):
+        return 1
+    observation_state = observation.get("observation_state")
+    if observation_state == "history_observation_failed":
+        return 1
+    if observation_state == "no_history_observed":
+        return (
+            0
+            if observation.get("failure_reason") in (None, "no_history_observed")
+            else 1
+        )
+    if observation_state == "history_observed":
+        return 0 if observation.get("failure_reason") is None else 1
+    return 1
+
+
+def _run_chatgpt_native_history_probe(  # noqa: PLR0915 - bounded one-shot probe
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+) -> Dict[str, Any]:
+    """Run exactly one supervised native-history observation, without persistence."""
+
+    event: Dict[str, Any] = {
+        "event": "chatgpt_native_history_probe",
+        "observed_at": _utc_timestamp(),
+        "environment": config.environment,
+        "attempted": False,
+    }
+    probe_deadline = (
+        time.monotonic() + DEFAULT_CHATGPT_NATIVE_HISTORY_PROBE_TIMEOUT_SECONDS
+    )
+    state.chatgpt_native_history_probe_operation_deadline = probe_deadline
+
+    label = config.chatgpt_native_history_probe_account_label
+    if label is None:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeNotConfigured",
+            telemetry_class="configuration",
+        )
+        return event
+
+    try:
+        inventory = _require_codex_oauth_inventory(config)
+    except Exception:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeInventoryUnavailable",
+            telemetry_class="configuration",
+        )
+        return event
+
+    try:
+        matches = [
+            record
+            for record in inventory.ordered_records(enabled_only=True)
+            if record.label == label
+        ]
+    except Exception:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeInventoryUnavailable",
+            telemetry_class="configuration",
+        )
+        return event
+    if not matches:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeAccountNotFound",
+            telemetry_class="configuration",
+        )
+        return event
+    if len(matches) != 1:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeAccountNotUnique",
+            telemetry_class="configuration",
+        )
+        return event
+
+    record = matches[0]
+    if record.expected_account_hash != CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeAccountHashMismatch",
+            telemetry_class="configuration",
+        )
+        return event
+    event["account_label"] = record.label
+    event["account_hash"] = record.expected_account_hash
+
+    binding = (config.chatgpt_conversation_init_account_bindings or {}).get(label)
+    if binding is None:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeBindingMissing",
+            telemetry_class="configuration",
+        )
+        return event
+    if binding.oracle_profile_path is None:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeProfileBindingRequired",
+            telemetry_class="configuration",
+        )
+        return event
+
+    session_keys = _chatgpt_conversation_init_session_keys(
+        binding,
+        account_label=record.label,
+    )
+    if _chatgpt_conversation_init_session_cooldown_active(
+        state,
+        session_keys,
+        now_monotonic=time.monotonic(),
+    ):
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeSharedSessionCooldown",
+            telemetry_class="throttled",
+        )
+        return event
+    if not config.chatgpt_native_history_probe_cooldown_cleared:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeCooldownClearanceRequired",
+            telemetry_class="configuration",
+        )
+        return event
+
+    effective_deadline = probe_deadline
+    cancellation_deadline = state.chatgpt_oracle_browser_shutdown_deadline
+    if cancellation_deadline is not None:
+        effective_deadline = min(effective_deadline, cancellation_deadline)
+    remaining = effective_deadline - time.monotonic()
+    if remaining <= DEFAULT_CHATGPT_ORACLE_STARTUP_TIMEOUT_SECONDS:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeDeadlineExceeded",
+            telemetry_class="timeout",
+        )
+        return event
+
+    event["attempted"] = True
+    try:
+        with _chatgpt_oracle_browser_binding(
+            binding,
+            history_task_state=state,
+            operation_deadline=probe_deadline,
+        ) as resolved:
+            effective_deadline = probe_deadline
+            cancellation_deadline = (
+                state.chatgpt_oracle_browser_shutdown_deadline
+            )
+            if cancellation_deadline is not None:
+                effective_deadline = min(effective_deadline, cancellation_deadline)
+            remaining = effective_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("native-history probe deadline expired")
+            result = observe_native_chatgpt_history_from_oracle_browser(
+                page_target_id=resolved.page_target_id,
+                cdp_endpoint=resolved.cdp_endpoint,
+                lifecycle_capability=resolved.lifecycle_capability,
+                expected_account_hash=record.expected_account_hash,
+                timeout_seconds=min(
+                    DEFAULT_CHATGPT_NATIVE_HISTORY_PROBE_TIMEOUT_SECONDS,
+                    remaining,
+                ),
+            )
+        observation = _sanitize_chatgpt_native_history_probe_observation(result)
+        if observation is None:
+            _set_chatgpt_native_history_probe_failure(
+                event,
+                error_class="ChatGPTNativeHistoryProbeMalformedObservation",
+                telemetry_class="boundary",
+            )
+        else:
+            event["observation"] = observation
+    except Exception as exc:
+        error_class, telemetry_class = _chatgpt_native_history_probe_exception_class(
+            exc
+        )
+        if isinstance(exc, OracleBrowserCleanupError):
+            message = exc.args[0] if len(exc.args) == 1 else None
+            event["cleanup_subreason"] = (
+                _CHATGPT_NATIVE_HISTORY_PROBE_CLEANUP_SUBREASONS.get(
+                    message, "unknown"
+                )
+                if isinstance(message, str)
+                else "unknown"
+            )
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class=error_class,
+            telemetry_class=telemetry_class,
+        )
+    return event
+
+
+def _run_chatgpt_native_history_probe_once(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+) -> int:
+    result = _run_chatgpt_native_history_probe(config, state)
+    _emit_probe_diagnostic_best_effort(result)
+    return _chatgpt_native_history_probe_exit_status(result)
+
+
 def _emit(payload: Dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(payload, sort_keys=True))
     sys.stdout.write("\n")
     sys.stdout.flush()
+
+
+def _emit_probe_diagnostic_best_effort(payload: Dict[str, Any]) -> bool:
+    """Never let a closed diagnostic stream bypass owner supervision."""
+    try:
+        _emit(payload)
+    except (BrokenPipeError, OSError, ValueError):
+        return False
+    return True
 
 
 def _sidecar_refresh_deadline(
@@ -16491,6 +19505,7 @@ def _run_due_managed_refresh_tasks(
     now: float,
     wall_now: Optional[datetime] = None,
 ) -> list[Dict[str, Any]]:
+    _service_pending_chatgpt_oracle_browser_owners(state)
     due_names = {
         name
         for name, deadline in _managed_refresh_deadlines(
@@ -16595,6 +19610,67 @@ def _next_sidecar_wake_delay(
     return max(0.0, next_deadline - now)
 
 
+def _run_explicit_chatgpt_usage_bridge_recovery(
+    config: ProviderStatusLoopConfig,
+    recovery_state: SidecarTaskState,
+) -> Dict[str, Any]:
+    try:
+        recovery_event = _run_chatgpt_usage_bridge_task(
+            config,
+            recovery_state,
+            now_monotonic=time.monotonic(),
+            force=True,
+            account_filter=config.chatgpt_usage_bridge_recovery_account,
+            profile_filter=config.chatgpt_usage_bridge_recovery_profile,
+            authentication_recovery_requested=True,
+        )
+    except Exception as exc:
+        recovery_event = None
+        error = exc
+    else:
+        error = None
+    if recovery_event is not None:
+        return recovery_event
+    if error is None:
+        error_class = "RecoveryNotAttempted"
+        error_message = "explicit recovery action did not run"
+    else:
+        error_class = error.__class__.__name__
+        error_message = _redacted_failure_message(str(error))
+    return {
+        "event": "chatgpt_usage_bridge",
+        "observed_at": _utc_timestamp(),
+        "environment": config.environment,
+        "attempted": True,
+        "ok": False,
+        "coverage_incomplete": True,
+        "history_contract": "unavailable",
+        "authentication_recovery_requested": True,
+        "error_class": error_class,
+        "error_message": error_message,
+    }
+
+
+def _setup_schema_before_loop(config: ProviderStatusLoopConfig) -> bool:
+    if not (config.apply and config.setup_schema):
+        return True
+    try:
+        _emit(setup_schema_once(config))
+    except Exception as exc:
+        _emit(
+            {
+                "event": "provider_status_observations_schema_error",
+                "observed_at": _utc_timestamp(),
+                "environment": config.environment,
+                "error_class": exc.__class__.__name__,
+                "error_message": str(exc),
+                "traceback": traceback.format_exc(limit=5),
+            }
+        )
+        return False
+    return True
+
+
 def _sleep_until_next_sidecar_deadline(
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
@@ -16613,10 +19689,46 @@ def _sleep_until_next_sidecar_deadline(
         wake_delay = sleep_deadline - time.monotonic()
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
+    argv: Optional[Sequence[str]] = None,
+) -> int:
+    native_probe_requested = _chatgpt_native_history_probe_requested(argv)
     try:
-        config = parse_config(argv)
+        config = parse_config(
+            argv,
+            suppress_parser_errors=native_probe_requested,
+        )
+    except SystemExit:
+        if native_probe_requested:
+            _emit_probe_diagnostic_best_effort(
+                {
+                    "event": "chatgpt_native_history_probe",
+                    "observed_at": _utc_timestamp(),
+                    "environment": os.getenv("AAWM_LITELLM_ENVIRONMENT", "dev"),
+                    "attempted": False,
+                    "error_class": (
+                        "ChatGPTNativeHistoryProbeConfigurationInvalid"
+                    ),
+                    "telemetry_class": "configuration",
+                }
+            )
+            return 1
+        raise
     except Exception as exc:
+        if native_probe_requested:
+            _emit_probe_diagnostic_best_effort(
+                {
+                    "event": "chatgpt_native_history_probe",
+                    "observed_at": _utc_timestamp(),
+                    "environment": os.getenv("AAWM_LITELLM_ENVIRONMENT", "dev"),
+                    "attempted": False,
+                    "error_class": (
+                        "ChatGPTNativeHistoryProbeConfigurationInvalid"
+                    ),
+                    "telemetry_class": "configuration",
+                }
+            )
+            return 1
         _emit(
             {
                 "event": "provider_status_observations_config_error",
@@ -16627,6 +19739,109 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             }
         )
         return 1
+    stopping = False
+    sidecar_state: Optional[SidecarTaskState] = None
+
+    native_probe_label = config.chatgpt_native_history_probe_account_label
+
+    def _stop(_signum: int, _frame: object) -> None:
+        nonlocal stopping
+        stopping = True
+        if sidecar_state is not None:
+            _stop_chatgpt_usage_bridge(sidecar_state)
+            if sidecar_state.chatgpt_oracle_browser_shutdown_deadline is None:
+                sidecar_state.chatgpt_oracle_browser_shutdown_deadline = (
+                    time.monotonic()
+                    + DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS
+                )
+            sidecar_state.chatgpt_oracle_browser_owners_stopping = True
+            with sidecar_state.pending_chatgpt_oracle_browser_owners_lock:
+                owners = list(
+                    sidecar_state.pending_chatgpt_oracle_browser_owners.values()
+                )
+            for owner in owners:
+                owner.request_shutdown(
+                    deadline=sidecar_state.chatgpt_oracle_browser_shutdown_deadline
+                )
+
+    if native_probe_label is not None:
+        exit_status = 1
+        drained = True
+        sidecar_state = SidecarTaskState()
+        try:
+            _admit_sidecar_task_state(sidecar_state)
+            signal.signal(signal.SIGINT, _stop)
+            signal.signal(signal.SIGTERM, _stop)
+            exit_status = _run_chatgpt_native_history_probe_once(
+                config,
+                sidecar_state,
+            )
+        except Exception:
+            # The probe event itself uses only fixed classifications. A failure
+            # before it can be emitted must still reach the bounded drain.
+            exit_status = 1
+        finally:
+            fallback_shutdown_deadline = (
+                time.monotonic()
+                + DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS
+            )
+
+            def _probe_shutdown_deadline() -> float:
+                """Re-read the shared cutoff so cancellation can shorten drain."""
+                deadlines = [
+                    deadline
+                    for deadline in (
+                        sidecar_state.chatgpt_native_history_probe_operation_deadline,
+                        sidecar_state.chatgpt_oracle_browser_shutdown_deadline,
+                    )
+                    if deadline is not None
+                ]
+                return min(deadlines) if deadlines else fallback_shutdown_deadline
+
+            try:
+                drained = _drain_pending_chatgpt_oracle_browser_owners(
+                    sidecar_state,
+                    deadline=_probe_shutdown_deadline(),
+                )
+            except Exception:
+                drained = False
+            if not drained:
+                _emit_probe_diagnostic_best_effort(
+                    {
+                        "event": "provider_status_sidecar_task_error",
+                        "observed_at": _utc_timestamp(),
+                        "environment": config.environment,
+                        "task": "chatgpt_oracle_browser_owner_shutdown",
+                        "error_class": "OracleBrowserCleanupError",
+                        "error_message": (
+                            "Retained Oracle browser owners remained after "
+                            "the bounded shutdown drain."
+                        ),
+                    }
+                )
+                # Keep the admitted state alive while an owner remains pending.
+                # Returning here would abandon the only in-memory supervisor.
+                while True:
+                    shutdown_deadline = _probe_shutdown_deadline()
+                    try:
+                        _service_pending_chatgpt_oracle_browser_owners(
+                            sidecar_state,
+                            deadline=shutdown_deadline,
+                        )
+                    except Exception:
+                        pass
+                    with sidecar_state.pending_chatgpt_oracle_browser_owners_lock:
+                        pending = bool(
+                            sidecar_state.pending_chatgpt_oracle_browser_owners
+                        )
+                    if not pending:
+                        drained = True
+                        break
+                    time.sleep(0.1)
+            if drained:
+                _release_sidecar_task_state(sidecar_state)
+        return exit_status or (0 if drained else 1)
+
     try:
         validate_runtime_guardrails(config)
     except Exception as exc:
@@ -16640,34 +19855,110 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             }
         )
         return 1
-    stopping = False
 
-    def _stop(_signum: int, _frame: object) -> None:
-        nonlocal stopping
-        stopping = True
+    if not _setup_schema_before_loop(config) and config.once:
+        return 1
 
+    sidecar_state = SidecarTaskState()
+    _admit_sidecar_task_state(sidecar_state)
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
-
-    if config.apply and config.setup_schema:
+    def _drain_owners(deadline: float) -> bool:
         try:
-            _emit(setup_schema_once(config))
+            if _drain_pending_chatgpt_oracle_browser_owners(
+                sidecar_state,
+                deadline=deadline,
+            ):
+                return True
+            _emit(
+                {
+                    "event": "provider_status_sidecar_task_error",
+                    "observed_at": _utc_timestamp(),
+                    "environment": config.environment,
+                    "task": "chatgpt_oracle_browser_owner_shutdown",
+                    "error_class": "OracleBrowserCleanupError",
+                    "error_message": (
+                        "Retained Oracle browser owners remained after "
+                        "the bounded shutdown drain."
+                    ),
+                }
+            )
+            return False
         except Exception as exc:
             _emit(
                 {
-                    "event": "provider_status_observations_schema_error",
+                    "event": "provider_status_sidecar_task_error",
                     "observed_at": _utc_timestamp(),
                     "environment": config.environment,
+                    "task": "chatgpt_oracle_browser_owner_shutdown",
                     "error_class": exc.__class__.__name__,
-                    "error_message": str(exc),
-                    "traceback": traceback.format_exc(limit=5),
+                    "error_message": _redacted_failure_message(str(exc)),
                 }
             )
-            if config.once:
-                return 1
+            return False
 
-    sidecar_state = SidecarTaskState()
-    while not stopping:
+    def _shutdown_and_wait() -> bool:
+        """Service retained owners under the cutoff captured at cancellation."""
+        if sidecar_state.chatgpt_oracle_browser_shutdown_deadline is None:
+            sidecar_state.chatgpt_oracle_browser_shutdown_deadline = (
+                time.monotonic()
+                + DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS
+            )
+        shutdown_deadline = sidecar_state.chatgpt_oracle_browser_shutdown_deadline
+        drained = _drain_owners(shutdown_deadline)
+        while not drained:
+            _service_pending_chatgpt_oracle_browser_owners(
+                sidecar_state,
+                deadline=shutdown_deadline,
+            )
+            with sidecar_state.pending_chatgpt_oracle_browser_owners_lock:
+                pending = bool(
+                    sidecar_state.pending_chatgpt_oracle_browser_owners
+                )
+            if not pending:
+                drained = True
+                break
+            time.sleep(0.1)
+        _release_sidecar_task_state(sidecar_state)
+        return drained
+
+    try:
+        if config.chatgpt_usage_bridge_recovery_account is not None:
+            recovery_event = _run_explicit_chatgpt_usage_bridge_recovery(
+                config,
+                sidecar_state,
+            )
+            _emit(recovery_event)
+            exit_code = 0 if recovery_event.get("ok") is True else 1
+        else:
+            exit_code = _run_sidecar_loop(
+                config,
+                sidecar_state,
+                should_stop=lambda: stopping,
+            )
+    finally:
+        try:
+            cleanup_errors = _close_chatgpt_usage_bridge(config, sidecar_state)
+        finally:
+            drained = _shutdown_and_wait()
+    if not config.once and config.chatgpt_usage_bridge_recovery_account is None:
+        _emit(
+            {
+                "event": "provider_status_observations_stopped",
+                "observed_at": _utc_timestamp(),
+                "environment": config.environment,
+            }
+        )
+    return 1 if cleanup_errors or not drained else exit_code
+
+
+def _run_sidecar_loop(
+    config: ProviderStatusLoopConfig,
+    sidecar_state: SidecarTaskState,
+    *,
+    should_stop: Callable[[], bool],
+) -> int:
+    while not should_stop():
         now = time.monotonic()
         generic_cycle_deadline = sidecar_state.next_generic_cycle_due_monotonic
         if generic_cycle_deadline is None:
@@ -16686,7 +19977,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _sleep_until_next_sidecar_deadline(
                 config,
                 sidecar_state,
-                should_stop=lambda: stopping,
+                should_stop=should_stop,
             )
             continue
 
@@ -16738,16 +20029,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _sleep_until_next_sidecar_deadline(
             config,
             sidecar_state,
-            should_stop=lambda: stopping,
+            should_stop=should_stop,
         )
 
-    _emit(
-        {
-            "event": "provider_status_observations_stopped",
-            "observed_at": _utc_timestamp(),
-            "environment": config.environment,
-        }
-    )
     return 0
 
 

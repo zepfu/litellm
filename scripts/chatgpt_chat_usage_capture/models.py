@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -82,6 +82,10 @@ class AttemptRecord:
     evidence_message_ids: tuple[str, ...]
     revision: int
     warnings: tuple[str, ...]
+    quarantine: Optional[Mapping[str, Any]] = None
+    source_identity_basis: Optional[str] = None
+    source_time_basis: Optional[str] = None
+    source_outcome: Optional[str] = None
 
 
 @dataclass(frozen=True)
