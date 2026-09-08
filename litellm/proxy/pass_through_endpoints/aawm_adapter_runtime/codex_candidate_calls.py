@@ -1075,6 +1075,7 @@ def _maybe_wrap_xai_passthrough_responses_stream(
     )
     return inherit_or_wrap_passthrough_streaming_response(
         reconstructed,
+        source_response=response,
         request_context=request_context,
     )
 

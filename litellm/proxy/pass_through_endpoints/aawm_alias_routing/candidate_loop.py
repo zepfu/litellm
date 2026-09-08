@@ -55,6 +55,9 @@ from litellm.proxy.aawm_route_logging import (
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.cohere import (
     classify_cohere_failure,
 )
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.deferred_success import (
+    finalize_deferred_success,
+)
 
 from . import codex_oauth as _codex_oauth_mod
 from . import error_signals as _error_signals
@@ -2086,6 +2089,7 @@ async def handle_alias_route(  # noqa: PLR0915
                                 raise
                             intent.complete()
                             alias_routing_state.publication_intents.remove(intent)
+                            await finalize_deferred_success(response)
 
                         async def _complete_deferred_failure(cause):
                             assert intent is not None

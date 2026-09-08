@@ -704,7 +704,9 @@ def inherit_or_wrap_passthrough_streaming_response(
     must be wrapped when the source was guarded.
     """
     from fastapi.responses import StreamingResponse
+    from .deferred_success import inherit_deferred_success_holder
 
+    inherit_deferred_success_holder(response, source_response=source_response)
     if not isinstance(response, StreamingResponse):
         return response
     context = request_context or getattr(response, OUTPUT_GUARD_CONTEXT_ATTR, None)
@@ -736,6 +738,7 @@ def inherit_or_wrap_passthrough_streaming_response(
         status_code=response.status_code,
         media_type=response.media_type or "text/event-stream",
     )
+    inherit_deferred_success_holder(guarded, source_response=response)
     return bind_output_guard_to_streaming_response(
         guarded,
         request_context=context,
