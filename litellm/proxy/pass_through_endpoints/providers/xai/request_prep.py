@@ -51,6 +51,10 @@ from litellm.llms.xai.responses.transformation import (
     XAIResponsesAPIConfig,
     rewrite_codex_agent_message_items_for_xai_responses,
 )
+from litellm.llms.xai.route_descriptors import (
+    XAI_NATIVE_RESPONSES_TOOL_HISTORY_CAPABILITY,
+    has_grok_native_route_capability,
+)
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.secret_managers.main import get_secret_str as _get_secret_str
 from litellm.types.llms.openai import ResponsesAPIOptionalRequestParams
@@ -1219,8 +1223,15 @@ async def _prepare_grok_native_oauth_passthrough_request(
         prepared_body
     )
     _rewrite_codex_agent_message_items_in_place(prepared_body)
-    _sanitize_grok_native_function_call_arguments_in_place(prepared_body)
-    _rewrite_grok_native_unsupported_input_items_in_place(prepared_body)
+    if has_grok_native_route_capability(
+        model, XAI_NATIVE_RESPONSES_TOOL_HISTORY_CAPABILITY
+    ):
+        _anthropic_grok_normalization.preserve_typed_function_history_in_place(
+            prepared_body
+        )
+    else:
+        _sanitize_grok_native_function_call_arguments_in_place(prepared_body)
+        _rewrite_grok_native_unsupported_input_items_in_place(prepared_body)
     _lower_xai_instructions_to_input(prepared_body)
     runtime._sanitize_xai_responses_request_body_in_place(prepared_body)
     (

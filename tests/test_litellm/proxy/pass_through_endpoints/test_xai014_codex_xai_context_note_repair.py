@@ -1,4 +1,4 @@
-"""XAI-014: repair context-note literal calls on Codex xAI response paths."""
+"""XAI-014: reject non-executable history on Codex xAI response paths."""
 
 from __future__ import annotations
 
@@ -98,7 +98,9 @@ def _response_body(*, text: str, model: str) -> dict[str, Any]:
         "output": [
             {
                 "type": "message",
+                "id": "msg_xai014_context_note",
                 "role": "assistant",
+                "status": "completed",
                 "content": [{"type": "output_text", "text": text}],
             }
         ],
@@ -217,7 +219,7 @@ def _function_calls(response_body: dict[str, Any]) -> list[dict[str, Any]]:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["native", "managed"])
 @pytest.mark.parametrize("stream", [False, True])
-async def test_should_repair_repeated_context_note_blocks_on_both_codex_xai_paths(
+async def test_should_reject_repeated_non_executable_notes_on_both_codex_xai_paths(
     route: str,
     stream: bool,
 ) -> None:
@@ -239,34 +241,25 @@ async def test_should_repair_repeated_context_note_blocks_on_both_codex_xai_path
         model=route_config["prepared_model"],
     )
 
-    result = await _invoke_codex_xai_route(
-        route,
-        request_body=request_body,
-        response_body=response_body,
-        stream=stream,
-    )
-    repaired = await _response_body_from_result(result)
+    original_response = deepcopy(response_body)
+    with pytest.raises(ProxyException) as exc_info:
+        result = await _invoke_codex_xai_route(
+            route,
+            request_body=request_body,
+            response_body=response_body,
+            stream=stream,
+        )
+        await _response_body_from_result(result)
 
-    rendered = json.dumps(repaired)
-    assert "Context note" not in rendered
-    assert "Tool label:" not in rendered
-    assert "Correlation ref:" not in rendered
-    assert "Input payload:" not in rendered
-    calls = _function_calls(repaired)
-    assert len(calls) == 3
-    assert calls[0]["call_id"] == repeated_ref
-    assert calls[1]["call_id"].endswith("_repaired_1")
-    assert calls[2]["call_id"].endswith("_repaired_2")
-    assert [json.loads(call["arguments"])["cmd"] for call in calls] == [
-        "pwd",
-        "git status --short",
-        "git diff --check",
-    ]
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_auto_agent_malformed_tool_call_text"
+    )
+    assert response_body == original_response
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["native", "managed"])
-async def test_should_preserve_interleaved_structured_calls_and_surrounding_text(
+async def test_should_reject_non_executable_notes_alongside_structured_calls(
     route: str,
 ) -> None:
     route_config = _ROUTES[route]
@@ -298,33 +291,23 @@ async def test_should_preserve_interleaved_structured_calls_and_surrounding_text
     )
     response_body["output"] = [before_call, *response_body["output"], after_call]
 
-    result = await _invoke_codex_xai_route(
-        route,
-        request_body=_request_body(
+    original_response = deepcopy(response_body)
+    with pytest.raises(ProxyException) as exc_info:
+        await _invoke_codex_xai_route(
+            route,
+            request_body=_request_body(
+                stream=False,
+                model=route_config["request_model"],
+            ),
+            response_body=response_body,
             stream=False,
-            model=route_config["request_model"],
-        ),
-        response_body=response_body,
-        stream=False,
-    )
-    repaired = await _response_body_from_result(result)
+        )
 
-    rendered = json.dumps(repaired)
-    assert rendered.count("Before the repaired call.") == 1
-    assert rendered.count("After the repaired call.") == 1
-    assert "Context note" not in rendered
-    assert "Tool label:" not in rendered
-    calls = _function_calls(repaired)
-    assert [call["call_id"] for call in calls] == [
-        "call_xai014_before",
-        "synthetic-xai014-interleaved-ref",
-        "call_xai014_after",
-    ]
-    assert [json.loads(call["arguments"])["cmd"] for call in calls] == [
-        "printf before",
-        "printf repaired",
-        "printf after",
-    ]
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_auto_agent_malformed_tool_call_text"
+    )
+    assert response_body == original_response
+    assert _function_calls(response_body) == [before_call, after_call]
 
 
 @pytest.mark.asyncio
