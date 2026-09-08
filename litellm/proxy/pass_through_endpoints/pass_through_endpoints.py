@@ -6983,9 +6983,7 @@ def create_pass_through_route(
             param_expected_target_family = target_params.get(
                 "expected_target_family", expected_target_family
             )
-            param_managed_xai_oauth_request = target_params.get(
-                "managed_xai_oauth_request", managed_xai_oauth_request
-            )
+            param_managed_xai_oauth_request = managed_xai_oauth_request
             param_allowed_forward_headers = target_params.get(
                 "allowed_forward_headers", allowed_forward_headers
             )
