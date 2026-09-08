@@ -68,6 +68,9 @@ _CODEX_OAUTH_AFFINITY_TOKEN_ISSUER = "litellm.aawm.codex_oauth"
 _CODEX_OAUTH_AFFINITY_TOKEN_AUDIENCE = "litellm.codex_oauth.affinity"
 _CODEX_OAUTH_AFFINITY_TOKEN_TTL_SECONDS = 15 * 60
 _CODEX_OAUTH_AFFINITY_TOKEN_ACCOUNT_REF_CLAIM = "account_ref"
+_CODEX_OAUTH_AFFINITY_CONTINUATION_STATE_ATTR = (
+    "aawm_codex_oauth_affinity_continuation"
+)
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -201,6 +204,23 @@ class CodexOAuthRequestAuth:
     lane_key: str
     headers: dict[str, str] = field(repr=False)
     account_display: str = CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY
+
+
+@dataclass(frozen=True)
+class CodexOAuthAffinityContinuation:
+    """Request-local authenticated continuation state without the raw token."""
+
+    declared: bool
+    invalid: bool
+    token_digest: Optional[str]
+    model: str
+    session_identity: Optional[str]
+    affinity_items: tuple[tuple[str, Any], ...] = ()
+
+    def as_affinity(self) -> Optional[dict[str, Any]]:
+        if self.invalid or not self.affinity_items:
+            return None
+        return dict(self.affinity_items)
 
 
 def _codex_oauth_account_lane_key(
@@ -909,19 +929,33 @@ def _codex_oauth_affinity_token_request_state(
     """
     values: list[str] = []
     malformed = False
-    containers: list[dict[str, Any]] = [body]
-    metadata = body.get("litellm_metadata")
-    if isinstance(metadata, dict):
-        containers.append(metadata)
-    for container in containers:
-        if _CODEX_OAUTH_AFFINITY_TOKEN_BODY_KEY not in container:
-            continue
-        raw_token = container.get(_CODEX_OAUTH_AFFINITY_TOKEN_BODY_KEY)
-        cleaned_token = _clean_codex_auth_value(raw_token)
-        if cleaned_token is None:
-            malformed = True
-            continue
-        values.append(cleaned_token)
+    seen: set[int] = set()
+
+    def _visit(value: Any) -> None:
+        nonlocal malformed
+        if isinstance(value, dict):
+            marker = id(value)
+            if marker in seen:
+                return
+            seen.add(marker)
+            if _CODEX_OAUTH_AFFINITY_TOKEN_BODY_KEY in value:
+                raw_token = value.get(_CODEX_OAUTH_AFFINITY_TOKEN_BODY_KEY)
+                cleaned_token = _clean_codex_auth_value(raw_token)
+                if cleaned_token is None:
+                    malformed = True
+                else:
+                    values.append(cleaned_token)
+            for nested in value.values():
+                _visit(nested)
+        elif isinstance(value, list):
+            marker = id(value)
+            if marker in seen:
+                return
+            seen.add(marker)
+            for nested in value:
+                _visit(nested)
+
+    _visit(body)
     if not values:
         return None, malformed
     if malformed or any(value != values[0] for value in values[1:]):
@@ -942,10 +976,237 @@ def _remove_codex_oauth_affinity_token_from_body(
     body: dict[str, Any],
 ) -> None:
     """Keep internal continuation state out of the provider wire body."""
-    body.pop(_CODEX_OAUTH_AFFINITY_TOKEN_BODY_KEY, None)
-    metadata = body.get("litellm_metadata")
-    if isinstance(metadata, dict):
-        metadata.pop(_CODEX_OAUTH_AFFINITY_TOKEN_BODY_KEY, None)
+    seen: set[int] = set()
+
+    def _visit(value: Any) -> None:
+        if isinstance(value, dict):
+            marker = id(value)
+            if marker in seen:
+                return
+            seen.add(marker)
+            value.pop(_CODEX_OAUTH_AFFINITY_TOKEN_BODY_KEY, None)
+            for nested in value.values():
+                _visit(nested)
+        elif isinstance(value, list):
+            marker = id(value)
+            if marker in seen:
+                return
+            seen.add(marker)
+            for nested in value:
+                _visit(nested)
+
+    _visit(body)
+
+
+def _codex_oauth_affinity_token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _codex_oauth_affinity_token_invalid_exception(
+    *,
+    message: str = (
+        "Codex OAuth continuation affinity state is invalid, expired, "
+        "or unavailable."
+    ),
+) -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail={
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": "aawm_codex_oauth_affinity_token_invalid",
+            },
+            "failure_phase": "authenticated_continuation_validation",
+            "attempted_provider_call": False,
+            "alternate_accounts_considered": False,
+            "continuation_portable": False,
+        },
+    )
+
+
+def _codex_oauth_affinity_conflicts(
+    left: Optional[Mapping[str, Any]],
+    right: Optional[Mapping[str, Any]],
+) -> bool:
+    """Return whether two server-derived affinity scopes disagree."""
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        return False
+
+    for scope_field in ("provider", "model"):
+        left_value = _clean_codex_auth_value(left.get(scope_field))
+        right_value = _clean_codex_auth_value(right.get(scope_field))
+        if left_value and right_value and left_value != right_value:
+            return True
+
+    left_route = _clean_codex_auth_value(left.get("route_family"))
+    right_route = _clean_codex_auth_value(right.get("route_family"))
+    codex_routes = {
+        "codex_oauth",
+        "codex_responses",
+        "openai_responses",
+    }
+    if (
+        left_route
+        and right_route
+        and (
+            left_route not in codex_routes
+            or right_route not in codex_routes
+            or left_route != right_route
+        )
+    ):
+        return True
+
+    for identity_field in (
+        "codex_oauth_account_label",
+        "codex_oauth_account_hash",
+        "codex_oauth_lane_key",
+    ):
+        left_value = _clean_codex_auth_value(left.get(identity_field))
+        right_value = _clean_codex_auth_value(right.get(identity_field))
+        if left_value and right_value and left_value != right_value:
+            return True
+    return False
+
+
+def _codex_oauth_affinity_selection_reason(
+    affinity: Optional[Mapping[str, Any]],
+) -> Optional[str]:
+    if not isinstance(affinity, Mapping):
+        return None
+    source = affinity.get("affinity_state_source")
+    if source == "session_owner":
+        return "session_owner_pin"
+    if source == "authenticated_continuation_token":
+        return "authenticated_continuation_token_pin"
+    return None
+
+
+def _get_codex_oauth_affinity_continuation_state(
+    request: Request,
+    *,
+    body: dict[str, Any],
+    model: str,
+    session_identity: Optional[str],
+) -> CodexOAuthAffinityContinuation:
+    """Validate once and retain immutable server state across retries."""
+    token, token_declared = _codex_oauth_affinity_token_request_state(body=body)
+    _remove_codex_oauth_affinity_token_from_body(body)
+    normalized_model = _clean_codex_auth_value(model) or ""
+    normalized_session = _clean_codex_auth_value(session_identity)
+    existing = getattr(
+        request.state,
+        _CODEX_OAUTH_AFFINITY_CONTINUATION_STATE_ATTR,
+        None,
+    )
+    token_digest = (
+        _codex_oauth_affinity_token_digest(token)
+        if token is not None
+        else None
+    )
+
+    if isinstance(existing, CodexOAuthAffinityContinuation):
+        if existing.invalid:
+            return existing
+        if (
+            existing.model != normalized_model
+            or existing.session_identity != normalized_session
+            or (
+                token_declared
+                and existing.token_digest != token_digest
+            )
+        ):
+            invalid = CodexOAuthAffinityContinuation(
+                declared=existing.declared or token_declared,
+                invalid=True,
+                token_digest=token_digest or existing.token_digest,
+                model=normalized_model,
+                session_identity=normalized_session,
+            )
+            setattr(
+                request.state,
+                _CODEX_OAUTH_AFFINITY_CONTINUATION_STATE_ATTR,
+                invalid,
+            )
+            return invalid
+        return existing
+
+    if not token_declared:
+        state = CodexOAuthAffinityContinuation(
+            declared=False,
+            invalid=False,
+            token_digest=None,
+            model=normalized_model,
+            session_identity=normalized_session,
+        )
+    else:
+        affinity = _codex_oauth_affinity_from_authenticated_token(
+            token=token,
+            model=normalized_model,
+            session_identity=normalized_session,
+        )
+        state = CodexOAuthAffinityContinuation(
+            declared=True,
+            invalid=affinity is None,
+            token_digest=token_digest,
+            model=normalized_model,
+            session_identity=normalized_session,
+            affinity_items=(
+                tuple(sorted(affinity.items())) if affinity is not None else ()
+            ),
+        )
+    setattr(
+        request.state,
+        _CODEX_OAUTH_AFFINITY_CONTINUATION_STATE_ATTR,
+        state,
+    )
+    return state
+
+
+def _redact_codex_oauth_account_diagnostics(
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Remove account identity from client-visible selection diagnostics."""
+    redacted: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        shaped = dict(candidate)
+        for identity_field in (
+            "account",
+            "account_label",
+            "account_hash",
+            "account_lane",
+            "account_display",
+            "lane_key",
+        ):
+            shaped.pop(identity_field, None)
+        redacted.append(shaped)
+    return redacted
+
+
+def _redact_codex_oauth_terminal_reset(
+    terminal_reset: Any,
+) -> Optional[dict[str, Any]]:
+    """Keep reset evidence while omitting exhausted-account identities."""
+    if not isinstance(terminal_reset, dict):
+        return None
+    redacted = {
+        key: value for key, value in terminal_reset.items() if key != "accounts"
+    }
+    accounts = terminal_reset.get("accounts")
+    if isinstance(accounts, list):
+        redacted_accounts: list[dict[str, Any]] = []
+        for account in accounts:
+            if not isinstance(account, dict):
+                continue
+            shaped = dict(account)
+            for field in ("account_label", "account_hash", "account_lane"):
+                shaped.pop(field, None)
+            redacted_accounts.append(shaped)
+        if redacted_accounts:
+            redacted["accounts"] = redacted_accounts
+    return redacted
 
 
 def _codex_oauth_affinity_signing_key() -> Optional[str]:
@@ -1128,9 +1389,13 @@ def _codex_oauth_affinity_from_authenticated_token(
     )
     if not all((token_model, token_session, account_ref)):
         return None
-    if token_session != _clean_codex_auth_value(session_identity):
+    request_model = _clean_codex_auth_value(model)
+    request_session = _clean_codex_auth_value(session_identity)
+    if request_model is None or request_session is None:
         return None
-    if model and token_model != model:
+    if token_session != request_session:
+        return None
+    if token_model != request_model:
         return None
     if len(account_ref) != hashlib.sha256().digest_size * 2:
         return None
@@ -1290,7 +1555,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         _safe_set_request_parsed_body,
     )
 
-    body = dict(request_body) if isinstance(request_body, dict) else {}
+    body = request_body if isinstance(request_body, dict) else {}
     explicit_model = _clean_codex_auth_value(body.get("model"))
     native_auth = _request_uses_codex_native_auth(request)
     if explicit_model is not None:
@@ -1350,66 +1615,45 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             }
         )
 
-    affinity: Optional[dict[str, Any]] = None
     session_identity = _sa.resolve_canonical_session_identity(request, body)
+    continuation = _get_codex_oauth_affinity_continuation_state(
+        request,
+        body=body,
+        model=model,
+        session_identity=session_identity,
+    )
+    if continuation.invalid:
+        raise _codex_oauth_affinity_token_invalid_exception()
+    token_affinity = continuation.as_affinity()
+    affinity: Optional[dict[str, Any]] = None
     if session_identity is not None:
         owner_record, _cache_key, owner_error = await _sa.get_session_owner_record(
             session_identity=session_identity,
         )
         if owner_error is None and isinstance(owner_record, dict):
-            affinity = _direct_codex_oauth_affinity_from_session_owner(
+            owner_affinity = _direct_codex_oauth_affinity_from_session_owner(
                 _sa.owner_record_as_affinity_hint(
                     owner_record,
                     preserve_account_identity=True,
                 ),
                 model=model,
             )
-
-    token, token_declared = _codex_oauth_affinity_token_request_state(body=body)
-    # Internal continuation state is never part of the provider wire body,
-    # regardless of whether durable ownership wins over token affinity.
-    _remove_codex_oauth_affinity_token_from_body(body)
-
-    # Only a server-authenticated continuation token may pin when no owner
-    # pin exists. A declared but malformed, tampered, expired, mixed, or
-    # cross-scope token fails closed rather than falling through to fresh
-    # account selection. Raw caller account labels, hashes, and lanes remain
-    # ignored.
-    if affinity is None:
-        if token_declared:
-            affinity = _codex_oauth_affinity_from_authenticated_token(
-                token=token,
-                model=model,
-                session_identity=session_identity,
-            )
-            if affinity is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "error": {
-                            "message": (
-                                "Codex OAuth continuation affinity state is "
-                                "invalid, expired, or unavailable."
-                            ),
-                            "type": "invalid_request_error",
-                            "code": "aawm_codex_oauth_affinity_token_invalid",
-                        },
-                        "failure_phase": "authenticated_continuation_validation",
-                        "attempted_provider_call": False,
-                        "alternate_accounts_considered": False,
-                        "continuation_portable": False,
-                    },
+            if _codex_oauth_affinity_conflicts(owner_affinity, token_affinity):
+                raise _codex_oauth_affinity_token_invalid_exception(
+                    message=(
+                        "Codex OAuth continuation affinity state conflicts "
+                        "with durable session ownership."
+                    )
                 )
+            affinity = owner_affinity
+    if affinity is None:
+        affinity = token_affinity
 
     affinity_selection_reason: Optional[str] = None
     if affinity is not None:
-        if affinity.get("affinity_state_source") == "session_owner":
-            affinity_selection_reason = "session_owner_pin"
-        elif (
-            affinity.get("affinity_state_source")
-            == "authenticated_continuation_token"
-        ):
-            affinity_selection_reason = "authenticated_continuation_token_pin"
+        affinity_selection_reason = _codex_oauth_affinity_selection_reason(
+            affinity
+        )
 
     if inventory_model is None and affinity is None:
         # Model-less native path: reuse inventory model=None eligibility
@@ -1461,6 +1705,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             if state.get("cooldown_state_source") != "normalized_quota_observation":
                 state["cooldown_state_source"] = "direct_concrete_bypass"
     skipped = _selection._build_auto_agent_skipped_candidates_from_states(states)
+    diagnostic_skipped = _redact_codex_oauth_account_diagnostics(skipped)
 
     selected_state = _selection._select_first_available_codex_oauth_account_state(
         states
@@ -1491,7 +1736,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 "type": "rate_limit_error",
                 "code": "aawm_codex_oauth_direct_inventory_unavailable",
             },
-            "skipped_candidates": skipped,
+            "skipped_candidates": diagnostic_skipped,
             "attempted_provider_call": False,
             "failure_phase": "direct_inventory_selection",
         }
@@ -1500,7 +1745,11 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 _selection._build_codex_oauth_terminal_reset_information(states)
             )
             if terminal_reset is not None:
-                detail["terminal_reset"] = terminal_reset
+                redacted_terminal_reset = _redact_codex_oauth_terminal_reset(
+                    terminal_reset
+                )
+                if redacted_terminal_reset is not None:
+                    detail["terminal_reset"] = redacted_terminal_reset
             detail.update(
                 {
                     "selection_reason": affinity_selection_reason,
