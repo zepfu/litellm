@@ -271,6 +271,28 @@ def _record_adapted_completed_route_rollup_after_stream(
     *,
     adapter_label: str,
 ) -> StreamingResponse:
+    wire_trace = getattr(response, "wire_trace", None)
+    if wire_trace is not None and getattr(
+        response, "_aawm_responses_wire_coordinator_installed", False
+    ):
+        async def _record_delivered_completion(snapshot: dict[str, Any]) -> None:
+            validation_state = getattr(
+                response, "_aawm_responses_validation_state", None
+            )
+            if (
+                snapshot.get("disposition") == "completed"
+                and snapshot.get("terminal_sent")
+                and isinstance(validation_state, dict)
+                and validation_state.get("complete")
+                and validation_state.get("valid")
+            ):
+                _record_adapted_completed_route_rollup_turn(
+                    rollup_kwargs, adapter_label=adapter_label
+                )
+
+        wire_trace.register_post_finalization_callback(_record_delivered_completion)
+        return response
+
     original_iterator = response.body_iterator
     recorded = False
 

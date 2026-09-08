@@ -99,9 +99,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         # Provider tool/call_id -> Responses function_call item id (fc_*).
         self._tool_item_id_by_call_id: dict[str, str] = {}
         self._ambiguous_tool_call_indexes: set[int] = set()
-        self._next_tool_output_index: int = (
-            1  # output_index=0 reserved for the message item
-        )
+        self._next_tool_output_index: int = 0
         self._message_output_index: Optional[int] = None
         self._reasoning_output_index: Optional[int] = None
         self._message_output_item_added = False
@@ -1605,6 +1603,26 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                 for item in responses_api_response.output:
                     if getattr(item, "type", None) == "reasoning":
                         item.id = self._cached_reasoning_item_id
+
+            def terminal_output_order(item: Any) -> tuple[int, int]:
+                item_type = getattr(item, "type", None)
+                if item_type == "message":
+                    return (0, self._get_or_assign_message_output_index())
+                if item_type == "reasoning":
+                    return (0, self._get_or_assign_reasoning_output_index())
+                if item_type == "function_call":
+                    return (
+                        0,
+                        self._get_or_assign_tool_output_index(item.call_id),
+                    )
+                if item_type == "code_interpreter_call":
+                    index = self._tool_output_index_by_call_id.get(item.id)
+                    if index is not None:
+                        return (0, index)
+                return (1, 0)
+
+            # The converter groups by type; the wire indexes follow arrival order.
+            responses_api_response.output.sort(key=terminal_output_order)
 
             # Use the cached response ID to ensure consistency across all events
             if self._cached_response_id:

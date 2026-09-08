@@ -442,6 +442,13 @@ streaming response has been handed to the client, midstream failures remain
 terminal for that stream and are recorded through the streaming error context
 path instead of replaying the request.
 
+Adapted Responses streams validate successful terminal payloads before sending
+them. After HTTP headers are committed, a rejected terminal becomes a
+`response.failed` event followed by `[DONE]`, not an HTTP exception or a retry.
+The rejected success terminal is not forwarded or counted as a completed turn.
+Tool-only chat completions with absent message text retain their tool calls
+without inventing a message containing `output_text.text: null`.
+
 Post-first-byte upstream read timeouts also emit an explicit terminal stream
 event to the client after any bytes already forwarded. The proxy preserves the
 partial stream, appends a route-family-specific terminal failure chunk, and does

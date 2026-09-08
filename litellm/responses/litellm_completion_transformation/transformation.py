@@ -2151,7 +2151,7 @@ class LiteLLMCompletionResponsesConfig:
                     choice=choice,
                 )
                 message_output_items.extend(image_generation_items)
-            else:
+            elif choice.message.content is not None:
                 # Regular message output
                 message_output_items.append(
                     GenericResponseOutputItem(

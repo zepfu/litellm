@@ -190,6 +190,7 @@ class OpenAIResponsesWireTrace:
             "policy_failure_kind": self.metadata.get("policy_failure_kind"),
             "policy_failure_code": self.metadata.get("policy_failure_code"),
             "policy_failure_class": self.metadata.get("policy_failure_class"),
+            "validation_failure_code": self.metadata.get("validation_failure_code"),
         }
 
     def record_policy_failure(
@@ -520,6 +521,8 @@ def _split_sse_blocks(value: bytes) -> tuple[list[bytes], bytes]:
 
 def _parse_sse_block(
     block: bytes,
+    *,
+    allow_response_done: bool = False,
 ) -> tuple[Optional[str], Optional[dict], bool, bool]:
     """Parse one complete SSE block and flag invalid Responses framing.
 
@@ -596,11 +599,12 @@ def _parse_sse_block(
     if saw_done and event_type is not None:
         malformed = True
 
-    if event_type in {
-        "response.completed",
-        "response.failed",
-        "response.incomplete",
-    } and _terminal_disposition(event_type, payload) is None:
+    if (
+        event_type in {"response.completed", "response.failed", "response.incomplete"}
+        or (allow_response_done and event_type == "response.done")
+    ) and _terminal_disposition(
+        event_type, payload, allow_response_done=allow_response_done
+    ) is None:
         malformed = True
 
     return event_type, payload, saw_done, malformed
@@ -648,6 +652,8 @@ def _remove_done_lines(block: bytes) -> tuple[bytes, bool]:
 def _terminal_disposition(
     event_type: Optional[str],
     payload: Optional[dict],
+    *,
+    allow_response_done: bool = False,
 ) -> Optional[OpenAIResponsesWireDisposition]:
     if not isinstance(payload, dict):
         return None
@@ -661,6 +667,8 @@ def _terminal_disposition(
     effective_event_type = event_type or (
         payload_type.strip() if isinstance(payload_type, str) else None
     )
+    if allow_response_done and effective_event_type == "response.done":
+        effective_event_type = "response.completed"
     if effective_event_type not in {
         "response.completed",
         "response.failed",
@@ -725,6 +733,7 @@ class OpenAIResponsesWireCoordinator:
         pre_terminal_validation: Optional[PreTerminalValidationCallback] = None,
         trace: Optional[OpenAIResponsesWireTrace] = None,
         model: Optional[str] = None,
+        allow_response_done: bool = False,
     ) -> None:
         self._source = source
         self._upstream_response = upstream_response
@@ -732,6 +741,7 @@ class OpenAIResponsesWireCoordinator:
         self._pre_terminal_validation = pre_terminal_validation
         self.trace = trace or OpenAIResponsesWireTrace()
         self._model = model
+        self._allow_response_done = allow_response_done
         self._buffer = b""
         self._closed = False
         self._source_iterator: Optional[AsyncIterator[bytes]] = None
@@ -867,12 +877,22 @@ class OpenAIResponsesWireCoordinator:
             async for raw_chunk in self._source_iterator:
                 if not raw_chunk:
                     continue
-                self._buffer += bytes(raw_chunk)
+                self._buffer += (
+                    raw_chunk.encode("utf-8")
+                    if isinstance(raw_chunk, str)
+                    else bytes(raw_chunk)
+                )
                 blocks, self._buffer = _split_sse_blocks(self._buffer)
                 for block in blocks:
-                    event_type, payload, saw_done, malformed = _parse_sse_block(block)
+                    event_type, payload, saw_done, malformed = _parse_sse_block(
+                        block, allow_response_done=self._allow_response_done
+                    )
                     if self.trace.terminal_selected:
-                        if _terminal_disposition(event_type, payload) is not None:
+                        if _terminal_disposition(
+                            event_type,
+                            payload,
+                            allow_response_done=self._allow_response_done,
+                        ) is not None:
                             self.trace.duplicate_terminal_suppressed += 1
                         if saw_done:
                             self.trace.upstream_done_suppressed += 1
@@ -885,7 +905,11 @@ class OpenAIResponsesWireCoordinator:
                         ):
                             yield emitted
                         return
-                    disposition = _terminal_disposition(event_type, payload)
+                    disposition = _terminal_disposition(
+                        event_type,
+                        payload,
+                        allow_response_done=self._allow_response_done,
+                    )
                     if disposition is not None:
                         self.trace.record_policy_failure_from_payload(payload)
                         if saw_done:
@@ -1005,6 +1029,16 @@ class OpenAIResponsesWireCoordinator:
             policy_failure_recorded = (
                 self.trace.record_policy_failure_from_exception(exc)
             )
+            detail = getattr(exc, "detail", None)
+            error = detail.get("error") if isinstance(detail, dict) else None
+            validation_failure_code = (
+                "aawm_auto_agent_invalid_responses_shape"
+                if isinstance(error, dict)
+                and error.get("code") == "aawm_auto_agent_invalid_responses_shape"
+                else None
+            )
+            if validation_failure_code is not None:
+                self.trace.metadata["validation_failure_code"] = validation_failure_code
             if self.trace.terminal_selected:
                 await self.finalize_transport(OpenAIResponsesWireDisposition.FAILED)
                 return
@@ -1015,7 +1049,7 @@ class OpenAIResponsesWireCoordinator:
                         self.trace.metadata.get("policy_failure_code")
                         or self.trace.metadata.get("policy_failure_kind")
                         if policy_failure_recorded
-                        else "openai_responses_wire_source_error"
+                        else validation_failure_code or "openai_responses_wire_source_error"
                     ),
                 ):
                     yield emitted
@@ -1208,6 +1242,7 @@ def wrap_openai_responses_stream(
     pre_terminal_validation: Optional[PreTerminalValidationCallback] = None,
     trace: Optional[OpenAIResponsesWireTrace] = None,
     model: Optional[str] = None,
+    allow_response_done: bool = False,
 ) -> tuple[AsyncIterator[bytes], OpenAIResponsesWireTrace]:
     """Wrap a processed stream and return its iterator plus lifecycle trace."""
 
@@ -1219,6 +1254,7 @@ def wrap_openai_responses_stream(
         pre_terminal_validation=pre_terminal_validation,
         trace=trace,
         model=model,
+        allow_response_done=allow_response_done,
     )
     trace._finalize_transport = coordinator.finalize_transport
     trace._finalize_prefetch_abort = coordinator.finalize_prefetch_abort
