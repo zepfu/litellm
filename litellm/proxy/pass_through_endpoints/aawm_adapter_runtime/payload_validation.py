@@ -1447,6 +1447,11 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             0,
             int(_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES),  # noqa: F821
         )
+        # The stream peek bound limits retained upstream history, not the
+        # size of one valid SSE event. Keep a separate bounded parser budget so
+        # a large output-text delta does not turn an otherwise valid stream
+        # into a malformed response merely because peeking stopped early.
+        max_event_buffered_bytes = max(max_buffered_bytes, 8 * 1024 * 1024)
         terminal_event_types = frozenset(
             {
                 "response.completed",
@@ -1527,7 +1532,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 delimiter_index = normalized.find("\n\n")
                 if delimiter_index < 0:
                     candidate = sse_buffer + normalized
-                    if len(candidate.encode("utf-8")) > max_buffered_bytes:
+                    if len(candidate.encode("utf-8")) > max_event_buffered_bytes:
                         buffer_limit_exceeded = True
                         sse_buffer = ""
                         _invalidate_stream(target, state, "byte_limit")
@@ -1537,7 +1542,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                     continue
                 event_fragment = normalized[:delimiter_index]
                 candidate = sse_buffer + event_fragment
-                if len(candidate.encode("utf-8")) > max_buffered_bytes:
+                if len(candidate.encode("utf-8")) > max_event_buffered_bytes:
                     buffer_limit_exceeded = True
                     sse_buffer = ""
                     _invalidate_stream(target, state, "byte_limit")
@@ -1549,7 +1554,10 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             if final:
                 if trailing_cr:
                     trailing_cr = False
-                    if len((sse_buffer + "\n").encode("utf-8")) > max_buffered_bytes:
+                    if (
+                        len((sse_buffer + "\n").encode("utf-8"))
+                        > max_event_buffered_bytes
+                    ):
                         buffer_limit_exceeded = True
                         sse_buffer = ""
                         _invalidate_stream(target, state, "byte_limit")

@@ -368,6 +368,7 @@ class TestValidateSerializesFunctionCallIdentityRepair:
         expected_item_id, _ = resolve_responses_function_call_identity(call_id)
         body = {
             "id": "resp_identity",
+            "object": "response",
             "status": "completed",
             "output": [
                 {

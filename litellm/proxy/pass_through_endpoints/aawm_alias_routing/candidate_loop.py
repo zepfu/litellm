@@ -256,6 +256,16 @@ _IN_FLIGHT_REDISPATCH_ERROR_CODES = frozenset(
         "aawm_anthropic_auto_agent_in_flight_provider_cooling_down",
     }
 )
+_TYPED_REDISPATCH_ERROR_CODES = frozenset(
+    {
+        "aawm_codex_auto_agent_redispatch_required",
+        "aawm_anthropic_auto_agent_redispatch_required",
+        "aawm_session_owner_redispatch_required",
+    }
+)
+_SUPPORTED_REDISPATCH_ERROR_CODES = (
+    _IN_FLIGHT_REDISPATCH_ERROR_CODES | _TYPED_REDISPATCH_ERROR_CODES
+)
 _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER = (
     "_cursor_session_continuation_failure"
 )
@@ -383,6 +393,24 @@ def _extract_cursor_sanitized_proto_structure(
     return {"fields": copied_fields}
 
 
+def _redispatch_error_codes(
+    exc: Exception,
+    detail_mapping: Mapping[str, Any],
+) -> set[str]:
+    detail_error = detail_mapping.get("error")
+    detail_error = detail_error if isinstance(detail_error, Mapping) else {}
+    return {
+        str(value)
+        for value in (
+            detail_error.get("code"),
+            detail_mapping.get("error_code"),
+            getattr(exc, "error_code", None),
+            getattr(exc, "code", None),
+        )
+        if value is not None
+    }
+
+
 def _validated_redispatch_terminal_metadata(
     exc: Exception,
     *,
@@ -393,20 +421,9 @@ def _validated_redispatch_terminal_metadata(
     detail_mapping = detail if isinstance(detail, Mapping) else {}
     detail_error = detail_mapping.get("error")
     detail_error = detail_error if isinstance(detail_error, Mapping) else {}
-    redispatch_error_codes = {
-        str(value)
-        for value in (
-            detail_error.get("code"),
-            detail_mapping.get("error_code"),
-            getattr(exc, "error_code", None),
-            getattr(exc, "code", None),
-        )
-        if value is not None
-    }
+    redispatch_error_codes = _redispatch_error_codes(exc, detail_mapping)
     if not (
-        getattr(exc, "redispatch_required", None) is True
-        or detail_mapping.get("redispatch_required") is True
-        or bool(redispatch_error_codes & _IN_FLIGHT_REDISPATCH_ERROR_CODES)
+        bool(redispatch_error_codes & _SUPPORTED_REDISPATCH_ERROR_CODES)
     ):
         return None
 
@@ -1523,13 +1540,16 @@ async def handle_alias_route(  # noqa: PLR0915
                 if isinstance(selection_error, dict)
                 else None
             )
+            selection_error_codes = _redispatch_error_codes(exc, selection_detail)
             if (
                 exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS
                 and (
                     getattr(exc, "redispatch_required", None) is True
                     or selection_detail.get("redispatch_required") is True
                 )
-                and selection_error_code not in _IN_FLIGHT_REDISPATCH_ERROR_CODES
+                and not (
+                    selection_error_codes & _SUPPORTED_REDISPATCH_ERROR_CODES
+                )
             ):
                 raise
             if _emit_validated_redispatch_terminal_event(
@@ -2347,8 +2367,13 @@ async def handle_alias_route(  # noqa: PLR0915
                         break
                     if probe_failure_exc is None:
                         if deferred_session_owner_stream:
-                            # The response-owned finalizer completes the
-                            # publication intent after validated EOF.
+                            # Release single-flight coordination as soon as
+                            # provider response acceptance succeeds. Ownership
+                            # promotion and authoritative success callbacks
+                            # remain deferred until the stream finalizer has
+                            # validated the complete response.
+                            intent.complete()
+                            alias_routing_state.publication_intents.remove(intent)
                             return response
                         else:
                             await _commit_candidate_success()

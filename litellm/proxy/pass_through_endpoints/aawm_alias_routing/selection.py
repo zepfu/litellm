@@ -4882,7 +4882,11 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         affinity,
         account_bound=account_identity_pinned,
     )
-    if provider_owned_continuation and affinity is None:
+    if (
+        provider_owned_continuation
+        and affinity is None
+        and not (is_auto_review and replay_safe)
+    ):
         owner_state = (
             sa._record_state(session_owner_record)
             if isinstance(session_owner_record, dict)

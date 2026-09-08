@@ -352,7 +352,7 @@ async def test_candidate_loop_records_in_flight_pinned_cooldown_without_no_candi
 
 
 @pytest.mark.asyncio
-async def test_candidate_loop_other_redispatch_429_emits_no_terminal_event(
+async def test_candidate_loop_typed_redispatch_429_emits_terminal_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = Request(
@@ -437,7 +437,11 @@ async def test_candidate_loop_other_redispatch_429_emits_no_terminal_event(
     assert caught.value is original_exc
     assert caught.value.detail is detail
     assert caught.value.headers == {"Retry-After": "3"}
-    assert pinned_events == []
+    assert len(pinned_events) == 1
+    assert pinned_events[0]["event_type"] == "redispatch_required"
+    assert pinned_events[0]["candidate_status"] == "redispatch_required"
+    assert pinned_events[0]["redispatch_required"] is True
+    assert pinned_events[0]["attempts"] == []
     assert no_candidate_events == []
 
 

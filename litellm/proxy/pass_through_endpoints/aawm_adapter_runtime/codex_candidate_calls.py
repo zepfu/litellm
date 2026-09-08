@@ -3728,7 +3728,16 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
     elif isinstance(exc, CursorConnectProtocolError) and message.startswith(
         _CURSOR_SUBAGENT_SCHEMA_REJECTION_PREFIXES
     ):
-        attempted_provider_call = True
+        schema_attempted_provider_call = getattr(
+            exc,
+            "attempted_provider_call",
+            True,
+        )
+        attempted_provider_call = (
+            schema_attempted_provider_call
+            if isinstance(schema_attempted_provider_call, bool)
+            else True
+        )
         ineligibility_summary = (
             "the Cursor Agent session advertised an unsupported "
             "spawn_agent schema"

@@ -2557,7 +2557,9 @@ async def test_codex_compatible_owned_redispatch_metadata_remains_pinned(
     )
 
     assert selected["selection_reason"] == "session_affinity"
-    assert selected["request_mode"] == "fresh_redispatch"
+    # The client ordinal is telemetry only; fresh redispatch requires
+    # server-owned replay validation bound to the exact rebuilt body.
+    assert selected["request_mode"] == "ordinary_continuation"
     assert selected["candidate"] == candidate
     activate.assert_not_called()
 

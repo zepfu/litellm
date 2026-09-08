@@ -288,11 +288,15 @@ def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
             for attempt in attempts or []
             if isinstance(attempt, dict)
         ]
+        attempted_provider_call = any(
+            attempt.get("attempted_provider_call") is True
+            for attempt in normalized_attempts
+        )
         terminal_attempt = dict(terminal_candidate)
         terminal_attempt.update(
             {
                 "status": candidate_status,
-                "attempted_provider_call": False,
+                "attempted_provider_call": attempted_provider_call,
                 "error_status_code": error_status_code,
                 "failure_phase": failure_phase,
             }
@@ -312,6 +316,7 @@ def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
             )
         if extra_fields:
             terminal_attempt.update(extra_fields)
+        terminal_attempt["attempted_provider_call"] = attempted_provider_call
 
         matching_keys = tuple(
             key
@@ -341,7 +346,7 @@ def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
                 "candidate_status": candidate_status,
                 "failure_phase": failure_phase,
                 "error_status_code": int(error_status_code),
-                "attempted_provider_call": False,
+                "attempted_provider_call": attempted_provider_call,
                 "redispatch_required": bool(redispatch_required),
                 "terminal_outcome": (
                     "redispatch_required" if redispatch_required else "failed"
@@ -359,6 +364,7 @@ def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
             event["error_code"] = str(error_code)
         if extra_fields:
             event.update(copy.deepcopy(dict(extra_fields)))
+        event["attempted_provider_call"] = attempted_provider_call
         if schema_rejection is not None:
             event[SCHEMA_REJECTION_KEY] = schema_rejection.to_dict()
             event["failure_class"], event["error_code"] = (
