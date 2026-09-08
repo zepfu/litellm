@@ -15,7 +15,7 @@ Unknown windows use `show_activity_only`. Working used/remaining stay `null`, no
 
 Generation IDs are stronger attempt identity than request IDs. Distinct generations
 that reuse one request ID remain separate attempts; exact repeats of one generation
-remain idempotent. Failed, cancelled, and in-progress assistant nodes remain
+remain idempotent. Failed, cancelled, rejected-after-start, and in-progress assistant nodes remain
 uncertain until an explicit successful terminal is observed, so they are not
 completed answers or default working-estimate contributions.
 
@@ -32,3 +32,7 @@ also classified as `unknown_identity`, so they remain auditable without
 contributing to definite totals or model breakdowns. Unknown and excluded
 classes retain activity whose time evidence is ambiguous or unknown, but omit
 rows proven outside the requested half-open window.
+
+Open-ended interval evidence is still unknown when it cannot prove inclusion, but
+a one-sided bound that independently proves an attempt is outside the window is
+classified as out and omitted.

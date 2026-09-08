@@ -11,7 +11,9 @@ Initialize the ledger, inspect capabilities, then backfill or refresh through th
 - Page observations are projected through the typed metadata allowlist before
   they are written. The `items`, `messages`, and `mapping` collections are
   recursively content-sanitized and bounded; unknown fields remain limited to
-  structural counts and provenance.
+  structural counts and provenance. Projection truncation downgrades coverage
+  and cannot establish page exhaustion. Unsupported transfer versions are
+  retained as evidence but marked unrecognized.
 - Missing or contradictory detail pagination, including an unknown HTTP 200 shape, records an open coverage gap, keeps the conversation pending, and prevents the run watermark from advancing.
 
 Dashboard cards show three policy buckets. Unknown remaining is the string Unknown, never zero.
