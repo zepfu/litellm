@@ -24,6 +24,18 @@ from litellm.secret_managers.xai_oauth_inventory import (
 )
 
 _XAI_OAUTH_SELECTED_ACCOUNT_STATE = "aawm_xai_oauth_selected_account"
+_XAI_OAUTH_SELECTED_ACCOUNT_CONTEXTS_STATE = (
+    "aawm_xai_oauth_selected_account_contexts"
+)
+_XAI_OAUTH_CANDIDATE_IDENTITY_FIELDS = (
+    "provider",
+    "model",
+    "route_family",
+    "xai_oauth_account_label",
+    "xai_oauth_account_hash",
+    "xai_oauth_scope_identity",
+    "xai_oauth_lane_key",
+)
 _XAI_OAUTH_MANAGED_ROUTE_FAMILIES = frozenset(
     {
         "codex_xai_oauth_responses_adapter",
@@ -130,6 +142,73 @@ def _clean_string(value: Any) -> Optional[str]:
     return cleaned or None
 
 
+def _xai_oauth_candidate_context_key(
+    candidate: Mapping[str, Any],
+) -> Optional[tuple[str, ...]]:
+    values = tuple(
+        _clean_string(candidate.get(field))
+        for field in _XAI_OAUTH_CANDIDATE_IDENTITY_FIELDS
+    )
+    if any(value is None for value in values):
+        return None
+    return values  # type: ignore[return-value]
+
+
+def _selected_account_matches_candidate(
+    candidate: Mapping[str, Any],
+    selected: XaiOAuthSelectedAccount,
+) -> bool:
+    return all(
+        (
+            _clean_string(candidate.get("xai_oauth_account_label"))
+            == selected.label,
+            _clean_string(candidate.get("xai_oauth_account_hash"))
+            == selected.account_hash,
+            _clean_string(candidate.get("xai_oauth_scope_identity"))
+            == selected.scope_identity,
+            _clean_string(candidate.get("xai_oauth_lane_key"))
+            == selected.lane_key,
+        )
+    )
+
+
+def preserve_xai_oauth_candidate_context(
+    request: Any,
+    candidate: Mapping[str, Any],
+    selected: XaiOAuthSelectedAccount,
+    snapshot: Any = None,
+) -> None:
+    """Keep verified account state out of public candidate dictionaries."""
+
+    key = _xai_oauth_candidate_context_key(candidate)
+    state = getattr(request, "state", None)
+    if key is None or state is None:
+        return
+    contexts = getattr(state, _XAI_OAUTH_SELECTED_ACCOUNT_CONTEXTS_STATE, None)
+    if not isinstance(contexts, dict):
+        contexts = {}
+        setattr(state, _XAI_OAUTH_SELECTED_ACCOUNT_CONTEXTS_STATE, contexts)
+    contexts[key] = (selected, snapshot)
+
+
+def _get_preserved_xai_oauth_candidate_context(
+    request: Any,
+    candidate: Mapping[str, Any],
+) -> Optional[tuple[XaiOAuthSelectedAccount, Any]]:
+    key = _xai_oauth_candidate_context_key(candidate)
+    state = getattr(request, "state", None)
+    contexts = getattr(state, _XAI_OAUTH_SELECTED_ACCOUNT_CONTEXTS_STATE, None)
+    if key is None or not isinstance(contexts, Mapping):
+        return None
+    context = contexts.get(key)
+    if not isinstance(context, tuple) or len(context) != 2:
+        return None
+    selected, snapshot = context
+    if not isinstance(selected, XaiOAuthSelectedAccount):
+        return None
+    return selected, snapshot
+
+
 def _candidate_selected_account(
     candidate: Mapping[str, Any],
 ) -> Optional[XaiOAuthSelectedAccount]:
@@ -182,7 +261,23 @@ def bind_xai_oauth_candidate_to_request(
     if not is_managed_xai_oauth_candidate(candidate):
         setattr(request.state, _XAI_OAUTH_SELECTED_ACCOUNT_STATE, None)
         return None
-    selected = _candidate_selected_account(candidate)
+    preserved_context = _get_preserved_xai_oauth_candidate_context(
+        request,
+        candidate,
+    )
+    if preserved_context is not None:
+        selected, snapshot = preserved_context
+        if not _selected_account_matches_candidate(candidate, selected):
+            raise HTTPException(
+                status_code=500,
+                detail="Selected xAI OAuth account identity is invalid.",
+            )
+        if snapshot is not None:
+            from litellm.llms.xai.oauth import bind_xai_oauth_snapshot_to_request
+
+            bind_xai_oauth_snapshot_to_request(request, snapshot)
+    else:
+        selected = _candidate_selected_account(candidate)
     if selected is None:
         raise HTTPException(
             status_code=500,
@@ -201,11 +296,24 @@ def get_bound_xai_oauth_selected_account(
     selected = getattr(state, _XAI_OAUTH_SELECTED_ACCOUNT_STATE, None)
     if not isinstance(selected, XaiOAuthSelectedAccount):
         return None
+    if selected.record.expected_account_identity is None:
+        return None
     try:
         current_record = select_xai_oauth_account_record(label=selected.label)
     except XaiOAuthInventoryError:
         return None
-    expected = build_xai_oauth_selected_account(current_record)
+    if (
+        current_record.auth_path != selected.record.auth_path
+        or current_record.scope != selected.record.scope
+        or current_record.legacy != selected.record.legacy
+        or (
+            current_record.expected_account_identity is not None
+            and current_record.expected_account_identity
+            != selected.record.expected_account_identity
+        )
+    ):
+        return None
+    expected = build_xai_oauth_selected_account(selected.record)
     if (
         expected.account_hash != selected.account_hash
         or expected.scope_identity != selected.scope_identity
@@ -553,7 +661,7 @@ def xai_oauth_selected_account_metadata(
 ) -> dict[str, str | bool]:
     """Return the bounded server-derived metadata allowed into observations."""
 
-    return {
+    metadata: dict[str, str | bool] = {
         "xai_oauth_server_account_binding": True,
         "xai_oauth_account_label": selected.label,
         "xai_oauth_account_hash": selected.account_hash,
@@ -561,6 +669,21 @@ def xai_oauth_selected_account_metadata(
         "xai_oauth_record_identity": selected.account_hash,
         "xai_oauth_scope_identity": selected.scope_identity,
     }
+    verified_identity = _clean_string(
+        selected.record.expected_account_identity
+    )
+    if verified_identity is not None:
+        metadata["xai_oauth_verified_account_identity"] = verified_identity
+    return metadata
+
+
+def _is_xai_oauth_account_identity(value: Optional[str]) -> bool:
+    return bool(
+        value is not None
+        and len(value) == len("sha256:") + 64
+        and value.startswith("sha256:")
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
 
 
 def validated_xai_oauth_server_account_metadata(
@@ -575,6 +698,9 @@ def validated_xai_oauth_server_account_metadata(
     scope_identity = _clean_string(metadata.get("xai_oauth_scope_identity"))
     lane_key = _clean_string(metadata.get("xai_oauth_lane_key"))
     record_identity = _clean_string(metadata.get("xai_oauth_record_identity"))
+    verified_identity = _clean_string(
+        metadata.get("xai_oauth_verified_account_identity")
+    )
     if not all(
         (
             label,
@@ -587,11 +713,25 @@ def validated_xai_oauth_server_account_metadata(
         return None
     assert label is not None
     try:
-        selected = build_xai_oauth_selected_account(
-            select_xai_oauth_account_record(label=label)
-        )
+        current_record = select_xai_oauth_account_record(label=label)
     except XaiOAuthInventoryError:
         return None
+    if current_record.expected_account_identity is None:
+        if not _is_xai_oauth_account_identity(verified_identity):
+            return None
+        selected = build_xai_oauth_selected_account(
+            replace(
+                current_record,
+                expected_account_identity=verified_identity,
+            )
+        )
+    else:
+        if (
+            verified_identity is not None
+            and verified_identity != current_record.expected_account_identity
+        ):
+            return None
+        selected = build_xai_oauth_selected_account(current_record)
     expected = xai_oauth_selected_account_metadata(selected)
     if (
         account_hash != expected["xai_oauth_account_hash"]
@@ -612,6 +752,7 @@ __all__ = [
     "get_or_bind_xai_oauth_selected_account",
     "get_xai_oauth_snapshot_for_selected_account",
     "is_managed_xai_oauth_candidate",
+    "preserve_xai_oauth_candidate_context",
     "resolve_xai_oauth_direct_continuation_account",
     "resolve_xai_oauth_selected_account_identity",
     "select_xai_oauth_account_record",

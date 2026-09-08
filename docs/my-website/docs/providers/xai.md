@@ -172,6 +172,15 @@ cached snapshot before a later request rebuilds it. Missing, malformed,
 ambiguous-scope, expired, and near-expiry records fail closed; request handling
 does not refresh or write the managed credential file.
 
+Managed account selection resolves the non-secret account identity from the same
+credential snapshot whose token is sent. The legacy single-file configuration is
+therefore not assigned a file-only account lane: token rotation preserves the
+account lane, while replacing account A with account B produces a new lane.
+If the snapshot cannot prove an account identity, the request fails closed.
+Explicit inventory records continue to use their configured
+`expected_account_identity` pin. Account identity metadata is server-derived;
+caller-supplied metadata cannot select or replace it.
+
 For a provider-owned managed xAI `401` before response bytes are committed,
 LiteLLM may reread the exact bound file and scope and retry once on alias,
 direct async, OpenAI passthrough, or Anthropic compatibility routes. The

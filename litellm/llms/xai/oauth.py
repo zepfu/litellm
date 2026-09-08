@@ -273,7 +273,6 @@ async def prepare_oa_xai_request(
             resolved_snapshot = snapshot
     else:
         record = getattr(selected_account, "record", None)
-        expected_identity = getattr(record, "expected_account_identity", None)
         auth_path = getattr(record, "auth_path", None)
         scope = getattr(record, "scope", None)
         if not isinstance(auth_path, Path) or not isinstance(scope, str) or not scope:
@@ -284,19 +283,20 @@ async def prepare_oa_xai_request(
         if (
             resolved_snapshot.auth_file != auth_path
             or resolved_snapshot.scope != scope
-            or (
-                expected_identity is not None
-                and resolved_snapshot.account_identity != expected_identity
-            )
         ):
             raise ValueError(
                 "Managed xAI OAuth selected account does not match its "
                 "credential snapshot."
             )
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+            resolve_xai_oauth_selected_account_identity,
             xai_oauth_selected_account_metadata,
         )
 
+        selected_account = await resolve_xai_oauth_selected_account_identity(
+            selected_account,
+            snapshot=resolved_snapshot,
+        )
         selected_metadata = xai_oauth_selected_account_metadata(selected_account)
     if snapshot_out is not None:
         snapshot_out["snapshot"] = resolved_snapshot
