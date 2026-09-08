@@ -152,6 +152,13 @@ credentials, resume/fork state, selected context, parent state, environment,
 or model parameters. Protocol framing and transport failures remain separate
 upstream errors.
 
+Before Codex alias ownership classification, LiteLLM restores the exact stock
+`NEW_TASK` envelope whose second `encrypted_content` part carries ordinary task
+text. Selection and execution receive the same normalized body, with that text
+visible in the existing `agent_message`. Other envelope shapes, encrypted
+reasoning, and provider-owned continuation state remain subject to the existing
+ownership guards.
+
 ## Continuations and ownership
 
 Ordinary external-tool continuations retain the Cursor session assignment while
