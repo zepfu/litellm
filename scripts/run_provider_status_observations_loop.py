@@ -18554,7 +18554,9 @@ def main(  # noqa: PLR0915 - bounded sidecar lifecycle loop
                     sidecar_state.pending_chatgpt_oracle_browser_owners.values()
                 )
             for owner in owners:
-                owner.request_shutdown()
+                owner.request_shutdown(
+                    deadline=sidecar_state.chatgpt_oracle_browser_shutdown_deadline
+                )
 
     if native_probe_label is not None:
         exit_status = 1
