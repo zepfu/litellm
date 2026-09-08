@@ -5771,6 +5771,7 @@ _HOST_FUNCTION_NAMES = (
     "_extract_codex_request_redispatch_ordinal",
     "_resolve_codex_request_mode_and_ordinal",
     "_codex_auto_agent_candidate_public_shape",
+    "_redact_auto_agent_account_identity",
     "_codex_oauth_routing_candidate_fields",
     "_is_auto_agent_candidate_state_available",
     "_build_auto_agent_skipped_candidates_from_states",
@@ -5854,6 +5855,7 @@ _HOST_FUNCTION_NAMES = (
     "_raise_codex_auto_agent_in_flight_cooldown",
     "_raise_anthropic_auto_agent_in_flight_cooldown",
     "_build_auto_agent_redispatch_http_exception_detail",
+    "_raise_codex_auto_agent_authenticated_continuation_unavailable",
     "_raise_codex_auto_agent_redispatch_required",
     "_raise_anthropic_auto_agent_redispatch_required",
     "_select_codex_auto_agent_candidate",
@@ -5917,6 +5919,9 @@ def install(host_globals: dict) -> None:
         "alias_routing_state": alias_routing_state,
         "inspect": inspect,
         "math": math,
+        "_AUTO_AGENT_ACCOUNT_IDENTITY_FIELDS": (
+            _AUTO_AGENT_ACCOUNT_IDENTITY_FIELDS
+        ),
         "_CODEX_OAUTH_QUOTA_FAMILY_OVERALL": _CODEX_OAUTH_QUOTA_FAMILY_OVERALL,
         "_CODEX_OAUTH_QUOTA_FAMILY_SPARK": _CODEX_OAUTH_QUOTA_FAMILY_SPARK,
         "_get_codex_active_cooldown_state": _get_codex_active_cooldown_state,
