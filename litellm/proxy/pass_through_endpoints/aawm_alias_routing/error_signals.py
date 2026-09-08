@@ -395,11 +395,13 @@ def _parse_xai_rate_limit_header_wait_seconds(
             return max(1.0, waits_by_scope["tokens"])
         if generic_wait is not None:
             return max(1.0, generic_wait)
+        return None
     if mentions_requests and not mentions_tokens:
         if "requests" in waits_by_scope:
             return max(1.0, waits_by_scope["requests"])
         if generic_wait is not None:
             return max(1.0, generic_wait)
+        return None
     # Without an attributable exhausted dimension, wait for both scopes.
     if waits_by_scope:
         return max(1.0, max(waits_by_scope.values()))
