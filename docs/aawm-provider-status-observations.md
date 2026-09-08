@@ -1048,6 +1048,10 @@ distinct bounded outcome and exits zero.
 `ChatGPTNativeHistoryProbeCleanupFailed` events include `cleanup_subreason`,
 an allowlisted code matched against existing fixed lifecycle failure messages.
 Unrecognized failures report `unknown`; exception text is never emitted.
+When a reaped target closer has not confirmed cleanup, `target_closer_*` codes
+identify its last operation or failed response check, including CDP connection,
+target listing, target matching, close acknowledgment, and absence verification.
+The closer shares only a numeric stage; no CDP payload or target data is added.
 The event precedes the final retained-owner drain, so it does not report final
 retirement or imply that cleanup has completed.
 

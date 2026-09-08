@@ -145,6 +145,7 @@ from litellm.llms.cursor_agent.usage import (
 )
 from litellm.llms.chatgpt.conversation_init import (
     CHATGPT_CONVERSATION_INIT_DEFAULT_URL,
+    CHATGPT_NATIVE_HISTORY_CLOSER_FAILURE_SUBREASONS,
     CHATGPT_NATIVE_HISTORY_ROLE_ENV,
     CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH,
     ChatGPTConversationInitError,
@@ -17979,6 +17980,7 @@ _CHATGPT_NATIVE_HISTORY_PROBE_OBSERVATION_KEYS = frozenset(
     }
 )
 _CHATGPT_NATIVE_HISTORY_PROBE_CLEANUP_SUBREASONS = {
+    **CHATGPT_NATIVE_HISTORY_CLOSER_FAILURE_SUBREASONS,
     "Native ChatGPT history lifecycle registration failed.": "native_registration_failed",
     "Native ChatGPT history abort control failed.": "native_abort_control_failed",
     "Native ChatGPT history finalization control failed.": "native_finalization_control_failed",
