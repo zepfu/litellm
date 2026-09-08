@@ -400,11 +400,17 @@ DEFAULT_CHATGPT_CONVERSATION_INIT_URL = CHATGPT_CONVERSATION_INIT_DEFAULT_URL
 DEFAULT_CHATGPT_CONVERSATION_INIT_BROWSER_TIMEOUT_SECONDS = 30.0
 DEFAULT_CHATGPT_USAGE_BRIDGE_ENABLED = False
 DEFAULT_CHATGPT_USAGE_BRIDGE_INTERVAL_SECONDS = 600.0
-DEFAULT_CHATGPT_USAGE_BRIDGE_WORKER_SCRIPT = (
-    "/app/scripts/chatgpt_chat_usage_capture/ts/dist/worker/main.js"
+DEFAULT_CHATGPT_USAGE_BRIDGE_WORKER_ROOT = (
+    "/app/scripts/chatgpt_chat_usage_capture/ts"
 )
 CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV = (
     "AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS"
+)
+CHATGPT_USAGE_BRIDGE_RECOVERY_ACCOUNT_ENV = (
+    "AAWM_CHATGPT_USAGE_BRIDGE_AUTHENTICATION_RECOVERY_ACCOUNT"
+)
+CHATGPT_USAGE_BRIDGE_RECOVERY_PROFILE_ENV = (
+    "AAWM_CHATGPT_USAGE_BRIDGE_AUTHENTICATION_RECOVERY_PROFILE"
 )
 CHATGPT_ORACLE_NODE_EXECUTABLE_ENV = "AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE"
 CHATGPT_ORACLE_PACKAGE_DIR_ENV = "AAWM_CHATGPT_ORACLE_PACKAGE_DIR"
@@ -1604,9 +1610,11 @@ class ProviderStatusLoopConfig:
     chatgpt_usage_bridge_node_executable: str = os.getenv(
         "AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE", "node"
     )
-    chatgpt_usage_bridge_worker_script: str = (
-        DEFAULT_CHATGPT_USAGE_BRIDGE_WORKER_SCRIPT
+    chatgpt_usage_bridge_worker_root: str = (
+        DEFAULT_CHATGPT_USAGE_BRIDGE_WORKER_ROOT
     )
+    chatgpt_usage_bridge_recovery_account: Optional[str] = None
+    chatgpt_usage_bridge_recovery_profile: Optional[str] = None
     grok_billing_url: str = DEFAULT_GROK_BILLING_URL
     grok_billing_client_version: Optional[str] = None
     grok_billing_client_version_source: Optional[str] = None
@@ -3719,14 +3727,32 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         ),
     )
     parser.add_argument(
-        "--chatgpt-usage-bridge-worker-script",
+        "--chatgpt-usage-bridge-worker-root",
         default=os.getenv(
-            "AAWM_CHATGPT_USAGE_BRIDGE_WORKER_SCRIPT",
-            DEFAULT_CHATGPT_USAGE_BRIDGE_WORKER_SCRIPT,
+            "AAWM_CHATGPT_USAGE_BRIDGE_WORKER_ROOT",
+            DEFAULT_CHATGPT_USAGE_BRIDGE_WORKER_ROOT,
         ),
         help=(
-            "Bounded worker JavaScript entrypoint. Defaults to "
-            "AAWM_CHATGPT_USAGE_BRIDGE_WORKER_SCRIPT or the packaged image path."
+            "Bounded worker project root. The bridge launches "
+            "dist/src/worker/main.js beneath this root. Defaults to "
+            "AAWM_CHATGPT_USAGE_BRIDGE_WORKER_ROOT or the packaged image path."
+        ),
+    )
+    parser.add_argument(
+        "--chatgpt-usage-bridge-authentication-recovery-account",
+        default=os.getenv(CHATGPT_USAGE_BRIDGE_RECOVERY_ACCOUNT_ENV),
+        help=(
+            "Run one explicit ChatGPT authentication-recovery bridge action for "
+            "this configured account label, then exit. This never enables "
+            "recovery in the recurring sidecar loop."
+        ),
+    )
+    parser.add_argument(
+        "--chatgpt-usage-bridge-authentication-recovery-profile",
+        default=os.getenv(CHATGPT_USAGE_BRIDGE_RECOVERY_PROFILE_ENV),
+        help=(
+            "Optional profile label for the explicit ChatGPT authentication "
+            "recovery action. Requires an account label."
         ),
     )
 
@@ -4179,8 +4205,23 @@ def _validate_chatgpt_usage_bridge_config_args(
         )
     if not str(args.chatgpt_usage_bridge_node_executable).strip():
         raise SystemExit("--chatgpt-usage-bridge-node-executable must not be empty")
-    if not str(args.chatgpt_usage_bridge_worker_script).strip():
-        raise SystemExit("--chatgpt-usage-bridge-worker-script must not be empty")
+    if not str(args.chatgpt_usage_bridge_worker_root).strip():
+        raise SystemExit("--chatgpt-usage-bridge-worker-root must not be empty")
+    recovery_account = args.chatgpt_usage_bridge_authentication_recovery_account
+    recovery_profile = args.chatgpt_usage_bridge_authentication_recovery_profile
+    if recovery_profile is not None and not str(recovery_account or "").strip():
+        raise SystemExit(
+            "--chatgpt-usage-bridge-authentication-recovery-profile requires "
+            "--chatgpt-usage-bridge-authentication-recovery-account"
+        )
+    if recovery_account is not None and not str(recovery_account).strip():
+        raise SystemExit(
+            "--chatgpt-usage-bridge-authentication-recovery-account must not be empty"
+        )
+    if recovery_profile is not None and not str(recovery_profile).strip():
+        raise SystemExit(
+            "--chatgpt-usage-bridge-authentication-recovery-profile must not be empty"
+        )
 
 
 def _validate_grok_billing_config_args(args: argparse.Namespace) -> None:
@@ -4341,9 +4382,19 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         chatgpt_usage_bridge_node_executable=str(
             args.chatgpt_usage_bridge_node_executable
         ).strip(),
-        chatgpt_usage_bridge_worker_script=str(
-            args.chatgpt_usage_bridge_worker_script
+        chatgpt_usage_bridge_worker_root=str(
+            args.chatgpt_usage_bridge_worker_root
         ).strip(),
+        chatgpt_usage_bridge_recovery_account=(
+            str(args.chatgpt_usage_bridge_authentication_recovery_account).strip()
+            if args.chatgpt_usage_bridge_authentication_recovery_account is not None
+            else None
+        ),
+        chatgpt_usage_bridge_recovery_profile=(
+            str(args.chatgpt_usage_bridge_authentication_recovery_profile).strip()
+            if args.chatgpt_usage_bridge_authentication_recovery_profile is not None
+            else None
+        ),
         codex_auth_file=resolved_codex_auth_file,
         codex_auth_file_source=resolved_codex_auth_file_source,
         codex_lock_file=args.codex_lock_file,
@@ -16098,12 +16149,17 @@ def _run_chatgpt_usage_bridge_task(
     state: SidecarTaskState,
     *,
     now_monotonic: float,
+    force: bool = False,
+    account_filter: Optional[str] = None,
+    profile_filter: Optional[str] = None,
+    authentication_recovery_requested: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    if not config.chatgpt_usage_bridge_enabled:
+    if not force and not config.chatgpt_usage_bridge_enabled:
         return None
     last_attempt = state.chatgpt_usage_bridge_last_attempt_monotonic
     if (
-        last_attempt is not None
+        not force
+        and last_attempt is not None
         and now_monotonic - last_attempt
         < config.chatgpt_usage_bridge_interval_seconds
     ):
@@ -16113,112 +16169,237 @@ def _run_chatgpt_usage_bridge_task(
     summary: Dict[str, Any] = {
         "attempted": True,
         "ok": False,
-        "coverageIncomplete": True,
-        "historyContract": "unavailable",
-        "errorClass": None,
-        "errorMessage": None,
+        "coverage_incomplete": True,
+        "history_contract": "unavailable",
+        "error_class": None,
+        "error_message": None,
+        "account_count": 0,
+        "successful_account_count": 0,
+        "failed_account_count": 0,
+        "results": [],
+        "authentication_recovery_requested": authentication_recovery_requested,
     }
     try:
-        from scripts.chatgpt_chat_usage_capture.ts_bridge import (
-            BridgeConfig,
-            TsWorkerBridge,
-        )
-        from scripts.chatgpt_chat_usage_capture.pg_collector_state import (
-            PgCollectorState,
-        )
-        from scripts.chatgpt_chat_usage_capture.pg_ledger import (
-            LedgerScope,
-            PgLedger,
+        bindings = _load_chatgpt_usage_bridge_bindings(account_filter)
+        results = _run_chatgpt_usage_bridge_accounts(
+            config,
+            bindings,
+            profile_filter=profile_filter,
+            authentication_recovery_requested=authentication_recovery_requested,
         )
 
-        raw_bindings = os.getenv(
-            "AAWM_CHATGPT_USAGE_BRIDGE_ACCOUNT_BINDINGS",
-            "",
+        statuses = {
+            str(result.get("history_contract"))
+            for result in results
+            if result.get("history_contract")
+        }
+        if "unavailable" in statuses:
+            history_contract = "unavailable"
+        elif "blocked" in statuses:
+            history_contract = "blocked"
+        elif statuses and statuses == {"ready"}:
+            history_contract = "ready"
+        else:
+            history_contract = "unknown"
+        summary["ok"] = bool(results) and all(
+            bool(result.get("ok")) for result in results
         )
-        parsed = json.loads(raw_bindings or "{}")
-        if not isinstance(parsed, dict) or not parsed:
-            raise ValueError(
-                "AAWM_CHATGPT_USAGE_BRIDGE_ACCOUNT_BINDINGS must be a nonempty JSON object"
-            )
-        bindings: Dict[str, Dict[str, str]] = {}
-        for account_id, raw_scope in parsed.items():
-            if not isinstance(account_id, str) or not account_id.strip():
-                raise ValueError("bridge account id must be a nonempty string")
-            if not isinstance(raw_scope, dict):
-                raise ValueError("bridge account scope must be an object")
-            allowed = {
-                "provider",
-                "providerUserId",
-                "workspaceId",
-                "quotaOwnerId",
-                "surface",
-                "profileId",
-            }
-            if set(raw_scope) - allowed:
-                raise ValueError("bridge account scope contains an unsupported field")
-            provider = str(raw_scope.get("provider") or "openai").strip()
-            surface = str(raw_scope.get("surface") or "chat").strip()
-            profile_id = str(raw_scope.get("profileId") or account_id).strip()
-            bindings[account_id] = {
-                "provider": provider,
-                "provider_user_id": str(raw_scope.get("providerUserId") or "") or "unknown",
-                "workspace_id": str(raw_scope.get("workspaceId") or "") or "unknown",
-                "quota_owner_id": str(raw_scope.get("quotaOwnerId") or account_id),
-                "surface": surface,
-                "profile_id": profile_id,
-            }
-        ledger = PgLedger(
-            _resolve_codex_quota_dsn(config),
-            application_name=(
-                f"{probes._provider_status_db_application_name()}-chatgpt-usage-bridge"
-            ),
-            lock_timeout_ms=config.db_lock_timeout_ms,
-            statement_timeout_ms=config.db_statement_timeout_ms,
+        summary["coverage_incomplete"] = any(
+            bool(result.get("coverage_incomplete", True)) for result in results
         )
-        bridge_state = PgCollectorState(ledger)
-        bridge = TsWorkerBridge(
-            bridge_state,
-            BridgeConfig.from_runtime(
-                node_executable=config.chatgpt_usage_bridge_node_executable,
-                worker_script=config.chatgpt_usage_bridge_worker_script,
-            ),
+        summary["history_contract"] = history_contract
+        summary["account_count"] = len(results)
+        summary["successful_account_count"] = sum(
+            1 for result in results if bool(result.get("ok"))
         )
-        results = []
-        for account_id, bound_scope in bindings.items():
-            scope = LedgerScope(
-                collector_account_id=account_id,
-                provider=bound_scope["provider"],
-                provider_user_id=bound_scope["provider_user_id"],
-                workspace_id=bound_scope["workspace_id"],
-                quota_owner_id=bound_scope["quota_owner_id"],
-                surface=bound_scope["surface"],
-            )
-            result = bridge.run_once(
-                collector_account_id=account_id,
-                profile_id=bound_scope["profile_id"],
-                scope=scope,
-            )
-            results.append(result)
-        summary["ok"] = all(bool(result.get("ok", True)) for result in results)
-        summary["coverageIncomplete"] = any(
-            bool(result.get("coverageIncomplete", True)) for result in results
+        summary["failed_account_count"] = len(results) - int(
+            summary["successful_account_count"]
         )
-        summary["historyContract"] = (
-            "unavailable"
-            if any(result.get("historyContract") == "unavailable" for result in results)
-            else "unknown"
-        )
-        summary["accountCount"] = len(results)
         summary["results"] = results
     except Exception as exc:
         summary["ok"] = False
-        summary["errorClass"] = exc.__class__.__name__
-        summary["errorMessage"] = _redacted_failure_message(str(exc))
+        summary["error_class"] = exc.__class__.__name__
+        summary["error_message"] = _redacted_failure_message(str(exc))
     return {
         "event": "chatgpt_usage_bridge",
-        "observedAt": observed_at.isoformat().replace("+00:00", "Z"),
+        "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
         "environment": config.environment,
         **summary,
+    }
+
+
+def _load_chatgpt_usage_bridge_bindings(
+    account_filter: Optional[str],
+) -> Dict[str, Dict[str, Optional[str]]]:
+    raw_bindings = os.getenv("AAWM_CHATGPT_USAGE_BRIDGE_ACCOUNT_BINDINGS", "")
+    parsed = json.loads(raw_bindings or "{}")
+    if not isinstance(parsed, dict) or not parsed:
+        raise ValueError(
+            "AAWM_CHATGPT_USAGE_BRIDGE_ACCOUNT_BINDINGS must be a nonempty JSON object"
+        )
+    bindings: Dict[str, Dict[str, Optional[str]]] = {}
+    allowed = {
+        "provider",
+        "providerUserId",
+        "workspaceId",
+        "quotaOwnerId",
+        "surface",
+        "profileId",
+    }
+    for account_id, raw_scope in parsed.items():
+        if not isinstance(account_id, str) or not account_id.strip():
+            raise ValueError("bridge account id must be a nonempty string")
+        if not isinstance(raw_scope, dict):
+            raise ValueError("bridge account scope must be an object")
+        if set(raw_scope) - allowed:
+            raise ValueError("bridge account scope contains an unsupported field")
+        account_key = account_id.strip()
+        bindings[account_key] = {
+            "provider": _chatgpt_usage_bridge_binding_value(
+                raw_scope.get("provider"),
+                "provider",
+            )
+            or "openai",
+            "provider_user_id": _chatgpt_usage_bridge_binding_value(
+                raw_scope.get("providerUserId"),
+                "providerUserId",
+            ),
+            "workspace_id": _chatgpt_usage_bridge_binding_value(
+                raw_scope.get("workspaceId"),
+                "workspaceId",
+            ),
+            "quota_owner_id": _chatgpt_usage_bridge_binding_value(
+                raw_scope.get("quotaOwnerId"),
+                "quotaOwnerId",
+            ),
+            "surface": _chatgpt_usage_bridge_binding_value(
+                raw_scope.get("surface"),
+                "surface",
+            )
+            or "chat",
+            "profile_id": _chatgpt_usage_bridge_binding_value(
+                raw_scope.get("profileId"),
+                "profileId",
+            )
+            or account_key,
+        }
+    if account_filter is None:
+        return bindings
+    account_key = account_filter.strip()
+    if account_key not in bindings:
+        raise ValueError("requested ChatGPT recovery account is not configured")
+    return {account_key: bindings[account_key]}
+
+
+def _run_chatgpt_usage_bridge_accounts(
+    config: ProviderStatusLoopConfig,
+    bindings: Mapping[str, Mapping[str, Optional[str]]],
+    *,
+    profile_filter: Optional[str],
+    authentication_recovery_requested: bool,
+) -> list[Dict[str, Any]]:
+    from scripts.chatgpt_chat_usage_capture.pg_collector_state import (
+        PgCollectorState,
+    )
+    from scripts.chatgpt_chat_usage_capture.pg_ledger import LedgerScope, PgLedger
+    from scripts.chatgpt_chat_usage_capture.ts_bridge import BridgeConfig, TsWorkerBridge
+
+    ledger = PgLedger(
+        _resolve_codex_quota_dsn(config),
+        application_name=(
+            f"{probes._provider_status_db_application_name()}-chatgpt-usage-bridge"
+        ),
+        lock_timeout_ms=config.db_lock_timeout_ms,
+        statement_timeout_ms=config.db_statement_timeout_ms,
+    )
+    bridge = TsWorkerBridge(
+        PgCollectorState(ledger),
+        BridgeConfig.from_runtime(
+            node_executable=config.chatgpt_usage_bridge_node_executable,
+            worker_root=config.chatgpt_usage_bridge_worker_root,
+        ),
+    )
+    results: list[Dict[str, Any]] = []
+    try:
+        for account_id, bound_scope in bindings.items():
+            try:
+                scope = LedgerScope(
+                    collector_account_id=account_id,
+                    provider=str(bound_scope["provider"] or "openai"),
+                    provider_user_id=bound_scope["provider_user_id"],
+                    workspace_id=bound_scope["workspace_id"],
+                    quota_owner_id=bound_scope["quota_owner_id"],
+                    surface=str(bound_scope["surface"] or "chat"),
+                )
+                result = bridge.run_once(
+                    collector_account_id=account_id,
+                    profile_id=(
+                        profile_filter
+                        if profile_filter is not None
+                        else str(bound_scope["profile_id"] or account_id)
+                    ),
+                    scope=scope,
+                    authentication_recovery_requested=(
+                        authentication_recovery_requested
+                    ),
+                )
+                results.append(_chatgpt_usage_bridge_result(account_id, result))
+            except Exception as exc:
+                results.append(_chatgpt_usage_bridge_failure(account_id, exc))
+    finally:
+        bridge.close()
+    return results
+
+
+def _chatgpt_usage_bridge_binding_value(value: Any, field_name: str) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"bridge binding field {field_name} must be a string")
+    normalized = value.strip()
+    return normalized or None
+
+
+def _chatgpt_usage_bridge_result(
+    account_id: str,
+    result: Mapping[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "account_id": account_id,
+        "ok": bool(result.get("ok")),
+        "status": result.get("status"),
+        "run_id": result.get("runId"),
+        "profile_id": result.get("profileId"),
+        "coverage_incomplete": bool(result.get("coverageIncomplete", True)),
+        "history_contract": result.get("historyContract") or "unknown",
+        "history_reason": result.get("historyReason"),
+        "retry_after_ms": result.get("retryAfterMs"),
+        "state_version": result.get("stateVersion"),
+        "requests": result.get("requests"),
+        "error_code": result.get("errorCode"),
+        "retryable": result.get("retryable"),
+    }
+
+
+def _chatgpt_usage_bridge_failure(
+    account_id: str,
+    error: BaseException,
+) -> Dict[str, Any]:
+    return {
+        "account_id": account_id,
+        "ok": False,
+        "status": "failed",
+        "run_id": None,
+        "profile_id": None,
+        "coverage_incomplete": True,
+        "history_contract": "unavailable",
+        "history_reason": "account_run_failed",
+        "retry_after_ms": None,
+        "state_version": None,
+        "requests": 0,
+        "error_code": error.__class__.__name__,
+        "retryable": True,
+        "error_message": _redacted_failure_message(str(error)),
     }
 
 
@@ -16427,6 +16608,11 @@ _CHATGPT_CONVERSATION_INIT_OPTIONAL_DEGRADED_STATUSES = frozenset(
 def _optional_one_shot_event_failed(event: Mapping[str, Any]) -> bool:
     if event.get("error_class"):
         return True
+    if event.get("event") == "chatgpt_usage_bridge":
+        return (
+            event.get("ok") is not True
+            or int(event.get("failed_account_count") or 0) > 0
+        )
     if event.get("event") != "chatgpt_conversation_init_poll":
         return False
     return any(
@@ -16714,6 +16900,67 @@ def _next_sidecar_wake_delay(
     return max(0.0, next_deadline - now)
 
 
+def _run_explicit_chatgpt_usage_bridge_recovery(
+    config: ProviderStatusLoopConfig,
+) -> Dict[str, Any]:
+    recovery_state = SidecarTaskState()
+    try:
+        recovery_event = _run_chatgpt_usage_bridge_task(
+            config,
+            recovery_state,
+            now_monotonic=time.monotonic(),
+            force=True,
+            account_filter=config.chatgpt_usage_bridge_recovery_account,
+            profile_filter=config.chatgpt_usage_bridge_recovery_profile,
+            authentication_recovery_requested=True,
+        )
+    except Exception as exc:
+        recovery_event = None
+        error = exc
+    else:
+        error = None
+    if recovery_event is not None:
+        return recovery_event
+    if error is None:
+        error_class = "RecoveryNotAttempted"
+        error_message = "explicit recovery action did not run"
+    else:
+        error_class = error.__class__.__name__
+        error_message = _redacted_failure_message(str(error))
+    return {
+        "event": "chatgpt_usage_bridge",
+        "observed_at": _utc_timestamp(),
+        "environment": config.environment,
+        "attempted": True,
+        "ok": False,
+        "coverage_incomplete": True,
+        "history_contract": "unavailable",
+        "authentication_recovery_requested": True,
+        "error_class": error_class,
+        "error_message": error_message,
+    }
+
+
+def _setup_schema_before_loop(config: ProviderStatusLoopConfig) -> bool:
+    if not (config.apply and config.setup_schema):
+        return True
+    try:
+        _emit(setup_schema_once(config))
+    except Exception as exc:
+        _emit(
+            {
+                "event": "provider_status_observations_schema_error",
+                "observed_at": _utc_timestamp(),
+                "environment": config.environment,
+                "error_class": exc.__class__.__name__,
+                "error_message": str(exc),
+                "traceback": traceback.format_exc(limit=5),
+            }
+        )
+        return False
+    return True
+
+
 def _sleep_until_next_sidecar_deadline(
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
@@ -16768,22 +17015,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    if config.apply and config.setup_schema:
-        try:
-            _emit(setup_schema_once(config))
-        except Exception as exc:
-            _emit(
-                {
-                    "event": "provider_status_observations_schema_error",
-                    "observed_at": _utc_timestamp(),
-                    "environment": config.environment,
-                    "error_class": exc.__class__.__name__,
-                    "error_message": str(exc),
-                    "traceback": traceback.format_exc(limit=5),
-                }
-            )
-            if config.once:
-                return 1
+    if not _setup_schema_before_loop(config) and config.once:
+        return 1
+
+    if config.chatgpt_usage_bridge_recovery_account is not None:
+        recovery_event = _run_explicit_chatgpt_usage_bridge_recovery(config)
+        _emit(recovery_event)
+        return 0 if recovery_event.get("ok") is True else 1
 
     sidecar_state = SidecarTaskState()
     while not stopping:

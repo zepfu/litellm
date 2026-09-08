@@ -1,3 +1,23 @@
+FROM node:24-bookworm-slim AS chatgpt-usage-worker-build
+
+ENV NPM_CONFIG_UPDATE_NOTIFIER=false \
+    NPM_CONFIG_FUND=false \
+    NPM_CONFIG_AUDIT=false
+
+WORKDIR /build/scripts/chatgpt_chat_usage_capture/ts
+
+COPY scripts/chatgpt_chat_usage_capture/ts/package-lock.json package-lock.json
+COPY scripts/chatgpt_chat_usage_capture/ts/package.json package.json
+COPY scripts/chatgpt_chat_usage_capture/ts/tsconfig.json tsconfig.json
+COPY scripts/chatgpt_chat_usage_capture/ts/src src
+COPY scripts/chatgpt_chat_usage_capture/ts/bin bin
+
+RUN npm ci --ignore-scripts \
+    && npm run build \
+    && rm -rf node_modules \
+    && npm ci --omit=dev --ignore-scripts \
+    && rm -rf node_modules/playwright/.local-browsers
+
 FROM python:3.13-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -22,7 +42,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         iputils-ping \
-        nodejs \
+        libstdc++6 \
         rsync \
         xauth \
     && rm -rf /var/lib/apt/lists/*
@@ -35,6 +55,15 @@ RUN pip install --no-cache-dir \
 
 RUN python -m playwright install-deps chromium
 
+ENV AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE=/usr/local/bin/node \
+    AAWM_CHATGPT_USAGE_BRIDGE_WORKER_ROOT=/app/scripts/chatgpt_chat_usage_capture/ts
+
+COPY --from=chatgpt-usage-worker-build /usr/local/bin/node /usr/local/bin/node
+COPY --from=chatgpt-usage-worker-build /build/scripts/chatgpt_chat_usage_capture/ts/dist /app/scripts/chatgpt_chat_usage_capture/ts/dist
+COPY --from=chatgpt-usage-worker-build /build/scripts/chatgpt_chat_usage_capture/ts/node_modules /app/scripts/chatgpt_chat_usage_capture/ts/node_modules
+COPY --from=chatgpt-usage-worker-build /build/scripts/chatgpt_chat_usage_capture/ts/package-lock.json /app/scripts/chatgpt_chat_usage_capture/ts/package-lock.json
+COPY --from=chatgpt-usage-worker-build /build/scripts/chatgpt_chat_usage_capture/ts/package.json /app/scripts/chatgpt_chat_usage_capture/ts/package.json
+
 COPY scripts/record_provider_status_observations.py /app/scripts/record_provider_status_observations.py
 COPY scripts/apply_chatgpt_usage_ledger_2026_09_08.sql /app/scripts/apply_chatgpt_usage_ledger_2026_09_08.sql
 COPY scripts/chatgpt_chat_usage_capture/__init__.py /app/scripts/chatgpt_chat_usage_capture/__init__.py
@@ -44,7 +73,6 @@ COPY scripts/chatgpt_chat_usage_capture/timeutil.py /app/scripts/chatgpt_chat_us
 COPY scripts/chatgpt_chat_usage_capture/pg_ledger.py /app/scripts/chatgpt_chat_usage_capture/pg_ledger.py
 COPY scripts/chatgpt_chat_usage_capture/pg_collector_state.py /app/scripts/chatgpt_chat_usage_capture/pg_collector_state.py
 COPY scripts/chatgpt_chat_usage_capture/ts_bridge.py /app/scripts/chatgpt_chat_usage_capture/ts_bridge.py
-COPY scripts/chatgpt_chat_usage_capture/ts/dist /app/scripts/chatgpt_chat_usage_capture/ts/dist
 COPY scripts/chatgpt_oracle_browser_session.mjs /app/scripts/chatgpt_oracle_browser_session.mjs
 COPY scripts/grok_oidc_refresh.py /app/scripts/grok_oidc_refresh.py
 COPY scripts/codex_oauth_refresh.py /app/scripts/codex_oauth_refresh.py
