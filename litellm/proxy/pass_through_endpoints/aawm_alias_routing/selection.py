@@ -3157,6 +3157,8 @@ async def _resolve_xai_oauth_account_candidate_contexts(
         build_xai_oauth_selected_account,
         configured_xai_oauth_records,
         get_xai_oauth_snapshot_for_selected_account,
+        preserve_xai_oauth_candidate_context,
+        resolve_xai_oauth_selected_account_identity,
     )
 
     for field in (
@@ -3245,6 +3247,33 @@ async def _resolve_xai_oauth_account_candidate_contexts(
     contexts: list[dict[str, Any]] = []
     for record in records:
         selected = build_xai_oauth_selected_account(record)
+        legacy_identity_error: Optional[Exception] = None
+        snapshot_error: Optional[Exception] = None
+        snapshot: Any = None
+        try:
+            snapshot = await get_xai_oauth_snapshot_for_selected_account(selected)
+            if record.expected_account_identity is None:
+                selected = await resolve_xai_oauth_selected_account_identity(
+                    selected,
+                    snapshot=snapshot,
+                )
+        except Exception as exc:  # noqa: BLE001
+            if record.expected_account_identity is None:
+                legacy_identity_error = exc
+            else:
+                snapshot_error = exc
+        if legacy_identity_error is not None:
+            contexts.append(
+                {
+                    "candidate": dict(candidate_template),
+                    "lane_key": "xai-oauth:unavailable",
+                    "auth_status": "degraded",
+                    "skip_reason": "auth_degraded",
+                    "failure_phase": "account_identity_unavailable",
+                    "attempted_provider_call": False,
+                }
+            )
+            continue
         account_candidate = {
             **candidate_template,
             "xai_oauth_account_label": selected.label,
@@ -3259,7 +3288,7 @@ async def _resolve_xai_oauth_account_candidate_contexts(
             "lane_key": selected.lane_key,
             "auth_status": "healthy",
         }
-        if any(
+        if legacy_identity_error is None and any(
             value is not None and account_candidate[field] != value
             for field, value in pinned_values.items()
         ):
@@ -3273,9 +3302,7 @@ async def _resolve_xai_oauth_account_candidate_contexts(
             )
             contexts.append(context)
             continue
-        try:
-            await get_xai_oauth_snapshot_for_selected_account(selected)
-        except Exception:  # noqa: BLE001
+        if snapshot_error is not None:
             context.update(
                 {
                     "auth_status": "degraded",
@@ -3283,6 +3310,13 @@ async def _resolve_xai_oauth_account_candidate_contexts(
                     "failure_phase": "pre_dispatch_auth",
                     "attempted_provider_call": False,
                 }
+            )
+        else:
+            preserve_xai_oauth_candidate_context(
+                request,
+                account_candidate,
+                selected,
+                snapshot,
             )
         contexts.append(context)
     return contexts

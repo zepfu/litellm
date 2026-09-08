@@ -2069,6 +2069,10 @@ async def handle_alias_route(  # noqa: PLR0915
                 provider_status_code=attempt_record.get("error_status_code"),
             )
             if account_failover_planned:
+                provider_candidate_attempts = max(
+                    0,
+                    provider_candidate_attempts - 1,
+                )
                 _mark_auto_agent_alias_request_failover_pending(
                     request,
                     attempt_record,
@@ -3702,6 +3706,8 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                 )
                 if native_grok_retry_eligible:
+                    if failover_ordinal > 0:
+                        provider_candidate_attempts += 1
                     native_grok_continuation_transient_provider_attempts += 1
                     (
                         should_retry_same_candidate,
@@ -4225,9 +4231,13 @@ async def handle_alias_route(  # noqa: PLR0915
                             emit_pre_attempt_terminal_event=(
                                 _emit_auto_agent_alias_pre_attempt_terminal_event
                             ),
-                        )
-                        raise
+                    )
+                    raise
                 if account_failover_planned:
+                    provider_candidate_attempts = max(
+                        0,
+                        provider_candidate_attempts - 1,
+                    )
                     _mark_auto_agent_alias_request_failover_pending(
                         request,
                         attempt_record,
