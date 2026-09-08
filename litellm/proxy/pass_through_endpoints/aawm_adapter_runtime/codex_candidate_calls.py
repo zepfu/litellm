@@ -5006,6 +5006,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             custom_llm_provider=litellm.LlmProviders.XAI.value,
             egress_credential_family="xai",
             expected_target_family="xai",
+            managed_xai_oauth_request=True,
             blocked_pass_through_prefixed_headers=[
                 "authorization",
                 "api-key",

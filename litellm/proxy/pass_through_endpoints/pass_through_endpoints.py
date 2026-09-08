@@ -1251,6 +1251,81 @@ def _ensure_passthrough_metadata(kwargs: Optional[dict]) -> Dict[str, Any]:
     return metadata
 
 
+_XAI_OAUTH_SEND_AUTH_SHAPE_FIELDS = (
+    "xai_oauth_send_bearer_authorization_present",
+    "xai_oauth_send_api_key_absent",
+    "xai_oauth_send_x_api_key_absent",
+)
+_XAI_OAUTH_SEND_AUTH_SHAPE_STATE_FIELD = "_aawm_xai_oauth_send_auth_shape"
+
+
+def _record_xai_oauth_send_auth_shape(
+    *,
+    request: Request,
+    prepared_request: httpx.Request,
+    managed_xai_oauth_request: bool,
+) -> dict[str, bool]:
+    """Record only the managed xAI outbound authentication header shape."""
+    if not managed_xai_oauth_request:
+        return {}
+
+    authorization = prepared_request.headers.get("authorization")
+    bearer_authorization_present = (
+        isinstance(authorization, str)
+        and authorization.strip().lower().startswith("bearer ")
+        and bool(authorization.strip()[len("bearer ") :].strip())
+    )
+    header_names = {str(key).lower() for key in prepared_request.headers}
+    observation = {
+        "xai_oauth_send_bearer_authorization_present": (
+            bearer_authorization_present
+        ),
+        "xai_oauth_send_api_key_absent": "api-key" not in header_names,
+        "xai_oauth_send_x_api_key_absent": "x-api-key" not in header_names,
+    }
+
+    request_state = getattr(request, "state", None)
+    if request_state is not None:
+        setattr(
+            request_state,
+            _XAI_OAUTH_SEND_AUTH_SHAPE_STATE_FIELD,
+            dict(observation),
+        )
+
+    verbose_proxy_logger.info(
+        "Managed xAI OAuth actual-send auth shape: "
+        "bearer_authorization_present=%s api_key_absent=%s x_api_key_absent=%s",
+        observation["xai_oauth_send_bearer_authorization_present"],
+        observation["xai_oauth_send_api_key_absent"],
+        observation["xai_oauth_send_x_api_key_absent"],
+    )
+    return observation
+
+
+def _xai_oauth_send_auth_shape_metadata(
+    request: Request,
+) -> dict[str, bool]:
+    request_state = getattr(request, "state", None)
+    observation = (
+        getattr(request_state, _XAI_OAUTH_SEND_AUTH_SHAPE_STATE_FIELD, None)
+        if request_state is not None
+        else None
+    )
+    if not isinstance(observation, dict):
+        return {}
+    return {
+        key: observation[key]
+        for key in _XAI_OAUTH_SEND_AUTH_SHAPE_FIELDS
+        if isinstance(observation.get(key), bool)
+    }
+
+
+def _clear_xai_oauth_send_auth_shape(request: Request) -> None:
+    request_state = getattr(request, "state", None)
+    if request_state is not None:
+        setattr(request_state, _XAI_OAUTH_SEND_AUTH_SHAPE_STATE_FIELD, None)
+
+
 def _watermark_endpoint_from_path(*parts: Any) -> str:
     combined = " ".join(
         str(part or "") for part in parts if part is not None
@@ -4780,6 +4855,7 @@ async def pass_through_request(  # noqa: PLR0915
     guardrails_config: Optional[dict] = None,
     egress_credential_family: Optional[str] = None,
     expected_target_family: Optional[str] = None,
+    managed_xai_oauth_request: bool = False,
     allowed_forward_headers: Optional[list[str]] = None,
     allowed_pass_through_prefixed_headers: Optional[list[str]] = None,
     blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
@@ -4808,6 +4884,7 @@ async def pass_through_request(  # noqa: PLR0915
         guardrails_config: Optional field - guardrails configuration for passthrough endpoint
         egress_credential_family: Optional provider family for sensitive local/client credentials
         expected_target_family: Optional provider family expected for the final egress target
+        managed_xai_oauth_request: Whether the route owner resolved a managed xAI OAuth request.
         retryable_upstream_status_codes: Optional upstream status codes that will be retried by the
             caller, so generic passthrough failure logging should be deferred to the adapter layer
         caller_managed_hidden_retry: When true, disables shared pre-first-byte hidden retries so
@@ -4908,6 +4985,7 @@ async def pass_through_request(  # noqa: PLR0915
     #########################################################
     try:
         start_time = datetime.now()
+        _clear_xai_oauth_send_auth_shape(request)
         # Register before session-owner 409 / candidate selection so native
         # uvicorn ACCESS on /openai_passthrough/responses is replaced even
         # when the request never reaches emit_aawm_route_access_log.
@@ -5383,6 +5461,12 @@ async def pass_through_request(  # noqa: PLR0915
                     metadata=passthrough_metadata,
                 )
                 try:
+                    if managed_xai_oauth_request:
+                        _record_xai_oauth_send_auth_shape(
+                            request=request,
+                            prepared_request=prepared_request,
+                            managed_xai_oauth_request=True,
+                        )
                     response = await async_client.send(
                         prepared_request,
                         stream=send_stream,
@@ -5395,6 +5479,24 @@ async def pass_through_request(  # noqa: PLR0915
                 return response
 
             openai_send_request_fn = _send_prepared_openai_request
+
+        send_request_fn = openai_send_request_fn
+        if managed_xai_oauth_request and send_request_fn is None:
+            async def _send_managed_xai_request(
+                prepared_request: httpx.Request,
+                send_stream: bool,
+            ) -> httpx.Response:
+                _record_xai_oauth_send_auth_shape(
+                    request=request,
+                    prepared_request=prepared_request,
+                    managed_xai_oauth_request=True,
+                )
+                return await async_client.send(
+                    prepared_request,
+                    stream=send_stream,
+                )
+
+            send_request_fn = _send_managed_xai_request
 
         if stream:
             await _aawm_session_owner_pre_send_guard(
@@ -5500,8 +5602,8 @@ async def pass_through_request(  # noqa: PLR0915
                     params=requested_query_params,
                     headers=stream_headers,
                 )
-                if openai_send_request_fn is not None:
-                    response = await openai_send_request_fn(req, stream)
+                if send_request_fn is not None:
+                    response = await send_request_fn(req, stream)
                 else:
                     response = await async_client.send(req, stream=stream)
                 try:
@@ -5520,7 +5622,12 @@ async def pass_through_request(  # noqa: PLR0915
                         upstream_request=getattr(e.response, "request", None) or req,
                         response_content=error_content,
                         litellm_call_id=litellm_call_id,
-                        extra_metadata={"stream": True},
+                        extra_metadata={
+                            "stream": True,
+                            **_xai_oauth_send_auth_shape_metadata(
+                                request
+                            ),
+                        },
                     )
                     raise _build_http_exception_from_upstream_status_error(
                         e,
@@ -5736,7 +5843,7 @@ async def pass_through_request(  # noqa: PLR0915
                     _parsed_body=provider_bound_body,
                     raw_body=raw_body,
                     prefer_stream_for_unknown_content=True,
-                    send_request_fn=openai_send_request_fn,
+                    send_request_fn=send_request_fn,
                 )
             )
             if _is_streaming_response(response) is True:
@@ -5756,7 +5863,12 @@ async def pass_through_request(  # noqa: PLR0915
                         upstream_request=getattr(e.response, "request", None),
                         response_content=error_content,
                         litellm_call_id=litellm_call_id,
-                        extra_metadata={"stream": True},
+                        extra_metadata={
+                            "stream": True,
+                            **_xai_oauth_send_auth_shape_metadata(
+                                request
+                            ),
+                        },
                     )
                     raise _build_http_exception_from_upstream_status_error(
                         e,
@@ -5806,7 +5918,12 @@ async def pass_through_request(  # noqa: PLR0915
                     upstream_request=getattr(e.response, "request", None),
                     response_content=error_content,
                     litellm_call_id=litellm_call_id,
-                    extra_metadata={"stream": False},
+                    extra_metadata={
+                        "stream": False,
+                        **_xai_oauth_send_auth_shape_metadata(
+                            request
+                        ),
+                    },
                 )
                 raise _build_http_exception_from_upstream_status_error(
                     e,
@@ -6014,7 +6131,10 @@ async def pass_through_request(  # noqa: PLR0915
             response_body=response_body,
             response_content=content,
             litellm_call_id=litellm_call_id,
-            extra_metadata={"stream": False},
+            extra_metadata={
+                "stream": False,
+                **_xai_oauth_send_auth_shape_metadata(request),
+            },
         )
         end_time = datetime.now()
 
@@ -6748,6 +6868,7 @@ def create_pass_through_route(
     guardrails: Optional[Dict[str, Any]] = None,
     egress_credential_family: Optional[str] = None,
     expected_target_family: Optional[str] = None,
+    managed_xai_oauth_request: bool = False,
     allowed_forward_headers: Optional[list[str]] = None,
     allowed_pass_through_prefixed_headers: Optional[list[str]] = None,
     blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
@@ -6832,6 +6953,7 @@ def create_pass_through_route(
                 "guardrails": None,
                 "egress_credential_family": egress_credential_family,
                 "expected_target_family": expected_target_family,
+                "managed_xai_oauth_request": managed_xai_oauth_request,
                 "allowed_forward_headers": allowed_forward_headers,
                 "allowed_pass_through_prefixed_headers": allowed_pass_through_prefixed_headers,
                 "blocked_pass_through_prefixed_headers": blocked_pass_through_prefixed_headers,
@@ -6861,6 +6983,7 @@ def create_pass_through_route(
             param_expected_target_family = target_params.get(
                 "expected_target_family", expected_target_family
             )
+            param_managed_xai_oauth_request = managed_xai_oauth_request
             param_allowed_forward_headers = target_params.get(
                 "allowed_forward_headers", allowed_forward_headers
             )
@@ -6924,6 +7047,7 @@ def create_pass_through_route(
                 expected_target_family=cast(
                     Optional[str], param_expected_target_family
                 ),
+                managed_xai_oauth_request=bool(param_managed_xai_oauth_request),
                 allowed_forward_headers=cast(
                     Optional[list[str]], param_allowed_forward_headers
                 ),
