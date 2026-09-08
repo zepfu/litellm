@@ -525,7 +525,6 @@ async def _validate_alias_candidate_responses_stream_if_needed(
             adapter_label=adapter_label,
             intake_context=intake_context,
             request_body=request_body,
-            request=request,
         ),
     )
 
@@ -1661,7 +1660,6 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
     adapter_label: str,
     intake_context: Optional[dict[str, Any]] = None,
     request_body: Optional[dict[str, Any]] = None,
-    request: Optional[Request] = None,
 ) -> Response:
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.repetitive_output import (
         inherit_or_wrap_passthrough_streaming_response,
@@ -2362,15 +2360,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 event_summaries=event_summaries,
                 reject_malformed_tool_text=True,
             )
-            from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
-                _bind_responses_wire_stream,
-            )
-
-            return _bind_responses_wire_stream(
-                validated_response,
-                request=request,
-                adapter_model=adapter_model,
-            )
+            return validated_response
         validation_state = prefetch_state
         _set_stream_validation_state(peek.response, validation_state)
         validated_response = _bind_incremental_stream_validation(

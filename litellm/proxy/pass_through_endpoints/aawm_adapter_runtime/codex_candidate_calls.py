@@ -4871,9 +4871,11 @@ async def _handle_codex_cohere_chat_completions_adapter_route(
         adapter_label="Cohere",
         intake_context=intake_context,
         request_body=prepared_request_body,
-        request=request,
     )
     if isinstance(validated_response, StreamingResponse):
+        validated_response = _bind_responses_wire_stream(
+            validated_response, request=request, adapter_model=adapter_model
+        )
         return _record_adapted_completed_route_rollup_after_stream(
             validated_response,
             rollup_kwargs,
@@ -5230,9 +5232,11 @@ async def _handle_codex_nvidia_completion_adapter_route(
         adapter_label="NVIDIA",
         intake_context=intake_context,
         request_body=prepared_request_body,
-        request=request,
     )
     if isinstance(validated_response, StreamingResponse):
+        validated_response = _bind_responses_wire_stream(
+            validated_response, request=request, adapter_model=adapter_model
+        )
         return _record_adapted_completed_route_rollup_after_stream(
             validated_response,
             rollup_kwargs,
@@ -5456,7 +5460,6 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
             adapter_label="Grok native",
             intake_context=grok_intake_context,
             request_body=canonical_request_body,
-            request=request,
         )
         if isinstance(validated_response, StreamingResponse):
             validated_response = _bind_xai_responses_wire_stream(
@@ -5609,7 +5612,6 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             adapter_label="xAI OAuth",
             intake_context=xai_intake_context,
             request_body=canonical_request_body,
-            request=request,
         )
         if isinstance(validated_response, StreamingResponse):
             validated_response = _bind_xai_responses_wire_stream(
@@ -6234,9 +6236,11 @@ async def _handle_codex_kimi_chat_completions_adapter_route(
         adapter_label="Kimi Code",
         intake_context=intake_context,
         request_body=prepared_request_body,
-        request=request,
     )
     if isinstance(validated_response, StreamingResponse):
+        validated_response = _bind_responses_wire_stream(
+            validated_response, request=request, adapter_model=adapter_model
+        )
         return _record_adapted_completed_route_rollup_after_stream(
             validated_response,
             rollup_kwargs,
@@ -6540,9 +6544,11 @@ async def _handle_codex_alibaba_token_plan_adapter_route(
             provider="alibaba_token_plan",
         ),
         request_body=prepared_request_body,
-        request=request,
     )
     if isinstance(validated_response, StreamingResponse):
+        validated_response = _bind_responses_wire_stream(
+            validated_response, request=request, adapter_model=adapter_model
+        )
         return _record_adapted_completed_route_rollup_after_stream(
             validated_response,
             rollup_kwargs,
@@ -6751,9 +6757,11 @@ async def _handle_codex_zai_coding_plan_adapter_route(
         adapter_label="Z.AI Coding Plan",
         intake_context=intake_context,
         request_body=prepared_request_body,
-        request=request,
     )
     if isinstance(validated_response, StreamingResponse):
+        validated_response = _bind_responses_wire_stream(
+            validated_response, request=request, adapter_model=adapter_model
+        )
         return _record_adapted_completed_route_rollup_after_stream(
             validated_response,
             rollup_kwargs,
@@ -8105,9 +8113,11 @@ async def _perform_codex_auto_agent_openrouter_completion_request(  # noqa: PLR0
             adapter_label="OpenRouter chat-completions",
             intake_context=intake_context,
             request_body=canonical_request_body,
-            request=request,
         )
         if isinstance(validated_response, StreamingResponse):
+            validated_response = _bind_responses_wire_stream(
+                validated_response, request=request, adapter_model=adapter_model
+            )
             return _record_adapted_completed_route_rollup_after_stream(
                 validated_response,
                 rollup_kwargs,
@@ -8149,7 +8159,6 @@ async def _perform_codex_auto_agent_openrouter_completion_request(  # noqa: PLR0
         adapter_label="OpenRouter chat-completions",
         intake_context=intake_context,
         request_body=canonical_request_body,
-        request=request,
     )
     _record_adapted_completed_route_rollup_turn(
         rollup_kwargs,
