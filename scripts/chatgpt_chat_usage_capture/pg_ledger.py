@@ -2672,6 +2672,24 @@ def _follow_superseded_attempt(
     return current_ref, _attempt(cur, current_ref.scope_key, current_ref.attempt_id)
 
 
+def _weak_matches_without_generation_anchors(
+    cur: psycopg.Cursor,
+    aliases: Sequence[tuple[str, str]],
+    matches: set[AttemptRef],
+) -> set[AttemptRef]:
+    if not _attempt_alias_values_for_input(aliases, "generation"):
+        return matches
+    return {
+        matched_ref
+        for matched_ref in matches
+        if not _attempt_alias_values(
+            cur,
+            _follow_superseded_attempt(cur, matched_ref)[0],
+            "generation",
+        )
+    }
+
+
 def _resolve_attempt_identity(
     page: PgLedgerPage,
     cur: psycopg.Cursor,
@@ -2693,17 +2711,7 @@ def _resolve_attempt_identity(
     else:
         matches = _matching_alias_refs(cur, lineage_keys, weak_aliases)
         if matches:
-            incoming_generations = _attempt_alias_values_for_input(aliases, "generation")
-            if incoming_generations:
-                generation_anchored = set()
-                for matched_ref in matches:
-                    resolved_ref, _candidate = _follow_superseded_attempt(
-                        cur,
-                        matched_ref,
-                    )
-                    if _attempt_alias_values(cur, resolved_ref, "generation"):
-                        generation_anchored.add(matched_ref)
-                matches -= generation_anchored
+            matches = _weak_matches_without_generation_anchors(cur, aliases, matches)
     matches.discard(raw_incoming_ref)
     matches.discard(incoming_ref)
 
