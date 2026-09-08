@@ -2409,10 +2409,19 @@ def _chatgpt_oracle_browser_binding(
         raise RuntimeError("Oracle process-handle supervision is unavailable.") from exc
     process: Optional[subprocess.Popen] = None
     temp_root = tempfile.mkdtemp(prefix="aawm-oracle-owner-")
-    child_env = {
-        **os.environ, "TMPDIR": temp_root, CHATGPT_ORACLE_OWNER_ENV: temp_root,
-    }
     try:
+        private_home = Path(temp_root)
+        # Keep Chrome's desktop/config state separate from the sidecar user's home.
+        for directory_name in ("config", "cache"):
+            (private_home / directory_name).mkdir(mode=0o700)
+        child_env = {
+            **os.environ,
+            "HOME": temp_root,
+            "XDG_CONFIG_HOME": str(private_home / "config"),
+            "XDG_CACHE_HOME": str(private_home / "cache"),
+            "TMPDIR": temp_root,
+            CHATGPT_ORACLE_OWNER_ENV: temp_root,
+        }
         try:
             process = subprocess.Popen(
                 _chatgpt_oracle_startup_argv(binding),
