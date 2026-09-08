@@ -797,7 +797,8 @@ falling back to the general provider-status DSN. Account identifiers and
 collector source paths are hashed; titles, names, usernames, workspace fields,
 feature notes, emails, cookies, token values, and unknown string fields are
 redacted. Strings are retained only for explicit telemetry fields such as
-model/feature identity, status, state, mode, window, and reset timestamps.
+model/feature identity (including native limits-progress `feature_name`),
+status, state, mode, window, and reset timestamps.
 Finite numeric token usage counters such as `input_tokens`, `output_tokens`,
 and `token_limit` remain available in sanitized projections. Snapshot
 `raw_provider_fields` omit `observed_at` so repeated identical polls do not
@@ -869,6 +870,40 @@ status, bound capture or persistence coverage of `partial`, `failed`,
 `database_write_skipped` degrades optional health. Persistence
 `not_applied` is intentional dry-run behavior and does not degrade health;
 required refresh failures still control the one-shot exit code.
+
+When a bound capture cannot write a current snapshot,
+`account_coverage[].collector_failure_reason` is either null or one of these
+fixed sanitized values:
+`invalid_expected_account_hash`, `browser_boundary_unavailable`,
+`malformed_browser_response`, `browser_challenge`, `http_auth`,
+`http_error`, `http_http_error`, `native_identity_unverified`, `native_capture_error`,
+`native_capture_incomplete`,
+`native_capture_invalid_account_hash`,
+`native_capture_invalid_identity_source`,
+`native_capture_incomplete_selector_evidence`, `native_capture_uncorrelated`,
+`native_capture_invalid_request_method`,
+`native_capture_invalid_body_observation`,
+`native_capture_invalid_browser_challenge`,
+`conflicting_native_payload_account_id`, `native_payload_identity_mismatch`,
+`invalid_retry_after_seconds`,
+`account_identity_mismatch`, `missing_authoritative_account_id`,
+`conflicting_authoritative_account_id`, `payload_not_present`,
+`payload_not_mapping`, `payload_marker_missing`,
+`collections_wholly_malformed`, `account_identity_unverified`,
+`account_identity_missing`, or `snapshot_write_failed`. These values describe
+the rejected current capture; they do not replace a reusable last-good
+snapshot.
+
+The same per-account entry exposes bounded structural diagnostics from the
+sanitized current payload: `model_limits_state`, `limits_progress_state`, and
+`blocked_features_state` are fixed enums (`absent_unknown`, `empty_unknown`,
+`present`, `partial`, or `malformed`); `malformed_entry_count` and
+`valid_observation_count` are nonnegative counts capped at 800;
+`projection_truncated` reports projection truncation; and
+`malformed_collection_projection` reports collection members dropped by
+sanitization. These fields contain no collection values, identities, dynamic
+keys, schema strings, or raw errors, and remain zero/unknown when no payload
+was available.
 
 Relevant environment variables:
 
