@@ -1131,12 +1131,9 @@ function summaryOrigin(
   warnings: string[],
 ): string | null {
   const origin = optionalString(item.origin);
-  if (origin !== null) {
-    return origin;
-  }
   const metadataRaw = item.metadata;
   if (!isRecord(metadataRaw)) {
-    return null;
+    return origin;
   }
   const metadataProjection = sanitizeMetadataWithDiagnostics(metadataRaw);
   if (metadataProjection.diagnostics.status !== "complete") {
@@ -1146,9 +1143,13 @@ function summaryOrigin(
   }
   const metadata = metadataProjection.metadata;
   return (
-    optionalString(metadata.origin) ??
-    (metadata.imported === true ? "imported" : null) ??
-    (metadata.from_copy === true ? "copied" : null)
+    (metadata.imported === true
+      ? "imported"
+      : metadata.from_copy === true
+        ? "copied"
+        : metadata.from_shared === true
+          ? "shared"
+          : origin ?? optionalString(metadata.origin))
   );
 }
 
