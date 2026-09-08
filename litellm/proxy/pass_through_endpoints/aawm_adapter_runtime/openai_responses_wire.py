@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, AsyncIterable, AsyncIterator, Awaitable, Callable, Dict, Optional
 
+import anyio
 from starlette.responses import Response, StreamingResponse
 
 
@@ -206,7 +207,11 @@ async def _await_shielded(awaitable: Awaitable[Any]) -> Any:
     try:
         await asyncio.shield(task)
     except asyncio.CancelledError:
-        await task
+        # AnyIO cancellation scopes can keep delivering cancellation at every
+        # await. Keep the cleanup task shielded while it finishes, then
+        # propagate the original cancellation to the caller.
+        with anyio.CancelScope(shield=True):
+            await task
         raise
     return task.result()
 
@@ -507,26 +512,6 @@ class OpenAIResponsesWireCoordinator:
     ) -> None:
         await self.trace._finalize_disposition(disposition, self._on_disposition)
 
-    async def _resume_source_after_terminal(self) -> None:
-        """Resume stream finalization once before emitting canonical ``[DONE]``."""
-
-        source_iterator = self._source_iterator
-        if source_iterator is None:
-            source_iterator = self._source.__aiter__()
-            self._source_iterator = source_iterator
-        advance = getattr(source_iterator, "__anext__", None)
-        if not callable(advance):
-            return
-        try:
-            discarded = await advance()
-        except StopAsyncIteration:
-            return
-        except Exception as exc:  # noqa: BLE001
-            self.trace.metadata["post_terminal_source_error"] = type(exc).__name__
-            return
-        if discarded:
-            self.trace.metadata["post_terminal_source_chunk_discarded"] = True
-
     def _select_terminal(
         self,
         *,
@@ -550,7 +535,6 @@ class OpenAIResponsesWireCoordinator:
         self.trace._done_body = self._DONE
         self._select_terminal(event_type=event_type, disposition=disposition)
         yield block
-        await self._resume_source_after_terminal()
         yield self._DONE
         await self._notify(disposition)
 
@@ -807,6 +791,10 @@ class OpenAIResponsesBufferedResponse(Response):
         self.wire_trace = wire_trace
         self._disposition = disposition
         self._on_disposition = on_disposition
+        # A buffered Responses JSON body is the terminal payload itself. Bind
+        # it before ASGI delivery so the post-send trace records commitment.
+        if isinstance(self.body, bytes):
+            self.wire_trace._terminal_body = self.body
 
     async def _finalize(
         self,
