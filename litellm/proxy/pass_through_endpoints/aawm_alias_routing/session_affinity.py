@@ -132,6 +132,11 @@ class SessionOwnerLease:
         compare=False,
     )
     finalizing: bool = False
+    # Native OpenAI Responses ownership cannot be promoted from HTTP 2xx. The
+    # lease remains renewable until the final wire coordinator reports a
+    # terminal disposition.
+    wire_terminal_pending: bool = False
+    wire_disposition: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -2641,6 +2646,7 @@ async def run_with_session_owner_lease_renewal(
         raise
     lease.renewal_task = renewal_task
 
+    operation_succeeded = False
     try:
         done, _ = await asyncio.wait(
             {operation_task, renewal_task},
@@ -2660,19 +2666,38 @@ async def run_with_session_owner_lease_renewal(
                 raise
             if renewal_error is not None:
                 raise renewal_error
+            operation_succeeded = True
             return result
 
         renewal_error = _session_owner_renewal_task_error(renewal_task, lease)
         if renewal_error is not None:
             await _cancel_and_await_tasks(operation_task)
             raise renewal_error
-        return await operation_task
+        result = await operation_task
+        operation_succeeded = True
+        return result
     finally:
-        try:
-            await _cancel_and_await_tasks(operation_task, renewal_task)
-        finally:
-            if lease.renewal_task is renewal_task:
-                lease.renewal_task = None
+        preserve_deferred_wire_renewal = (
+            operation_succeeded
+            and lease.wire_terminal_pending
+            and lease.wire_disposition is None
+            and not lease.finalizing
+            and not lease.promoted
+            and not lease.released
+            and lease.renewal_task is renewal_task
+        )
+        if preserve_deferred_wire_renewal:
+            # A nested pass-through may defer this lease after returning a
+            # streaming response. Keep the existing renewer alive until the
+            # final wire disposition releases or promotes the lease.
+            if not operation_task.done():
+                await _cancel_and_await_tasks(operation_task)
+        else:
+            try:
+                await _cancel_and_await_tasks(operation_task, renewal_task)
+            finally:
+                if lease.renewal_task is renewal_task:
+                    lease.renewal_task = None
 
 
 async def promote_session_owner_reservation(  # noqa: PLR0911
@@ -2974,6 +2999,8 @@ async def finalize_session_owner_lease_on_success(
 ) -> Optional[SessionOwnerMutationResult]:
     if lease is None or not lease.held_reservation or lease.promoted or lease.released:
         return None
+    if lease.wire_terminal_pending:
+        return None
     await _barrier_session_owner_lease_renewal(lease)
     result = await promote_session_owner_reservation(
         session_identity=lease.session_identity,
@@ -2996,6 +3023,9 @@ async def finalize_session_owner_lease_on_failure(
 ) -> Optional[SessionOwnerMutationResult]:
     if lease is None or not lease.held_reservation or lease.promoted or lease.released:
         return None
+    if lease.wire_terminal_pending and lease.wire_disposition is None:
+        lease.wire_disposition = "failed"
+        lease.wire_terminal_pending = False
     await _barrier_session_owner_lease_renewal(lease)
     result = await release_session_owner_reservation(
         session_identity=lease.session_identity,
@@ -3009,6 +3039,75 @@ async def finalize_session_owner_lease_on_failure(
         lease.released = True
         _stop_session_owner_lease_renewal(lease)
     return result
+
+
+def defer_session_owner_lease_until_wire_terminal(request: Any) -> bool:
+    """Keep a native OpenAI lease reserved until final wire disposition."""
+
+    lease = get_request_session_owner_lease(request)
+    if lease is None or not lease.held_reservation or lease.promoted or lease.released:
+        return False
+    lease.wire_terminal_pending = True
+    lease.wire_disposition = None
+    if lease.renewal_task is None or lease.renewal_task.done():
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return True
+        renewal_task = loop.create_task(
+            _session_owner_lease_renewal_loop(
+                lease,
+                ttl_seconds=_DEFAULT_RESERVATION_TTL_SECONDS,
+                interval_seconds=_normalize_reservation_renewal_interval(
+                    _DEFAULT_RESERVATION_TTL_SECONDS,
+                    None,
+                ),
+            )
+        )
+
+        def _consume_renewal_task_result(task: Any) -> None:
+            if task.cancelled():
+                return
+            try:
+                error = task.exception()
+            except BaseException:
+                return
+            if error is not None:
+                verbose_proxy_logger.error(
+                    "Session-owner reservation renewal stopped for deferred "
+                    "wire terminal: %s",
+                    type(error).__name__,
+                )
+
+        renewal_task.add_done_callback(_consume_renewal_task_result)
+        lease.renewal_task = renewal_task
+    return True
+
+
+async def finalize_session_owner_lease_on_wire_disposition(
+    request: Any,
+    *,
+    disposition: str,
+    attributes: Optional[Mapping[str, Any]] = None,
+    candidate: Optional[Mapping[str, Any]] = None,
+) -> Optional[SessionOwnerMutationResult]:
+    """Finalize one deferred lease from the immutable final-wire decision."""
+
+    lease = get_request_session_owner_lease(request)
+    if lease is None or not lease.held_reservation or lease.promoted or lease.released:
+        return None
+    if lease.wire_disposition is not None:
+        return None
+    normalized = str(disposition or "").strip().lower()
+    lease.wire_disposition = normalized or "failed"
+    lease.wire_terminal_pending = False
+    if normalized == "completed":
+        return await finalize_session_owner_lease_on_success(
+            lease,
+            attributes=attributes,
+            candidate=candidate,
+        )
+    return await finalize_session_owner_lease_on_failure(lease)
 
 
 async def finalize_request_session_owner_lease(
