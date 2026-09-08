@@ -2692,6 +2692,8 @@ class NativeHistoryLifecycleRegistration:
     cdp_endpoint: str
     anchor_target_id: str
     deadline: float
+    operation_start: float
+    target_close_budget: float
     cleanup_callback: Optional[Callable[[float], Any]] = None
     close_registration: Optional[NativeHistoryCloseRegistration] = None
     started: bool = False
@@ -2736,6 +2738,14 @@ class NativeHistoryLifecycleCapability(Protocol):
         ...
 
     def terminate_owned_browser(self, deadline: float) -> bool:
+        ...
+
+    def bind_native_history_endpoint(
+        self,
+        *,
+        cdp_endpoint: str,
+        anchor_target_id: str,
+    ) -> None:
         ...
 
 
@@ -3680,6 +3690,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
     expected_account_hash: str,
     deadline: float,
     max_response_bytes: int,
+    abort_event: Optional[Any] = None,
 ) -> Mapping[str, Any]:
     capture: Dict[str, Any] = {}
     boundary_reason: Optional[str] = None
@@ -3711,6 +3722,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             observer_closed
             or boundary_reason is not None
             or terminal_failure is not None
+            or (abort_event is not None and abort_event.is_set())
         )
 
     def is_history_url(url: Any) -> bool:
@@ -4136,6 +4148,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             observer_closed
             or boundary_reason is not None
             or terminal_failure is not None
+            or (abort_event is not None and abort_event.is_set())
             or capture.get("identity_conflict") is True
             or (
                 capture.get("loading_failed") is True
@@ -4647,6 +4660,7 @@ def observe_native_chatgpt_history_from_oracle_browser(
             "retain_native_history",
             "release_native_history",
             "terminate_owned_browser",
+            "bind_native_history_endpoint",
         )
     ):
         raise OracleBrowserBoundaryUnavailable(
@@ -4692,6 +4706,20 @@ def observe_native_chatgpt_history_from_oracle_browser(
             "Oracle browser CDP endpoint is not configured."
         )
     deadline = time.monotonic() + float(timeout_seconds)
+    operation_start = time.monotonic()
+    target_close_budget = min(
+        10.0,
+        max(0.0, deadline - operation_start) / 4,
+    )
+    try:
+        lifecycle_capability.bind_native_history_endpoint(
+            cdp_endpoint=endpoint,
+            anchor_target_id=target_id,
+        )
+    except Exception as exc:
+        raise OracleBrowserBoundaryUnavailable(
+            "Native ChatGPT history lifecycle endpoint binding failed."
+        ) from exc
     try:
         return dict(
             _run_oracle_browser_history_observation_in_worker(
@@ -4699,6 +4727,8 @@ def observe_native_chatgpt_history_from_oracle_browser(
                 page_target_id=target_id,
                 expected_account_hash=expected_account_hash,
                 deadline=deadline,
+                operation_start=operation_start,
+                target_close_budget=target_close_budget,
                 max_response_bytes=max_response_bytes,
                 lifecycle_capability=lifecycle_capability,
             )
@@ -4980,11 +5010,16 @@ def _run_oracle_browser_history_observation_in_worker(  # noqa: PLR0915 - bounde
     abort_event = context.Event()
     release_event = context.Event()
     creation_url = "about:blank#oracle-native-history-" + os.urandom(16).hex()
-    cleanup_budget = min(
-        3.0,
-        max(0.0, _remaining_browser_timeout(deadline)) / 4,
+    operation_start = time.monotonic()
+    target_close_budget = min(
+        10.0,
+        max(0.0, deadline - operation_start) / 4,
     )
-    capture_deadline = deadline - cleanup_budget
+    cleanup_deadline = min(
+        operation_start + target_close_budget,
+        deadline,
+    )
+    capture_deadline = cleanup_deadline
     process = context.Process(
         target=_oracle_browser_history_observation_worker,
         args=(
@@ -4992,6 +5027,7 @@ def _run_oracle_browser_history_observation_in_worker(  # noqa: PLR0915 - bounde
             cdp_endpoint,
             page_target_id,
             capture_deadline,
+            cleanup_deadline,
             expected_account_hash,
             max_response_bytes,
             private_process_group,
@@ -5019,12 +5055,18 @@ def _run_oracle_browser_history_observation_in_worker(  # noqa: PLR0915 - bounde
         cdp_endpoint=cdp_endpoint,
         anchor_target_id=page_target_id,
         deadline=deadline,
+        operation_start=operation_start,
+        target_close_budget=target_close_budget,
     )
     registration.cleanup_callback = lambda cleanup_deadline: (
         _finalize_native_history_registration(
             registration,
             lifecycle_capability,
-            cleanup_deadline,
+            cleanup_deadline=min(
+                registration.operation_start + registration.target_close_budget,
+                deadline,
+            ),
+            operation_deadline=deadline,
         )
     )
     try:
@@ -5075,7 +5117,12 @@ def _run_oracle_browser_history_observation_in_worker(  # noqa: PLR0915 - bounde
         if not _finalize_native_history_registration(
             registration,
             lifecycle_capability,
-            deadline,
+            cleanup_deadline=min(
+                registration.operation_start
+                + registration.target_close_budget,
+                deadline,
+            ),
+            operation_deadline=deadline,
         ):
             cleanup_error = OracleBrowserCleanupError(
                 registration.cleanup_failure
@@ -5153,7 +5200,9 @@ def _native_history_process_reaped(
 def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle finalizer
     registration: NativeHistoryLifecycleRegistration,
     lifecycle_capability: NativeHistoryLifecycleCapability,
-    deadline: float,
+    *,
+    cleanup_deadline: float,
+    operation_deadline: float,
 ) -> bool:
     """Close, release, and reap one history operation without dropping ownership."""
 
@@ -5162,7 +5211,7 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
         and _native_history_process_reaped(
             registration.process,
             registration.private_process_group,
-            deadline,
+            operation_deadline,
         )
         and (
             registration.close_registration is None
@@ -5181,7 +5230,7 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
         if not _native_history_process_reaped(
             close_registration.process,
             close_registration.private_process_group,
-            deadline,
+            cleanup_deadline,
         ):
             registration.cleanup_failure = (
                 "Native ChatGPT history closer was not reaped."
@@ -5232,7 +5281,7 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
                 target_id=target_id,
                 anchor_target_id=registration.anchor_target_id,
                 creation_url=registration.creation_url,
-                deadline=deadline,
+                deadline=cleanup_deadline,
                 playwright_factory=None,
                 lifecycle_capability=lifecycle_capability,
                 lifecycle_registration=registration,
@@ -5248,7 +5297,7 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
 
     if proof is None:
         try:
-            if lifecycle_capability.terminate_owned_browser(deadline):
+            if lifecycle_capability.terminate_owned_browser(operation_deadline):
                 registration.creation_state.value = (
                     _NATIVE_HISTORY_TARGET_BROWSER_TERMINATED
                 )
@@ -5284,7 +5333,7 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
     if not _native_history_process_reaped(
         registration.process,
         registration.private_process_group,
-        deadline,
+        operation_deadline,
     ):
         registration.cleanup_failure = (
             "Native ChatGPT history interception worker was not reaped."
@@ -5309,6 +5358,7 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
     cdp_endpoint: str,
     page_target_id: str,
     capture_deadline: float,
+    cleanup_deadline: float,
     expected_account_hash: str,
     max_response_bytes: int,
     private_process_group: Any,
@@ -5377,6 +5427,7 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
             expected_account_hash=expected_account_hash,
             deadline=capture_deadline,
             max_response_bytes=max_response_bytes,
+            abort_event=abort_event,
         )
         _raise_if_browser_deadline_expired(capture_deadline)
         successful = not abort_event.is_set()
@@ -5526,6 +5577,7 @@ def _close_owned_oracle_target(
     lifecycle_registration: Optional[NativeHistoryLifecycleRegistration] = None,
 ) -> None:
     """Give exact-target cleanup its own bounded, killable driver."""
+    _raise_if_browser_deadline_expired(deadline)
     if target_id == anchor_target_id:
         raise OracleBrowserBoundaryUnavailable(
             "Oracle browser cleanup cannot close the context anchor."

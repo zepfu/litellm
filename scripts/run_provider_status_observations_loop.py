@@ -2405,10 +2405,13 @@ class _ChatGPTOracleBrowserOwner:
         self.pending_registry = pending_registry
         self.pending_registry_lock = pending_registry_lock
         self.owner_id = "oracle-owner-" + uuid.uuid4().hex
+        self.cdp_endpoint = ""
+        self.anchor_target_id = ""
         self.registrations: Dict[str, NativeHistoryLifecycleRegistration] = {}
         self.handles: Dict[int, int] = {}
         self.cleanup_error: Optional[str] = None
         self.transferred = False
+        self.operation_deadline: Optional[float] = None
         self.history_deadline: Optional[float] = None
 
     @staticmethod
@@ -2428,6 +2431,13 @@ class _ChatGPTOracleBrowserOwner:
             if registration.registration_id in self.registrations:
                 raise RuntimeError("Native history lifecycle was registered twice.")
             self.registrations[registration.registration_id] = registration
+            if self.operation_deadline is None:
+                self.operation_deadline = registration.deadline
+            else:
+                self.operation_deadline = min(
+                    self.operation_deadline,
+                    registration.deadline,
+                )
             if self.history_deadline is None:
                 self.history_deadline = registration.deadline
             else:
@@ -2497,6 +2507,8 @@ class _ChatGPTOracleBrowserOwner:
         return True
 
     def terminate_owned_browser(self, deadline: float) -> bool:
+        if deadline is None:
+            raise RuntimeError("Oracle browser termination deadline is required.")
         """Terminate only this profile owner's helper tree and prove reaping."""
 
         try:
@@ -2528,12 +2540,18 @@ class _ChatGPTOracleBrowserOwner:
         return self.process.returncode is not None
 
     def _cleanup_owner(self, deadline: float) -> bool:
-        if not self.terminate_owned_browser(deadline):
+        phase_deadline = time.monotonic() + max(
+            0.0,
+            (deadline - time.monotonic()) / 2,
+        )
+        if not self.terminate_owned_browser(phase_deadline):
+            self._retain_orphaned_scratch()
             return False
         if not _remove_chatgpt_oracle_scratch_bounded(
             self.temp_root,
             deadline,
         ):
+            self._retain_orphaned_scratch()
             self.cleanup_error = "Oracle browser scratch cleanup failed."
             return False
         for handle in self.handles.values():
@@ -2543,6 +2561,31 @@ class _ChatGPTOracleBrowserOwner:
             if stream is not None:
                 stream.close()
         return True
+
+    def _retain_orphaned_scratch(self) -> None:
+        """Keep one bounded remover handle if browser cleanup cannot finish."""
+
+        try:
+            if not Path(self.temp_root).exists():
+                return
+            remover = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import shutil,sys; shutil.rmtree(sys.argv[1])",
+                    self.temp_root,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            handle = os.pidfd_open(remover.pid)
+            self.handles[remover.pid] = handle
+        except OSError as exc:
+            self.cleanup_error = (
+                self.cleanup_error
+                or f"Oracle browser scratch remover could not be retained: "
+                f"{_redacted_failure_message(str(exc))}"
+            )
 
     def finalize(self, deadline: float) -> bool:
         with self.pending_registry_lock:
@@ -2563,7 +2606,13 @@ class _ChatGPTOracleBrowserOwner:
         return self._cleanup_owner(deadline)
 
     def service_pending(self) -> bool:
-        cleanup_deadline = time.monotonic() + 5.0
+        with self.pending_registry_lock:
+            deadline = self.operation_deadline
+        if deadline is None:
+            deadline = self.history_deadline
+        if deadline is None:
+            deadline = time.monotonic() + 5.0
+        cleanup_deadline = deadline
         with self.pending_registry_lock:
             registrations = list(self.registrations.values())
             for registration in registrations:
@@ -2614,7 +2663,25 @@ class _ChatGPTOracleBrowserLifecycleCapability:
         self.owner.release(registration, proof=proof)
 
     def terminate_owned_browser(self, deadline: float) -> bool:
+        if deadline is None:
+            raise RuntimeError("Oracle browser termination deadline is required.")
         return self.owner.terminate_owned_browser(deadline)
+
+    def bind_native_history_endpoint(
+        self,
+        *,
+        cdp_endpoint: str,
+        anchor_target_id: str,
+    ) -> None:
+        with self.owner.pending_registry_lock:
+            if self.owner.transferred:
+                raise RuntimeError("Oracle browser lifecycle authority was lost.")
+        if cdp_endpoint != self.owner.cdp_endpoint:
+            raise RuntimeError("Native history CDP endpoint does not match owner.")
+        if anchor_target_id != self.owner.anchor_target_id:
+            raise RuntimeError(
+                "Native history anchor target does not match owner."
+            )
 
 
 def _cleanup_chatgpt_oracle_process(
@@ -2751,20 +2818,28 @@ def _chatgpt_oracle_browser_binding(  # noqa: PLR0915 - bounded owner lifecycle 
         )
         capability = _ChatGPTOracleBrowserLifecycleCapability(owner)
         resolved = _read_chatgpt_oracle_startup_binding(process)
+        owner.cdp_endpoint = resolved.cdp_endpoint
+        owner.anchor_target_id = resolved.page_target_id
         yield ChatGPTConversationInitResolvedBinding(
             cdp_endpoint=resolved.cdp_endpoint,
             page_target_id=resolved.page_target_id,
-            lifecycle_capability=capability,
+            lifecycle_capability=(
+                capability if pending_lifecycle_registry is not None else None
+            ),
         )
     finally:
         if process is not None:
             if owner is not None and (
-                owner.registrations or owner.history_deadline is not None
+                owner.registrations
+                or owner.history_deadline is not None
+                or owner.operation_deadline is not None
             ):
                 deadlines = [
                     registration.deadline
                     for registration in owner.registrations.values()
                 ]
+                if owner.operation_deadline is not None:
+                    deadlines.append(owner.operation_deadline)
                 if owner.history_deadline is not None:
                     deadlines.append(owner.history_deadline)
                 completed = owner.finalize(

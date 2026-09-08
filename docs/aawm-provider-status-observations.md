@@ -969,9 +969,13 @@ prior rows or establish account coverage.
 `observe_native_chatgpt_history_from_oracle_browser(...)` is a separate,
 attach-only feasibility observer for ordinary Chat history. It requires the
 nonserialized lifecycle capability supplied by the private profile owner, the
-exact CDP anchor target, and the pinned canonical-12 account hash
-`8e92854835c4`, creates one owned page in that browser context, and performs
-one ordinary `https://chatgpt.com/` navigation. It observes at most one native
+owner's persistent supervised registry, the exact CDP endpoint and anchor
+target, and the pinned canonical-12 account hash `8e92854835c4`, creates one
+owned page in that browser context, and performs one ordinary
+`https://chatgpt.com/` navigation. The observer first rejects a capability whose
+CDP endpoint or anchor target does not match the owner. Cleanup uses one
+absolute operation deadline with reserved phase budgets for target close,
+termination, reaping, and scratch removal. It observes at most one native
 `GET /backend-api/conversations` request through CDP
 `Network.requestWillBeSent`, `Network.requestWillBeSentExtraInfo`, and the
 correlated response events. The timeout is capped at 150 seconds and the
