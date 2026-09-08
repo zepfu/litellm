@@ -2673,6 +2673,49 @@ def _session_owner_renewal_task_error(
     return task.exception()
 
 
+def start_session_owner_lease_renewal(
+    lease: Optional[SessionOwnerLease],
+    *,
+    reservation_ttl_seconds: float = _DEFAULT_RESERVATION_TTL_SECONDS,
+    renewal_interval_seconds: Optional[float] = None,
+) -> Optional[Any]:
+    """Start a response-owned renewer for a still-held reservation.
+
+    ``run_with_session_owner_lease_renewal`` owns its task only for the
+    provider operation. Deferred responses need the same renewal contract
+    while their body iterator is being consumed, so the response lifecycle
+    takes ownership of a separate task and joins it during finalization.
+    """
+
+    if not _session_owner_lease_is_renewable(lease):
+        return None
+    assert lease is not None
+
+    existing_task = lease.renewal_task
+    if existing_task is not None:
+        if not existing_task.done():
+            return existing_task
+        existing_error = _session_owner_renewal_task_error(existing_task, lease)
+        if existing_error is not None:
+            return existing_task
+        lease.renewal_task = None
+
+    ttl = _normalize_reservation_ttl(reservation_ttl_seconds)
+    interval = _normalize_reservation_renewal_interval(
+        ttl,
+        renewal_interval_seconds,
+    )
+    renewal_task = asyncio.create_task(
+        _session_owner_lease_renewal_loop(
+            lease,
+            ttl_seconds=ttl,
+            interval_seconds=interval,
+        )
+    )
+    lease.renewal_task = renewal_task
+    return renewal_task
+
+
 async def run_with_session_owner_lease_renewal(
     lease: Optional[SessionOwnerLease],
     operation: Callable[[], Awaitable[_SessionOwnerLeaseOperationT]],
@@ -3150,17 +3193,23 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
     attributes: Optional[Mapping[str, Any]] = None,
     candidate: Optional[Mapping[str, Any]] = None,
     failure_phase: str = "session_owner_stream_promote",
+    success_finalizer: Optional[
+        Callable[[], Awaitable[Optional[SessionOwnerMutationResult]]]
+    ] = None,
+    success_outcomes: Optional[set[SessionOwnerMutationOutcome]] = None,
+    on_success: Optional[Callable[[], Awaitable[None]]] = None,
+    on_failure: Optional[Callable[[Optional[BaseException]], Awaitable[None]]] = None,
 ) -> bool:
-    """Finalize a deferred lease only after the complete stream outcome.
+    """Bind ownership to the complete, validated response stream.
 
-    Alias candidate validation can return a bounded-peeked stream before its
-    terminal Responses event is available. Keep that reservation pending until
-    clean EOF; release it on iterator error, cancellation, or early close.
+    The provider operation ends when a ``StreamingResponse`` is constructed,
+    but ownership remains pending until the response validator has observed a
+    terminal valid event and the client-side iterator reaches EOF. The
+    response therefore owns renewal, finalization, and iterator cleanup.
     """
 
     from fastapi.responses import StreamingResponse
 
-    _ = request
     if not isinstance(response, StreamingResponse):
         return False
     if getattr(
@@ -3173,80 +3222,267 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
     if original_iterator is None:
         return False
 
-    finalized = False
+    renewal_task = start_session_owner_lease_renewal(lease)
 
-    async def _finalize(success: bool) -> None:
-        nonlocal finalized
-        if finalized:
+    async def _promote() -> Optional[SessionOwnerMutationResult]:
+        return await finalize_session_owner_lease_on_success(
+            lease,
+            attributes=attributes,
+            candidate=candidate,
+        )
+
+    if success_finalizer is None:
+        success_finalizer = _promote
+    if success_outcomes is None:
+        success_outcomes = {
+            SessionOwnerMutationOutcome.PROMOTED,
+            SessionOwnerMutationOutcome.ALREADY_OWNED,
+        }
+
+    def _validation_status() -> tuple[bool, str]:
+        state = getattr(response, "_aawm_responses_validation_state", None)
+        if isinstance(state, Mapping):
+            complete = state.get("complete") is True
+            valid = state.get("valid") is True
+            terminal_seen = state.get("terminal_seen") is True
+            if complete and valid and terminal_seen:
+                return True, ""
+            reason = state.get("reason")
+            return (
+                False,
+                str(reason)
+                if reason is not None
+                else "response validation did not reach a valid terminal event",
+            )
+
+        complete = getattr(
+            response,
+            "_aawm_responses_validation_complete",
+            None,
+        )
+        valid = getattr(response, "_aawm_responses_validation_valid", None)
+        if complete is True and valid is True:
+            return True, ""
+        return False, "response validation did not complete successfully"
+
+    def _mutation_error(reason: str) -> SessionOwnerMutationResult:
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.ERROR,
+            session_identity=(
+                lease.session_identity if lease is not None else None
+            ),
+            cache_key=lease.cache_key if lease is not None else None,
+            reservation_token=(
+                lease.reservation_token if lease is not None else None
+            ),
+            error=reason,
+        )
+
+    def _raise_structured_failure(
+        *,
+        mutation: SessionOwnerMutationResult,
+        phase: str,
+    ) -> None:
+        raise_session_owner_redispatch_required(
+            session_identity=(
+                lease.session_identity if lease is not None else None
+            ),
+            mutation=mutation,
+            candidate=candidate,
+            failure_phase=phase,
+            attempted_provider_call=True,
+            request=request,
+        )
+
+    def _renewal_error() -> Optional[BaseException]:
+        if renewal_task is None or lease is None:
+            return None
+        return _session_owner_renewal_task_error(renewal_task, lease)
+
+    finalization_task: Optional[Any] = None
+
+    async def _notify_failure(cause: Optional[BaseException]) -> None:
+        if on_failure is not None:
+            await on_failure(cause)
+
+    async def _run_finalization(
+        success: bool,
+        cause: Optional[BaseException],
+    ) -> None:
+        if not success:
+            release_result = await finalize_session_owner_lease_on_failure(lease)
+            await _notify_failure(cause)
+            if (
+                cause is None
+                and release_result is not None
+                and release_result.outcome is SessionOwnerMutationOutcome.ERROR
+            ):
+                _raise_structured_failure(
+                    mutation=release_result,
+                    phase=f"{failure_phase}_release",
+                )
             return
-        finalized = True
 
-        async def _run() -> None:
+        renewal_error = _renewal_error()
+        if renewal_error is not None:
+            release_result = await finalize_session_owner_lease_on_failure(lease)
+            await _notify_failure(renewal_error)
+            _raise_structured_failure(
+                mutation=(
+                    release_result
+                    if release_result is not None
+                    and release_result.outcome
+                    is SessionOwnerMutationOutcome.ERROR
+                    else _mutation_error(str(renewal_error))
+                ),
+                phase="session_owner_reservation_renewal",
+            )
+
+        validation_ok, validation_reason = _validation_status()
+        if not validation_ok:
+            await finalize_session_owner_lease_on_failure(lease)
+            validation_error = RuntimeError(
+                f"session_owner: deferred response validation failed: "
+                f"{validation_reason}"
+            )
+            await _notify_failure(validation_error)
+            _raise_structured_failure(
+                mutation=_mutation_error(str(validation_error)),
+                phase=f"{failure_phase}_validation",
+            )
+
+        result = await success_finalizer()
+        if (
+            result is not None
+            and result.outcome not in success_outcomes
+        ):
+            await finalize_session_owner_lease_on_failure(lease)
+            finalization_error = RuntimeError(
+                "session_owner: deferred lease finalization did not commit "
+                f"outcome={result.outcome.value}"
+            )
+            await _notify_failure(finalization_error)
+            _raise_structured_failure(
+                mutation=result,
+                phase=failure_phase,
+            )
+        if on_success is not None:
+            await on_success()
+
+    async def _finalize(
+        success: bool,
+        cause: Optional[BaseException] = None,
+    ) -> None:
+        nonlocal finalization_task
+        if finalization_task is None:
+            finalization_task = asyncio.create_task(
+                _run_finalization(success, cause)
+            )
+        task = finalization_task
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await asyncio.shield(task)
+            raise
+
+    original_closed = False
+
+    async def _close_original_iterator() -> None:
+        nonlocal original_closed
+        if original_closed:
+            return
+        original_closed = True
+        close = getattr(original_iterator, "aclose", None)
+        if callable(close):
             try:
-                if success:
-                    result = await finalize_session_owner_lease_on_success(
-                        lease,
-                        attributes=attributes,
-                        candidate=candidate,
-                    )
-                    if result is not None and result.outcome in {
-                        SessionOwnerMutationOutcome.CONFLICT,
-                        SessionOwnerMutationOutcome.ERROR,
-                        SessionOwnerMutationOutcome.NOT_HELD,
-                    }:
-                        await finalize_session_owner_lease_on_failure(lease)
-                        verbose_proxy_logger.warning(
-                            "Deferred session-owner promotion did not commit "
-                            "after stream EOF phase=%s outcome=%s",
-                            failure_phase,
-                            result.outcome.value,
-                        )
-                else:
-                    await finalize_session_owner_lease_on_failure(lease)
+                await close()
             except BaseException:
-                try:
-                    await finalize_session_owner_lease_on_failure(lease)
-                except BaseException:
-                    verbose_proxy_logger.debug(
-                        "Deferred session-owner lease release failed phase=%s",
-                        failure_phase,
-                        exc_info=True,
-                    )
-                verbose_proxy_logger.warning(
-                    "Deferred session-owner lease finalization failed phase=%s",
-                    failure_phase,
+                verbose_proxy_logger.debug(
+                    "Failed to close deferred session-owner stream iterator",
                     exc_info=True,
                 )
 
-        await asyncio.shield(asyncio.create_task(_run()))
+    class _DeferredLeaseIterator:
+        def __init__(self) -> None:
+            self._iterator = original_iterator.__aiter__()
+            self._closed = False
+            self._completed = False
 
-    completed = False
+        def __aiter__(self) -> "_DeferredLeaseIterator":
+            return self
 
-    async def _wrapped_iterator() -> Any:
-        nonlocal completed
-        try:
-            async for chunk in original_iterator:
-                yield chunk
-            completed = True
-            await _finalize(True)
-        except BaseException:
-            if not completed:
-                await _finalize(False)
-            raise
-        finally:
-            if not completed:
-                await _finalize(False)
-            close = getattr(original_iterator, "aclose", None)
-            if callable(close):
-                try:
-                    await close()
-                except BaseException:
-                    verbose_proxy_logger.debug(
-                        "Failed to close deferred session-owner stream iterator",
-                        exc_info=True,
+        async def __anext__(self) -> Any:
+            if self._closed:
+                raise StopAsyncIteration
+            renewal_error = _renewal_error()
+            if renewal_error is not None:
+                await _finalize(False, renewal_error)
+                await _close_original_iterator()
+                _raise_structured_failure(
+                    mutation=_mutation_error(str(renewal_error)),
+                    phase="session_owner_reservation_renewal",
+                )
+            next_task = asyncio.ensure_future(self._iterator.__anext__())
+            try:
+                if renewal_task is None:
+                    chunk = await next_task
+                else:
+                    done, _ = await asyncio.wait(
+                        {next_task, renewal_task},
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
+                    if renewal_task in done:
+                        renewal_error = _renewal_error()
+                        if renewal_error is not None:
+                            await _cancel_and_await_tasks(next_task)
+                            await _finalize(False, renewal_error)
+                            await _close_original_iterator()
+                            self._closed = True
+                            _raise_structured_failure(
+                                mutation=_mutation_error(str(renewal_error)),
+                                phase="session_owner_reservation_renewal",
+                            )
+                    chunk = await next_task
+            except StopAsyncIteration:
+                self._completed = True
+                try:
+                    await _finalize(True)
+                finally:
+                    self._closed = True
+                    await _close_original_iterator()
+                raise
+            except BaseException as exc:
+                try:
+                    await _cancel_and_await_tasks(next_task)
+                    await _finalize(False, exc)
+                finally:
+                    self._closed = True
+                    await _close_original_iterator()
+                raise
+            renewal_error = _renewal_error()
+            if renewal_error is not None:
+                try:
+                    await _finalize(False, renewal_error)
+                finally:
+                    self._closed = True
+                    await _close_original_iterator()
+                _raise_structured_failure(
+                    mutation=_mutation_error(str(renewal_error)),
+                    phase="session_owner_reservation_renewal",
+                )
+            return chunk
 
-    wrapped_iterator = _wrapped_iterator()
+        async def aclose(self) -> None:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                if not self._completed:
+                    await _finalize(False)
+            finally:
+                await _close_original_iterator()
+
+    wrapped_iterator = _DeferredLeaseIterator()
     response.body_iterator = wrapped_iterator
     setattr(response, "_aawm_session_owner_deferred_finalizer_bound", True)
 
@@ -3255,7 +3491,17 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
 
         async def _stream_response_with_finalizer(send: Any) -> None:
             try:
+                renewal_error = _renewal_error()
+                if renewal_error is not None:
+                    await _finalize(False, renewal_error)
+                    _raise_structured_failure(
+                        mutation=_mutation_error(str(renewal_error)),
+                        phase="session_owner_reservation_renewal",
+                    )
                 await original_stream_response(send)
+            except BaseException as exc:
+                await _finalize(False, exc)
+                raise
             finally:
                 await wrapped_iterator.aclose()
 

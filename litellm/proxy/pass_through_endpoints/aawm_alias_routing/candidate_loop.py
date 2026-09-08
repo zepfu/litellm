@@ -2000,7 +2000,101 @@ async def handle_alias_route(  # noqa: PLR0915
                                     status_code=None,
                                 )
                             raise
+                        is_auto_review = (
+                            alias_model in {"codex-auto-review", "auto-review"}
+                            or sa.get_request_codex_auto_review_parent_session_identity(
+                                request
+                            )
+                            is not None
+                        )
                         deferred_session_owner_stream = False
+                        deferred_success_committed = False
+
+                        async def _commit_candidate_success() -> None:
+                            nonlocal deferred_success_committed
+                            if deferred_success_committed:
+                                return
+                            deferred_success_committed = True
+                            assert intent is not None
+                            try:
+                                if (
+                                    codex_failure_evidence_alias is not None
+                                    and alias_routing_state.codex_failure_evidence_gate.contains(
+                                        canonical_alias=codex_failure_evidence_alias,
+                                        cooldown_key=selection["cooldown_key"],
+                                    )
+                                ):
+                                    alias_routing_state.codex_failure_evidence_gate.clear_entries(
+                                        canonical_aliases=(
+                                            codex_failure_evidence_alias,
+                                        ),
+                                        cooldown_keys=(selection["cooldown_key"],),
+                                    )
+                                await set_session_affinity_fn(
+                                    selection.get("session_key"),
+                                    candidate,
+                                )
+                                assert response is not None
+                                attempt_record["attempted_provider_call"] = (
+                                    attempted_provider_call
+                                )
+                                _record_auto_agent_alias_attempt_success(
+                                    alias_family=alias_family,
+                                    alias_model=alias_model,
+                                    request=request,
+                                    prepared_request_body=prepared_request_body,
+                                    selection=selection,
+                                    attempts=attempts,
+                                    attempt_record=attempt_record,
+                                    add_alias_metadata_fn=add_alias_metadata_fn,
+                                )
+                                if capacity_retry_coordinator is not None:
+                                    await capacity_retry_coordinator.signal_success()
+                                    capacity_retry_coordinator.record_terminal(
+                                        "success",
+                                        error_class="success",
+                                        status_code=getattr(
+                                            response,
+                                            "status_code",
+                                            200,
+                                        ),
+                                    )
+                            except BaseException as success_exc:
+                                if not intent.done.is_set():
+                                    intent.complete(error=success_exc)
+                                alias_routing_state.publication_intents.remove(intent)
+                                raise
+                            intent.complete()
+                            alias_routing_state.publication_intents.remove(intent)
+
+                        async def _complete_deferred_failure(cause):
+                            assert intent is not None
+                            if not intent.done.is_set():
+                                intent.complete(
+                                    error=(
+                                        cause
+                                        if isinstance(cause, BaseException)
+                                        else RuntimeError(
+                                            "deferred candidate stream did not "
+                                            "complete successfully"
+                                        )
+                                    )
+                                )
+                            alias_routing_state.publication_intents.remove(intent)
+
+                        async def _finalize_deferred_success():
+                            if is_auto_review:
+                                return (
+                                    await sa.finalize_codex_auto_review_lease_on_success(
+                                        session_owner_lease
+                                    )
+                                )
+                            return await sa.finalize_session_owner_lease_on_success(
+                                session_owner_lease,
+                                attributes=owner_attributes,
+                                candidate=candidate,
+                            )
+
                         if getattr(
                             response,
                             "_aawm_session_owner_promotion_deferred",
@@ -2016,15 +2110,23 @@ async def handle_alias_route(  # noqa: PLR0915
                                     failure_phase=(
                                         "session_owner_stream_promote"
                                     ),
+                                    success_finalizer=_finalize_deferred_success,
+                                    success_outcomes=(
+                                        {
+                                            sa.SessionOwnerMutationOutcome.RELEASED,
+                                            sa.SessionOwnerMutationOutcome.NOT_HELD,
+                                            sa.SessionOwnerMutationOutcome.ALREADY_OWNED,
+                                        }
+                                        if is_auto_review
+                                        else {
+                                            sa.SessionOwnerMutationOutcome.PROMOTED,
+                                            sa.SessionOwnerMutationOutcome.ALREADY_OWNED,
+                                        }
+                                    ),
+                                    on_success=_commit_candidate_success,
+                                    on_failure=_complete_deferred_failure,
                                 )
                             )
-                        is_auto_review = (
-                            alias_model in {"codex-auto-review", "auto-review"}
-                            or sa.get_request_codex_auto_review_parent_session_identity(
-                                request
-                            )
-                            is not None
-                        )
                         if deferred_session_owner_stream:
                             finalize_result = None
                         elif is_auto_review:
@@ -2033,6 +2135,25 @@ async def handle_alias_route(  # noqa: PLR0915
                                     session_owner_lease
                                 )
                             )
+                            if (
+                                finalize_result is not None
+                                and finalize_result.outcome
+                                not in {
+                                    sa.SessionOwnerMutationOutcome.RELEASED,
+                                    sa.SessionOwnerMutationOutcome.NOT_HELD,
+                                    sa.SessionOwnerMutationOutcome.ALREADY_OWNED,
+                                }
+                            ):
+                                sa.raise_session_owner_redispatch_required(
+                                    session_identity=session_owner_identity,
+                                    mutation=finalize_result,
+                                    alias_model=selection.get("alias_model")
+                                    or alias_model,
+                                    candidate=candidate,
+                                    failure_phase="session_owner_auto_review_release",
+                                    attempted_provider_call=attempted_provider_call,
+                                    request=request,
+                                )
                         elif not deferred_session_owner_stream:
                             # Authoritative success: promote reserved -> owned.
                             finalize_result = (
@@ -2058,6 +2179,7 @@ async def handle_alias_route(  # noqa: PLR0915
                                     or alias_model,
                                     candidate=candidate,
                                     failure_phase="session_owner_promote_after_success",
+                                    attempted_provider_call=attempted_provider_call,
                                     request=request,
                                 )
                     except asyncio.CancelledError:
@@ -2224,44 +2346,12 @@ async def handle_alias_route(  # noqa: PLR0915
                         alias_routing_state.publication_intents.remove(intent)
                         break
                     if probe_failure_exc is None:
-                        intent.complete()
-                        alias_routing_state.publication_intents.remove(intent)
-                        if (
-                            codex_failure_evidence_alias is not None
-                            and alias_routing_state.codex_failure_evidence_gate.contains(
-                                canonical_alias=codex_failure_evidence_alias,
-                                cooldown_key=selection["cooldown_key"],
-                            )
-                        ):
-                            alias_routing_state.codex_failure_evidence_gate.clear_entries(
-                                canonical_aliases=(codex_failure_evidence_alias,),
-                                cooldown_keys=(selection["cooldown_key"],),
-                            )
-                        await set_session_affinity_fn(
-                            selection.get("session_key"),
-                            candidate,
-                        )
-                        assert response is not None
-                        attempt_record["attempted_provider_call"] = (
-                            attempted_provider_call
-                        )
-                        _record_auto_agent_alias_attempt_success(
-                            alias_family=alias_family,
-                            alias_model=alias_model,
-                            request=request,
-                            prepared_request_body=prepared_request_body,
-                            selection=selection,
-                            attempts=attempts,
-                            attempt_record=attempt_record,
-                            add_alias_metadata_fn=add_alias_metadata_fn,
-                        )
-                        if capacity_retry_coordinator is not None:
-                            await capacity_retry_coordinator.signal_success()
-                            capacity_retry_coordinator.record_terminal(
-                                "success",
-                                error_class="success",
-                                status_code=getattr(response, "status_code", 200),
-                            )
+                        if deferred_session_owner_stream:
+                            # The response-owned finalizer completes the
+                            # publication intent after validated EOF.
+                            return response
+                        else:
+                            await _commit_candidate_success()
                         return response
 
                     early_pre_commit_error_class = (
