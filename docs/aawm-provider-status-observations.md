@@ -803,14 +803,19 @@ Native history capture is admitted only through the live sidecar
 `SidecarTaskState` that owns the private Oracle helper. The owner publishes its
 endpoint and anchor binding before registering a history worker, rejects
 borrowed or stale bindings, and retains each worker, exact-target closer, and
-scratch remover until their own process retirement is proven. Cleanup uses one
-absolute operation ceiling: target-close, cooperative termination, forced
-termination, reaping, and scratch removal may be shortened by shutdown but
-never restart a deadline or create a recovery allowance. A failed target proof
-or release channel remains an attributable cleanup failure; it is never
-reported as successful history or as an empty conversation set. Shutdown closes
-admission, requests abort for all published owners, and performs bounded
-nonblocking retirement through the same sidecar state.
+scratch remover until their own process retirement is proven. Descendant
+discovery retains live pidfd identities and role markers; a historical numeric
+parent or process group never authorizes adoption or termination after leader
+identity is lost. Cleanup uses one shared absolute operation ceiling:
+target-close, cooperative termination, forced termination, reconciliation,
+reaping, and scratch removal may be shortened by shutdown but never restart a
+deadline or create a recovery allowance. A failed target proof, release
+channel, or final descendant inventory remains an attributable cleanup failure;
+it is never reported as successful history or as an empty conversation set.
+Shutdown closes admission at cancellation, requests abort for all published
+owners, and keeps that same state servicing retained owners until safety and
+retirement are proven. The stopped event is emitted only after the owner
+registry is empty.
 
 The sidecar image packages `conversation_init.py`, the owned
 `scripts/chatgpt_oracle_browser_session.mjs` helper, and pinned Playwright with
