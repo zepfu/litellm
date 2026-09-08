@@ -56,7 +56,11 @@ signal. `assertAllowedRequest` is applied by the adapter and by both the
 Playwright and fixture transports before any request is issued.
 
 The adapter exposes active and archived index coverage, modern detail support,
-message-page pagination evidence, and legacy detail fallback behavior. The
+message-page pagination evidence, and legacy detail fallback behavior. It
+reconciles all nested pagination-control aliases before use, marks conflicting
+controls as contradictory, and never treats a full page without terminal or
+total evidence as exhaustion. HTTP 200 HTML authentication challenges are
+classified as authentication-required before generic adapter handling. The
 capability record is versioned with `chatgpt-chat-history-v1`.
 
 ### Identity
@@ -78,8 +82,11 @@ account, or default ID is used as an identity guess.
 metadata, status, timestamps, model labels, and relationship IDs. Message
 content, titles, prompt/answer fields, credentials, cookies, raw headers,
 browser storage, and email addresses are stripped or rejected at the
-persistence boundary. `assertNoSecrets` checks every persisted identity
-projection before it is written.
+persistence boundary. Allowlisted evidence is projected before unknown-field
+diagnostics consume traversal budget, and incomplete projection is propagated
+as a page warning rather than silently losing model or generation metadata.
+`assertNoSecrets` checks every persisted identity projection before it is
+written.
 
 ### Stage boundary
 

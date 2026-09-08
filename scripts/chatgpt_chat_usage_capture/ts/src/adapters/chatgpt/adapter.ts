@@ -20,8 +20,8 @@ import type {
 } from "../../contracts/records.js";
 import {
   classifySurface,
-  sanitizeMetadata,
   sanitizeToken,
+  sanitizeMetadataWithDiagnostics,
 } from "../../security/sanitizer.js";
 import { emptyCapabilities, inspectSession } from "../../normalize/identity.js";
 import type {
@@ -136,6 +136,7 @@ interface IndexPaginationControls {
   returnedOffset: number | null;
   returnedOffsetPresent: boolean;
   invalid: boolean;
+  contradictory: boolean;
   warnings: string[];
 }
 
@@ -325,6 +326,7 @@ export function adaptConversationIndex(
   const { archived, offset, limit } = options;
   raiseIfHttpError(payload, MODERN_INDEX);
   if (payload.content_type === "text/html" || typeof payload.items === "string") {
+    raiseIfAuthenticationRequired(payload, MODERN_INDEX);
     throw new AdapterError("unrecognized conversation index: HTML or non-list items");
   }
   const itemsRaw = Array.isArray(payload.items)
@@ -366,7 +368,7 @@ export function adaptConversationIndex(
       workspaceId: optionalString(item.workspace_id),
       projectId: optionalString(item.gizmo_id ?? item.project_id),
       surface: classifySurface(item, { default: null }) as Surface,
-      origin: optionalString(item.origin),
+      origin: summaryOrigin(item, warnings),
       hasVersions:
         typeof item.has_versions === "boolean" ? item.has_versions : null,
       currentNode: optionalString(item.current_node),
@@ -407,6 +409,13 @@ export function adaptConversationIndex(
         : pageEnd > offset
           ? pageEnd
           : offset;
+  } else if (controls.contradictory) {
+    warnings.push("conflicting_pagination_controls");
+    paginationState = "contradictory";
+    continuation =
+      controls.nextOffsetPresent && controls.nextOffset !== null
+        ? controls.nextOffset
+        : null;
   } else if (total !== null && total < offset) {
     warnings.push("total_before_offset");
     paginationState = "contradictory";
@@ -481,8 +490,9 @@ export function adaptConversationIndex(
     continuation = pageEnd > offset ? pageEnd : offset;
     paginationState = "unknown";
   } else {
+    warnings.push("missing_pagination_controls");
+    paginationState = "unknown";
     continuation = pageEnd;
-    paginationState = "continuation";
   }
 
   let coverage: AdaptedPage<ConversationSummary>["coverage"] = "validated_page";
@@ -593,13 +603,14 @@ export function adaptMessagePage(
   }
 
   if (hasMapping && !hasMessages && !("page_info" in payload)) {
+    warnings.push("missing_pagination_controls");
     return {
       items: records,
       continuation: null,
-      exhausted: true,
-      paginationState: "complete",
+      exhausted: false,
+      paginationState: "unknown",
       schemaVersion: ADAPTER_VERSION,
-      coverage: warnings.length > 0 ? "partial" : "validated_page",
+      coverage: "partial",
       warnings,
     };
   }
@@ -717,7 +728,15 @@ function messageFromNode(
   const author: Record<string, unknown> = isRecord(authorRaw) ? authorRaw : {};
   const authorRole = sanitizeToken(author.role);
   const metadataRaw = message.metadata;
-  const metadata = sanitizeMetadata(isRecord(metadataRaw) ? metadataRaw : {});
+  const metadataProjection = sanitizeMetadataWithDiagnostics(
+    isRecord(metadataRaw) ? metadataRaw : {},
+  );
+  const metadata = metadataProjection.metadata;
+  if (metadataProjection.diagnostics.status !== "complete") {
+    options.warnings.push(
+      `metadata_projection_${metadataProjection.diagnostics.status}`,
+    );
+  }
 
   const childrenRaw = Array.isArray(node.children)
     ? node.children
@@ -742,7 +761,7 @@ function messageFromNode(
   if (authorRole === "assistant") {
     recorded =
       metadata.model_slug ??
-      sanitizeMetadata({ model_slug: message.model_slug }).model_slug;
+      sanitizeToken(message.model_slug);
   }
 
   const conversationSurface = classifySurface(message, {
@@ -912,48 +931,83 @@ function readIndexPaginationControls(
     }
   }
 
-  const nextOffsetRaw = firstControlValue(sources, [
+  const nextOffsetRaw = readControlValues(sources, [
     "next_offset",
     "nextOffset",
     "next",
   ]);
-  const hasMoreRaw = firstControlValue(sources, [
+  const hasMoreRaw = readControlValues(sources, [
     "has_more",
     "hasMore",
     "has_next_page",
     "hasNextPage",
   ]);
-  const returnedOffsetRaw = firstControlValue(sources, [
+  const returnedOffsetRaw = readControlValues(sources, [
     "offset",
     "current_offset",
     "currentOffset",
   ]);
   const warnings: string[] = [];
   let invalid = false;
+  let contradictory = false;
 
   let nextOffset: number | null = null;
-  if (nextOffsetRaw.present && nextOffsetRaw.value !== null) {
-    nextOffset = nonNegativeInteger(nextOffsetRaw.value);
-    if (nextOffset === null) {
+  if (nextOffsetRaw.present) {
+    const parsedValues = nextOffsetRaw.values.map((value) =>
+      value === null || value === undefined ? null : nonNegativeInteger(value),
+    );
+    if (
+      nextOffsetRaw.values.some(
+        (value, index) =>
+          value !== null &&
+          value !== undefined &&
+          parsedValues[index] === null,
+      )
+    ) {
       warnings.push("invalid_next_offset");
       invalid = true;
+    } else if (hasConflictingControlValues(parsedValues)) {
+      warnings.push("conflicting_next_offset");
+      contradictory = true;
+    } else {
+      nextOffset = parsedValues[0] ?? null;
     }
   }
 
   let hasMore: boolean | null = null;
-  if (hasMoreRaw.present && typeof hasMoreRaw.value !== "boolean") {
-    warnings.push("invalid_has_more");
-    invalid = true;
-  } else if (hasMoreRaw.present) {
-    hasMore = hasMoreRaw.value as boolean;
+  if (hasMoreRaw.present) {
+    const values = hasMoreRaw.values;
+    if (values.some((value) => typeof value !== "boolean")) {
+      warnings.push("invalid_has_more");
+      invalid = true;
+    } else if (hasConflictingControlValues(values)) {
+      warnings.push("conflicting_has_more");
+      contradictory = true;
+    } else {
+      hasMore = values[0] as boolean;
+    }
   }
 
   let returnedOffset: number | null = null;
   if (returnedOffsetRaw.present) {
-    returnedOffset = nonNegativeInteger(returnedOffsetRaw.value);
-    if (returnedOffset === null) {
+    const parsedValues = returnedOffsetRaw.values.map((value) =>
+      value === null || value === undefined ? null : nonNegativeInteger(value),
+    );
+    if (
+      returnedOffsetRaw.values.some(
+        (value, index) =>
+          value !== null &&
+          value !== undefined &&
+          parsedValues[index] === null,
+      )
+    ) {
       warnings.push("invalid_returned_index_offset");
       invalid = true;
+    } else if (hasConflictingControlValues(parsedValues)) {
+      warnings.push("conflicting_returned_index_offset");
+      contradictory = true;
+    } else {
+      returnedOffset = parsedValues[0] ?? null;
     }
   }
 
@@ -965,22 +1019,35 @@ function readIndexPaginationControls(
     returnedOffset,
     returnedOffsetPresent: returnedOffsetRaw.present,
     invalid,
+    contradictory,
     warnings,
   };
 }
 
-function firstControlValue(
+function readControlValues(
   sources: Array<Record<string, unknown>>,
   keys: string[],
-): { present: boolean; value: unknown } {
+): { present: boolean; value: unknown; values: unknown[] } {
+  const values: unknown[] = [];
   for (const source of sources) {
     for (const key of keys) {
       if (Object.prototype.hasOwnProperty.call(source, key)) {
-        return { present: true, value: source[key] };
+        values.push(source[key]);
       }
     }
   }
-  return { present: false, value: undefined };
+  return {
+    present: values.length > 0,
+    value: values[0],
+    values,
+  };
+}
+
+function hasConflictingControlValues(values: unknown[]): boolean {
+  if (values.length < 2) {
+    return false;
+  }
+  return values.slice(1).some((value) => !Object.is(value, values[0]));
 }
 
 function httpStatus(payload: Record<string, unknown>, path: string): number {
@@ -1034,6 +1101,32 @@ function optionalString(value: unknown): string | null {
     return "true";
   }
   return String(value);
+}
+
+function summaryOrigin(
+  item: Record<string, unknown>,
+  warnings: string[],
+): string | null {
+  const origin = optionalString(item.origin);
+  if (origin !== null) {
+    return origin;
+  }
+  const metadataRaw = item.metadata;
+  if (!isRecord(metadataRaw)) {
+    return null;
+  }
+  const metadataProjection = sanitizeMetadataWithDiagnostics(metadataRaw);
+  if (metadataProjection.diagnostics.status !== "complete") {
+    warnings.push(
+      `metadata_projection_${metadataProjection.diagnostics.status}`,
+    );
+  }
+  const metadata = metadataProjection.metadata;
+  return (
+    optionalString(metadata.origin) ??
+    (metadata.imported === true ? "imported" : null) ??
+    (metadata.from_copy === true ? "copied" : null)
+  );
 }
 
 function normalizeTimestamp(value: unknown): string | null {

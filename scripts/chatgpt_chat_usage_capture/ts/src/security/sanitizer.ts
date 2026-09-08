@@ -730,6 +730,21 @@ export function sanitizeMetadata(
   return projectMetadataObject(metadata, state, 0, "metadata") ?? {};
 }
 
+export function sanitizeMetadataWithDiagnostics(
+  metadata: Record<string, unknown>,
+  options: SanitizerOptions = {},
+): {
+  metadata: Record<string, unknown>;
+  diagnostics: SanitizationDiagnostics;
+} {
+  const state = createTraversalState(options);
+  const projected = projectMetadataObject(metadata, state, 0, "metadata") ?? {};
+  return {
+    metadata: projected,
+    diagnostics: diagnosticsFromState(state),
+  };
+}
+
 function projectObject(
   value: unknown,
   state: TraversalState,
@@ -742,28 +757,41 @@ function projectObject(
     return undefined;
   }
   return visitNode(state, value, depth, path, () => {
+    const entries = Object.entries(value);
     const out: Record<string, unknown> = {};
-    for (const [rawKey, rawValue] of Object.entries(value)) {
+
+    // Project allowlisted evidence before unknown-field diagnostics so
+    // arbitrary provider fields cannot exhaust the budget first.
+    for (const [rawKey, rawValue] of entries) {
       const key = String(rawKey);
-      if (isExcludedKey(key)) {
-        recordExcludedSubtree(state, path, rawValue);
+      if (isExcludedKey(key) || !allowlist.has(key)) {
         continue;
       }
       const childPath = diagnosticPath(path, key, state);
-      if (!allowlist.has(key)) {
-        recordSchemaEntry(state, childPath, rawValue);
-        if (key === "mapping" && isPlainObject(rawValue)) {
-          walkUnknownValue(rawValue, state, depth + 1, childPath, true);
-        } else {
-          walkUnknownValue(rawValue, state, depth + 1, childPath, false);
-        }
-        continue;
-      }
       const projected = projectField(key, rawValue, state, depth + 1, childPath);
       if (projected !== undefined) {
         out[key] = projected;
       }
     }
+
+    for (const [rawKey, rawValue] of entries) {
+      const key = String(rawKey);
+      if (isExcludedKey(key)) {
+        recordExcludedSubtree(state, path, rawValue);
+        continue;
+      }
+      if (allowlist.has(key)) {
+        continue;
+      }
+      const childPath = diagnosticPath(path, key, state);
+      recordSchemaEntry(state, childPath, rawValue);
+      if (key === "mapping" && isPlainObject(rawValue)) {
+        walkUnknownValue(rawValue, state, depth + 1, childPath, true);
+      } else {
+        walkUnknownValue(rawValue, state, depth + 1, childPath, false);
+      }
+    }
+
     return out;
   });
 }
@@ -828,19 +856,18 @@ function projectMetadataObject(
     return undefined;
   }
   return visitNode(state, value, depth, path, () => {
+    const entries = Object.entries(value);
     const out: Record<string, unknown> = {};
-    for (const [rawKey, rawValue] of Object.entries(value)) {
+
+    // Process safety-critical allowlisted metadata before unknown-field
+    // diagnostics so a large unknown subtree cannot consume the traversal
+    // budget and silently drop model/generation evidence.
+    for (const [rawKey, rawValue] of entries) {
       const key = String(rawKey);
-      if (isExcludedKey(key)) {
-        recordExcludedSubtree(state, path, rawValue);
+      if (isExcludedKey(key) || !METADATA_ALLOWLIST.has(key)) {
         continue;
       }
       const childPath = diagnosticPath(path, key, state);
-      if (!METADATA_ALLOWLIST.has(key)) {
-        recordSchemaEntry(state, childPath, rawValue);
-        walkUnknownValue(rawValue, state, depth + 1, childPath, false);
-        continue;
-      }
       const projected = projectMetadataValue(
         key,
         rawValue,
@@ -852,6 +879,21 @@ function projectMetadataObject(
         out[key] = projected;
       }
     }
+
+    for (const [rawKey, rawValue] of entries) {
+      const key = String(rawKey);
+      if (isExcludedKey(key)) {
+        recordExcludedSubtree(state, path, rawValue);
+        continue;
+      }
+      if (METADATA_ALLOWLIST.has(key)) {
+        continue;
+      }
+      const childPath = diagnosticPath(path, key, state);
+      recordSchemaEntry(state, childPath, rawValue);
+      walkUnknownValue(rawValue, state, depth + 1, childPath, false);
+    }
+
     return out;
   });
 }
