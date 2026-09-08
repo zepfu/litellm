@@ -121,7 +121,9 @@ The Codex adapter advertises configured `collaboration` namespace tools as child
 functions with their input schemas, not as a callable namespace container.
 JSON and SSE responses restore their namespace identity for fresh runs and
 retained-session continuations; replay state preserves the original tool
-definitions.
+definitions. Bounded full-history replay preserves a function call's optional
+namespace as a nonempty string without surrounding whitespace, alongside its
+original name, arguments, and call ID.
 
 Stock Codex child-agent requests arrive from Cursor as ExecServerMessage field
 28 (`SubagentArgs`). LiteLLM bridges the portable fields to the advertised

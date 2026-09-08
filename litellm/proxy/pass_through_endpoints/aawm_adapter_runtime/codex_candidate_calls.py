@@ -133,6 +133,7 @@ _CURSOR_REPLAY_FRESH_DISPATCH_REJECTION_REASONS = frozenset(
         "call_id_shape",
         "call_id_alias_mismatch",
         "function_name",
+        "function_namespace",
         "arguments_not_object",
         "output_container",
         "output_not_string",
@@ -2022,6 +2023,8 @@ def _cursor_replay_stock_codex_function_call_item(
         "call_id",
         metadata_key,
     }
+    if "namespace" in item:
+        expected_item_keys.add("namespace")
     if set(item) != expected_item_keys and not (
         allow_missing_metadata and set(item) == expected_item_keys - {metadata_key}
     ):
@@ -2072,6 +2075,17 @@ def _cursor_replay_stock_codex_function_call_item(
 
     call_id = item.get("call_id")
     name = item.get("name")
+    namespace = item.get("namespace")
+    if "namespace" in item and (
+        not isinstance(namespace, str)
+        or not namespace
+        or namespace != namespace.strip()
+    ):
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "function_namespace",
+            item=item,
+        )
     arguments = item.get("arguments")
     if (
         not isinstance(call_id, str)
@@ -2107,14 +2121,15 @@ def _cursor_replay_stock_codex_function_call_item(
             "arguments_not_object",
             item=item,
         )
-    return _CursorReplayValidationResult(
-        value={
-            "type": "function_call",
-            "call_id": call_id,
-            "name": name,
-            "arguments": arguments,
-        }
-    )
+    canonical_item = {
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+    }
+    if namespace is not None:
+        canonical_item["namespace"] = namespace
+    return _CursorReplayValidationResult(value=canonical_item)
 
 
 def _cursor_replay_stock_codex_full_history_input(  # noqa: PLR0915
