@@ -106,6 +106,48 @@ the same non-secret account identity. An unchanged generation, a second
 `401`, missing or unproven account evidence, or a different account ends
 recovery; native Grok OIDC does not use this policy.
 
+### Managed xAI verified account identity
+
+The managed writer derives new account identity only from an xAI ID token
+verified with ES256, issuer `https://auth.x.ai`, the configured client audience,
+required expiry/issued-at claims, and a nonempty subject. A supplied `azp` must
+match that client; multiple audiences require it. Scope, explicit client, and
+record client settings must agree before a token exchange. Signing keys come
+only from `https://auth.x.ai/.well-known/jwks.json`, without redirects or
+credential headers. Fetches use the configured HTTP timeout, a 256-KiB response
+limit, at most 16 keys, and a five-minute cache.
+
+Under the existing canonical-file lock, a refresh first publishes all returned
+tokens atomically with account evidence quarantined. Signature/key failures
+cannot discard a rotated refresh token or the unverified ID token. The private
+`_litellm_xai_identity` record preserves the prior subject and account fields
+while verification is pending. Request readers reject pending, mismatched, or
+inconsistent bindings. Successful verification restores the same account
+fields, preserving existing identity hashes instead of adding another hashed
+field. Legacy account IDs without a stored subject need a valid pre-rotation
+ID token to establish their subject association. An omitted ID token can
+preserve an already trusted binding on successful refresh; an explicitly
+invalid supplied token cannot.
+
+A verified change from subject A to B remains quarantined across later
+refreshes and process restarts. It requires operator reconciliation of the
+credential record and any inventory pin, not an automatic bootstrap into B.
+The writer retains rotated token material while blocked. Private binding
+metadata, including any retained pre-rotation ID token, must not be logged or
+copied into observation metadata.
+
+The scheduler can verify an existing ID token without calling the token
+endpoint when refresh is not due or is suppressed. Identity-only publication
+does not change token timestamps or increment token-attempt counts. Its
+previous/final generation evidence keeps existing refresh failures and
+terminal-grant suppression intact, including concurrent passive observations.
+Passive health remains read-only and reports unverified identity as unavailable.
+
+The provider-status image includes `pyjwt[crypto]`; updating the proxy checkout
+does not activate an image-baked sidecar writer. Sidecar deployment and
+credential publication are separate authorized operations. Publication affects
+every environment sharing that credential file.
+
 ### Managed xAI account inventory and rollover
 
 Set `LITELLM_XAI_OAUTH_INVENTORY` to one strict JSON object to use more than

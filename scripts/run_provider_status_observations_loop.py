@@ -4578,6 +4578,12 @@ def _oauth_refresh_observation_metadata(event: Mapping[str, Any]) -> Dict[str, A
         "refresh_threshold_seconds",
         "credential_identity",
         "credential_generation",
+        "identity_bootstrap_needed",
+        "identity_subject_present",
+        "identity_verified",
+        "identity_bootstrapped",
+        "identity_only",
+        "identity_previous_generation",
         "structurally_valid",
         "access_available",
         "refresh_possible",
@@ -4741,6 +4747,9 @@ def _project_xai_oauth_passive_health_event(
             _oauth_refresh_generation(passive_summary) != initial_generation
         )
 
+    _rebind_identity_only_generation(schedule, passive_summary)
+    scheduled_identity = schedule.credential_identity
+    scheduled_generation = schedule.credential_generation
     passive_identity = _oauth_refresh_identity(passive_summary)
     passive_generation = _oauth_refresh_generation(passive_summary)
     passive_health = _xai_passive_health_status(passive_summary)
@@ -12957,10 +12966,11 @@ def _merge_oauth_refresh_eligibility(
         retry_at = retry_deadline
     if post.get("error_class") and summary_expires_at is not None:
         merged["expires_at"] = _scheduler_timestamp(summary_expires_at)
-        merged["credential_health"] = (
-            "expired" if summary_expires_at <= wall_now else "fresh"
-        )
-        merged["usable"] = summary_expires_at > wall_now
+        if post.get("route_unusable_reason") != "account_identity_unverified":
+            merged["credential_health"] = (
+                "expired" if summary_expires_at <= wall_now else "fresh"
+            )
+            merged["usable"] = summary_expires_at > wall_now
         window_seconds = (
             effective_threshold_seconds
             if effective_threshold_seconds is not None
@@ -13211,10 +13221,29 @@ def _oauth_refresh_failure_remains_authoritative(
     )
 
 
+def _rebind_identity_only_generation(
+    schedule: OAuthRefreshScheduleState,
+    observation: Mapping[str, Any],
+) -> None:
+    previous = observation.get("identity_previous_generation")
+    current = _oauth_refresh_generation(observation)
+    if (
+        previous is not None
+        and previous == schedule.credential_generation
+        and current is not None
+        and _oauth_refresh_identity(observation) == schedule.credential_identity
+        and (observation.get("usable") or observation.get("identity_only") is True)
+    ):
+        schedule.credential_generation = current
+        if schedule.terminal_refresh_identity == previous:
+            schedule.terminal_refresh_identity = current
+
+
 def _clear_oauth_refresh_failure_on_usable_identity_change(
     schedule: OAuthRefreshScheduleState,
     eligibility: Mapping[str, Any],
 ) -> bool:
+    _rebind_identity_only_generation(schedule, eligibility)
     candidate_identity = _oauth_refresh_identity(eligibility)
     candidate_generation = _oauth_refresh_generation(eligibility)
     if (
@@ -13252,7 +13281,39 @@ def _oauth_refresh_terminal_blocked(
     ):
         return False
     current_generation_key = _oauth_refresh_generation_key(eligibility)
-    return current_generation_key == schedule.terminal_refresh_identity
+    return (
+        current_generation_key == schedule.terminal_refresh_identity
+        or eligibility.get("identity_previous_generation")
+        == schedule.terminal_refresh_identity
+    )
+
+
+def _reconcile_xai_identity_publication(
+    schedule: OAuthRefreshScheduleState,
+    summary: Mapping[str, Any],
+) -> bool:
+    """Rebind unchanged-grant failures across an identity-only publication."""
+    if summary.get("identity_only") is not True:
+        return False
+    preserve_failure = bool(
+        _oauth_refresh_failure_remains_authoritative(schedule)
+        and (
+            schedule.terminal_refresh_error_class
+            or not (schedule.last_error_class or "").startswith("identity_")
+        )
+    )
+    _rebind_identity_only_generation(schedule, summary)
+    if (
+        not preserve_failure
+        and not summary.get("error_class")
+        and summary.get("identity_verified") is True
+        and (schedule.last_error_class or "").startswith("identity_")
+        and not schedule.terminal_refresh_error_class
+    ):
+        schedule.last_result_class = None
+        schedule.last_error_class = None
+        schedule.last_error_message = None
+    return preserve_failure
 
 
 def _record_oauth_refresh_schedule_outcome(
@@ -13278,9 +13339,18 @@ def _record_oauth_refresh_schedule_outcome(
         operation_summary.get("error_class")
     )
     operation_generation = _oauth_refresh_generation(operation_summary)
+    identity_only = operation_summary.get("identity_only") is True
+    preserve_refresh_failure = _reconcile_xai_identity_publication(
+        schedule, operation_summary
+    )
+    if preserve_refresh_failure:
+        operation_error_class = (
+            schedule.last_error_class or schedule.terminal_refresh_error_class
+        )
     if (
         clear_failure_on_usable_identity_change
         and not operation_error_class
+        and not identity_only
     ):
         _clear_oauth_refresh_failure_on_usable_identity_change(schedule, final)
     prior_failure_active = (
@@ -13297,7 +13367,9 @@ def _record_oauth_refresh_schedule_outcome(
         wall_now=wall_now,
         actual_attempt_count=actual_attempt_count,
         operation_error_class=operation_error_class,
-        prior_result_class=prior_result_class if not should_call else None,
+        prior_result_class=(
+            prior_result_class if not should_call or identity_only else None
+        ),
         preserve_failure_when_not_due=preserve_failure_when_not_due,
     )
     effective_health = _effective_oauth_credential_health(
@@ -13338,9 +13410,10 @@ def _record_oauth_refresh_schedule_outcome(
         schedule.credential_identity = recorded_identity
     if operation_error_class:
         schedule.last_error_class = operation_error_class
-        schedule.last_error_message = _redacted_failure_message(
-            operation_summary.get("error_message")
-        )
+        if not preserve_refresh_failure:
+            schedule.last_error_message = _redacted_failure_message(
+                operation_summary.get("error_message")
+            )
         terminal_error = _oauth_terminal_refresh_error_class(operation_error_class)
         if preserve_failure_when_not_due:
             stored_identity = (
@@ -13414,6 +13487,7 @@ def _run_oauth_refresh_schedule(
     eligibility_inspector_kwargs: Optional[Mapping[str, Any]] = None,
     preserve_failure_when_not_due: bool = False,
     clear_failure_on_usable_identity_change: bool = False,
+    identity_bootstrap_call: Optional[Callable[[], Mapping[str, Any]]] = None,
 ) -> tuple[
     Dict[str, Any],
     Dict[str, Any],
@@ -13481,14 +13555,24 @@ def _run_oauth_refresh_schedule(
         schedule.last_actual_attempt_at = _scheduler_timestamp(wall_now)
         schedule.actual_attempt_count += 1
 
-    should_call = (
+    token_refresh_call = (
         (force or bool(pre.get("eligible")))
         and not actual_throttled
         and not terminal_blocked
     )
+    identity_only_call = (
+        not token_refresh_call
+        and bool(pre.get("identity_bootstrap_needed"))
+        and identity_bootstrap_call is not None
+    )
+    should_call = token_refresh_call or identity_only_call
     if should_call:
         try:
-            operation_summary = refresh_call(on_token_endpoint_attempt)
+            if identity_only_call:
+                assert identity_bootstrap_call is not None
+                operation_summary = identity_bootstrap_call()
+            else:
+                operation_summary = refresh_call(on_token_endpoint_attempt)
         except Exception as exc:
             operation_summary = {
                 "attempted": True,
@@ -13878,6 +13962,18 @@ def _run_xai_oauth_refresh_task(
             http_timeout_seconds=config.xai_oauth_http_timeout_seconds,
             on_token_endpoint_attempt=callback,
         ),
+        identity_bootstrap_call=lambda: xai_oauth_refresh.refresh_xai_oauth_auth_file(
+            config.xai_oauth_auth_file,
+            scope=config.xai_oauth_scope,
+            buffer_seconds=config.xai_oauth_refresh_buffer_seconds,
+            force=False,
+            lock_file=_resolve_xai_oauth_sidecar_lock_file(
+                config.xai_oauth_lock_file,
+                config.xai_oauth_auth_file,
+            ),
+            http_timeout_seconds=config.xai_oauth_http_timeout_seconds,
+            identity_only=True,
+        ),
         force=config.xai_oauth_force_refresh,
         attempt_interval_seconds=config.xai_oauth_refresh_interval_seconds,
         eligibility_cadence_seconds=config.interval_seconds,
@@ -13902,6 +13998,12 @@ def _run_xai_oauth_refresh_task(
         or config.xai_oauth_auth_file_source,
         "scope_source": summary.get("scope_source")
         or config.xai_oauth_scope_source,
+        "identity_bootstrap_needed": final.get("identity_bootstrap_needed"),
+        "identity_subject_present": final.get("identity_subject_present"),
+        "identity_verified": summary.get("identity_verified"),
+        "identity_bootstrapped": bool(summary.get("identity_bootstrapped")),
+        "identity_only": bool(summary.get("identity_only")),
+        "identity_previous_generation": summary.get("identity_previous_generation"),
         "expires_at": final.get("expires_at") or summary.get("expires_at"),
         "error_class": _redacted_summary_field(summary.get("error_class")),
         "error_message": _redacted_failure_message(summary.get("error_message")),
