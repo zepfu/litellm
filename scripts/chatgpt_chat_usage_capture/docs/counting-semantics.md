@@ -15,11 +15,30 @@ Unknown windows use `show_activity_only`. Working used/remaining stay `null`, no
 
 Generation IDs are stronger attempt identity than request IDs. Distinct generations
 that reuse one request ID remain separate attempts; exact repeats of one generation
-remain idempotent. Failed, cancelled, and in-progress assistant nodes remain
+remain idempotent. Failed, cancelled, rejected-after-start, and in-progress assistant nodes remain
 uncertain until an explicit successful terminal is observed, so they are not
 completed answers or default working-estimate contributions.
 
 Mapping changes rebuild derived families from the retained raw model fields. The
 current mapping version is applied to the new aggregate revision while prior
-attempt projections remain auditable in mapping history; a rebuild does not merely
-rename a stale aggregate payload.
+attempt projections remain auditable in mapping history; a rebuild does not
+merely rename a stale aggregate payload.
+
+The PostgreSQL ledger resolves retired provisional scopes through their
+canonical scope redirects and accepts ownership only from the active collector
+binding. Missing canonical provider-user, workspace, or quota-owner identity is
+reported as `unknown_identity`. Attempts with a non-clear quarantine state are
+also classified as `unknown_identity`, so they remain auditable without
+contributing to definite totals or model breakdowns. Unknown and excluded
+classes retain activity whose time evidence is ambiguous or unknown, but omit
+rows proven outside the requested half-open window.
+
+Open-ended interval evidence is still unknown when it cannot prove inclusion, but
+a one-sided bound that independently proves an attempt is outside the window is
+classified as out and omitted.
+
+Quarantine warnings are retained ahead of the ordinary warning cap, so late
+resolver or future-timestamp evidence cannot be hidden by earlier diagnostics.
+An explicit `unknown` quarantine state remains unknown until stronger evidence
+is available. Nullable upstream timestamps remain null; they do not imply an
+incomplete projection.

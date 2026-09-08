@@ -90,6 +90,8 @@ METADATA_ALLOWLIST = {
     "model_slug",
     "requested_model",
     "requested_model_slug",
+    "resolved_model",
+    "resolved_model_slug",
     "requested_mode",
     "reasoning_effort",
     "default_model_slug",
@@ -137,6 +139,8 @@ _METADATA_IDENTIFIER_KEYS = {
     "model_slug",
     "requested_model",
     "requested_model_slug",
+    "resolved_model",
+    "resolved_model_slug",
     "default_model_slug",
     "generation_id",
     "request_id",
@@ -361,7 +365,7 @@ def observation_projection(
 
 
 def assert_no_secrets(value: Any, *, path: str = "root") -> None:
-    """Walk values only (not keys) looking for secret-like patterns."""
+    """Walk mapping keys and values looking for secret-like patterns."""
     _assert_no_secrets_walk(value, path=path)
 
 
@@ -375,7 +379,10 @@ def _assert_no_secrets_walk(value: Any, *, path: str) -> None:
             raise PrivacyError(f"email survived sanitization at {path}")
     elif isinstance(value, dict):
         for key, child in value.items():
-            _assert_no_secrets_walk(child, path=f"{path}.{key}")
+            key_text = str(key)
+            if SENSITIVE_KEY_RE.search(key_text) or EMAIL_RE.search(key_text):
+                raise PrivacyError(f"secret-like mapping key survived sanitization at {path}.{key_text}")
+            _assert_no_secrets_walk(child, path=f"{path}.{key_text}")
     elif isinstance(value, list):
         for idx, child in enumerate(value):
             _assert_no_secrets_walk(child, path=f"{path}[{idx}]")
