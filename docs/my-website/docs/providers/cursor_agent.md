@@ -178,6 +178,12 @@ Ordinary external-tool continuations retain the Cursor session assignment while
 the provider-owned session is live. Generic MCP/function calls (operation field
 11) return their actual output through Cursor's `McpResult` on the same open
 Run. Passive tool-progress notifications do not authorize another execution.
+Each bounded HTTP/2 read is fully consumed before pausing at a tool call, with
+later Connect frames retained in order and data acknowledged once. Received
+terminal or abort evidence prevents continuation result writes. Per-continuation
+transport evidence distinguishes result bytes handed to the writer from
+subsequent provider data; it contains no tool payloads or credentials.
+
 For stock full-history requests without `previous_response_id`, lookup requires
 the existing guarded owner identity, unchanged assignment and tools, and exact
 pending call IDs and qualified namespace/name identities. The trusted history
