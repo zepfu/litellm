@@ -352,6 +352,12 @@ Attempt telemetry records actual upstream provider sends separately from
 selection and guard rejection outcomes. Guard rejections retain the exact
 failed predicate for diagnosis.
 
+After a failed fresh request, a released request-local reservation may still
+carry an `UNOWNED_RESERVED` or `RESERVATION_RENEWED` decision. Replay-safe
+failover can clear that released state only after the same portability checks.
+This is distinct from a live `COMPATIBLE_OWNER`, which represents durable
+session ownership and must be validated as an owner before any account move.
+
 If no alternate is available after a planned failover, telemetry identifies the
 second-selection failure. This is distinct from an owner-bound rejection of a
 non-portable continuation.

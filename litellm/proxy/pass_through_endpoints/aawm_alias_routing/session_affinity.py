@@ -3784,7 +3784,11 @@ def request_session_owner_already_guarded(request: Any) -> bool:
 
 
 def reset_released_request_session_owner_guard(request: Any) -> bool:
-    """Allow a fresh-request retry after its reservation was released."""
+    """Clear a released fresh-request reservation before account failover.
+
+    This only resets request-local state from a fresh dispatch whose reservation
+    was released. It does not rebind a durable compatible owner.
+    """
     if request is None:
         return False
     state = getattr(request, "state", None)
@@ -3827,7 +3831,13 @@ async def clear_compatible_non_held_request_session_owner_guard_for_failover(
     failover_ordinal: int = 1,
     validate_durable_owner: bool = True,
 ) -> SessionOwnerLeaseRebindResult:
-    """Validate one portable account move, then clear only request state."""
+    """Validate one portable account move, then clear only request state.
+
+    A released fresh reservation may retain an ``UNOWNED_RESERVED`` or
+    ``RESERVATION_RENEWED`` decision, which is distinct from a live
+    ``COMPATIBLE_OWNER`` durable owner. Released request-local state is cleared
+    only after the same portability and ownership checks.
+    """
 
     if not request_session_owner_already_guarded(request):
         return SessionOwnerLeaseRebindResult(False, "guard_not_acquired")

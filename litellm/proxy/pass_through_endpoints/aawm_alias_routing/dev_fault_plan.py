@@ -342,6 +342,11 @@ def _apply_direct_attempt_trace(
                 if attempt_record is not None
                 else None
             ),
+            "account_failover_rejection_reason": (
+                attempt_record.get("account_failover_rejection_reason")
+                if attempt_record is not None
+                else None
+            ),
             "terminal_reason": (
                 attempt_record.get("terminal_reason")
                 if attempt_record is not None
@@ -372,6 +377,7 @@ def _copy_direct_attempt_trace_to_event(
         "credential_reload_outcome",
         "failover_decision",
         "guard_rebind_rejection_reason",
+        "account_failover_rejection_reason",
         "terminal_reason",
         "attempted_account_hashes",
     ):
@@ -430,6 +436,10 @@ def _add_direct_openai_managed_metadata(
     if trace["guard_rebind_rejection_reason"] is not None:
         metadata_trace["guard_rebind_rejection_reason"] = trace[
             "guard_rebind_rejection_reason"
+        ]
+    if trace["account_failover_rejection_reason"] is not None:
+        metadata_trace["account_failover_rejection_reason"] = trace[
+            "account_failover_rejection_reason"
         ]
     if trace["terminal_reason"] is not None:
         metadata_trace["terminal_reason"] = trace["terminal_reason"]
@@ -565,15 +575,21 @@ def update_direct_openai_managed_failure_attempt(
     exc: Exception,
     cooldown_seconds: float,
     attempted_provider_call: Optional[bool] = None,
+    error_class: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """Apply existing classifier fields to a retryable direct attempt."""
-    if isinstance(exc, AawmOpenAIFaultPlanError):
-        error_class = "usage_limit_reached"
-    elif _codex_oauth.is_direct_codex_usage_limit_error(exc):
-        error_class = "usage_limit_reached"
-    elif _codex_oauth.is_direct_codex_token_invalidated_error(exc):
-        error_class = "token_invalidated"
-    else:
+    if error_class is None:
+        if isinstance(exc, AawmOpenAIFaultPlanError):
+            error_class = "usage_limit_reached"
+        elif _codex_oauth.is_direct_codex_usage_limit_error(exc):
+            error_class = "usage_limit_reached"
+        elif _codex_oauth.is_direct_codex_token_invalidated_error(exc):
+            error_class = "token_invalidated"
+    if error_class not in {
+        "provider_terminal_error",
+        "token_invalidated",
+        "usage_limit_reached",
+    }:
         return None
     attempt_record = _current_direct_attempt(request)
     candidate = _managed_openai_oauth_candidate(selection.get("candidate"))
@@ -584,7 +600,11 @@ def update_direct_openai_managed_failure_attempt(
         exc=exc,
         error_class=error_class,
         cooldown_seconds=cooldown_seconds,
-        cooldown_scope="candidate",
+        cooldown_scope=(
+            "candidate"
+            if error_class in {"token_invalidated", "usage_limit_reached"}
+            else "none"
+        ),
         alias_model=_direct_alias_model(request_body, selection),
         candidate=candidate,
         attempted_provider_call=attempted_provider_call,
@@ -602,7 +622,11 @@ def note_direct_openai_managed_failure(
     if attempt_record is None:
         return
     error_class = attempt_record.get("error_class")
-    if error_class not in {"usage_limit_reached", "token_invalidated"}:
+    if error_class not in {
+        "provider_terminal_error",
+        "usage_limit_reached",
+        "token_invalidated",
+    }:
         return
     _attempt_records._mark_auto_agent_alias_request_failover_pending(
         request,
@@ -728,7 +752,11 @@ def note_direct_openai_managed_terminal_exhaustion(
         attempt_record is None
         or candidate is None
         or attempt_record.get("error_class")
-        not in {"usage_limit_reached", "token_invalidated"}
+        not in {
+            "provider_terminal_error",
+            "usage_limit_reached",
+            "token_invalidated",
+        }
     ):
         return
     if attempt_record.get("terminal_reason") in {None, "success"}:

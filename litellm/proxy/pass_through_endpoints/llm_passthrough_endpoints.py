@@ -3542,6 +3542,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             exc=exc,
             cooldown_seconds=cooldown_seconds,
             attempted_provider_call=attempted_provider_call,
+            error_class=error_class,
         )
     )
     retry_attempt_record = injected_attempt_record
@@ -3714,7 +3715,8 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
     else:
         retry_attempt_record["failover_decision"] = "terminal"
         retry_attempt_record["terminal_reason"] = (
-            "account_failover_exhausted"
+            retry_attempt_record.get("account_failover_rejection_reason")
+            or "account_failover_exhausted"
         )
     if not retry_planned:
         return None
