@@ -14,7 +14,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, MutableMapping, Optional
 
 import httpx  # noqa: F401  # harness patch surface; refresh path removed (RR-040)
 
@@ -655,7 +655,7 @@ def _read_credential_payload(credential_path: Path) -> Dict[str, Any]:
 def _select_credential_record(
     payload: Dict[str, Any],
     scope: str,
-) -> Dict[str, Any]:
+) -> MutableMapping[str, Any]:
     return select_xai_oauth_credential_record(
         payload,
         scope,
@@ -663,14 +663,14 @@ def _select_credential_record(
     )
 
 
-def _credential_access_token(credential: Dict[str, Any]) -> Optional[str]:
+def _credential_access_token(credential: Mapping[str, Any]) -> Optional[str]:
     token = credential.get("access_token") or credential.get("key")
     if isinstance(token, str) and token.strip():
         return token.strip()
     return None
 
 
-def _credential_needs_refresh(credential: Dict[str, Any]) -> bool:
+def _credential_needs_refresh(credential: Mapping[str, Any]) -> bool:
     """Return True when the credential should not be used as-is.
 
     Missing or unparseable ``expires_at`` fails safe toward refresh (not

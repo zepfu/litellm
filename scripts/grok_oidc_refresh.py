@@ -635,7 +635,9 @@ def _read_credential_payload(credential_path: Path) -> Dict[str, Any]:
     return payload
 
 
-def _select_credential_record(payload: Mapping[str, Any], scope: str) -> Dict[str, Any]:
+def _select_credential_record(
+    payload: Mapping[str, Any], scope: str
+) -> MutableMapping[str, Any]:
     return select_xai_oauth_credential_record(
         payload,
         scope,
