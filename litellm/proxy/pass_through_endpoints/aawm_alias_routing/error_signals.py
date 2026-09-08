@@ -60,7 +60,6 @@ from .policy import (
     CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS as _CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
     CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS as _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS,
     CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS as _CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS,
-    CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_COOLDOWN_SECONDS as _CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_COOLDOWN_SECONDS,
     CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY as _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
     CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER as _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
     CODEX_AUTO_AGENT_NATIVE_PROVIDER as _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
@@ -1637,7 +1636,7 @@ def _plan_codex_auto_agent_native_grok_continuation_transient_retry(
 
 def _get_codex_auto_agent_cooldown_scope(error_class: Optional[str]) -> str:
     if error_class == _CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS:
-        return "candidate"
+        return "none"
     if error_class == _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CLASS:
         return "none"
     if _is_codex_auto_agent_durable_cooldown_error_class(error_class):
@@ -1652,7 +1651,7 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
     kimi_failure_metadata: Optional[dict[str, Any]] = None,
 ) -> str:
     if error_class == _CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS:
-        return "candidate"
+        return "none"
     if error_class == _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CLASS:
         return "none"
     if error_class in _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES:
@@ -2997,7 +2996,7 @@ def _get_codex_auto_agent_cooldown_seconds(
         attempted_provider_call=attempted_provider_call,
     )
     if error_class == _CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS:
-        return _CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_COOLDOWN_SECONDS
+        return 0.0
     if error_class in _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES:
         return _resolve_alibaba_token_plan_exhaustion_cooldown_seconds()
     tokens = _extract_codex_auto_agent_error_tokens(exc)
