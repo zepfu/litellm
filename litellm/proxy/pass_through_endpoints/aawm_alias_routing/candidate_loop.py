@@ -124,6 +124,13 @@ def _store_attempt_failure_state(
     if not isinstance(attempted_provider_call, bool):
         attempted_provider_call = True
     attempt_record["attempted_provider_call"] = attempted_provider_call
+    provider_returned = attempt_record.get("provider_returned")
+    if not isinstance(provider_returned, bool):
+        provider_returned = (
+            getattr(exc, "_aawm_provider_returned", False) is True
+            or getattr(exc, "provider_returned", False) is True
+        )
+    attempt_record["provider_returned"] = provider_returned
 
     failure_phase = None
     for value in (
@@ -986,8 +993,9 @@ async def handle_alias_route(  # noqa: PLR0915
     # attempts. Must not reset when the outer candidate-selection loop re-enters.
     native_grok_continuation_transient_provider_attempts = 0
     provider_candidate_attempts = 0
+    managed_xai_oauth_provider_attempts = 0
     same_account_transient_attempts_by_slot: dict[Optional[str], int] = {}
-    managed_xai_generation_retry_attempted = False
+    managed_xai_generation_retry_attempted_lanes: set[str] = set()
     request_retry_started_at = time.monotonic()
     request_retry_budget = OpenAIAlphaCapacityRetryBudget()
     token_invalidated_reload_attempts: set[str] = set()
@@ -1120,7 +1128,22 @@ async def handle_alias_route(  # noqa: PLR0915
         candidate: dict[str, Any],
         selection: dict[str, Any],
         error_class: Optional[str],
+        attempt_record: Mapping[str, Any],
+        provider_status_code: Optional[int],
     ) -> bool:
+        if _is_managed_xai_oauth_candidate(candidate):
+            return bool(
+                not has_continuation_state
+                and not has_previous_response_id
+                and not selection.get("has_account_bound_state")
+                and not selection.get("in_flight_session")
+                and attempt_record.get("attempted_provider_call") is True
+                and attempt_record.get("provider_returned") is True
+                and (
+                    provider_status_code in {401, 429}
+                    or error_class == "usage_limit_reached"
+                )
+            )
         if error_class in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES:
             return False
         if error_class not in {
@@ -1721,6 +1744,9 @@ async def handle_alias_route(  # noqa: PLR0915
                 error_class=admission_error_class,
                 has_continuation_state=has_continuation_state,
                 has_previous_response_id=has_previous_response_id,
+                has_account_bound_state=bool(
+                    selection.get("has_account_bound_state")
+                ),
                 account_failover_replay_safe=account_failover_replay_safe,
                 provider_status_code=attempt_record.get("error_status_code"),
             )
@@ -1986,6 +2012,15 @@ async def handle_alias_route(  # noqa: PLR0915
 
                         async def _perform_candidate_request() -> Response:
                             nonlocal attempted_provider_call
+                            nonlocal managed_xai_oauth_provider_attempts
+                            if _is_managed_xai_oauth_candidate(candidate):
+                                managed_xai_oauth_provider_attempts += 1
+                                attempt_record[
+                                    "xai_oauth_provider_attempt_ordinal"
+                                ] = managed_xai_oauth_provider_attempts
+                                attempt_record[
+                                    "xai_oauth_account_traversal_ordinal"
+                                ] = max(1, failover_ordinal + 1)
                             attempts.append(attempt_record)
                             attempt_record["attempted_provider_call"] = True
                             attempted_provider_call = True
@@ -2205,7 +2240,10 @@ async def handle_alias_route(  # noqa: PLR0915
 
                     if (
                         probe_failure_exc is not None
-                        and not managed_xai_generation_retry_attempted
+                        and str(
+                            candidate.get("xai_oauth_lane_key") or ""
+                        )
+                        not in managed_xai_generation_retry_attempted_lanes
                     ):
                         refreshed_snapshot = (
                             await _try_managed_xai_oauth_generation_retry(
@@ -2216,7 +2254,9 @@ async def handle_alias_route(  # noqa: PLR0915
                             )
                         )
                         if refreshed_snapshot is not None:
-                            managed_xai_generation_retry_attempted = True
+                            managed_xai_generation_retry_attempted_lanes.add(
+                                str(candidate.get("xai_oauth_lane_key") or "")
+                            )
                             attempt_record["status"] = (
                                 "xai_oauth_generation_changed_retry"
                             )
@@ -2452,6 +2492,12 @@ async def handle_alias_route(  # noqa: PLR0915
                             candidate=candidate,
                             selection=selection,
                             error_class=early_pre_commit_error_class,
+                            attempt_record=attempt_record,
+                            provider_status_code=(
+                                _extract_adapter_exception_status_code(
+                                    probe_failure_exc
+                                )
+                            ),
                         )
                     )
                     skip_cooldown_for_account_failover = (
@@ -2907,6 +2953,10 @@ async def handle_alias_route(  # noqa: PLR0915
                     candidate=candidate,
                     selection=selection,
                     error_class=error_class,
+                    attempt_record=attempt_record,
+                    provider_status_code=_extract_adapter_exception_status_code(
+                        failure_exc
+                    ),
                 )
                 if (
                     not prefer_account_failover
@@ -3076,6 +3126,9 @@ async def handle_alias_route(  # noqa: PLR0915
                     error_class=error_class,
                     has_continuation_state=has_continuation_state,
                     has_previous_response_id=has_previous_response_id,
+                    has_account_bound_state=bool(
+                        selection.get("has_account_bound_state")
+                    ),
                     account_failover_replay_safe=account_failover_replay_safe,
                     provider_status_code=attempt_record.get("error_status_code"),
                 )

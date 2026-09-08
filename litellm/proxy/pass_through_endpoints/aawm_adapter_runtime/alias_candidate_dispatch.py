@@ -200,7 +200,7 @@ async def _dispatch_auto_agent_alias_candidate_request(
     return await default_handler()
 
 
-async def _perform_anthropic_auto_agent_alias_candidate_request(
+async def _perform_anthropic_auto_agent_alias_candidate_request(  # noqa: PLR0915
     *,
     endpoint: str,
     request: "Request",
@@ -225,8 +225,12 @@ async def _perform_anthropic_auto_agent_alias_candidate_request(
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
         _bind_codex_oauth_candidate_to_request,
     )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+        bind_xai_oauth_candidate_to_request,
+    )
 
     _bind_codex_oauth_candidate_to_request(request, candidate)
+    bind_xai_oauth_candidate_to_request(request, candidate)
     rt = _runtime
     adapter_model = candidate["model"]
 
