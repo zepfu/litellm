@@ -776,15 +776,37 @@ def _strip_route_identity_node(value: Any, *, _depth: int) -> tuple[Any, bool]:
 
 def strip_route_identity_from_request_body(
     request_body: Mapping[str, Any] | dict[str, Any] | None,
+    *,
+    protocol_owned_only: bool = False,
 ) -> Any:
     """Drop outbound ``aawm_route_identity`` before provider send.
 
     OpenAI and xAI reject unknown item fields such as
     ``input[N].aawm_route_identity``. Identity is client-facing only.
+    ``protocol_owned_only`` preserves nested user/tool values and strips only
+    the request envelope and top-level ``input``/``output`` item envelopes.
     """
 
     if not isinstance(request_body, dict):
         return dict(request_body) if isinstance(request_body, Mapping) else {}
+    if protocol_owned_only:
+        stripped_body = dict(request_body)
+        stripped_body.pop(ROUTE_IDENTITY_FIELD, None)
+        for item_field in ("input", "output"):
+            items = request_body.get(item_field)
+            if not isinstance(items, list):
+                continue
+            stripped_body[item_field] = [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key != ROUTE_IDENTITY_FIELD
+                }
+                if isinstance(item, dict) and ROUTE_IDENTITY_FIELD in item
+                else item
+                for item in items
+            ]
+        return stripped_body
     stripped, changed = _strip_route_identity_node(request_body, _depth=0)
     return stripped if changed else request_body
 

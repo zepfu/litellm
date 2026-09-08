@@ -4524,6 +4524,7 @@ def _aawm_apply_openai_encrypted_reasoning_pre_send(
         guard_openai_encrypted_reasoning_egress,
         is_openai_responses_egress,
         merge_encrypted_reasoning_disposition_into_request_body,
+        strip_route_identity_from_request_body,
     )
 
     path = str(getattr(url, "path", "") or "")
@@ -4534,6 +4535,16 @@ def _aawm_apply_openai_encrypted_reasoning_pre_send(
         url_path=path,
         url=url,
     ):
+        # OpenAI compilation owns its cleanup; direct routes still need the
+        # protocol-owned identity sidecars removed without traversing user data.
+        for body in (parsed_body, provider_bound_body):
+            if not isinstance(body, dict):
+                continue
+            stripped = strip_route_identity_from_request_body(
+                body, protocol_owned_only=True
+            )
+            body.clear()
+            body.update(stripped)
         return
 
     # Final serialized JSON for both stream and non-stream send paths.

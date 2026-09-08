@@ -28,3 +28,6 @@ context and route/provenance sidecars from top-level `input` and `output`
 items. It does not recurse into prompts, tool schemas, function arguments, or
 other user data. OpenAI `metadata` remains a supported client field; the
 server-owned `litellm_metadata` namespace does not.
+
+Direct non-OpenAI egress retains route-identity cleanup at the request envelope
+and top-level `input`/`output` items without traversing nested user/tool data.
