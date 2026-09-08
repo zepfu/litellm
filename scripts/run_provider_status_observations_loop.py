@@ -2282,7 +2282,10 @@ def _signal_chatgpt_oracle_process_group(
 
 
 def _chatgpt_oracle_owned_handles(
-    process: subprocess.Popen, temp_root: str, handles: Dict[int, int],
+    process: subprocess.Popen,
+    temp_root: str,
+    handles: Dict[int, int],
+    deadline: Optional[float] = None,
 ) -> None:
     marker = f"{CHATGPT_ORACLE_OWNER_ENV}={temp_root}".encode()
     candidates: Dict[int, tuple[int, int]] = {}
@@ -2293,6 +2296,8 @@ def _chatgpt_oracle_owned_handles(
             except ProcessLookupError:
                 pass
         for entry in Path("/proc").iterdir():
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Oracle browser process discovery timed out.")
             if not entry.name.isdigit() or int(entry.name) in handles:
                 continue
             pid = int(entry.name)
@@ -2369,24 +2374,27 @@ def _remove_chatgpt_oracle_scratch_bounded(
 ) -> bool:
     if not Path(temp_root).exists():
         return True
-    remover = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            "import shutil,sys; shutil.rmtree(sys.argv[1])",
-            temp_root,
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    remover: Optional[subprocess.Popen] = None
     try:
+        remover = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import shutil,sys; shutil.rmtree(sys.argv[1])",
+                temp_root,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         remover.wait(timeout=max(0.0, deadline - time.monotonic()))
-    except subprocess.TimeoutExpired:
-        try:
-            remover.kill()
-            remover.wait(timeout=max(0.0, deadline - time.monotonic()))
-        except (OSError, subprocess.TimeoutExpired):
-            return False
+    except (OSError, subprocess.TimeoutExpired):
+        if remover is not None:
+            try:
+                remover.kill()
+                remover.wait(timeout=0)
+            except (OSError, subprocess.TimeoutExpired, ValueError):
+                return False
+        return False
     return remover.returncode == 0 and not Path(temp_root).exists()
 
 
@@ -2428,8 +2436,20 @@ class _ChatGPTOracleBrowserOwner:
         registration: NativeHistoryLifecycleRegistration,
     ) -> None:
         with self.pending_registry_lock:
+            if self.transferred:
+                raise RuntimeError(
+                    "Native history lifecycle owner no longer accepts work."
+                )
             if registration.registration_id in self.registrations:
                 raise RuntimeError("Native history lifecycle was registered twice.")
+            if registration.cdp_endpoint != self.cdp_endpoint:
+                raise RuntimeError(
+                    "Native history CDP endpoint does not match lifecycle owner."
+                )
+            if registration.anchor_target_id != self.anchor_target_id:
+                raise RuntimeError(
+                    "Native history anchor target does not match lifecycle owner."
+                )
             self.registrations[registration.registration_id] = registration
             if self.operation_deadline is None:
                 self.operation_deadline = registration.deadline
@@ -2454,7 +2474,9 @@ class _ChatGPTOracleBrowserOwner:
         closer: NativeHistoryCloseRegistration,
     ) -> None:
         with self.pending_registry_lock:
-            if registration.registration_id not in self.registrations:
+            if self.registrations.get(
+                registration.registration_id
+            ) is not registration:
                 raise RuntimeError("Native history closer has no lifecycle owner.")
             registration.close_registration = closer
 
@@ -2464,7 +2486,12 @@ class _ChatGPTOracleBrowserOwner:
         reason: str,
     ) -> None:
         with self.pending_registry_lock:
-            self.registrations[registration.registration_id] = registration
+            if self.registrations.get(
+                registration.registration_id
+            ) is not registration:
+                raise RuntimeError(
+                    "Native history retention has no registered owner."
+                )
             registration.cleanup_failure = reason
 
     def release(
@@ -2474,6 +2501,12 @@ class _ChatGPTOracleBrowserOwner:
         proof: str,
     ) -> None:
         with self.pending_registry_lock:
+            if self.registrations.get(
+                registration.registration_id
+            ) is not registration:
+                raise RuntimeError(
+                    "Native history release has no registered owner."
+                )
             registration.released = True
             registration.release_proof = proof
             registration.release_event.set()
@@ -2509,17 +2542,24 @@ class _ChatGPTOracleBrowserOwner:
     def terminate_owned_browser(self, deadline: float) -> bool:
         if deadline is None:
             raise RuntimeError("Oracle browser termination deadline is required.")
+        if deadline <= time.monotonic():
+            raise TimeoutError("Oracle browser termination deadline expired.")
         """Terminate only this profile owner's helper tree and prove reaping."""
 
+        process_exited = False
         try:
             _chatgpt_oracle_owned_handles(
                 self.process,
                 self.temp_root,
                 self.handles,
+                deadline,
             )
             if self.process.stdin is not None:
                 self.process.stdin.close()
-        except (BrokenPipeError, OSError):
+        except (BrokenPipeError, OSError, TimeoutError) as exc:
+            if isinstance(exc, TimeoutError):
+                self.cleanup_error = str(exc)
+                return False
             pass
         _signal_chatgpt_oracle_handles(self.handles, signal.SIGTERM)
         if not self._wait_for_owned_handles(deadline):
@@ -2527,6 +2567,7 @@ class _ChatGPTOracleBrowserOwner:
                 self.process,
                 self.temp_root,
                 self.handles,
+                deadline,
             )
             _signal_chatgpt_oracle_handles(self.handles, signal.SIGKILL)
             if not self._wait_for_owned_handles(deadline):
@@ -2534,10 +2575,26 @@ class _ChatGPTOracleBrowserOwner:
                 return False
         try:
             self.process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            process_exited = True
         except (OSError, subprocess.TimeoutExpired):
             self.cleanup_error = "Oracle browser helper was not reaped."
             return False
-        return self.process.returncode is not None
+        try:
+            _chatgpt_oracle_owned_handles(
+                self.process,
+                self.temp_root,
+                self.handles,
+                deadline,
+            )
+        except (OSError, ValueError) as exc:
+            self.cleanup_error = (
+                self.cleanup_error or _redacted_failure_message(str(exc))
+            )
+            return False
+        except TimeoutError as exc:
+            self.cleanup_error = str(exc)
+            return False
+        return process_exited and self.process.returncode is not None
 
     def _cleanup_owner(self, deadline: float) -> bool:
         phase_deadline = time.monotonic() + max(
@@ -2591,13 +2648,25 @@ class _ChatGPTOracleBrowserOwner:
         with self.pending_registry_lock:
             registrations = list(self.registrations.values())
             for registration in registrations:
-                callback = registration.cleanup_callback
-                if callback is None:
-                    continue
-                try:
-                    callback(deadline)
-                except Exception as exc:
-                    registration.cleanup_failure = str(exc)
+                registration.finalizing = True
+        for registration in registrations:
+            callback = registration.cleanup_callback
+            if callback is None:
+                continue
+            try:
+                callback(deadline)
+            except Exception as exc:
+                registration.cleanup_failure = str(exc)
+        with self.pending_registry_lock:
+            for registration in registrations:
+                if (
+                    registration.released
+                    and registration.cleanup_failure is None
+                    and self.registrations.get(
+                        registration.registration_id
+                    ) is not registration
+                ):
+                    registration.finalizing = False
             has_registrations = bool(self.registrations)
             if has_registrations:
                 self.transferred = True
@@ -2616,13 +2685,25 @@ class _ChatGPTOracleBrowserOwner:
         with self.pending_registry_lock:
             registrations = list(self.registrations.values())
             for registration in registrations:
-                callback = registration.cleanup_callback
-                if callback is None:
-                    continue
-                try:
-                    callback(cleanup_deadline)
-                except Exception as exc:
-                    registration.cleanup_failure = str(exc)
+                registration.finalizing = True
+        for registration in registrations:
+            callback = registration.cleanup_callback
+            if callback is None:
+                continue
+            try:
+                callback(cleanup_deadline)
+            except Exception as exc:
+                registration.cleanup_failure = str(exc)
+        with self.pending_registry_lock:
+            for registration in registrations:
+                if (
+                    registration.released
+                    and registration.cleanup_failure is None
+                    and self.registrations.get(
+                        registration.registration_id
+                    ) is not registration
+                ):
+                    registration.finalizing = False
             if self.registrations:
                 return False
         return self._cleanup_owner(cleanup_deadline)

@@ -2694,6 +2694,7 @@ class NativeHistoryLifecycleRegistration:
     deadline: float
     operation_start: float
     target_close_budget: float
+    finalizing: bool = False
     cleanup_callback: Optional[Callable[[float], Any]] = None
     close_registration: Optional[NativeHistoryCloseRegistration] = None
     started: bool = False
@@ -5019,7 +5020,11 @@ def _run_oracle_browser_history_observation_in_worker(  # noqa: PLR0915 - bounde
         operation_start + target_close_budget,
         deadline,
     )
-    capture_deadline = cleanup_deadline
+    target_close_reserve = min(5.0, target_close_budget / 2)
+    capture_deadline = max(
+        operation_start,
+        cleanup_deadline - target_close_reserve,
+    )
     process = context.Process(
         target=_oracle_browser_history_observation_worker,
         args=(
@@ -5434,7 +5439,10 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
     except Exception:
         successful = False
     finally:
-        if not creation_settled.is_set() and not bool(creation_issued.value):
+        if (
+            not bool(creation_issued.value)
+            and creation_state.value == _NATIVE_HISTORY_TARGET_NONE
+        ):
             _native_history_mark_no_create(
                 creation_state=creation_state,
                 creation_issued=creation_issued,
@@ -5447,6 +5455,15 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
             creation_state.value = _NATIVE_HISTORY_TARGET_CLEANUP_PENDING
         if abort_event.is_set():
             successful = False
+        if (
+            not bool(creation_issued.value)
+            and creation_state.value == _NATIVE_HISTORY_TARGET_NONE
+        ):
+            _native_history_mark_no_create(
+                creation_state=creation_state,
+                creation_issued=creation_issued,
+                creation_settled=creation_settled,
+            )
         try:
             _send_oracle_browser_worker_message(
                 sender,
@@ -5506,6 +5523,15 @@ def _create_native_history_owned_page(
                 )
                 raise OracleBrowserBoundaryUnavailable(
                     "Native ChatGPT history was aborted before target creation."
+                )
+            if abort_event.is_set():
+                _native_history_mark_no_create(
+                    creation_state=creation_state,
+                    creation_issued=creation_issued,
+                    creation_settled=creation_settled,
+                )
+                raise OracleBrowserBoundaryUnavailable(
+                    "Native ChatGPT history was aborted before start."
                 )
             creation_state.value = _NATIVE_HISTORY_TARGET_CREATING
             creation_issued.value = True
@@ -5693,7 +5719,7 @@ def _oracle_browser_close_target_worker(
         target_listing = session.send("Target.getTargets")
         if not isinstance(target_listing, Mapping):
             return
-        targets = target_listing.get("targetInfos", ())
+        targets = target_listing.get("targetInfos")
         if not isinstance(targets, (list, tuple)):
             return
         if target_id is None:
@@ -5725,7 +5751,9 @@ def _oracle_browser_close_target_worker(
         post_close_listing = session.send("Target.getTargets")
         if not isinstance(post_close_listing, Mapping):
             return
-        post_close_targets = post_close_listing.get("targetInfos", ())
+        if "targetInfos" not in post_close_listing:
+            return
+        post_close_targets = post_close_listing["targetInfos"]
         if not isinstance(post_close_targets, (list, tuple)):
             return
         target_proof.value = not any(
