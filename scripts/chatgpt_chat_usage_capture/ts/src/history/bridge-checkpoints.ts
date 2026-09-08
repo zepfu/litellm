@@ -1,9 +1,16 @@
 import type {
   DiscoveryCheckpoint,
   HistoryCheckpointStore,
+  HistoryDiscoveryPageCommit,
+  HistoryPageCommit,
   HistoryScope,
   RevisitEntry,
 } from "../contracts/history.js";
+import type { HistoryAccountState } from "../contracts/history.js";
+import type {
+  IngestContext,
+  ReconstructedAttempt,
+} from "../ledger/types.js";
 
 export interface BridgeStateEnvelope {
   stateVersion: 1;
@@ -11,14 +18,51 @@ export interface BridgeStateEnvelope {
   stateVersionCounter: number;
   discovery: Partial<Record<HistoryScope, DiscoveryCheckpoint>>;
   revisits: RevisitEntry[];
+  accountState?: HistoryAccountState;
+  queueCoverage?: "complete" | "partial";
+}
+
+export type BridgeQueueMutationOperation = "replace" | "remove";
+
+export interface BridgeCandidateMutation {
+  candidateKey: string;
+  operation: BridgeQueueMutationOperation;
+  queueKind: "candidate" | "revisit";
+  scope?: HistoryScope;
+  payload?: Record<string, unknown>;
+}
+
+export interface BridgeCoverageMutation {
+  sourceKind: string;
+  sourceId: string;
+  reason: string;
+  state: "open" | "resolved";
+  seenAt: string;
+  details?: Record<string, unknown>;
+}
+
+export interface BridgeCheckpointMutation {
+  kind: "history";
+  value: BridgeStateEnvelope;
 }
 
 export interface BridgePageMutation {
   pageCommitId: string;
   conversationId: string;
   scopes: readonly HistoryScope[];
+  expectedStateVersion?: number;
+  source?: IngestContext;
+  discovery?: HistoryDiscoveryPageCommit;
+  page?: HistoryPageCommit;
+  observations?: readonly Record<string, unknown>[];
+  attempts?: readonly ReconstructedAttempt[];
+  ingestOperations?: readonly Record<string, unknown>[];
+  checkpointMutations?: BridgeCheckpointMutation;
+  candidateMutations?: readonly BridgeCandidateMutation[];
+  coverageMutations?: readonly BridgeCoverageMutation[];
   checkpoint?: DiscoveryCheckpoint;
   revisit?: RevisitEntry;
+  accountState?: HistoryAccountState;
 }
 
 /**
@@ -28,14 +72,29 @@ export interface BridgePageMutation {
 export class BridgeCheckpointStore implements HistoryCheckpointStore {
   private readonly discovery = new Map<HistoryScope, DiscoveryCheckpoint>();
   private readonly revisits = new Map<string, RevisitEntry>();
+  private readonly pendingQueueMutations = new Map<
+    string,
+    BridgeCandidateMutation
+  >();
+  private accountState: HistoryAccountState = {
+    status: "ready",
+    reason: null,
+    pausedAt: null,
+    cooldownUntil: null,
+    lastError: null,
+  };
 
   hydrate(state: BridgeStateEnvelope | null): void {
     if (!state) {
       this.discovery.clear();
       this.revisits.clear();
+      this.pendingQueueMutations.clear();
       return;
     }
     validateEnvelope(state);
+    if (state.accountState) {
+      this.accountState = validateAccountState(state.accountState);
+    }
     const hydratedRevisits = new Map<string, RevisitEntry>();
     for (const revisit of state.revisits) {
       hydratedRevisits.set(revisit.conversationId, clone(normalizeRevisit(revisit)));
@@ -50,6 +109,7 @@ export class BridgeCheckpointStore implements HistoryCheckpointStore {
     }
     this.revisits.clear();
     this.discovery.clear();
+    this.pendingQueueMutations.clear();
     for (const [scope, checkpoint] of hydratedDiscovery) {
       this.discovery.set(scope, checkpoint);
     }
@@ -58,12 +118,12 @@ export class BridgeCheckpointStore implements HistoryCheckpointStore {
     }
   }
 
-  loadAccountState(): never {
-    throw new Error("account state is owned by the collector bridge header");
+  loadAccountState(): HistoryAccountState {
+    return clone(this.accountState);
   }
 
-  saveAccountState(): never {
-    throw new Error("account state is owned by the collector bridge header");
+  saveAccountState(state: HistoryAccountState): void {
+    this.accountState = validateAccountState(state);
   }
 
   loadDiscovery(scope: HistoryScope): DiscoveryCheckpoint | null {
@@ -73,6 +133,12 @@ export class BridgeCheckpointStore implements HistoryCheckpointStore {
 
   saveDiscovery(checkpoint: DiscoveryCheckpoint): void {
     validateCheckpoint(checkpoint);
+    const previous = this.discovery.get(checkpoint.scope);
+    this.recordCandidateMutations(
+      checkpoint.scope,
+      previous?.candidateQueue ?? [],
+      checkpoint.candidateQueue ?? [],
+    );
     this.discovery.set(checkpoint.scope, clone(checkpoint));
   }
 
@@ -107,19 +173,62 @@ export class BridgeCheckpointStore implements HistoryCheckpointStore {
   }
 
   upsertRevisit(entry: RevisitEntry): void {
-    this.revisits.set(entry.conversationId, clone(normalizeRevisit(entry)));
+    const previous = this.revisits.get(entry.conversationId);
+    const normalized = clone(normalizeRevisit(entry));
+    if (!previous || !sameValue(previous, normalized)) {
+      this.pendingQueueMutations.set(
+        `revisit:${entry.conversationId}`,
+        {
+          candidateKey: `revisit:${entry.conversationId}`,
+          operation: "replace",
+          queueKind: "revisit",
+          payload: { entry: normalized },
+        },
+      );
+    }
+    this.revisits.set(entry.conversationId, normalized);
   }
 
   completeRevisit(_accountId: string, conversationId: string): void {
     this.revisits.delete(conversationId);
+    this.pendingQueueMutations.set(
+      `revisit:${conversationId}`,
+      {
+        candidateKey: `revisit:${conversationId}`,
+        operation: "remove",
+        queueKind: "revisit",
+      },
+    );
   }
 
-  snapshot(collectorAccountId: string, stateVersionCounter: number): BridgeStateEnvelope {
+  pendingQueueMutationsSnapshot(): BridgeCandidateMutation[] {
+    return [...this.pendingQueueMutations.values()].map((mutation) =>
+      clone(mutation),
+    );
+  }
+
+  acknowledgeQueueMutations(
+    mutations: readonly BridgeCandidateMutation[],
+  ): void {
+    for (const mutation of mutations) {
+      const current = this.pendingQueueMutations.get(mutation.candidateKey);
+      if (current && sameValue(current, mutation)) {
+        this.pendingQueueMutations.delete(mutation.candidateKey);
+      }
+    }
+  }
+
+  snapshot(
+    collectorAccountId: string,
+    stateVersionCounter: number,
+  ): BridgeStateEnvelope {
     const discovery: Partial<Record<HistoryScope, DiscoveryCheckpoint>> = {};
     for (const scope of ["active", "archived"] as const) {
       const checkpoint = this.discovery.get(scope);
       if (checkpoint) {
-        discovery[scope] = clone(checkpoint);
+        const { candidateQueue: _candidateQueue, ...headerCheckpoint } =
+          checkpoint;
+        discovery[scope] = clone(headerCheckpoint);
       }
     }
     return {
@@ -128,8 +237,85 @@ export class BridgeCheckpointStore implements HistoryCheckpointStore {
       stateVersionCounter,
       discovery,
       revisits: this.listRevisits(),
+      accountState: clone(this.accountState),
+      queueCoverage: "complete",
     };
   }
+
+  private recordCandidateMutations(
+    scope: HistoryScope,
+    previous: readonly {
+      summary: { conversationId: string };
+      missingUpdateTime: boolean;
+    }[],
+    next: readonly {
+      summary: { conversationId: string };
+      missingUpdateTime: boolean;
+    }[],
+  ): void {
+    const previousById = new Map(
+      previous.map((candidate) => [candidate.summary.conversationId, candidate]),
+    );
+    const nextById = new Map(
+      next.map((candidate) => [candidate.summary.conversationId, candidate]),
+    );
+    for (const conversationId of previousById.keys()) {
+      if (!nextById.has(conversationId)) {
+        this.pendingQueueMutations.set(
+          `candidate:${scope}:${conversationId}`,
+          {
+            candidateKey: `candidate:${scope}:${conversationId}`,
+            operation: "remove",
+            queueKind: "candidate",
+            scope,
+          },
+        );
+      }
+    }
+    for (const [conversationId, candidate] of nextById) {
+      const prior = previousById.get(conversationId);
+      if (prior && sameValue(prior, candidate)) {
+        continue;
+      }
+      this.pendingQueueMutations.set(
+        `candidate:${scope}:${conversationId}`,
+        {
+          candidateKey: `candidate:${scope}:${conversationId}`,
+          operation: "replace",
+          queueKind: "candidate",
+          scope,
+          payload: { candidate },
+        },
+      );
+    }
+  }
+}
+
+function validateAccountState(state: HistoryAccountState): HistoryAccountState {
+  if (
+    (state.status !== "ready" && state.status !== "paused") ||
+    state.pausedAt !== null && !isValidInstant(state.pausedAt) ||
+    state.cooldownUntil !== null && !isValidInstant(state.cooldownUntil) ||
+    state.lastError !== null && typeof state.lastError !== "string" ||
+    (
+      state.reason !== null &&
+      state.reason !== "authentication" &&
+      state.reason !== "cooldown"
+    )
+  ) {
+    throw new Error("account state is invalid");
+  }
+  if (state.status === "ready" && state.reason !== null) {
+    throw new Error("ready account state cannot have a pause reason");
+  }
+  if (state.status === "paused" && state.reason === null) {
+    throw new Error("paused account state requires a reason");
+  }
+  return clone(state);
+}
+
+function isValidInstant(value: string): boolean {
+  return Number.isFinite(new Date(value).getTime());
 }
 
 export function validateEnvelope(state: BridgeStateEnvelope): void {
@@ -200,4 +386,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function clone<T>(value: T): T {
   return structuredClone(value);
+}
+
+function sameValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }

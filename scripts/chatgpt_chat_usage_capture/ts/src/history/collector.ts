@@ -18,11 +18,13 @@ import type {
   HistoryRange,
   HistoryDiscoveryPageCommit,
   HistoryCheckpointStore,
+  HistoryAccountState,
   HistoryPageCommit,
   HistoryReader,
   HistoryScope,
   OlderHistoryAuditCoverage,
   OlderHistoryAuditState,
+  RevisitPageIssue,
   RevisitEntry,
   RevisitReason,
   ScopeCoverageResult,
@@ -66,6 +68,7 @@ interface DetailAcquisition {
   coverage: AcquiredConversation["coverage"];
   warnings: string[];
   detailPagesFetched: number;
+  blocked: boolean;
 }
 
 const TERMINAL_GENERATION_STATUSES = new Set([
@@ -92,6 +95,7 @@ export class HistoryCollector {
   private readonly maxIndexPagesPerScope: number;
   private readonly maxMessagePagesPerConversation: number;
   private readonly legacyFallbackApproved: boolean;
+  private readonly committedConversationIds = new Set<string>();
 
   constructor(
     private readonly reader: HistoryReader,
@@ -181,6 +185,7 @@ export class HistoryCollector {
         scanStartedAt,
         identity,
         "history collection requires a verified ready Chat identity",
+        this.options.store.loadAccountState(),
       );
     }
 
@@ -240,6 +245,7 @@ export class HistoryCollector {
 
     const conversations: AcquiredConversation[] = [];
     let detailPagesFetched = 0;
+    let blocked = false;
     for (const candidate of candidates.values()) {
       const acquisition = await this.acquireConversation(
         candidate,
@@ -250,6 +256,7 @@ export class HistoryCollector {
         requestedRange,
       );
       detailPagesFetched += acquisition.detailPagesFetched;
+      blocked ||= acquisition.blocked;
       conversations.push({
         summary: candidate.summary,
         scopes: [...candidate.scopes].sort(),
@@ -264,14 +271,19 @@ export class HistoryCollector {
           ...acquisition.warnings,
         ],
       });
+      if (blocked) {
+        break;
+      }
     }
 
     const revisits = this.options.store.listRevisits();
     const coverage = this.buildCoverage(scopeResults, conversations, warnings);
     const status =
-      coverage.overall === "complete" && revisits.length === 0
+      !blocked && coverage.overall === "complete" && revisits.length === 0
         ? "complete"
-        : "partial";
+        : blocked
+          ? "blocked"
+          : "partial";
 
     return {
       accountId: this.options.accountId,
@@ -416,7 +428,9 @@ export class HistoryCollector {
           isCandidateSummary(
             summary,
             candidateCutoff,
-            request.mode === "incremental" ? acquisitionRange.end : null,
+            request.mode === "incremental" && !explicitRange
+              ? acquisitionRange.end
+              : null,
           )
         ) {
           enqueueCandidate(summary);
@@ -897,6 +911,25 @@ export class HistoryCollector {
     scanStartedAt: string,
     requestedRange: HistoryRange,
   ): Promise<DetailAcquisition> {
+    const warnings: string[] = [];
+    const implicitUpperBound =
+      request.mode === "incremental" && request.range === undefined;
+    let retainedMessages: MessageRecord[] = [];
+    if (this.options.loadConversationMetadata) {
+      try {
+        const retained = await this.options.loadConversationMetadata(
+          candidate.summary.conversationId,
+        );
+        if (retained) {
+          retainedMessages = dedupeMessages(retained.messages ?? []);
+          if (isMoreRecent(retained.summary.updatedAt, candidate.summary.updatedAt)) {
+            candidate.summary = retained.summary;
+          }
+        }
+      } catch (error) {
+        warnings.push(`retained_metadata_${errorCode(error)}`);
+      }
+    }
     const existingRevisit =
       this.options.store
         .listRevisits()
@@ -922,6 +955,10 @@ export class HistoryCollector {
         errorCode(error),
         existingRevisit,
       );
+      const blockedByAccount = isAccountBlockingError(error);
+      if (blockedByAccount) {
+        this.pauseAccount(error, now);
+      }
       await this.commitPage({
         accountId: this.options.accountId,
         mode: request.mode,
@@ -930,29 +967,40 @@ export class HistoryCollector {
         summary: candidate.summary,
         scopes: [...candidate.scopes].sort(),
         detail: null,
-        messages: [],
+        messages: messagesBeforeExclusiveEnd(
+          retainedMessages,
+          implicitUpperBound ? requestedRange.end : null,
+        ),
         coverage: "partial",
-        warnings: [`detail_${errorCode(error)}`],
+        warnings: [...warnings, `detail_${errorCode(error)}`],
         pageKind: "detail",
         pageNumber: existingRevisit?.detailPagesFetched ?? 0,
         nextContinuation: revisit.continuation,
         revisit,
       });
+      if (!blockedByAccount) {
+        this.pauseAccount(error, now);
+      }
       return {
         detail: null,
-        messages: [],
+        messages: messagesBeforeExclusiveEnd(
+          retainedMessages,
+          implicitUpperBound ? requestedRange.end : null,
+        ),
         revisit,
         coverage: "partial",
-        warnings: [`detail_${errorCode(error)}`],
+        warnings: [...warnings, `detail_${errorCode(error)}`],
         detailPagesFetched: 0,
+        blocked: isAccountBlockingError(error),
       };
     }
 
     const messages = messagesBeforeExclusiveEnd(
-      dedupeMessages(detail.messages),
-      requestedRange.end,
+      dedupeMessages([...retainedMessages, ...detail.messages]),
+      implicitUpperBound ? requestedRange.end : null,
     );
     detail = { ...detail, messages };
+    const continuationRevision = conversationRevision(detail);
     const detailReason = detailRevisitReason(detail);
     let detailRevisit = existingRevisit;
     if (detailReason) {
@@ -963,7 +1011,31 @@ export class HistoryCollector {
         0,
         null,
         existingRevisit,
-        { continuation: detail.continuation },
+        {
+          continuation: detail.continuation,
+          continuationRevision,
+        },
+      );
+    }
+    if (
+      detailRevisit !== null &&
+      detailRevisit.continuation !== null &&
+      detailRevisit.continuationRevision !== null &&
+      detailRevisit.continuationRevision !== continuationRevision
+    ) {
+      warnings.push("conversation_revision_changed_restart");
+      detailRevisit = this.saveRevisit(
+        candidate,
+        now,
+        "bad_continuation",
+        0,
+        null,
+        detailRevisit,
+        {
+          continuation: null,
+          continuationRevision,
+          incrementAttempt: false,
+        },
       );
     }
     if (detail.detailRoute === "legacy") {
@@ -988,6 +1060,7 @@ export class HistoryCollector {
             ? "partial"
             : "complete",
         warnings: [
+          ...warnings,
           ...detail.warnings,
           ...(revisit?.reason === "nonterminal_generation"
             ? ["nonterminal_generation_pending"]
@@ -1008,6 +1081,7 @@ export class HistoryCollector {
             : "complete",
         warnings: detail.warnings,
         detailPagesFetched: 0,
+        blocked: false,
       };
     }
 
@@ -1026,7 +1100,7 @@ export class HistoryCollector {
         detail: { ...detail, messages },
         messages,
         coverage: "partial",
-        warnings: detail.warnings,
+        warnings: [...warnings, ...detail.warnings],
         pageKind: "detail",
         pageNumber: detailRevisit?.detailPagesFetched ?? 0,
         nextContinuation:
@@ -1049,7 +1123,7 @@ export class HistoryCollector {
       request.mode,
       identity,
       scanStartedAt,
-      requestedRange.end,
+      implicitUpperBound ? requestedRange.end : null,
     );
     return {
       detail: { ...detail, messages: pageResult.messages },
@@ -1059,8 +1133,9 @@ export class HistoryCollector {
         pageResult.revisit || detail.coverage !== "validated_page"
           ? "partial"
           : "complete",
-      warnings: [...detail.warnings, ...pageResult.warnings],
+      warnings: [...warnings, ...detail.warnings, ...pageResult.warnings],
       detailPagesFetched: pageResult.detailPagesFetched,
+      blocked: false,
     };
   }
 
@@ -1074,7 +1149,7 @@ export class HistoryCollector {
     mode: HistoryCollectionRequest["mode"],
     identity: IdentityRecord,
     scanStartedAt: string,
-    rangeEnd: string,
+    rangeEnd: string | null,
   ): Promise<{
     messages: MessageRecord[];
     revisit: RevisitEntry | null;
@@ -1092,6 +1167,7 @@ export class HistoryCollector {
     let continuationRestarted = false;
     let pageNumber = existingRevisit?.detailPagesFetched ?? 0;
     let retainedPageReason: RevisitReason | null = null;
+    const continuationRevision = conversationRevision(detail);
 
     while (detailPagesFetched < pageBudget) {
       let page;
@@ -1113,7 +1189,11 @@ export class HistoryCollector {
           0,
           errorCode(error),
           currentRevisit,
-          { continuation: before, incrementAttempt: false },
+          {
+            continuation: before,
+            continuationRevision,
+            incrementAttempt: false,
+          },
         );
         await this.commitPage({
           accountId: this.options.accountId,
@@ -1152,6 +1232,46 @@ export class HistoryCollector {
       warnings.push(...page.warnings);
       const mergedMessages = dedupeMessages(messages);
       const pageRevisitReason = messagePageRevisitReason(page);
+      const malformedPage =
+        page.paginationState === "contradictory"
+          ? {
+              reason: "contradictory_pagination" as const,
+              warnings: [...page.warnings],
+            }
+          : page.coverage === "unrecognized"
+            ? {
+                reason: "unrecognized_detail" as const,
+                warnings: [...page.warnings],
+              }
+            : page.coverage === "partial" || page.warnings.length > 0
+              ? {
+                  reason: "partial_detail" as const,
+                  warnings: [...page.warnings],
+                }
+              : null;
+      if (malformedPage) {
+        this.markMalformedPage(
+          currentRevisit,
+          malformedPage.reason,
+          malformedPage.warnings,
+        );
+        if (!currentRevisit) {
+          currentRevisit = this.saveRevisit(
+            candidate,
+            now,
+            malformedPage.reason,
+            0,
+            null,
+            null,
+            {
+              continuation: null,
+              continuationRevision,
+              incrementAttempt: false,
+              malformedPage,
+            },
+          );
+        }
+      }
 
       if (page.paginationState === "complete" && page.exhausted) {
         const revisit = this.finalizeRevisit(
@@ -1223,6 +1343,8 @@ export class HistoryCollector {
             continuation: null,
             pagesFetched: 1,
             incrementAttempt: false,
+            continuationRevision,
+            ...(malformedPage ? { malformedPage } : {}),
           },
         );
         await this.commitPage({
@@ -1274,6 +1396,8 @@ export class HistoryCollector {
             continuation: null,
             pagesFetched: 1,
             incrementAttempt: false,
+            continuationRevision,
+            ...(malformedPage ? { malformedPage } : {}),
           },
         );
         await this.commitPage({
@@ -1322,9 +1446,11 @@ export class HistoryCollector {
             null,
             currentRevisit,
             {
-            continuation: null,
-            pagesFetched: 1,
-            incrementAttempt: false,
+              continuation: null,
+              pagesFetched: 1,
+              incrementAttempt: false,
+              continuationRevision,
+              ...(malformedPage ? { malformedPage } : {}),
             },
           );
           await this.commitPage({
@@ -1366,6 +1492,8 @@ export class HistoryCollector {
             continuation: null,
             pagesFetched: 1,
             incrementAttempt: false,
+            continuationRevision,
+            ...(malformedPage ? { malformedPage } : {}),
           },
         );
         await this.commitPage({
@@ -1412,6 +1540,8 @@ export class HistoryCollector {
           continuation: cursor,
           pagesFetched: 1,
           incrementAttempt: false,
+          continuationRevision,
+          ...(malformedPage ? { malformedPage } : {}),
         },
       );
       if (detailPagesFetched >= pageBudget) {
@@ -1423,7 +1553,12 @@ export class HistoryCollector {
           0,
           null,
           currentRevisit,
-          { continuation: cursor, incrementAttempt: false },
+          {
+            continuation: cursor,
+            incrementAttempt: false,
+            continuationRevision,
+            ...(malformedPage ? { malformedPage } : {}),
+          },
         );
       }
       await this.commitPage({
@@ -1467,7 +1602,11 @@ export class HistoryCollector {
       0,
       null,
       currentRevisit,
-      { continuation: before, incrementAttempt: false },
+      {
+        continuation: before,
+        incrementAttempt: false,
+        continuationRevision,
+      },
     );
     const boundedMessages = messagesBeforeExclusiveEnd(
       dedupeMessages(messages),
@@ -1492,6 +1631,8 @@ export class HistoryCollector {
       continuation?: string | null;
       pagesFetched?: number;
       incrementAttempt?: boolean;
+      continuationRevision?: string | null;
+      malformedPage?: RevisitPageIssue | null;
     } = {},
   ): RevisitEntry {
     const nowIso = now.toISOString();
@@ -1513,11 +1654,16 @@ export class HistoryCollector {
       nextEligibleAt: nowIso,
       lastError,
       detailPagesFetched: (existing?.detailPagesFetched ?? 0) + pageDelta,
-      continuationRevision: existing?.continuationRevision ?? null,
-      malformedPage: existing?.malformedPage ?? null,
+      continuationRevision:
+        options.continuationRevision ?? existing?.continuationRevision ?? null,
+      malformedPage: options.malformedPage ?? existing?.malformedPage ?? null,
       outstandingGeneration:
         reason === "nonterminal_generation"
-          ? { state: "unknown", since: nowIso, timedOut: false }
+          ? existing?.outstandingGeneration ?? {
+              state: "unknown",
+              since: nowIso,
+              timedOut: false,
+            }
           : existing?.outstandingGeneration ?? null,
       continuation:
         options.continuation === undefined
@@ -1561,6 +1707,52 @@ export class HistoryCollector {
     return null;
   }
 
+  private pauseAccount(error: unknown, now: Date): void {
+    const nowIso = now.toISOString();
+    if (error instanceof AuthenticationRequiredError) {
+      this.setAccountState({
+        status: "paused",
+        reason: "authentication",
+        pausedAt: nowIso,
+        cooldownUntil: null,
+        lastError: "auth_required",
+      });
+      return;
+    }
+    if (error instanceof RateLimitedError) {
+      this.setAccountState({
+        status: "paused",
+        reason: "cooldown",
+        pausedAt: nowIso,
+        cooldownUntil: parseRetryAfter(error.retryAfter, now).toISOString(),
+        lastError: "rate_limited",
+      });
+    }
+  }
+
+  private setAccountState(state: HistoryAccountState): void {
+    this.options.store.saveAccountState(state);
+    if (this.options.onAccountStateCommit) {
+      void this.options.onAccountStateCommit(state);
+    }
+  }
+
+  private markMalformedPage(
+    currentRevisit: RevisitEntry | null,
+    reason: Extract<RevisitReason, "partial_detail" | "unrecognized_detail" | "contradictory_pagination">,
+    warnings: readonly string[],
+  ): void {
+    if (!currentRevisit) {
+      return;
+    }
+    const next: RevisitEntry = {
+      ...currentRevisit,
+      malformedPage: { reason, warnings: [...warnings] },
+    };
+    this.options.store.upsertRevisit(next);
+    currentRevisit.malformedPage = next.malformedPage;
+  }
+
   private async commitDiscoveryCheckpoint(
     checkpoint: DiscoveryCheckpoint,
     identity: IdentityRecord,
@@ -1576,15 +1768,23 @@ export class HistoryCollector {
     }
   }
 
-  private async commitPage(page: HistoryPageCommit): Promise<void> {
+  private async commitPage(
+    page: Omit<HistoryPageCommit, "accountState">,
+  ): Promise<void> {
+    const committedPage: HistoryPageCommit = {
+      ...page,
+      accountState: this.options.store.loadAccountState(),
+    };
     if (this.options.onPageCommit) {
-      await this.options.onPageCommit(page);
+      await this.options.onPageCommit(committedPage);
+      this.committedConversationIds.add(committedPage.summary.conversationId);
       return;
     }
     this.options.store.acknowledgeCandidates(
-      page.summary.conversationId,
-      page.scopes,
+      committedPage.summary.conversationId,
+      committedPage.scopes,
     );
+    this.committedConversationIds.add(committedPage.summary.conversationId);
   }
 
   private buildCoverage(
@@ -1632,6 +1832,14 @@ export class HistoryCollector {
     }
     if (conversations.some((conversation) => conversation.coverage !== "complete")) {
       gaps.push("incomplete_conversation_details");
+    }
+    if (
+      conversations.some(
+        (conversation) =>
+          !this.committedConversationIds.has(conversation.summary.conversationId),
+      )
+    ) {
+      gaps.push("uncommitted_conversation_details");
     }
     const auditEnabled =
       active.olderHistoryAudit.enabled || archived.olderHistoryAudit.enabled;
@@ -1903,8 +2111,11 @@ function isCandidateSummary(
 
 function messagesBeforeExclusiveEnd(
   messages: MessageRecord[],
-  rangeEnd: string,
+  rangeEnd: string | null,
 ): MessageRecord[] {
+  if (rangeEnd === null) {
+    return messages;
+  }
   const end = new Date(rangeEnd);
   if (!Number.isFinite(end.getTime())) {
     return messages;
@@ -1919,6 +2130,19 @@ function messagesBeforeExclusiveEnd(
       createdAt.getTime() < end.getTime()
     );
   });
+}
+
+function conversationRevision(detail: ConversationDetailProjection): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        conversationId: detail.conversationId,
+        currentNode: detail.currentNode,
+        updatedAt: detail.updatedAt,
+        continuation: detail.continuation,
+      }),
+    )
+    .digest("hex");
 }
 
 function isValidInstant(value: string): boolean {
@@ -2031,7 +2255,9 @@ function hasOutstandingGeneration(messages: MessageRecord[]): boolean {
     if (!hasGenerationIdentity) {
       return false;
     }
-    return message.endTurn !== true;
+    // An unknown provider status is never made terminal by an end-turn flag.
+    // Preserve it for a later reread when generation identity is present.
+    return true;
   });
 }
 
@@ -2100,6 +2326,13 @@ function classifyRevisitReason(error: unknown): RevisitReason {
   return "incomplete_detail";
 }
 
+function isAccountBlockingError(error: unknown): boolean {
+  return (
+    error instanceof AuthenticationRequiredError ||
+    error instanceof RateLimitedError
+  );
+}
+
 function errorCode(error: unknown): string {
   if (error instanceof RateLimitedError) {
     return "rate_limited";
@@ -2144,6 +2377,13 @@ function blockedResult(
   scanStartedAt: string,
   identity: IdentityRecord,
   warning: string,
+  accountState: HistoryAccountState = {
+    status: "ready",
+    reason: null,
+    pausedAt: null,
+    cooldownUntil: null,
+    lastError: null,
+  },
 ): HistoryCollectionResult {
   const active = unknownScopeCoverage("active");
   const archived = unknownScopeCoverage("archived");
@@ -2153,13 +2393,7 @@ function blockedResult(
     range,
     scanStartedAt,
     status: "blocked",
-    accountState: {
-      status: "ready",
-      reason: null,
-      pausedAt: null,
-      cooldownUntil: null,
-      lastError: null,
-    },
+    accountState,
     identity,
     scopes: [active, archived],
     conversations: [],
@@ -2192,4 +2426,18 @@ function validatePositiveInteger(value: number, label: string): void {
 
 function uniqueWarnings(warnings: string[]): string[] {
   return [...new Set(warnings)];
+}
+
+function parseRetryAfter(value: string | null, now: Date): Date {
+  if (!value) {
+    return now;
+  }
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return new Date(now.getTime() + seconds * 1000);
+  }
+  const instant = new Date(value);
+  return Number.isFinite(instant.getTime()) && instant.getTime() >= now.getTime()
+    ? instant
+    : now;
 }

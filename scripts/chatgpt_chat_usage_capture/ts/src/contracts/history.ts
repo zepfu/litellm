@@ -7,6 +7,12 @@ import type {
   MessageRecord,
   PaginationState,
 } from "./records.js";
+import type {
+  IngestContext,
+  LedgerScope,
+  ModelMappingVersion,
+  ReconstructedAttempt,
+} from "../ledger/types.js";
 
 export const HISTORY_STATE_VERSION = 1;
 export const DEFAULT_BACKFILL_DAYS = 14;
@@ -167,6 +173,7 @@ export interface HistoryDiscoveryPageCommit {
   checkpoint: DiscoveryCheckpoint;
   identity: IdentityRecord;
   scanStartedAt: string;
+  source?: IngestContext;
 }
 
 export interface HistoryPageCommit {
@@ -184,6 +191,8 @@ export interface HistoryPageCommit {
   pageNumber: number;
   nextContinuation: string | null;
   revisit: RevisitEntry | null;
+  accountState: HistoryAccountState;
+  source?: IngestContext;
 }
 
 export interface HistoryReader {
@@ -237,6 +246,18 @@ export interface HistoryCollectionOptions {
   onPageCommit?: (
     page: HistoryPageCommit,
   ) => Promise<void> | void;
+  onAccountStateCommit?: (
+    state: HistoryAccountState,
+  ) => Promise<void> | void;
+  scope?: LedgerScope;
+  mapping?: ModelMappingVersion;
+  loadConversationMetadata?: (
+    conversationId: string,
+  ) => Promise<{
+    summary: ConversationSummary;
+    messages?: MessageRecord[];
+    attempts?: ReconstructedAttempt[];
+  } | null>;
 }
 
 export interface ScopeCoverageResult {
