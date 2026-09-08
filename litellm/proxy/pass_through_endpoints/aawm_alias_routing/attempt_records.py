@@ -562,7 +562,7 @@ def _attach_kimi_managed_account_publication_telemetry(
     attempt_record["kimi_managed_account_publication"] = telemetry
 
 
-def _update_codex_auto_agent_retryable_attempt_record(
+def _update_codex_auto_agent_retryable_attempt_record(  # noqa: PLR0915
     *,
     attempt_record: dict[str, Any],
     exc: Any,
@@ -1392,6 +1392,30 @@ def _add_codex_auto_agent_alias_metadata(
             "account_bound_classification": selection.get(
                 "account_bound_classification"
             ),
+            "aawm_selected_account_label": (
+                candidate.get("xai_oauth_account_label")
+                or candidate.get("codex_oauth_account_label")
+            ),
+            "aawm_selected_account_hash": (
+                candidate.get("xai_oauth_account_hash")
+                or candidate.get("codex_oauth_account_hash")
+            ),
+            "aawm_selected_account_lane": (
+                candidate.get("xai_oauth_lane_key")
+                or candidate.get("codex_oauth_lane_key")
+            ),
+            "aawm_selected_account_scope": candidate.get(
+                "xai_oauth_scope_identity"
+            ),
+            "aawm_selected_account_provider": (
+                "xai_oauth"
+                if candidate.get("xai_oauth_account_hash")
+                else (
+                    "codex_oauth"
+                    if candidate.get("codex_oauth_account_hash")
+                    else None
+                )
+            ),
             "codex_auto_agent_selected_account_label": candidate.get(
                 "codex_oauth_account_label"
             ),
@@ -1565,6 +1589,30 @@ def _add_anthropic_auto_agent_alias_metadata(
             "has_account_bound_state": selection.get("has_account_bound_state"),
             "account_bound_classification": selection.get(
                 "account_bound_classification"
+            ),
+            "aawm_selected_account_label": (
+                candidate.get("xai_oauth_account_label")
+                or candidate.get("codex_oauth_account_label")
+            ),
+            "aawm_selected_account_hash": (
+                candidate.get("xai_oauth_account_hash")
+                or candidate.get("codex_oauth_account_hash")
+            ),
+            "aawm_selected_account_lane": (
+                candidate.get("xai_oauth_lane_key")
+                or candidate.get("codex_oauth_lane_key")
+            ),
+            "aawm_selected_account_scope": candidate.get(
+                "xai_oauth_scope_identity"
+            ),
+            "aawm_selected_account_provider": (
+                "xai_oauth"
+                if candidate.get("xai_oauth_account_hash")
+                else (
+                    "codex_oauth"
+                    if candidate.get("codex_oauth_account_hash")
+                    else None
+                )
             ),
             "anthropic_auto_agent_selected_account_label": candidate.get(
                 "codex_oauth_account_label"

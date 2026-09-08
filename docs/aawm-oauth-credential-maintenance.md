@@ -113,6 +113,53 @@ and scope alone are not sufficient. Missing, malformed, expired,
 unchanged-generation, unproven-account, or different-account material is not
 retried. Native Grok OIDC does not use this managed OAuth retry.
 
+### Managed xAI account inventory and rollover
+
+Set `LITELLM_XAI_OAUTH_INVENTORY` to one strict JSON object to use more than
+one managed xAI OAuth record:
+
+```json
+{
+  "schema_version": 1,
+  "accounts": [
+    {
+      "label": "primary",
+      "auth_path": "/run/secrets/xai-primary.json",
+      "scope": "https://auth.x.ai::example-primary",
+      "priority": 0,
+      "enabled": true,
+      "expected_account_identity": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "label": "secondary",
+      "auth_path": "/run/secrets/xai-secondary.json",
+      "scope": "https://auth.x.ai::example-secondary",
+      "priority": 1,
+      "enabled": true,
+      "expected_account_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  ]
+}
+```
+
+Every enabled entry has one exact auth-file/scope selector, a unique safe label,
+and an identity pin derived from the credential record's nonsecret account
+identity. The request path never discovers records by scanning files or accepts
+an account selection from client metadata. Invalid inventory, disabled records,
+or a pin mismatch leave that record unavailable before provider I/O. When the
+inventory variable is absent, the existing explicit one-file configuration
+remains one legacy account lane.
+
+Each record receives a separate server-owned lane and rate-observation
+identity. Fresh, unbound traffic can move to an untraversed record only after a
+provider-returned `401`, `429`, or recognized quota failure. Same-account
+generation reread remains the first `401` recovery path. Continuations,
+`previous_response_id`, and other account-bound state remain pinned to their
+original record and fail explicitly rather than switching accounts. Attempt
+metadata distinguishes provider-call ordinal from account-traversal ordinal;
+rate observations use inventory-derived account and scope identities and reject
+inbound replacements.
+
 ## OAuth refresh deadline contract
 
 Scheduled Grok OIDC, Codex OAuth, managed xAI OAuth, Kimi OAuth, and Nous
