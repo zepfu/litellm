@@ -298,32 +298,16 @@ def bind_xai_oauth_candidate_to_request(
                 detail="Selected xAI OAuth account identity is invalid.",
             )
         if snapshot is not None:
-            from litellm.llms.xai.oauth import (
-                bind_xai_oauth_snapshot_to_request,
-                get_xai_oauth_snapshot_from_request,
-            )
-
-            current_snapshot = get_xai_oauth_snapshot_from_request(request)
-            if _xai_oauth_snapshot_matches_selected_account(
-                current_snapshot,
+            if not _xai_oauth_snapshot_matches_selected_account(
+                snapshot,
                 selected,
             ):
-                current_generation = getattr(
-                    current_snapshot,
-                    "generation_metadata",
-                    None,
+                raise HTTPException(
+                    status_code=500,
+                    detail="Selected xAI OAuth snapshot identity is invalid.",
                 )
-                selected_generation = getattr(
-                    snapshot,
-                    "generation_metadata",
-                    None,
-                )
-                if (
-                    isinstance(current_generation, tuple)
-                    and isinstance(selected_generation, tuple)
-                    and current_generation >= selected_generation
-                ):
-                    snapshot = current_snapshot
+            from litellm.llms.xai.oauth import bind_xai_oauth_snapshot_to_request
+
             bind_xai_oauth_snapshot_to_request(request, snapshot)
     else:
         selected = _candidate_selected_account(candidate)
