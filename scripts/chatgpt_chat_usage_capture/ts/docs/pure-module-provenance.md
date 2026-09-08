@@ -21,7 +21,18 @@ and sanitizer were superseded by the same preserved Stage 2 tree.
 
 `6c1eae83ae` hardened reconstruction behavior in its own tree. The current
 local fixes normalize connected evidence components, avoid backward prompt
-attribution, and preserve imported/copied metadata.
+attribution, and preserve imported/copied metadata. Generation IDs take
+precedence over request aliases, including when one generation carries multiple
+request IDs. Request-only fallback uses the normalized branch/component and
+does not combine disconnected components that reuse a request ID.
+
+Fragment linkage cannot absorb a completed original response into a later
+generation. Conflicting generation links remain unresolved. Prompt evidence is
+selected separately from grouping: graph precedence or unambiguous sibling
+timestamps can identify an original request-only response without passing its
+model/time to a later regeneration. Missing/tied sibling timestamps, ambiguous
+explicit prompt IDs, and reused requests across sibling generation anchors do
+not create prompt attribution.
 
 The new `src/counting/index.ts` is the package-internal export surface for a
 future bounded worker. It deliberately does not define a transport protocol or
