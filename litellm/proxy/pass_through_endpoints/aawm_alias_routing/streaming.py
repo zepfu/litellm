@@ -14,6 +14,9 @@ from fastapi.responses import StreamingResponse
 
 from litellm._logging import verbose_proxy_logger
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.repetitive_output import (
+    _STREAM_CLEANUP_ATTR,
+    _CleanupBoundAsyncIterator,
+    _compose_stream_cleanups,
     inherit_or_wrap_passthrough_streaming_response,
     maybe_wrap_passthrough_responses_stream,
 )
@@ -53,7 +56,6 @@ class StreamingTimeoutProgress:
 
 StreamTimeoutTerminalizer = Callable[[BaseException, StreamingTimeoutProgress], Awaitable[Any]]
 _STREAM_TIMEOUT_TERMINALIZER_ATTR = "_aawm_stream_timeout_terminalizer"
-_STREAM_CLEANUP_ATTR = "_aawm_streaming_response_cleanup"
 
 
 def _bind_stream_timeout_terminalizer(
@@ -68,7 +70,12 @@ def _bind_stream_cleanup(
     response: StreamingResponse,
     cleanup: Callable[[], Awaitable[None]],
 ) -> StreamingResponse:
-    setattr(response, _STREAM_CLEANUP_ATTR, cleanup)
+    combined = _compose_stream_cleanups(
+        getattr(response, _STREAM_CLEANUP_ATTR, None),
+        cleanup,
+    )
+    if combined is not None:
+        setattr(response, _STREAM_CLEANUP_ATTR, combined)
     return response
 
 
@@ -79,13 +86,14 @@ def _guard_reconstructed_passthrough_streaming_response(
     request_context: Optional[OutputGuardRequestContext] = None,
 ) -> StreamingResponse:
     """Keep CFG-025 live-forward wrapping across peek/replay reconstructions."""
-    cleanup = getattr(reconstructed, _STREAM_CLEANUP_ATTR, None)
-    if not callable(cleanup):
-        cleanup = getattr(source_response, _STREAM_CLEANUP_ATTR, None)
+    cleanup = _compose_stream_cleanups(
+        getattr(reconstructed, _STREAM_CLEANUP_ATTR, None),
+        getattr(source_response, _STREAM_CLEANUP_ATTR, None),
+    )
 
     def _inherit_cleanup(target: StreamingResponse) -> StreamingResponse:
-        if callable(cleanup):
-            setattr(target, _STREAM_CLEANUP_ATTR, cleanup)
+        if cleanup is not None:
+            _bind_stream_cleanup(target, cleanup)
         return target
 
     guarded = inherit_or_wrap_passthrough_streaming_response(
@@ -159,6 +167,7 @@ async def peek_streaming_response(  # noqa: PLR0915
     timeout_types = (httpx.ReadTimeout, aiohttp.client_exceptions.SocketTimeoutError)
     body_iterator = response.body_iterator
     iterator = body_iterator.__aiter__()
+    inherited_cleanup = getattr(response, _STREAM_CLEANUP_ATTR, None)
     buffered_chunks: list[Any] = []
     buffered_bytes = 0
 
@@ -167,7 +176,7 @@ async def peek_streaming_response(  # noqa: PLR0915
     ) -> Callable[[], Awaitable[None]]:
         cleaned = False
 
-        async def _cleanup() -> None:
+        async def _close_continuation_resources() -> None:
             nonlocal cleaned
             if cleaned:
                 return
@@ -192,8 +201,13 @@ async def peek_streaming_response(  # noqa: PLR0915
                         "Failed to close peeked streaming response iterator",
                         exc_info=True,
                     )
-
-        return _cleanup
+        cleanup = _compose_stream_cleanups(
+            _close_continuation_resources,
+            inherited_cleanup,
+        )
+        if cleanup is None:
+            return _close_continuation_resources
+        return cleanup
 
     async def _streaming_continuation(
         *,
@@ -278,18 +292,25 @@ async def peek_streaming_response(  # noqa: PLR0915
 
     while True:
         if chunk is None:
-            async def _replay_buffered() -> Any:
+            cleanup = _make_continuation_cleanup(None)
+
+            async def _replay_buffered() -> AsyncGenerator[Any, None]:
                 for buffered in buffered_chunks:
                     yield buffered
 
+            replay_response = StreamingResponse(
+                _CleanupBoundAsyncIterator(
+                    _replay_buffered(),
+                    cleanup,
+                ),
+                headers=dict(response.headers),
+                status_code=response.status_code,
+                media_type=response.media_type or "text/event-stream",
+            )
+            _bind_stream_cleanup(replay_response, cleanup)
             return BoundedStreamPeek(
                 response=_guard_reconstructed_passthrough_streaming_response(
-                    StreamingResponse(
-                        _replay_buffered(),
-                        headers=dict(response.headers),
-                        status_code=response.status_code,
-                        media_type=response.media_type or "text/event-stream",
-                    ),
+                    replay_response,
                     source_response=response,
                 ),
                 buffered_chunks=buffered_chunks,
@@ -307,9 +328,12 @@ async def peek_streaming_response(  # noqa: PLR0915
         if stop_reason is not None:
             cleanup = _make_continuation_cleanup(None)
             continuation_response = StreamingResponse(
-                _streaming_continuation(
-                    initial_chunk=chunk,
-                    cleanup=cleanup,
+                _CleanupBoundAsyncIterator(
+                    _streaming_continuation(
+                        initial_chunk=chunk,
+                        cleanup=cleanup,
+                    ),
+                    cleanup,
                 ),
                 headers=dict(response.headers),
                 status_code=response.status_code,
@@ -346,9 +370,12 @@ async def peek_streaming_response(  # noqa: PLR0915
         if not next_chunk_task.done():
             cleanup = _make_continuation_cleanup(next_chunk_task)
             continuation_response = StreamingResponse(
-                _streaming_continuation(
-                    next_chunk_task=next_chunk_task,
-                    cleanup=cleanup,
+                _CleanupBoundAsyncIterator(
+                    _streaming_continuation(
+                        next_chunk_task=next_chunk_task,
+                        cleanup=cleanup,
+                    ),
+                    cleanup,
                 ),
                 headers=dict(response.headers),
                 status_code=response.status_code,
@@ -378,10 +405,13 @@ async def peek_streaming_response(  # noqa: PLR0915
 
             cleanup = _make_continuation_cleanup(None)
             continuation_response = StreamingResponse(
-                _streaming_continuation(
-                    terminal_exception=exc,
-                    next_chunk_task=None,
-                    cleanup=cleanup,
+                _CleanupBoundAsyncIterator(
+                    _streaming_continuation(
+                        terminal_exception=exc,
+                        next_chunk_task=None,
+                        cleanup=cleanup,
+                    ),
+                    cleanup,
                 ),
                 headers=dict(response.headers),
                 status_code=response.status_code,
