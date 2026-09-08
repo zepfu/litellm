@@ -1251,6 +1251,66 @@ def _ensure_passthrough_metadata(kwargs: Optional[dict]) -> Dict[str, Any]:
     return metadata
 
 
+_XAI_OAUTH_SEND_AUTH_SHAPE_FIELDS = (
+    "xai_oauth_send_bearer_authorization_present",
+    "xai_oauth_send_api_key_absent",
+    "xai_oauth_send_x_api_key_absent",
+)
+
+
+def _record_xai_oauth_send_auth_shape(
+    *,
+    request: Request,
+    prepared_request: httpx.Request,
+    metadata: Optional[dict[str, Any]],
+) -> dict[str, bool]:
+    """Record only the managed xAI outbound authentication header shape."""
+    if not isinstance(metadata, dict) or metadata.get("xai_oauth_managed") is not True:
+        return {}
+
+    authorization = prepared_request.headers.get("authorization")
+    bearer_authorization_present = (
+        isinstance(authorization, str)
+        and authorization.strip().lower().startswith("bearer ")
+        and bool(authorization.strip()[len("bearer ") :].strip())
+    )
+    header_names = {str(key).lower() for key in prepared_request.headers}
+    observation = {
+        "xai_oauth_send_bearer_authorization_present": (
+            bearer_authorization_present
+        ),
+        "xai_oauth_send_api_key_absent": "api-key" not in header_names,
+        "xai_oauth_send_x_api_key_absent": "x-api-key" not in header_names,
+    }
+    metadata.update(observation)
+
+    request_state = getattr(request, "state", None)
+    if request_state is not None:
+        for key, value in observation.items():
+            setattr(request_state, key, value)
+
+    verbose_proxy_logger.info(
+        "Managed xAI OAuth actual-send auth shape: "
+        "bearer_authorization_present=%s api_key_absent=%s x_api_key_absent=%s",
+        observation["xai_oauth_send_bearer_authorization_present"],
+        observation["xai_oauth_send_api_key_absent"],
+        observation["xai_oauth_send_x_api_key_absent"],
+    )
+    return observation
+
+
+def _xai_oauth_send_auth_shape_metadata(
+    metadata: Optional[dict[str, Any]],
+) -> dict[str, bool]:
+    if not isinstance(metadata, dict):
+        return {}
+    return {
+        key: metadata[key]
+        for key in _XAI_OAUTH_SEND_AUTH_SHAPE_FIELDS
+        if isinstance(metadata.get(key), bool)
+    }
+
+
 def _watermark_endpoint_from_path(*parts: Any) -> str:
     combined = " ".join(
         str(part or "") for part in parts if part is not None
@@ -5396,6 +5456,31 @@ async def pass_through_request(  # noqa: PLR0915
 
             openai_send_request_fn = _send_prepared_openai_request
 
+        send_request_fn = openai_send_request_fn
+        if passthrough_metadata.get("xai_oauth_managed") is True:
+            downstream_send_request_fn = send_request_fn
+
+            async def _send_managed_xai_request(
+                prepared_request: httpx.Request,
+                send_stream: bool,
+            ) -> httpx.Response:
+                _record_xai_oauth_send_auth_shape(
+                    request=request,
+                    prepared_request=prepared_request,
+                    metadata=passthrough_metadata,
+                )
+                if downstream_send_request_fn is not None:
+                    return await downstream_send_request_fn(
+                        prepared_request,
+                        send_stream,
+                    )
+                return await async_client.send(
+                    prepared_request,
+                    stream=send_stream,
+                )
+
+            send_request_fn = _send_managed_xai_request
+
         if stream:
             await _aawm_session_owner_pre_send_guard(
                 request=request,
@@ -5500,8 +5585,8 @@ async def pass_through_request(  # noqa: PLR0915
                     params=requested_query_params,
                     headers=stream_headers,
                 )
-                if openai_send_request_fn is not None:
-                    response = await openai_send_request_fn(req, stream)
+                if send_request_fn is not None:
+                    response = await send_request_fn(req, stream)
                 else:
                     response = await async_client.send(req, stream=stream)
                 try:
@@ -5520,7 +5605,12 @@ async def pass_through_request(  # noqa: PLR0915
                         upstream_request=getattr(e.response, "request", None) or req,
                         response_content=error_content,
                         litellm_call_id=litellm_call_id,
-                        extra_metadata={"stream": True},
+                        extra_metadata={
+                            "stream": True,
+                            **_xai_oauth_send_auth_shape_metadata(
+                                passthrough_metadata
+                            ),
+                        },
                     )
                     raise _build_http_exception_from_upstream_status_error(
                         e,
@@ -5736,7 +5826,7 @@ async def pass_through_request(  # noqa: PLR0915
                     _parsed_body=provider_bound_body,
                     raw_body=raw_body,
                     prefer_stream_for_unknown_content=True,
-                    send_request_fn=openai_send_request_fn,
+                    send_request_fn=send_request_fn,
                 )
             )
             if _is_streaming_response(response) is True:
@@ -5756,7 +5846,12 @@ async def pass_through_request(  # noqa: PLR0915
                         upstream_request=getattr(e.response, "request", None),
                         response_content=error_content,
                         litellm_call_id=litellm_call_id,
-                        extra_metadata={"stream": True},
+                        extra_metadata={
+                            "stream": True,
+                            **_xai_oauth_send_auth_shape_metadata(
+                                passthrough_metadata
+                            ),
+                        },
                     )
                     raise _build_http_exception_from_upstream_status_error(
                         e,
@@ -5806,7 +5901,12 @@ async def pass_through_request(  # noqa: PLR0915
                     upstream_request=getattr(e.response, "request", None),
                     response_content=error_content,
                     litellm_call_id=litellm_call_id,
-                    extra_metadata={"stream": False},
+                    extra_metadata={
+                        "stream": False,
+                        **_xai_oauth_send_auth_shape_metadata(
+                            passthrough_metadata
+                        ),
+                    },
                 )
                 raise _build_http_exception_from_upstream_status_error(
                     e,
@@ -6014,7 +6114,10 @@ async def pass_through_request(  # noqa: PLR0915
             response_body=response_body,
             response_content=content,
             litellm_call_id=litellm_call_id,
-            extra_metadata={"stream": False},
+            extra_metadata={
+                "stream": False,
+                **_xai_oauth_send_auth_shape_metadata(passthrough_metadata),
+            },
         )
         end_time = datetime.now()
 
