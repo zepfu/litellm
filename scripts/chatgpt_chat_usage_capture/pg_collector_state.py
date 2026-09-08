@@ -224,6 +224,38 @@ STATE_TERMINAL_SUMMARY_KEYS = {
     "updatedAt",
     "reason",
     "outcome",
+    "scheduleState",
+    "report",
+    "errorCode",
+}
+STATE_REPORT_KEYS = {
+    "snapshotVersion", "account", "asOf", "modelDimension", "window",
+    "activityOnly", "activity", "definite", "uncertain", "excluded",
+    "quotaEstimate", "coverage",
+}
+STATE_REPORT_OBJECT_KEYS = {
+    "window": {"kind", "start", "end", "known", "timezone", "resetEvidenceSource"},
+    "activity": {"last24h", "last7d"},
+    "last24h": {"count", "completed", "uncertain", "excluded"},
+    "last7d": {"count", "completed", "uncertain", "excluded"},
+    "definite": {
+        "total", "completed", "byRequestedFamily", "byRecordedFinalFamily",
+        "byResolvedFamily", "byDimension", "raw", "modelMismatches",
+    },
+    "raw": {"requested", "recordedFinal", "resolved"},
+    "uncertain": {
+        "unknownOwnership", "unknownModel", "unknownWindowMembership",
+        "ambiguousWindowMembership", "quarantined", "unresolvedIdentity",
+        "nonGenerationActivity",
+    },
+    "excluded": {
+        "outOfWindow", "nonChatSurface", "excludedOrigin", "rejectedBeforeStart",
+    },
+    "coverage": {"history", "overall", "projects", "branches", "gaps"},
+}
+STATE_REPORT_COUNT_MAP_KEYS = {
+    "byRequestedFamily", "byRecordedFinalFamily", "byResolvedFamily",
+    "byDimension", "requested", "recordedFinal", "resolved",
 }
 STATE_CANDIDATE_KEYS = {"summary", "missingUpdateTime", "revisit"}
 STATE_REVISIT_KEYS = {
@@ -864,24 +896,36 @@ class PgCollectorState:
             wire_page_commit_id, "pageCommitId"
         ) != safe_commit:
             raise LedgerError("collector page commit identity conflicts with its payload")
-        derived_candidates = self._derive_candidate_mutations(wire_payload)
-        actual_candidates = (
-            tuple(candidate_mutations) + tuple(derived_candidates)
-            if candidate_mutations
-            else tuple(derived_candidates)
-        )
-        derived_operations = self._derive_ingest_operations(
-            wire_payload,
+        # Legacy keyword batches fill absent canonical fields, never duplicate
+        # the same batches already carried by the worker payload.
+        mutation_payload = dict(wire_payload)
+        for key, supplied in (
+            ("candidateMutations", candidate_mutations),
+            ("coverageMutations", coverage_mutations),
+            ("ingestOperations", ingest_operations),
+        ):
+            canonical_key = (
+                "operations"
+                if key == "ingestOperations"
+                and key not in mutation_payload
+                and "operations" in mutation_payload
+                else key
+            )
+            if supplied:
+                if canonical_key in mutation_payload:
+                    if list(mutation_payload[canonical_key] or ()) != list(supplied):
+                        raise LedgerError(
+                            f"collector {key} conflicts with its canonical payload"
+                        )
+                else:
+                    mutation_payload[key] = list(supplied)
+        actual_candidates = self._derive_candidate_mutations(mutation_payload)
+        actual_operations = self._derive_ingest_operations(
+            mutation_payload,
             default_run_id=safe_run,
             candidate_mutations=actual_candidates,
         )
-        actual_operations = tuple(ingest_operations) + tuple(derived_operations)
-        derived_coverage = self._derive_coverage_mutations(wire_payload)
-        actual_coverage = (
-            tuple(coverage_mutations) + tuple(derived_coverage)
-            if coverage_mutations
-            else tuple(derived_coverage)
-        )
+        actual_coverage = self._derive_coverage_mutations(mutation_payload)
         expected_version = (
             expected_state_version
             if expected_state_version is not None
@@ -3681,12 +3725,7 @@ def _validate_state_field(
                 raise LedgerError(
                     f"collector state field {field_name}.{key} must be an object"
                 )
-            nested_keys = _nested_state_keys(key, field_name)
-            if nested_keys is None:
-                raise LedgerError(
-                    f"collector state field {field_name}.{key} has an unsupported object"
-                )
-            _validate_state_field(f"{field_name}.{key}", child, nested_keys)
+            _validate_state_object(field_name, key, child)
         elif shape == "array":
             if child is None:
                 continue
@@ -3737,6 +3776,22 @@ def _validate_state_field(
             _validate_state_scalar(field_name, key, child)
 
 
+def _validate_state_object(
+    field_name: str, key: str, value: Mapping[str, Any]
+) -> None:
+    if key == "scheduleState":
+        _validate_state_field("scheduleTransition", value, STATE_SCHEDULE_KEYS)
+    elif key == "report":
+        _validate_usage_report(value)
+    else:
+        nested_keys = _nested_state_keys(key, field_name)
+        if nested_keys is None:
+            raise LedgerError(
+                f"collector state field {field_name}.{key} has an unsupported object"
+            )
+        _validate_state_field(f"{field_name}.{key}", value, nested_keys)
+
+
 def _state_child_shape(key: str, field_name: str) -> str:
     """Return the contract shape for one state field in its parent context."""
     if key in STATE_STRING_ARRAY_KEYS or key in STATE_OBJECT_ARRAY_KEYS:
@@ -3762,6 +3817,8 @@ def _state_child_shape(key: str, field_name: str) -> str:
         "historyCoverage",
         "identity",
         "accountState",
+        "scheduleState",
+        "report",
         "discovery",
         "terminalSummary",
         "candidate",
@@ -3792,6 +3849,8 @@ def _validate_state_scalar(field_name: str, key: str, value: Any) -> None:
     audit_path = "olderHistoryAudit" in field_name
     if key == "nextCursor":
         _cursor_token(value)
+    elif key == "errorCode":
+        _token(value, "errorCode")
     elif key == "stateVersionCounter":
         if (
             isinstance(value, bool)
@@ -3989,6 +4048,68 @@ def _safe_terminal_summary(
     return projected
 
 
+def _validate_usage_report(value: Any, *, field_name: str = "report") -> None:
+    """Validate the metadata-only report emitted by the sidecar worker."""
+    if not isinstance(value, Mapping):
+        raise LedgerError(f"collector {field_name} must be an object")
+    name = field_name.rsplit(".", 1)[-1]
+    allowed = STATE_REPORT_KEYS if name == "report" else STATE_REPORT_OBJECT_KEYS[name]
+    for key, child in value.items():
+        if key not in allowed:
+            raise LedgerError(f"collector {field_name} contains an unknown key")
+        path = f"{field_name}.{key}"
+        if key in STATE_REPORT_COUNT_MAP_KEYS:
+            if not isinstance(child, Mapping):
+                raise LedgerError(f"collector {path} must be an object")
+            for model, count in child.items():
+                _token(model, "report model")
+                _validate_report_count(count, path)
+        elif key in STATE_REPORT_OBJECT_KEYS and not (
+            name in {"last24h", "last7d"} and key in {"uncertain", "excluded"}
+        ):
+            _validate_usage_report(child, field_name=path)
+        elif key == "quotaEstimate":
+            # The worker snapshot has no quota-policy/window input.
+            if child is not None:
+                raise LedgerError("collector report quota estimate is unavailable")
+        elif key == "snapshotVersion":
+            if isinstance(child, bool) or not isinstance(child, int) or child != 1:
+                raise LedgerError("collector report snapshot version is unsupported")
+        elif key in {"activityOnly", "known"}:
+            if not isinstance(child, bool):
+                raise LedgerError(f"collector {path} must be boolean")
+        elif key == "gaps":
+            _validate_state_field("reportCoverage", {key: child}, {key})
+        elif name == "coverage":
+            _enum(child, {"complete", "partial", "unknown"}, path)
+        elif key == "modelDimension":
+            _enum(child, {"requested", "recordedFinal", "resolved"}, path)
+        elif key == "kind":
+            _enum(child, {"calendar_day", "elapsed_lookback", "reset_window", "unknown"}, path)
+        elif key == "resetEvidenceSource":
+            if child is not None:
+                _enum(
+                    child,
+                    {"provider_explicit", "operator_explicit", "reviewed_rule",
+                     "provisional_assumption", "unknown"},
+                    path,
+                )
+        elif key == "account":
+            _account(child)
+        elif key in {"asOf", "start", "end", "timezone"}:
+            if not (child is None and key != "asOf") and (
+                not isinstance(child, str) or len(child.encode("utf-8")) > 4096
+            ):
+                raise LedgerError(f"collector {path} must be a bounded string")
+        else:
+            _validate_report_count(child, path)
+
+
+def _validate_report_count(value: Any, field_name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise LedgerError(f"collector {field_name} must be a nonnegative integer")
+
+
 def _copy_metadata_value(value: Any, field_name: str) -> Any:
     if isinstance(value, Mapping):
         out: dict[str, Any] = {}
@@ -4010,7 +4131,19 @@ def _copy_metadata_value(value: Any, field_name: str) -> Any:
 def _candidate_envelope(payload: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise LedgerError("candidate payload must be an object")
-    _validate_state_field("candidate", payload, STATE_CANDIDATE_KEYS | STATE_REVISIT_KEYS)
+    if "candidate" in payload:
+        if set(payload) != {"candidate", "scope"}:
+            raise LedgerError("candidate envelope contains unsupported fields")
+        _enum(payload["scope"], {"active", "archived"}, "candidate scope")
+        if not isinstance(payload["candidate"], Mapping):
+            raise LedgerError("candidate envelope must contain an object")
+        _validate_state_field("candidate", payload["candidate"], STATE_CANDIDATE_KEYS)
+    elif "entry" in payload:
+        if set(payload) != {"entry"} or not isinstance(payload["entry"], Mapping):
+            raise LedgerError("revisit envelope must contain only an entry object")
+        _validate_state_field("revisit", payload["entry"], STATE_REVISIT_KEYS)
+    else:
+        _validate_state_field("candidate", payload, STATE_CANDIDATE_KEYS | STATE_REVISIT_KEYS)
     return _copy_metadata_value(payload, "candidate")
 
 

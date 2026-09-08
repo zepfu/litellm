@@ -1479,18 +1479,6 @@ class TsWorkerBridge:
                 "page commit is not bound to a committed trigger",
                 code="fence_invalid",
             )
-        ingest_operations = _bounded_sequence(
-            canonical_payload.get("ingestOperations"),
-            field_name="page commit ingestOperations",
-        )
-        candidate_mutations = _bounded_sequence(
-            canonical_payload.get("candidateMutations"),
-            field_name="page commit candidateMutations",
-        )
-        coverage_mutations = _bounded_sequence(
-            canonical_payload.get("coverageMutations"),
-            field_name="page commit coverageMutations",
-        )
         def adopt_page_ack(value: Any) -> None:
             if isinstance(value, PageAck):
                 context.state_version = int(value.state_version)
@@ -1505,9 +1493,6 @@ class TsWorkerBridge:
             canonical_payload=canonical_payload,
             expected_state_version=expected_version,
             trigger_id=context.trigger_id,
-            ingest_operations=ingest_operations,
-            candidate_mutations=candidate_mutations,
-            coverage_mutations=coverage_mutations,
             operation=context.operation,
             on_result=adopt_page_ack,
         )

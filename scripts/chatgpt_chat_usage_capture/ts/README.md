@@ -166,3 +166,11 @@ clears transport pagination truncation, not independent coverage warnings.
 Terminal request capacity remains three operations: schedule load, schedule
 CAS, and finish acknowledgment. Byte reservation uses the existing 64 KiB
 state-field limit plus framing overhead, not six maximum-size history frames.
+
+PostgreSQL preserves candidate `{candidate, scope}` and revisit `{entry}`
+queue envelopes for worker readback. Each page's canonical payload supplies
+its ingest, candidate, and coverage mutations exactly once. Legacy keyword
+batches may fill missing fields but must agree with fields already present.
+Terminal summaries retain the completed schedule state, metadata-only usage
+report, and fixed error codes on blocked/cancelled runs. The sidecar report
+has no quota-policy input, so its `quotaEstimate` remains `null`.
