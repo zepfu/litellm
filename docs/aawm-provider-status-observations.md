@@ -804,36 +804,21 @@ Native history capture is admitted only through the live sidecar
 endpoint and anchor binding before registering a history worker, rejects
 borrowed or stale bindings, and retains each worker, exact-target closer, and
 scratch remover until their own process retirement is proven. Descendant
-discovery retains live pidfd identities, observed parent start times, and
-role-specific markers installed in each native-history worker before Playwright
-launch; a historical numeric parent or process group never authorizes adoption
-or termination after identity is lost. Browser-owner signals exclude the
-role-marked observer and closer scopes; those retained pidfds are retired only
-after exact-target safety or private-browser termination is authorized.
-Inventory phase expiry does not disable later bounded phases, while the final
-inventory cutoff remains a hard ceiling. Incomplete scans retain explicit
-unresolved inventory diagnostics and cannot become a positive retirement proof.
-Candidate ancestry is resolved by identity-bound reachability, independent of
-`/proc` enumeration order; unrelated candidate chains remain unrelated.
-An inventory scan becomes terminal evidence only when admission is closed and
-all known browser producers were already observed exited before that scan.
-Newly discovered live browser processes therefore require another bounded
-retirement pass before sealing. Poll-only servicing never performs a new
-process discovery scan: it signals only retained role-specific pidfds, sends
-KILL at the end of the existing TERM grace, and leaves an unknown ownership
-obligation retained.
-Cleanup uses one shared absolute operation ceiling:
+discovery retains live pidfd identities and role-specific markers installed in
+each native-history worker before Playwright launch; a historical numeric
+parent or process group never authorizes adoption or termination after leader
+identity is lost. Incomplete bounded scans retain explicit unresolved inventory
+diagnostics and cannot become a positive retirement proof. Cleanup uses one
+shared absolute operation ceiling:
 target-close, cooperative termination, forced termination, reconciliation,
 reaping, and scratch removal may be shortened by shutdown but never restart a
 deadline or create a recovery allowance. A failed target proof, release
 channel, or final descendant inventory remains an attributable cleanup failure;
 it is never reported as successful history or as an empty conversation set.
-Startup and failure cleanup also honor the caller's operation deadline with
-bounded wakeups. Shutdown captures its cutoff at cancellation (or one-shot
-shutdown entry), closes admission, requests abort for all published owners,
-and keeps that same state servicing retained owners after a timed drain failure;
-it creates no new cleanup allowance. The stopped event is emitted only after
-the owner registry is empty.
+Shutdown captures its cutoff at cancellation (or one-shot shutdown entry),
+closes admission, requests abort for all published owners, and keeps that same
+state servicing retained owners until safety and retirement are proven. The
+stopped event is emitted only after the owner registry is empty.
 
 The sidecar image packages `conversation_init.py`, the owned
 `scripts/chatgpt_oracle_browser_session.mjs` helper, and pinned Playwright with
@@ -1038,6 +1023,72 @@ header, token, or storage value is returned. If the native index request never
 appears, the result explicitly uses `observation_state=no_history_observed`;
 auth, throttle, challenge, identity, boundary, and body failures use an
 explicit failed observation state and preserve only a safe retry-after value.
+
+The sidecar has an explicit opt-in entrypoint for this observer. Before
+execution, the parent must verify that the bound browser session has no active
+conversation-history cooldown, then supply both
+`--chatgpt-native-history-probe-account-label account1` (or the matching
+`AAWM_CHATGPT_NATIVE_HISTORY_PROBE_ACCOUNT_LABEL` environment value) and
+`--chatgpt-native-history-probe-cooldown-cleared` (or
+`AAWM_CHATGPT_NATIVE_HISTORY_PROBE_COOLDOWN_CLEARED=1`) together with an
+Oracle profile binding for that exact label. The label must resolve to exactly
+one enabled Codex OAuth inventory record whose pinned account hash is
+`8e92854835c4`; a CDP-only binding is rejected because native history requires
+the private profile owner's supervised lifecycle capability. This action runs
+before provider observations, schema setup, and all other sidecar tasks,
+performs no database setup or persistence, and uses one 150-second operation
+budget including startup, observation, and owner cleanup. It emits one
+structural observation event with the existing fixed classification fields
+only; preflight and boundary failures use fixed classes and never echo raw
+labels, URLs, identifiers, headers, content, or exception text. It is a
+one-shot foreground action, not a recurring schedule. A
+`history_observation_failed` result exits nonzero; `no_history_observed` is a
+distinct bounded outcome and exits zero.
+
+Probe option parsing is strict: abbreviated probe long options are rejected.
+When an exact or abbreviated probe option is present, malformed arguments emit
+only the fixed `ChatGPTNativeHistoryProbeConfigurationInvalid` event; argparse
+usage text and raw option values are suppressed. Normal sidecar invocations
+retain argparse's ordinary unique long-option abbreviation behavior and
+diagnostics.
+
+The operation deadline is distinct from the sidecar's cancellation cutoff.
+Startup, observation, and cleanup use the same absolute operation ceiling;
+when SIGINT or SIGTERM is received, the effective cutoff is the earlier of
+that ceiling and the cancellation cutoff. The native probe caller passes the
+ceiling through the existing browser-binding context as the optional keyword
+`operation_deadline=<absolute monotonic deadline>`. The lifecycle binding must
+accept that keyword with a default of `None` for existing callers and
+propagate it through startup and failure cleanup; its effective cleanup
+deadline remains the minimum of the operation ceiling and cancellation cutoff.
+If the initial drain leaves an owner retained, the probe caller recomputes that
+minimum before each subsequent servicing pass; the lifecycle owner still
+enforces the cutoff within its own cleanup plan.
+If a bounded drain cannot prove owner retirement, the admitted sidecar state
+continues supervising retained owners until they retire; it is not released
+while owners remain pending.
+
+Parent-run shape (replace only the profile path and deployment-specific
+executable paths):
+
+```bash
+AAWM_CHATGPT_NATIVE_HISTORY_PROBE_ACCOUNT_LABEL=account1 \
+AAWM_CHATGPT_NATIVE_HISTORY_PROBE_COOLDOWN_CLEARED=1 \
+AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS='{"account1":{"oracle_profile_path":"/path/to/operator-approved-profile"}}' \
+AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE=/path/to/node \
+AAWM_CHATGPT_ORACLE_PACKAGE_DIR=/path/to/oracle-package \
+AAWM_CHATGPT_ORACLE_CHROME_EXECUTABLE=/path/to/chrome \
+python3 scripts/run_provider_status_observations_loop.py \
+  --chatgpt-native-history-probe-account-label account1 \
+  --chatgpt-native-history-probe-cooldown-cleared
+```
+
+The parent must also provide the explicit Codex OAuth inventory containing the
+enabled `account1` record pinned to `8e92854835c4`, and `xvfb-run` when no
+`DISPLAY` is available. The profile, node, package, and Chrome paths are
+runtime prerequisites, not fallback discovery inputs. This command must be
+run only after the parent checks that no other process owns the browser session
+or has an active conversation-history cooldown.
 
 ## Alibaba Token Plan quota polling
 
