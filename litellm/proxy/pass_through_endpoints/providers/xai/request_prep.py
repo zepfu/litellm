@@ -332,6 +332,75 @@ def _xai_responses_sanitized_tool_changes(
     return tool_changes
 
 
+def _xai_input_item_matches_instructions(
+    item: Any,
+    instructions: str,
+) -> bool:
+    if not isinstance(item, dict) or item.get("role") != "system":
+        return False
+
+    content = item.get("content")
+    if isinstance(content, str):
+        return content == instructions
+    if not isinstance(content, list):
+        return False
+
+    text_parts: list[str] = []
+    for part in content:
+        if isinstance(part, str):
+            text_parts.append(part)
+        elif (
+            isinstance(part, dict)
+            and part.get("type") in {"input_text", "text"}
+            and isinstance(part.get("text"), str)
+        ):
+            text_parts.append(part["text"])
+    return "\n".join(text_parts) == instructions
+
+
+def _lower_xai_instructions_to_input(
+    request_body: dict[str, Any],
+) -> None:
+    """Lower unsupported top-level instructions into one system input item."""
+    instructions = request_body.get("instructions")
+    if not isinstance(instructions, str):
+        return
+
+    request_body.pop("instructions", None)
+    if not instructions.strip():
+        return
+
+    input_value = request_body.get("input")
+    if isinstance(input_value, list):
+        input_items = list(input_value)
+    elif isinstance(input_value, str):
+        input_items = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": input_value,
+            }
+        ]
+    elif input_value is None:
+        input_items = []
+    else:
+        input_items = [input_value]
+
+    if not any(
+        _xai_input_item_matches_instructions(item, instructions)
+        for item in input_items
+    ):
+        input_items.insert(
+            0,
+            {
+                "type": "message",
+                "role": "system",
+                "content": instructions,
+            },
+        )
+    request_body["input"] = input_items
+
+
 def _sanitize_xai_responses_request_body(
     request_body: dict[str, Any],
 ) -> tuple[dict[str, Any], list[str], list[dict[str, Any]]]:
@@ -536,6 +605,7 @@ async def _prepare_oa_xai_passthrough_request(
         runtime._replace_request_body_in_place(request_body, updated_body)
         _rewrite_codex_agent_message_items_in_place(request_body)
         _rewrite_grok_native_unsupported_input_items_in_place(request_body)
+        _lower_xai_instructions_to_input(request_body)
         runtime._sanitize_xai_responses_request_body_in_place(request_body)
         (
             updated_body,
@@ -809,6 +879,7 @@ async def _prepare_grok_native_oauth_passthrough_request(
     _rewrite_codex_agent_message_items_in_place(prepared_body)
     _sanitize_grok_native_function_call_arguments_in_place(prepared_body)
     _rewrite_grok_native_unsupported_input_items_in_place(prepared_body)
+    _lower_xai_instructions_to_input(prepared_body)
     runtime._sanitize_xai_responses_request_body_in_place(prepared_body)
     (
         prepared_body,
