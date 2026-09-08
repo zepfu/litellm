@@ -158,6 +158,15 @@ LiteLLM sends `store=false` automatically. This applies to URL and base64
 image forms on both native xAI and managed xAI OAuth routes. Text-only
 requests preserve the caller's explicit `store` value or the provider default.
 
+## Responses API Instructions
+
+xAI Responses does not accept OpenAI's top-level `instructions` field. On
+supported LiteLLM proxy routes, caller instructions and configured alias
+guidance are lowered into one ordered `system` message in `input` before
+egress. The outbound request omits top-level `instructions`, and repeated
+preparation during continuations, retries, or redispatch does not duplicate the
+message. Internal metadata and credentials remain outside prompt input.
+
 ## Native Grok Route Capabilities
 
 Native `xai/grok-4.5` and `xai/grok-4.6` declare the
