@@ -56,6 +56,8 @@ class StreamingTimeoutProgress:
 
 StreamTimeoutTerminalizer = Callable[[BaseException, StreamingTimeoutProgress], Awaitable[Any]]
 _STREAM_TIMEOUT_TERMINALIZER_ATTR = "_aawm_stream_timeout_terminalizer"
+_RESPONSES_PREFETCH_ABORT_ATTR = "_aawm_responses_prefetch_abort"
+_PREFETCH_ABORT_REGISTER_ATTR = "_aawm_register_prefetch_continuation"
 
 
 def _bind_stream_timeout_terminalizer(
@@ -126,6 +128,25 @@ def _get_stream_timeout_terminalizer(
 ) -> Optional[StreamTimeoutTerminalizer]:
     terminalizer = getattr(response, _STREAM_TIMEOUT_TERMINALIZER_ATTR, None)
     return terminalizer if callable(terminalizer) else None
+
+
+def _register_prefetch_abort_continuation(
+    source_response: StreamingResponse,
+    continuation_response: StreamingResponse,
+    cleanup: Optional[Callable[[], Awaitable[None]]],
+) -> None:
+    """Attach continuation cleanup to the response-local abort owner."""
+    if cleanup is None:
+        return
+    owner = getattr(source_response, _RESPONSES_PREFETCH_ABORT_ATTR, None)
+    if not callable(owner):
+        return
+    register = getattr(owner, _PREFETCH_ABORT_REGISTER_ATTR, None)
+    if callable(register):
+        register(continuation_response, cleanup)
+        return
+    owner_target = getattr(owner, "_aawm_prefetch_abort_target", None)
+    _bind_stream_cleanup(owner_target or source_response, cleanup)
 
 
 def _chunk_size(chunk: object) -> int:
@@ -321,6 +342,11 @@ async def peek_streaming_response(  # noqa: PLR0915
                     replay_response,
                     source_response=response,
                 )
+                _register_prefetch_abort_continuation(
+                    response,
+                    reconstructed,
+                    cleanup,
+                )
                 active_cleanup = None
                 return BoundedStreamPeek(
                     response=reconstructed,
@@ -360,6 +386,11 @@ async def peek_streaming_response(  # noqa: PLR0915
                 reconstructed = _guard_reconstructed_passthrough_streaming_response(
                     continuation_response,
                     source_response=response,
+                )
+                _register_prefetch_abort_continuation(
+                    response,
+                    reconstructed,
+                    cleanup,
                 )
                 active_cleanup = None
                 return BoundedStreamPeek(
@@ -406,6 +437,11 @@ async def peek_streaming_response(  # noqa: PLR0915
                     continuation_response,
                     source_response=response,
                 )
+                _register_prefetch_abort_continuation(
+                    response,
+                    reconstructed,
+                    cleanup,
+                )
                 active_cleanup = None
                 return BoundedStreamPeek(
                     response=reconstructed,
@@ -443,6 +479,11 @@ async def peek_streaming_response(  # noqa: PLR0915
                 reconstructed = _guard_reconstructed_passthrough_streaming_response(
                     continuation_response,
                     source_response=response,
+                )
+                _register_prefetch_abort_continuation(
+                    response,
+                    reconstructed,
+                    cleanup,
                 )
                 active_cleanup = None
                 return BoundedStreamPeek(

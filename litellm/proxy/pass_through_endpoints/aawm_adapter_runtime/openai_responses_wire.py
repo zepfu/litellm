@@ -96,6 +96,11 @@ class OpenAIResponsesWireTrace:
     _finalize_prefetch_abort: Optional[
         Callable[[OpenAIResponsesWireDisposition], Awaitable[None]]
     ] = field(default=None, repr=False, compare=False)
+    _background_owner: Optional[Callable[[], Awaitable[None]]] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     _terminal_body: Optional[bytes] = field(
         default=None,
         repr=False,
@@ -320,6 +325,24 @@ class OpenAIResponsesWireTrace:
             return
         self._post_finalization_callbacks.append(callback)
 
+    def register_background_owner(
+        self,
+        callback: Optional[Callable[[], Awaitable[None]]],
+    ) -> None:
+        """Share one response background owner across prefetch and ASGI paths."""
+
+        if self._background_owner is None and callable(callback):
+            self._background_owner = callback
+
+    async def _run_background_owner(self) -> None:
+        callback = self._background_owner
+        if callback is None:
+            return
+        try:
+            await callback()
+        except BaseException as exc:  # noqa: BLE001
+            self.metadata["background_callback_error"] = type(exc).__name__
+
     def record_asgi_delivery_complete(self) -> None:
         """Freeze the delivered snapshot after the response attempt finishes."""
 
@@ -376,15 +399,18 @@ class OpenAIResponsesWireTrace:
 
         async def _run() -> None:
             finalizer = self._finalize_prefetch_abort
-            if finalizer is not None:
-                await finalizer(disposition)
-                return
-            if self._finalize_transport is not None:
-                await self._finalize_transport(disposition)
-            if not self.finalized:
-                await self._finalize_disposition(disposition, None)
-            self.record_asgi_delivery_complete()
-            await self.run_post_finalization_callbacks()
+            try:
+                if finalizer is not None:
+                    await finalizer(disposition)
+                    return
+                if self._finalize_transport is not None:
+                    await self._finalize_transport(disposition)
+                if not self.finalized:
+                    await self._finalize_disposition(disposition, None)
+                self.record_asgi_delivery_complete()
+                await self.run_post_finalization_callbacks()
+            finally:
+                await self._run_background_owner()
 
         await _await_shielded(_run())
 

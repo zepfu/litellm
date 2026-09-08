@@ -52,6 +52,14 @@ _STREAM_CLEANUP_CALLBACKS_ATTR = "_aawm_stream_cleanup_callbacks"
 # Kept local to avoid importing the alias streaming module back into this
 # module while preserving an already-bound provider-neutral terminalizer.
 _STREAM_TIMEOUT_TERMINALIZER_ATTR = "_aawm_stream_timeout_terminalizer"
+_RESPONSES_PRE_TERMINAL_VALIDATION_ATTR = (
+    "_aawm_responses_pre_terminal_validation"
+)
+_RESPONSES_BACKGROUND_OWNER_ATTR = "_aawm_responses_background_owner"
+_RESPONSES_PREFETCH_ABORT_ATTR = "_aawm_responses_prefetch_abort"
+_RESPONSES_VALIDATION_STATE_ATTR = "_aawm_responses_validation_state"
+_RESPONSES_VALIDATION_COMPLETE_ATTR = "_aawm_responses_validation_complete"
+_RESPONSES_VALIDATION_VALID_ATTR = "_aawm_responses_validation_valid"
 
 
 def _event_type(event: Any) -> str:
@@ -579,6 +587,44 @@ def _headers_without_content_length(headers: Any) -> dict[str, Any]:
     }
 
 
+def _ensure_responses_wire_streaming_response(
+    response: Any,
+    *,
+    source_response: Any = None,
+) -> Any:
+    """Keep ASGI commitment tracking on reconstructed Responses streams."""
+    from .openai_responses_wire import OpenAIResponsesStreamingResponse
+
+    wire_trace = getattr(response, "wire_trace", None)
+    if wire_trace is None and source_response is not None:
+        wire_trace = getattr(source_response, "wire_trace", None)
+    if wire_trace is None or isinstance(response, OpenAIResponsesStreamingResponse):
+        return response
+
+    wire_response = OpenAIResponsesStreamingResponse(
+        getattr(response, "body_iterator", None),
+        wire_trace=wire_trace,
+        on_disposition=getattr(
+            response,
+            "_on_disposition",
+            getattr(source_response, "_on_disposition", None),
+        ),
+        headers=_headers_without_content_length(getattr(response, "headers", None)),
+        status_code=getattr(response, "status_code", 200),
+        media_type=getattr(response, "media_type", None) or "text/event-stream",
+        background=getattr(response, "background", None),
+    )
+    for name, value in vars(response).items():
+        if name.startswith("_aawm_") or name in {"wire_trace", "_on_disposition"}:
+            setattr(wire_response, name, value)
+    wire_response.wire_trace = wire_trace
+    if getattr(wire_response, "_on_disposition", None) is None:
+        inherited_callback = getattr(source_response, "_on_disposition", None)
+        if inherited_callback is not None:
+            wire_response._on_disposition = inherited_callback
+    return wire_response
+
+
 def _strip_content_length_header(response: Any) -> None:
     headers = getattr(response, "headers", None)
     if headers is None:
@@ -604,6 +650,38 @@ def _inherit_stream_lifecycle(response: Any, source_response: Any) -> None:
         terminalizer = getattr(source_response, _STREAM_TIMEOUT_TERMINALIZER_ATTR, None)
         if terminalizer is not None:
             setattr(response, _STREAM_TIMEOUT_TERMINALIZER_ATTR, terminalizer)
+    if getattr(response, "wire_trace", None) is None:
+        wire_trace = getattr(source_response, "wire_trace", None)
+        if wire_trace is not None:
+            setattr(response, "wire_trace", wire_trace)
+    if getattr(response, "_on_disposition", None) is None:
+        on_disposition = getattr(source_response, "_on_disposition", None)
+        if on_disposition is not None:
+            setattr(response, "_on_disposition", on_disposition)
+    if getattr(response, "_aawm_upstream_response", None) is None:
+        upstream_response = getattr(source_response, "_aawm_upstream_response", None)
+        if upstream_response is not None:
+            setattr(response, "_aawm_upstream_response", upstream_response)
+    for attribute in (
+        _RESPONSES_PRE_TERMINAL_VALIDATION_ATTR,
+        _RESPONSES_BACKGROUND_OWNER_ATTR,
+        _RESPONSES_PREFETCH_ABORT_ATTR,
+        _RESPONSES_VALIDATION_STATE_ATTR,
+        _RESPONSES_VALIDATION_COMPLETE_ATTR,
+        _RESPONSES_VALIDATION_VALID_ATTR,
+    ):
+        if getattr(response, attribute, None) is None:
+            inherited = getattr(source_response, attribute, None)
+            if inherited is not None:
+                setattr(response, attribute, inherited)
+    if (
+        getattr(response, "background", None) is None
+        and getattr(response, _RESPONSES_BACKGROUND_OWNER_ATTR, None) is not None
+    ):
+        response.background = getattr(
+            response,
+            _RESPONSES_BACKGROUND_OWNER_ATTR,
+        )
 
 
 def _terminal_metadata(
@@ -969,6 +1047,10 @@ def inherit_or_wrap_passthrough_streaming_response(
     if not isinstance(response, StreamingResponse):
         return response
     _inherit_stream_lifecycle(response, source_response)
+    response = _ensure_responses_wire_streaming_response(
+        response,
+        source_response=source_response,
+    )
     _strip_content_length_header(response)
     inherited_cleanup = _compose_stream_cleanups(
         getattr(response, _STREAM_CLEANUP_ATTR, None),
@@ -1021,6 +1103,10 @@ def inherit_or_wrap_passthrough_streaming_response(
     if inherited_cleanup is not None:
         setattr(guarded, _STREAM_CLEANUP_ATTR, inherited_cleanup)
     _inherit_stream_lifecycle(guarded, response)
+    guarded = _ensure_responses_wire_streaming_response(
+        guarded,
+        source_response=response,
+    )
     inherit_deferred_success_holder(guarded, source_response=response)
     return bind_output_guard_to_streaming_response(
         guarded,
