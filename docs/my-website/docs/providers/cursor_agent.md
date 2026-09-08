@@ -128,6 +128,7 @@ original name, arguments, and call ID.
 For stock `collaboration.wait_agent` and its supported namespace/tool aliases,
 Cursor's build/restoration copies narrow `timeout_ms` from `number` to `integer`
 to match the client's integer parser without changing the advertised names.
+The native Grok and managed xAI Codex fallback routes apply the same correction.
 Finite integral protobuf values are returned as JSON integers; fractional values
 and unrelated numeric arguments are not coerced. Canonical replay tool
 definitions remain unchanged.

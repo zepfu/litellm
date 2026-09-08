@@ -174,6 +174,12 @@ Reset values may be bounded durations, epoch timestamps, ISO timestamps, or
 HTTP-date values. Malformed, expired, non-finite, and unreasonably future
 values are ignored instead of creating a durable cooldown.
 
+When xAI supplies quota limit or remaining values without provider reset or
+billing-period evidence, LiteLLM leaves the reset time and quota period
+unknown. It does not synthesize a monthly boundary that could drive cooldown,
+availability, rollover, or forecasting. Explicit provider reset and billing
+period evidence remains authoritative.
+
 ## OAuth Credential Scope Selection
 
 Managed xAI OAuth and native Grok OIDC credential files must contain the exact
@@ -248,6 +254,13 @@ original custom and namespace identities in both streaming and non-streaming
 responses. Name collisions use the established deterministic policy; retries
 start from the caller's original tool definitions, so conversions are not
 applied twice.
+
+For stock `collaboration.wait_agent` and its supported namespace/tool aliases,
+native Grok and managed xAI Codex routes narrow `timeout_ms` from `number` to
+`integer` in derived build/restoration schemas to match the client's integer
+parser. Finite integral response values become JSON integers in both JSON and
+SSE output. Fractional values, unrelated numeric arguments, original tool names,
+and the caller's replay definitions remain unchanged.
 
 ## Responses API Instructions
 
