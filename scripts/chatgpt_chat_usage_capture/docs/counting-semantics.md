@@ -21,5 +21,14 @@ completed answers or default working-estimate contributions.
 
 Mapping changes rebuild derived families from the retained raw model fields. The
 current mapping version is applied to the new aggregate revision while prior
-attempt projections remain auditable in mapping history; a rebuild does not merely
-rename a stale aggregate payload.
+attempt projections remain auditable in mapping history; a rebuild does not
+merely rename a stale aggregate payload.
+
+The PostgreSQL ledger resolves retired provisional scopes through their
+canonical scope redirects and accepts ownership only from the active collector
+binding. Missing canonical provider-user, workspace, or quota-owner identity is
+reported as `unknown_identity`. Attempts with a non-clear quarantine state are
+also classified as `unknown_identity`, so they remain auditable without
+contributing to definite totals or model breakdowns. Unknown and excluded
+classes retain activity whose time evidence is ambiguous or unknown, but omit
+rows proven outside the requested half-open window.
