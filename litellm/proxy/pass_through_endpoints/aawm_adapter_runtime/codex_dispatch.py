@@ -14,36 +14,6 @@ from typing import TYPE_CHECKING, Any, Optional
 from fastapi import Request, Response
 
 from litellm.proxy._types import UserAPIKeyAuth
-from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
-    load_text_watermark_config,
-)
-from litellm.proxy.pass_through_endpoints.aawm_text_watermark.policy import (
-    apply_request_watermark_egress,
-)
-
-
-def _watermark_endpoint_from_path(*parts: Any) -> str:
-    combined = " ".join(
-        str(part or "") for part in parts if part is not None
-    ).lower()
-    if "chat/completions" in combined or "chat_completions" in combined:
-        return "chat_completions"
-    return "responses"
-
-
-def _get_runtime_text_watermark_config() -> Any:
-    payload = None
-    try:
-        from litellm.proxy.proxy_server import general_settings as _gs
-
-        if isinstance(_gs, dict):
-            payload = _gs.get("openai_passthrough_text_watermark")
-        else:
-            payload = getattr(_gs, "openai_passthrough_text_watermark", None)
-    except Exception:
-        payload = None
-    return load_text_watermark_config(payload)
-
 if TYPE_CHECKING:
 
     # Host-global functions (bound via install())
@@ -222,15 +192,6 @@ def install(
         if publish_to_module:
             _mod[_name] = _rebound
         host_globals[_name] = _rebound
-    for _name, _value in (
-        ("apply_request_watermark_egress", apply_request_watermark_egress),
-        ("load_text_watermark_config", load_text_watermark_config),
-        ("_get_runtime_text_watermark_config", _get_runtime_text_watermark_config),
-        ("_watermark_endpoint_from_path", _watermark_endpoint_from_path),
-    ):
-        host_globals.setdefault(_name, _value)
-
-
 # ── Extracted function ──────────────────────────────────────────────
 
 
@@ -507,44 +468,17 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
         prepared_request_body=prepared_request_body,
     )
     _sid = _sa.resolve_canonical_session_identity(request, prepared_request_body)
-    _watermark_metadata = (
-        prepared_request_body.get("litellm_metadata")
-        if isinstance(prepared_request_body, dict)
-        else None
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        sanitize_wire_envelope,
     )
-    if not isinstance(_watermark_metadata, dict):
-        _watermark_metadata = {}
-        if isinstance(prepared_request_body, dict):
-            prepared_request_body["litellm_metadata"] = _watermark_metadata
-    _watermark_intake = None
-    try:
-        _watermark_intake = getattr(
-            getattr(request, "state", None), "watermark_intake", None
-        )
-    except Exception:
-        _watermark_intake = None
-    _watermark_egress = apply_request_watermark_egress(
-        body=prepared_request_body,
-        intake=_watermark_intake,
-        config=_get_runtime_text_watermark_config(),
-        endpoint=_watermark_endpoint_from_path(endpoint, target_url),
-        direction="request",
-        metadata=_watermark_metadata,
-        litellm_metadata=_watermark_metadata,
-    )
-    if isinstance(getattr(_watermark_egress, "body", None), dict):
-        prepared_request_body = _watermark_egress.body
-    if isinstance(prepared_request_body, dict):
-        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
-            strip_route_identity_from_request_body,
-        )
 
-        prepared_request_body = strip_route_identity_from_request_body(
-            prepared_request_body
-        )
-    watermark_input_audit = getattr(_watermark_egress, "audit", None)
-    if watermark_input_audit is not None:
-        _watermark_metadata["watermark_input_audit"] = watermark_input_audit
+    sanitized_request_body, _ = sanitize_wire_envelope(prepared_request_body)
+    if (
+        sanitized_request_body is not prepared_request_body
+        and isinstance(sanitized_request_body, dict)
+    ):
+        prepared_request_body.clear()
+        prepared_request_body.update(sanitized_request_body)
 
     opencode_zen_adapter_model = _resolve_codex_opencode_zen_adapter_model(
         prepared_request_body,
@@ -974,8 +908,8 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
         await _finalize_nested_session_owner_lease(request, _resp)
         return _resp
 
-    # No adapter matched -- apply direct-model reasoning effort normalization
-    # (side-effect on prepared_request_body) and fall through.
+    # No adapter matched -- apply direct-model reasoning effort normalization,
+    # then compile the exact OpenAI wire body before falling through.
     direct_model = prepared_request_body.get("model")
     if isinstance(direct_model, str) and direct_model:
         (
@@ -993,4 +927,23 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
             prepared_request_body.clear()
             prepared_request_body.update(normalized_request_body)
 
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        bind_openai_responses_wire_body,
+        compile_openai_responses_wire_body,
+    )
+
+    wire_body = compile_openai_responses_wire_body(
+        prepared_request_body,
+        request=request,
+        resolved_model=direct_model,
+        client_stream=True,
+        store=False,
+        url=target_url,
+        egress_credential_family="openai",
+        custom_llm_provider="openai",
+        expected_target_family="openai",
+        endpoint=endpoint,
+        session_identity=_sid,
+    )
+    bind_openai_responses_wire_body(request, wire_body)
     return None

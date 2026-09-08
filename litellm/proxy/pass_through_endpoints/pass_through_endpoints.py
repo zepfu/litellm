@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -147,6 +148,10 @@ from .aawm_adapter_runtime.repetitive_output import (
     bind_output_guard_to_streaming_response,
     maybe_reject_passthrough_responses_body,
     maybe_wrap_passthrough_responses_stream,
+)
+from .aawm_adapter_runtime.openai_responses_wire import (
+    get_bound_openai_responses_wire_body,
+    sanitize_wire_envelope,
 )
 from .aawm_text_watermark.config import load_text_watermark_config
 from .aawm_text_watermark.response_hooks import (
@@ -3995,11 +4000,19 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         logging_obj: LiteLLMLoggingObj,
         _parsed_body: Optional[dict] = None,
         litellm_call_id: Optional[str] = None,
+        compiled_wire_body: Any = None,
     ) -> dict:
         """
         Filter out litellm params from the request body
         """
         _parsed_body = _parsed_body or {}
+        compiled_wire_body = compiled_wire_body or get_bound_openai_responses_wire_body(
+            request,
+            _parsed_body,
+        )
+        compiled_provider_body = getattr(compiled_wire_body, "body", None)
+        if not isinstance(compiled_provider_body, dict):
+            compiled_provider_body = None
         # all_litellm_params / get_end_user_id_from_request_body: module-scope (RR-056 #8).
         working_body, _provider_body = _detach_passthrough_body_for_kwargs(_parsed_body)
 
@@ -4070,7 +4083,11 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 "proxy_server_request": {
                     "url": str(request.url),
                     "method": request.method,
-                    "body": _shallow_copy_request_dict(working_body),
+                    "body": (
+                        compiled_provider_body
+                        if compiled_provider_body is not None
+                        else _shallow_copy_request_dict(working_body)
+                    ),
                     "headers": request_headers or {},
                 },
             },
@@ -4201,13 +4218,12 @@ def _aawm_apply_openai_encrypted_reasoning_pre_send(
         is_openai_responses_egress,
         merge_encrypted_reasoning_disposition_into_request_body,
         should_strip_encrypted_function_output_without_plaintext,
-        strip_route_identity_from_request_body,
     )
 
     def _strip_identity_in_place(body: Optional[dict]) -> None:
         if not isinstance(body, dict):
             return
-        stripped = strip_route_identity_from_request_body(body)
+        stripped, _ = sanitize_wire_envelope(body)
         if stripped is body or not isinstance(stripped, dict):
             return
         body.clear()
@@ -4240,35 +4256,49 @@ def _aawm_apply_openai_encrypted_reasoning_pre_send(
     session_identity = sa.resolve_canonical_session_identity(
         request, identity_source
     )
-    try:
-        prepared, disposition = guard_openai_encrypted_reasoning_egress(
-            send_body,
-            session_identity=session_identity,
-            target_provider="openai",
-            target_route_family=egress_credential_family or expected_target_family,
-            failure_phase="encrypted_reasoning_openai_pre_send",
-            strip_function_output_ciphertext_without_plaintext=(
-                should_strip_encrypted_function_output_without_plaintext(
-                    url=url,
-                    egress_credential_family=egress_credential_family,
-                    custom_llm_provider=custom_llm_provider,
-                    request_body=identity_source,
-                )
-            ),
-        )
-    except HTTPException as exc:
-        _emit_openai_encrypted_reasoning_redispatch_terminal_error(
-            exc,
-            marker=getattr(request, "state", None),
-            correlation_id=session_identity,
-        )
-        raise
+    compiled_wire_body = get_bound_openai_responses_wire_body(
+        request, send_body
+    )
+    if compiled_wire_body is not None:
+        # The canonical compiler already ran this gate on the exact body that
+        # will be serialized. Keep this transport hook as the final gate, but
+        # reuse its immutable disposition instead of applying the guard twice.
+        prepared = send_body
+        disposition = dict(compiled_wire_body.encrypted_reasoning_disposition)
+    else:
+        try:
+            prepared, disposition = guard_openai_encrypted_reasoning_egress(
+                send_body,
+                session_identity=session_identity,
+                target_provider="openai",
+                target_route_family=egress_credential_family or expected_target_family,
+                failure_phase="encrypted_reasoning_openai_pre_send",
+                strip_function_output_ciphertext_without_plaintext=(
+                    should_strip_encrypted_function_output_without_plaintext(
+                        url=url,
+                        egress_credential_family=egress_credential_family,
+                        custom_llm_provider=custom_llm_provider,
+                        request_body=identity_source,
+                    )
+                ),
+            )
+        except HTTPException as exc:
+            _emit_openai_encrypted_reasoning_redispatch_terminal_error(
+                exc,
+                marker=getattr(request, "state", None),
+                correlation_id=session_identity,
+            )
+            raise
 
     # Synchronize the prepared body into the live send body used by httpx.
     # ``prepare`` returns a new dict when items change; a top-level shallow
     # provider_bound_body copy would otherwise keep the original input list
     # (and shared item dicts) including function_call_output ciphertext.
-    if isinstance(prepared, dict) and isinstance(send_body, dict):
+    if (
+        compiled_wire_body is None
+        and isinstance(prepared, dict)
+        and isinstance(send_body, dict)
+    ):
         for key, value in prepared.items():
             if key == "litellm_metadata":
                 continue
@@ -4284,7 +4314,7 @@ def _aawm_apply_openai_encrypted_reasoning_pre_send(
 
     # Disposition/observability only — do not reintroduce litellm_metadata onto
     # the stripped provider-bound send body.
-    if isinstance(parsed_body, dict):
+    if isinstance(parsed_body, dict) and compiled_wire_body is None:
         merged = merge_encrypted_reasoning_disposition_into_request_body(
             parsed_body, disposition
         )
@@ -4558,6 +4588,7 @@ async def pass_through_request(  # noqa: PLR0915
     error_log_context: Optional[Dict[str, Any]] = None
     raw_body: Optional[bytes] = None
     responses_function_name_rewrite: Optional[ResponsesFunctionNameRewrite] = None
+    compiled_wire_body: Any = None
     _transfer_identity: Optional[dict[str, Any]] = None
     route_custom_headers = dict(custom_headers or {})
     headers: Dict[str, Any] = dict(route_custom_headers)
@@ -4622,7 +4653,15 @@ async def pass_through_request(  # noqa: PLR0915
         )
 
         if custom_body:
-            _parsed_body = _copy_custom_body_for_passthrough(custom_body)
+            compiled_wire_body = get_bound_openai_responses_wire_body(
+                request,
+                custom_body,
+            )
+            _parsed_body = (
+                copy.deepcopy(custom_body)
+                if compiled_wire_body is not None
+                else _copy_custom_body_for_passthrough(custom_body)
+            )
         elif is_multipart:
             # Don't parse multipart body here - it will be handled by make_multipart_http_request
             _parsed_body = {}
@@ -4781,6 +4820,7 @@ async def pass_through_request(  # noqa: PLR0915
             litellm_call_id=litellm_call_id,
             request=request,
             logging_obj=logging_obj,
+            compiled_wire_body=compiled_wire_body,
         )
         _set_passthrough_stream_timeout_metadata(
             kwargs=kwargs,
@@ -4789,7 +4829,15 @@ async def pass_through_request(  # noqa: PLR0915
         provider_bound_body = _provider_bound_body_from_kwargs(kwargs)
         if provider_bound_body is None:
             provider_bound_body = _parsed_body if isinstance(_parsed_body, dict) else {}
-        if _is_openai_responses_function_name_target(
+        compiled_wire_body = (
+            get_bound_openai_responses_wire_body(request, provider_bound_body)
+            or compiled_wire_body
+        )
+        if compiled_wire_body is not None:
+            responses_function_name_rewrite = (
+                compiled_wire_body.function_name_rewrite
+            )
+        elif _is_openai_responses_function_name_target(
             url=url,
             custom_llm_provider=custom_llm_provider,
         ):
@@ -4964,7 +5012,7 @@ async def pass_through_request(  # noqa: PLR0915
             raw_body=raw_body,
             provider_bound_body=provider_bound_body,
         )
-        if isinstance(provider_bound_body, dict):
+        if isinstance(provider_bound_body, dict) and compiled_wire_body is None:
             _watermark_metadata = _ensure_passthrough_metadata(kwargs)
             _litellm_metadata = provider_bound_body.get("litellm_metadata")
             if not isinstance(_litellm_metadata, dict):

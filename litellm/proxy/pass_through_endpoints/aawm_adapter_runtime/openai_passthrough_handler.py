@@ -644,6 +644,16 @@ class BaseOpenAIPassThroughHandler:
                     request, prepared_request_body
                 )
                 endpoint_custom_body = prepared_request_body
+            if is_codex_responses_request:
+                from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+                    get_bound_openai_responses_wire_body,
+                )
+
+                compiled_wire_body = get_bound_openai_responses_wire_body(request)
+                if compiled_wire_body is not None:
+                    # Keep the observability body on the request while passing
+                    # only the compiler's exact provider body downstream.
+                    endpoint_custom_body = compiled_wire_body.body
 
         ## check for streaming
         is_streaming_request = (

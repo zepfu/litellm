@@ -1156,19 +1156,21 @@ async def _perform_codex_auto_agent_alias_candidate_request(
 
     _bind_codex_oauth_candidate_to_request(request, candidate)
     if isinstance(candidate_body, dict):
-        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
-            strip_route_identity_from_request_body,
-        )
+        # Native OpenAI candidates are compiled below. Other adapter routes
+        # still need the protocol-owned sidecar removal before their provider
+        # translators run, but must not recursively inspect user/tool data.
+        if str(candidate.get("provider") or "").strip().lower() != "openai":
+            from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+                sanitize_wire_envelope,
+            )
 
-        stripped_candidate_body = strip_route_identity_from_request_body(
-            candidate_body
-        )
-        if (
-            stripped_candidate_body is not candidate_body
-            and isinstance(stripped_candidate_body, dict)
-        ):
-            candidate_body.clear()
-            candidate_body.update(stripped_candidate_body)
+            sanitized_candidate_body, _ = sanitize_wire_envelope(candidate_body)
+            if (
+                sanitized_candidate_body is not candidate_body
+                and isinstance(sanitized_candidate_body, dict)
+            ):
+                candidate_body.clear()
+                candidate_body.update(sanitized_candidate_body)
     adapter_model = candidate["model"]
     cohere_provider = globals().get("_CODEX_AUTO_AGENT_COHERE_PROVIDER", "cohere")
     zai_coding_plan_provider = globals().get(
@@ -4333,36 +4335,34 @@ async def _perform_codex_auto_agent_native_openai_request(
     request_body: dict[str, Any],
     custom_headers: Optional[dict[str, str]] = None,
 ) -> Response:
-    # OPENAI-007: legacy history may collapse provider tool ids into item id.
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.direct_openai_function_call_history import (
-        normalize_direct_openai_legacy_function_call_history_ids,
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        bind_openai_responses_wire_body,
+        compile_openai_responses_wire_body,
     )
 
-    request_body = normalize_direct_openai_legacy_function_call_history_ids(
-        request_body
-    )
-    # Ingress drop keys off the caller/alias model id. Alias names such as
-    # ``work`` / ``expert`` / ``sota`` are not cost-map keys, so Ohmypi
-    # ``max_output_tokens`` survives until this resolved Codex candidate.
-    (
+    # The native candidate receives the resolved model, so the shared compiler
+    # owns legacy-history normalization, resolved-model parameter dropping,
+    # function-name rewriting, watermark egress, and encrypted-reasoning
+    # preparation exactly once.
+    wire_body = compile_openai_responses_wire_body(
         request_body,
-        _codex_unsupported_request_params,
-    ) = _drop_unsupported_codex_request_params_from_request_body(request_body)
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
-        guard_openai_encrypted_reasoning_egress,
+        request=request,
+        resolved_model=request_body.get("model"),
+        client_stream=True,
+        store=False,
+        url=target_url,
+        egress_credential_family=(
+            "openai" if custom_headers is not None or forward_headers else None
+        ),
+        custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+        expected_target_family="openai",
+        endpoint="responses",
+        drop_codex_request_params_fn=(
+            _drop_unsupported_codex_request_params_from_request_body
+        ),
     )
-
-    request_body, _encrypted_reasoning_disposition = (
-        guard_openai_encrypted_reasoning_egress(
-            request_body,
-            url=target_url,
-        )
-    )
-    request_body = {
-        **request_body,
-        "store": False,
-        "stream": True,
-    }
+    bind_openai_responses_wire_body(request, wire_body)
+    request_body = wire_body.body
     is_streaming_request = bool(request_body.get("stream"))
     # The candidate loop attaches this coordinator only for eligible alpha
     # OpenAI capacity-retry requests. Preserve stock hidden transport retries
@@ -6818,16 +6818,16 @@ async def _perform_codex_auto_agent_openrouter_completion_request(  # noqa: PLR0
         )
 
     if isinstance(request_body, dict):
-        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
-            strip_route_identity_from_request_body,
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+            sanitize_wire_envelope,
         )
 
-        stripped_request_body = strip_route_identity_from_request_body(request_body)
-        if stripped_request_body is not request_body and isinstance(
-            stripped_request_body, dict
+        sanitized_request_body, _ = sanitize_wire_envelope(request_body)
+        if sanitized_request_body is not request_body and isinstance(
+            sanitized_request_body, dict
         ):
             request_body.clear()
-            request_body.update(stripped_request_body)
+            request_body.update(sanitized_request_body)
     requested_model = request_body.get("model")
     upstream_adapter_model = _get_openrouter_completion_adapter_upstream_model(adapter_model) or adapter_model
     route_family = "codex_openrouter_completion_adapter"
