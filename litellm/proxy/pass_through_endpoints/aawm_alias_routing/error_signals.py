@@ -21,6 +21,7 @@ import random
 import re
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Mapping, Optional
 
 import httpx
@@ -228,6 +229,10 @@ _XAI_RATE_LIMIT_RESET_HEADERS = {
         "x-ratelimit-reset-token",
     ),
 }
+_XAI_RATE_LIMIT_GENERIC_RESET_HEADERS = (
+    "x-ratelimit-reset",
+    "x-rate-limit-reset",
+)
 _XAI_RATE_LIMIT_DURATION_RE = re.compile(
     r"^(?P<value>[0-9]+(?:\.[0-9]+)?)\s*(?P<unit>ms|s|m|h|d)?$",
     re.IGNORECASE,
@@ -278,10 +283,16 @@ def _parse_xai_rate_limit_reset_wait_seconds(
             # prevents them from becoming durable cooldowns.
             wait_seconds = numeric_value
     else:
+        parsed_at: Optional[datetime] = None
         try:
             iso_text = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
             parsed_at = datetime.fromisoformat(iso_text)
         except (TypeError, ValueError):
+            try:
+                parsed_at = parsedate_to_datetime(text)
+            except (IndexError, OverflowError, TypeError, ValueError):
+                return None
+        if parsed_at is None:
             return None
         if parsed_at.tzinfo is None:
             parsed_at = parsed_at.replace(tzinfo=timezone.utc)
@@ -364,18 +375,37 @@ def _parse_xai_rate_limit_header_wait_seconds(
             if wait_seconds is not None:
                 waits_by_scope[scope] = wait_seconds
                 break
-    if not waits_by_scope:
-        return None
+    generic_wait: Optional[float] = None
+    for header_name in _XAI_RATE_LIMIT_GENERIC_RESET_HEADERS:
+        reset_value = _get_adapter_header_value(headers, header_name)
+        if reset_value is None:
+            continue
+        generic_wait = _parse_xai_rate_limit_reset_wait_seconds(
+            reset_value,
+            now_epoch=now_epoch,
+        )
+        if generic_wait is not None:
+            break
 
     error_text = _codex_auto_agent_error_text(exc).lower()
     mentions_tokens = re.search(r"\btoken(?:s)?\b", error_text) is not None
     mentions_requests = re.search(r"\brequest(?:s)?\b", error_text) is not None
-    if mentions_tokens and not mentions_requests and "tokens" in waits_by_scope:
-        return max(1.0, waits_by_scope["tokens"])
-    if mentions_requests and not mentions_tokens and "requests" in waits_by_scope:
-        return max(1.0, waits_by_scope["requests"])
+    if mentions_tokens and not mentions_requests:
+        if "tokens" in waits_by_scope:
+            return max(1.0, waits_by_scope["tokens"])
+        if generic_wait is not None:
+            return max(1.0, generic_wait)
+    if mentions_requests and not mentions_tokens:
+        if "requests" in waits_by_scope:
+            return max(1.0, waits_by_scope["requests"])
+        if generic_wait is not None:
+            return max(1.0, generic_wait)
     # Without an attributable exhausted dimension, wait for both scopes.
-    return max(1.0, max(waits_by_scope.values()))
+    if waits_by_scope:
+        return max(1.0, max(waits_by_scope.values()))
+    if generic_wait is not None:
+        return max(1.0, generic_wait)
+    return None
 
 
 def _extract_embedded_json_payload_candidates(detail: object) -> list[str]:
@@ -2890,7 +2920,7 @@ def _parse_codex_auto_agent_header_wait_seconds(
         )
         or any(
             _get_adapter_header_value(headers, header_name) is not None
-            for header_name in ("x-ratelimit-reset", "x-rate-limit-reset")
+            for header_name in _XAI_RATE_LIMIT_GENERIC_RESET_HEADERS
         )
     ):
         return None
