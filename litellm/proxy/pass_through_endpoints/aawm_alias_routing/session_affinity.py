@@ -889,34 +889,6 @@ def is_session_owner_redispatch_effective_identity(
     )
 
 
-def derive_session_owner_base_identity(
-    effective_session_identity: Optional[str],
-) -> Optional[str]:
-    """Reverse the server-only first-generation redispatch identity."""
-
-    identity = _clean_optional_str(effective_session_identity)
-    if identity is None or not identity.startswith(
-        _SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX
-    ):
-        return None
-    try:
-        raw = bytes.fromhex(
-            identity[
-                len(_SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX):
-            ]
-        )
-        label, base = raw.split(b"\x00", 1)
-    except (ValueError, TypeError):
-        return None
-    if label != (
-        _SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_DOMAIN_SEPARATOR[:-1].encode(
-            "ascii"
-        )
-    ):
-        return None
-    return _clean_optional_str(base.decode("utf-8"))
-
-
 def _hosted_providers_match(
     left: Mapping[str, Any],
     right: Optional[Mapping[str, Any]] = None,
@@ -4083,7 +4055,7 @@ def clear_expected_non_held_request_session_owner_lease(
     *,
     expected_session_identity: str,
 ) -> bool:
-    """Clear only a non-held lease matching this base identity."""
+    """Clear only the expected compatible, non-held base lease."""
 
     if request is None:
         return False
@@ -4095,12 +4067,19 @@ def clear_expected_non_held_request_session_owner_lease(
         return True
     expected = _clean_optional_str(expected_session_identity)
     lease_identity = _clean_optional_str(lease.session_identity)
-    if expected is None or lease_identity is None:
+    if (
+        expected is None
+        or lease_identity is None
+        or is_session_owner_redispatch_effective_identity(expected)
+        or lease.decision != SessionOwnerGuardDecision.COMPATIBLE_OWNER.value
+        or lease.held_reservation
+        or lease.promoted
+        or lease.released
+        or _clean_optional_str(lease.owner_id) is None
+    ):
         return False
     if (
-        lease.held_reservation
-        or lease.promoted
-        or _strip_legacy_affinity_prefixes(lease_identity)
+        _strip_legacy_affinity_prefixes(lease_identity)
         != _strip_legacy_affinity_prefixes(expected)
     ):
         return False
@@ -4263,15 +4242,70 @@ async def ensure_session_owner_guard_for_request(
     a second competing reservation.
     """
 
+    resolved_session_identity = resolve_canonical_session_identity(
+        request,
+        request_body,
+        session_identity=session_identity,
+    )
     existing = get_request_session_owner_lease(request)
     active_lease = (
         existing
         if existing is not None and not existing.released and not existing.promoted
         else None
     )
+    if active_lease is not None:
+        lease_identity = _clean_optional_str(active_lease.session_identity)
+        identities_match = (
+            resolved_session_identity is not None
+            and lease_identity is not None
+            and _strip_legacy_affinity_prefixes(lease_identity)
+            == _strip_legacy_affinity_prefixes(resolved_session_identity)
+        )
+        if not identities_match:
+            if active_lease.held_reservation:
+                mismatch_reason = (
+                    "session_owner: request lease identity does not match "
+                    "the requested session identity"
+                )
+                mismatch_cache_key = (
+                    build_aawm_alias_routing_session_owner_cache_key(
+                        session_identity=resolved_session_identity
+                    )
+                    if resolved_session_identity is not None
+                    else None
+                )
+                guard = SessionOwnerGuardResult(
+                    decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                    session_identity=resolved_session_identity,
+                    cache_key=mismatch_cache_key,
+                    owner_id=active_lease.owner_id,
+                    reservation_token=active_lease.reservation_token,
+                    mismatch_reason=mismatch_reason,
+                    provenance=build_session_owner_provenance(
+                        session_identity=resolved_session_identity,
+                        decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,
+                        owner_id=active_lease.owner_id,
+                        mismatch_reason=mismatch_reason,
+                        cache_key=mismatch_cache_key,
+                        reservation_token=active_lease.reservation_token,
+                    ),
+                )
+                if raise_on_redispatch:
+                    raise_session_owner_redispatch_required(
+                        session_identity=resolved_session_identity,
+                        guard=guard,
+                        alias_model=alias_model,
+                        candidate=requested_attributes or candidate,
+                        failure_phase="session_owner_request_lease_identity_conflict",
+                        request=request,
+                    )
+                return guard
+            # A non-held lease does not authorize the new identity. Let the
+            # new guard result replace it instead of donating stale state.
+            active_lease = None
     token = active_lease.reservation_token if active_lease is not None else None
     guard = await guard_session_owner_before_egress(
-        session_identity=session_identity,
+        session_identity=resolved_session_identity,
         request=request,
         request_body=request_body,
         requested_attributes=requested_attributes
@@ -4295,6 +4329,8 @@ async def ensure_session_owner_guard_for_request(
             request=request,
         )
     if active_lease is not None and guard.held_reservation:
+        active_lease.session_identity = guard.session_identity
+        active_lease.cache_key = guard.cache_key
         active_lease.reservation_token = guard.reservation_token
         active_lease.held_reservation = True
         active_lease.decision = guard.decision.value
