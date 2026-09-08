@@ -2061,6 +2061,12 @@ _AAWM_RATE_LIMIT_METADATA_KEYS = (
     "xai_oauth_managed",
     "xai_oauth_public_model",
     "xai_oauth_upstream_model",
+    "xai_oauth_server_account_binding",
+    "xai_oauth_account_label",
+    "xai_oauth_account_hash",
+    "xai_oauth_record_identity",
+    "xai_oauth_scope_identity",
+    "xai_oauth_lane_key",
     "xai_quota_family",
     "shared_quota_family",
 )

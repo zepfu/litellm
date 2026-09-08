@@ -266,7 +266,11 @@ def _resolve_codex_auto_agent_xai_lane_key(candidate: dict[str, Any]) -> str:
     if route_family in {
         "codex_xai_oauth_responses_adapter",
         "anthropic_xai_oauth_responses_adapter",
+        "codex_auto_agent_xai_oauth_responses",
     }:
+        account_lane = candidate.get("xai_oauth_lane_key")
+        if isinstance(account_lane, str) and account_lane:
+            return account_lane
         return _CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY  # noqa: F821
     return _CODEX_AUTO_AGENT_XAI_LANE_KEY  # noqa: F821
 

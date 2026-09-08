@@ -187,6 +187,7 @@ _OWNER_ATTRIBUTE_FIELDS = (
     "account_label",
     "account_hash",
     "account_lane",
+    "account_scope",
     "endpoint_contract",
     "state_format",
     "credential_affinity",
@@ -203,6 +204,7 @@ _CORE_OWNER_ATTRIBUTE_KEYS = (
     "account_label",
     "account_hash",
     "account_lane",
+    "account_scope",
     "endpoint_contract",
     "state_format",
     "credential_affinity",
@@ -913,6 +915,7 @@ def build_session_owner_attributes(
     account_label: Any = None,
     account_hash: Any = None,
     account_lane: Any = None,
+    account_scope: Any = None,
     endpoint_contract: Any = None,
     state_format: Any = None,
     ingress: Any = None,
@@ -928,18 +931,27 @@ def build_session_owner_attributes(
     if isinstance(candidate, Mapping):
         source.update(dict(candidate))
     if account_label is None:
-        account_label = source.get("account_label") or source.get(
-            "codex_oauth_account_label"
+        account_label = (
+            source.get("xai_oauth_account_label")
+            or source.get("account_label")
+            or source.get("codex_oauth_account_label")
         )
     if account_hash is None:
-        account_hash = source.get("account_hash") or source.get(
-            "codex_oauth_account_hash"
+        account_hash = (
+            source.get("xai_oauth_account_hash")
+            or source.get("account_hash")
+            or source.get("codex_oauth_account_hash")
         )
     if account_lane is None:
         account_lane = (
-            source.get("account_lane")
+            source.get("xai_oauth_lane_key")
+            or source.get("account_lane")
             or source.get("codex_oauth_lane_key")
             or source.get("lane_key")
+        )
+    if account_scope is None:
+        account_scope = source.get("xai_oauth_scope_identity") or source.get(
+            "account_scope"
         )
     if provider is None:
         provider = source.get("provider")
@@ -960,7 +972,10 @@ def build_session_owner_attributes(
     if alias_family is None:
         alias_family = source.get("alias_family")
     if credential_affinity is None:
-        credential_affinity = source.get("codex_oauth_credential_affinity")
+        credential_affinity = (
+            source.get("xai_oauth_credential_affinity")
+            or source.get("codex_oauth_credential_affinity")
+        )
 
     attributes: Payload = {}
     values = {
@@ -970,6 +985,7 @@ def build_session_owner_attributes(
         "account_label": account_label,
         "account_hash": account_hash,
         "account_lane": account_lane,
+        "account_scope": account_scope,
         "endpoint_contract": endpoint_contract,
         "state_format": state_format,
         "credential_affinity": credential_affinity,
@@ -1223,6 +1239,13 @@ def incomplete_owner_attribute_reason(
                 "session_owner: account-scoped route requires credential/"
                 "account identity on promotion"
             )
+    route_family = str(attributes.get("route_family") or "").lower()
+    if for_promotion and "xai_oauth" in route_family:
+        if not _clean_optional_str(attributes.get("account_scope")):
+            return (
+                "session_owner: managed xAI OAuth route requires an exact "
+                "record scope identity on promotion"
+            )
     return None
 
 
@@ -1320,7 +1343,7 @@ def _attributes_exactly_equal(
             left_core.pop(key, None)
             right_core.pop(key, None)
     if _same_hosted_provider_account_identity_is_mutable(left_core, right_core):
-        for key in _MUTABLE_OPENAI_ACCOUNT_ATTRIBUTE_KEYS:
+        for key in (*_MUTABLE_OPENAI_ACCOUNT_ATTRIBUTE_KEYS, "account_scope"):
             left_core.pop(key, None)
             right_core.pop(key, None)
     if _managed_direct_openai_owner_shapes_are_equivalent(left_core, right_core):
@@ -1434,6 +1457,7 @@ def build_session_owner_provenance(
         "session_owner_endpoint_contract": attrs.get("endpoint_contract"),
         "session_owner_state_format": attrs.get("state_format"),
         "session_owner_account_lane": attrs.get("account_lane"),
+        "session_owner_account_scope": attrs.get("account_scope"),
         "session_owner_mutation_outcome": claim_outcome,
         # Never include reservation tokens or secrets in provenance.
         "session_owner_has_reservation_token": bool(reservation_token),
@@ -1474,15 +1498,29 @@ def owner_record_as_affinity_hint(
         "last_resort": False,
         "affinity_state_source": "session_owner",
     }
+    managed_xai_oauth = (
+        str(attrs.get("provider") or "").strip().lower() == "xai"
+        and "xai_oauth" in str(attrs.get("route_family") or "").lower()
+    )
     interchangeable = _accounts_are_interchangeable(attrs)
     if interchangeable:
         affinity["codex_oauth_credential_affinity"] = "interchangeable"
     include_account_identity = preserve_account_identity or not interchangeable
-    if attrs.get("account_label") and include_account_identity:
+    if managed_xai_oauth:
+        for source_field, affinity_field in (
+            ("account_label", "xai_oauth_account_label"),
+            ("account_hash", "xai_oauth_account_hash"),
+            ("account_scope", "xai_oauth_scope_identity"),
+            ("account_lane", "xai_oauth_lane_key"),
+        ):
+            if attrs.get(source_field):
+                affinity[affinity_field] = attrs.get(source_field)
+        affinity["xai_oauth_credential_affinity"] = "pinned"
+    elif attrs.get("account_label") and include_account_identity:
         affinity["codex_oauth_account_label"] = attrs.get("account_label")
-    if attrs.get("account_hash") and include_account_identity:
+    if not managed_xai_oauth and attrs.get("account_hash") and include_account_identity:
         affinity["codex_oauth_account_hash"] = attrs.get("account_hash")
-    if attrs.get("account_lane") and include_account_identity:
+    if not managed_xai_oauth and attrs.get("account_lane") and include_account_identity:
         affinity["codex_oauth_lane_key"] = attrs.get("account_lane")
     return {k: v for k, v in affinity.items() if v is not None}
 
@@ -3074,6 +3112,31 @@ async def finalize_request_session_owner_lease(
     return result
 
 
+def _bound_xai_oauth_account_identity(request: Any) -> Payload:
+    """Return a request-bound managed xAI account identity when available."""
+
+    if request is None:
+        return {}
+    try:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+            get_bound_xai_oauth_selected_account,
+            xai_oauth_selected_account_metadata,
+        )
+
+        selected_account = get_bound_xai_oauth_selected_account(request)
+    except Exception:  # noqa: BLE001
+        return {}
+    if selected_account is None:
+        return {}
+    selected_metadata = xai_oauth_selected_account_metadata(selected_account)
+    return {
+        "account_label": selected_metadata["xai_oauth_account_label"],
+        "account_hash": selected_metadata["xai_oauth_account_hash"],
+        "account_lane": selected_metadata["xai_oauth_lane_key"],
+        "account_scope": selected_metadata["xai_oauth_scope_identity"],
+    }
+
+
 def extract_account_identity_from_context(
     *,
     request: Any = None,
@@ -3106,6 +3169,10 @@ def extract_account_identity_from_context(
                 hdrs = {}
     elif isinstance(headers, Mapping):
         hdrs = {str(k).lower(): v for k, v in headers.items()}
+
+    bound_xai_identity = _bound_xai_oauth_account_identity(request)
+    if bound_xai_identity:
+        return bound_xai_identity
 
     def _pick(*keys: str) -> Optional[str]:
         for source in (metadata, body, kw):
@@ -3647,6 +3714,10 @@ def raise_session_owner_redispatch_required(
             "codex_oauth_account_label",
             "codex_oauth_account_hash",
             "codex_oauth_lane_key",
+            "xai_oauth_account_label",
+            "xai_oauth_account_hash",
+            "xai_oauth_scope_identity",
+            "xai_oauth_lane_key",
         ):
             if candidate.get(key) is not None:
                 shaped_candidate[key] = candidate.get(key)
