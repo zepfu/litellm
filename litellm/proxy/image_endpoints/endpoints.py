@@ -135,6 +135,7 @@ async def image_generation(
             route_type="aimage_generation",
             llm_router=llm_router,
             user_model=user_model,
+            request=request,
         )
         response = await llm_call
 

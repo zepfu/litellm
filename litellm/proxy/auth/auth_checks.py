@@ -2778,6 +2778,7 @@ async def is_valid_fallback_model(
     model: str,
     llm_router: Optional[Router],
     user_model: Optional[str],
+    request: Optional[Request] = None,
 ) -> Literal[True]:
     """
     Try to route the fallback model request.
@@ -2794,6 +2795,7 @@ async def is_valid_fallback_model(
         llm_router=llm_router,
         user_model=user_model,
         route_type="acompletion",  # route type shouldn't affect the fallback model check
+        request=request,
     )
 
     return True

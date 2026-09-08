@@ -28,6 +28,9 @@ from litellm.llms.xai.oauth import (
     get_xai_oauth_snapshot_from_request as _get_xai_oauth_snapshot_from_request,
 )
 from litellm.llms.xai.oauth import (
+    clear_xai_oauth_snapshot_from_request as _clear_xai_oauth_snapshot_from_request,
+)
+from litellm.llms.xai.oauth import (
     bind_xai_oauth_snapshot_to_request as _bind_xai_oauth_snapshot_to_request,
 )
 from litellm.llms.xai.oauth import (
@@ -647,6 +650,7 @@ async def _prepare_oa_xai_passthrough_request(  # noqa: PLR0915
                 and snapshot_identity != selected_identity
             )
         ):
+            _clear_xai_oauth_snapshot_from_request(request)
             request_snapshot = None
     try:
         prepare_signature = inspect.signature(prepare_fn)

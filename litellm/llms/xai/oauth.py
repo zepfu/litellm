@@ -1016,6 +1016,20 @@ def bind_xai_oauth_snapshot_to_request(
     snapshots[snapshot.credential_family] = snapshot
 
 
+def clear_xai_oauth_snapshot_from_request(
+    request: Any,
+    *,
+    credential_family: str = _XAI_MANAGED_SNAPSHOT_FAMILY,
+) -> None:
+    """Drop a request snapshot before rebinding a different server account."""
+
+    state = getattr(request, "state", None)
+    snapshots = getattr(state, _XAI_SNAPSHOT_STATE_ATTR, None)
+    if not isinstance(snapshots, dict):
+        return
+    snapshots.pop(credential_family, None)
+
+
 def get_xai_oauth_snapshot_from_request(
     request: Any,
     *,

@@ -1943,8 +1943,6 @@ async def handle_alias_route(  # noqa: PLR0915
                     }
                 },
             ))
-        if failover_ordinal == 0:
-            provider_candidate_attempts += 1
         # D1-564: provider/account lane admission after selection and before
         # attempt-start / probe lock / provider I/O. Separate from cooldown and
         # session ownership. Fail-fast only: never queue/sleep/background-retry.
@@ -1973,10 +1971,6 @@ async def handle_alias_route(  # noqa: PLR0915
                 provider_status_code=attempt_record.get("error_status_code"),
             )
             if account_failover_planned:
-                provider_candidate_attempts = max(
-                    0,
-                    provider_candidate_attempts - 1,
-                )
                 _mark_auto_agent_alias_request_failover_pending(
                     request,
                     attempt_record,
@@ -2234,6 +2228,7 @@ async def handle_alias_route(  # noqa: PLR0915
 
                         async def _perform_candidate_request() -> Response:  # noqa: PLR0915
                             nonlocal attempted_provider_call
+                            nonlocal provider_candidate_attempts
                             nonlocal managed_xai_oauth_provider_attempts
                             candidate_is_openai = (
                                 str(candidate.get("provider") or "").strip().lower()
@@ -2250,10 +2245,6 @@ async def handle_alias_route(  # noqa: PLR0915
                                 else 0
                             )
                             if _is_managed_xai_oauth_candidate(candidate):
-                                managed_xai_oauth_provider_attempts += 1
-                                attempt_record[
-                                    "xai_oauth_provider_attempt_ordinal"
-                                ] = managed_xai_oauth_provider_attempts
                                 attempt_record[
                                     "xai_oauth_account_traversal_ordinal"
                                 ] = max(1, failover_ordinal + 1)
@@ -2351,6 +2342,13 @@ async def handle_alias_route(  # noqa: PLR0915
                                 attempt_record["attempted_provider_call"] = (
                                     attempted_provider_call
                                 )
+                                if attempted_provider_call:
+                                    provider_candidate_attempts += 1
+                                    if _is_managed_xai_oauth_candidate(candidate):
+                                        managed_xai_oauth_provider_attempts += 1
+                                        attempt_record[
+                                            "xai_oauth_provider_attempt_ordinal"
+                                        ] = managed_xai_oauth_provider_attempts
                                 if "hidden_logical_retry_count" not in attempt_record:
                                     attempt_record["hidden_logical_retry_count"] = (
                                         getattr(
@@ -3266,10 +3264,6 @@ async def handle_alias_route(  # noqa: PLR0915
                             if replay_safety is not None
                             else True
                         )
-                        provider_candidate_attempts = max(
-                            0,
-                            provider_candidate_attempts - 1,
-                        )
                         deterministically_ineligible_candidate_keys.add(cooldown_key)
                         last_retryable_exc = failure_exc
                         break
@@ -3429,11 +3423,6 @@ async def handle_alias_route(  # noqa: PLR0915
                         or (replay_safety is not None and replay_safety.safe)
                     )
                 ):
-                    if deterministic_exclusion_eligible:
-                        provider_candidate_attempts = max(
-                            0,
-                            provider_candidate_attempts - 1,
-                        )
                     deterministically_ineligible_candidate_keys.add(cooldown_key)
                 last_retryable_exc = failure_exc
                 native_grok_recovery_candidate = (
@@ -3455,8 +3444,6 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                 )
                 if native_grok_retry_eligible:
-                    if failover_ordinal > 0:
-                        provider_candidate_attempts += 1
                     native_grok_continuation_transient_provider_attempts += 1
                     (
                         should_retry_same_candidate,
@@ -3956,10 +3943,6 @@ async def handle_alias_route(  # noqa: PLR0915
                         )
                         raise
                 if account_failover_planned:
-                    provider_candidate_attempts = max(
-                        0,
-                        provider_candidate_attempts - 1,
-                    )
                     _mark_auto_agent_alias_request_failover_pending(
                         request,
                         attempt_record,
@@ -3984,8 +3967,6 @@ async def handle_alias_route(  # noqa: PLR0915
                         error_class,
                     )
                     break
-                if failover_ordinal > 0:
-                    provider_candidate_attempts += 1
                 _record_auto_agent_alias_attempt_failure(
                     alias_family=alias_family,
                     alias_model=alias_model,

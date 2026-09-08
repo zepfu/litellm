@@ -1,7 +1,7 @@
 import inspect
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
-from fastapi import HTTPException, status
+from fastapi import HTTPException, Request, status
 
 import litellm
 
@@ -237,6 +237,7 @@ async def route_request(  # noqa: PLR0915 - Complex routing function, refactorin
         "acancel_run",
         "adelete_run",
     ],
+    request: Optional[Request] = None,
 ):
     """
     Common helper to route the request
@@ -253,14 +254,28 @@ async def route_request(  # noqa: PLR0915 - Complex routing function, refactorin
             data["config"] = data.pop("generationConfig")
 
     from litellm.llms.xai.oauth import (
+        is_oa_xai_model,
         prepare_oa_xai_request,
         reread_xai_oauth_snapshot_after_provider_401,
     )
 
     snapshot_out: dict[str, Any] = {}
+    selected_xai_account = None
+    if is_oa_xai_model(data.get("model")):
+        if request is None:
+            raise ValueError(
+                "Managed xAI OAuth routing requires the originating proxy "
+                "request context."
+            )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+            get_or_bind_xai_oauth_selected_account,
+        )
+
+        selected_xai_account = get_or_bind_xai_oauth_selected_account(request)
     prepared_oa_xai_request = await prepare_oa_xai_request(
         data,
         snapshot_out=snapshot_out,
+        selected_account=selected_xai_account,
     )
     if prepared_oa_xai_request:
         route_fn = getattr(litellm, f"{route_type}")

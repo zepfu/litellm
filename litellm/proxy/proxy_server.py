@@ -7572,6 +7572,7 @@ async def moderations(
             route_type="amoderation",
             llm_router=llm_router,
             user_model=user_model,
+            request=request,
         )
         response = await llm_call
 
@@ -7694,6 +7695,7 @@ async def audio_speech(
             route_type="aspeech",
             llm_router=llm_router,
             user_model=user_model,
+            request=request,
         )
         response = await llm_call
 
@@ -7844,6 +7846,7 @@ async def audio_transcriptions(
                 route_type="atranscription",
                 llm_router=llm_router,
                 user_model=user_model,
+                request=request,
             )
             response = await llm_call
         except Exception as e:
@@ -8086,6 +8089,7 @@ async def realtime_websocket_endpoint(
             route_type="_arealtime",
             llm_router=llm_router,
             user_model=user_model,
+            request=request,
         )
         await llm_call
     except websockets.exceptions.InvalidStatusCode as e:  # type: ignore
