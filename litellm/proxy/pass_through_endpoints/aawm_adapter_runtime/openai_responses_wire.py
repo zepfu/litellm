@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, AsyncIterable, AsyncIterator, Awaitable, Callable, Dict, Optional
 
-import anyio
 from starlette.responses import Response, StreamingResponse
 
 
@@ -204,15 +203,17 @@ async def _await_shielded(awaitable: Awaitable[Any]) -> Any:
     """Complete cleanup/finalization before propagating cancellation."""
 
     task = asyncio.ensure_future(awaitable)
-    try:
-        await asyncio.shield(task)
-    except asyncio.CancelledError:
-        # AnyIO cancellation scopes can keep delivering cancellation at every
-        # await. Keep the cleanup task shielded while it finishes, then
-        # propagate the original cancellation to the caller.
-        with anyio.CancelScope(shield=True):
-            await task
-        raise
+    cancellation_requested = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # A caller can cancel the waiting task repeatedly. Keep the
+            # cleanup task shielded until it reaches a terminal state.
+            cancellation_requested = True
+            continue
+    if cancellation_requested:
+        raise asyncio.CancelledError
     return task.result()
 
 
@@ -473,6 +474,12 @@ class OpenAIResponsesWireCoordinator:
         self._source_iterator: Optional[AsyncIterator[bytes]] = None
 
     async def _close_source(self) -> None:
+        if self.trace.done_wire_committed:
+            extensions = getattr(self._upstream_response, "extensions", None)
+            if isinstance(extensions, dict):
+                extensions[
+                    "aawm_openai_responses_terminal_close_expected"
+                ] = True
         close_errors: list[str] = []
         for value in (self._source, self._upstream_response):
             close = getattr(value, "aclose", None)

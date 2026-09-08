@@ -1387,6 +1387,8 @@ class PassThroughStreamingHandler:
         - Collect non-empty chunks for post-processing (logging)
         - Inject cost into chunks if include_cost_in_streaming_usage is enabled
         """
+        completion_bookkeeping_done = False
+        responses_tracking_finalized = False
         try:
             raw_bytes: List[bytes] = []
             line_accumulator: Optional[_PassThroughStreamLineAccumulator] = None
@@ -1565,6 +1567,138 @@ class PassThroughStreamingHandler:
                     )
                 return recovery_failure
 
+            def _finalize_responses_tracking() -> Optional[Dict[str, Any]]:
+                nonlocal responses_tracking_finalized
+                nonlocal responses_sse_event_buffer, held_responses_done_suffix
+                if (
+                    responses_tracking_finalized
+                    or responses_terminal_accumulator is None
+                ):
+                    return None
+                responses_tracking_finalized = True
+                if responses_sse_event_buffer or (
+                    responses_terminal_accumulator.has_pending_frame()
+                ):
+                    OpenAIPassthroughLoggingHandler._mark_responses_sse_partial_frame(
+                        responses_sse_tracker
+                    )
+                else:
+                    _consume_responses_lines(
+                        responses_terminal_accumulator.finish()
+                    )
+
+                if responses_sse_event_buffer:
+                    # Native Responses partial frames are not client-deliverable
+                    # data. The outer coordinator emits one canonical
+                    # incomplete terminal at EOF; do not concatenate this tail
+                    # with that synthetic event.
+                    responses_sse_event_buffer = b""
+                    held_responses_done_suffix = b""
+
+                metadata["aawm_stream_tracker_state"] = (
+                    OpenAIPassthroughLoggingHandler._responses_sse_tracker_metadata(
+                        responses_sse_tracker
+                    )
+                )
+                if first_emitted_at is not None and not responses_terminal_seen:
+                    return OpenAIPassthroughLoggingHandler._classify_responses_sse_clean_eof(
+                        responses_sse_tracker
+                    )
+                return None
+
+            async def _finalize_completed_stream() -> None:
+                nonlocal completion_bookkeeping_done, responses_sse_event_buffer
+                nonlocal held_responses_done_suffix
+                if completion_bookkeeping_done:
+                    return
+                completion_bookkeeping_done = True
+
+                _finalize_responses_tracking()
+                end_time = datetime.now()
+                metadata["aawm_stream_chunk_count"] = chunk_count
+                metadata["aawm_stream_total_bytes"] = total_stream_bytes
+                if upstream_wait_started_at is not None:
+                    metadata["aawm_upstream_stream_complete_ms"] = round(
+                        max(
+                            0.0,
+                            (end_time - upstream_wait_started_at).total_seconds()
+                            * 1000.0,
+                        ),
+                        3,
+                    )
+                metadata["aawm_total_proxy_duration_ms"] = round(
+                    max(0.0, (end_time - start_time).total_seconds() * 1000.0),
+                    3,
+                )
+                PassThroughStreamingHandler._append_stream_span(
+                    success_handler_kwargs,
+                    name="stream.completed",
+                    start_time=upstream_wait_completed_at or start_time,
+                    end_time=end_time,
+                    span_metadata={
+                        "chunk_count": chunk_count,
+                        "stream_bytes": total_stream_bytes,
+                        "upstream_stream_complete_ms": metadata.get(
+                            "aawm_upstream_stream_complete_ms"
+                        ),
+                    },
+                )
+                await safe_mark_phase(
+                    transfer_identity,
+                    "finalizing",
+                    extra={
+                        "upstream_chunk_count": chunk_count,
+                        "upstream_byte_count": total_stream_bytes,
+                        "downstream_chunk_count": downstream_chunk_count,
+                        "downstream_byte_count": downstream_byte_count,
+                    },
+                )
+                async def _finalize_deferred_success() -> None:
+                    await safe_finalize(
+                        transfer_identity,
+                        "completed",
+                        extra={
+                            "upstream_chunk_count": chunk_count,
+                            "upstream_byte_count": total_stream_bytes,
+                            "downstream_chunk_count": downstream_chunk_count,
+                            "downstream_byte_count": downstream_byte_count,
+                        },
+                    )
+
+                    precomputed_lines: Optional[List[str]] = None
+                    if line_accumulator is not None:
+                        precomputed_lines = line_accumulator.finish()
+
+                    asyncio.create_task(
+                        PassThroughStreamingHandler._route_streaming_logging_to_handler(
+                            litellm_logging_obj=litellm_logging_obj,
+                            passthrough_success_handler_obj=passthrough_success_handler_obj,
+                            response=response,
+                            url_route=url_route,
+                            request_body=request_body or {},
+                            endpoint_type=endpoint_type,
+                            start_time=start_time,
+                            raw_bytes=raw_bytes,
+                            precomputed_lines=precomputed_lines,
+                            end_time=end_time,
+                            passthrough_logging_payload=passthrough_logging_payload,
+                            custom_llm_provider=custom_llm_provider,
+                            success_handler_kwargs=success_handler_kwargs,
+                            local_prepare_ms=local_prepare_ms,
+                            error_log_context=error_log_context,
+                        )
+                    )
+
+                if deferred_success_holder is not None:
+                    deferred_success_holder.set_finalizer(_finalize_deferred_success)
+                else:
+                    await _finalize_deferred_success()
+
+            def _mark_responses_terminal_pending() -> None:
+                extensions = getattr(response, "extensions", None)
+                if isinstance(extensions, dict):
+                    extensions["aawm_openai_responses_terminal_pending"] = True
+
             async for chunk in response.aiter_bytes():
                 current_chunk_at = datetime.now()
                 chunk_count += 1
@@ -1682,6 +1816,7 @@ class PassThroughStreamingHandler:
                                 exc=recovery_failure,
                             )
                         )
+                        _mark_responses_terminal_pending()
                         for terminal_chunk in terminal_chunks:
                             _record_responses_wire_chunk(terminal_chunk)
                             yield terminal_chunk
@@ -1702,11 +1837,12 @@ class PassThroughStreamingHandler:
                             first_downstream=first_emitted_at is not None
                             and downstream_chunk_count == 1
                         )
+                        _mark_responses_terminal_pending()
                         yield complete_chunk
                         # The outer native Responses coordinator owns terminal
-                        # and [DONE] delivery. Resume once so this generator
-                        # can run its normal post-stream logging/finalization,
-                        # then stop before reading another provider chunk.
+                        # and [DONE] delivery. It closes this source after
+                        # delivery; GeneratorExit then runs the non-reading
+                        # completion bookkeeping path below.
                         break
 
                     (
@@ -1800,41 +1936,21 @@ class PassThroughStreamingHandler:
                 yield chunk
 
             if responses_terminal_accumulator is not None:
-                if responses_sse_event_buffer or (
-                    responses_terminal_accumulator.has_pending_frame()
-                ):
-                    OpenAIPassthroughLoggingHandler._mark_responses_sse_partial_frame(
-                        responses_sse_tracker
-                    )
-                else:
-                    _consume_responses_lines(responses_terminal_accumulator.finish())
-
-                if responses_sse_event_buffer:
-                    # Native Responses partial frames are not client-deliverable
-                    # data. The outer coordinator emits one canonical
-                    # incomplete terminal at EOF; do not concatenate this tail
-                    # with that synthetic event.
-                    responses_sse_event_buffer = b""
-                    held_responses_done_suffix = b""
-
+                synthetic_terminal = _finalize_responses_tracking()
                 terminal_chunks: List[bytes] = []
-                if first_emitted_at is not None and not responses_terminal_seen:
-                    synthetic_terminal = OpenAIPassthroughLoggingHandler._classify_responses_sse_clean_eof(
-                        responses_sse_tracker
-                    )
-                    if synthetic_terminal is not None:
-                        event_type = synthetic_terminal["type"]
-                        terminal_chunks = [
-                            (
-                                f"event: {event_type}\ndata: "
-                                + json.dumps(
-                                    synthetic_terminal,
-                                    separators=(",", ":"),
-                                )
-                                + "\n\n"
-                            ).encode("utf-8"),
-                            b"data: [DONE]\n\n",
-                        ]
+                if synthetic_terminal is not None:
+                    event_type = synthetic_terminal["type"]
+                    terminal_chunks = [
+                        (
+                            f"event: {event_type}\ndata: "
+                            + json.dumps(
+                                synthetic_terminal,
+                                separators=(",", ":"),
+                            )
+                            + "\n\n"
+                        ).encode("utf-8"),
+                        b"data: [DONE]\n\n",
+                    ]
 
                 if terminal_chunks:
                     held_responses_done_suffix = b""
@@ -1845,12 +1961,6 @@ class PassThroughStreamingHandler:
                     _record_responses_wire_chunk(held_responses_done_suffix)
                     yield held_responses_done_suffix
                     held_responses_done_suffix = b""
-
-                metadata["aawm_stream_tracker_state"] = (
-                    OpenAIPassthroughLoggingHandler._responses_sse_tracker_metadata(
-                        responses_sse_tracker
-                    )
-                )
             elif is_non_openai_responses_stream and responses_sse_event_buffer:
                 trailing_partial = responses_sse_event_buffer
                 responses_sse_event_buffer = b""
@@ -1863,81 +1973,7 @@ class PassThroughStreamingHandler:
                 )
                 yield trailing_partial
 
-            # After all chunks are processed, handle post-processing
-            end_time = datetime.now()
-            metadata["aawm_stream_chunk_count"] = chunk_count
-            metadata["aawm_stream_total_bytes"] = total_stream_bytes
-            if upstream_wait_started_at is not None:
-                metadata["aawm_upstream_stream_complete_ms"] = round(
-                    max(0.0, (end_time - upstream_wait_started_at).total_seconds() * 1000.0),
-                    3,
-                )
-            metadata["aawm_total_proxy_duration_ms"] = round(
-                max(0.0, (end_time - start_time).total_seconds() * 1000.0),
-                3,
-            )
-            PassThroughStreamingHandler._append_stream_span(
-                success_handler_kwargs,
-                name="stream.completed",
-                start_time=upstream_wait_completed_at or start_time,
-                end_time=end_time,
-                span_metadata={
-                    "chunk_count": chunk_count,
-                    "stream_bytes": total_stream_bytes,
-                    "upstream_stream_complete_ms": metadata.get(
-                        "aawm_upstream_stream_complete_ms"
-                    ),
-                },
-            )
-            await safe_mark_phase(
-                transfer_identity,
-                "finalizing",
-                extra={
-                    "upstream_chunk_count": chunk_count,
-                    "upstream_byte_count": total_stream_bytes,
-                    "downstream_chunk_count": downstream_chunk_count,
-                    "downstream_byte_count": downstream_byte_count,
-                },
-            )
-
-            async def _finalize_deferred_success() -> None:
-                await safe_finalize(
-                    transfer_identity,
-                    "completed",
-                    extra={
-                        "upstream_chunk_count": chunk_count,
-                        "upstream_byte_count": total_stream_bytes,
-                        "downstream_chunk_count": downstream_chunk_count,
-                        "downstream_byte_count": downstream_byte_count,
-                    },
-                )
-                precomputed_lines: Optional[List[str]] = None
-                if line_accumulator is not None:
-                    precomputed_lines = line_accumulator.finish()
-                asyncio.create_task(
-                    PassThroughStreamingHandler._route_streaming_logging_to_handler(
-                        litellm_logging_obj=litellm_logging_obj,
-                        passthrough_success_handler_obj=passthrough_success_handler_obj,
-                        response=response,
-                        url_route=url_route,
-                        request_body=request_body or {},
-                        endpoint_type=endpoint_type,
-                        start_time=start_time,
-                        raw_bytes=raw_bytes,
-                        precomputed_lines=precomputed_lines,
-                        end_time=end_time,
-                        passthrough_logging_payload=passthrough_logging_payload,
-                        custom_llm_provider=custom_llm_provider,
-                        success_handler_kwargs=success_handler_kwargs,
-                        local_prepare_ms=local_prepare_ms,
-                        error_log_context=error_log_context,
-                    )
-                )
-
-            if deferred_success_holder is not None:
-                deferred_success_holder.set_finalizer(_finalize_deferred_success)
-            else:
-                await _finalize_deferred_success()
+            await _finalize_completed_stream()
         except asyncio.CancelledError:
             local_identity = (
                 transfer_identity if "transfer_identity" in locals() else {}
@@ -1964,6 +2000,20 @@ class PassThroughStreamingHandler:
             )
             raise
         except GeneratorExit:
+            response_extensions = getattr(response, "extensions", None)
+            if (
+                isinstance(response_extensions, dict)
+                and response_extensions.get(
+                    "aawm_openai_responses_terminal_close_expected"
+                )
+                and response_extensions.get(
+                    "aawm_openai_responses_terminal_pending"
+                )
+                and locals().get("responses_terminal_seen") is True
+            ):
+                metadata["aawm_responses_terminal_close_finalized"] = True
+                await _finalize_completed_stream()
+                raise
             local_identity = (
                 transfer_identity if "transfer_identity" in locals() else {}
             )
