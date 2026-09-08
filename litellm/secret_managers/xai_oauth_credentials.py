@@ -225,8 +225,8 @@ def resolve_xai_oauth_lock_path(
     relative paths and existing symlink aliases coordinate on one lock. The
     portable default lock is also remapped to that sibling for custom auth
     files, preventing a legacy fixed default from creating a second lock
-    identity. Other explicit locks remain supported, but lock symlinks and a
-    lock path equal to the credential file are rejected.
+    identity. Explicit lock values are accepted only when they resolve to that
+    same canonical sibling; lock symlinks and auth-file collisions are rejected.
     """
 
     if explicit_lock_file is None:
@@ -251,8 +251,14 @@ def resolve_xai_oauth_lock_path(
         canonical_lock == canonical_default_lock
         and canonical_auth != canonical_default_lock
     ):
-        return default_xai_oauth_lock_path(auth_file)
-    return canonical_lock
+        canonical_lock = default_xai_oauth_lock_path(auth_file)
+    canonical_sibling = default_xai_oauth_lock_path(auth_file)
+    if canonical_lock != canonical_sibling:
+        raise ValueError(
+            "xAI OAuth lock path must resolve to the canonical auth-file "
+            "sibling lock."
+        )
+    return canonical_sibling
 
 
 def _credential_identity(canonical_path: Path, scope: str) -> str:

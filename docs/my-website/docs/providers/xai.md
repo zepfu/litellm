@@ -172,9 +172,9 @@ credential contents and raw paths are never included in that identity.
 Managed xAI refreshes derive their default advisory lock from the canonical
 resolved auth file, using the file's `.lock` sibling. Different custom auth
 files use independent locks, while aliases for one file coordinate on one
-lock. Set `AAWM_XAI_OAUTH_LOCK_FILE` or `--xai-oauth-lock-file` only for an
-intentional explicit override; lock symlinks and auth-file lock collisions fail
-closed.
+lock. Set `AAWM_XAI_OAUTH_LOCK_FILE` or `--xai-oauth-lock-file` only to an
+alias of that canonical sibling; arbitrary paths, lock symlinks, and auth-file
+lock collisions fail closed.
 
 ## Proxy Retry and Quota Behavior
 

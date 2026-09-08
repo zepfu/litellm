@@ -484,8 +484,9 @@ metadata uses the `300`-second degraded fallback.
 Managed xAI's omitted lock option is derived from the canonical resolved auth
 file and uses its `.lock` sibling. Distinct custom auth files therefore do not
 serialize each other, while relative or symlink aliases for one file share one
-lock identity. Explicit lock overrides remain supported and are validated before
-the refresh writer reads or mutates credentials.
+lock identity. An explicit lock value is accepted only when it resolves to that
+canonical sibling; arbitrary paths are rejected before the refresh writer reads
+or mutates credentials.
 
 Rendered native defaults:
 

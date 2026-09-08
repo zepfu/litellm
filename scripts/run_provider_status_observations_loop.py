@@ -2790,7 +2790,8 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         help=(
             "Lock file for sidecar managed xAI OAuth refresh writes. When "
             "omitted, the shared resolver derives a canonical sibling of the "
-            "resolved auth file; AAWM_XAI_OAUTH_LOCK_FILE remains an override."
+            "resolved auth file; AAWM_XAI_OAUTH_LOCK_FILE must resolve to that "
+            "same sibling when supplied."
         ),
     )
     parser.add_argument(
