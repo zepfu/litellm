@@ -23,12 +23,14 @@ duplicate hardcoded mapping.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import (
     TYPE_CHECKING,
     Any,
     Awaitable,
     Callable,
     Mapping,
+    Never,
     Optional,
 )
 
@@ -173,6 +175,58 @@ _runtime: Optional[AliasCandidateDispatchRuntime] = None
 # ---------------------------------------------------------------------------
 
 
+def _raise_xai_alias_route_family_ineligible(
+    *,
+    candidate: Payload,
+    ingress: str,
+) -> Never:
+    """Reject an unregistered xAI alias route before credential preparation."""
+    from litellm.proxy._types import ProxyException
+
+    model = str(candidate.get("model") or "")
+    route_family = str(candidate.get("route_family") or "")
+    message = (
+        "aawm_codex_auto_agent_candidate_ineligible: "
+        "xAI alias route family is not registered for this ingress; "
+        f"ingress={ingress} model={model} route_family={route_family}."
+    )
+    proxy_exc = ProxyException(
+        message=message,
+        type="invalid_request_error",
+        param="model",
+        code=400,
+    )
+    setattr(proxy_exc, "status_code", 400)
+    setattr(proxy_exc, "candidate_status", "ineligible")
+    setattr(proxy_exc, "ineligibility_reason", "unsupported")
+    setattr(proxy_exc, "failure_phase", "route_family_validation")
+    setattr(proxy_exc, "attempted_provider_call", False)
+    setattr(
+        proxy_exc,
+        "detail",
+        {
+            "error": {
+                "message": message,
+                "code": "aawm_codex_auto_agent_candidate_ineligible",
+            },
+            "failure_phase": "route_family_validation",
+            "attempted_provider_call": False,
+        },
+    )
+    raise proxy_exc
+
+
+async def _reject_xai_alias_route_family(
+    *,
+    candidate: Payload,
+    ingress: str,
+) -> "Response":
+    return _raise_xai_alias_route_family_ineligible(
+        candidate=candidate,
+        ingress=ingress,
+    )
+
+
 async def _dispatch_auto_agent_alias_candidate_request(
     *,
     candidate: Payload,
@@ -180,6 +234,9 @@ async def _dispatch_auto_agent_alias_candidate_request(
     default_handler: Callable[[], Awaitable["Response"]],
     route_family_handlers: Optional[
         Mapping[str, Mapping[str, Callable[[], Awaitable["Response"]]]]
+    ] = None,
+    unsupported_route_family_handlers: Optional[
+        Mapping[str, Callable[[], Awaitable["Response"]]]
     ] = None,
 ) -> "Response":
     """Table-driven provider/route_family candidate dispatch (RR-054 #10).
@@ -194,6 +251,10 @@ async def _dispatch_auto_agent_alias_candidate_request(
         handler = family_map.get(route_family) or family_map.get("*")
         if handler is not None:
             return await handler()
+        if unsupported_route_family_handlers:
+            unsupported_handler = unsupported_route_family_handlers.get(provider)
+            if unsupported_handler is not None:
+                return await unsupported_handler()
     handler = provider_handlers.get(provider)
     if handler is not None:
         return await handler()
@@ -430,8 +491,15 @@ async def _perform_anthropic_auto_agent_alias_candidate_request(
             },
             rt.provider_xai: {
                 "anthropic_xai_oauth_responses_adapter": _xai_oauth,
-                "*": _grok_native,
+                "anthropic_grok_native_responses_adapter": _grok_native,
             },
+        },
+        unsupported_route_family_handlers={
+            rt.provider_xai: partial(
+                _reject_xai_alias_route_family,
+                candidate=candidate,
+                ingress="anthropic",
+            ),
         },
         default_handler=_native,
     )
