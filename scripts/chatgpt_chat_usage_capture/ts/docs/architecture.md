@@ -70,8 +70,9 @@ no continuation, so they cannot be mistaken for complete history. Summary and
 message origin evidence is resolved together from root, mapping wrapper, and
 metadata fields: strict `imported`, `from_copy`, and `from_shared` exclusion
 flags take precedence over any benign `origin` label, and conflicting or
-malformed labels resolve to unknown origin. These origins remain excluded from
-ordinary Chat accounting.
+malformed labels resolve to unknown origin. Label comparison is
+case-insensitive while raw labels remain in metadata. These origins remain
+excluded from ordinary Chat accounting.
 
 ### Identity
 

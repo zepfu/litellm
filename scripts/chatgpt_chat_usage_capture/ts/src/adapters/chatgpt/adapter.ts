@@ -1163,6 +1163,8 @@ function resolveOriginEvidence(
   }
 
   const labels = new Set<string>();
+  const normalizedLabels = new Set<string>();
+  let observedUnknown = false;
   let observedOrigin = false;
   let malformedOrigin = false;
   const collectOrigin = (value: unknown): void => {
@@ -1174,6 +1176,10 @@ function resolveOriginEvidence(
       return;
     }
     labels.add(label);
+    normalizedLabels.add(label.toLowerCase());
+    if (label.toLowerCase() === "unknown") {
+      observedUnknown = true;
+    }
   };
   for (const source of sources) {
     collectOrigin(source.root.origin);
@@ -1181,11 +1187,12 @@ function resolveOriginEvidence(
   for (const metadata of metadataSources) {
     collectOrigin(metadata.origin);
   }
-  if (labels.size === 1) {
+  if (normalizedLabels.has("unknown")) return null;
+  if (normalizedLabels.size === 1) {
     const [label] = labels;
     return label ?? null;
   }
-  if (labels.size > 1 || malformedOrigin) return null;
+  if (normalizedLabels.size > 1 || malformedOrigin) return null;
   return observedOrigin ? null : null;
 }
 
