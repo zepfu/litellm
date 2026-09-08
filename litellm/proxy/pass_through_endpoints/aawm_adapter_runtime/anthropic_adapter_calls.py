@@ -1581,6 +1581,7 @@ async def _perform_anthropic_completion_adapter_messages_call(  # noqa: PLR0915
         "proxy_server_request": {
             "headers": dict(request.headers),
             "body": prepared_request_body,
+            "_request": request,
         },
     }
     if timeout is not None:
