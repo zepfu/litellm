@@ -383,6 +383,12 @@ def _codex_auto_agent_candidate_public_shape(
         ("codex_oauth_account_weight", "account_weight"),
         ("codex_oauth_credential_affinity", "credential_affinity"),
         ("codex_oauth_selection_strategy", "selection_strategy"),
+        ("xai_oauth_account_label", "account_label"),
+        ("xai_oauth_account_hash", "account_hash"),
+        ("xai_oauth_lane_key", "account_lane"),
+        ("xai_oauth_scope_identity", "account_scope"),
+        ("xai_oauth_account_priority", "account_priority"),
+        ("xai_oauth_credential_affinity", "credential_affinity"),
     ):
         if not include_account_identity and source_field in {
             "codex_oauth_account_label",
@@ -845,7 +851,10 @@ def _peek_codex_auto_agent_request_local_excluded_keys(
 def _codex_oauth_candidate_slot(
     candidate: dict[str, Any],
 ) -> Optional[str]:
-    account_hash = candidate.get("codex_oauth_account_hash")
+    account_hash = (
+        candidate.get("codex_oauth_account_hash")
+        or candidate.get("xai_oauth_account_hash")
+    )
     if not account_hash:
         return None
     base_slot = _codex_oauth_candidate_base_slot(candidate)
@@ -857,7 +866,10 @@ def _codex_oauth_candidate_slot(
 def _codex_oauth_candidate_base_slot(
     candidate: dict[str, Any],
 ) -> Optional[str]:
-    if not candidate.get("codex_oauth_account_hash"):
+    if not (
+        candidate.get("codex_oauth_account_hash")
+        or candidate.get("xai_oauth_account_hash")
+    ):
         return None
     return "{}:{}:{}:{}".format(
         candidate.get("provider") or "",
@@ -961,6 +973,159 @@ def _apply_codex_oauth_failover_context_to_state(
     return state
 
 
+def _get_xai_oauth_request_local_failover_context(
+    request: Request,
+    *,
+    candidate: Optional[dict[str, Any]] = None,
+) -> Optional[dict[str, Any]]:
+    context = getattr(
+        request.state,
+        "aawm_xai_oauth_request_local_failover_context",
+        None,
+    )
+    if not isinstance(context, dict):
+        return None
+    context = dict(context)
+    if candidate is not None:
+        candidate_slot = _codex_oauth_candidate_slot(candidate)
+        if context.get("slot") != candidate_slot:
+            identity = context.get("candidate_identity")
+            if not isinstance(identity, dict):
+                return None
+            for field in ("provider", "model", "route_family"):
+                if str(identity.get(field) or "") != str(
+                    candidate.get(field) or ""
+                ):
+                    return None
+    return context
+
+
+def _apply_xai_oauth_failover_context_to_state(
+    request: Request,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    candidate = state["candidate"]
+    if not _is_xai_oauth_account_candidate(candidate):
+        return state
+    state["failover_ordinal"] = 0
+    context = _get_xai_oauth_request_local_failover_context(
+        request,
+        candidate=candidate,
+    )
+    account_hash = candidate.get("xai_oauth_account_hash")
+    if (
+        context is None
+        or account_hash in set(context.get("attempted_account_hashes") or ())
+    ):
+        return state
+    state["failover_ordinal"] = len(
+        context.get("attempted_account_hashes") or ()
+    )
+    state["prior_account_outcome"] = dict(
+        context.get("prior_account_outcome") or {}
+    )
+    return state
+
+
+def _plan_xai_oauth_account_failover(
+    request: Request,
+    *,
+    candidate: dict[str, Any],
+    selection: dict[str, Any],
+    attempt_record: dict[str, Any],
+    error_class: str,
+    has_continuation_state: bool,
+    has_previous_response_id: bool = False,
+    has_account_bound_state: bool = False,
+    provider_status_code: Optional[int] = None,
+) -> bool:
+    """Move one fresh managed xAI request to one untraversed account."""
+
+    if not _is_xai_oauth_account_candidate(candidate):
+        return False
+    if (
+        has_continuation_state
+        or has_previous_response_id
+        or has_account_bound_state
+        or selection.get("has_account_bound_state")
+        or selection.get("in_flight_session")
+        or attempt_record.get("attempted_provider_call") is not True
+        or attempt_record.get("provider_returned") is not True
+    ):
+        return False
+    if (
+        provider_status_code not in {401, 429}
+        and error_class != "usage_limit_reached"
+    ):
+        return False
+
+    account_hash = candidate.get("xai_oauth_account_hash")
+    if not isinstance(account_hash, str) or not account_hash:
+        return False
+    existing = _get_xai_oauth_request_local_failover_context(
+        request,
+        candidate=candidate,
+    )
+    attempted_account_hashes = list(
+        (existing or {}).get("attempted_account_hashes") or ()
+    )
+    if account_hash in attempted_account_hashes:
+        attempt_record["account_failover_limit_reached"] = True
+        return False
+
+    prior_account_outcome = {
+        "account_label": candidate.get("xai_oauth_account_label"),
+        "account_hash": account_hash,
+        "account_lane": candidate.get("xai_oauth_lane_key"),
+        "account_scope": candidate.get("xai_oauth_scope_identity"),
+        "outcome": error_class,
+        "failure_phase": attempt_record.get("failure_phase"),
+        "attempted_provider_call": True,
+        "provider_returned": True,
+    }
+    for field in (
+        "cooldown_seconds",
+        "provider_resets_in_seconds",
+        "provider_resets_at",
+    ):
+        value = attempt_record.get(field)
+        if value is not None:
+            prior_account_outcome[field] = value
+    prior_account_outcome = {
+        key: value
+        for key, value in prior_account_outcome.items()
+        if value is not None
+    }
+    attempted_account_hashes.append(account_hash)
+    prior_account_outcomes = list(
+        (existing or {}).get("prior_account_outcomes") or ()
+    )
+    prior_account_outcomes.append(prior_account_outcome)
+    setattr(
+        request.state,
+        "aawm_xai_oauth_request_local_failover_context",
+        {
+            "slot": _codex_oauth_candidate_slot(candidate),
+            "candidate_identity": {
+                field: candidate.get(field)
+                for field in ("provider", "model", "route_family")
+            },
+            "attempted_account_hashes": attempted_account_hashes,
+            "prior_account_hash": account_hash,
+            "prior_account_outcomes": prior_account_outcomes,
+            "prior_account_outcome": prior_account_outcome,
+        },
+    )
+    _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
+        request,
+        candidate=candidate,
+        lane_key=selection.get("lane_key"),
+    )
+    attempt_record["account_failover_planned"] = True
+    attempt_record["xai_oauth_account_failover_planned"] = True
+    return True
+
+
 def _plan_codex_oauth_account_failover(
     request: Request,
     *,
@@ -981,6 +1146,18 @@ def _plan_codex_oauth_account_failover(
         return False
 
     attempt_record.pop("account_failover_rejection_reason", None)
+    if _is_xai_oauth_account_candidate(candidate):
+        return _plan_xai_oauth_account_failover(
+            request,
+            candidate=candidate,
+            selection=selection,
+            attempt_record=attempt_record,
+            error_class=error_class,
+            has_continuation_state=has_continuation_state,
+            has_previous_response_id=has_previous_response_id,
+            has_account_bound_state=has_account_bound_state,
+            provider_status_code=provider_status_code,
+        )
     if not _is_codex_oauth_account_candidate(candidate):
         return reject("candidate_not_codex_oauth")
     if (
@@ -2287,6 +2464,21 @@ def _candidate_uses_codex_oauth(
     )
 
 
+def _candidate_uses_xai_oauth(
+    candidate: Optional[dict[str, Any]],
+) -> bool:
+    return bool(
+        isinstance(candidate, dict)
+        and candidate.get("provider") == _CODEX_AUTO_AGENT_XAI_PROVIDER
+        and candidate.get("route_family")
+        in {
+            "codex_xai_oauth_responses_adapter",
+            "anthropic_xai_oauth_responses_adapter",
+            "codex_auto_agent_xai_oauth_responses",
+        }
+    )
+
+
 def _is_codex_oauth_account_candidate(
     candidate: Optional[dict[str, Any]],
 ) -> bool:
@@ -2296,6 +2488,19 @@ def _is_codex_oauth_account_candidate(
         and candidate.get("codex_oauth_account_label")
         and candidate.get("codex_oauth_account_hash")
         and candidate.get("codex_oauth_lane_key")
+    )
+
+
+def _is_xai_oauth_account_candidate(
+    candidate: Optional[dict[str, Any]],
+) -> bool:
+    return bool(
+        _candidate_uses_xai_oauth(candidate)
+        and isinstance(candidate, dict)
+        and candidate.get("xai_oauth_account_label")
+        and candidate.get("xai_oauth_account_hash")
+        and candidate.get("xai_oauth_scope_identity")
+        and candidate.get("xai_oauth_lane_key")
     )
 
 
@@ -2310,8 +2515,40 @@ def _affinity_pins_account_identity(
             "codex_oauth_account_label",
             "codex_oauth_account_hash",
             "codex_oauth_lane_key",
+            "xai_oauth_account_label",
+            "xai_oauth_account_hash",
+            "xai_oauth_scope_identity",
+            "xai_oauth_lane_key",
         )
     )
+
+
+def _affinity_pins_xai_oauth_account_identity(
+    affinity: Optional[Mapping[str, Any]],
+) -> bool:
+    if not isinstance(affinity, Mapping):
+        return False
+    return any(
+        str(affinity.get(field) or "").strip()
+        for field in (
+            "xai_oauth_account_label",
+            "xai_oauth_account_hash",
+            "xai_oauth_scope_identity",
+            "xai_oauth_lane_key",
+        )
+    )
+
+
+def _affinity_account_lane(
+    affinity: Optional[Mapping[str, Any]],
+) -> Optional[str]:
+    if not isinstance(affinity, Mapping):
+        return None
+    for field in ("xai_oauth_lane_key", "codex_oauth_lane_key"):
+        value = affinity.get(field)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 def _attach_account_bound_selection_metadata(
@@ -2329,9 +2566,12 @@ def _attach_account_bound_selection_metadata(
     candidate = selection.get("candidate")
     lane = None
     if isinstance(affinity, Mapping):
-        lane = affinity.get("codex_oauth_lane_key")
+        lane = _affinity_account_lane(affinity)
     if not lane and isinstance(candidate, Mapping):
-        lane = candidate.get("codex_oauth_lane_key")
+        lane = (
+            candidate.get("xai_oauth_lane_key")
+            or candidate.get("codex_oauth_lane_key")
+        )
     if lane:
         selection["account_bound_owner_lane"] = lane
     return selection
@@ -2347,6 +2587,27 @@ def _candidate_matches_affinity(
         return False
     if not _route_families_compatible_for_affinity(candidate, affinity):
         return False
+    if _candidate_uses_xai_oauth(candidate) or (
+        affinity.get("provider") == _CODEX_AUTO_AGENT_XAI_PROVIDER
+        and affinity.get("route_family")
+        in {
+            "codex_xai_oauth_responses_adapter",
+            "anthropic_xai_oauth_responses_adapter",
+            "codex_auto_agent_xai_oauth_responses",
+        }
+    ):
+        for field in (
+            "xai_oauth_account_label",
+            "xai_oauth_account_hash",
+            "xai_oauth_scope_identity",
+            "xai_oauth_lane_key",
+        ):
+            expected = str(affinity.get(field) or "").strip()
+            if not expected or candidate.get(field) != expected:
+                return False
+        if _codex_oauth_affinity_is_authenticated_token(affinity):
+            return candidate.get("model") == affinity.get("model")
+        return True
     if _codex_oauth_affinity_is_authenticated_token(affinity):
         return candidate.get("model") == affinity.get("model")
     # OPENAI-020: model and OpenAI account are mutable on the same hosted
@@ -2767,6 +3028,149 @@ async def _resolve_codex_oauth_account_candidate_contexts(
     return contexts
 
 
+async def _resolve_xai_oauth_account_candidate_contexts(
+    request: Request,
+    *,
+    candidate_template: dict[str, Any],
+    affinity: Optional[dict[str, Any]] = None,
+) -> list[dict[str, Any]]:
+    """Expand managed xAI candidates from server inventory and validate pins."""
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+        build_xai_oauth_selected_account,
+        configured_xai_oauth_records,
+        get_xai_oauth_snapshot_for_selected_account,
+    )
+
+    for field in (
+        "xai_oauth_account_label",
+        "xai_oauth_account_hash",
+        "xai_oauth_scope_identity",
+        "xai_oauth_lane_key",
+        "xai_oauth_account_priority",
+        "xai_oauth_credential_affinity",
+    ):
+        candidate_template.pop(field, None)
+
+    pinned_values: dict[str, Optional[str]] = {
+        field: None
+        for field in (
+            "xai_oauth_account_label",
+            "xai_oauth_account_hash",
+            "xai_oauth_scope_identity",
+            "xai_oauth_lane_key",
+        )
+    }
+    if affinity is not None:
+        for field in pinned_values:
+            value = affinity.get(field)
+            if isinstance(value, str) and value.strip():
+                pinned_values[field] = value.strip()
+        if any(pinned_values.values()) and not all(pinned_values.values()):
+            unavailable_candidate = dict(candidate_template)
+            unavailable_candidate.update(
+                {
+                    field: value
+                    for field, value in pinned_values.items()
+                    if value is not None
+                }
+            )
+            return [
+                {
+                    "candidate": unavailable_candidate,
+                    "lane_key": (
+                        pinned_values["xai_oauth_lane_key"]
+                        or "xai-oauth:unavailable"
+                    ),
+                    "auth_status": "degraded",
+                    "skip_reason": "auth_degraded",
+                    "failure_phase": "affinity_account_context_missing",
+                    "attempted_provider_call": False,
+                }
+            ]
+
+    try:
+        records = configured_xai_oauth_records()
+    except Exception:  # noqa: BLE001
+        records = ()
+    pinned_label = pinned_values["xai_oauth_account_label"]
+    if pinned_label is not None:
+        records = tuple(
+            record for record in records if record.label == pinned_label
+        )
+    if not records:
+        unavailable_candidate = dict(candidate_template)
+        unavailable_candidate.update(
+            {
+                field: value
+                for field, value in pinned_values.items()
+                if value is not None
+            }
+        )
+        return [
+            {
+                "candidate": unavailable_candidate,
+                "lane_key": (
+                    pinned_values["xai_oauth_lane_key"]
+                    or "xai-oauth:unavailable"
+                ),
+                "auth_status": "degraded",
+                "skip_reason": "auth_degraded",
+                "failure_phase": (
+                    "affinity_account_unavailable"
+                    if affinity is not None
+                    else "account_inventory_unavailable"
+                ),
+                "attempted_provider_call": False,
+            }
+        ]
+
+    contexts: list[dict[str, Any]] = []
+    for record in records:
+        selected = build_xai_oauth_selected_account(record)
+        account_candidate = {
+            **candidate_template,
+            "xai_oauth_account_label": selected.label,
+            "xai_oauth_account_hash": selected.account_hash,
+            "xai_oauth_scope_identity": selected.scope_identity,
+            "xai_oauth_lane_key": selected.lane_key,
+            "xai_oauth_account_priority": record.priority,
+            "xai_oauth_credential_affinity": "pinned",
+        }
+        context: dict[str, Any] = {
+            "candidate": account_candidate,
+            "lane_key": selected.lane_key,
+            "auth_status": "healthy",
+        }
+        if any(
+            value is not None and account_candidate[field] != value
+            for field, value in pinned_values.items()
+        ):
+            context.update(
+                {
+                    "auth_status": "degraded",
+                    "skip_reason": "auth_degraded",
+                    "failure_phase": "affinity_account_identity_mismatch",
+                    "attempted_provider_call": False,
+                }
+            )
+            contexts.append(context)
+            continue
+        try:
+            await get_xai_oauth_snapshot_for_selected_account(selected)
+        except Exception:  # noqa: BLE001
+            context.update(
+                {
+                    "auth_status": "degraded",
+                    "skip_reason": "auth_degraded",
+                    "failure_phase": "pre_dispatch_auth",
+                    "attempted_provider_call": False,
+                }
+            )
+        contexts.append(context)
+    return contexts
+
+
 # ---------------------------------------------------------------------------
 # Candidate state construction
 # ---------------------------------------------------------------------------
@@ -2800,7 +3204,10 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
     assert _get_codex_active_cooldown_state is not None
     active_cooldown_state = _get_codex_active_cooldown_state
     candidate = dict(candidate_template)
-    account_lane_key = candidate.get("codex_oauth_lane_key")
+    account_lane_key = (
+        candidate.get("codex_oauth_lane_key")
+        or candidate.get("xai_oauth_lane_key")
+    )
     if isinstance(account_lane_key, str) and account_lane_key:
         openai_lane_key = account_lane_key
     elif openai_lane_key is None:
@@ -3443,7 +3850,10 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
 ) -> dict[str, Any]:
     assert _get_anthropic_active_cooldown_state is not None
     candidate = dict(candidate_template)
-    account_lane_key = candidate.get("codex_oauth_lane_key")
+    account_lane_key = (
+        candidate.get("codex_oauth_lane_key")
+        or candidate.get("xai_oauth_lane_key")
+    )
     if isinstance(account_lane_key, str) and account_lane_key:
         openai_lane_key = account_lane_key
     elif openai_lane_key is None:
@@ -3639,6 +4049,23 @@ def _apply_codex_oauth_account_context_to_state(
     return _apply_codex_oauth_failover_context_to_state(request, state)
 
 
+def _apply_xai_oauth_account_context_to_state(
+    request: Request,
+    state: dict[str, Any],
+    *,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    state["auth_status"] = context.get("auth_status") or "degraded"
+    for field in (
+        "skip_reason",
+        "failure_phase",
+        "attempted_provider_call",
+    ):
+        if field in context:
+            state[field] = context[field]
+    return _apply_xai_oauth_failover_context_to_state(request, state)
+
+
 async def _build_codex_auto_agent_affinity_candidate_state(
     request: Request,
     *,
@@ -3646,6 +4073,24 @@ async def _build_codex_auto_agent_affinity_candidate_state(
     affinity: dict[str, Any],
     excluded_candidate_keys: Optional[AbstractSet[str]] = None,
 ) -> dict[str, Any]:
+    if _candidate_uses_xai_oauth(candidate_template):
+        contexts = await _resolve_xai_oauth_account_candidate_contexts(
+            request,
+            candidate_template=candidate_template,
+            affinity=affinity,
+        )
+        context = contexts[0]
+        state = await _build_codex_auto_agent_candidate_state(
+            request,
+            candidate_template=context["candidate"],
+            openai_lane_key=context["lane_key"],
+            excluded_candidate_keys=excluded_candidate_keys,
+        )
+        return _apply_xai_oauth_account_context_to_state(
+            request,
+            state,
+            context=context,
+        )
     if not _candidate_uses_codex_oauth(candidate_template):
         candidate_state = await _build_codex_auto_agent_candidate_state(
             request,
@@ -3703,6 +4148,24 @@ async def _build_anthropic_auto_agent_affinity_candidate_state(
     affinity: dict[str, Any],
     excluded_candidate_keys: Optional[AbstractSet[str]] = None,
 ) -> dict[str, Any]:
+    if _candidate_uses_xai_oauth(candidate_template):
+        contexts = await _resolve_xai_oauth_account_candidate_contexts(
+            request,
+            candidate_template=candidate_template,
+            affinity=affinity,
+        )
+        context = contexts[0]
+        state = await _build_anthropic_auto_agent_candidate_state(
+            request,
+            candidate_template=context["candidate"],
+            openai_lane_key=context["lane_key"],
+            excluded_candidate_keys=excluded_candidate_keys,
+        )
+        return _apply_xai_oauth_account_context_to_state(
+            request,
+            state,
+            context=context,
+        )
     if not _candidate_uses_codex_oauth(candidate_template):
         return _attach_normalized_quota_state(
             await _build_anthropic_auto_agent_candidate_state(
@@ -3801,6 +4264,35 @@ async def _build_codex_auto_agent_candidate_states(
     ):
         await _hydrate_zai_coding_plan_quota_observations()
     for candidate_template in candidates:
+        if _candidate_uses_xai_oauth(candidate_template):
+            contexts = await _resolve_xai_oauth_account_candidate_contexts(
+                request,
+                candidate_template=candidate_template,
+            )
+            for context in contexts:
+                candidate_state_kwargs: dict[str, Any] = {
+                    "candidate_template": context["candidate"],
+                    "openai_lane_key": context["lane_key"],
+                    "excluded_candidate_keys": excluded_candidate_keys,
+                }
+                candidate_state_kwargs.update(
+                    _candidate_state_semantic_marker_kwargs(
+                        _build_codex_auto_agent_candidate_state,
+                        enabled=include_candidate_semantic_ineligibility,
+                    )
+                )
+                state = await _build_codex_auto_agent_candidate_state(
+                    request,
+                    **candidate_state_kwargs,
+                )
+                states.append(
+                    _apply_xai_oauth_account_context_to_state(
+                        request,
+                        state,
+                        context=context,
+                    )
+                )
+            continue
         if _candidate_uses_codex_oauth(candidate_template):
             contexts = await _resolve_codex_oauth_account_candidate_contexts(
                 request,
@@ -3881,6 +4373,36 @@ async def _build_anthropic_auto_agent_candidate_states(
         ingress="anthropic",
         client_product_label=client_product_label,
     ).candidates:
+        if _candidate_uses_xai_oauth(candidate_template):
+            contexts = await _resolve_xai_oauth_account_candidate_contexts(
+                request,
+                candidate_template=candidate_template,
+            )
+            for context in contexts:
+                candidate_state_kwargs: dict[str, Any] = {
+                    "candidate_template": context["candidate"],
+                    "openai_lane_key": context["lane_key"],
+                    "anthropic_lane_key": anthropic_lane_key,
+                    "excluded_candidate_keys": excluded_candidate_keys,
+                }
+                candidate_state_kwargs.update(
+                    _candidate_state_semantic_marker_kwargs(
+                        _build_anthropic_auto_agent_candidate_state,
+                        enabled=include_candidate_semantic_ineligibility,
+                    )
+                )
+                state = await _build_anthropic_auto_agent_candidate_state(
+                    request,
+                    **candidate_state_kwargs,
+                )
+                states.append(
+                    _apply_xai_oauth_account_context_to_state(
+                        request,
+                        state,
+                        context=context,
+                    )
+                )
+            continue
         if _candidate_uses_codex_oauth(candidate_template):
             contexts = await _resolve_codex_oauth_account_candidate_contexts(
                 request,
@@ -5108,6 +5630,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
 
     account_identity_pinned = has_account_bound_state
     authenticated_token_affinity = token_affinity is not None
+    effective_account_bound_state = has_account_bound_state
     account_failover_context = (
         _get_codex_oauth_request_local_failover_context(
             request,
@@ -5175,6 +5698,9 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             ),
             request=request,
         )
+    if _affinity_pins_xai_oauth_account_identity(affinity):
+        account_identity_pinned = True
+        effective_account_bound_state = True
     if affinity is not None:
         affinity_candidate = _find_codex_auto_agent_affinity_candidate(
             affinity,
@@ -5222,6 +5748,10 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     "codex_oauth_account_label",
                     "codex_oauth_account_hash",
                     "codex_oauth_lane_key",
+                    "xai_oauth_account_label",
+                    "xai_oauth_account_hash",
+                    "xai_oauth_scope_identity",
+                    "xai_oauth_lane_key",
                 ):
                     if affinity.get(field) is not None:
                         pinned_candidate_shape[field] = affinity.get(field)
@@ -5235,7 +5765,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     )
                 _raise_codex_auto_agent_redispatch_required(
                     candidate=pinned_candidate_shape,
-                    lane_key=affinity.get("codex_oauth_lane_key"),
+                    lane_key=_affinity_account_lane(affinity),
                     cooldown_seconds=0.0,
                     error_tokens=set(),
                     alias_model=alias_model,
@@ -5254,12 +5784,16 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 "codex_oauth_account_label",
                 "codex_oauth_account_hash",
                 "codex_oauth_lane_key",
+                "xai_oauth_account_label",
+                "xai_oauth_account_hash",
+                "xai_oauth_scope_identity",
+                "xai_oauth_lane_key",
             ):
                 if affinity.get(field) is not None:
                     pinned_candidate_shape[field] = affinity.get(field)
             _raise_codex_auto_agent_redispatch_required(
                 candidate=pinned_candidate_shape,
-                lane_key=affinity.get("codex_oauth_lane_key"),
+                lane_key=_affinity_account_lane(affinity),
                 cooldown_seconds=0.0,
                 error_tokens=set(),
                 alias_model=alias_model,
@@ -5287,7 +5821,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     and _affinity_pins_account_identity(affinity)
                 )
                 or affinity_state.get("lane_key")
-                == affinity.get("codex_oauth_lane_key")
+                == _affinity_account_lane(affinity)
             )
             and affinity_state.get("skip_reason") is None
             and 0 < affinity_state["cooldown_seconds"] <= 1.0
@@ -5350,7 +5884,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     session_owner_guard=type("G", (), session_owner_guard_meta)(),
                     session_owner_identity=session_owner_identity,
                 ),
-                has_account_bound_state=has_account_bound_state,
+                has_account_bound_state=effective_account_bound_state,
                 affinity=affinity,
             )
         if (
@@ -5369,7 +5903,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 _raise_codex_auto_agent_redispatch_required(
                     candidate=dict(affinity_state.get("candidate") or {}),
                     lane_key=affinity_state.get("lane_key")
-                    or affinity.get("codex_oauth_lane_key"),
+                    or _affinity_account_lane(affinity),
                     cooldown_seconds=0.0,
                     error_tokens=set(),
                     alias_model=alias_model,
@@ -5404,7 +5938,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             _raise_codex_auto_agent_redispatch_required(
                 candidate=dict(affinity_state.get("candidate") or affinity),
                 lane_key=affinity_state.get("lane_key")
-                or affinity.get("codex_oauth_lane_key"),
+                or _affinity_account_lane(affinity),
                 cooldown_seconds=0.0,
                 error_tokens=set(),
                 alias_model=alias_model,
@@ -5553,7 +6087,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 request_mode=request_mode,
                 has_continuation_state=provider_owned_continuation,
                 has_previous_response_id=has_previous_response_id,
-                has_account_bound_state=has_account_bound_state,
+                has_account_bound_state=effective_account_bound_state,
                 in_flight_session=in_flight_session,
             )
         ),
@@ -5593,7 +6127,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 session_owner_guard=type("G", (), session_owner_guard_meta)(),
                 session_owner_identity=session_owner_identity,
             ),
-            has_account_bound_state=has_account_bound_state,
+            has_account_bound_state=effective_account_bound_state,
             affinity=affinity,
         )
 
@@ -5629,7 +6163,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 session_owner_guard=type("G", (), session_owner_guard_meta)(),
                 session_owner_identity=session_owner_identity,
             ),
-            has_account_bound_state=has_account_bound_state,
+            has_account_bound_state=effective_account_bound_state,
             affinity=affinity,
         )
 
@@ -5856,6 +6390,10 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
         if existing_affinity is not None:
             affinity_bypassed = True
 
+    effective_account_bound_state = bool(
+        has_account_bound_state
+        or _affinity_pins_xai_oauth_account_identity(affinity)
+    )
     if affinity is not None:
         affinity_candidate = _find_anthropic_auto_agent_affinity_candidate(
             affinity,
@@ -5874,12 +6412,16 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
                 "codex_oauth_account_label",
                 "codex_oauth_account_hash",
                 "codex_oauth_lane_key",
+                "xai_oauth_account_label",
+                "xai_oauth_account_hash",
+                "xai_oauth_scope_identity",
+                "xai_oauth_lane_key",
             ):
                 if affinity.get(field) is not None:
                     pinned_candidate_shape[field] = affinity.get(field)
             _raise_anthropic_auto_agent_redispatch_required(
                 candidate=pinned_candidate_shape,
-                lane_key=affinity.get("codex_oauth_lane_key"),
+                lane_key=_affinity_account_lane(affinity),
                 cooldown_seconds=0.0,
                 error_tokens=set(),
                 alias_model=alias_model,
@@ -5911,6 +6453,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
                         "selection_reason": "session_affinity",
                         "skipped": [],
                         "in_flight_session": True,
+                        "has_account_bound_state": effective_account_bound_state,
                         "request_mode": request_mode,
                         "redispatch_ordinal": redispatch_ordinal,
                         "affinity_bypassed": affinity_bypassed,
@@ -6000,7 +6543,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
                 request_mode=request_mode,
                 has_continuation_state=has_continuation_state,
                 has_previous_response_id=has_previous_response_id,
-                has_account_bound_state=has_account_bound_state,
+                has_account_bound_state=effective_account_bound_state,
                 in_flight_session=in_flight_session,
             )
         ),
@@ -6028,7 +6571,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
                 "selection_reason": selection_reason,
                 "skipped": skipped,
                 "in_flight_session": in_flight_session,
-                "has_account_bound_state": has_account_bound_state,
+                "has_account_bound_state": effective_account_bound_state,
                 "request_mode": request_mode,
                 "redispatch_ordinal": redispatch_ordinal,
                 "affinity_bypassed": affinity_bypassed,
@@ -6056,7 +6599,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
                 "selection_reason": selection_reason,
                 "skipped": skipped,
                 "in_flight_session": in_flight_session,
-                "has_account_bound_state": has_account_bound_state,
+                "has_account_bound_state": effective_account_bound_state,
                 "request_mode": request_mode,
                 "redispatch_ordinal": redispatch_ordinal,
                 "affinity_bypassed": affinity_bypassed,
@@ -6113,6 +6656,9 @@ _HOST_FUNCTION_NAMES = (
     "_block_codex_oauth_request_local_candidate_slot",
     "_get_codex_oauth_request_local_failover_context",
     "_apply_codex_oauth_failover_context_to_state",
+    "_get_xai_oauth_request_local_failover_context",
+    "_apply_xai_oauth_failover_context_to_state",
+    "_plan_xai_oauth_account_failover",
     "_plan_codex_oauth_account_failover",
     "_exclude_codex_auto_agent_request_local_candidate",
     "_exclude_codex_auto_agent_request_local_candidate_without_cooldown",
@@ -6141,13 +6687,18 @@ _HOST_FUNCTION_NAMES = (
     "_find_anthropic_auto_agent_candidate",
     "_find_anthropic_auto_agent_affinity_candidate",
     "_candidate_uses_codex_oauth",
+    "_candidate_uses_xai_oauth",
     "_is_codex_oauth_account_candidate",
+    "_is_xai_oauth_account_candidate",
     "_affinity_pins_account_identity",
+    "_affinity_pins_xai_oauth_account_identity",
+    "_affinity_account_lane",
     "_attach_account_bound_selection_metadata",
     "_candidate_matches_affinity",
     "_codex_oauth_affinity_is_authenticated_token",
     "_apply_codex_oauth_inventory_affinity_policy",
     "_resolve_codex_oauth_account_candidate_contexts",
+    "_resolve_xai_oauth_account_candidate_contexts",
     "_get_anthropic_auto_agent_candidate_cooldown_state",
     "_build_codex_auto_agent_candidate_state",
     "_build_anthropic_auto_agent_candidate_state",
@@ -6169,6 +6720,7 @@ _HOST_FUNCTION_NAMES = (
     "_codex_oauth_dual_family_remaining",
     "_select_first_available_codex_oauth_account_state",
     "_apply_codex_oauth_account_context_to_state",
+    "_apply_xai_oauth_account_context_to_state",
     "_build_codex_auto_agent_affinity_candidate_state",
     "_build_anthropic_auto_agent_affinity_candidate_state",
     "_build_codex_auto_agent_candidate_states",
