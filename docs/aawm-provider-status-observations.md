@@ -978,12 +978,17 @@ response body budget at 1 MiB (1,048,576 bytes).
 
 The observer never calls the history endpoint directly, supplies guessed
 headers, reads cookies or storage, paginates, requests conversation details,
-retries, or permits model/mutation requests. It returns only route class,
-status, identity-match and request/response-correlation flags, bounded
-response size, fixed field/container/type/count metadata, and model-field
-presence. No URL, conversation ID, title, message, payload, header, token, or
-storage value is returned. If the native index request never appears, the
-result explicitly uses `observation_state=no_history_observed`.
+retries, or permits model/mutation requests. It allows only the existing
+frontend bootstrap/init request policy around the ordinary navigation. It
+returns only route class, status, identity-match and request/response-
+correlation flags, bounded response size, fixed field/container/type/count
+metadata, fixed model/updated-time/pagination presence/type counters, and
+model-field presence. Counts include explicit truncation/lower-bound and
+unknown-absence metadata. No URL, conversation ID, title, message, payload,
+header, token, or storage value is returned. If the native index request never
+appears, the result explicitly uses `observation_state=no_history_observed`;
+auth, throttle, challenge, identity, boundary, and body failures use an
+explicit failed observation state and preserve only a safe retry-after value.
 
 ## Alibaba Token Plan quota polling
 

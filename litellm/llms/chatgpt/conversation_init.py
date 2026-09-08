@@ -125,6 +125,10 @@ _NATIVE_HISTORY_FIELD_NAMES = (
     "offset",
     "limit",
     "has_missing_conversations",
+    "updated_at",
+    "updatedAt",
+    "update_time",
+    "updateTime",
 )
 _NATIVE_HISTORY_MODEL_FIELD_NAMES = (
     "model_slug",
@@ -133,6 +137,58 @@ _NATIVE_HISTORY_MODEL_FIELD_NAMES = (
     "model",
     "recorded_model",
     "recorded_final_model",
+)
+_NATIVE_HISTORY_FIELD_COUNTER_SPECS = {
+    "model": (
+        ("model_slug", ("model_slug", "modelSlug")),
+        (
+            "requested_model",
+            (
+                "requested_model",
+                "requestedModel",
+                "requested_model_slug",
+                "requestedModelSlug",
+            ),
+        ),
+        ("default_model_slug", ("default_model_slug", "defaultModelSlug")),
+        ("model", ("model",)),
+        ("recorded_model", ("recorded_model", "recordedModel")),
+        (
+            "recorded_final_model",
+            ("recorded_final_model", "recordedFinalModel"),
+        ),
+    ),
+    "updated_time": (
+        ("updated_at", ("updated_at", "updatedAt")),
+        ("update_time", ("update_time", "updateTime")),
+        (
+            "last_updated_at",
+            ("last_updated_at", "lastUpdatedAt"),
+        ),
+    ),
+    "pagination": (
+        ("total", ("total",)),
+        ("offset", ("offset",)),
+        ("limit", ("limit",)),
+        ("page", ("page",)),
+        ("page_size", ("page_size", "pageSize")),
+        ("has_more", ("has_more", "hasMore")),
+        (
+            "has_missing_conversations",
+            ("has_missing_conversations", "hasMissingConversations"),
+        ),
+        ("next_cursor", ("next_cursor", "nextCursor")),
+        ("cursor", ("cursor",)),
+    ),
+}
+_NATIVE_HISTORY_VALUE_TYPES = (
+    "null",
+    "boolean",
+    "number",
+    "string",
+    "object",
+    "array",
+    "unsupported",
 )
 _NATIVE_HISTORY_MODEL_FIELD_ALIASES = {
     "model_slug": ("model_slug", "modelSlug"),
@@ -150,6 +206,7 @@ _NATIVE_HISTORY_MODEL_FIELD_ALIASES = {
         "recordedFinalModel",
     ),
 }
+_NATIVE_HISTORY_STREAM_CHUNK_BYTES = 64 * 1024
 
 _FORBIDDEN_REQUEST_CONTENT_FIELDS = (
     "messages",
@@ -2922,26 +2979,36 @@ def _native_history_metadata(value: Any, *, present: bool = True) -> Dict[str, A
             "container": "missing",
             "type": "missing",
             "count": None,
+            "count_truncated": False,
+            "count_is_lower_bound": False,
         }
     if isinstance(value, list):
+        truncated = len(value) > _NATIVE_HISTORY_MAX_COUNT
         return {
             "present": True,
             "container": "array",
             "type": "array",
             "count": min(len(value), _NATIVE_HISTORY_MAX_COUNT),
+            "count_truncated": truncated,
+            "count_is_lower_bound": truncated,
         }
     if isinstance(value, Mapping):
+        truncated = len(value) > _NATIVE_HISTORY_MAX_COUNT
         return {
             "present": True,
             "container": "object",
             "type": "object",
             "count": min(len(value), _NATIVE_HISTORY_MAX_COUNT),
+            "count_truncated": truncated,
+            "count_is_lower_bound": truncated,
         }
     return {
         "present": True,
         "container": "scalar",
         "type": _native_history_type_name(value),
         "count": None,
+        "count_truncated": False,
+        "count_is_lower_bound": False,
     }
 
 
@@ -2967,28 +3034,94 @@ def _native_history_fixed_field_value(
 
 
 def _native_history_model_presence(payload: Any) -> Dict[str, Optional[bool]]:
-    fields: Dict[str, Optional[bool]] = {
-        field_name: False for field_name in _NATIVE_HISTORY_MODEL_FIELD_NAMES
+    counters, traversal = _native_history_field_presence_type_counts(payload)
+    fields: Dict[str, Optional[bool]] = {}
+    for field_name in _NATIVE_HISTORY_MODEL_FIELD_NAMES:
+        field = counters["model"][field_name]
+        if field["presence_count"]:
+            fields[field_name] = True
+        elif traversal["absence_is_known"]:
+            fields[field_name] = False
+        else:
+            fields[field_name] = None
+    return fields
+
+
+def _native_history_empty_field_counters() -> Dict[str, Dict[str, Dict[str, Any]]]:
+    return {
+        group_name: {
+            field_name: {
+                "presence_count": 0,
+                "count_is_lower_bound": False,
+                "type_counts": {
+                    type_name: 0 for type_name in _NATIVE_HISTORY_VALUE_TYPES
+                },
+            }
+            for field_name, _aliases in field_specs
+        }
+        for group_name, field_specs in _NATIVE_HISTORY_FIELD_COUNTER_SPECS.items()
     }
-    if payload is None:
-        return {field_name: None for field_name in fields}
+
+
+def _native_history_field_presence_type_counts(
+    payload: Any,
+) -> Tuple[Dict[str, Dict[str, Dict[str, Any]]], Dict[str, Any]]:
+    counters = _native_history_empty_field_counters()
+    if payload is None or not isinstance(payload, (Mapping, list)):
+        return counters, {
+            "visited_nodes": 0,
+            "max_nodes": _NATIVE_HISTORY_MAX_INSPECTED_NODES,
+            "truncated": False,
+            "absence_is_known": False,
+        }
+
     pending: List[Any] = [payload]
-    inspected = 0
-    while pending and inspected < _NATIVE_HISTORY_MAX_INSPECTED_NODES:
+    visited = 0
+    truncated = False
+    while pending:
+        if visited >= _NATIVE_HISTORY_MAX_INSPECTED_NODES:
+            truncated = True
+            break
         value = pending.pop()
         if isinstance(value, Mapping):
-            inspected += 1
-            for field_name in _NATIVE_HISTORY_MODEL_FIELD_NAMES:
-                aliases = _NATIVE_HISTORY_MODEL_FIELD_ALIASES[field_name]
-                if any(alias in value for alias in aliases):
-                    fields[field_name] = True
-            pending.extend(
-                list(value.values())[:MAX_PROJECTION_OBJECT_KEYS]
-            )
+            visited += 1
+            for group_name, field_specs in _NATIVE_HISTORY_FIELD_COUNTER_SPECS.items():
+                for field_name, aliases in field_specs:
+                    present_alias = next(
+                        (alias for alias in aliases if alias in value),
+                        None,
+                    )
+                    if present_alias is None:
+                        continue
+                    field_counter = counters[group_name][field_name]
+                    field_counter["presence_count"] += 1
+                    type_name = _native_history_type_name(
+                        value[present_alias]
+                    )
+                    field_counter["type_counts"][type_name] += 1
+            children = list(value.values())
+            if len(children) > MAX_PROJECTION_OBJECT_KEYS:
+                truncated = True
+                children = children[:MAX_PROJECTION_OBJECT_KEYS]
+            pending.extend(children)
         elif isinstance(value, list):
-            inspected += 1
-            pending.extend(value[:MAX_PROJECTION_LIST_ITEMS])
-    return fields
+            visited += 1
+            children = value
+            if len(children) > MAX_PROJECTION_LIST_ITEMS:
+                truncated = True
+                children = children[:MAX_PROJECTION_LIST_ITEMS]
+            pending.extend(children)
+
+    if truncated:
+        for group_counters in counters.values():
+            for field_counter in group_counters.values():
+                field_counter["count_is_lower_bound"] = True
+    return counters, {
+        "visited_nodes": visited,
+        "max_nodes": _NATIVE_HISTORY_MAX_INSPECTED_NODES,
+        "truncated": truncated,
+        "absence_is_known": not truncated,
+    }
 
 
 def _native_history_structural_projection(payload: Any) -> Dict[str, Any]:
@@ -3008,10 +3141,15 @@ def _native_history_structural_projection(payload: Any) -> Dict[str, Any]:
         schema_state = "recognized"
     else:
         schema_state = "unrecognized"
+    field_counters, traversal = _native_history_field_presence_type_counts(
+        payload
+    )
     return {
         "root": root,
         "fields": field_metadata,
         "schema_state": schema_state,
+        "field_presence_type_counts": field_counters,
+        "traversal": traversal,
     }
 
 
@@ -3126,6 +3264,20 @@ def _native_history_finalize_observation(
     structural: Optional[Mapping[str, Any]] = None,
     failure_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
+    request_id = capture.get("request_id")
+    if not isinstance(request_id, str) or not request_id:
+        return _native_history_no_route_observation(
+            page_target_id_matched=page_target_id_matched,
+            request_count=request_count,
+            history_request_count=history_request_count,
+            failure_reason=(
+                failure_reason
+                or capture.get("boundary_reason")
+                or "no_history_observed"
+            ),
+            browser_challenge=bool(capture.get("browser_challenge")),
+            retry_after_seconds=capture.get("retry_after_seconds"),
+        )
     result = _native_history_base_observation(
         page_target_id_matched=page_target_id_matched,
         request_count=request_count,
@@ -3178,6 +3330,10 @@ def _native_history_finalize_observation(
         result["model_field_presence"] = _native_history_model_presence(
             capture.get("payload")
         )
+        result["field_presence_type_counts"] = dict(
+            structural.get("field_presence_type_counts", {})
+        )
+        result["traversal"] = dict(structural.get("traversal", {}))
     else:
         result["structural_metadata"] = {
             "root": _native_history_metadata(None, present=False),
@@ -3186,6 +3342,15 @@ def _native_history_finalize_observation(
                 for field_name in _NATIVE_HISTORY_FIELD_NAMES
             },
             "schema_state": "absent",
+        }
+        result["field_presence_type_counts"] = (
+            _native_history_empty_field_counters()
+        )
+        result["traversal"] = {
+            "visited_nodes": 0,
+            "max_nodes": _NATIVE_HISTORY_MAX_INSPECTED_NODES,
+            "truncated": False,
+            "absence_is_known": False,
         }
     if failure_reason is None:
         if capture.get("boundary_reason"):
@@ -3219,6 +3384,7 @@ def _native_history_no_route_observation(
     history_request_count: int,
     failure_reason: Optional[str],
     browser_challenge: bool,
+    retry_after_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     result = _native_history_base_observation(
         page_target_id_matched=page_target_id_matched,
@@ -3226,67 +3392,125 @@ def _native_history_no_route_observation(
         history_request_count=history_request_count,
     )
     result["browser_challenge"] = bool(browser_challenge)
+    result["retry_after_seconds"] = retry_after_seconds
     result["failure_reason"] = failure_reason or "no_history_observed"
+    if result["failure_reason"] != "no_history_observed":
+        result["observation_state"] = "history_observation_failed"
     if failure_reason == "no_history_observed" or failure_reason is None:
         result["warnings"] = ["no_native_history_index_request"]
     return result
 
 
-def _capture_native_history_body(
+def _native_history_response_headers(headers: Any) -> Mapping[str, Any]:
+    if isinstance(headers, Mapping):
+        return headers
+    if not isinstance(headers, list):
+        return {}
+    allowed = {
+        "content-type",
+        "content-length",
+        "retry-after",
+        "cf-mitigated",
+    }
+    normalized: Dict[str, str] = {}
+    for header in headers:
+        if not isinstance(header, Mapping):
+            continue
+        name = header.get("name")
+        value = header.get("value")
+        if (
+            isinstance(name, str)
+            and name.strip().lower() in allowed
+            and isinstance(value, str)
+        ):
+            normalized[name.strip().lower()] = value
+    return normalized
+
+
+def _capture_native_history_body_stream(
     session: Any,
     capture: Dict[str, Any],
     *,
+    fetch_request_id: str,
+    response_headers: Any,
+    deadline: float,
     max_response_bytes: int,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[int]]:
+    import binascii
     import base64
 
-    request_id = capture.get("request_id")
-    if not isinstance(request_id, str):
-        return None, "history_response_missing", None
+    headers = _native_history_response_headers(response_headers)
+    content_length = _native_history_content_length(headers)
+    if content_length is not None and content_length > max_response_bytes:
+        return None, "response_too_large", content_length
     try:
-        body = session.send(
-            "Network.getResponseBody",
-            {"requestId": request_id},
+        stream_result = session.send(
+            "Fetch.takeResponseBodyAsStream",
+            {"requestId": fetch_request_id},
         )
     except Exception:
         return None, "response_body_unavailable", None
-    if not isinstance(body, Mapping) or not isinstance(body.get("body"), str):
-        return None, "invalid_response_body", None
-    content = body["body"]
+    if not isinstance(stream_result, Mapping):
+        return None, "response_body_unavailable", None
+    stream_handle = stream_result.get("stream")
+    if not isinstance(stream_handle, str) or not stream_handle:
+        return None, "response_body_unavailable", None
+
+    raw_bytes = bytearray()
     try:
-        if body.get("base64Encoded"):
-            estimated = (len(content) * 3) // 4 + 3
-            if estimated > max_response_bytes:
-                return None, "response_too_large", estimated
-            raw_bytes = base64.b64decode(content, validate=True)
-            content = raw_bytes.decode("utf-8")
-        else:
-            raw_bytes = content.encode("utf-8")
-    except (UnicodeDecodeError, ValueError, base64.binascii.Error):
-        return None, "invalid_response_body", None
+        while True:
+            _raise_if_browser_deadline_expired(deadline)
+            remaining = max_response_bytes - len(raw_bytes)
+            read_size = min(
+                _NATIVE_HISTORY_STREAM_CHUNK_BYTES,
+                remaining + 1,
+            )
+            if read_size <= 0:
+                return None, "response_too_large", len(raw_bytes) + 1
+            chunk_result = session.send(
+                "IO.read",
+                {"handle": stream_handle, "size": read_size},
+            )
+            if not isinstance(chunk_result, Mapping):
+                return None, "invalid_response_body", len(raw_bytes)
+            chunk = chunk_result.get("data")
+            if not isinstance(chunk, str):
+                return None, "invalid_response_body", len(raw_bytes)
+            try:
+                chunk_bytes = (
+                    base64.b64decode(chunk, validate=True)
+                    if chunk_result.get("base64Encoded")
+                    else chunk.encode("utf-8")
+                )
+            except (UnicodeDecodeError, ValueError, binascii.Error):
+                return None, "invalid_response_body", len(raw_bytes)
+            if len(raw_bytes) + len(chunk_bytes) > max_response_bytes:
+                return (
+                    None,
+                    "response_too_large",
+                    len(raw_bytes) + len(chunk_bytes),
+                )
+            raw_bytes.extend(chunk_bytes)
+            if chunk_result.get("eof") is True:
+                break
+            if not chunk_bytes:
+                return None, "invalid_response_body", len(raw_bytes)
+    finally:
+        try:
+            session.send("IO.close", {"handle": stream_handle})
+        except Exception:
+            pass
+
     response_bytes = len(raw_bytes)
-    encoded_bytes = capture.get("encoded_data_length")
-    if (
-        isinstance(encoded_bytes, int)
-        and not isinstance(encoded_bytes, bool)
-        and encoded_bytes >= 0
-    ):
-        response_bytes = max(response_bytes, encoded_bytes)
-    content_length = capture.get("content_length")
-    if (
-        isinstance(content_length, int)
-        and not isinstance(content_length, bool)
-        and content_length >= 0
-    ):
+    if content_length is not None:
         response_bytes = max(response_bytes, content_length)
-    if response_bytes > max_response_bytes:
-        return None, "response_too_large", response_bytes
     try:
-        payload = json.loads(content)
-    except (TypeError, ValueError):
+        payload = json.loads(bytes(raw_bytes).decode("utf-8"))
+    except (UnicodeDecodeError, TypeError, ValueError):
         return None, "invalid_json", response_bytes
     # Keep the parsed value only for this bounded in-process projection.
     capture["payload"] = payload
+    capture["response_stream_complete"] = True
     return _native_history_structural_projection(payload), None, response_bytes
 
 
@@ -3299,11 +3523,13 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
     max_response_bytes: int,
 ) -> Mapping[str, Any]:
     capture: Dict[str, Any] = {}
-    extra_hashes: Dict[str, Optional[str]] = {}
     boundary_reason: Optional[str] = None
+    terminal_failure: Optional[Dict[str, Any]] = None
+    pending_response: Optional[Dict[str, Any]] = None
     browser_challenge = False
     request_count = 0
     history_request_count = 0
+    history_admitted = False
     capture_deadline = deadline - min(2.0, _remaining_browser_timeout(deadline) / 5)
 
     def set_boundary(reason: str) -> None:
@@ -3322,30 +3548,299 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             and parsed.path == CHATGPT_NATIVE_HISTORY_INDEX_PATH
         )
 
+    def is_home_url(url: Any) -> bool:
+        if not isinstance(url, str):
+            return False
+        parsed = urlsplit(url)
+        return (
+            parsed.scheme == "https"
+            and parsed.netloc == "chatgpt.com"
+            and parsed.path == "/"
+        )
+
+    def is_init_url(url: Any) -> bool:
+        if not isinstance(url, str):
+            return False
+        parsed = urlsplit(url)
+        return (
+            parsed.scheme == "https"
+            and parsed.netloc == "chatgpt.com"
+            and parsed.path == CHATGPT_CONVERSATION_INIT_PATH
+        )
+
     def is_model_or_mutation_path(path: str) -> bool:
+        if path == CHATGPT_CONVERSATION_INIT_PATH:
+            return False
         return (
             path in {
                 "/backend-api/conversation",
-                "/backend-api/conversation/init",
                 "/backend-api/f/conversation",
             }
             or path.startswith("/backend-api/conversation/")
             or path.startswith("/backend-api/f/conversation/")
         )
 
-    def guard_request(event: Mapping[str, Any]) -> None:
+    def terminal_priority(reason: str) -> int:
+        if "rate_limited" in reason:
+            return 4
+        if "auth" in reason:
+            return 3
+        if "challenge" in reason:
+            return 2
+        return 1
+
+    def latch_terminal(
+        reason: str,
+        *,
+        retry_after_seconds: Optional[float] = None,
+        challenged: bool = False,
+    ) -> None:
+        nonlocal browser_challenge, terminal_failure
+        browser_challenge = browser_challenge or challenged
+        candidate = {
+            "reason": reason,
+            "retry_after_seconds": retry_after_seconds,
+            "browser_challenge": browser_challenge,
+        }
+        if terminal_failure is None or terminal_priority(reason) > terminal_priority(
+            str(terminal_failure.get("reason") or "")
+        ):
+            terminal_failure = candidate
+        elif terminal_failure is not None:
+            existing_retry = terminal_failure.get("retry_after_seconds")
+            if (
+                retry_after_seconds is not None
+                and (
+                    not isinstance(existing_retry, (int, float))
+                    or retry_after_seconds > existing_retry
+                )
+            ):
+                terminal_failure["retry_after_seconds"] = retry_after_seconds
+            terminal_failure["browser_challenge"] = bool(
+                terminal_failure.get("browser_challenge") or browser_challenge
+            )
+        if capture:
+            capture["browser_challenge"] = browser_challenge
+
+    def terminal_reason() -> Optional[str]:
+        if terminal_failure is None:
+            return None
+        reason = terminal_failure.get("reason")
+        return reason if isinstance(reason, str) else "terminal_failure"
+
+    def terminal_retry_after() -> Optional[float]:
+        if terminal_failure is None:
+            return None
+        retry_after = terminal_failure.get("retry_after_seconds")
+        return retry_after if isinstance(retry_after, (int, float)) else None
+
+    def fail_fetch(request_id: Any) -> None:
+        if not isinstance(request_id, str) or not request_id:
+            set_boundary("fetch_control_failed")
+            return
+        try:
+            session.send(
+                "Fetch.failRequest",
+                {
+                    "requestId": request_id,
+                    "errorReason": "BlockedByClient",
+                },
+            )
+        except Exception:
+            set_boundary("fetch_control_failed")
+
+    def continue_fetch(request_id: Any) -> None:
+        if not isinstance(request_id, str) or not request_id:
+            set_boundary("fetch_control_failed")
+            return
+        try:
+            session.send("Fetch.continueRequest", {"requestId": request_id})
+        except Exception:
+            set_boundary("fetch_control_failed")
+
+    def record_relevant_response(
+        *,
+        response_url: Any,
+        status: Optional[int],
+        headers: Any,
+    ) -> None:
+        nonlocal browser_challenge
+        normalized_headers = _native_history_response_headers(headers)
+        challenged = (
+            _native_init_header(normalized_headers, "cf-mitigated") == "challenge"
+        )
+        browser_challenge = browser_challenge or challenged
+        retry_after = _native_init_retry_after(normalized_headers)
+        if challenged:
+            latch_terminal(
+                "browser_challenge",
+                retry_after_seconds=retry_after,
+                challenged=True,
+            )
+        parsed_url = urlsplit(response_url) if isinstance(response_url, str) else None
+        if parsed_url is None or parsed_url.netloc != "chatgpt.com":
+            return
+        if parsed_url.path == CHATGPT_NATIVE_HISTORY_INDEX_PATH:
+            if status in {401, 403}:
+                latch_terminal(
+                    "history_auth",
+                    retry_after_seconds=retry_after,
+                )
+            elif status == 429:
+                latch_terminal(
+                    "history_rate_limited",
+                    retry_after_seconds=retry_after,
+                )
+        elif parsed_url.path == "/":
+            if status in {401, 403}:
+                latch_terminal(
+                    "home_auth",
+                    retry_after_seconds=retry_after,
+                )
+            elif status == 429:
+                latch_terminal(
+                    "home_rate_limited",
+                    retry_after_seconds=retry_after,
+                )
+        elif parsed_url.path == CHATGPT_CONVERSATION_INIT_PATH:
+            if status in {401, 403}:
+                latch_terminal(
+                    "init_auth",
+                    retry_after_seconds=retry_after,
+                )
+            elif status == 429:
+                latch_terminal(
+                    "init_rate_limited",
+                    retry_after_seconds=retry_after,
+                )
+
+    def record_history_response(
+        *,
+        request_id: Any,
+        response_url: Any,
+        status: Optional[int],
+        headers: Any,
+    ) -> None:
+        normalized_headers = _native_history_response_headers(headers)
+        record_relevant_response(
+            response_url=response_url,
+            status=status,
+            headers=normalized_headers,
+        )
+        if request_id != capture.get("network_request_id"):
+            return
+        capture.update(
+            response_received=True,
+            response_request_id=request_id,
+            status_code=status,
+            content_type=_native_history_content_type(normalized_headers),
+            content_length=_native_history_content_length(normalized_headers),
+            retry_after_seconds=_native_init_retry_after(normalized_headers),
+            response_url_valid=is_history_url(response_url),
+        )
+        if not capture["response_url_valid"]:
+            set_boundary("history_response_mismatch")
+        elif status is None:
+            set_boundary("invalid_status")
+        elif 300 <= status < 400:
+            set_boundary("history_response_redirected")
+
+    def process_pending_response() -> None:
+        nonlocal pending_response
+        if pending_response is None or capture.get("finished"):
+            return
+        if terminal_failure is not None or boundary_reason is not None:
+            fail_fetch(pending_response.get("fetch_request_id"))
+            capture["finished"] = True
+            pending_response = None
+            return
+        if (
+            capture.get("request_account_hash") != expected_account_hash
+            or capture.get("extra_account_hash") != expected_account_hash
+        ):
+            return
+        try:
+            structural, body_error, response_bytes = (
+                _capture_native_history_body_stream(
+                    session,
+                    capture,
+                    fetch_request_id=str(pending_response["fetch_request_id"]),
+                    response_headers=pending_response.get("response_headers"),
+                    deadline=capture_deadline,
+                    max_response_bytes=max_response_bytes,
+                )
+            )
+        except Exception:
+            structural, body_error, response_bytes = (
+                None,
+                "response_body_unavailable",
+                None,
+            )
+        if response_bytes is not None:
+            capture["response_bytes"] = response_bytes
+        if structural is not None:
+            capture["structural"] = structural
+        if body_error is not None:
+            capture["body_failure_reason"] = body_error
+        capture["finished"] = True
+        fail_fetch(pending_response.get("fetch_request_id"))
+        pending_response = None
+
+    def guard_response(event: Mapping[str, Any]) -> None:
+        nonlocal pending_response
         request = event.get("request")
+        response_url = (
+            request.get("url") if isinstance(request, Mapping) else None
+        )
+        fetch_request_id = event.get("requestId")
+        network_request_id = event.get("networkId")
+        if not is_history_url(response_url):
+            continue_fetch(fetch_request_id)
+            return
+        if (
+            not history_admitted
+            or fetch_request_id != capture.get("fetch_request_id")
+            or network_request_id != capture.get("network_request_id")
+        ):
+            set_boundary("history_response_unowned")
+            fail_fetch(fetch_request_id)
+            return
+        status = _native_history_status(event.get("responseStatusCode"))
+        headers = event.get("responseHeaders")
+        record_history_response(
+            request_id=network_request_id,
+            response_url=response_url,
+            status=status,
+            headers=headers,
+        )
+        if (
+            terminal_failure is not None
+            or boundary_reason is not None
+            or status is None
+            or _native_history_failure_for_status(status) is not None
+            or capture.get("content_type") != "json"
+        ):
+            fail_fetch(fetch_request_id)
+            capture["finished"] = True
+            return
+        pending_response = {
+            "fetch_request_id": fetch_request_id,
+            "response_headers": headers,
+        }
+        process_pending_response()
+
+    def guard_request(  # noqa: PLR0915 - admission branches share one boundary
+        event: Mapping[str, Any],
+    ) -> None:
+        nonlocal history_admitted, history_request_count
+        if "responseStatusCode" in event or "responseHeaders" in event:
+            guard_response(event)
+            return
+        request = event.get("request")
+        request_id = event.get("requestId")
         if not isinstance(request, Mapping):
             set_boundary("malformed_request_event")
-            request_id = event.get("requestId")
-            if request_id is not None:
-                session.send(
-                    "Fetch.failRequest",
-                    {
-                        "requestId": request_id,
-                        "errorReason": "BlockedByClient",
-                    },
-                )
+            fail_fetch(request_id)
             return
         url = request.get("url", "")
         parsed = urlsplit(url if isinstance(url, str) else "")
@@ -3354,17 +3849,55 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
         history = is_history_url(url)
         blocked = False
         if history:
-            blocked = (
-                method != "GET"
-                or redirected is not None
-                or history_request_count > 1
+            history_request_count += 1
+            network_request_id = event.get("networkId")
+            headers = request.get("headers")
+            request_account_hash = (
+                _native_init_account_hash(headers)
+                if isinstance(headers, Mapping)
+                else None
             )
-            if method != "GET":
+            known_mismatch = (
+                request_account_hash is not None
+                and request_account_hash != expected_account_hash
+            )
+            blocked = (
+                terminal_failure is not None
+                or history_admitted
+                or method != "GET"
+                or redirected is not None
+                or not isinstance(request_id, str)
+                or not isinstance(network_request_id, str)
+                or known_mismatch
+            )
+            if terminal_failure is not None:
+                set_boundary("terminal_failure")
+            elif history_admitted:
+                set_boundary("history_request_limit_exceeded")
+            elif method != "GET":
                 set_boundary("history_request_invalid_method")
             elif redirected is not None:
                 set_boundary("history_request_redirected")
-            elif history_request_count > 1:
-                set_boundary("history_request_limit_exceeded")
+            elif not isinstance(request_id, str) or not isinstance(
+                network_request_id, str
+            ):
+                set_boundary("history_request_identity_missing")
+            elif known_mismatch:
+                set_boundary("account_identity_mismatch")
+                latch_terminal("account_identity_mismatch")
+            else:
+                history_admitted = True
+                capture.update(
+                    request_id=network_request_id,
+                    network_request_id=network_request_id,
+                    fetch_request_id=request_id,
+                    method=method,
+                    request_account_hash=request_account_hash,
+                    body_omitted=(
+                        not request.get("hasPostData", False)
+                        and "postData" not in request
+                    ),
+                )
         elif event.get("resourceType") == "Document":
             home_navigation = (
                 parsed.scheme == "https"
@@ -3375,60 +3908,59 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             blocked = not home_navigation
             if not home_navigation:
                 set_boundary("unexpected_document_navigation")
-        elif method in {"POST", "PUT", "PATCH", "DELETE"}:
+        elif method in {"POST", "PUT", "PATCH", "DELETE"} and (
+            is_model_or_mutation_path(parsed.path)
+        ):
             blocked = True
-            if is_model_or_mutation_path(parsed.path):
+            if parsed.path != CHATGPT_CONVERSATION_INIT_PATH:
                 set_boundary("model_or_mutation_blocked")
-        elif parsed.path.startswith("/backend-api/"):
-            # Detail, message, session, and mutation routes are never needed
-            # for this one-index observation.
+        elif (
+            parsed.path.startswith("/backend-api/conversation/")
+            and parsed.path != CHATGPT_CONVERSATION_INIT_PATH
+        ):
+            # Conversation details and message routes are never needed for the
+            # one-index observation; ordinary frontend bootstrap reads remain
+            # allowed under the existing init observer policy.
+            blocked = True
+            set_boundary("conversation_detail_blocked")
+        if terminal_failure is not None and not history:
             blocked = True
         if blocked:
-            session.send(
-                "Fetch.failRequest",
-                {
-                    "requestId": event.get("requestId"),
-                    "errorReason": "BlockedByClient",
-                },
-            )
+            fail_fetch(request_id)
         else:
-            session.send(
-                "Fetch.continueRequest",
-                {"requestId": event.get("requestId")},
-            )
+            continue_fetch(request_id)
 
     def request_seen(event: Mapping[str, Any]) -> None:
-        nonlocal request_count, history_request_count
+        nonlocal request_count
         request_count += 1
         request = event.get("request")
         if not isinstance(request, Mapping) or not is_history_url(
             request.get("url", "")
         ):
             return
-        history_request_count += 1
-        if capture:
+        request_id = event.get("requestId")
+        if request_id != capture.get("network_request_id"):
             set_boundary("history_request_limit_exceeded")
             return
         headers = request.get("headers")
-        capture.update(
-            request_id=event.get("requestId"),
-            method=str(request.get("method") or "").upper() or None,
-            request_account_hash=(
-                _native_init_account_hash(headers)
-                if isinstance(headers, Mapping)
-                else None
-            ),
-            body_omitted=(
-                not request.get("hasPostData", False)
-                and "postData" not in request
-            ),
+        account_hash = (
+            _native_init_account_hash(headers)
+            if isinstance(headers, Mapping)
+            else None
         )
-        if capture["method"] != "GET":
+        request_hash = capture.get("request_account_hash")
+        if account_hash is not None and request_hash not in {None, account_hash}:
+            set_boundary("account_identity_mismatch")
+            latch_terminal("account_identity_mismatch")
+        elif account_hash is not None:
+            capture["request_account_hash"] = account_hash
+        capture["network_request_seen"] = True
+        if str(request.get("method") or "").upper() != "GET":
             set_boundary("history_request_invalid_method")
 
     def extra_seen(event: Mapping[str, Any]) -> None:
         request_id = event.get("requestId")
-        if not isinstance(request_id, str):
+        if request_id != capture.get("network_request_id"):
             return
         headers = event.get("headers")
         account_hash = (
@@ -3436,59 +3968,38 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             if isinstance(headers, Mapping)
             else None
         )
-        captured_id = capture.get("request_id")
-        if account_hash is None and request_id != captured_id:
-            return
-        if request_id not in extra_hashes and len(extra_hashes) >= 256:
-            oldest = next(
-                (key for key in extra_hashes if key != captured_id),
-                None,
-            )
-            if oldest is not None:
-                del extra_hashes[oldest]
-        extra_hashes[request_id] = account_hash
-        if request_id == captured_id:
-            capture["extra_account_hash"] = account_hash
+        capture["extra_seen"] = True
+        capture["extra_account_hash"] = account_hash
+        if account_hash is not None and account_hash != expected_account_hash:
+            set_boundary("account_identity_mismatch")
+            latch_terminal("account_identity_mismatch")
+        process_pending_response()
 
     def response_seen(event: Mapping[str, Any]) -> None:
-        nonlocal browser_challenge
         response = event.get("response")
         if not isinstance(response, Mapping):
             set_boundary("malformed_response_event")
             return
         headers = response.get("headers")
-        challenged = (
-            isinstance(headers, Mapping)
-            and _native_init_header(headers, "cf-mitigated") == "challenge"
-        )
-        browser_challenge = browser_challenge or challenged
-        request_id = event.get("requestId")
-        if request_id != capture.get("request_id"):
-            return
         status = _native_history_status(response.get("status"))
-        capture.update(
-            response_received=True,
-            response_request_id=request_id,
-            status_code=status,
-            content_type=_native_history_content_type(headers),
-            content_length=_native_history_content_length(headers),
-            retry_after_seconds=(
-                _native_init_retry_after(headers)
-                if isinstance(headers, Mapping)
-                else None
-            ),
-            browser_challenge=browser_challenge,
-            response_url_valid=is_history_url(response.get("url", "")),
+        response_url = response.get("url")
+        record_relevant_response(
+            response_url=response_url,
+            status=status,
+            headers=headers,
         )
-        if not capture["response_url_valid"]:
-            set_boundary("history_response_mismatch")
-        elif status is None:
-            set_boundary("invalid_status")
-        elif 300 <= status < 400:
-            set_boundary("history_response_redirected")
+        request_id = event.get("requestId")
+        if request_id != capture.get("network_request_id"):
+            return
+        record_history_response(
+            request_id=request_id,
+            response_url=response_url,
+            status=status,
+            headers=headers,
+        )
 
     def loading_finished(event: Mapping[str, Any]) -> None:
-        if event.get("requestId") != capture.get("request_id"):
+        if event.get("requestId") != capture.get("network_request_id"):
             return
         capture["finished"] = True
         encoded = event.get("encodedDataLength")
@@ -3500,7 +4011,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             capture["encoded_data_length"] = int(encoded)
 
     def loading_failed(event: Mapping[str, Any]) -> None:
-        if event.get("requestId") == capture.get("request_id"):
+        if event.get("requestId") == capture.get("network_request_id"):
             capture["finished"] = True
             capture["loading_failed"] = True
 
@@ -3522,7 +4033,15 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
         session.send("Network.setBypassServiceWorker", {"bypass": True})
         session.send(
             "Fetch.enable",
-            {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]},
+            {
+                "patterns": [
+                    {"urlPattern": "*", "requestStage": "Request"},
+                    {
+                        "urlPattern": "*://chatgpt.com/backend-api/conversations*",
+                        "requestStage": "Response",
+                    },
+                ]
+            },
         )
         try:
             page.goto(
@@ -3533,40 +4052,13 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
                 ),
             )
         except Exception:
-            if capture:
-                capture.setdefault("boundary_reason", "home_navigation_failed")
-            else:
-                boundary_reason = boundary_reason or "home_navigation_failed"
+            set_boundary("home_navigation_failed")
         while True:
-            if capture.get("finished"):
-                capture["extra_account_hash"] = extra_hashes.get(
-                    capture.get("request_id")
-                )
-                if boundary_reason is not None:
-                    capture["boundary_reason"] = boundary_reason
-                request_hash = capture.get("request_account_hash")
-                extra_hash = capture.get("extra_account_hash")
-                if (
-                    request_hash == expected_account_hash
-                    and extra_hash == expected_account_hash
-                    and capture.get("response_received")
-                    and capture.get("response_url_valid")
-                    and capture.get("status_code") is not None
-                    and _native_history_failure_for_status(
-                        capture.get("status_code")
-                    )
-                    is None
-                    and capture.get("content_type") == "json"
-                ):
-                    structural, body_error, response_bytes = (
-                        _capture_native_history_body(
-                            session,
-                            capture,
-                            max_response_bytes=max_response_bytes,
-                        )
-                    )
-                    if response_bytes is not None:
-                        capture["response_bytes"] = response_bytes
+            process_pending_response()
+            if terminal_failure is not None:
+                retry_after = terminal_retry_after()
+                if isinstance(capture.get("request_id"), str):
+                    capture["retry_after_seconds"] = retry_after
                     return _native_history_finalize_observation(
                         capture,
                         expected_account_hash=expected_account_hash,
@@ -3574,9 +4066,20 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
                         request_count=request_count,
                         history_request_count=history_request_count,
                         max_response_bytes=max_response_bytes,
-                        structural=structural,
-                        failure_reason=body_error,
+                        structural=capture.get("structural"),
+                        failure_reason=terminal_reason(),
                     )
+                return _native_history_no_route_observation(
+                    page_target_id_matched=True,
+                    request_count=request_count,
+                    history_request_count=history_request_count,
+                    failure_reason=terminal_reason(),
+                    browser_challenge=browser_challenge,
+                    retry_after_seconds=retry_after,
+                )
+            if capture.get("finished") and capture.get("extra_seen"):
+                if boundary_reason is not None:
+                    capture["boundary_reason"] = boundary_reason
                 return _native_history_finalize_observation(
                     capture,
                     expected_account_hash=expected_account_hash,
@@ -3584,6 +4087,26 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
                     request_count=request_count,
                     history_request_count=history_request_count,
                     max_response_bytes=max_response_bytes,
+                    structural=capture.get("structural"),
+                    failure_reason=capture.get("body_failure_reason"),
+                )
+            if boundary_reason is not None and capture:
+                if pending_response is not None:
+                    fail_fetch(pending_response.get("fetch_request_id"))
+                    pending_response = None
+                elif isinstance(capture.get("fetch_request_id"), str):
+                    fail_fetch(capture.get("fetch_request_id"))
+                capture["finished"] = True
+                capture["boundary_reason"] = boundary_reason
+                return _native_history_finalize_observation(
+                    capture,
+                    expected_account_hash=expected_account_hash,
+                    page_target_id_matched=True,
+                    request_count=request_count,
+                    history_request_count=history_request_count,
+                    max_response_bytes=max_response_bytes,
+                    structural=capture.get("structural"),
+                    failure_reason=boundary_reason,
                 )
             if browser_challenge:
                 return _native_history_no_route_observation(
@@ -3592,14 +4115,15 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
                     history_request_count=history_request_count,
                     failure_reason=boundary_reason or "browser_challenge",
                     browser_challenge=True,
+                    retry_after_seconds=terminal_retry_after(),
                 )
             if _remaining_browser_timeout(capture_deadline) <= 0:
+                if pending_response is not None:
+                    fail_fetch(pending_response.get("fetch_request_id"))
+                    pending_response = None
                 if capture:
                     capture["boundary_reason"] = (
                         boundary_reason or "history_response_timeout"
-                    )
-                    capture["extra_account_hash"] = extra_hashes.get(
-                        capture.get("request_id")
                     )
                     return _native_history_finalize_observation(
                         capture,
@@ -3615,6 +4139,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
                     history_request_count=history_request_count,
                     failure_reason=boundary_reason or "no_history_observed",
                     browser_challenge=browser_challenge,
+                    retry_after_seconds=terminal_retry_after(),
                 )
             try:
                 challenge_visible = bool(
@@ -3632,12 +4157,14 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
                 challenge_visible = False
             if challenge_visible:
                 browser_challenge = True
+                latch_terminal("browser_challenge", challenged=True)
                 return _native_history_no_route_observation(
                     page_target_id_matched=True,
                     request_count=request_count,
                     history_request_count=history_request_count,
-                    failure_reason=boundary_reason or "browser_challenge",
+                    failure_reason=terminal_reason() or "browser_challenge",
                     browser_challenge=True,
+                    retry_after_seconds=terminal_retry_after(),
                 )
             if boundary_reason is not None and not capture:
                 return _native_history_no_route_observation(
@@ -3646,6 +4173,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
                     history_request_count=history_request_count,
                     failure_reason=boundary_reason,
                     browser_challenge=False,
+                    retry_after_seconds=terminal_retry_after(),
                 )
             page.wait_for_timeout(
                 min(
