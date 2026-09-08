@@ -117,6 +117,15 @@ from litellm.secret_managers.codex_oauth_inventory import (
 from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
 )
+from litellm.secret_managers.xai_oauth_credentials import (
+    DEFAULT_XAI_OAUTH_AUTH_FILE as FOUNDATION_DEFAULT_XAI_OAUTH_AUTH_FILE,
+    DEFAULT_XAI_OAUTH_LOCK_FILE as FOUNDATION_DEFAULT_XAI_OAUTH_LOCK_FILE,
+    XAI_OAUTH_SCOPE_ENV_VARS,
+    default_xai_oauth_lock_path,
+    resolve_xai_oauth_auth_path,
+    resolve_xai_oauth_lock_path,
+    resolve_xai_oauth_scope,
+)
 from litellm.llms.cursor_agent.constants import CURSOR_AGENT_DASHBOARD_HOST
 from litellm.llms.cursor_agent.dashboard import (
     build_dashboard_headers,
@@ -169,8 +178,8 @@ CODEX_SIDECAR_DEFAULT_AUTH_PATHS = (
 )
 DEFAULT_CODEX_OAUTH_REFRESH_INTERVAL_SECONDS = 300.0
 DEFAULT_CODEX_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
-DEFAULT_XAI_OAUTH_AUTH_FILE = xai_oauth_refresh.DEFAULT_XAI_OAUTH_AUTH_FILE
-DEFAULT_XAI_OAUTH_LOCK_FILE = xai_oauth_refresh.DEFAULT_XAI_OAUTH_LOCK_FILE
+DEFAULT_XAI_OAUTH_AUTH_FILE = FOUNDATION_DEFAULT_XAI_OAUTH_AUTH_FILE
+DEFAULT_XAI_OAUTH_LOCK_FILE = FOUNDATION_DEFAULT_XAI_OAUTH_LOCK_FILE
 XAI_OAUTH_SIDECAR_AUTH_FILE_ENV_VARS = (
     "LITELLM_XAI_OAUTH_AUTH_FILE",
     "LITELLM_XAI_OAUTH_MIGRATED_AUTH_FILE",
@@ -1486,6 +1495,7 @@ class ProviderStatusLoopConfig:
     xai_oauth_auth_file_source: str = "default"
     xai_oauth_lock_file: str = DEFAULT_XAI_OAUTH_LOCK_FILE
     xai_oauth_scope: str = xai_oauth_refresh.DEFAULT_XAI_OAUTH_SCOPE
+    xai_oauth_scope_source: str = "default"
     xai_oauth_refresh_interval_seconds: float = (
         DEFAULT_XAI_OAUTH_REFRESH_INTERVAL_SECONDS
     )
@@ -1852,26 +1862,60 @@ def _require_codex_oauth_inventory(
 def _resolve_xai_oauth_sidecar_auth_file(
     explicit_auth_file: Optional[str],
 ) -> tuple[str, str]:
+    resolution = resolve_xai_oauth_auth_path(
+        explicit_auth_file,
+        value_getter=os.getenv,
+    )
+    _maybe_reject_default_auth_source(resolution.source)
+    return str(resolution.path), resolution.source
+
+
+def _resolve_xai_oauth_sidecar_scope(
+    explicit_scope: Optional[str],
+) -> tuple[str, str]:
+    resolution = resolve_xai_oauth_scope(
+        explicit_scope,
+        value_getter=os.getenv,
+        env_names=XAI_OAUTH_SCOPE_ENV_VARS,
+        default_scope=xai_oauth_refresh.DEFAULT_XAI_OAUTH_SCOPE,
+    )
+    return resolution.scope, resolution.source
+
+
+def _resolve_xai_oauth_sidecar_lock_file(
+    explicit_lock_file: Optional[str],
+    auth_file: str,
+) -> str:
+    """Use one sibling lock for each canonical auth file by default.
+
+    An omitted lock option is resolved from ``AAWM_XAI_OAUTH_LOCK_FILE`` when
+    configured, otherwise from the canonical auth-file sibling. A configured
+    legacy default lock is ignored for a custom auth file because honoring it
+    would create a second lock identity for the same credentials.
+    """
+
     explicit_value = (
-        explicit_auth_file.strip()
-        if isinstance(explicit_auth_file, str) and explicit_auth_file.strip()
+        explicit_lock_file.strip()
+        if isinstance(explicit_lock_file, str) and explicit_lock_file.strip()
         else None
     )
-
-    aawm_auth_file = os.getenv("AAWM_XAI_OAUTH_AUTH_FILE", "").strip()
-    if aawm_auth_file:
-        return str(Path(aawm_auth_file).expanduser()), "AAWM_XAI_OAUTH_AUTH_FILE"
-
-    if explicit_value and explicit_value != DEFAULT_XAI_OAUTH_AUTH_FILE:
-        return str(Path(explicit_value).expanduser()), "explicit"
-
-    for env_name in XAI_OAUTH_SIDECAR_AUTH_FILE_ENV_VARS:
-        env_value = os.getenv(env_name, "").strip()
-        if env_value:
-            return str(Path(env_value).expanduser()), env_name
-
-    _maybe_reject_default_auth_source("default")
-    return DEFAULT_XAI_OAUTH_AUTH_FILE, "default"
+    if explicit_value is None:
+        configured_lock_file = os.getenv("AAWM_XAI_OAUTH_LOCK_FILE")
+        if isinstance(configured_lock_file, str) and configured_lock_file.strip():
+            explicit_value = configured_lock_file.strip()
+    if explicit_value is not None:
+        explicit_path = Path(explicit_value).expanduser()
+        canonical_path = default_xai_oauth_lock_path(auth_file)
+        default_lock_path = Path(DEFAULT_XAI_OAUTH_LOCK_FILE).expanduser().resolve(
+            strict=False
+        )
+        if (
+            explicit_path.resolve(strict=False) == default_lock_path
+            and canonical_path != default_lock_path
+        ):
+            return str(canonical_path)
+        return str(resolve_xai_oauth_lock_path(auth_file, explicit_path))
+    return str(resolve_xai_oauth_lock_path(auth_file))
 
 
 def _resolve_kimi_oauth_sidecar_auth_file(
@@ -2724,7 +2768,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     )
     parser.add_argument(
         "--xai-oauth-auth-file",
-        default=os.getenv("AAWM_XAI_OAUTH_AUTH_FILE", DEFAULT_XAI_OAUTH_AUTH_FILE),
+        default=None,
         help=(
             "Managed xAI OAuth auth JSON file maintained by this sidecar. "
             "Defaults to AAWM_XAI_OAUTH_AUTH_FILE, then LiteLLM managed xAI "
@@ -2733,7 +2777,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     )
     parser.add_argument(
         "--xai-oauth-lock-file",
-        default=os.getenv("AAWM_XAI_OAUTH_LOCK_FILE", DEFAULT_XAI_OAUTH_LOCK_FILE),
+        default=None,
         help=(
             "Lock file for sidecar managed xAI OAuth refresh writes. Defaults "
             "to AAWM_XAI_OAUTH_LOCK_FILE or ~/.litellm/xai/oauth-auth.json.lock."
@@ -2741,11 +2785,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     )
     parser.add_argument(
         "--xai-oauth-scope",
-        default=(
-            os.getenv("AAWM_XAI_OAUTH_SCOPE")
-            or os.getenv("LITELLM_XAI_OAUTH_SCOPE")
-            or xai_oauth_refresh.DEFAULT_XAI_OAUTH_SCOPE
-        ),
+        default=None,
         help=(
             "Managed xAI OAuth credential scope. Defaults to AAWM_XAI_OAUTH_SCOPE, "
             "LITELLM_XAI_OAUTH_SCOPE, or the Grok subscription scope."
@@ -4151,6 +4191,16 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         resolved_xai_oauth_auth_file_source,
     ) = _resolve_xai_oauth_sidecar_auth_file(args.xai_oauth_auth_file)
     (
+        resolved_xai_oauth_scope,
+        resolved_xai_oauth_scope_source,
+    ) = _resolve_xai_oauth_sidecar_scope(
+        args.xai_oauth_scope
+    )
+    resolved_xai_oauth_lock_file = _resolve_xai_oauth_sidecar_lock_file(
+        args.xai_oauth_lock_file,
+        resolved_xai_oauth_auth_file,
+    )
+    (
         resolved_kimi_oauth_auth_file,
         resolved_kimi_oauth_auth_file_source,
     ) = _resolve_kimi_oauth_sidecar_auth_file(args.kimi_oauth_auth_file)
@@ -4199,8 +4249,9 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         xai_oauth_refresh_enabled=args.xai_oauth_refresh_enabled,
         xai_oauth_auth_file=resolved_xai_oauth_auth_file,
         xai_oauth_auth_file_source=resolved_xai_oauth_auth_file_source,
-        xai_oauth_lock_file=args.xai_oauth_lock_file,
-        xai_oauth_scope=str(args.xai_oauth_scope).strip(),
+        xai_oauth_lock_file=resolved_xai_oauth_lock_file,
+        xai_oauth_scope=resolved_xai_oauth_scope,
+        xai_oauth_scope_source=resolved_xai_oauth_scope_source,
         xai_oauth_refresh_interval_seconds=args.xai_oauth_refresh_interval_seconds,
         xai_oauth_refresh_buffer_seconds=args.xai_oauth_refresh_buffer_seconds,
         xai_oauth_force_refresh=args.xai_oauth_force_refresh,
@@ -4511,6 +4562,18 @@ def _oauth_refresh_observation_metadata(event: Mapping[str, Any]) -> Dict[str, A
         "refresh_attempt_interval_seconds",
         "refresh_buffer_seconds",
         "refresh_threshold_seconds",
+        "credential_identity",
+        "structurally_valid",
+        "access_available",
+        "refresh_possible",
+        "route_usable",
+        "route_unusable",
+        "refresh_due",
+        "terminal_unrefreshable",
+        "lifecycle_state",
+        "route_unusable_reason",
+        "route_unusable_at",
+        "route_safety_buffer_seconds",
         "credential_health",
         "usable",
         "scheduler_error_class",
@@ -4779,6 +4842,7 @@ def _build_xai_oauth_auth_observation(
     metadata = {
         "auth_file_hash_algorithm": "sha256",
         "auth_file_source": config.xai_oauth_auth_file_source,
+        "scope_source": config.xai_oauth_scope_source,
         "refresh_buffer_seconds": config.xai_oauth_refresh_buffer_seconds,
         "refresh_interval_seconds": config.xai_oauth_refresh_interval_seconds,
         "force_refresh": config.xai_oauth_force_refresh,
@@ -12782,6 +12846,8 @@ def _oauth_refresh_schedule_evidence(
         "refresh_attempt_interval_seconds": attempt_interval_seconds,
         "refresh_buffer_seconds": buffer_seconds,
         "refresh_threshold_seconds": effective_threshold_seconds,
+        "credential_identity": final.get("credential_identity")
+        or pre.get("credential_identity"),
         "credential_health": credential_health
         if credential_health is not None
         else final.get("credential_health"),
@@ -13360,7 +13426,10 @@ def _run_xai_oauth_refresh_task(
             scope=config.xai_oauth_scope,
             buffer_seconds=config.xai_oauth_refresh_buffer_seconds,
             force=config.xai_oauth_force_refresh,
-            lock_file=config.xai_oauth_lock_file,
+            lock_file=_resolve_xai_oauth_sidecar_lock_file(
+                config.xai_oauth_lock_file,
+                config.xai_oauth_auth_file,
+            ),
             http_timeout_seconds=config.xai_oauth_http_timeout_seconds,
             on_token_endpoint_attempt=callback,
         ),
@@ -13748,7 +13817,10 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
             "xai_oauth_passive_health_inspection",
             xai_oauth_refresh.inspect_xai_oauth_credential_health,
             (config.xai_oauth_auth_file,),
-            {"scope": config.xai_oauth_scope},
+            {
+                "scope": config.xai_oauth_scope,
+                "buffer_seconds": config.xai_oauth_refresh_buffer_seconds,
+            },
             "xai",
             "xai_oauth",
             config.xai_oauth_auth_file,
