@@ -132,9 +132,10 @@ When Cursor advertises `spawn_agent`, its input schema must be an object with
 `properties`. The bridged properties must use the canonical names above, declare
 the matching scalar types, and accept the requested values. Required properties
 that cannot be represented, ambiguous schema definitions, invalid schema
-payloads, and explicit `readonly` values that the schema cannot represent are
-rejected before child dispatch. Without an advertised schema, LiteLLM uses the
-canonical argument names.
+payloads, and explicit `readonly=true` values that the schema cannot represent
+are rejected before child dispatch. An explicit `readonly=false` is omitted
+when the advertised schema has no `readonly` property. Without an advertised
+schema, LiteLLM uses the canonical argument names.
 
 Unsupported subagent fields and schema failures are deterministic candidate
 ineligibility (`aawm_codex_auto_agent_candidate_ineligible`) with no candidate

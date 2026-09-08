@@ -4077,6 +4077,9 @@ async def test_candidate_loop_cursor_session_continuation_is_session_scoped(  # 
         classify_session_owner_replay_safety_body=(
             session_affinity.classify_session_owner_replay_safety_body
         ),
+        validate_cursor_replay_matches_body=(
+            session_affinity.validate_cursor_replay_matches_body
+        ),
         resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
         get_request_codex_auto_review_parent_session_identity=lambda _request: None,
         build_session_owner_attributes=lambda **_kwargs: {},
@@ -4442,6 +4445,10 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
 
     session_affinity_seam = SimpleNamespace(
         is_replay_safe_session_owner_redispatch_body=_classify_rebuilt_request,
+        validate_cursor_replay_matches_body=(
+            session_affinity.validate_cursor_replay_matches_body
+        ),
+        set_validated_cursor_replay=session_affinity.set_validated_cursor_replay,
         resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
         get_request_codex_auto_review_parent_session_identity=lambda _request: None,
         build_session_owner_attributes=lambda **_kwargs: {},
@@ -4955,6 +4962,10 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
 
     session_affinity_seam = SimpleNamespace(
         is_replay_safe_session_owner_redispatch_body=_classify_rebuilt_request,
+        validate_cursor_replay_matches_body=(
+            session_affinity.validate_cursor_replay_matches_body
+        ),
+        set_validated_cursor_replay=session_affinity.set_validated_cursor_replay,
         resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
         get_request_codex_auto_review_parent_session_identity=lambda _request: None,
         build_session_owner_attributes=lambda **_kwargs: {},
@@ -5288,6 +5299,7 @@ async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_a
 
     session_affinity = SimpleNamespace(
         is_replay_safe_session_owner_redispatch_body=lambda _body: False,
+        validate_cursor_replay_matches_body=lambda *_args, **_kwargs: False,
         resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
         get_request_codex_auto_review_parent_session_identity=lambda _request: None,
         build_session_owner_attributes=lambda **_kwargs: {},
