@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Iterable, Mapping, Optional, Sequence
@@ -15,6 +14,7 @@ import psycopg
 
 from .models import AttemptRecord
 from .privacy import (
+    PrivacyError,
     assert_no_secrets,
     classify_surface,
     sanitize_metadata,
@@ -85,7 +85,6 @@ _ALLOWED_OUTCOMES = frozenset(
     }
 )
 _ALLOWED_ALIAS_KINDS = frozenset({"generation", "request", "prompt", "message", "branch"})
-_STRONG_ALIAS_KINDS = frozenset({"generation", "message", "branch"})
 _ALLOWED_GAP_STATES = frozenset({"open", "resolved", "unknown"})
 _ALLOWED_QUARANTINE_STATES = frozenset({"clear", "quarantined", "unknown"})
 _OBSERVATION_KEY_ALIASES = {
@@ -447,6 +446,13 @@ _PAGE_FIELDS = frozenset(
         "update_time",
         "quarantine",
         "quarantine_state",
+        "future_timestamp_quarantined",
+        "quarantine_warnings",
+        "quarantine_warning",
+        "quarantine_reason",
+        "quarantine_timestamp",
+        "quarantine_at",
+        "quarantined_at",
         "transfer_version",
         "transfer_schema_version",
         "schema_fingerprint",
@@ -552,6 +558,15 @@ class AttemptIdentityResolution:
     conflicts: int = 0
     quarantine_reason: Optional[str] = None
     merge_refs: tuple[AttemptRef, ...] = ()
+    identity_basis: Optional[str] = None
+    tied_projection_conflict: bool = False
+
+
+@dataclass(frozen=True)
+class AttemptAliasPlan:
+    aliases: tuple[tuple[str, str], ...] = ()
+    conflicts: tuple[tuple[str, str, tuple[AttemptRef, ...]], ...] = ()
+    generation_conflict: bool = False
 
 
 @dataclass(frozen=True)
@@ -882,8 +897,29 @@ class PgLedger:
                     canonical_scope.workspace_id AS canonical_workspace_id,
                     canonical_scope.quota_owner_id AS canonical_quota_owner_id,
                     canonical_scope.identity_state AS canonical_identity_state,
-                    canonical_scope.surface AS canonical_surface
+                    canonical_scope.surface AS canonical_surface,
+                    revisions.payload AS projection_payload,
+                    (
+                        revisions.payload - ARRAY[
+                            'attemptId', 'identityBasis', 'sourceIdentityBasis',
+                            'aliases', 'evidenceMessageIds'
+                        ] || jsonb_build_object(
+                            'sourceTimeBasis', COALESCE(
+                                revisions.payload->'sourceTimeBasis',
+                                revisions.payload->'timeBasis'
+                            ),
+                            'sourceOutcome', COALESCE(
+                                revisions.payload->'sourceOutcome',
+                                revisions.payload->'outcome'
+                            )
+                        )
+                    ) AS business_projection
                 FROM public.chatgpt_usage_attempts AS attempts
+                LEFT JOIN public.chatgpt_usage_attempt_revisions AS revisions
+                  ON revisions.scope_key = attempts.scope_key
+                 AND revisions.attempt_id = attempts.attempt_id
+                 AND revisions.revision = attempts.revision
+                 AND revisions.projection_fingerprint = attempts.projection_fingerprint
                 JOIN canonical_scope_map AS scope_map
                   ON scope_map.stored_scope_key = attempts.scope_key
                 JOIN public.chatgpt_usage_scopes AS canonical_scope
@@ -911,6 +947,9 @@ class PgLedger:
                     scoped.canonical_scope_key,
                     scoped.scope_key,
                     scoped.attempt_id,
+                    count(alias_rows.alias_value)
+                        FILTER (WHERE alias_rows.alias_kind = 'generation')
+                        AS generation_alias_count,
                     string_agg(
                         alias_rows.alias_value,
                         ',' ORDER BY alias_rows.alias_value
@@ -943,7 +982,19 @@ class PgLedger:
                     attempt_id,
                     'generation:' || generation_aliases AS generation_key
                 FROM alias_values
-                WHERE generation_aliases IS NOT NULL
+                WHERE generation_alias_count = 1
+            ),
+            contested_aliases AS (
+                SELECT DISTINCT
+                    scope_map.canonical_scope_key,
+                    gaps.details->'alias'->>'kind' AS alias_kind,
+                    gaps.details->'alias'->>'value' AS alias_value
+                FROM public.chatgpt_usage_coverage_gaps AS gaps
+                JOIN canonical_scope_map AS scope_map
+                  ON scope_map.stored_scope_key = gaps.scope_key
+                WHERE gaps.source_kind = 'attempt_alias'
+                  AND gaps.reason = 'alias_collision' AND gaps.state = 'open'
+                  AND gaps.details->'alias'->>'kind' IN ('message', 'branch')
             ),
             strong_edges AS (
                 SELECT DISTINCT
@@ -957,7 +1008,15 @@ class PgLedger:
                   ON right_alias.canonical_scope_key = left_alias.canonical_scope_key
                  AND right_alias.alias_kind = left_alias.alias_kind
                  AND right_alias.alias_value = left_alias.alias_value
+                LEFT JOIN generation_keys AS left_generation
+                  ON left_generation.scope_key = left_alias.scope_key
+                 AND left_generation.attempt_id = left_alias.attempt_id
+                LEFT JOIN generation_keys AS right_generation
+                  ON right_generation.scope_key = right_alias.scope_key
+                 AND right_generation.attempt_id = right_alias.attempt_id
                 WHERE left_alias.alias_kind IN ('message', 'branch')
+                  AND left_generation.generation_key IS NULL
+                  AND right_generation.generation_key IS NULL
                   AND (
                       left_alias.scope_key <> right_alias.scope_key
                       OR left_alias.attempt_id <> right_alias.attempt_id
@@ -977,6 +1036,10 @@ class PgLedger:
                     scoped.scope_key,
                     scoped.attempt_id
                 FROM scoped
+                LEFT JOIN generation_keys
+                  ON generation_keys.scope_key = scoped.scope_key
+                 AND generation_keys.attempt_id = scoped.attempt_id
+                WHERE generation_keys.generation_key IS NULL
                 UNION
                 SELECT
                     reach.canonical_scope_key,
@@ -1028,15 +1091,36 @@ class PgLedger:
                     components.component_key,
                     count(DISTINCT generations.generation_key)
                         AS generation_key_count,
-                    MIN(generations.generation_key) AS generation_key
-                FROM strong_components AS components
+                    MIN(generations.generation_key) AS generation_key,
+                    bool_or(contested_aliases.alias_kind IS NOT NULL)
+                        AS contested_association,
+                    bool_or(member_values.generation_alias_count > 1)
+                        AS contradictory_generation_claims
+                FROM (
+                    SELECT DISTINCT canonical_scope_key, component_key
+                    FROM strong_components
+                ) AS components
                 LEFT JOIN strong_components AS members
                   ON members.canonical_scope_key = components.canonical_scope_key
                  AND members.component_key = components.component_key
+                LEFT JOIN alias_values AS member_values
+                  ON member_values.scope_key = members.scope_key
+                 AND member_values.attempt_id = members.attempt_id
+                LEFT JOIN alias_rows AS member_alias
+                  ON member_alias.scope_key = members.scope_key
+                 AND member_alias.attempt_id = members.attempt_id
+                 AND member_alias.alias_kind IN ('message', 'branch')
+                LEFT JOIN alias_rows AS anchor_alias
+                  ON anchor_alias.canonical_scope_key = members.canonical_scope_key
+                 AND anchor_alias.alias_kind = member_alias.alias_kind
+                 AND anchor_alias.alias_value = member_alias.alias_value
                 LEFT JOIN generation_keys AS generations
-                  ON generations.canonical_scope_key = members.canonical_scope_key
-                 AND generations.scope_key = members.scope_key
-                 AND generations.attempt_id = members.attempt_id
+                  ON generations.scope_key = anchor_alias.scope_key
+                 AND generations.attempt_id = anchor_alias.attempt_id
+                LEFT JOIN contested_aliases
+                  ON contested_aliases.canonical_scope_key = members.canonical_scope_key
+                 AND contested_aliases.alias_kind = member_alias.alias_kind
+                 AND contested_aliases.alias_value = member_alias.alias_value
                 GROUP BY
                     components.canonical_scope_key,
                     components.component_key
@@ -1045,17 +1129,32 @@ class PgLedger:
                 SELECT
                     scoped.*,
                     (
-                        alias_values.generation_aliases IS NULL
-                        AND component_generation_keys.generation_key_count > 1
+                        alias_values.generation_alias_count > 1
+                        OR (
+                            alias_values.generation_alias_count <> 1
+                            AND (
+                                component_generation_keys.generation_key_count > 1
+                                OR component_generation_keys.contested_association
+                                OR component_generation_keys.contradictory_generation_claims
+                            )
+                        )
                     ) AS ambiguous_generation_component,
+                    (
+                        alias_values.generation_alias_count = 1
+                        OR component_generation_keys.generation_key_count = 1
+                    ) AS canonical_generation_known,
                     CASE
-                        WHEN alias_values.generation_aliases IS NOT NULL
+                        WHEN alias_values.generation_alias_count = 1
                             THEN 'generation:' || alias_values.generation_aliases
+                        WHEN alias_values.generation_alias_count > 1
+                            THEN 'attempt:' || scoped.scope_key || ':' || scoped.attempt_id
+                        WHEN component_generation_keys.contested_association
+                          OR component_generation_keys.contradictory_generation_claims
+                            THEN 'uncertainty:' || strong_components.component_key
                         WHEN component_generation_keys.generation_key_count = 1
                             THEN component_generation_keys.generation_key
                         WHEN component_generation_keys.generation_key_count > 1
-                            THEN 'attempt:' || scoped.scope_key || ':'
-                                || scoped.attempt_id
+                            THEN 'uncertainty:' || strong_components.component_key
                         WHEN alias_values.message_aliases IS NOT NULL
                           OR alias_values.branch_aliases IS NOT NULL
                             THEN 'strong:' || strong_components.component_key
@@ -1067,7 +1166,7 @@ class PgLedger:
                   ON alias_values.canonical_scope_key = scoped.canonical_scope_key
                  AND alias_values.scope_key = scoped.scope_key
                  AND alias_values.attempt_id = scoped.attempt_id
-                JOIN strong_components
+                LEFT JOIN strong_components
                   ON strong_components.canonical_scope_key = scoped.canonical_scope_key
                  AND strong_components.scope_key = scoped.scope_key
                  AND strong_components.attempt_id = scoped.attempt_id
@@ -1077,18 +1176,40 @@ class PgLedger:
                  AND component_generation_keys.component_key =
                          strong_components.component_key
             ),
-            canonicalized AS (
-                SELECT DISTINCT ON (canonical_scope_key, identity_key)
-                    identified.*
+            identity_freshness AS (
+                SELECT canonical_scope_key, identity_key, max(observed_at) AS observed_at
                 FROM identified
+                GROUP BY canonical_scope_key, identity_key
+            ),
+            identity_conflicts AS (
+                SELECT
+                    identified.canonical_scope_key, identified.identity_key,
+                    (
+                        count(DISTINCT identified.business_projection) > 1
+                        OR bool_or(identified.projection_payload IS NULL)
+                    ) AS projection_conflict
+                FROM identified
+                JOIN identity_freshness AS freshness
+                  ON freshness.canonical_scope_key = identified.canonical_scope_key
+                 AND freshness.identity_key = identified.identity_key
+                 AND freshness.observed_at = identified.observed_at
+                GROUP BY identified.canonical_scope_key, identified.identity_key
+            ),
+            canonicalized AS (
+                SELECT DISTINCT ON (identified.canonical_scope_key, identified.identity_key)
+                    identified.*, identity_conflicts.projection_conflict
+                FROM identified
+                JOIN identity_conflicts
+                  ON identity_conflicts.canonical_scope_key = identified.canonical_scope_key
+                 AND identity_conflicts.identity_key = identified.identity_key
                 ORDER BY
-                    canonical_scope_key,
-                    identity_key,
+                    identified.canonical_scope_key,
+                    identified.identity_key,
                     observed_at DESC,
                     (COALESCE(quarantine_state, 'unknown') <> 'clear') DESC,
                     revision DESC,
                     last_seen_at DESC,
-                    (scope_key = canonical_scope_key) DESC,
+                    (scope_key = identified.canonical_scope_key) DESC,
                     scope_key,
                     attempt_id
             ),
@@ -1096,7 +1217,7 @@ class PgLedger:
                 SELECT
                     canonicalized.*,
                     CASE
-                        WHEN ambiguous_generation_component
+                        WHEN ambiguous_generation_component OR projection_conflict
                           OR COALESCE(quarantine_state, 'unknown') <> 'clear'
                             THEN 'unknown_identity'
                         WHEN canonical_surface = 'unknown'
@@ -1114,7 +1235,10 @@ class PgLedger:
                           OR canonical_provider_user_id IS NULL
                           OR canonical_workspace_id IS NULL
                           OR canonical_quota_owner_id IS NULL
-                          OR identity_basis IN ('unresolved', 'unknown')
+                          OR (
+                              identity_basis IN ('unresolved', 'unknown')
+                              AND NOT COALESCE(canonical_generation_known, FALSE)
+                          )
                             THEN 'unknown_identity'
                         ELSE 'eligible'
                     END AS evidence_state,
@@ -1862,15 +1986,22 @@ class PgLedgerPage:
             lineage_keys = _scope_lineage(cur, binding.scope_key)
             _lock_scope_lineage(cur, lineage_keys)
             resolution = _resolve_attempt_identity(
-                self,
                 cur,
-                safe_scope,
                 binding.scope_key,
                 safe_attempt,
                 aliases,
                 observed_at,
                 lineage_keys,
             )
+            alias_plan = _plan_attempt_aliases(cur, resolution, aliases, lineage_keys)
+            if alias_plan.generation_conflict:
+                resolution = replace(
+                    resolution,
+                    conflicts=max(1, resolution.conflicts),
+                    quarantine_reason=resolution.quarantine_reason or "ambiguous_attempt_alias",
+                )
+            if resolution.identity_basis is not None and resolution.quarantine_reason is None:
+                safe_attempt = replace(safe_attempt, identity_basis=resolution.identity_basis)
             canonical_ref = resolution.canonical_ref
             effective_id = canonical_ref.attempt_id
             attempt_payload = _attempt_payload(
@@ -1920,7 +2051,12 @@ class PgLedgerPage:
                 and resolution.quarantine_reason is None
             )
             stale = current is not None and observed_at < current["observed_at"]
-            if current is not None and current["projection_fingerprint"] == projection_fingerprint:
+            equal_conflict = current is not None and isinstance(current["payload"], Mapping) and (
+                observed_at == current["observed_at"]
+                and _business_projection(current["payload"]) != _business_projection(attempt_payload)
+                or observed_at <= current["observed_at"] and resolution.tied_projection_conflict
+            )
+            if current is not None and current["projection_fingerprint"] == projection_fingerprint and not equal_conflict:
                 cur.execute(
                     """
                     UPDATE public.chatgpt_usage_attempts
@@ -1937,26 +2073,9 @@ class PgLedgerPage:
                         effective_id,
                     ),
                 )
-                if publish_aliases:
-                    _finalize_identity_merges(
-                        cur,
-                        canonical_ref=canonical_ref,
-                        merge_refs=resolution.merge_refs,
-                        seen_at=observed_at,
-                    )
-                merge_result = (
-                    _merge_attempt_links(
-                        self,
-                        cur,
-                        safe_scope,
-                        scope_key_value=canonical_scope_key,
-                        attempt_id=effective_id,
-                        aliases=aliases,
-                        seen_at=observed_at,
-                        lineage_keys=lineage_keys,
-                    )
-                    if publish_aliases
-                    else AliasMergeResult()
+                merge_result = _publish_attempt_identity(
+                    self, cur, safe_scope, resolution, alias_plan, observed_at,
+                    publish_aliases=publish_aliases,
                 )
                 _record_activity_provenance(
                     cur,
@@ -1974,7 +2093,7 @@ class PgLedgerPage:
                     resolution.conflicts + merge_result.conflicts + merge_result.quarantine_conflicts,
                 )
 
-            if stale:
+            if stale or equal_conflict:
                 return self._record_stale_attempt(
                     cur,
                     safe_scope,
@@ -1982,9 +2101,10 @@ class PgLedgerPage:
                     resolution=resolution,
                     attempt_payload=attempt_payload,
                     projection_fingerprint=projection_fingerprint,
-                    aliases=aliases,
-                    lineage_keys=lineage_keys,
+                    current=current,
+                    alias_plan=alias_plan,
                     publish_aliases=publish_aliases,
+                    equal_conflict=equal_conflict,
                 )
             revision = _next_attempt_revision(cur, canonical_scope_key, effective_id)
             if current is None:
@@ -2071,26 +2191,9 @@ class PgLedgerPage:
                     True,
                 ),
             )
-            if publish_aliases:
-                _finalize_identity_merges(
-                    cur,
-                    canonical_ref=canonical_ref,
-                    merge_refs=resolution.merge_refs,
-                    seen_at=observed_at,
-                )
-            merge_result = (
-                _merge_attempt_links(
-                    self,
-                    cur,
-                    safe_scope,
-                    scope_key_value=canonical_scope_key,
-                    attempt_id=effective_id,
-                    aliases=aliases,
-                    seen_at=observed_at,
-                    lineage_keys=lineage_keys,
-                )
-                if publish_aliases
-                else AliasMergeResult()
+            merge_result = _publish_attempt_identity(
+                self, cur, safe_scope, resolution, alias_plan, observed_at,
+                publish_aliases=publish_aliases,
             )
             _record_activity_provenance(
                 cur,
@@ -2115,9 +2218,10 @@ class PgLedgerPage:
         resolution: AttemptIdentityResolution,
         attempt_payload: Mapping[str, Any],
         projection_fingerprint: str,
-        aliases: Sequence[tuple[str, str]],
-        lineage_keys: Sequence[str],
+        current: Mapping[str, Any],
+        alias_plan: AttemptAliasPlan,
         publish_aliases: bool,
+        equal_conflict: bool,
     ) -> AttemptUpsertResult:
         ref = resolution.canonical_ref
         cur.execute(
@@ -2126,9 +2230,14 @@ class PgLedgerPage:
             FROM public.chatgpt_usage_attempt_revisions
             WHERE scope_key = %s AND attempt_id = %s
               AND projection_fingerprint = %s AND recorded_at = %s
+              AND source_kind = %s AND source_id = %s
+              AND schema_version = %s AND collector_account_id = %s
             LIMIT 1
             """,
-            (ref.scope_key, ref.attempt_id, projection_fingerprint, context.observed_at),
+            (
+                ref.scope_key, ref.attempt_id, projection_fingerprint, context.observed_at,
+                context.source_kind, context.source_id, context.schema_version, scope.collector_account_id,
+            ),
         )
         if cur.fetchone() is None:
             cur.execute(
@@ -2161,25 +2270,15 @@ class PgLedgerPage:
             """,
             (context.observed_at, ref.scope_key, ref.attempt_id),
         )
-        merge_result = AliasMergeResult()
-        if publish_aliases:
-            # Proven older identity can enrich the surviving, fresher projection.
-            _finalize_identity_merges(
-                cur,
-                canonical_ref=ref,
-                merge_refs=resolution.merge_refs,
-                seen_at=context.observed_at,
-            )
-            merge_result = _merge_attempt_links(
-                self,
-                cur,
-                scope,
-                scope_key_value=ref.scope_key,
-                attempt_id=ref.attempt_id,
-                aliases=aliases,
-                seen_at=context.observed_at,
-                lineage_keys=lineage_keys,
-            )
+        _retain_current_attempt(
+            self, cur, ref, current,
+            identity_basis=resolution.identity_basis if publish_aliases else None,
+            equal_conflict=equal_conflict,
+        )
+        merge_result = _publish_attempt_identity(
+            self, cur, scope, resolution, alias_plan, context.observed_at,
+            publish_aliases=publish_aliases,
+        )
         _record_activity_provenance(
             cur,
             ref.scope_key,
@@ -2190,7 +2289,9 @@ class PgLedgerPage:
         )
         return AttemptUpsertResult(
             ref.attempt_id,
-            "quarantined" if _attempt_quarantine_state(attempt_payload) != "clear" else "stale",
+            "quarantined"
+            if equal_conflict or _attempt_quarantine_state(attempt_payload) != "clear"
+            else "stale",
             resolution.conflicts + merge_result.conflicts + merge_result.quarantine_conflicts,
         )
 
@@ -2622,11 +2723,20 @@ def _attempt(
 ) -> Optional[dict[str, Any]]:
     cur.execute(
         """
-        SELECT revision, projection_fingerprint, collector_account_id, tombstone,
-               quarantine_state, identity_basis, observed_at, last_seen_at,
-               superseded_by_attempt_id, superseded_by_scope_key
-        FROM public.chatgpt_usage_attempts
-        WHERE scope_key = %s AND attempt_id = %s
+        SELECT attempts.revision, attempts.projection_fingerprint,
+               attempts.collector_account_id, attempts.tombstone,
+               attempts.quarantine_state, attempts.identity_basis,
+               attempts.observed_at, attempts.last_seen_at,
+               attempts.superseded_by_attempt_id, attempts.superseded_by_scope_key,
+               revisions.payload, revisions.source_kind, revisions.source_id,
+               revisions.run_id, revisions.schema_version
+        FROM public.chatgpt_usage_attempts AS attempts
+        LEFT JOIN public.chatgpt_usage_attempt_revisions AS revisions
+          ON revisions.scope_key = attempts.scope_key
+         AND revisions.attempt_id = attempts.attempt_id
+         AND revisions.revision = attempts.revision
+         AND revisions.projection_fingerprint = attempts.projection_fingerprint
+        WHERE attempts.scope_key = %s AND attempts.attempt_id = %s
         """,
         (scope_key_value, attempt_id),
     )
@@ -2646,6 +2756,11 @@ def _attempt(
                 "last_seen_at",
                 "superseded_by_attempt_id",
                 "superseded_by_scope_key",
+                "payload",
+                "source_kind",
+                "source_id",
+                "run_id",
+                "schema_version",
             ),
             row,
         )
@@ -2776,29 +2891,193 @@ def _retained_attempt_refs(
     return {AttemptRef(str(row[0]), str(row[1])) for row in cur.fetchall()}
 
 
-def _weak_matches_without_generation_anchors(
+def _contested_alias_refs(
     cur: psycopg.Cursor,
-    aliases: Sequence[tuple[str, str]],
-    matches: set[AttemptRef],
     lineage_keys: Sequence[str],
-) -> set[AttemptRef]:
-    if not _attempt_alias_values_for_input(aliases, "generation"):
-        return matches
-    return {
-        matched_ref
-        for matched_ref in matches
-        if not _attempt_alias_values(
-            cur,
-            _follow_superseded_attempt(cur, matched_ref, lineage_keys=lineage_keys)[0],
-            "generation",
+    alias: tuple[str, str],
+) -> tuple[set[AttemptRef], bool]:
+    cur.execute(
+        """
+        SELECT details
+        FROM public.chatgpt_usage_coverage_gaps
+        WHERE scope_key = ANY(%s) AND source_kind = 'attempt_alias'
+          AND reason = 'alias_collision' AND state = 'open'
+          AND details->'alias'->>'kind' = %s
+          AND details->'alias'->>'value' = %s
+        """,
+        (list(lineage_keys), *alias),
+    )
+    refs: set[AttemptRef] = set()
+    gaps = cur.fetchall()
+    for (details,) in gaps:
+        if not isinstance(details, Mapping):
+            continue
+        for participant in _coverage_participants(details.get("participants", [])):
+            if participant.get("scope_key") in lineage_keys and participant.get("attempt_id"):
+                refs.add(AttemptRef(participant["scope_key"], participant["attempt_id"]))
+    return refs, bool(gaps)
+
+
+def _resolved_attempt_rows(
+    cur: psycopg.Cursor,
+    refs: Iterable[AttemptRef],
+    lineage_keys: Sequence[str],
+) -> dict[AttemptRef, Optional[dict[str, Any]]]:
+    rows: dict[AttemptRef, Optional[dict[str, Any]]] = {}
+    for ref in refs:
+        terminal, row = _follow_superseded_attempt(cur, ref, lineage_keys=lineage_keys)
+        rows[terminal] = row
+    return rows
+
+
+def _identity_candidates(
+    cur: psycopg.Cursor,
+    incoming_ref: AttemptRef,
+    incoming_row: Optional[dict[str, Any]],
+    aliases: Sequence[tuple[str, str]],
+    lineage_keys: Sequence[str],
+) -> tuple[dict[AttemptRef, Optional[dict[str, Any]]], Optional[str]]:
+    generations = _attempt_alias_values_for_input(aliases, "generation")
+    if incoming_row is not None:
+        generations |= _attempt_alias_values(cur, incoming_ref, "generation")
+    if len(generations) > 1:
+        return {incoming_ref: incoming_row}, "contradictory_generation_anchors"
+    matches = _matching_alias_refs(
+        cur, lineage_keys, [("generation", value) for value in generations]
+    )
+    retained = (
+        _retained_attempt_refs(cur, lineage_keys, incoming_ref.attempt_id)
+        if incoming_row is None else set()
+    )
+    matches |= retained
+    grouped: set[AttemptRef] = set()
+    weak: set[AttemptRef] = set()
+    contested_input = False
+    for alias in aliases:
+        if alias[0] == "generation":
+            continue
+        owners = _matching_alias_refs(cur, lineage_keys, [alias])
+        contested_refs, contested = _contested_alias_refs(cur, lineage_keys, alias)
+        contested_input |= contested
+        associations = _resolved_attempt_rows(cur, owners | contested_refs, lineage_keys)
+        anchored = {
+            ref: _attempt_alias_values(cur, ref, "generation")
+            for ref in associations
+        }
+        if generations:
+            # An established generation cannot be poisoned by a grouping claim.
+            if alias[0] in {"message", "branch"} and not contested and all(
+                values <= generations for values in anchored.values()
+            ) and all(
+                row is not None and not row["tombstone"] and isinstance(row["payload"], Mapping)
+                for row in associations.values()
+            ):
+                matches.update(associations)
+        elif alias[0] in {"message", "branch"}:
+            grouped.update(associations)
+        else:
+            weak.update(associations)
+    if not generations:
+        matches |= grouped or (set() if retained else weak)
+    if incoming_row is not None:
+        matches.add(incoming_ref)
+    rows = _resolved_attempt_rows(cur, matches, lineage_keys)
+    anchor_sets = [_attempt_alias_values(cur, ref, "generation") for ref in rows]
+    anchors = set().union(*anchor_sets)
+    if contested_input and not generations:
+        return rows, "ambiguous_attempt_alias"
+    if any(len(values) > 1 for values in anchor_sets) or len(anchors | generations) > 1:
+        return rows, "ambiguous_attempt_alias"
+    if not generations and not grouped and not retained and weak:
+        if anchors or len(rows) > 1:
+            return rows, "ambiguous_attempt_alias"
+    if retained and not grouped and len(rows) > 1 and (
+        len(anchors) != 1 or any(not values for values in anchor_sets)
+    ):
+        return rows, "ambiguous_attempt_alias"
+    return rows, None
+
+
+def _business_projection(payload: Mapping[str, Any]) -> dict[str, Any]:
+    business = _without_keys(
+        payload,
+        "attemptId", "identityBasis", "sourceIdentityBasis",
+        "aliases", "evidenceMessageIds",
+    )
+    business.setdefault("sourceTimeBasis", payload.get("timeBasis"))
+    business.setdefault("sourceOutcome", payload.get("outcome"))
+    return business
+
+
+def _retain_current_attempt(
+    page: PgLedgerPage,
+    cur: psycopg.Cursor,
+    ref: AttemptRef,
+    current: Mapping[str, Any],
+    *,
+    identity_basis: Optional[str],
+    equal_conflict: bool,
+) -> None:
+    if not isinstance(current["payload"], Mapping):
+        raise LedgerError("missing current attempt projection")
+    payload = dict(current["payload"])
+    if identity_basis is not None:
+        payload.setdefault("sourceIdentityBasis", payload.get("identityBasis"))
+        payload["identityBasis"] = identity_basis
+    if equal_conflict:
+        warnings = _safe_warning_tokens([
+            *payload.get("warnings", []), "quarantine:equal_time_projection_conflict",
+        ])
+        payload["warnings"] = warnings
+        payload["quarantine"] = _quarantine_envelope(
+            warnings, _normalize_quarantine(payload.get("quarantine"))
         )
-    }
+    fingerprint = fingerprint_value(payload)
+    if fingerprint == current["projection_fingerprint"]:
+        return
+    page.assert_safe_record(payload)
+    revision = _next_attempt_revision(cur, ref.scope_key, ref.attempt_id)
+    cur.execute(
+        """
+        UPDATE public.chatgpt_usage_attempt_revisions
+        SET is_current_projection = FALSE
+        WHERE scope_key = %s AND attempt_id = %s AND is_current_projection
+        """,
+        (ref.scope_key, ref.attempt_id),
+    )
+    cur.execute(
+        """
+        INSERT INTO public.chatgpt_usage_attempt_revisions (
+            scope_key, attempt_id, revision, projection_fingerprint, payload,
+            source_kind, source_id, run_id, schema_version, collector_account_id,
+            recorded_at, is_current_projection
+        ) VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, TRUE)
+        """,
+        (
+            ref.scope_key, ref.attempt_id, revision, fingerprint,
+            json.dumps(payload, separators=(",", ":"), default=str),
+            current["source_kind"], current["source_id"], current["run_id"],
+            current["schema_version"], current["collector_account_id"], current["observed_at"],
+        ),
+    )
+    cur.execute(
+        """
+        UPDATE public.chatgpt_usage_attempts
+        SET revision = %s, projection_fingerprint = %s, identity_basis = %s,
+            quarantine_state = %s, warnings = %s::jsonb
+        WHERE scope_key = %s AND attempt_id = %s
+        """,
+        (
+            revision, fingerprint, payload["identityBasis"],
+            _attempt_quarantine_state(payload),
+            json.dumps(payload["warnings"], separators=(",", ":")),
+            ref.scope_key, ref.attempt_id,
+        ),
+    )
 
 
 def _resolve_attempt_identity(
-    page: PgLedgerPage,
     cur: psycopg.Cursor,
-    scope: LedgerScope,
     scope_key_value: str,
     attempt: AttemptRecord,
     aliases: Sequence[tuple[str, str]],
@@ -2810,174 +3089,37 @@ def _resolve_attempt_identity(
     incoming_ref, incoming_row = _follow_superseded_attempt(
         cur, raw_incoming_ref, lineage_keys=lineage_keys
     )
-    strong_aliases = [alias for alias in aliases if alias[0] in _STRONG_ALIAS_KINDS]
-    weak_aliases = [alias for alias in aliases if alias[0] not in _STRONG_ALIAS_KINDS]
-    strong_matches = _matching_alias_refs(cur, lineage_keys, strong_aliases)
-    retained_matches = (
-        _retained_attempt_refs(cur, lineage_keys, attempt.attempt_id)
-        if incoming_row is None
-        else set()
+    candidate_rows, reason = _identity_candidates(
+        cur, incoming_ref, incoming_row, aliases, lineage_keys
     )
-    if strong_matches or retained_matches:
-        matches = strong_matches | retained_matches
-    else:
-        matches = _matching_alias_refs(cur, lineage_keys, weak_aliases)
-        if matches:
-            matches = _weak_matches_without_generation_anchors(
-                cur, aliases, matches, lineage_keys
-            )
-    matches.discard(raw_incoming_ref)
-    matches.discard(incoming_ref)
-
-    candidate_rows: dict[AttemptRef, dict[str, Any]] = {}
-    missing_refs: set[AttemptRef] = set()
-    for matched_ref in matches:
-        resolved_ref, candidate = _follow_superseded_attempt(
-            cur, matched_ref, lineage_keys=lineage_keys
-        )
-        if candidate is None:
-            missing_refs.add(matched_ref)
-        else:
-            candidate_rows[resolved_ref] = candidate
-    if incoming_row is not None:
-        candidate_rows[incoming_ref] = incoming_row
-
-    if missing_refs:
-        _record_identity_gap(
-            page,
-            cur,
-            scope,
-            scope_key_value,
-            source_id=raw_incoming_ref.attempt_id,
-            reason="alias_to_missing_attempt",
-            details={
-                "participants": [
-                    _attempt_participant(raw_incoming_ref, role="incoming"),
-                    *[
-                        _attempt_participant(ref, role="missing")
-                        for ref in sorted(
-                            missing_refs,
-                            key=lambda item: (item.scope_key, item.attempt_id),
-                        )[:16]
-                    ],
-                ]
-            },
-            seen_at=seen_at,
-        )
+    if any(row is None for row in candidate_rows.values()):
+        reason = reason or "alias_to_missing_attempt"
+    elif any(row["tombstone"] for row in candidate_rows.values()):
+        reason = reason or "alias_to_retired_attempt"
+    elif any(not isinstance(row["payload"], Mapping) for row in candidate_rows.values()):
+        reason = reason or "missing_current_projection"
+    if reason is not None:
         return AttemptIdentityResolution(
             incoming_ref,
-            conflicts=len(missing_refs),
-            quarantine_reason="alias_to_missing_attempt",
+            conflicts=max(1, len(candidate_rows)),
+            quarantine_reason=reason,
+            merge_refs=tuple(candidate_rows),
         )
-
     if not candidate_rows:
-        return AttemptIdentityResolution(incoming_ref)
-
-    incoming_generations = _attempt_alias_values_for_input(aliases, "generation")
-    candidate_generations = {
-        ref: _attempt_alias_values(cur, ref, "generation")
-        for ref in candidate_rows
-    }
-    incompatible = {
-        ref
-        for ref, generations in candidate_generations.items()
-        if generations
-        and incoming_generations
-        and not generations.intersection(incoming_generations)
-    }
-    nonempty_generation_sets = [
-        generations for generations in candidate_generations.values() if generations
-    ]
-    generation_ambiguity = any(
-        not left.intersection(right)
-        for index, left in enumerate(nonempty_generation_sets)
-        for right in nonempty_generation_sets[index + 1 :]
-    )
-    weak_only = not (strong_matches or retained_matches) and bool(matches)
-    weak_selection = (
-        weak_only
-        and (
-            attempt.identity_basis == "generation"
-            or len(candidate_rows) > 1
-            or any(candidate_generations.values())
-        )
-    )
-    retirement_ambiguity = (
-        bool(retained_matches)
-        and not strong_matches
-        and len(candidate_rows) > 1
-        and (
-            len(nonempty_generation_sets) != len(candidate_rows)
-            or not set.intersection(*nonempty_generation_sets)
-        )
-    )
-    if incompatible or generation_ambiguity or weak_selection or retirement_ambiguity:
-        _record_identity_gap(
-            page,
-            cur,
-            scope,
-            scope_key_value,
-            source_id=raw_incoming_ref.attempt_id,
-            reason="ambiguous_attempt_alias",
-            details={
-                "participants": [
-                    _attempt_participant(raw_incoming_ref, role="incoming"),
-                    *[
-                        _attempt_participant(ref, role="candidate")
-                        for ref in sorted(
-                            candidate_rows,
-                            key=lambda item: (item.scope_key, item.attempt_id),
-                        )[:16]
-                    ],
-                ]
-            },
-            seen_at=seen_at,
-        )
         return AttemptIdentityResolution(
             incoming_ref,
-            conflicts=len(candidate_rows),
-            quarantine_reason="ambiguous_attempt_alias",
-        )
-
-    tombstoned = {
-        ref for ref, candidate in candidate_rows.items() if candidate["tombstone"]
-    }
-    if tombstoned:
-        _record_identity_gap(
-            page,
-            cur,
-            scope,
-            scope_key_value,
-            source_id=raw_incoming_ref.attempt_id,
-            reason="alias_to_retired_attempt",
-            details={
-                "participants": [
-                    _attempt_participant(raw_incoming_ref, role="incoming"),
-                    *[
-                        _attempt_participant(ref, role="retired")
-                        for ref in sorted(
-                            tombstoned,
-                            key=lambda item: (item.scope_key, item.attempt_id),
-                        )[:16]
-                    ],
-                ]
-            },
-            seen_at=seen_at,
-        )
-        return AttemptIdentityResolution(
-            incoming_ref,
-            conflicts=len(tombstoned),
-            quarantine_reason="alias_to_retired_attempt",
+            identity_basis="generation"
+            if _attempt_alias_values_for_input(aliases, "generation")
+            else attempt.identity_basis,
         )
 
     def candidate_key(ref: AttemptRef) -> tuple[Any, ...]:
         candidate = candidate_rows[ref]
         return (
-            candidate["observed_at"] is not None,
             candidate["observed_at"],
+            candidate["quarantine_state"] != "clear",
             _identity_rank(str(candidate["identity_basis"])),
             ref.scope_key == scope_key_value,
-            int(candidate["revision"] or 0),
             ref.scope_key,
             ref.attempt_id,
         )
@@ -2988,8 +3130,7 @@ def _resolve_attempt_identity(
         _identity_rank(attempt.identity_basis)
         > _identity_rank(str(candidate["identity_basis"]))
         and str(candidate["identity_basis"]) in {"provisional", "unresolved"}
-        and candidate["observed_at"] is not None
-        and seen_at >= candidate["observed_at"]
+        and seen_at > candidate["observed_at"]
     )
     canonical_ref = incoming_ref if prefer_incoming else canonical_candidate
     merge_refs = tuple(
@@ -3002,6 +3143,18 @@ def _resolve_attempt_identity(
         canonical_ref=canonical_ref,
         conflicts=0,
         merge_refs=merge_refs,
+        identity_basis="generation" if (
+            _attempt_alias_values_for_input(aliases, "generation")
+            or any(_attempt_alias_values(cur, ref, "generation") for ref in candidate_rows)
+        ) else max(
+            [attempt.identity_basis, *[row["identity_basis"] for row in candidate_rows.values()]],
+            key=_identity_rank,
+        ),
+        tied_projection_conflict=len({
+            fingerprint_value(_business_projection(row["payload"]))
+            for row in candidate_rows.values()
+            if row["observed_at"] == candidate["observed_at"]
+        }) > 1,
     )
 
 
@@ -3054,6 +3207,7 @@ def _reassign_attempt_aliases(
     previous_ref: AttemptRef,
     canonical_ref: AttemptRef,
     seen_at: datetime,
+    allowed_aliases: Sequence[tuple[str, str]],
 ) -> None:
     cur.execute(
         """
@@ -3065,6 +3219,8 @@ def _reassign_attempt_aliases(
     )
     aliases = cur.fetchall()
     for alias_kind, alias_value, first_seen_at, last_seen_at in aliases:
+        if (alias_kind, alias_value) not in allowed_aliases:
+            continue
         transfer_seen_at = max(last_seen_at, seen_at)
         if previous_ref.scope_key == canonical_ref.scope_key:
             cur.execute(
@@ -3158,6 +3314,7 @@ def _finalize_identity_merges(
     canonical_ref: AttemptRef,
     merge_refs: Sequence[AttemptRef],
     seen_at: datetime,
+    allowed_aliases: Sequence[tuple[str, str]],
 ) -> None:
     for previous_ref in merge_refs:
         if previous_ref == canonical_ref:
@@ -3167,6 +3324,7 @@ def _finalize_identity_merges(
             previous_ref=previous_ref,
             canonical_ref=canonical_ref,
             seen_at=seen_at,
+            allowed_aliases=allowed_aliases,
         )
         _tombstone_attempt(
             cur,
@@ -3374,6 +3532,90 @@ def _attempt_projection_params(
     )
 
 
+def _plan_attempt_aliases(
+    cur: psycopg.Cursor,
+    resolution: AttemptIdentityResolution,
+    incoming_aliases: Sequence[tuple[str, str]],
+    lineage_keys: Sequence[str],
+) -> AttemptAliasPlan:
+    participants = {resolution.canonical_ref, *resolution.merge_refs}
+    aliases = set(incoming_aliases)
+    for ref in participants:
+        cur.execute(
+            """
+            SELECT alias_kind, alias_value
+            FROM public.chatgpt_usage_attempt_aliases
+            WHERE scope_key = %s AND attempt_id = %s
+            """,
+            (ref.scope_key, ref.attempt_id),
+        )
+        aliases.update((str(kind), str(value)) for kind, value in cur.fetchall())
+    allowed: list[tuple[str, str]] = []
+    conflicts: list[tuple[str, str, tuple[AttemptRef, ...]]] = []
+    for alias in sorted(aliases):
+        owners = _matching_alias_refs(cur, lineage_keys, [alias])
+        contested = False
+        if alias[0] != "generation":
+            contested_refs, contested = _contested_alias_refs(cur, lineage_keys, alias)
+            owners |= contested_refs
+        resolved = _resolved_attempt_rows(cur, owners, lineage_keys)
+        conflicting = set(resolved) - participants
+        if conflicting or contested:
+            conflicts.append((
+                *alias,
+                tuple(sorted(conflicting, key=lambda ref: (ref.scope_key, ref.attempt_id))),
+            ))
+        else:
+            allowed.append(alias)
+    return AttemptAliasPlan(
+        aliases=tuple(allowed),
+        conflicts=tuple(conflicts),
+        generation_conflict=(
+            len(_attempt_alias_values_for_input(tuple(aliases), "generation")) > 1
+            or any(kind == "generation" for kind, _, _ in conflicts)
+        ),
+    )
+
+
+def _publish_attempt_identity(
+    page: PgLedgerPage,
+    cur: psycopg.Cursor,
+    scope: LedgerScope,
+    resolution: AttemptIdentityResolution,
+    plan: AttemptAliasPlan,
+    seen_at: datetime,
+    *,
+    publish_aliases: bool,
+) -> AliasMergeResult:
+    if resolution.quarantine_reason is not None:
+        _record_identity_gap(
+            page, cur, scope, scope_key(scope),
+            source_id=resolution.canonical_ref.attempt_id,
+            reason=resolution.quarantine_reason,
+            details={"participants": [
+                _attempt_participant(resolution.canonical_ref, role="incoming"),
+                *[_attempt_participant(ref, role="candidate") for ref in resolution.merge_refs[:16]],
+            ]},
+            seen_at=seen_at,
+        )
+    if not publish_aliases:
+        return AliasMergeResult()
+    result = _merge_attempt_links(
+        page, cur, scope,
+        scope_key_value=resolution.canonical_ref.scope_key,
+        attempt_id=resolution.canonical_ref.attempt_id,
+        plan=plan, seen_at=seen_at,
+    )
+    _finalize_identity_merges(
+        cur,
+        canonical_ref=resolution.canonical_ref,
+        merge_refs=resolution.merge_refs,
+        seen_at=seen_at,
+        allowed_aliases=plan.aliases,
+    )
+    return result
+
+
 def _merge_attempt_links(
     ledger: PgLedger | PgLedgerPage,
     cur: psycopg.Cursor,
@@ -3381,38 +3623,17 @@ def _merge_attempt_links(
     *,
     scope_key_value: str,
     attempt_id: str,
-    aliases: Sequence[tuple[str, str]],
+    plan: AttemptAliasPlan,
     seen_at: datetime,
-    lineage_keys: Sequence[str],
 ) -> AliasMergeResult:
-    conflicts = 0
-    quarantine_conflicts = 0
     safe_scope = _normalize_scope(scope)
-    safe_aliases = _unique_aliases(aliases)
+    safe_aliases = _unique_aliases(plan.aliases)
     safe_seen_at = _utc_datetime(seen_at, "seen_at")
     ledger.assert_safe_record(safe_aliases)
-    conflicts_by_alias: dict[tuple[str, str], set[AttemptRef]] = {}
-    for alias_kind, safe_value in safe_aliases:
-        existing_refs = _matching_alias_refs(
-            cur,
-            lineage_keys,
-            ((alias_kind, safe_value),),
-        )
-        existing_refs = {
-            _follow_superseded_attempt(cur, ref, lineage_keys=lineage_keys)[0]
-            for ref in existing_refs
-        }
-        existing_refs.discard(AttemptRef(scope_key_value, attempt_id))
-        if existing_refs:
-            conflicts_by_alias[(alias_kind, safe_value)] = existing_refs
-            conflicts += 1
-            quarantine_conflicts += 1 if alias_kind in _STRONG_ALIAS_KINDS else 0
-    if conflicts_by_alias:
-        for (alias_kind, safe_value), existing_refs in conflicts_by_alias.items():
-            existing_ref = sorted(
-                existing_refs,
-                key=lambda item: (item.scope_key, item.attempt_id),
-            )[0]
+    if plan.generation_conflict:
+        raise LedgerError("unresolved generation alias plan")
+    for alias_kind, safe_value, existing_refs in plan.conflicts:
+        for existing_ref in existing_refs:
             _record_alias_collision(
                 ledger,
                 cur,
@@ -3423,14 +3644,7 @@ def _merge_attempt_links(
                 incoming_ref=AttemptRef(scope_key_value, attempt_id),
                 seen_at=safe_seen_at,
             )
-        if quarantine_conflicts:
-            return AliasMergeResult(
-                conflicts=conflicts,
-                quarantine_conflicts=quarantine_conflicts,
-            )
     for alias_kind, safe_value in safe_aliases:
-        if (alias_kind, safe_value) in conflicts_by_alias:
-            continue
         cur.execute(
             """
             SELECT first_seen_at, last_seen_at
@@ -3468,8 +3682,7 @@ def _merge_attempt_links(
             ),
         )
     return AliasMergeResult(
-        conflicts=conflicts,
-        quarantine_conflicts=quarantine_conflicts,
+        conflicts=len(plan.conflicts),
     )
 
 
@@ -3491,16 +3704,42 @@ def _record_alias_collision(
     key = scope_key(safe_scope)
     source_id = f"{safe_alias_kind}:{safe_alias_value}"
     gap_id = stable_id(key, "attempt_alias", source_id, "alias_collision")
+    cur.execute(
+        """
+        SELECT details
+        FROM public.chatgpt_usage_coverage_gaps
+        WHERE scope_key = %s AND source_kind = 'attempt_alias'
+          AND source_id = %s AND reason = 'alias_collision'
+        FOR UPDATE
+        """,
+        (key, source_id),
+    )
+    previous = cur.fetchone()
+    previously_truncated = (
+        previous is not None
+        and isinstance(previous[0], Mapping)
+        and isinstance(previous[0].get("warnings"), list)
+        and "alias_participants_truncated" in previous[0].get("warnings", [])
+    )
+    participants = [
+        _attempt_participant(existing_ref, role="existing"),
+        _attempt_participant(incoming_ref, role="incoming"),
+    ]
+    if previous is not None and isinstance(previous[0], Mapping):
+        participants.extend(_coverage_participants(previous[0].get("participants", [])))
+    participants = list({
+        (participant.get("scope_key"), participant.get("attempt_id")): participant
+        for participant in participants
+    }.values())
     details = _coverage_details_envelope(
         {
             "alias": {
                 "kind": safe_alias_kind,
                 "value": safe_alias_value,
             },
-            "participants": [
-                _attempt_participant(existing_ref, role="existing"),
-                _attempt_participant(incoming_ref, role="incoming"),
-            ],
+            "participants": participants[:32],
+            "warnings": ["alias_participants_truncated"]
+            if len(participants) > 32 or previously_truncated else [],
         }
     )
     ledger.assert_safe_record(
@@ -3720,6 +3959,9 @@ def _attempt_payload(
         "conversationId": attempt.conversation_id,
         "identityBasis": attempt.identity_basis,
         "timeBasis": attempt.time_basis,
+        "sourceIdentityBasis": attempt.source_identity_basis or attempt.identity_basis,
+        "sourceTimeBasis": attempt.source_time_basis or attempt.time_basis,
+        "sourceOutcome": attempt.source_outcome or attempt.outcome,
         "attemptTime": isoformat_utc(attempt.attempt_time),
         "earliestPossibleAt": isoformat_utc(attempt.earliest_possible_at),
         "latestPossibleAt": isoformat_utc(attempt.latest_possible_at),
@@ -3841,8 +4083,8 @@ def _normalize_attempt(
         raise LedgerError("attempt must be an AttemptRecord")
     try:
         revision = int(attempt.revision)
-    except (TypeError, ValueError) as exc:
-        raise LedgerError("attempt revision must be an integer") from exc
+    except (TypeError, ValueError, OverflowError):
+        raise LedgerError("attempt revision must be an integer") from None
     if revision < 1:
         raise LedgerError("attempt revision must be positive")
     return AttemptRecord(
@@ -3874,6 +4116,9 @@ def _normalize_attempt(
         revision=revision,
         warnings=tuple(_safe_warning_tokens(attempt.warnings)),
         quarantine=_normalize_quarantine(attempt.quarantine),
+        source_identity_basis=_optional_token(attempt.source_identity_basis or attempt.identity_basis),
+        source_time_basis=_optional_token(attempt.source_time_basis or attempt.time_basis),
+        source_outcome=_optional_token(attempt.source_outcome or attempt.outcome),
     )
 
 
@@ -4072,6 +4317,10 @@ def _record_observation_collection_counts(projected: dict[str, Any]) -> None:
 
 def _apply_observation_quarantine(projected: dict[str, Any]) -> None:
     quarantine = projected.get("quarantine")
+    outer_state = (
+        _quarantine_state_token(projected["quarantine_state"])
+        if "quarantine_state" in projected else None
+    )
     safety_warnings: list[str] = []
     for warning_key in ("warnings", "quarantine_warnings"):
         warning_values = projected.get(warning_key)
@@ -4081,13 +4330,21 @@ def _apply_observation_quarantine(projected: dict[str, Any]) -> None:
                 for warning in warning_values
                 if isinstance(warning, str) and _is_quarantine_warning(warning)
             )
+    for warning_key in ("quarantine_warning", "quarantine_reason"):
+        warning = projected.get(warning_key)
+        if isinstance(warning, str) and _is_quarantine_warning(warning):
+            safety_warnings.append(warning)
     future_timestamp_quarantined = projected.get("future_timestamp_quarantined") is True
-    if future_timestamp_quarantined or safety_warnings or isinstance(quarantine, Mapping):
+    if future_timestamp_quarantined or safety_warnings or isinstance(quarantine, Mapping) or outer_state is not None:
         envelope = _quarantine_envelope(
             safety_warnings,
             quarantine if isinstance(quarantine, Mapping) else None,
             future_timestamp_quarantined=future_timestamp_quarantined,
         )
+        if outer_state == "quarantined":
+            envelope["state"] = "quarantined"
+        elif outer_state == "unknown" and envelope["state"] == "clear":
+            envelope["state"] = "unknown"
         projected["quarantine"] = envelope
         projected["quarantine_state"] = envelope["state"]
 
@@ -4134,9 +4391,17 @@ def _apply_projection_status(
         projected["projection_status"] = "unrecognized"
     elif (state.incomplete or upstream_incomplete) and projected.get("coverage") != "unrecognized":
         projected["coverage"] = "partial"
-        projected.setdefault("projection_status", "partial")
+        if projected.get("projection_status") != "unsupported_transfer_version":
+            projected["projection_status"] = "partial"
     elif has_truncation and projected.get("projection_status") != "unsupported_transfer_version":
         projected["projection_status"] = "partial"
+    if (
+        state.invalid or state.incomplete or upstream_incomplete or has_truncation
+        or projected.get("projection_status") in {"unsupported_transfer_version", "unrecognized", "partial"}
+        or projected.get("coverage") in {"unrecognized", "partial"}
+    ):
+        if projected.get("exhausted") is True:
+            projected["exhausted"] = False
 
 
 def _project_observation_field(
@@ -4154,7 +4419,7 @@ def _project_observation_field(
         return _DROP
     if key in {"surface", "origin"}:
         return _surface_token(value) if key == "surface" else _origin_token(value)
-    if key == "continuation":
+    if key in {"continuation", "start_cursor", "end_cursor", "next_cursor", "previous_cursor"}:
         projected = _continuation_token(value)
         if projected is _DROP:
             projection_state.mark_incomplete()
@@ -4477,8 +4742,6 @@ def _bounded_object_sequence(
     path: str,
     collection_name: str,
 ) -> Any:
-    if value is None:
-        return None
     if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
         state.mark_incomplete()
         return _DROP
@@ -4508,8 +4771,6 @@ def _bounded_mapping(
     path: str,
     collection_name: str,
 ) -> Any:
-    if value is None:
-        return None
     if not isinstance(value, Mapping):
         state.mark_incomplete()
         return _DROP
@@ -4620,6 +4881,7 @@ def _bounded_projection_truncations(
 ) -> Any:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         state.mark_incomplete()
+        state.mark_truncated(path=path, reason="invalid_truncation_record")
         return _DROP
     out: list[dict[str, Any]] = []
     for index, item in enumerate(value):
@@ -4634,12 +4896,15 @@ def _bounded_projection_truncations(
             break
         if not isinstance(item, Mapping):
             state.mark_incomplete()
+            state.mark_truncated(path=path, reason="invalid_truncation_record")
             continue
         record: dict[str, Any] = {}
         for key in ("path", "reason"):
-            token = _optional_token(item.get(key))
-            if key == "path" and token is None and isinstance(item.get(key), str):
-                token = _projection_path_token(item[key])
+            token = (
+                _projection_path_token(item[key])
+                if key == "path" and isinstance(item.get(key), str)
+                else _optional_token(item.get(key)) if key != "path" else None
+            )
             if token is not None:
                 record[key] = token
         for key in ("retained_count", "source_count"):
@@ -4650,28 +4915,41 @@ def _bounded_projection_truncations(
             record["source_count_lower_bound"] = True
         if "path" in record and "reason" in record:
             out.append(record)
+        else:
+            state.mark_incomplete()
+            state.mark_truncated(path=path, reason="invalid_truncation_record")
     return out
 
 
 def _projection_path_token(value: str) -> Optional[str]:
-    """Validate projector paths without treating path punctuation as identity syntax."""
-    if len(value) > 256 or not value.startswith("$."):
+    """Accept root, indexes and sanitized mapping keys without regex backtracking."""
+    if len(value) > 4096 or not value.startswith("$"):
         return None
-
-    position = 2
+    try:
+        assert_no_secrets(value)
+    except PrivacyError:
+        return None
+    position = 1
     while position < len(value):
-        field_match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", value[position:])
-        if field_match is None:
-            return None
-        position += field_match.end()
-        while position < len(value) and value[position] == "[":
-            index_match = re.match(r"\[[0-9]+\]", value[position:])
-            if index_match is None:
+        if value[position] == ".":
+            position += 1
+            if position == len(value) or not value[position].isascii() or not value[position].isalnum():
                 return None
-            position += index_match.end()
-        if position < len(value) and value[position] != ".":
+            while position < len(value) and (
+                value[position].isascii() and value[position].isalnum()
+                or value[position] in "._:/-"
+            ):
+                position += 1
+        elif value[position] == "[":
+            position += 1
+            start = position
+            while position < len(value) and value[position] in "0123456789":
+                position += 1
+            if position == start or position == len(value) or value[position] != "]":
+                return None
+            position += 1
+        else:
             return None
-        position += 1
     return value
 
 
@@ -4689,7 +4967,13 @@ def _continuation_token(value: Any) -> Any:
     if isinstance(value, bool):
         return _DROP
     if isinstance(value, str):
-        return _optional_token(value)
+        if len(value) > 4096 or any(ord(character) < 32 or ord(character) == 127 for character in value):
+            return _DROP
+        try:
+            assert_no_secrets(value)
+        except PrivacyError:
+            return _DROP
+        return value
     return _safe_number(value)
 
 

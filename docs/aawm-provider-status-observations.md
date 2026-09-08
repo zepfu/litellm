@@ -1012,6 +1012,13 @@ collections after recursive content sanitization. Unknown fields are also
 represented by bounded structural counts and provenance. Secret-like values,
 content, titles, credentials, browser state, and unallowlisted metadata are
 rejected or dropped before persistence.
+Opaque pagination cursors retain their exact bounded value, not identifier
+normalization. A rejected non-null cursor, malformed collection, unsupported
+transfer, or incomplete projection cannot establish exhaustion. Flat and nested
+quarantine indicators combine conservatively. Truncation paths preserve root,
+indexed, and sanitized mapping-key forms; rejected path records retain explicit
+incompleteness without retaining unsafe text. Privacy diagnostics use structural
+positions, never caller paths, rejected keys, or conversion exception text.
 
 Verified identities converge by
 provider/provider-user/workspace/quota-owner/surface; an unverified identity
@@ -1027,20 +1034,28 @@ but cannot drop or change any known provider, user, workspace, quota owner, or
 surface. Compatible refinements retire and redirect prior scopes while
 preserving their attempts and aliases; readers follow those redirects so
 retained history remains visible under the active collector binding. Strong
-generation, message, and branch aliases take
-precedence over weaker request and prompt grouping aliases. Distinct
-generations sharing a weak alias retain their independent generation aliases;
-only the conflicting weak link is withheld. Ambiguous alias
-matches are retained with explicit quarantine state and a coverage gap.
+generation aliases establish generation identity. Message, branch, request,
+and prompt associations cannot override different generation anchors. Distinct
+generations sharing an association retain their independent generation aliases;
+only the contested association is withheld. An unanchored observation cannot
+use that association to select one generation. Multiple different generation
+anchors on one input are contradictory, not a compound identity.
+Alias preflight includes every proposed donor's aliases. Contested associations
+retain coverage-gap evidence before donor retirement.
 Active attempts with stronger identity evidence can retire weaker provisional
 aliases. Retirement records retain the successor's physical scope and attempt
 ID. Aliasless replays consult that retained proof across compatible scope
 lineage; matching live attempt IDs alone do not establish equivalence.
 Duplicate current fingerprints advance the current projection's observation
 watermark. Differing older evidence remains non-current without advancing that
-watermark; an exact fingerprint/timestamp replay adds no further revision, but
-a fresh recurrence can become current. Quarantined evidence cannot transfer
-aliases or retire other attempts.
+watermark; an exact fingerprint/timestamp/source/schema/collector replay adds
+no further revision, but a fresh recurrence can become current. All accepted
+sightings retain collector provenance. Validated identity can strengthen
+without replacing fresher outcome, model, or time evidence. Equal-time
+contradictions retain quarantine; local revision numbers and physical keys
+cannot clear it. Quarantined input cannot transfer aliases or retire attempts.
+Safe source identity/time/outcome tokens remain in revision JSONB separately
+from interpreted classifications, including unknown tokens.
 
 The migration bootstrap creates generation 1 only for collectors with no
 existing binding, selecting one deterministic legacy scope per collector. It
@@ -1063,7 +1078,9 @@ result also exposes excluded non-Chat/shared activity, unknown
 identity/surface/origin/model classes, uncertain outcomes, and observed model
 mismatches. A nongeneration record connected to multiple distinct generation
 identities contributes unknown identity, not another definite attempt; the
-known generations remain independently countable.
+known generations remain independently countable. Anchored generations do not
+connect separate unanchored components. Equal-time conflicting projections
+remain uncertain under the same policy as ingestion.
 
 These tables are independent of `rate_limit_observations`, which remains the
 capacity-only observation store. Source delivery requires separate operational

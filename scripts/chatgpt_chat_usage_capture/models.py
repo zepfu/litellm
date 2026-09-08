@@ -83,6 +83,9 @@ class AttemptRecord:
     revision: int
     warnings: tuple[str, ...]
     quarantine: Optional[Mapping[str, Any]] = None
+    source_identity_basis: Optional[str] = None
+    source_time_basis: Optional[str] = None
+    source_outcome: Optional[str] = None
 
 
 @dataclass(frozen=True)
