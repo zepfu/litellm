@@ -180,6 +180,7 @@ from .aawm_adapter_runtime.provider_call_ledger import (
     current_candidate_context,
     ensure_openai_wire_replay_allowed,
     get_or_create_openai_provider_call_ledger,
+    get_request_provider_call_ledger,
     publish_reservation_metadata,
     record_transport_connection_failure,
     register_active_upstream_response,
@@ -1773,6 +1774,8 @@ def _record_passthrough_hidden_retry_metadata(
     wait_seconds: float,
     final_outcome: Optional[str] = None,
     failure_classification: Optional[str] = None,
+    request: Optional[Request] = None,
+    logical_provider_call_start: Optional[int] = None,
 ) -> None:
     if not isinstance(kwargs, dict):
         return
@@ -1794,14 +1797,31 @@ def _record_passthrough_hidden_retry_metadata(
         attempt_record["status_code"] = status_code
     if failure_classification is not None:
         attempt_record["failure_classification"] = failure_classification
+
+    logical_provider_send_count: Optional[int] = None
+    if request is not None and logical_provider_call_start is not None:
+        request_ledger = get_request_provider_call_ledger(request)
+        if request_ledger is not None:
+            logical_provider_send_count = max(
+                0,
+                request_ledger.logical_provider_calls
+                - logical_provider_call_start,
+            )
+            attempt_record["logical_provider_send_count"] = (
+                logical_provider_send_count
+            )
     attempts.append(attempt_record)
 
-    retry_count = sum(
-        1
-        for record in attempts
-        if isinstance(record, dict)
-        and str(record.get("failure_class") or "").strip().lower() != "success"
-    )
+    if logical_provider_send_count is not None:
+        retry_count = max(0, logical_provider_send_count - 1)
+    else:
+        retry_count = sum(
+            1
+            for record in attempts
+            if isinstance(record, dict)
+            and str(record.get("failure_class") or "").strip().lower()
+            != "success"
+        )
     metadata["aawm_passthrough_hidden_retry_count"] = retry_count
     metadata["aawm_passthrough_hidden_logical_retry_count"] = retry_count
     if final_outcome is not None:
@@ -1864,6 +1884,11 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
     start_monotonic = time.monotonic()
     attempt_number = 0
     last_capacity_exception: Optional[Exception] = None
+    logical_provider_call_start: Optional[int] = None
+    if request is not None:
+        request_ledger = get_request_provider_call_ledger(request)
+        if request_ledger is not None:
+            logical_provider_call_start = request_ledger.logical_provider_calls
     while True:
         attempt_number += 1
         if request is not None:
@@ -1950,6 +1975,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     failure_class="success",
                     wait_seconds=0.0,
                     final_outcome="success_after_retry",
+                    request=request,
+                    logical_provider_call_start=logical_provider_call_start,
                 )
             return result
         except Exception as exc:
@@ -1973,6 +2000,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         else "failed_without_retry"
                     ),
                     failure_classification=failure_classification,
+                    request=request,
+                    logical_provider_call_start=logical_provider_call_start,
                 )
                 _mark_passthrough_hidden_retry_budget_exhausted(
                     kwargs,
@@ -2081,6 +2110,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         wait_seconds=0.0,
                         final_outcome="failed_after_retry",
                         failure_classification=failure_classification,
+                        request=request,
+                        logical_provider_call_start=logical_provider_call_start,
                     )
                     _mark_passthrough_hidden_retry_budget_exhausted(
                         kwargs,
@@ -2127,6 +2158,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         else "failed_without_retry"
                     ),
                     failure_classification=failure_classification,
+                    request=request,
+                    logical_provider_call_start=logical_provider_call_start,
                 )
                 raise
 
@@ -2165,6 +2198,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         else "failed_without_retry"
                     ),
                     failure_classification=failure_classification,
+                    request=request,
+                    logical_provider_call_start=logical_provider_call_start,
                 )
                 _mark_passthrough_hidden_retry_budget_exhausted(
                     kwargs,
@@ -2191,6 +2226,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 failure_class=failure_class,
                 wait_seconds=wait_seconds,
                 failure_classification=failure_classification,
+                request=request,
+                logical_provider_call_start=logical_provider_call_start,
             )
             verbose_proxy_logger.info(
                 "Pass-through %s hidden retry attempt %s/%s after %s; sleeping %.1fs",
@@ -5874,9 +5911,7 @@ async def pass_through_request(  # noqa: PLR0915
         )
     except Exception as e:
         _publish_openai_send_telemetry()
-        if getattr(e, "aawm_openai_wire_replay_blocked", False):
-            clear_active_upstream_response(request)
-        else:
+        if not getattr(e, "aawm_openai_wire_replay_blocked", False):
             await close_active_upstream_response(request)
         custom_headers = ProxyBaseLLMRequestProcessing.get_custom_headers(
             user_api_key_dict=user_api_key_dict,
