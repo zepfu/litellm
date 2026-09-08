@@ -195,7 +195,9 @@ generations remain non-replayable within the process-local registry's existing
 worker replacement or eviction.
 
 Missing retained state and recoverable failure of one live transport do not
-enter shared cooldown evidence or publication. Failed live continuations carry
+enter shared cooldown evidence or publication. Socket EOF after complete frames
+but before an accepted terminal is a transport failure; malformed framing and
+protocol messages do not qualify for this recovery. Failed live continuations carry
 separate invocation, result-write and provider-progress evidence; unknown write
 status is counted conservatively, not reported as no egress. Full-history
 recovery retains the existing single trailing call/output-pair grammar.

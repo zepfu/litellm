@@ -3201,7 +3201,16 @@ class CursorAgentRetainedSession:
                 if provider_response_error is not None:
                     raise provider_response_error
                 self.decoder.finish()
-                result.validate_terminal()
+                # Complete frames followed by socket EOF are transport loss;
+                # malformed framing still fails above as a protocol error.
+                try:
+                    result.validate_terminal()
+                except CursorConnectProtocolError as exc:
+                    raise CursorConnectError(
+                        "Cursor Agent HTTP/2 connection closed before turnEnded "
+                        "or a completed tool call.",
+                        status_code=502,
+                    ) from exc
                 return result
 
             from h2 import events as h2_events
