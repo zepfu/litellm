@@ -47,6 +47,7 @@ OPENAI-007 remains sole function_call id/call_id owner.
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 from typing import Any, Mapping, MutableMapping, Optional, Sequence
 
@@ -446,6 +447,40 @@ def unwrap_encrypted_content_wrappers(encrypted_content: str) -> str:
     return current
 
 
+def _looks_like_encrypted_function_output_string(value: str) -> bool:
+    """Recognize explicit wrappers or structurally valid Fernet ciphertext.
+
+    Plaintext tool output is allowed to begin with ``gAAAA``; require the
+    Fernet version byte, URL-safe base64, and the token's block layout before
+    classifying an unwrapped string as ciphertext.
+    """
+    candidate = value.strip()
+    if not candidate:
+        return False
+    if candidate.startswith((_WRAP_PREFIX, _LITELLM_ENC_PREFIX)):
+        return True
+    if not candidate.startswith("gAAAA"):
+        return False
+
+    try:
+        padding = "=" * (-len(candidate) % 4)
+        decoded = base64.b64decode(
+            (candidate + padding).encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+    except (UnicodeEncodeError, binascii.Error, ValueError):
+        return False
+
+    # Fernet: version (1) + timestamp (8) + IV (16) + ciphertext (>=16,
+    # block-aligned) + HMAC (32).
+    return (
+        len(decoded) >= 73
+        and decoded[0] == 0x80
+        and (len(decoded) - 57) % 16 == 0
+    )
+
+
 def _encrypted_function_output_blob_present(value: Any) -> bool:
     """True when *value* is ChatGPT-bound function-output ciphertext."""
     if isinstance(value, str):
@@ -469,9 +504,8 @@ def _item_has_encrypted_function_output(item: Any) -> bool:
         if _encrypted_function_output_blob_present(item.get("encrypted_content")):
             return True
         output = item.get("output")
-        # Plaintext string/list output is not itself a ciphertext blob.
         if isinstance(output, str):
-            return False
+            return _looks_like_encrypted_function_output_string(output)
         return _encrypted_function_output_blob_present(output)
     if getattr(item, "type", None) != _FUNCTION_CALL_OUTPUT_ITEM_TYPE:
         return False
@@ -481,13 +515,15 @@ def _item_has_encrypted_function_output(item: Any) -> bool:
         return True
     output = getattr(item, "output", None)
     if isinstance(output, str):
-        return False
+        return _looks_like_encrypted_function_output_string(output)
     return _encrypted_function_output_blob_present(output)
 
 
 def _function_call_output_part_is_plaintext(value: Any) -> bool:
     if isinstance(value, str):
-        return bool(value.strip())
+        return bool(value.strip()) and not _looks_like_encrypted_function_output_string(
+            value
+        )
     if isinstance(value, Mapping):
         if str(value.get("type") or "").strip() == _NESTED_ENCRYPTED_CONTENT_PART_TYPE:
             return False
