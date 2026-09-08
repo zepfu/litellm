@@ -104,8 +104,9 @@ reads run off the request event loop. A fingerprint change or route-safety
 deadline evicts the cached snapshot before a later request rebuilds it.
 
 For a provider-returned managed `401` before response bytes are committed,
-alias routing, direct LiteLLM async routes, and OpenAI passthrough can make one
-recovery attempt. The retry uses the exact same request body and the reread
+alias routing, direct LiteLLM async routes, OpenAI passthrough, and Anthropic
+Messages passthrough can make one recovery attempt. The retry uses the exact
+same request body and the reread
 must produce a changed generation with the same derived non-secret account
 identity. An account identity requires explicit account-specific credential
 evidence such as `account_id`, `source_account_id`, or `subject`; client IDs
