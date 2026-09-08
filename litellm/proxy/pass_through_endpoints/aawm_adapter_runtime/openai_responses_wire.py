@@ -1032,10 +1032,11 @@ class OpenAIResponsesBufferedResponse(Response):
         self,
         disposition: OpenAIResponsesWireDisposition,
     ) -> None:
-        await self.wire_trace._finalize_disposition(
-            disposition,
-            self._on_disposition,
-        )
+        finalizer = self.wire_trace._finalize_transport
+        if finalizer is not None:
+            await finalizer(disposition)
+            return
+        await self.wire_trace._finalize_disposition(disposition, self._on_disposition)
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         async def tracked_send(message: Dict[str, Any]) -> None:
