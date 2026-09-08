@@ -286,6 +286,7 @@ _SAFE_STRING_FIELD_NAMES = {
         "category",
         "period",
         "window",
+        "malformed_fields",
     )
 }
 _SAFE_NUMERIC_TOKEN_KEY_MARKERS = (
@@ -316,6 +317,37 @@ _RESET_KEYS = (
     "resetAt",
     "resets_at",
     "resetsAt",
+)
+_MALFORMED_FIELDS_KEY = "_malformed_fields"
+_USAGE_NUMBER_FIELD_NAMES = frozenset(
+    {
+        "remaining",
+        "remaining_count",
+        "left",
+        "limit",
+        "quota",
+        "max",
+        "total",
+        "used",
+        "usage",
+        "consumed",
+    }
+)
+_NAMED_USAGE_COLLECTIONS = frozenset({"model_limits", "limits_progress"})
+_NORMALIZED_IDENTITY_FIELD_NAMES = frozenset(
+    {
+        "feature",
+        "feature_id",
+        "feature_slug",
+        "model",
+        "model_slug",
+        "slug",
+        "id",
+        "name",
+        "key",
+        "code",
+        "type",
+    }
 )
 _CONVERSATION_INIT_MARKERS = {
     "model_limits",
@@ -1360,12 +1392,62 @@ def _redact_mapping(
     redacted_count = 0
     payload: Dict[str, Any] = {}
     schema: Dict[str, Any] = {}
+    malformed_fields: List[str] = []
     items = list(mapping.items())[:MAX_PROJECTION_OBJECT_KEYS]
     parent_normalized = _normalize_key(parent_key) if parent_key else ""
     identity_container = parent_normalized in _ACCOUNT_IDENTITY_CONTAINERS
+    entry_like = any(
+        _normalize_key(key) in _NORMALIZED_IDENTITY_FIELD_NAMES
+        for key in mapping
+    )
     for key, value in items:
         name = str(key)
         normalized = _normalize_key(name)
+        child_parent_key = name
+        if (
+            parent_normalized in _NAMED_USAGE_COLLECTIONS
+            and not entry_like
+            and not isinstance(value, (Mapping, list))
+        ):
+            child_parent_key = "remaining"
+        malformed_usage_field = _malformed_usage_field(
+            child_parent_key,
+            value,
+        )
+        if malformed_usage_field is not None:
+            if (
+                parent_normalized in _NAMED_USAGE_COLLECTIONS
+                and child_parent_key == "remaining"
+                and normalized not in _USAGE_NUMBER_FIELD_NAMES
+            ):
+                marker = {_MALFORMED_FIELDS_KEY: [child_parent_key]}
+                marker_schema = {
+                    _MALFORMED_FIELDS_KEY: {
+                        "kind": "array",
+                        "length": 1,
+                        "state": "present",
+                        "item_kinds": ["slug"],
+                        "projection": [child_parent_key],
+                        "dropped_items": 0,
+                        "truncated": False,
+                    }
+                }
+                payload[name] = marker
+                schema[name] = {
+                    "kind": "object",
+                    "keys": [_MALFORMED_FIELDS_KEY],
+                    "schema_fingerprint": _schema_fingerprint(marker_schema),
+                    "state": "present",
+                    "projection": marker,
+                    "projection_dropped": True,
+                    "truncated": False,
+                }
+            else:
+                payload[name] = None
+                schema[name] = {"kind": "null", "malformed": True}
+                malformed_fields.append(malformed_usage_field)
+            redacted_count += 1
+            continue
         if (
             _is_secret_key(name, value)
             or _is_pii_field_name(name)
@@ -1380,12 +1462,24 @@ def _redact_mapping(
         redacted_value, node, nested_redacted = _redact_value(
             value,
             depth=depth + 1,
-            parent_key=name,
+            parent_key=child_parent_key,
         )
         redacted_count += nested_redacted
         schema[name] = node
         if node.get("kind") != "redacted":
             payload[name] = redacted_value
+    if malformed_fields:
+        marker = sorted(set(malformed_fields))
+        payload[_MALFORMED_FIELDS_KEY] = marker
+        schema[_MALFORMED_FIELDS_KEY] = {
+            "kind": "array",
+            "length": len(marker),
+            "state": "present",
+            "item_kinds": ["slug"],
+            "projection": marker,
+            "dropped_items": 0,
+            "truncated": False,
+        }
     return payload, schema, redacted_count
 
 
@@ -1640,6 +1734,9 @@ def _parse_limits_progress(
     rows: List[Dict[str, Any]] = []
     identities: List[str] = []
     for entry in entries:
+        if _entry_has_malformed_usage_fields(entry):
+            malformed += 1
+            continue
         identity = _entry_identity(entry)
         if identity is None:
             malformed += 1
@@ -1677,6 +1774,9 @@ def _parse_model_limits(
     rows: List[Dict[str, Any]] = []
     identities: List[str] = []
     for entry in entries:
+        if _entry_has_malformed_usage_fields(entry):
+            malformed += 1
+            continue
         identity = _entry_identity(entry) or _safe_identity(entry.get("slug"))
         if identity is None:
             malformed += 1
@@ -1875,6 +1975,17 @@ def _parse_usage_entry(
             "quota_unknown": remaining is None and limit is None and used is None,
         },
     }
+
+
+def _entry_has_malformed_usage_fields(entry: Mapping[str, Any]) -> bool:
+    marker = entry.get(_MALFORMED_FIELDS_KEY)
+    if not isinstance(marker, list):
+        return False
+    return any(
+        isinstance(field_name, str)
+        and _normalize_key(field_name) in _USAGE_NUMBER_FIELD_NAMES
+        for field_name in marker
+    )
 
 
 def _normalize_named_collection(
@@ -2078,6 +2189,18 @@ def _parse_usage_number(value: Any) -> Optional[float]:
     if not isfinite(number) or number < 0:
         return None
     return number
+
+
+def _malformed_usage_field(
+    field_name: Optional[str],
+    value: Any,
+) -> Optional[str]:
+    normalized = _normalize_key(field_name) if field_name else ""
+    if normalized not in _USAGE_NUMBER_FIELD_NAMES:
+        return None
+    if value is None or _parse_usage_number(value) is not None:
+        return None
+    return normalized
 
 
 def _finite_float(value: Any) -> Optional[float]:

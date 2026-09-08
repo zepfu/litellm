@@ -811,6 +811,10 @@ numbers are rejected locally. A wholly malformed collection response does not
 replace a reusable snapshot; usable partial responses and genuinely empty
 collections remain distinct. Projection limits carry explicit truncation
 evidence through file rereads, rather than inferring loss from row counts.
+Malformed numeric fields are retained only as safe field-name markers, so the
+affected entry is excluded while usable sibling entries remain. Browser
+challenge evidence is retained separately from browser-cleanup failures and
+continues to drive the bound-session cooldown.
 
 When `AAWM_CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS` is absent, the sidecar
 preserves legacy file-only mode. That mode covers only the one

@@ -14182,9 +14182,12 @@ def _new_chatgpt_conversation_init_account_coverage(
         "retry_after_seconds": None,
         "telemetry_class": None,
         "telemetry_status": None,
+        "browser_challenge": False,
         "request_body_omitted": None,
         "error_class": None,
         "error_message": None,
+        "cleanup_error_class": None,
+        "cleanup_error_message": None,
     }
 
 
@@ -14210,6 +14213,12 @@ def _set_chatgpt_account_capture_exception(
     coverage: Dict[str, Any],
     exc: Exception,
 ) -> None:
+    coverage["cleanup_error_class"] = _redacted_summary_field(
+        exc.__class__.__name__
+    )
+    coverage["cleanup_error_message"] = _redacted_failure_message(str(exc))
+    collector_telemetry_class = coverage.get("telemetry_class")
+    browser_challenge = coverage.get("browser_challenge") is True
     retry_after_seconds = _chatgpt_conversation_init_retry_after_seconds(
         getattr(exc, "retry_after_seconds", None)
     )
@@ -14228,7 +14237,11 @@ def _set_chatgpt_account_capture_exception(
         capture_status = "dependency_unavailable"
     else:
         stage = "capture"
-        telemetry_class = telemetry_class or "malformed_telemetry"
+        telemetry_class = (
+            collector_telemetry_class
+            if browser_challenge and isinstance(collector_telemetry_class, str)
+            else telemetry_class or "malformed_telemetry"
+        )
         capture_status = "capture_failed"
     status_code = getattr(exc, "status_code", None)
     if isinstance(status_code, int):
@@ -14260,6 +14273,8 @@ def _chatgpt_conversation_init_retry_after_seconds(
 def _chatgpt_conversation_init_is_throttled(
     coverage: Mapping[str, Any],
 ) -> bool:
+    if coverage.get("browser_challenge") is True:
+        return True
     status_code = coverage.get("status_code")
     try:
         if (
@@ -14529,6 +14544,9 @@ def _record_chatgpt_collector_summary(
     )
     coverage["telemetry_class"] = collector_summary.get("telemetry_class")
     coverage["telemetry_status"] = collector_summary.get("telemetry_status")
+    coverage["browser_challenge"] = bool(
+        collector_summary.get("browser_challenge")
+    )
     coverage["request_body_omitted"] = (
         _chatgpt_native_capture_request_body_omitted(collector_summary)
     )
