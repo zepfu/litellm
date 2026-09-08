@@ -150,7 +150,8 @@ sends during the retry operation: the request-ledger send delta minus the
 initial send. A denied reservation is recorded separately as
 `reservation_denied` with no provider-call attempt and cannot become a logical
 retry. Transport connection attempts remain separate evidence; the legacy
-failure-named projection remains available for existing consumers.
+attempts-named projection aliases the failure-only count for existing
+consumers.
 
 ### Tool-schema normalization gate (issue #9)
 

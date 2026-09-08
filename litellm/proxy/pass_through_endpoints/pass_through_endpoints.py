@@ -1853,16 +1853,17 @@ def _record_passthrough_hidden_retry_metadata(
     metadata["aawm_passthrough_hidden_retry_count"] = retry_count
     metadata["aawm_passthrough_hidden_logical_retry_count"] = retry_count
     if final_outcome is not None:
-        if final_outcome.startswith("success"):
-            final_outcome = (
-                "success_after_retry" if retry_count > 0 else "success"
-            )
-        elif final_outcome.startswith("failed"):
-            final_outcome = (
-                "failed_after_retry"
-                if retry_count > 0
-                else "failed_without_retry"
-            )
+        if logical_provider_send_count is not None:
+            if final_outcome.startswith("success"):
+                final_outcome = (
+                    "success_after_retry" if retry_count > 0 else "success"
+                )
+            elif final_outcome.startswith("failed"):
+                final_outcome = (
+                    "failed_after_retry"
+                    if retry_count > 0
+                    else "failed_without_retry"
+                )
         metadata["aawm_passthrough_hidden_retry_final_outcome"] = final_outcome
     if failure_classification is not None:
         metadata[
