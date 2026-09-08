@@ -32,6 +32,9 @@ from litellm.secret_managers.credential_error_sanitizer import (
     DEFAULT_SECRET_FIELD_NAMES,
     sanitize_credential_error_message,
 )
+from litellm.secret_managers.xai_oauth_credentials import (
+    select_xai_oauth_credential_record,
+)
 
 # Portable ~ defaults (expanded via Path.expanduser at use sites).
 DEFAULT_XAI_OAUTH_AUTH_FILE = "~/.litellm/xai/oauth-auth.json"
@@ -570,20 +573,10 @@ def _select_credential_record(
     payload: MutableMapping[str, Any],
     scope: str,
 ) -> MutableMapping[str, Any]:
-    if _looks_like_credential_record(payload):
-        return payload
-
-    scoped_record = payload.get(scope)
-    if isinstance(scoped_record, dict):
-        return scoped_record
-
-    for value in payload.values():
-        if isinstance(value, dict) and _looks_like_credential_record(value):
-            return value
-
-    raise ValueError(
-        "xAI OAuth auth file does not contain a usable credential record. "
-        "Expected a scoped record or a flat object with key/access_token."
+    return select_xai_oauth_credential_record(
+        payload,
+        scope,
+        provider_label="xAI OAuth",
     )
 
 

@@ -2952,6 +2952,115 @@ async def handle_alias_route(  # noqa: PLR0915
                         )
                     deterministically_ineligible_candidate_keys.add(cooldown_key)
                 last_retryable_exc = failure_exc
+                native_grok_recovery_candidate = (
+                    _is_codex_auto_agent_native_grok_4_5_candidate(candidate)
+                )
+                native_grok_cooldown_scope = (
+                    probe_failure_plan.applied_scope
+                    if probe_failure_plan is not None
+                    else "none"
+                )
+                native_grok_retry_eligible = (
+                    _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
+                        is_native_grok_4_5_candidate=(
+                            native_grok_recovery_candidate
+                        ),
+                        has_continuation_state=_provider_owned_continuation(),
+                        error_class=error_class,
+                        cooldown_scope=native_grok_cooldown_scope,
+                    )
+                )
+                if native_grok_retry_eligible:
+                    if failover_ordinal > 0:
+                        provider_candidate_attempts += 1
+                    native_grok_continuation_transient_provider_attempts += 1
+                    (
+                        should_retry_same_candidate,
+                        same_candidate_backoff_seconds,
+                        native_grok_retry_metadata,
+                    ) = _plan_codex_auto_agent_native_grok_continuation_transient_retry(
+                        is_native_grok_4_5_candidate=(
+                            native_grok_recovery_candidate
+                        ),
+                        has_continuation_state=_provider_owned_continuation(),
+                        error_class=error_class,
+                        cooldown_scope=native_grok_cooldown_scope,
+                        provider_attempt=(
+                            native_grok_continuation_transient_provider_attempts
+                        ),
+                        provider=str(candidate.get("provider") or "") or None,
+                        model=str(candidate.get("model") or "") or None,
+                        route_family=str(candidate.get("route_family") or "") or None,
+                        max_attempts=native_grok_continuation_transient_max_attempts,
+                    )
+                    if native_grok_retry_metadata is not None:
+                        attempt_record[
+                            "native_grok_continuation_retry"
+                        ] = native_grok_retry_metadata
+                    error_tokens = _update_codex_auto_agent_retryable_attempt_record(
+                        attempt_record=attempt_record,
+                        exc=failure_exc,
+                        error_class=error_class,
+                        cooldown_seconds=(
+                            probe_failure_plan.duration_seconds
+                            if probe_failure_plan is not None
+                            else 0.0
+                        ),
+                        cooldown_scope=native_grok_cooldown_scope,
+                        alias_model=alias_model,
+                        candidate=candidate,
+                    )
+                    attempt_record["shadow_failure_action"] = (
+                        _error_signals.build_shadow_failure_action_decision_from_exc(
+                            failure_exc,
+                            candidate=candidate,
+                            current_error_class=error_class,
+                            current_cooldown_scope=native_grok_cooldown_scope,
+                            current_status=attempt_record.get("status"),
+                        ).to_observability_dict()
+                    )
+                    _record_auto_agent_alias_attempt_failure(
+                        alias_family=alias_family,
+                        alias_model=alias_model,
+                        request=request,
+                        prepared_request_body=prepared_request_body,
+                        selection=selection,
+                        attempts=attempts,
+                        attempt_record=attempt_record,
+                        error_class=error_class,
+                        add_alias_metadata_fn=add_alias_metadata_fn,
+                    )
+                    verbose_proxy_logger.debug(
+                        "%s auto-agent alias %s target %s/%s hit %s on "
+                        "native continuation attempt %s; cooldown %.1fs scope=%s "
+                        "tokens=%s",
+                        log_label,
+                        alias_model,
+                        candidate["provider"],
+                        candidate["model"],
+                        error_class,
+                        len(attempts),
+                        0.0,
+                        native_grok_cooldown_scope,
+                        sorted(error_tokens),
+                    )
+                    if should_retry_same_candidate:
+                        # Native-grok backoff sleep is NEVER inside the probe lock.
+                        if (
+                            same_candidate_backoff_seconds
+                            and same_candidate_backoff_seconds > 0
+                        ):
+                            await asyncio.sleep(same_candidate_backoff_seconds)
+                        attempt_record = _codex_auto_agent_candidate_public_shape(
+                            candidate,
+                            lane_key=selection.get("lane_key"),
+                            reason="native_grok_continuation_same_candidate_retry",
+                        )
+                        attempt_record["attempted_provider_call"] = False
+                        continue
+                    # Native policy owns terminal behavior after its exact
+                    # request-scoped budget is exhausted.
+                    _raise_terminal_alias_failure(last_retryable_exc)
                 account_slot = _codex_oauth_candidate_slot(candidate)
                 if capacity_retry_coordinator is None:
                     same_account_transient_attempts_by_slot[account_slot] = (
@@ -3168,7 +3277,7 @@ async def handle_alias_route(  # noqa: PLR0915
                         selection=selection,
                         attempt_record=attempt_record,
                         error_class=error_class,
-                        has_continuation_state=has_continuation_state,
+                        has_continuation_state=_provider_owned_continuation(),
                         has_previous_response_id=has_previous_response_id,
                         account_failover_replay_safe=account_failover_replay_safe,
                         provider_status_code=attempt_record.get(
@@ -3188,10 +3297,15 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                 if (
                     error_class == "token_invalidated"
-                    and _provider_owned_continuation()
                     and (
-                        not account_failover_replay_safe
-                        or authenticated_token_pin
+                        (
+                            _provider_owned_continuation()
+                            and not account_failover_replay_safe
+                        )
+                        or (
+                            authenticated_token_pin
+                            and has_continuation_state
+                        )
                     )
                     and not account_failover_planned
                 ):
@@ -3269,10 +3383,10 @@ async def handle_alias_route(  # noqa: PLR0915
                     _provider_owned_continuation()
                     and cooldown_scope != "none"
                     and not account_failover_planned
-                        and not (
-                            error_class == "candidate_unavailable"
-                            and account_failover_replay_safe
-                        )
+                    and not (
+                        error_class == "candidate_unavailable"
+                        and account_failover_replay_safe
+                    )
                 ):
                     attempt_record["status"] = (
                         "terminal_authenticated_continuation_unavailable"
@@ -3388,34 +3502,6 @@ async def handle_alias_route(  # noqa: PLR0915
                     break
                 if failover_ordinal > 0:
                     provider_candidate_attempts += 1
-                native_grok_retry_eligible = _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
-                    is_native_grok_4_5_candidate=(_is_codex_auto_agent_native_grok_4_5_candidate(candidate)),
-                    has_continuation_state=_provider_owned_continuation(),
-                    error_class=error_class,
-                    cooldown_scope=cooldown_scope,
-                )
-                if native_grok_retry_eligible:
-                    native_grok_continuation_transient_provider_attempts += 1
-                    native_grok_provider_attempt = native_grok_continuation_transient_provider_attempts
-                else:
-                    native_grok_provider_attempt = 0
-                (
-                    should_retry_same_candidate,
-                    same_candidate_backoff_seconds,
-                    native_grok_retry_metadata,
-                ) = _plan_codex_auto_agent_native_grok_continuation_transient_retry(
-                    is_native_grok_4_5_candidate=(_is_codex_auto_agent_native_grok_4_5_candidate(candidate)),
-                    has_continuation_state=_provider_owned_continuation(),
-                    error_class=error_class,
-                    cooldown_scope=cooldown_scope,
-                    provider_attempt=native_grok_provider_attempt,
-                    provider=str(candidate.get("provider") or "") or None,
-                    model=str(candidate.get("model") or "") or None,
-                    route_family=str(candidate.get("route_family") or "") or None,
-                    max_attempts=native_grok_continuation_transient_max_attempts,
-                )
-                if native_grok_retry_metadata is not None:
-                    attempt_record["native_grok_continuation_retry"] = native_grok_retry_metadata
                 _record_auto_agent_alias_attempt_failure(
                     alias_family=alias_family,
                     alias_model=alias_model,
@@ -3439,20 +3525,6 @@ async def handle_alias_route(  # noqa: PLR0915
                     cooldown_scope,
                     sorted(error_tokens),
                 )
-                if should_retry_same_candidate:
-                    # Native-grok backoff sleep is NEVER inside the probe lock.
-                    if same_candidate_backoff_seconds and same_candidate_backoff_seconds > 0:
-                        await asyncio.sleep(same_candidate_backoff_seconds)
-                    attempt_record = _codex_auto_agent_candidate_public_shape(
-                        candidate,
-                        lane_key=selection.get("lane_key"),
-                        reason="native_grok_continuation_same_candidate_retry",
-                    )
-                    attempt_record["attempted_provider_call"] = False
-                    continue
-                if native_grok_retry_eligible:
-                    # Same-candidate budget exhausted; do not switch providers.
-                    _raise_terminal_alias_failure(last_retryable_exc)
                 break
 
         finally:

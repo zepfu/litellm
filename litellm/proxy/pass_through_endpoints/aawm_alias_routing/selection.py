@@ -5044,14 +5044,6 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 ),
                 request=request,
             )
-        affinity = _codex_oauth_mod._codex_oauth_resolve_affinity(
-            durable_affinity=durable_affinity,
-            token_affinity=token_affinity,
-            conflict_message=(
-                "Codex OAuth continuation affinity state conflicts "
-                "with durable session ownership."
-            ),
-        )
         session_owner_guard_meta.update(
             {
                 "decision": "compatible_owner",
