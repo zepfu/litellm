@@ -18,6 +18,10 @@ and sanitizer were superseded by the same preserved Stage 2 tree.
 | `src/normalize/reconstruct.ts` | `920c18cc5a`, hardened at `6c1eae83ae`, with local D1-752 reconstruction fixes | Pure generation graph reconstruction and evidence linkage. |
 | `src/accounting/quota.ts` | `fb51bf0287` | Corrected pure quota estimation semantics. |
 | `src/accounting/windows.ts` | `fb51bf0287` | Pure reset-window resolution and interval membership. |
+| `src/scheduler/bridge-store.ts` | `65123441ea` | Durable schedule bridge state and lease/claim persistence contract. |
+| `src/scheduler/interval.ts` | `65123441ea` | Validated interval and due-window calculations. |
+| `src/scheduler/transitions.ts` | `65123441ea` | Pure schedule transitions with cadence and retry provenance. |
+| `src/scheduler/types.ts` | `65123441ea` | Schedule, pending-trigger, and active-trigger contracts. |
 
 `6c1eae83ae` hardened reconstruction behavior in its own tree. The current
 local fixes normalize connected evidence components, avoid backward prompt
@@ -64,11 +68,18 @@ observations, expose
 observations agree. Conflicting recorded/resolved models additionally expose
 `terminal_model_conflict`; message IDs never decide the final model.
 
-The preserved `src/counting/index.ts` pure barrel is the exact f328 module
-surface. `src/counting/report.ts` is staged as a direct module dependency for
-the accepted report contract and is not exported through this barrel until a
-combined review accepts that export delta. The staged pure modules
-deliberately define no transport protocol and connect no live runtime. No
-`ledger/store.ts`, SQLite package dependency, scheduler durable store, old
-standalone CLI, dashboard/API entrypoint, obsolete browser launch, or test
-source was restored.
+The scheduler body is accepted at `65123441ea285e7044d7220b61015a7b87affe13`
+by `gpt_scheduler_651_read_analysis_d1_752_scheduler_345_corrections_md`
+against `3a7f092b0a2e98e90f32ea70f4a53e3c613b19ed`; it preserves cadence,
+retry-count, trigger-kind, identity, resumed, and relative-cooldown contracts.
+The preserved `src/counting/index.ts` pure barrel retains the f328 module
+surface and exports the accepted `src/counting/report.ts` module from
+`4c57167f067e0347d203505bd1449f9ce8a25214`.
+
+The history lifecycle source at
+`bc68b057e1845641615a987da447a67c67c3f146` remains FAILED and awaits its
+replacement review; its native history path is not accepted or activated by
+this integration. The staged pure modules deliberately define no transport
+protocol and connect no live runtime. No `ledger/store.ts`, SQLite package
+dependency, old standalone CLI, dashboard/API entrypoint, obsolete browser
+launch, or test source was restored.
