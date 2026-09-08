@@ -102,6 +102,7 @@ CHATGPT_NATIVE_HISTORY_HOME_URL = "https://chatgpt.com/"
 CHATGPT_NATIVE_HISTORY_INDEX_PATH = "/backend-api/conversations"
 CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH = "8e92854835c4"
 CHATGPT_NATIVE_HISTORY_OBSERVER = "chatgpt_native_history"
+CHATGPT_NATIVE_HISTORY_ROLE_ENV = "AAWM_CHATGPT_NATIVE_HISTORY_ROLE"
 CHATGPT_NATIVE_HISTORY_DEFAULT_TIMEOUT_SECONDS = 150.0
 CHATGPT_NATIVE_HISTORY_MAX_RESPONSE_BYTES = 1_048_576
 # Shared across the history worker and its parent.  A target stays owned until
@@ -5084,6 +5085,8 @@ def _run_oracle_browser_history_observation_in_worker(  # noqa: PLR0915 - bounde
     release_event = context.Event()
     release_control_failed = context.RawValue("b", False)
     creation_url = "about:blank#oracle-native-history-" + os.urandom(16).hex()
+    registration_id = "native-history-" + os.urandom(16).hex()
+    role_marker = "history-observer:" + registration_id
     target_close_budget = min(
         _NATIVE_HISTORY_CLEANUP_RESERVE_SECONDS,
         max(0.0, target_close_budget),
@@ -5108,6 +5111,7 @@ def _run_oracle_browser_history_observation_in_worker(  # noqa: PLR0915 - bounde
             max_response_bytes,
             private_process_group,
             private_process_start_time,
+            role_marker,
             owned_target,
             creation_state,
             creation_url,
@@ -5138,6 +5142,7 @@ def _run_oracle_browser_history_observation_in_worker(  # noqa: PLR0915 - bounde
         operation_start=operation_start,
         target_close_budget=target_close_budget,
         finalization_gate=context.Lock(),
+        registration_id=registration_id,
     )
     registration.cleanup_callback = lambda cleanup_deadline, poll_only=False: (
         _finalize_native_history_registration(
@@ -5476,6 +5481,7 @@ def _native_history_process_reaped(
         _signal_native_history_worker(
             process,
             private_process_group,
+            private_process_start_time,
             signal.SIGTERM,
         )
         return scope_reaped()
@@ -5687,16 +5693,54 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
             registration.released = True
             registration.release_proof = release_proof
 
-        close_registration = registration.close_registration
-        if close_registration is not None and not close_registration.reaped:
-            if not _native_history_process_reaped(
-                close_registration.process,
-                close_registration.private_process_group,
-                close_registration.private_process_start_time,
+        def worker_tree_reaped(
+            process: Any,
+            private_process_group: Any,
+            private_process_start_time: Any,
+            *,
+            phase_poll_only: bool,
+        ) -> bool:
+            if _native_history_process_reaped(
+                process,
+                private_process_group,
+                private_process_start_time,
                 term_deadline=plan["term_deadline"],
                 kill_deadline=plan["kill_deadline"],
                 reap_deadline=plan["reap_deadline"],
-                poll_only=poll_only,
+                poll_only=phase_poll_only,
+            ):
+                return True
+            # The browser driver can outlive its multiprocessing leader. Give
+            # the owning sidecar a chance to signal its retained role-marked
+            # pidfds before declaring the worker tree unreaped.
+            try:
+                lifecycle_capability.terminate_owned_browser(
+                    term_deadline=plan["term_deadline"],
+                    kill_deadline=plan["kill_deadline"],
+                    reap_deadline=plan["reap_deadline"],
+                    final_deadline=plan["final_deadline"],
+                    poll_only=phase_poll_only,
+                )
+            except Exception as exc:
+                registration.cleanup_failure = str(exc)
+                return False
+            return _native_history_process_reaped(
+                process,
+                private_process_group,
+                private_process_start_time,
+                term_deadline=plan["term_deadline"],
+                kill_deadline=plan["kill_deadline"],
+                reap_deadline=plan["reap_deadline"],
+                poll_only=True,
+            )
+
+        close_registration = registration.close_registration
+        if close_registration is not None and not close_registration.reaped:
+            if not worker_tree_reaped(
+                close_registration.process,
+                close_registration.private_process_group,
+                close_registration.private_process_start_time,
+                phase_poll_only=poll_only,
             ):
                 registration.cleanup_failure = (
                     "Native ChatGPT history closer was not reaped."
@@ -5709,14 +5753,11 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
             close_registration.reaped = True
             close_registration.reap_ack.set()
 
-        if not _native_history_process_reaped(
+        if not worker_tree_reaped(
             registration.process,
             registration.private_process_group,
             registration.private_process_start_time,
-            term_deadline=plan["term_deadline"],
-            kill_deadline=plan["kill_deadline"],
-            reap_deadline=plan["reap_deadline"],
-            poll_only=poll_only,
+            phase_poll_only=poll_only,
         ):
             registration.cleanup_failure = (
                 "Native ChatGPT history interception worker was not reaped."
@@ -5772,6 +5813,7 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
     max_response_bytes: int,
     private_process_group: Any,
     private_process_start_time: Any,
+    role_marker: str,
     owned_target: Any,
     creation_state: Any,
     creation_url: str,
@@ -5786,6 +5828,10 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
         private_process_group,
         private_process_start_time,
     )
+    # Install the role marker before Playwright launches any driver process.
+    # The marker is inherited by the actual browser driver and lets the owner
+    # retain its pidfd after this worker exits.
+    os.environ[CHATGPT_NATIVE_HISTORY_ROLE_ENV] = role_marker
     playwright = None
     browser = None
     target_session = None
@@ -6049,6 +6095,14 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
     target_proof = context.RawValue("b", False)
     driver_done = context.Event()
     reap_ack = context.Event()
+    role_marker = (
+        "history-closer:"
+        + (
+            lifecycle_registration.registration_id
+            if lifecycle_registration is not None
+            else os.urandom(16).hex()
+        )
+    )
     process = context.Process(
         target=_oracle_browser_close_target_worker,
         args=(
@@ -6060,6 +6114,7 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
             playwright_factory,
             private_process_group,
             private_process_start_time,
+            role_marker,
             target_proof,
             driver_done,
             lifecycle_registration is not None,
@@ -6187,6 +6242,7 @@ def _oracle_browser_close_target_worker(
     playwright_factory: Optional[Callable[[], Any]],
     private_process_group: Any,
     private_process_start_time: Any,
+    role_marker: str,
     target_proof: Any,
     driver_done: Any,
     require_target_present: bool,
@@ -6196,6 +6252,9 @@ def _oracle_browser_close_target_worker(
         private_process_group,
         private_process_start_time,
     )
+    # Install the role marker before Playwright launches its driver. The
+    # sidecar uses this marker plus pidfds, never a stale parent PID.
+    os.environ[CHATGPT_NATIVE_HISTORY_ROLE_ENV] = role_marker
     playwright = None
     browser = None
     try:
