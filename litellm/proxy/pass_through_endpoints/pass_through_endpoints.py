@@ -221,6 +221,11 @@ _AAWM_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS = (
 )
 _DEFAULT_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS = 600.0
 _AAWM_PASSTHROUGH_STREAM_TIMEOUT_DEFAULT_SOURCE = "compatibility_default"
+_MANAGED_XAI_OAUTH_BLOCKED_PASSTHROUGH_HEADERS = (
+    "authorization",
+    "api-key",
+    "x-api-key",
+)
 
 
 @dataclass(frozen=True)
@@ -3492,6 +3497,30 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         )
 
     @staticmethod
+    def _sanitize_egress_guard_target(url: Union[str, httpx.URL]) -> str:
+        try:
+            parsed_url = urlparse(str(url))
+            hostname = parsed_url.hostname
+            path = parsed_url.path or "/"
+        except (TypeError, ValueError):
+            return "unknown-target"
+        if not hostname:
+            return "unknown-target"
+        return f"{hostname}{path}"
+
+    @staticmethod
+    def _sanitize_egress_guard_detail(
+        detail: str,
+        *,
+        url: Union[str, httpx.URL],
+        safe_target: str,
+    ) -> str:
+        raw_target = str(url)
+        if raw_target and raw_target in detail:
+            return detail.replace(raw_target, safe_target)
+        return detail
+
+    @staticmethod
     def _raise_egress_guard_block(
         *,
         detail: str,
@@ -3500,22 +3529,30 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         target_family: Optional[str],
         marker_families: Optional[set[str]] = None,
     ) -> None:
+        safe_target = HttpPassThroughEndpointHelpers._sanitize_egress_guard_target(
+            url
+        )
+        safe_detail = HttpPassThroughEndpointHelpers._sanitize_egress_guard_detail(
+            detail,
+            url=url,
+            safe_target=safe_target,
+        )
         alert_state = trigger_egress_guard_alert(
-            reason=detail,
-            target=str(url),
+            reason=safe_detail,
+            target=safe_target,
             credential_family=credential_family,
             target_family=target_family,
         )
         verbose_proxy_logger.critical(
             "Egress guard blocked passthrough request: detail=%s target=%s credential_family=%s target_family=%s marker_families=%s trigger_count=%s",
-            detail,
-            str(url),
+            safe_detail,
+            safe_target,
             credential_family,
             target_family,
             sorted(marker_families) if marker_families else [],
             alert_state.get("trigger_count"),
         )
-        raise HTTPException(status_code=500, detail=detail)
+        raise HTTPException(status_code=500, detail=safe_detail)
 
     @staticmethod
     def get_target_provider_family(url: Union[str, httpx.URL]) -> str:
@@ -4680,13 +4717,25 @@ async def pass_through_request(  # noqa: PLR0915
         ):
             register_aawm_route_rollup_access_log_replacement(request)
         url = httpx.URL(target)
+        managed_xai_oauth_egress = (
+            HttpPassThroughEndpointHelpers._is_managed_xai_oauth_egress(
+                egress_credential_family
+            )
+        )
+        effective_blocked_pass_through_prefixed_headers = list(
+            blocked_pass_through_prefixed_headers or []
+        )
+        if managed_xai_oauth_egress:
+            effective_blocked_pass_through_prefixed_headers.extend(
+                _MANAGED_XAI_OAUTH_BLOCKED_PASSTHROUGH_HEADERS
+            )
         headers = HttpPassThroughEndpointHelpers.forward_headers_from_request(
             request_headers=_safe_get_request_headers(request).copy(),
             headers=headers,
             forward_headers=forward_headers,
             allowed_forward_headers=allowed_forward_headers,
             allowed_pass_through_prefixed_headers=allowed_pass_through_prefixed_headers,
-            blocked_pass_through_prefixed_headers=blocked_pass_through_prefixed_headers,
+            blocked_pass_through_prefixed_headers=effective_blocked_pass_through_prefixed_headers,
         )
 
         # Apply default query parameters if provided, regardless of merge_query_params setting
@@ -4711,12 +4760,6 @@ async def pass_through_request(  # noqa: PLR0915
             credential_family=egress_credential_family,
             expected_target_family=expected_target_family,
         )
-        managed_xai_oauth_egress = (
-            HttpPassThroughEndpointHelpers._is_managed_xai_oauth_egress(
-                egress_credential_family
-            )
-        )
-
         endpoint_type: EndpointType = HttpPassThroughEndpointHelpers.get_endpoint_type(
             str(url)
         )

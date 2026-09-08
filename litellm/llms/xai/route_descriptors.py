@@ -7,6 +7,8 @@ from types import MappingProxyType
 from typing import Any, Literal, Mapping, Optional
 from urllib.parse import urlsplit
 
+import httpx
+
 XAIRouteFamily = Literal["xai_oauth_api", "grok_cli_chat_proxy"]
 XAICredentialFamily = Literal["xai_oauth", "xai_grok_oidc"]
 XAIAuthMode = Literal["oauth", "grok_oidc"]
@@ -38,10 +40,16 @@ class XAIRouteDescriptor:
 
 
 def _parse_xai_oauth_url(url: Any, *, label: str) -> Any:
-    if not isinstance(url, str) or not url.strip():
+    if isinstance(url, httpx.URL):
+        raw_url = str(url)
+    elif isinstance(url, str):
+        raw_url = url.strip()
+    else:
+        raw_url = ""
+    if not raw_url:
         raise ValueError(f"{label} must be a non-empty URL.")
 
-    parsed = urlsplit(url.strip())
+    parsed = urlsplit(raw_url)
     if parsed.scheme.lower() != "https":
         raise ValueError(f"{label} must use HTTPS.")
     if (parsed.hostname or "").lower() != XAI_OAUTH_API_HOST:
