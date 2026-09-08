@@ -3067,6 +3067,7 @@ def _responses_input_to_cursor_messages(  # noqa: PLR0915
 def _cursor_messages_with_result_tool_calls(
     messages: list[dict[str, Any]],
     tool_calls: list[Any],
+    assistant_text: Any = None,
 ) -> list[dict[str, Any]]:
     replay_messages = copy.deepcopy(messages)
     _validate_cursor_returned_tool_calls(tool_calls)
@@ -3081,6 +3082,13 @@ def _cursor_messages_with_result_tool_calls(
                 message.get("tool_calls") or message.get("toolCalls"),
                 function_calls,
             )
+    if isinstance(assistant_text, str) and assistant_text:
+        replay_messages.append(
+            {
+                "role": "assistant",
+                "content": assistant_text,
+            }
+        )
     for tool_call in tool_calls:
         replay_messages.append(
             _cursor_function_call_message(tool_call, function_calls)
@@ -3339,6 +3347,7 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             replay_messages = _cursor_messages_with_result_tool_calls(
                 messages,
                 result.tool_calls,
+                result.text,
             )
         except _CursorPostEgressOutputError as exc:
             _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
@@ -3450,6 +3459,7 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             replay_messages = _cursor_messages_with_result_tool_calls(
                 messages,
                 result.tool_calls,
+                result.text,
             )
         except _CursorPostEgressOutputError as exc:
             _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
