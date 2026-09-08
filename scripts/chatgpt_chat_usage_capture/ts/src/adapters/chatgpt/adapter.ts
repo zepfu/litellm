@@ -146,17 +146,26 @@ interface TimestampResult {
 }
 
 interface OriginSource {
-  [key: string]: unknown;
+  value: Record<string, unknown>;
+  context: "observation" | "message" | "metadata";
 }
+
+type ExcludedOrigin = "imported" | "copied" | "shared";
 
 const ORIGIN_EXCLUSION_GROUPS: ReadonlyArray<{
   fields: readonly string[];
-  origin: "imported" | "copied" | "shared";
+  origin: ExcludedOrigin;
 }> = [
   { fields: ["imported"], origin: "imported" },
   { fields: ["copied", "from_copy"], origin: "copied" },
   { fields: ["shared", "from_shared"], origin: "shared" },
 ];
+
+const ORIGIN_BOOLEAN_FIELDS = {
+  observation: ["imported", "copied", "shared"],
+  message: ["imported", "copied", "shared", "from_copy", "from_shared"],
+  metadata: ["imported", "from_copy", "from_shared"],
+} as const;
 
 export interface HistoryTransport {
   request(
@@ -360,6 +369,10 @@ export function adaptConversationIndex(
   }
   const summaries: ConversationSummary[] = [];
   const warnings: string[] = [];
+  const projectionIncomplete = originProjectionIncomplete(payload);
+  if (projectionIncomplete) {
+    warnings.push("origin_evidence_incomplete");
+  }
   for (const item of itemsRaw) {
     if (!isRecord(item)) {
       warnings.push("non-object conversation item");
@@ -381,11 +394,16 @@ export function adaptConversationIndex(
       workspaceId: optionalString(item.workspace_id),
       projectId: optionalString(item.gizmo_id ?? item.project_id),
       surface: classifySurface(item, { default: null }) as Surface,
-      origin: summaryOrigin(item, warnings),
+      origin: summaryOrigin(item, warnings, projectionIncomplete),
       hasVersions:
         typeof item.has_versions === "boolean" ? item.has_versions : null,
       currentNode: optionalString(item.current_node),
-      coverage: updatedAt.warning === null ? "validated_page" : "partial",
+      coverage:
+        updatedAt.warning === null &&
+        !projectionIncomplete &&
+        !originProjectionIncomplete(item)
+          ? "validated_page"
+          : "partial",
     });
   }
 
@@ -574,6 +592,14 @@ export function adaptMessagePage(
   } = options;
   const warnings: string[] = [];
   const records: MessageRecord[] = [];
+  const envelopeOrigin = summaryOrigin(payload, warnings);
+  // Envelopes may exclude contained activity, but cannot establish that an
+  // otherwise unknown message is native.
+  const originConstraint =
+    envelopeOrigin === "unknown" ||
+    (envelopeOrigin !== null && excludedOriginLabel(envelopeOrigin) !== null)
+      ? envelopeOrigin
+      : null;
   const hasMapping = isRecord(payload.mapping);
   const hasMessages = "messages" in payload;
   const messagesRaw = payload.messages;
@@ -583,6 +609,7 @@ export function adaptMessagePage(
       ...iterMappingMessages(payload.mapping as Record<string, unknown>, {
         conversationId,
         warnings,
+        originConstraint,
         conversationSurface: classifySurface(payload, {
           default: conversationSurface,
         }) as Surface,
@@ -594,6 +621,7 @@ export function adaptMessagePage(
         const record = messageFromNode(item, {
           conversationId,
           warnings,
+          originConstraint,
           conversationSurface,
         });
         if (record) {
@@ -716,6 +744,7 @@ function iterMappingMessages(
     conversationId: string;
     warnings: string[];
     conversationSurface: Surface;
+    originConstraint: string | null;
   },
 ): MessageRecord[] {
   const records: MessageRecord[] = [];
@@ -729,6 +758,7 @@ function iterMappingMessages(
       nodeId: String(nodeId),
       warnings: options.warnings,
       conversationSurface: options.conversationSurface,
+      originConstraint: options.originConstraint,
     });
     if (record) {
       records.push(record);
@@ -744,6 +774,7 @@ function messageFromNode(
     nodeId?: string;
     warnings: string[];
     conversationSurface: Surface;
+    originConstraint: string | null;
   },
 ): MessageRecord | null {
   const messageRaw = node.message;
@@ -760,15 +791,32 @@ function messageFromNode(
   const authorRaw = message.author;
   const author: Record<string, unknown> = isRecord(authorRaw) ? authorRaw : {};
   const authorRole = sanitizeToken(author.role);
-  const metadataRaw = message.metadata;
-  const metadataProjection = sanitizeMetadataWithDiagnostics(
-    isRecord(metadataRaw) ? metadataRaw : {},
-  );
+  const metadataProjection = projectOriginMetadata(message, options.warnings);
   const metadata = metadataProjection.metadata;
-  if (metadataProjection.diagnostics.status !== "complete") {
-    options.warnings.push(
-      `metadata_projection_${metadataProjection.diagnostics.status}`,
+  const originSources: OriginSource[] = [
+    { value: message, context: "message" },
+    { value: metadata, context: "metadata" },
+  ];
+  let originIncomplete =
+    metadataProjection.incomplete || originProjectionIncomplete(message);
+  if (node !== message) {
+    const wrapperMetadata = projectOriginMetadata(node, options.warnings);
+    originSources.push(
+      { value: node, context: "message" },
+      { value: wrapperMetadata.metadata, context: "metadata" },
     );
+    originIncomplete ||=
+      wrapperMetadata.incomplete || originProjectionIncomplete(node);
+  }
+  if (options.originConstraint !== null) {
+    originSources.push({
+      value: { origin: options.originConstraint },
+      context: "observation",
+    });
+    originIncomplete ||= options.originConstraint === "unknown";
+  }
+  if (originIncomplete) {
+    options.warnings.push("origin_evidence_incomplete");
   }
 
   const childrenRaw = Array.isArray(node.children)
@@ -827,7 +875,7 @@ function messageFromNode(
       sanitizeToken(metadata.message_request_id),
     requestId: sanitizeToken(metadata.request_id),
     surface: conversationSurface,
-    origin: resolveOriginEvidence([message, node], metadata),
+    origin: resolveOriginEvidence(originSources, originIncomplete),
     metadata,
   };
 }
@@ -1135,66 +1183,123 @@ function optionalString(value: unknown): string | null {
 function summaryOrigin(
   item: Record<string, unknown>,
   warnings: string[],
+  inheritedIncomplete = false,
 ): string | null {
-  const metadataRaw = item.metadata;
-  if (!isRecord(metadataRaw)) {
-    return resolveOriginEvidence([item], {});
+  const metadataProjection = projectOriginMetadata(item, warnings);
+  const incomplete =
+    inheritedIncomplete ||
+    metadataProjection.incomplete ||
+    originProjectionIncomplete(item);
+  if (incomplete) {
+    warnings.push("origin_evidence_incomplete");
   }
-  const metadataProjection = sanitizeMetadataWithDiagnostics(metadataRaw);
+  return resolveOriginEvidence(
+    [
+      { value: item, context: "observation" },
+      { value: metadataProjection.metadata, context: "metadata" },
+    ],
+    incomplete,
+  );
+}
+
+function projectOriginMetadata(
+  source: Record<string, unknown>,
+  warnings: string[],
+): { metadata: Record<string, unknown>; incomplete: boolean } {
+  const raw = source.metadata;
+  if (raw === null || raw === undefined) {
+    return { metadata: {}, incomplete: false };
+  }
+  if (!isRecord(raw)) {
+    warnings.push("metadata_projection_incomplete");
+    return { metadata: {}, incomplete: true };
+  }
+  const metadataProjection = sanitizeMetadataWithDiagnostics(raw);
   if (metadataProjection.diagnostics.status !== "complete") {
     warnings.push(
       `metadata_projection_${metadataProjection.diagnostics.status}`,
     );
   }
-  const metadata = metadataProjection.metadata;
-  return resolveOriginEvidence([item], metadata);
+  return {
+    metadata: metadataProjection.metadata,
+    incomplete: metadataProjection.diagnostics.status !== "complete",
+  };
+}
+
+function originProjectionIncomplete(source: Record<string, unknown>): boolean {
+  const provenance = source.provenance;
+  if (!isRecord(provenance)) {
+    return provenance !== null && provenance !== undefined;
+  }
+  if (
+    provenance.projection_status !== undefined &&
+    provenance.projection_status !== "complete"
+  ) {
+    return true;
+  }
+  const sanitization = provenance.sanitization;
+  return isRecord(sanitization) &&
+    sanitization.status !== undefined &&
+    sanitization.status !== "complete";
 }
 
 function resolveOriginEvidence(
-  roots: ReadonlyArray<OriginSource>,
-  metadata: OriginSource,
+  sources: ReadonlyArray<OriginSource>,
+  incomplete = false,
 ): string | null {
-  const sources = [...roots, metadata];
   for (const group of ORIGIN_EXCLUSION_GROUPS) {
     if (
-      sources.some((source) =>
-        group.fields.some((field) => source[field] === true),
+      sources.some(({ value, context }) =>
+        ORIGIN_BOOLEAN_FIELDS[context].some(
+          (field) => group.fields.includes(field) && value[field] === true,
+        ),
       )
     ) {
       return group.origin;
     }
   }
 
-  let benignOrigin: string | null = null;
-  for (const source of sources) {
-    const label = originLabel(source.origin);
-    if (label === null) {
+  const labels: string[] = [];
+  let malformed = incomplete;
+  for (const { value, context } of sources) {
+    for (const field of ORIGIN_BOOLEAN_FIELDS[context]) {
+      if (Object.hasOwn(value, field) && typeof value[field] !== "boolean") {
+        malformed = true;
+      }
+    }
+    if (value.origin === null || value.origin === undefined) {
       continue;
     }
-    const excludedOrigin = excludedOriginLabel(label);
-    if (excludedOrigin !== null) {
-      return excludedOrigin;
+    const label = sanitizeToken(value.origin);
+    if (label === null) {
+      malformed = true;
+    } else {
+      labels.push(label);
     }
-    benignOrigin ??= label;
   }
-  return benignOrigin;
+
+  for (const group of ORIGIN_EXCLUSION_GROUPS) {
+    if (labels.some((label) => excludedOriginLabel(label) === group.origin)) {
+      return group.origin;
+    }
+  }
+  const first = labels[0];
+  if (
+    malformed ||
+    labels.some((label) => label.toLowerCase() !== first?.toLowerCase())
+  ) {
+    return "unknown";
+  }
+  return first ?? null;
 }
 
-function originLabel(value: unknown): string | null {
-  if (value === true) {
-    return "true";
-  }
-  return sanitizeToken(value);
-}
-
-function excludedOriginLabel(value: string): "imported" | "copied" | "shared" | null {
+function excludedOriginLabel(value: string): ExcludedOrigin | null {
   switch (value.toLowerCase()) {
     case "imported":
       return "imported";
     case "copied":
       return "copied";
     case "shared":
-    case "true":
       return "shared";
     default:
       return null;

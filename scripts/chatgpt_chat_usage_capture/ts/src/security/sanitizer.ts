@@ -192,6 +192,16 @@ const METADATA_BOOLEAN_KEYS = new Set([
 
 const METADATA_NUMBER_KEYS = new Set(["timestamp_"]);
 
+const ORIGIN_FIELD_PRIORITY = new Set([
+  "imported",
+  "copied",
+  "shared",
+  "from_copy",
+  "from_shared",
+  "origin",
+  "metadata",
+]);
+
 const MESSAGE_ALLOWLIST = new Set([
   ...OBSERVATION_ALLOWLIST,
   ...METADATA_ALLOWLIST,
@@ -760,9 +770,9 @@ function projectObject(
     const entries = Object.entries(value);
     const out: Record<string, unknown> = {};
 
-    // Project allowlisted evidence before unknown-field diagnostics so
-    // arbitrary provider fields cannot exhaust the budget first.
-    for (const [rawKey, rawValue] of entries) {
+    // Root flags and metadata origin precede recursive metadata diagnostics,
+    // regardless of the provider's property insertion order.
+    for (const [rawKey, rawValue] of originFirstEntries(value, entries)) {
       const key = String(rawKey);
       if (isExcludedKey(key) || !allowlist.has(key)) {
         continue;
@@ -794,6 +804,22 @@ function projectObject(
 
     return out;
   });
+}
+
+function* originFirstEntries(
+  value: Record<string, unknown>,
+  entries: [string, unknown][],
+): Generator<[string, unknown]> {
+  for (const key of ORIGIN_FIELD_PRIORITY) {
+    if (Object.hasOwn(value, key)) {
+      yield [key, value[key]];
+    }
+  }
+  for (const entry of entries) {
+    if (!ORIGIN_FIELD_PRIORITY.has(entry[0])) {
+      yield entry;
+    }
+  }
 }
 
 function projectField(
@@ -859,10 +885,9 @@ function projectMetadataObject(
     const entries = Object.entries(value);
     const out: Record<string, unknown> = {};
 
-    // Process safety-critical allowlisted metadata before unknown-field
-    // diagnostics so a large unknown subtree cannot consume the traversal
-    // budget and silently drop model/generation evidence.
-    for (const [rawKey, rawValue] of entries) {
+    // Prioritize fixed origin evidence, then remaining allowlisted metadata,
+    // before unknown subtrees can consume the traversal budget.
+    for (const [rawKey, rawValue] of originFirstEntries(value, entries)) {
       const key = String(rawKey);
       if (isExcludedKey(key) || !METADATA_ALLOWLIST.has(key)) {
         continue;

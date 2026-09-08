@@ -67,10 +67,19 @@ Legacy mapping-only detail responses are an established terminal shape and are
 complete only when reached through the capability-approved legacy route.
 Modern mapping-only responses without `page_info` remain partial/unknown with
 no continuation, so they cannot be mistaken for complete history. Message
-and summary metadata flags `imported` and `from_copy` project to `imported`
-and `copied` origins, respectively, before any benign `origin` label; shared
-provenance is handled the same way. These flags remain excluded from ordinary
-Chat accounting.
+and summary origins use one exclusion-dominant resolver. Supported root flags
+`imported`, `copied`, and `shared` and metadata flags `imported`, `from_copy`,
+and `from_shared` require strict booleans; message and mapping-node roots also
+support `from_copy` and `from_shared`. True flags take precedence in the order
+imported, copied, shared, followed by excluding origin labels from any source.
+Distinct mapping wrappers contribute their own flags and metadata without
+merging wrapper metadata into the selected message.
+
+Detail and message-page envelope exclusions constrain both mapping and
+messages-array records. Benign envelope labels never establish native message
+origin. Malformed, conflicting, or incomplete evidence yields unknown unless
+positive exclusion evidence exists. Labels must be strings accepted by
+`sanitizeToken`; retained metadata labels are not rewritten to derived origins.
 
 ### Identity
 
@@ -94,6 +103,10 @@ browser storage, and email addresses are stripped or rejected at the
 persistence boundary. Allowlisted evidence is projected before unknown-field
 diagnostics consume traversal budget, and incomplete projection is propagated
 as a page warning rather than silently losing model or generation metadata.
+Within each object, fixed origin fields and metadata origin are prioritized
+before recursive metadata diagnostics. Adapter origin resolution carries
+incomplete projection provenance from the envelope to contained records, so
+re-projecting retained metadata cannot turn missing evidence into native usage.
 `assertNoSecrets` checks every persisted identity projection before it is
 written.
 
