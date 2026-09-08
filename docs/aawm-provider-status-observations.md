@@ -1046,8 +1046,10 @@ one-shot foreground action, not a recurring schedule. A
 distinct bounded outcome and exits zero.
 
 Unknown mutating requests remain blocked without ending observation of
-already-permitted reads. Known model and conversation-mutation paths still
-stop observation; no additional route or method is permitted or retried.
+already-permitted reads. A blocked-request diagnostic alone does not count as
+an observed history request; expiration without a history request still
+returns `no_history_observed`. Known model and conversation-mutation paths
+still stop observation; no additional route or method is permitted or retried.
 `blocked_request` records the first blocking branch (`mutating_method` or
 `model_or_mutation_path`), a fixed HTTP method, resource type, origin category,
 and route family. Categories distinguish existing bootstrap-read paths,

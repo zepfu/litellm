@@ -4741,7 +4741,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             ):
                 return finalize_capture()
             if _remaining_browser_timeout(capture_deadline) <= 0:
-                if capture:
+                if history_request_count > 0:
                     set_boundary("history_response_timeout")
                     return finalize_capture()
                 return finalize_capture("no_history_observed")
