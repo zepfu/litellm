@@ -151,6 +151,16 @@ observability, routing, authentication, and session metadata remain in the
 separate `litellm_metadata` structure and are never merged into caller
 top-level `metadata`.
 
+## Native Grok OIDC request snapshots
+
+Native Grok routes use immutable, validated snapshots for the OIDC credential
+and the installed client-version cache. File metadata checks, reads, and JSON
+validation run off the request event loop, with one in-flight validation per
+credential or version path. Atomic file replacement invalidates the matching
+snapshot on the next request; missing, malformed, ambiguous-scope, expired,
+or near-expiry records fail closed. LiteLLM does not refresh or write native
+credential files during request handling.
+
 ## OAuth Credential Scope Selection
 
 Managed xAI OAuth and native Grok OIDC credential files must contain the exact
