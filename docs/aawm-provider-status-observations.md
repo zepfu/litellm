@@ -201,6 +201,14 @@ unreadable credential is reported as malformed and unusable until recovery.
 Inspection and operation errors are bounded and redacted before they enter
 events or persisted auth observations.
 
+Managed xAI lifecycle metadata is produced by the same evaluator for request
+readiness, refresh eligibility, and passive health. Sanitized observations may
+include `structurally_valid`, `access_available`, `refresh_possible`,
+`route_usable`, `route_unusable`, `refresh_due`, `terminal_unrefreshable`,
+`lifecycle_state`, `route_unusable_reason`, `route_unusable_at`, and
+`route_safety_buffer_seconds`. `refresh_due` and `route_usable` remain separate
+signals, so proactive refresh does not create a request outage.
+
 The pre-refresh inspection and post-refresh inspection are both retained in
 the scheduler evidence. The post-refresh file is authoritative when a helper
 replaces the credential with an earlier or later expiry. If the post-refresh

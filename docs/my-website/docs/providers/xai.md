@@ -169,6 +169,17 @@ configured values fail closed. Resolution metadata uses a nonsecret
 `credential_identity` derived from the canonical file target and exact scope;
 credential contents and raw paths are never included in that identity.
 
+Managed credential lifecycle is evaluated by one side-effect-free policy shared
+by request readiness, refresh eligibility, and passive health. It reports
+structural validity, access availability, expiry availability, refresh
+possibility, refresh due state, route usability, and terminal unrefreshability.
+The route-safety buffer controls whether an access token may be sent; the
+proactive refresh threshold is a separate value derived from issued lifetime
+and the configured minimum. A credential can therefore be `refresh_due` while
+remaining `route_usable`, and refresh-only, access-only, malformed-expiry, and
+expired records receive distinct lifecycle states. Missing or malformed expiry
+never becomes permanently fresh.
+
 ## Proxy Retry and Quota Behavior
 
 For proxy routes that use Grok, LiteLLM treats these exact upstream responses as
