@@ -49,18 +49,16 @@ def _window(row: Mapping[str, Any], *, now: float, horizon: float) -> dict[str, 
         )
     ):
         reason = "invalid_window"
-    elif row.get("status") != "fresh":
-        reason = "observation_not_fresh"
+    elif row.get("status") not in {"fresh", "stale"}:
+        reason = "invalid_observation_status"
     elif remaining is None or not 0 <= remaining <= 100:
         reason = "invalid_remaining_pct"
-    elif age is None or age < 0 or age > horizon:
+    elif age is None or age < 0:
         reason = "invalid_observation_age"
     elif reset_at is None:
         reason = "missing_reset"
-    elif reset_at <= now:
-        reason = "expired_reset"
     elif observed_at is not None and (
-        reset_at - observed_at > _PERIOD_MINUTES[period] * 60
+        reset_at <= observed_at or reset_at - observed_at > _PERIOD_MINUTES[period] * 60
     ):
         reason = "invalid_reset_window"
     return {
@@ -78,8 +76,15 @@ def _window(row: Mapping[str, Any], *, now: float, horizon: float) -> dict[str, 
         "model": row.get("model"),
         "quota_family": row.get("quota_family"),
         "status": row.get("status"),
-        # Missing reset prevents ranking, not an otherwise fresh confirmed zero.
-        "exhausted": remaining == 0 and reason in {None, "missing_reset"},
+        # Historical quota can rank accounts, but cannot impose a hard block.
+        "exhausted": (
+            remaining == 0
+            and reason in {None, "missing_reset"}
+            and row.get("status") == "fresh"
+            and age is not None
+            and age <= horizon
+            and (reset_at is None or reset_at > now)
+        ),
         "unusable_reason": reason,
     }
 
@@ -93,10 +98,11 @@ def account_evidence(
     now: float,
     horizon: float,
 ) -> dict[str, Any]:
-    """Resolve current logical windows before judging their usability.
+    """Resolve latest logical windows before judging their usability.
 
     Model/quota-key aliases of one account window are not independent capacity.
-    A newer stale or invalid row must shadow older usable comparison evidence.
+    A newer invalid row must shadow older usable comparison evidence.
+    Historical weekly quota can rank accounts without extending hard blocks.
     Local response observations can retain hard exclusions, but only the shared
     poll scope supplies cross-runtime weekly ranking.
     """
@@ -158,10 +164,17 @@ def account_evidence(
         "unusable_reason": (
             weekly["unusable_reason"] if weekly is not None else missing_reason
         ),
+        # Preserve current-window consumers outside weekly account ranking.
         "valid_windows": [
             window
             for window in windows
-            if window["unusable_reason"] is None or window["exhausted"]
+            if (
+                window["unusable_reason"] is None
+                and window["status"] == "fresh"
+                and window["observation_age_seconds"] <= horizon
+                and window["expected_reset_at"] > now
+            )
+            or window["exhausted"]
         ],
     }
 

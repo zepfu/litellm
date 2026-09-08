@@ -348,14 +348,16 @@ including its model, provider, route, reasoning configuration, priority and
 distribution policy. Account balancing then operates only on inventory variants
 of that exact template. Direct requests use the same account policy.
 
-Comparison requires every eligible account to have a fresh `codex_quota_poll`
+Comparison uses each eligible account's latest available `codex_quota_poll`
 weekly observation in the configured shared observation scope and requested
 quota family. Overall and Spark windows are independent. Each window must have
-a valid remaining percentage, an observation age between zero and the poll
-interval (default 600 seconds), consistent seven-day duration, and a current
-reset timestamp. Accounts need not reset together. Duplicate model/quota-key
-rows use the newest logical window; a newer unusable observation does not
-restore an older usable comparison.
+a valid remaining percentage, a nonfuture observation timestamp, consistent
+seven-day duration, and a reset timestamp within that observed window.
+Observation age, `stale` status, and a reset that has since passed do not prevent
+ranking. Original age, status, and reset metadata remain visible; historical
+quota is not relabeled fresh. Accounts need not reset together. Duplicate
+model/quota-key rows use the newest logical window; a newer malformed or
+missing-value observation does not restore an older usable comparison.
 
 When the pool's highest minus lowest remaining percentage is at least
 `AAWM_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_PCT` (default `10`), choose the
@@ -369,11 +371,16 @@ not consumption measurements.
 
 Five-hour and weekly exhaustion, credential eligibility, model support, and
 request-local exclusions remain hard gates. Missing comparison evidence does
-not clear these gates. Cooldown-only last-resort selection records its bypass
-without also reporting the winner as skipped. Account-bound continuations
-retain ownership; ordinary continuations bypass fresh balancing. Only existing
-server-authorized replay permits fresh reselection. Parent-session or
-diagnostic metadata cannot establish ownership of a genuinely fresh request.
+not clear these gates. A zero observation imposes a hard quota exclusion only
+while its status is `fresh`, its age is within the configured poll interval
+(default 600 seconds), and its reset has not passed. A missing reset still
+allows an otherwise fresh confirmed zero to block; old zero values can guide
+ranking but cannot prolong that block. Cooldown-only last-resort selection
+records its bypass without also reporting the winner as skipped. Account-bound
+continuations retain ownership; ordinary continuations bypass fresh balancing.
+Only existing server-authorized replay permits fresh reselection.
+Parent-session or diagnostic metadata cannot establish ownership of a genuinely
+fresh request.
 
 Managed Codex OAuth direct Responses requests preserve canonical session
 ownership and allow at most one replay-safe account move. The guard validates
