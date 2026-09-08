@@ -9,7 +9,7 @@ from typing import Any, Mapping, Optional, Sequence
 
 import psycopg
 
-from .models import AttemptRecord, IngestContext
+from .models import AttemptRecord
 from .privacy import assert_no_secrets, sanitize_metadata, sanitize_token
 from .pg_ledger import (
     LedgerBinding,
@@ -17,6 +17,9 @@ from .pg_ledger import (
     LedgerScope,
     PgLedger,
     PgLedgerPage,
+    IngestContext,
+    _lock_scope_registry,
+    _observation_envelope,
     _assert_active_binding,
     _lock_scope,
     fingerprint_value,
@@ -29,6 +32,38 @@ PROTOCOL_VERSION = 1
 SCHEMA_VERSION = "chatgpt-collector-state-v1"
 MAX_QUEUE_PAGE = 256
 MAX_QUEUE_ITEM_BYTES = 16 * 1024
+MAX_STATE_FIELD_BYTES = 64 * 1024
+STATE_SCHEDULE_KEYS = {
+    "interval",
+    "intervalMs",
+    "anchorAt",
+    "jitterSeconds",
+    "jitterMs",
+    "nextTickIndex",
+    "nextDueAt",
+    "pending",
+    "active",
+    "retryNotBefore",
+    "serverRetryNotBefore",
+    "failureStreak",
+    "authPausedUntil",
+    "lastTriggerAt",
+    "lastCompletedAt",
+    "scope",
+    "stateVersion",
+}
+STATE_TRIGGER_KEYS = {
+    "triggerId",
+    "kind",
+    "missedCount",
+    "dueAt",
+    "jitterMs",
+    "claimedAt",
+    "fencingToken",
+    "state",
+    "runId",
+}
+STATE_FORBIDDEN_KEYS = {"title", "body", "content", "text"}
 
 
 @dataclass(frozen=True)
@@ -143,6 +178,9 @@ class PgCollectorState:
             "activeTrigger": active_trigger,
         }
         self.assert_safe_record(payload)
+        _validate_state_field("scheduleTransition", schedule_transition, STATE_SCHEDULE_KEYS)
+        _validate_state_field("checkpoint", checkpoint, None)
+        _validate_state_field("activeTrigger", active_trigger, STATE_TRIGGER_KEYS)
         now = datetime.now(timezone.utc)
         with self.ledger.connect() as conn, conn.cursor() as cur:
             self._require_active_lease(
@@ -160,6 +198,11 @@ class PgCollectorState:
                 if current.state_version != expected_state_version:
                     raise LedgerError("collector state version is stale")
                 state_version = current.state_version + 1
+            next_schedule = (
+                schedule_transition if schedule_transition is not None else current.schedule_transition
+            )
+            next_checkpoint = checkpoint if checkpoint is not None else current.checkpoint
+            next_trigger = active_trigger if active_trigger is not None else current.active_trigger
             cur.execute(
                 """
                 INSERT INTO public.chatgpt_usage_collector_state (
@@ -177,9 +220,9 @@ class PgCollectorState:
                     profile,
                     account,
                     state_version,
-                    _json(schedule_transition),
-                    _json(checkpoint),
-                    _json(active_trigger),
+                    _json(next_schedule),
+                    _json(next_checkpoint),
+                    _json(next_trigger),
                     now,
                 ),
             )
@@ -187,9 +230,9 @@ class PgCollectorState:
                 profile,
                 account,
                 state_version,
-                schedule_transition,
-                checkpoint,
-                active_trigger,
+                next_schedule,
+                next_checkpoint,
+                next_trigger,
                 now,
             )
 
@@ -338,7 +381,13 @@ class PgCollectorState:
             self._validate_ingest_operation(operation)
         for mutation in candidate_mutations:
             self.assert_safe_record(mutation)
-        fingerprint = fingerprint_value(canonical_payload)
+        fingerprint = fingerprint_value(
+            {
+                "payload": canonical_payload,
+                "ingestOperations": list(ingest_operations),
+                "candidateMutations": list(candidate_mutations),
+            }
+        )
         with self.ledger.connect() as conn, conn.cursor() as cur:
             self._require_active_lease(
                 cur,
@@ -346,6 +395,7 @@ class PgCollectorState:
                 profile_id=profile,
                 expected=lease,
             )
+            _lock_scope_registry(cur)
             binding = self._binding_for_scope(cur, scope, account, lease.binding)
             _lock_scope(cur, binding.scope_key)
             cur.execute(
@@ -417,7 +467,8 @@ class PgCollectorState:
         collector_account_id: str,
         conversation_id: str,
         limit: int = 32,
-    ) -> tuple[Mapping[str, Any], ...]:
+        cursor: Optional[str] = None,
+    ) -> Mapping[str, Any]:
         account = _account(collector_account_id)
         conversation = _token(conversation_id, "conversation_id")
         if limit <= 0 or limit > MAX_QUEUE_PAGE:
@@ -425,27 +476,124 @@ class PgCollectorState:
         with self.ledger.connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT observation.payload
+                SELECT scope_key, binding_generation
+                FROM public.chatgpt_usage_scope_bindings
+                WHERE collector_account_id = %s AND binding_state = 'active'
+                FOR SHARE
+                """,
+                (account,),
+            )
+            active_bindings = cur.fetchall()
+            if not active_bindings:
+                return {
+                    "schemaVersion": SCHEMA_VERSION,
+                    "items": (),
+                    "totalAttempts": 0,
+                    "returnedAttempts": 0,
+                    "hasMore": False,
+                    "truncated": False,
+                }
+            cur.execute(
+                """
+                WITH RECURSIVE canonical_scope(scope_key) AS (
+                    SELECT binding.scope_key
+                    FROM public.chatgpt_usage_scope_bindings AS binding
+                    WHERE binding.collector_account_id = %s
+                      AND binding.binding_state = 'active'
+                    UNION
+                    SELECT redirect.retired_scope_key
+                    FROM public.chatgpt_usage_scope_redirects AS redirect
+                    JOIN canonical_scope
+                      ON canonical_scope.scope_key = redirect.canonical_scope_key
+                )
+                SELECT COUNT(*)
                 FROM public.chatgpt_usage_observations AS observation
-                JOIN public.chatgpt_usage_scope_bindings AS binding
-                  ON binding.scope_key = observation.scope_key
-                 AND binding.binding_state = 'active'
                 WHERE observation.collector_account_id = %s
                   AND observation.conversation_id = %s
                   AND observation.is_current_projection
+                  AND observation.scope_key IN (SELECT scope_key FROM canonical_scope)
+                """,
+                (account, account, conversation),
+            )
+            total = int(cur.fetchone()[0])
+            cur.execute(
+                """
+                WITH RECURSIVE canonical_scope(scope_key) AS (
+                    SELECT binding.scope_key
+                    FROM public.chatgpt_usage_scope_bindings AS binding
+                    WHERE binding.collector_account_id = %s
+                      AND binding.binding_state = 'active'
+                    UNION
+                    SELECT redirect.retired_scope_key
+                    FROM public.chatgpt_usage_scope_redirects AS redirect
+                    JOIN canonical_scope
+                      ON canonical_scope.scope_key = redirect.canonical_scope_key
+                )
+                SELECT observation.payload
+                FROM public.chatgpt_usage_observations AS observation
+                WHERE observation.collector_account_id = %s
+                  AND observation.conversation_id = %s
+                  AND observation.is_current_projection
+                  AND observation.scope_key IN (SELECT scope_key FROM canonical_scope)
+                  AND (%s::text IS NULL OR observation.observation_id > %s::text)
                 ORDER BY observation.observed_at DESC
                 LIMIT %s
                 """,
-                (account, conversation, limit),
+                (account, account, conversation, cursor, cursor, limit + 1),
             )
-            return tuple(dict(row[0]) for row in cur.fetchall())
+            rows = cur.fetchall()
+            has_more = len(rows) > limit
+            next_cursor = None
+            if has_more:
+                next_cursor = _token(
+                    rows[limit - 1][0].get("observationId") or rows[limit - 1][0].get("id"),
+                    "observation_id",
+                )
+                rows = rows[:limit]
+            items = tuple(dict(row[0]) for row in rows)
+            for item in items:
+                if item.get("observationId") is not None:
+                    item["observationId"] = _token(item["observationId"], "observation_id")
+            return {
+                "schemaVersion": SCHEMA_VERSION,
+                "items": items,
+                "totalAttempts": total,
+                "returnedAttempts": len(items),
+                "hasMore": has_more,
+                "truncated": has_more,
+                "cursor": next_cursor,
+            }
 
-    def load_report_snapshot(self, *, collector_account_id: str, limit: int = 256) -> Mapping[str, Any]:
+    def load_report_snapshot(
+        self,
+        *,
+        collector_account_id: str,
+        limit: int = 256,
+        cursor: Optional[str] = None,
+    ) -> Mapping[str, Any]:
         account = _account(collector_account_id)
         if limit <= 0 or limit > MAX_QUEUE_PAGE:
             raise LedgerError("report snapshot limit is outside the supported range")
         counts = self.ledger.count_attempts(account)
         with self.ledger.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(array_agg(DISTINCT scope_key), ARRAY[]::text[])
+                FROM public.chatgpt_usage_attempts
+                WHERE collector_account_id = %s
+                """,
+                (account,),
+            )
+            scope_keys = tuple(str(value) for value in cur.fetchone()[0])
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM public.chatgpt_usage_attempts
+                WHERE collector_account_id = %s AND NOT tombstone
+                """,
+                (account,),
+            )
+            total_attempts = int(cur.fetchone()[0])
             cur.execute(
                 """
                 SELECT attempt.scope_key, attempt.attempt_id,
@@ -466,23 +614,40 @@ class PgCollectorState:
                 WHERE attempt.collector_account_id = %s
                   AND NOT attempt.tombstone
                 ORDER BY attempt.scope_key, attempt.attempt_id
+                OFFSET COALESCE(%s::bigint, 0)
                 LIMIT %s
                 """,
-                (account, limit),
+                (account, cursor, limit + 1),
             )
             rows = cur.fetchall()
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            next_cursor = str(limit + int(cursor or 0)) if has_more else None
         attempts = tuple(self._attempt_snapshot(row) for row in rows)
         return {
+            "snapshotVersion": 1,
             "schemaVersion": SCHEMA_VERSION,
             "collectorAccountId": account,
-            "counts": counts,
+            "asOf": datetime.now(timezone.utc).isoformat(),
+            "counts": _usage_counts_payload(counts),
+            "coverage": {
+                "timeWindow": None,
+                "truncated": has_more,
+                "capped": has_more,
+                "totalAttempts": total_attempts,
+                "returnedAttempts": len(attempts),
+            },
+            "scope": {
+                "collectorAccountId": account,
+                "scopeKeys": list(scope_keys),
+            },
+            "quarantine": {
+                "quarantined": counts.excluded_non_generation,
+                "unknown": counts.unknown_model,
+                "clear": max(0, total_attempts - counts.excluded_non_generation - counts.unknown_model),
+            },
             "attempts": attempts,
-            "coverageIncomplete": bool(
-                counts.unknown_time
-                or counts.unknown_identity
-                or counts.unknown_surface
-                or counts.unknown_model
-            ),
+            "cursor": next_cursor,
         }
 
     def read_candidates(
@@ -547,15 +712,25 @@ class PgCollectorState:
                 profile_id=lease.profile_id,
                 expected=lease,
             )
+            self._transition_active_run(
+                cur,
+                lease,
+                safe_run,
+                state="idle",
+            )
             cur.execute(
                 """
                 UPDATE public.chatgpt_usage_collector_state
-                SET active_trigger =
-                        jsonb_build_object('state', 'idle', 'runId', %s),
-                    updated_at = NOW()
+                SET active_trigger = %s::jsonb,
+                    updated_at = NOW(),
+                    state_version = state_version + 1
                 WHERE profile_id = %s AND collector_account_id = %s
                 """,
-                (safe_run, lease.profile_id, lease.collector_account_id),
+                (
+                    _json({"state": "idle", "runId": safe_run}),
+                    lease.profile_id,
+                    lease.collector_account_id,
+                ),
             )
         self.release_lease(lease=lease)
 
@@ -568,15 +743,25 @@ class PgCollectorState:
                 profile_id=lease.profile_id,
                 expected=lease,
             )
+            self._transition_active_run(
+                cur,
+                lease,
+                safe_run,
+                state="cancelled",
+            )
             cur.execute(
                 """
                 UPDATE public.chatgpt_usage_collector_state
-                SET active_trigger =
-                        jsonb_build_object('state', 'cancelled', 'runId', %s),
-                    updated_at = NOW()
+                SET active_trigger = %s::jsonb,
+                    updated_at = NOW(),
+                    state_version = state_version + 1
                 WHERE profile_id = %s AND collector_account_id = %s
                 """,
-                (safe_run, lease.profile_id, lease.collector_account_id),
+                (
+                    _json({"state": "cancelled", "runId": safe_run}),
+                    lease.profile_id,
+                    lease.collector_account_id,
+                ),
             )
         self.release_lease(lease=lease)
 
@@ -649,6 +834,24 @@ class PgCollectorState:
             "verified",
         )
 
+    def _transition_active_run(
+        self,
+        cur: psycopg.Cursor,
+        lease: CollectorLease,
+        run_id: str,
+        *,
+        state: str,
+    ) -> None:
+        current = self._load_header(
+            cur,
+            lease.collector_account_id,
+            lease.profile_id,
+            lock=True,
+        )
+        trigger = current.active_trigger if current else None
+        if not isinstance(trigger, Mapping) or str(trigger.get("runId")) != run_id:
+            raise LedgerError("collector run is not active")
+
     def _require_active_lease(
         self,
         cur: psycopg.Cursor,
@@ -680,7 +883,9 @@ class PgCollectorState:
             raise LedgerError("collector lease fence is stale")
 
     @staticmethod
-    def _checkpoint_from_canonical(payload: Mapping[str, Any]) -> dict[str, Any]:
+    def _checkpoint_from_canonical(payload: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+        if "checkpoint" not in payload:
+            return None
         checkpoint = payload.get("checkpoint")
         return dict(checkpoint) if isinstance(checkpoint, Mapping) else {}
 
@@ -689,7 +894,7 @@ class PgCollectorState:
         cur: psycopg.Cursor,
         lease: CollectorLease,
         *,
-        checkpoint: Mapping[str, Any],
+        checkpoint: Optional[Mapping[str, Any]],
     ) -> CollectorStateHeader:
         current = self._load_header(
             cur,
@@ -699,6 +904,7 @@ class PgCollectorState:
         )
         next_version = current.state_version + 1 if current else 1
         schedule_transition = current.schedule_transition if current else None
+        prior_checkpoint = current.checkpoint if current else None
         active_trigger = current.active_trigger if current else None
         now = datetime.now(timezone.utc)
         cur.execute(
@@ -712,13 +918,13 @@ class PgCollectorState:
                 checkpoint = EXCLUDED.checkpoint,
                 updated_at = EXCLUDED.updated_at
             """,
-            (
-                lease.profile_id,
-                lease.collector_account_id,
-                next_version,
-                _json(schedule_transition),
-                _json(checkpoint),
-                _json(active_trigger),
+                (
+                    lease.profile_id,
+                    lease.collector_account_id,
+                    next_version,
+                    _json(schedule_transition),
+                    _json(checkpoint if checkpoint is not None else prior_checkpoint),
+                    _json(active_trigger),
                 now,
             ),
         )
@@ -744,7 +950,7 @@ class PgCollectorState:
         accepted = 0
         for operation in operations:
             kind = str(operation["kind"])
-            safe_operation = _safe_operation(operation)
+            safe_operation = self._safe_operation(operation)
             self.assert_safe_record(safe_operation)
             if kind == "observation":
                 context = IngestContext(
@@ -845,7 +1051,13 @@ class PgCollectorState:
         candidate_key = _token(mutation.get("candidateKey"), "candidate_key")
         operation = _enum(mutation.get("operation"), {"replace", "remove"}, "candidate_operation")
         payload = mutation.get("payload")
-        safe_payload = sanitize_metadata(payload if isinstance(payload, Mapping) else {})
+        safe_payload = {
+            "candidateKey": candidate_key,
+            "operation": operation,
+            "payload": _observation_envelope(payload) if isinstance(payload, Mapping) else {},
+            "hasMore": bool(mutation.get("hasMore", False)),
+        }
+        assert_no_secrets(safe_payload)
         serialized = _json(safe_payload)
         if len(serialized.encode("utf-8")) > MAX_QUEUE_ITEM_BYTES:
             raise LedgerError("collector candidate payload exceeds the supported bound")
@@ -939,27 +1151,82 @@ def _json(value: Optional[Mapping[str, Any]]) -> str:
     return json.dumps(value or {}, separators=(",", ":"), default=str)
 
 
-def _safe_operation(operation: Mapping[str, Any]) -> dict[str, Any]:
-    safe = {
-        key: value
-        for key, value in operation.items()
-        if key not in {"payload", "aliases", "quarantine", "details"}
+def _usage_counts_payload(counts: Any) -> dict[str, Any]:
+    return {
+        "total": counts.total,
+        "completed": counts.completed,
+        "ambiguous": counts.ambiguous,
+        "unknown": {
+            "time": counts.unknown_time,
+            "identity": counts.unknown_identity,
+            "surface": counts.unknown_surface,
+            "origin": counts.unknown_origin,
+            "model": counts.unknown_model,
+        },
+        "excluded": {
+            "surface": counts.excluded_surface,
+            "origin": counts.excluded_origin,
+            "nonGeneration": counts.excluded_non_generation,
+        },
+        "uncertainOutcome": counts.uncertain_outcome,
+        "observedModelMismatches": counts.observed_model_mismatches,
+        "byRequestedFamily": counts.by_requested_family,
+        "byRecordedFinalFamily": counts.by_recorded_final_family,
+        "byResolvedFamily": counts.by_resolved_family,
+        "byRequestedModelRaw": counts.by_requested_model_raw,
+        "byRecordedFinalModelRaw": counts.by_recorded_final_model_raw,
+        "byResolvedModelRaw": counts.by_resolved_model_raw,
     }
-    if isinstance(operation.get("payload"), Mapping):
-        safe["payload"] = sanitize_metadata(operation["payload"])
-    if isinstance(operation.get("aliases"), Sequence) and not isinstance(
-        operation.get("aliases"), str
-    ):
-        safe["aliases"] = [
-            {
-                "kind": _token(alias.get("kind"), "alias.kind"),
-                "value": _token(alias.get("value"), "alias.value"),
-            }
-            for alias in operation.get("aliases", ())
-        ]
-    if isinstance(operation.get("quarantine"), Mapping):
-        safe["quarantine"] = sanitize_metadata(operation["quarantine"])
-    if isinstance(operation.get("details"), Mapping):
-        safe["details"] = sanitize_metadata(operation["details"])
-    assert_no_secrets(safe)
-    return safe
+
+
+def _validate_state_field(
+    field_name: str,
+    value: Any,
+    allowed_keys: Optional[set[str]],
+) -> None:
+    if value is None:
+        return
+    if not isinstance(value, Mapping):
+        raise LedgerError(f"collector state field {field_name} is not an object")
+    serialized = _json(value)
+    if len(serialized.encode("utf-8")) > MAX_STATE_FIELD_BYTES:
+        raise LedgerError(f"collector state field {field_name} exceeds the supported bound")
+    for raw_key, child in value.items():
+        key = str(raw_key)
+        if key in STATE_FORBIDDEN_KEYS:
+            raise LedgerError(f"collector state field {field_name} contains unsupported content")
+        if allowed_keys is not None and key not in allowed_keys:
+            raise LedgerError(f"collector state field {field_name} contains an unknown key")
+        if isinstance(child, Mapping):
+            _validate_state_field(f"{field_name}.{key}", child, None)
+        elif isinstance(child, Sequence) and not isinstance(child, (str, bytes)):
+            for index, item in enumerate(child):
+                if isinstance(item, Mapping):
+                    _validate_state_field(f"{field_name}.{key}[{index}]", item, None)
+
+
+    @staticmethod
+    def _safe_operation(operation: Mapping[str, Any]) -> dict[str, Any]:
+        safe = {
+            key: value
+            for key, value in operation.items()
+            if key not in {"payload", "aliases", "quarantine", "details"}
+        }
+        if isinstance(operation.get("payload"), Mapping):
+            safe["payload"] = _observation_envelope(operation["payload"])
+        if isinstance(operation.get("aliases"), Sequence) and not isinstance(
+            operation.get("aliases"), str
+        ):
+            safe["aliases"] = [
+                {
+                    "kind": _token(alias.get("kind"), "alias.kind"),
+                    "value": _token(alias.get("value"), "alias.value"),
+                }
+                for alias in operation.get("aliases", ())
+            ]
+        if isinstance(operation.get("quarantine"), Mapping):
+            safe["quarantine"] = sanitize_metadata(operation["quarantine"])
+        if isinstance(operation.get("details"), Mapping):
+            safe["details"] = sanitize_metadata(operation["details"])
+        assert_no_secrets(safe)
+        return safe
