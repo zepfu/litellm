@@ -1,3 +1,4 @@
+import copy
 import inspect
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
@@ -241,6 +242,19 @@ async def route_request(  # noqa: PLR0915 - Complex routing function, refactorin
     """
     Common helper to route the request
     """
+    from litellm.llms.xai.oauth import (
+        is_oa_xai_model,
+        prepare_oa_xai_request,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+        build_xai_oauth_direct_account_traversal,
+        recover_xai_oauth_direct_request,
+    )
+
+    public_model = data.get("model")
+    ingress_oa_xai_request_body = (
+        copy.deepcopy(data) if is_oa_xai_model(public_model) else None
+    )
     add_shared_session_to_data(data)
 
     team_id = get_team_id_from_data(data)
@@ -252,22 +266,12 @@ async def route_request(  # noqa: PLR0915 - Complex routing function, refactorin
         if "generationConfig" in data and "config" not in data:
             data["config"] = data.pop("generationConfig")
 
-    from litellm.llms.xai.oauth import (
-        is_oa_xai_model,
-        prepare_oa_xai_request,
-    )
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
-        build_xai_oauth_direct_account_traversal,
-        recover_xai_oauth_direct_request,
-    )
-
     snapshot_out: dict[str, Any] = {}
-    public_model = data.get("model")
     xai_direct_traversal = (
         await build_xai_oauth_direct_account_traversal(
             cooldown_family="codex"
         )
-        if is_oa_xai_model(public_model)
+        if ingress_oa_xai_request_body is not None
         else None
     )
     prepared_oa_xai_request = await prepare_oa_xai_request(
@@ -294,14 +298,18 @@ async def route_request(  # noqa: PLR0915 - Complex routing function, refactorin
                 try:
                     return await initial_invocation
                 except Exception as exc:
-                    if xai_direct_traversal is None:
+                    if (
+                        xai_direct_traversal is None
+                        or ingress_oa_xai_request_body is None
+                    ):
                         raise
                     recovery = await recover_xai_oauth_direct_request(
                         traversal=xai_direct_traversal,
-                        request_body=data,
+                        request_body=ingress_oa_xai_request_body,
                         exc=exc,
                         snapshot=snapshot,
                         api_base=api_base if isinstance(api_base, str) else None,
+                        ingress_format="responses",
                     )
                     if recovery is None:
                         raise

@@ -96,7 +96,7 @@ async def _prepare_passthrough_request(
 async def _recover_xai_oauth_direct_retry(
     *,
     request: object,
-    request_body: Payload,
+    ingress_request_body: Payload,
     traversal: Optional[XaiOAuthDirectAccountTraversal],
     exc: Exception,
     api_base: str,
@@ -107,10 +107,11 @@ async def _recover_xai_oauth_direct_retry(
     snapshot = get_xai_oauth_snapshot_from_request(request)
     recovery = await recover_xai_oauth_direct_request(
         traversal=traversal,
-        request_body=request_body,
+        request_body=ingress_request_body,
         exc=exc,
         snapshot=snapshot,
         api_base=api_base,
+        ingress_format="anthropic",
     )
     if recovery is None:
         return None, None
@@ -129,6 +130,7 @@ async def prepare_responses_route(
     use_alias_candidate_probe: bool = False,
 ) -> adapter_driver.ResponsesAdapterRoutePlan:
     """Build the complete xAI OAuth Responses route plan."""
+    ingress_request_body = copy.deepcopy(prepared_request_body)
     client_requested_stream = bool(prepared_request_body.get("stream"))
     translated_request_body = runtime.build_responses_body(
         prepared_request_body,
@@ -225,7 +227,7 @@ async def prepare_responses_route(
             refreshed_snapshot, selected_account = (
                 await _recover_xai_oauth_direct_retry(
                     request=request,
-                    request_body=rollover_request_body,
+                    ingress_request_body=ingress_request_body,
                     traversal=direct_traversal,
                     exc=exc,
                     api_base=target_base_url,
@@ -305,6 +307,7 @@ async def prepare_completion_route(
 ) -> adapter_driver.CompletionAdapterRoutePlan:
     """Build the complete xAI OAuth completion route plan."""
     config = adapter_config.XAI_OAUTH_COMPLETION
+    ingress_request_body = copy.deepcopy(prepared_request_body)
     client_requested_stream = bool(prepared_request_body.get("stream"))
     prepared_request_body = runtime.prepare_completion_body(
         prepared_request_body,
@@ -372,7 +375,7 @@ async def prepare_completion_route(
             refreshed_snapshot, selected_account = (
                 await _recover_xai_oauth_direct_retry(
                     request=request,
-                    request_body=rollover_request_body,
+                    ingress_request_body=ingress_request_body,
                     traversal=direct_traversal,
                     exc=exc,
                     api_base=target_base_url,

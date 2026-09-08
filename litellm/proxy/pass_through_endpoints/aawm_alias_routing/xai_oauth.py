@@ -32,6 +32,14 @@ _XAI_OAUTH_MANAGED_ROUTE_FAMILIES = frozenset(
     }
 )
 _XAI_OAUTH_DIRECT_ACCOUNT_COOLDOWN_SECONDS = 3 * 60 * 60.0
+_ANTHROPIC_NONPORTABLE_CONTENT_BLOCK_TYPES = frozenset(
+    {
+        "thinking",
+        "redacted_thinking",
+        "tool_use",
+        "tool_result",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -420,10 +428,55 @@ def bind_xai_oauth_selected_account_to_request(
     setattr(request.state, _XAI_OAUTH_SELECTED_ACCOUNT_STATE, selected)
 
 
-def _direct_xai_oauth_rollover_body_is_fresh(
+def _anthropic_xai_oauth_rollover_body_is_fresh(
     request_body: Mapping[str, Any],
 ) -> bool:
-    """Reject continuation, reasoning, and account-bound request state."""
+    """Return whether Anthropic ingress has no nonportable message state."""
+
+    messages = request_body.get("messages")
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, Mapping):
+            return False
+        content = message.get("content")
+        if isinstance(content, str):
+            continue
+        if not isinstance(content, list):
+            return False
+        for block in content:
+            if not isinstance(block, Mapping):
+                return False
+            block_type = block.get("type")
+            if not isinstance(block_type, str):
+                return False
+            normalized_block_type = block_type.strip().casefold()
+            if not normalized_block_type:
+                return False
+            if (
+                normalized_block_type
+                in _ANTHROPIC_NONPORTABLE_CONTENT_BLOCK_TYPES
+                or normalized_block_type.startswith("mcp_")
+            ):
+                return False
+            signature = block.get("signature")
+            if isinstance(signature, str):
+                if signature.strip():
+                    return False
+            elif signature is not None:
+                return False
+    return True
+
+
+def _direct_xai_oauth_rollover_body_is_fresh(
+    request_body: Mapping[str, Any],
+    *,
+    ingress_format: Literal["responses", "anthropic"] = "responses",
+) -> bool:
+    """Reject continuation, reasoning, and account-bound ingress state."""
+
+    if ingress_format == "anthropic":
+        return _anthropic_xai_oauth_rollover_body_is_fresh(request_body)
 
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_build import (
         _aawm_auto_agent_audit_request_has_account_bound_state,
@@ -495,6 +548,7 @@ async def recover_xai_oauth_direct_request(
     exc: BaseException,
     snapshot: Any,
     api_base: Optional[str],
+    ingress_format: Literal["responses", "anthropic"] = "responses",
 ) -> Optional[XaiOAuthDirectRetryRecovery]:
     """Choose one same-account reread or fresh-request account rollover."""
 
@@ -534,7 +588,10 @@ async def recover_xai_oauth_direct_request(
 
     if not (
         is_xai_oauth_direct_rollover_failure(exc, api_base=api_base)
-        and _direct_xai_oauth_rollover_body_is_fresh(request_body)
+        and _direct_xai_oauth_rollover_body_is_fresh(
+            request_body,
+            ingress_format=ingress_format,
+        )
     ):
         return None
     selected_account = await traversal.advance()

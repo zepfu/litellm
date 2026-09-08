@@ -176,7 +176,13 @@ cooling, no record is selected. A pre-commit exact `402`
 selected record under that same family before any rollover decision. Fresh,
 unbound traffic can move to an untraversed eligible record only after a
 provider-returned `401`, `429`, or recognized quota failure. Same-account
-generation reread remains the first `401` recovery path. Continuations,
+generation reread remains the first `401` recovery path. Rollover eligibility
+uses the immutable ingress request before provider-specific normalization or
+unsupported-item removal, so normalization cannot make continuation state
+portable. For Anthropic Messages ingress, the guard examines only message
+content blocks: `thinking`, `redacted_thinking`, nonempty `signature`,
+tool-use/result, and `mcp_*` blocks remain pinned, while a top-level fresh
+request `thinking` configuration does not. Continuations,
 `previous_response_id`, and other account-bound state remain pinned to their
 original record and fail explicitly rather than switching accounts. Attempt
 metadata distinguishes provider-call ordinal from account-traversal ordinal;

@@ -1068,6 +1068,7 @@ class BaseOpenAIPassThroughHandler:
                 except Exception as exc:
                     if (
                         xai_direct_traversal is None
+                        or canonical_managed_oa_xai_request_body is None
                         or managed_oa_xai_rollover_request_body is None
                     ):
                         raise
@@ -1083,10 +1084,11 @@ class BaseOpenAIPassThroughHandler:
 
                     recovery = await recover_xai_oauth_direct_request(
                         traversal=xai_direct_traversal,
-                        request_body=managed_oa_xai_rollover_request_body,
+                        request_body=canonical_managed_oa_xai_request_body,
                         exc=exc,
                         snapshot=get_xai_oauth_snapshot_from_request(request),
                         api_base=base_target_url,
+                        ingress_format="responses",
                     )
                     if recovery is None:
                         raise
