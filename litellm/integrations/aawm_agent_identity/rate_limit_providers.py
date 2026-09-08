@@ -759,23 +759,6 @@ def _validated_xai_oauth_server_account_metadata(
         return validated_xai_oauth_server_account_metadata(metadata)
     except Exception:  # noqa: BLE001
         return None
-
-
-def _validated_xai_oauth_server_account_metadata(
-    metadata: Dict[str, Any],
-) -> Optional[Dict[str, str | bool]]:
-    """Accept only an inventory-proven managed xAI account binding."""
-
-    try:
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
-            validated_xai_oauth_server_account_metadata,
-        )
-
-        return validated_xai_oauth_server_account_metadata(metadata)
-    except Exception:  # noqa: BLE001
-        return None
-
-
 def _extract_xai_oauth_account_hash(metadata: Dict[str, Any]) -> Optional[str]:
     server_metadata = _validated_xai_oauth_server_account_metadata(metadata)
     value = (
