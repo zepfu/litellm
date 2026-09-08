@@ -181,12 +181,18 @@ async def peek_streaming_response(  # noqa: PLR0915
             if cleaned:
                 return
             cleaned = True
-            if next_chunk_task is not None and not next_chunk_task.done():
-                next_chunk_task.cancel()
+            if next_chunk_task is not None:
+                if not next_chunk_task.done():
+                    next_chunk_task.cancel()
                 try:
                     await next_chunk_task
                 except (asyncio.CancelledError, StopAsyncIteration):
                     pass
+                except BaseException:
+                    verbose_proxy_logger.debug(
+                        "Failed to settle peeked streaming response read task",
+                        exc_info=True,
+                    )
             candidates = [iterator]
             if body_iterator is not iterator:
                 candidates.append(body_iterator)
@@ -285,151 +291,169 @@ async def peek_streaming_response(  # noqa: PLR0915
             if cleanup is not None:
                 await cleanup()
 
+    active_cleanup = _make_continuation_cleanup(None)
     try:
-        chunk = await iterator.__anext__()
-    except StopAsyncIteration:
-        chunk = None
-
-    while True:
-        if chunk is None:
-            cleanup = _make_continuation_cleanup(None)
-
-            async def _replay_buffered() -> AsyncGenerator[Any, None]:
-                for buffered in buffered_chunks:
-                    yield buffered
-
-            replay_response = StreamingResponse(
-                _CleanupBoundAsyncIterator(
-                    _replay_buffered(),
-                    cleanup,
-                ),
-                headers=dict(response.headers),
-                status_code=response.status_code,
-                media_type=response.media_type or "text/event-stream",
-            )
-            _bind_stream_cleanup(replay_response, cleanup)
-            return BoundedStreamPeek(
-                response=_guard_reconstructed_passthrough_streaming_response(
-                    replay_response,
-                    source_response=response,
-                ),
-                buffered_chunks=buffered_chunks,
-                buffered_bytes=buffered_bytes,
-                stop_reason="stream_exhausted",
-            )
-
-        chunk_bytes = _chunk_size(chunk)
-        stop_reason: Optional[StreamPeekStopReason] = None
-        if len(buffered_chunks) >= max(0, max_chunks):
-            stop_reason = "chunk_limit"
-        elif buffered_bytes + chunk_bytes > max(0, max_bytes):
-            stop_reason = "byte_limit"
-
-        if stop_reason is not None:
-            cleanup = _make_continuation_cleanup(None)
-            continuation_response = StreamingResponse(
-                _CleanupBoundAsyncIterator(
-                    _streaming_continuation(
-                        initial_chunk=chunk,
-                        cleanup=cleanup,
-                    ),
-                    cleanup,
-                ),
-                headers=dict(response.headers),
-                status_code=response.status_code,
-                media_type=response.media_type or "text/event-stream",
-            )
-            _bind_stream_cleanup(continuation_response, cleanup)
-            if terminalizer is not None:
-                _bind_stream_timeout_terminalizer(
-                    continuation_response,
-                    terminalizer,
-                )
-            return BoundedStreamPeek(
-                response=_guard_reconstructed_passthrough_streaming_response(
-                    continuation_response,
-                    source_response=response,
-                ),
-                buffered_chunks=buffered_chunks,
-                buffered_bytes=buffered_bytes,
-                stop_reason=stop_reason,
-            )
-
-        buffered_chunks.append(chunk)
-        buffered_bytes += chunk_bytes
-
-        # create_task requires a Coroutine; AsyncIterator.__anext__ is typed as
-        # Awaitable, so wrap it without changing scheduling/read semantics.
-        async def _await_next_chunk() -> Any:
-            return await iterator.__anext__()
-
-        next_chunk_coro: Coroutine[Any, Any, Any] = _await_next_chunk()
-        next_chunk_task: asyncio.Task[Any] = asyncio.create_task(next_chunk_coro)
-        await asyncio.sleep(0)
-
-        if not next_chunk_task.done():
-            cleanup = _make_continuation_cleanup(next_chunk_task)
-            continuation_response = StreamingResponse(
-                _CleanupBoundAsyncIterator(
-                    _streaming_continuation(
-                        next_chunk_task=next_chunk_task,
-                        cleanup=cleanup,
-                    ),
-                    cleanup,
-                ),
-                headers=dict(response.headers),
-                status_code=response.status_code,
-                media_type=response.media_type or "text/event-stream",
-            )
-            _bind_stream_cleanup(continuation_response, cleanup)
-            if terminalizer is not None:
-                _bind_stream_timeout_terminalizer(
-                    continuation_response,
-                    terminalizer,
-                )
-            return BoundedStreamPeek(
-                response=_guard_reconstructed_passthrough_streaming_response(
-                    continuation_response,
-                    source_response=response,
-                ),
-                buffered_chunks=buffered_chunks,
-                buffered_bytes=buffered_bytes,
-                stop_reason="pending_stream",
-            )
-
         try:
-            chunk = next_chunk_task.result()
-        except timeout_types as exc:
-            if terminalizer is None:
-                raise exc
-
-            cleanup = _make_continuation_cleanup(None)
-            continuation_response = StreamingResponse(
-                _CleanupBoundAsyncIterator(
-                    _streaming_continuation(
-                        terminal_exception=exc,
-                        next_chunk_task=None,
-                        cleanup=cleanup,
-                    ),
-                    cleanup,
-                ),
-                headers=dict(response.headers),
-                status_code=response.status_code,
-                media_type=response.media_type or "text/event-stream",
-            )
-            _bind_stream_cleanup(continuation_response, cleanup)
-            _bind_stream_timeout_terminalizer(
-                continuation_response,
-                terminalizer,
-            )
-            return BoundedStreamPeek(
-                response=_guard_reconstructed_passthrough_streaming_response(
-                    continuation_response,
-                    source_response=response,
-                ),
-                buffered_chunks=buffered_chunks,
-                buffered_bytes=buffered_bytes,
-                stop_reason="stream_exhausted",
-            )
+            chunk = await iterator.__anext__()
         except StopAsyncIteration:
             chunk = None
+
+        while True:
+            if chunk is None:
+                cleanup = _make_continuation_cleanup(None)
+                active_cleanup = cleanup
+
+                async def _replay_buffered() -> AsyncGenerator[Any, None]:
+                    for buffered in buffered_chunks:
+                        yield buffered
+
+                replay_response = StreamingResponse(
+                    _CleanupBoundAsyncIterator(
+                        _replay_buffered(),
+                        cleanup,
+                    ),
+                    headers=dict(response.headers),
+                    status_code=response.status_code,
+                    media_type=response.media_type or "text/event-stream",
+                )
+                _bind_stream_cleanup(replay_response, cleanup)
+                reconstructed = _guard_reconstructed_passthrough_streaming_response(
+                    replay_response,
+                    source_response=response,
+                )
+                active_cleanup = None
+                return BoundedStreamPeek(
+                    response=reconstructed,
+                    buffered_chunks=buffered_chunks,
+                    buffered_bytes=buffered_bytes,
+                    stop_reason="stream_exhausted",
+                )
+
+            chunk_bytes = _chunk_size(chunk)
+            stop_reason: Optional[StreamPeekStopReason] = None
+            if len(buffered_chunks) >= max(0, max_chunks):
+                stop_reason = "chunk_limit"
+            elif buffered_bytes + chunk_bytes > max(0, max_bytes):
+                stop_reason = "byte_limit"
+
+            if stop_reason is not None:
+                cleanup = _make_continuation_cleanup(None)
+                active_cleanup = cleanup
+                continuation_response = StreamingResponse(
+                    _CleanupBoundAsyncIterator(
+                        _streaming_continuation(
+                            initial_chunk=chunk,
+                            cleanup=cleanup,
+                        ),
+                        cleanup,
+                    ),
+                    headers=dict(response.headers),
+                    status_code=response.status_code,
+                    media_type=response.media_type or "text/event-stream",
+                )
+                _bind_stream_cleanup(continuation_response, cleanup)
+                if terminalizer is not None:
+                    _bind_stream_timeout_terminalizer(
+                        continuation_response,
+                        terminalizer,
+                    )
+                reconstructed = _guard_reconstructed_passthrough_streaming_response(
+                    continuation_response,
+                    source_response=response,
+                )
+                active_cleanup = None
+                return BoundedStreamPeek(
+                    response=reconstructed,
+                    buffered_chunks=buffered_chunks,
+                    buffered_bytes=buffered_bytes,
+                    stop_reason=stop_reason,
+                )
+
+            buffered_chunks.append(chunk)
+            buffered_bytes += chunk_bytes
+
+            # create_task requires a Coroutine; AsyncIterator.__anext__ is typed
+            # as Awaitable, so wrap it without changing scheduling/read semantics.
+            async def _await_next_chunk() -> Any:
+                return await iterator.__anext__()
+
+            next_chunk_coro: Coroutine[Any, Any, Any] = _await_next_chunk()
+            next_chunk_task: asyncio.Task[Any] = asyncio.create_task(next_chunk_coro)
+            active_cleanup = _make_continuation_cleanup(next_chunk_task)
+            await asyncio.sleep(0)
+
+            if not next_chunk_task.done():
+                cleanup = active_cleanup
+                continuation_response = StreamingResponse(
+                    _CleanupBoundAsyncIterator(
+                        _streaming_continuation(
+                            next_chunk_task=next_chunk_task,
+                            cleanup=cleanup,
+                        ),
+                        cleanup,
+                    ),
+                    headers=dict(response.headers),
+                    status_code=response.status_code,
+                    media_type=response.media_type or "text/event-stream",
+                )
+                _bind_stream_cleanup(continuation_response, cleanup)
+                if terminalizer is not None:
+                    _bind_stream_timeout_terminalizer(
+                        continuation_response,
+                        terminalizer,
+                    )
+                reconstructed = _guard_reconstructed_passthrough_streaming_response(
+                    continuation_response,
+                    source_response=response,
+                )
+                active_cleanup = None
+                return BoundedStreamPeek(
+                    response=reconstructed,
+                    buffered_chunks=buffered_chunks,
+                    buffered_bytes=buffered_bytes,
+                    stop_reason="pending_stream",
+                )
+
+            try:
+                chunk = next_chunk_task.result()
+            except timeout_types as exc:
+                if terminalizer is None:
+                    raise exc
+
+                cleanup = _make_continuation_cleanup(None)
+                active_cleanup = cleanup
+                continuation_response = StreamingResponse(
+                    _CleanupBoundAsyncIterator(
+                        _streaming_continuation(
+                            terminal_exception=exc,
+                            next_chunk_task=None,
+                            cleanup=cleanup,
+                        ),
+                        cleanup,
+                    ),
+                    headers=dict(response.headers),
+                    status_code=response.status_code,
+                    media_type=response.media_type or "text/event-stream",
+                )
+                _bind_stream_cleanup(continuation_response, cleanup)
+                _bind_stream_timeout_terminalizer(
+                    continuation_response,
+                    terminalizer,
+                )
+                reconstructed = _guard_reconstructed_passthrough_streaming_response(
+                    continuation_response,
+                    source_response=response,
+                )
+                active_cleanup = None
+                return BoundedStreamPeek(
+                    response=reconstructed,
+                    buffered_chunks=buffered_chunks,
+                    buffered_bytes=buffered_bytes,
+                    stop_reason="stream_exhausted",
+                )
+            except StopAsyncIteration:
+                chunk = None
+    except BaseException:
+        if active_cleanup is not None:
+            await active_cleanup()
+        raise
