@@ -10,6 +10,10 @@ Requests to /chat/completions may be bridged here automatically when the provide
 
 When a provider is bridged through chat-completions streaming, LiteLLM accumulates per-chunk `provider_specific_fields` (including ordered `code_interpreter_results` from server-side tool execution) onto the terminal aggregated response used for `response.completed`, so reconstruction into OpenAI-shaped `code_interpreter_call` output items remains complete for streaming paths.
 
+Bridged chat-completion reasoning is returned as a `reasoning` item with
+`summary_text` entries in `summary`. Streaming terminal output preserves the
+reasoning item ID used by earlier events.
+
 | Feature | Supported | Notes |
 |---------|-----------|--------|
 | Cost Tracking | ✅ | Works with all supported models |
@@ -1755,7 +1759,6 @@ Response:
   }]
 }
 ```
-
 
 
 

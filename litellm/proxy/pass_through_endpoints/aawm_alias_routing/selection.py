@@ -27,6 +27,7 @@ from litellm._logging import verbose_proxy_logger
 from litellm.utils import get_model_info
 
 from . import cooldown_state as _cooldown_state
+from . import codex_quota_balance as _codex_quota_balance
 from .cooldown_state import _attach_aawm_alias_routing_state_sources
 from .lane_keys import (
     _codex_auto_agent_candidate_key,
@@ -124,6 +125,10 @@ _CODEX_OAUTH_QUOTA_FAILURE_RETRY_SECONDS = 5.0
 _CODEX_OAUTH_QUOTA_LOOKUP_TIMEOUT_SECONDS = 0.5
 _CODEX_OAUTH_QUOTA_VALIDITY_DEFAULT_SECONDS = 600.0
 _CODEX_OAUTH_QUOTA_VALIDITY_ENV = "AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS"
+_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_DEFAULT_PCT = 10.0
+_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_ENV = (
+    "AAWM_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_PCT"
+)
 _CODEX_OAUTH_QUOTA_CLIENT = "codex"
 _CODEX_OAUTH_QUOTA_SOURCE = "codex_quota_poll"
 _CODEX_OAUTH_QUOTA_FAMILY_OVERALL = "overall"
@@ -411,6 +416,44 @@ def _codex_auto_agent_candidate_public_shape(
     return shaped
 
 
+def _attempt_has_provider_call(attempt: Mapping[str, Any]) -> bool:
+    """Treat explicit no-I/O records as skips; preserve legacy missing flags."""
+    if attempt.get("terminal_disposition") == "skipped":
+        return False
+    return attempt.get("attempted_provider_call") is not False
+
+
+def _provider_attempt_count(attempts: Sequence[Any]) -> int:
+    return sum(
+        isinstance(attempt, Mapping) and _attempt_has_provider_call(attempt)
+        for attempt in attempts
+    )
+
+
+def _provider_attempt_record_index(
+    attempts: Sequence[Any],
+    attempt_number: Any,
+) -> Optional[int]:
+    if isinstance(attempt_number, bool):
+        return None
+    try:
+        target = int(attempt_number)
+    except (TypeError, ValueError):
+        return None
+    if target < 1:
+        return None
+    provider_attempt_number = 0
+    for raw_index, attempt in enumerate(attempts):
+        if not isinstance(attempt, Mapping) or not _attempt_has_provider_call(
+            attempt
+        ):
+            continue
+        provider_attempt_number += 1
+        if provider_attempt_number == target:
+            return raw_index
+    return None
+
+
 _AUTO_AGENT_ACCOUNT_IDENTITY_FIELDS = frozenset(
     {
         "account",
@@ -627,7 +670,7 @@ def _build_auto_agent_skipped_candidates_from_states(
     return skipped
 
 
-def _build_auto_agent_terminal_candidate_inventory(
+def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
     *,
     request: Request,
     alias_model: str,
@@ -705,6 +748,8 @@ def _build_auto_agent_terminal_candidate_inventory(
         "candidate_semantic_ineligibility_reason",
         "candidate_semantic_ineligibility_state_source",
         "candidate_semantic_ineligibility_remaining_seconds",
+        "skip_reason",
+        "provider_attempt_budget_refunded",
     )
 
     inventory: list[dict[str, Any]] = []
@@ -717,6 +762,26 @@ def _build_auto_agent_terminal_candidate_inventory(
             shaped["reasoning_effort"] = candidate["reasoning_effort"]
         if candidate_attempts:
             last_attempt = candidate_attempts[-1]
+            terminal_skip = (
+                last_attempt.get("terminal_disposition") == "skipped"
+                and not any(
+                    attempt.get("attempted_provider_call") is True
+                    for attempt in candidate_attempts
+                )
+            )
+            if terminal_skip:
+                for field in skip_metadata_fields:
+                    if field in last_attempt:
+                        shaped[field] = last_attempt[field]
+                shaped["terminal_disposition"] = "skipped"
+                shaped["attempted_provider_call"] = False
+                shaped["reason"] = (
+                    last_attempt.get("skip_reason")
+                    or last_attempt.get("reason")
+                    or "unavailable"
+                )
+                inventory.append(shaped)
+                continue
             outcome = (
                 last_attempt.get("status")
                 or last_attempt.get("error_class")
@@ -725,7 +790,7 @@ def _build_auto_agent_terminal_candidate_inventory(
             shaped.update(
                 {
                     "terminal_disposition": "attempted",
-                    "attempt_count": len(candidate_attempts),
+                    "attempt_count": _provider_attempt_count(candidate_attempts),
                     "outcome": outcome,
                 }
             )
@@ -2718,9 +2783,8 @@ def _codex_oauth_quota_observation_from_row(
             evidence.get("upstream_limit_scope")
             or raw_provider_fields.get("limit_scope")
         ),
-        "window_minutes": _codex_oauth_quota_int(
-            raw_provider_fields.get("window_minutes")
-        ),
+        # Preserve malformed duration evidence instead of treating it as absent.
+        "window_minutes": raw_provider_fields.get("window_minutes"),
         "remaining_pct": remaining_pct,
         "observed_at": values.get("observed_at"),
         "expected_reset_at": values.get("expected_reset_at"),
@@ -2733,15 +2797,68 @@ def _codex_oauth_quota_observation_from_row(
 async def _hydrate_codex_oauth_quota_observations(
     contexts: Sequence[dict[str, Any]],
 ) -> None:
+    await _refresh_codex_oauth_quota_observations(contexts)
+    _capture_codex_oauth_quota_evidence(contexts)
+
+
+def _capture_codex_oauth_quota_evidence(
+    contexts: Sequence[dict[str, Any]],
+) -> None:
+    now = time.time()
+    environment = _codex_oauth_expected_quota_environment()
+    try:
+        runtime_environment = (
+            _get_codex_quota_observation_environment()
+            if _get_codex_quota_observation_environment is not None
+            else None
+        )
+    except Exception:
+        runtime_environment = None
+    account_hashes = {
+        context["candidate"].get("codex_oauth_account_hash")
+        for context in contexts
+    }
+    with alias_routing_state._normalized_quota_observations_lock:
+        observations = [
+            {
+                **observation,
+                "quota_family": _codex_oauth_quota_observation_family(observation),
+            }
+            for key, observation in (
+                alias_routing_state._normalized_quota_observations.items()
+            )
+            if key[0] == _CODEX_AUTO_AGENT_NATIVE_PROVIDER
+            and key[2] in account_hashes
+        ]
+    horizon = _codex_oauth_quota_validity_horizon_seconds()
+    for context in contexts:
+        candidate = context["candidate"]
+        context["quota_evidence"] = _codex_quota_balance.account_evidence(
+            [
+                row for row in observations
+                if row.get("account_hash") == candidate.get("codex_oauth_account_hash")
+            ],
+            family=(
+                _codex_oauth_quota_family_for_model(candidate["model"])
+                if candidate.get("model") else None
+            ),
+            environment=environment,
+            runtime_environment=runtime_environment,
+            now=now,
+            horizon=horizon,
+        )
+
+
+async def _refresh_codex_oauth_quota_observations(
+    contexts: Sequence[dict[str, Any]],
+) -> None:
     if (
         _get_codex_quota_observation_pool is None
         or _get_codex_quota_observation_environment is None
     ):
         return
     try:
-        environment = str(
-            _get_codex_quota_observation_environment() or ""
-        ).strip()
+        environment = _codex_oauth_expected_quota_environment() or ""
     except Exception as exc:
         verbose_proxy_logger.debug(
             "Codex OAuth durable quota environment resolution failed open "
@@ -2790,7 +2907,7 @@ async def _hydrate_codex_oauth_quota_observations(
                     _CODEX_OAUTH_QUOTA_CLIENT,
                     _CODEX_OAUTH_QUOTA_SOURCE,
                     environment,
-                    list(due_account_hashes),
+                    list(account_hashes),
                 )
 
             rows = await asyncio.wait_for(
@@ -2824,10 +2941,10 @@ async def _hydrate_codex_oauth_quota_observations(
             observations,
             provider=_CODEX_AUTO_AGENT_NATIVE_PROVIDER,
             source=_CODEX_OAUTH_QUOTA_SOURCE,
-            account_hashes=due_account_hashes,
+            account_hashes=account_hashes,
         )
         alias_routing_state.defer_codex_quota_hydration(
-            due_account_hashes,
+            account_hashes,
             environment=environment,
             ttl_seconds=_CODEX_OAUTH_QUOTA_CACHE_TTL_SECONDS,
         )
@@ -3364,11 +3481,17 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_state_source = cooldown_state_source_override or "forced_candidate_cooldown"
     if (
         candidate_semantic_ineligibility is not None
-        and cooldown_seconds <= 0
+        and (
+            cooldown_seconds <= 0 or _candidate_uses_codex_oauth(candidate)
+        )
         and skip_reason is None
     ):
         skip_reason = "candidate_ineligible"
-    if excluded_candidate and cooldown_seconds <= 0 and skip_reason is None:
+    if (
+        excluded_candidate
+        and (cooldown_seconds <= 0 or _candidate_uses_codex_oauth(candidate))
+        and skip_reason is None
+    ):
         skip_reason = "candidate_ineligible"
     state: dict[str, Any] = {
         "candidate": candidate,
@@ -3470,7 +3593,13 @@ def _codex_oauth_quota_validity_horizon_seconds() -> float:
     return parsed
 
 
-def _codex_oauth_expected_quota_environment() -> Optional[str]:
+def _codex_oauth_expected_quota_environment(
+    *, use_shared_scope: bool = True
+) -> Optional[str]:
+    if use_shared_scope:
+        shared_scope = os.getenv("AAWM_CODEX_OAUTH_QUOTA_OBSERVATION_ENVIRONMENT")
+        if shared_scope is not None:
+            return shared_scope.strip() or None
     if _get_codex_quota_observation_environment is None:
         return None
     try:
@@ -3505,65 +3634,175 @@ def _codex_oauth_window_is_weekly(window: Mapping[str, Any]) -> bool:
 
 def _codex_oauth_dual_family_remaining(
     state: Mapping[str, Any],
-) -> dict[str, Optional[float]]:
+) -> tuple[dict[str, Optional[float]], dict[str, Optional[float]]]:
     remaining_by_family: dict[str, Optional[float]] = {
         _CODEX_OAUTH_QUOTA_FAMILY_OVERALL: None,
         _CODEX_OAUTH_QUOTA_FAMILY_SPARK: None,
     }
-    candidate = state.get("candidate")
-    if not isinstance(candidate, Mapping):
-        return remaining_by_family
-    account_hash = str(
-        candidate.get("codex_oauth_account_hash") or ""
-    ).strip()
-    if not account_hash:
-        return remaining_by_family
-
-    windows = alias_routing_state.resolve_normalized_quota_windows_for_account(
-        provider=str(candidate.get("provider") or ""),
-        account_hash=account_hash,
-        max_age_seconds=_codex_oauth_quota_validity_horizon_seconds(),
-    )
-    expected_environment = _codex_oauth_expected_quota_environment()
-    for family in (
-        _CODEX_OAUTH_QUOTA_FAMILY_OVERALL,
-        _CODEX_OAUTH_QUOTA_FAMILY_SPARK,
+    remaining_ages_by_family: dict[str, Optional[float]] = {
+        _CODEX_OAUTH_QUOTA_FAMILY_OVERALL: None,
+        _CODEX_OAUTH_QUOTA_FAMILY_SPARK: None,
+    }
+    evidence = state.get("codex_oauth_quota_evidence") or {}
+    weekly = evidence.get("weekly")
+    family = evidence.get("quota_family")
+    if (
+        family in remaining_by_family
+        and isinstance(weekly, dict)
+        and evidence.get("unusable_reason") is None
     ):
-        weekly_values: list[float] = []
-        for window in _filter_codex_oauth_quota_windows_for_family(
-            windows,
-            family=family,
-        ):
-            if not _codex_oauth_window_matches_environment(
-                window,
-                expected_environment=expected_environment,
-            ):
-                continue
-            status = str(window.get("status") or "").strip().lower()
-            if status and status != "fresh":
-                continue
-            if not _codex_oauth_window_is_weekly(window):
-                continue
-            remaining = _codex_oauth_window_remaining_pct(window)
-            if remaining is not None:
-                weekly_values.append(remaining)
-        if weekly_values:
-            remaining_by_family[family] = min(weekly_values)
-    return remaining_by_family
+        remaining_by_family[family] = weekly["remaining_pct"]
+        remaining_ages_by_family[family] = weekly["observation_age_seconds"]
+    return remaining_by_family, remaining_ages_by_family
 
 
 def _select_first_available_codex_oauth_account_state(
     states: Sequence[dict[str, Any]],
+    *,
+    allow_cooled_down: bool = False,
+    bypass_reason: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
-    """Pick the first account in deterministic configured priority order."""
+    """Balance fresh account variants without changing their template or pins."""
     available = [
         state
         for state in states
-        if _is_auto_agent_candidate_state_available(state)
+        if (
+            state.get("skip_reason") is None
+            and (
+                allow_cooled_down
+                or _is_auto_agent_candidate_state_available(state)
+            )
+        )
     ]
     if not available:
         return None
-    return available[0]
+
+    available_ids = {id(state) for state in available}
+    observations = [
+        _codex_quota_balance.decision_account(
+            state, eligible=id(state) in available_ids
+        )
+        for state in states
+    ]
+    eligible_observations = [
+        observation for observation in observations if observation["eligible"]
+    ]
+    comparable = all(
+        observation["unusable_reason"] is None
+        and observation["weekly"] is not None
+        for observation in eligible_observations
+    ) and len({
+        (observation["quota_family"], observation["environment"],
+         observation["evaluated_at"])
+        for observation in eligible_observations
+    }) == 1
+    threshold = _codex_oauth_weekly_balance_threshold_pct()
+    quota_selection: dict[str, Any] = {
+        "strategy": "weekly_quota_balance",
+        "window": "weekly",
+        "threshold_pct": threshold,
+        "comparable_observations": comparable,
+        "observations": observations,
+        "eligible_account_count": len(available),
+        "account_count": len(states),
+        "balancing_applied": False,
+        "bypass_reason": bypass_reason,
+    }
+    selected_index = 0
+    if bypass_reason is not None:
+        quota_selection["selection_reason"] = "weekly_quota_bypassed"
+    elif comparable:
+        remaining_values = [
+            observation["weekly"]["remaining_pct"]
+            for observation in eligible_observations
+        ]
+        highest = max(remaining_values)
+        gap = highest - min(remaining_values)
+        quota_selection["observed_gap_pct"] = gap
+        quota_selection["max_observation_age_seconds"] = max(
+            observation["weekly"]["observation_age_seconds"]
+            for observation in eligible_observations
+        )
+        if len(available) > 1 and gap >= threshold:
+            selected_index = remaining_values.index(highest)
+            quota_selection["selection_reason"] = "weekly_quota_balanced"
+            quota_selection["balancing_applied"] = True
+        else:
+            quota_selection["selection_reason"] = "weekly_quota_priority_tie"
+    else:
+        quota_selection["selection_reason"] = (
+            "weekly_quota_observation_fallback"
+        )
+
+    selected = available[selected_index]
+    quota_selection["selected_account"] = {
+        "account_label": selected["candidate"].get("codex_oauth_account_label"),
+        "account_hash": selected["candidate"].get("codex_oauth_account_hash"),
+    }
+    quota_selection["outer_candidate"] = {
+        field: selected["candidate"].get(field)
+        for field in (
+            "provider", "model", "route_family", "selection_group",
+            "selection_strategy", "selection_choice",
+            "codex_oauth_account_selection_identity",
+        )
+    }
+    quota_selection["cooldown_bypassed"] = bool(
+        allow_cooled_down and float(selected.get("cooldown_seconds") or 0) > 0
+    )
+    selected["quota_selection"] = quota_selection
+    selected["quota_balancing"] = quota_selection
+    quota_selection["quota_family"] = eligible_observations[selected_index]["quota_family"]
+    return selected
+
+
+def _codex_oauth_weekly_balance_threshold_pct() -> float:
+    configured = os.getenv(_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_ENV)
+    if configured is None:
+        return _CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_DEFAULT_PCT
+    try:
+        parsed = float(configured)
+    except (TypeError, ValueError):
+        return _CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_DEFAULT_PCT
+    if not math.isfinite(parsed) or not 0.0 < parsed <= 100.0:
+        return _CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_DEFAULT_PCT
+    return parsed
+
+
+def _select_codex_oauth_account_within_identity(
+    tier: Sequence[dict[str, Any]],
+    selected_state: dict[str, Any],
+    *,
+    last_resort: bool,
+    bypass_reason: Optional[str] = None,
+) -> dict[str, Any]:
+    """Balance managed accounts only within the outer selected identity."""
+    candidate = selected_state["candidate"]
+    identity = candidate.get("codex_oauth_account_selection_identity")
+    if (
+        candidate.get("codex_oauth_account_selection_strategy")
+        != "weekly_quota_balance"
+        or identity is None
+    ):
+        return selected_state
+    identity_states = [
+        state
+        for state in tier
+        if state["candidate"].get(
+            "codex_oauth_account_selection_identity"
+        )
+        == identity
+        and state["candidate"].get("selection_choice")
+        == candidate.get("selection_choice")
+    ]
+    return (
+        _select_first_available_codex_oauth_account_state(
+            identity_states,
+            allow_cooled_down=last_resort,
+            bypass_reason=bypass_reason,
+        )
+        or selected_state
+    )
 
 
 def _format_codex_oauth_quota_reset_at(value: Any) -> Optional[str]:
@@ -3761,7 +4000,20 @@ def _attach_normalized_quota_state(
     )
     request_model = str(candidate.get("model") or "")
     quota_family = _codex_oauth_quota_family_for_model(request_model)
-    expected_environment = _codex_oauth_expected_quota_environment()
+    expected_environment = _codex_oauth_expected_quota_environment(
+        use_shared_scope=_candidate_uses_codex_oauth(candidate)
+    )
+    evidence = state.get("codex_oauth_quota_evidence")
+    if isinstance(evidence, dict):
+        family_windows = evidence["valid_windows"]
+        if not family_windows:
+            return state
+        return _attach_codex_oauth_quota_windows(
+            state,
+            observation=family_windows[0],
+            family_windows=family_windows,
+            quota_family=evidence.get("quota_family") or quota_family,
+        )
     observation = _alias_routing_state.resolve_normalized_quota_observation(
         provider=str(candidate.get("provider") or ""),
         model=request_model,
@@ -3802,6 +4054,19 @@ def _attach_normalized_quota_state(
         # Do not let the other quota family hide or invent exhaustion/remaining.
         return state
 
+    return _attach_codex_oauth_quota_windows(
+        state, observation=observation, family_windows=family_windows,
+        quota_family=quota_family,
+    )
+
+
+def _attach_codex_oauth_quota_windows(
+    state: dict[str, Any],
+    *,
+    observation: Mapping[str, Any],
+    family_windows: Sequence[dict[str, Any]],
+    quota_family: str,
+) -> dict[str, Any]:
     family_observation = _build_family_quota_observation(
         observation,
         family_windows=family_windows,
@@ -3982,11 +4247,17 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_state_source = cooldown_state_source_override or "forced_candidate_cooldown"
     if (
         candidate_semantic_ineligibility is not None
-        and cooldown_seconds <= 0
+        and (
+            cooldown_seconds <= 0 or _candidate_uses_codex_oauth(candidate)
+        )
         and skip_reason is None
     ):
         skip_reason = "candidate_ineligible"
-    if excluded_candidate and cooldown_seconds <= 0 and skip_reason is None:
+    if (
+        excluded_candidate
+        and (cooldown_seconds <= 0 or _candidate_uses_codex_oauth(candidate))
+        and skip_reason is None
+    ):
         skip_reason = "candidate_ineligible"
     state: dict[str, Any] = {
         "candidate": candidate,
@@ -4035,6 +4306,8 @@ def _apply_codex_oauth_account_context_to_state(
             state[field] = context[field]
     account_hash = state["candidate"].get("codex_oauth_account_hash")
     if isinstance(account_hash, str) and account_hash:
+        if isinstance(context.get("quota_evidence"), dict):
+            state["codex_oauth_quota_evidence"] = context["quota_evidence"]
         state = _attach_normalized_quota_state(
             state,
             account_hash=account_hash,
@@ -4046,6 +4319,14 @@ def _apply_codex_oauth_account_context_to_state(
             state["skip_reason"] = "quota_exhausted"
             state["cooldown_state_source"] = "normalized_quota_observation"
             state["terminal_reset"] = _build_codex_oauth_terminal_reset_information([state])
+        candidate = state["candidate"]
+        if _is_codex_oauth_account_candidate(candidate):
+            candidate["codex_oauth_account_selection_strategy"] = (
+                "weekly_quota_balance"
+            )
+            candidate["codex_oauth_account_selection_choice"] = str(
+                candidate.get("codex_oauth_account_label")
+            )
     return _apply_codex_oauth_failover_context_to_state(request, state)
 
 
@@ -4135,7 +4416,14 @@ async def _build_codex_auto_agent_affinity_candidate_state(
         and not _affinity_pins_account_identity(affinity)
     ):
         return (
-            _select_first_available_codex_oauth_account_state(states)
+            next(
+                (
+                    state
+                    for state in states
+                    if _is_auto_agent_candidate_state_available(state)
+                ),
+                None,
+            )
             or states[0]
         )
     return states[0]
@@ -4263,7 +4551,7 @@ async def _build_codex_auto_agent_candidate_states(
         for candidate in candidates
     ):
         await _hydrate_zai_coding_plan_quota_observations()
-    for candidate_template in candidates:
+    for template_index, candidate_template in enumerate(candidates):
         if _candidate_uses_xai_oauth(candidate_template):
             contexts = await _resolve_xai_oauth_account_candidate_contexts(
                 request,
@@ -4294,6 +4582,12 @@ async def _build_codex_auto_agent_candidate_states(
                 )
             continue
         if _candidate_uses_codex_oauth(candidate_template):
+            candidate_template = {
+                **candidate_template,
+                "codex_oauth_account_selection_identity": (
+                    "codex", alias_model, template_index
+                ),
+            }
             contexts = await _resolve_codex_oauth_account_candidate_contexts(
                 request,
                 candidate_template=candidate_template,
@@ -4367,12 +4661,13 @@ async def _build_anthropic_auto_agent_candidate_states(
     openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
     anthropic_lane_key = _resolve_anthropic_auto_agent_native_cooldown_lane_key(request)
     states: list[dict[str, Any]] = []
-    for candidate_template in _resolve_aawm_alias_selection_enumeration(
+    candidates = _resolve_aawm_alias_selection_enumeration(
         request,
         alias_model,
         ingress="anthropic",
         client_product_label=client_product_label,
-    ).candidates:
+    ).candidates
+    for template_index, candidate_template in enumerate(candidates):
         if _candidate_uses_xai_oauth(candidate_template):
             contexts = await _resolve_xai_oauth_account_candidate_contexts(
                 request,
@@ -4404,6 +4699,12 @@ async def _build_anthropic_auto_agent_candidate_states(
                 )
             continue
         if _candidate_uses_codex_oauth(candidate_template):
+            candidate_template = {
+                **candidate_template,
+                "codex_oauth_account_selection_identity": (
+                    "anthropic", alias_model, template_index
+                ),
+            }
             contexts = await _resolve_codex_oauth_account_candidate_contexts(
                 request,
                 candidate_template=candidate_template,
@@ -4541,6 +4842,7 @@ def _select_available_state(
     *,
     ingress: str,
     last_resort: bool,
+    request_mode: str = "fresh",
 ) -> Optional[dict[str, Any]]:
     available = [
         state
@@ -4568,8 +4870,14 @@ def _select_available_state(
     ]
     group = tier[0]["candidate"].get("selection_group")
     strategy = tier[0]["candidate"].get("selection_strategy")
+    bypass_reason = (
+        None if request_mode in {"fresh", "fresh_redispatch"}
+        else "ordinary_continuation"
+    )
     if not group or not strategy:
-        return tier[0]
+        return _select_codex_oauth_account_within_identity(
+            states, tier[0], last_resort=last_resort, bypass_reason=bypass_reason
+        )
 
     states_by_choice: dict[str, list[dict[str, Any]]] = {}
     weights: dict[str, float] = {}
@@ -4577,7 +4885,10 @@ def _select_available_state(
         candidate = state["candidate"]
         choice = str(candidate.get("selection_choice") or "")
         if not choice:
-            return tier[0]
+            return _select_codex_oauth_account_within_identity(
+                states, tier[0], last_resort=last_resort,
+                bypass_reason=bypass_reason,
+            )
         states_by_choice.setdefault(choice, []).append(state)
         weights.setdefault(
             choice,
@@ -4635,6 +4946,13 @@ def _select_available_state(
         selected_by_group[str(group)] = selected_choice
 
     selected = selected_state or states_by_choice[selected_choice][0]
+    selected = _select_codex_oauth_account_within_identity(
+        states,
+        selected,
+        last_resort=last_resort,
+        bypass_reason=bypass_reason,
+    )
+    quota_balancing = selected.get("quota_selection")
     total_weight = sum(max(0.0, weights[choice]) for choice in choices)
     selected["selection_diagnostics"] = {
         "strategy": strategy,
@@ -4653,6 +4971,9 @@ def _select_available_state(
             str(group), 0
         ),
     }
+    if isinstance(quota_balancing, dict):
+        selected["selection_diagnostics"]["quota_balancing"] = quota_balancing
+        selected["quota_balancing"] = quota_balancing
     return selected
 
 
@@ -6100,13 +6421,19 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         states,
         ingress="codex",
         last_resort=False,
+        request_mode=request_mode,
     )
     if state is not None:
-        selection_reason = (
-            "codex_oauth_account_failover"
-            if int(state.get("failover_ordinal") or 0) > 0
-            else "first_available"
-        )
+        if int(state.get("failover_ordinal") or 0) > 0:
+            selection_reason = "codex_oauth_account_failover"
+        else:
+            quota_selection = state.get("quota_selection")
+            selection_reason = (
+                quota_selection.get("selection_reason")
+                if isinstance(quota_selection, dict)
+                and quota_selection.get("selection_reason")
+                else "first_available"
+            )
         return _attach_account_bound_selection_metadata(
             _attach_session_owner_selection_fields(
                 _attach_aawm_alias_routing_state_sources(
@@ -6136,13 +6463,29 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         states,
         ingress="codex",
         last_resort=True,
+        request_mode=request_mode,
     )
     if state is not None:
-        selection_reason = (
-            "codex_oauth_account_failover"
-            if int(state.get("failover_ordinal") or 0) > 0
-            else "last_resort"
-        )
+        if _candidate_uses_codex_oauth(state["candidate"]):
+            skipped[:] = [
+                entry for entry in skipped
+                if (
+                    entry.get("provider"), entry.get("model"), entry.get("lane_key")
+                ) != (
+                    state["candidate"].get("provider"),
+                    state["candidate"].get("model"), state.get("lane_key"),
+                )
+            ]
+        if int(state.get("failover_ordinal") or 0) > 0:
+            selection_reason = "codex_oauth_account_failover"
+        else:
+            quota_selection = state.get("quota_selection")
+            selection_reason = (
+                quota_selection.get("selection_reason")
+                if isinstance(quota_selection, dict)
+                and quota_selection.get("selection_reason")
+                else "last_resort"
+            )
         return _attach_account_bound_selection_metadata(
             _attach_session_owner_selection_fields(
                 _attach_aawm_alias_routing_state_sources(
@@ -6556,13 +6899,19 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
         states,
         ingress="anthropic",
         last_resort=False,
+        request_mode=request_mode,
     )
     if state is not None:
-        selection_reason = (
-            "codex_oauth_account_failover"
-            if int(state.get("failover_ordinal") or 0) > 0
-            else "first_available"
-        )
+        if int(state.get("failover_ordinal") or 0) > 0:
+            selection_reason = "codex_oauth_account_failover"
+        else:
+            quota_selection = state.get("quota_selection")
+            selection_reason = (
+                quota_selection.get("selection_reason")
+                if isinstance(quota_selection, dict)
+                and quota_selection.get("selection_reason")
+                else "first_available"
+            )
         return _attach_aawm_alias_routing_state_sources(
             {
                 **state,
@@ -6584,13 +6933,29 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
         states,
         ingress="anthropic",
         last_resort=True,
+        request_mode=request_mode,
     )
     if state is not None:
-        selection_reason = (
-            "codex_oauth_account_failover"
-            if int(state.get("failover_ordinal") or 0) > 0
-            else "last_resort"
-        )
+        if _candidate_uses_codex_oauth(state["candidate"]):
+            skipped[:] = [
+                entry for entry in skipped
+                if (
+                    entry.get("provider"), entry.get("model"), entry.get("lane_key")
+                ) != (
+                    state["candidate"].get("provider"),
+                    state["candidate"].get("model"), state.get("lane_key"),
+                )
+            ]
+        if int(state.get("failover_ordinal") or 0) > 0:
+            selection_reason = "codex_oauth_account_failover"
+        else:
+            quota_selection = state.get("quota_selection")
+            selection_reason = (
+                quota_selection.get("selection_reason")
+                if isinstance(quota_selection, dict)
+                and quota_selection.get("selection_reason")
+                else "last_resort"
+            )
         return _attach_aawm_alias_routing_state_sources(
             {
                 **state,
@@ -6709,6 +7074,7 @@ _HOST_FUNCTION_NAMES = (
     "_codex_oauth_quota_window_is_confirmed_exhausted",
     "_build_codex_oauth_terminal_reset_information",
     "_attach_normalized_quota_state",
+    "_attach_codex_oauth_quota_windows",
     "_codex_oauth_public_quota_windows",
     "_build_family_quota_observation",
     "_is_codex_oauth_spark_model",
@@ -6719,6 +7085,8 @@ _HOST_FUNCTION_NAMES = (
     "_codex_oauth_window_is_weekly",
     "_codex_oauth_dual_family_remaining",
     "_select_first_available_codex_oauth_account_state",
+    "_codex_oauth_weekly_balance_threshold_pct",
+    "_select_codex_oauth_account_within_identity",
     "_apply_codex_oauth_account_context_to_state",
     "_apply_xai_oauth_account_context_to_state",
     "_build_codex_auto_agent_affinity_candidate_state",
@@ -6795,6 +7163,7 @@ def install(host_globals: dict) -> None:
     # Copy seam variables into host_globals so rebound functions resolve them.
     host_globals.update({
         "alias_routing_state": alias_routing_state,
+        "_codex_quota_balance": _codex_quota_balance,
         "inspect": inspect,
         "math": math,
         "_AUTO_AGENT_ACCOUNT_IDENTITY_FIELDS": (
@@ -6902,6 +7271,12 @@ def install(host_globals: dict) -> None:
             _CODEX_OAUTH_QUOTA_VALIDITY_DEFAULT_SECONDS
         ),
         "_CODEX_OAUTH_QUOTA_VALIDITY_ENV": _CODEX_OAUTH_QUOTA_VALIDITY_ENV,
+        "_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_DEFAULT_PCT": (
+            _CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_DEFAULT_PCT
+        ),
+        "_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_ENV": (
+            _CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_ENV
+        ),
         "os": os,
         "_hydrate_shared_account_quota_observations": (
             _hydrate_shared_account_quota_observations

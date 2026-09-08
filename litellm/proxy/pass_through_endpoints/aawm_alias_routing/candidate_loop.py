@@ -72,6 +72,7 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.deferred_success 
 from . import codex_oauth as _codex_oauth_mod
 from . import error_signals as _error_signals
 from . import dev_fault_plan as _dev_fault_plan
+from .codex_quota_balance import snapshot_selection
 from .interfaces import (
     AliasRouteServices,
     ClassifyKimiFailureFn,
@@ -327,6 +328,8 @@ _SUPPORTED_REDISPATCH_ERROR_CODES = (
 _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER = (
     "_cursor_session_continuation_failure"
 )
+_CURSOR_RETAINED_TRANSPORT_FAILURE_MARKER = "_cursor_retained_transport_failure"
+_CURSOR_CONTINUATION_EVIDENCE_FIELD = "cursor_continuation_evidence"
 _CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD = "cursor_sanitized_proto_structure"
 _CURSOR_PROTO_STRUCTURE_MAX_DEPTH = 3
 _CURSOR_PROTO_STRUCTURE_MAX_ITEMS = 64
@@ -370,7 +373,10 @@ def _is_cursor_session_continuation_failure(
     return bool(
         isinstance(candidate, Mapping)
         and candidate.get("provider") == "cursor_agent"
-        and getattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, False)
+        and (
+            getattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, False)
+            or getattr(exc, _CURSOR_RETAINED_TRANSPORT_FAILURE_MARKER, False)
+        )
     )
 
 
@@ -1162,6 +1168,62 @@ async def handle_alias_route(  # noqa: PLR0915
             and not bool(selection.get("in_flight_session"))
         )
 
+    def _xai_no_io_selection_skip_reason(
+        *,
+        candidate: Mapping[str, Any],
+        exc: BaseException,
+        attempted_provider_call: bool,
+        selection: Mapping[str, Any],
+    ) -> Optional[str]:
+        """Classify exact xAI failures that never reached egress."""
+        if (
+            str(candidate.get("provider") or "").strip().lower() != "xai"
+            or attempted_provider_call
+        ):
+            return None
+        if _error_signals._is_codex_auto_agent_candidate_deterministically_ineligible(
+            exc
+        ):
+            return "candidate_ineligible"
+        if getattr(exc, "failure_phase", None) == "credential_readiness":
+            return "credential_readiness"
+        return None
+
+    def _account_xai_no_io_selection(
+        *,
+        attempt_record: dict[str, Any],
+        reason: str,
+        budget_was_counted: bool,
+        selection_provider_egress_reached: bool,
+    ) -> None:
+        """Refund one counted xAI selection and mark its bounded skip outcome."""
+        nonlocal provider_candidate_attempts
+        if attempt_record.get("attempted_provider_call") is True:
+            return
+        already_skipped = (
+            attempt_record.get("terminal_disposition") == "skipped"
+            and attempt_record.get("skip_reason") == reason
+        )
+        budget_refunded = (
+            attempt_record.get("provider_attempt_budget_refunded") is True
+        )
+        if (
+            budget_was_counted
+            and not selection_provider_egress_reached
+            and not budget_refunded
+        ):
+            provider_candidate_attempts = max(
+                0,
+                provider_candidate_attempts - 1,
+            )
+            attempt_record["provider_attempt_budget_refunded"] = True
+        elif "provider_attempt_budget_refunded" not in attempt_record:
+            attempt_record["provider_attempt_budget_refunded"] = False
+        if already_skipped:
+            return
+        attempt_record["terminal_disposition"] = "skipped"
+        attempt_record["skip_reason"] = reason
+
     cursor_replay_rejection_request_shape_summary: Optional[dict[str, Any]] = None
     cursor_replay_fresh_dispatch_reject: Optional[dict[str, Any]] = None
 
@@ -1936,16 +1998,7 @@ async def handle_alias_route(  # noqa: PLR0915
             lane_key=selection.get("lane_key"),
             reason=selection.get("selection_reason"),
         )
-        for field in (
-            "quota_snapshot_age_seconds",
-            "quota_windows",
-            "failover_ordinal",
-            "prior_account_outcome",
-            "terminal_reset",
-        ):
-            value = selection.get(field)
-            if value is not None:
-                attempt_record[field] = value
+        attempt_record.update(snapshot_selection(selection))
         attempt_record["attempted_provider_call"] = False
         if (
             capacity_retry_coordinator is not None
@@ -1984,6 +2037,10 @@ async def handle_alias_route(  # noqa: PLR0915
                     }
                 },
             ))
+        selection_budget_counted = failover_ordinal == 0
+        if selection_budget_counted:
+            provider_candidate_attempts += 1
+        selection_provider_egress_reached = False
         # D1-564: provider/account lane admission after selection and before
         # attempt-start / probe lock / provider I/O. Separate from cooldown and
         # session ownership. Fail-fast only: never queue/sleep/background-retry.
@@ -2089,6 +2146,8 @@ async def handle_alias_route(  # noqa: PLR0915
                 # 6. Signal intent complete, remove from registry.
                 probe_failure_exc: Optional[Exception] = None
                 probe_failure_plan: Optional[CooldownPublicationPlan] = None
+                xai_no_io_selection_skip_reason: Optional[str] = None
+                xai_no_io_selection_reselect_eligible = False
                 skip_after_probe_wait = False
                 response: Optional[Response] = None
                 intent = None
@@ -2283,7 +2342,7 @@ async def handle_alias_route(  # noqa: PLR0915
 
                         async def _perform_candidate_request() -> Response:  # noqa: PLR0915
                             nonlocal attempted_provider_call
-                            nonlocal provider_candidate_attempts
+                            nonlocal selection_provider_egress_reached
                             candidate_is_openai = (
                                 str(candidate.get("provider") or "").strip().lower()
                                 == "openai"
@@ -2453,8 +2512,10 @@ async def handle_alias_route(  # noqa: PLR0915
                                 attempt_record["attempted_provider_call"] = (
                                     attempted_provider_call
                                 )
-                                if attempted_provider_call:
-                                    provider_candidate_attempts += 1
+                                selection_provider_egress_reached = (
+                                    selection_provider_egress_reached
+                                    or attempted_provider_call
+                                )
                                 if "hidden_logical_retry_count" not in attempt_record:
                                     attempt_record["hidden_logical_retry_count"] = (
                                         getattr(
@@ -2970,6 +3031,28 @@ async def handle_alias_route(  # noqa: PLR0915
                             cooldown_seconds_fn=_get_codex_auto_agent_cooldown_seconds,
                             fresh_codex_auth_error_class=fresh_codex_auth_error_class,
                         )
+                        xai_no_io_selection_skip_reason = (
+                            _xai_no_io_selection_skip_reason(
+                                candidate=candidate,
+                                exc=probe_failure_exc,
+                                attempted_provider_call=attempted_provider_call,
+                                selection=selection,
+                            )
+                        )
+                        if xai_no_io_selection_skip_reason is not None:
+                            xai_no_io_selection_reselect_eligible = (
+                                _genuinely_fresh_dispatch(selection)
+                                or _validated_unowned_replay(selection)
+                            )
+                            probe_failure_plan = CooldownPublicationPlan(
+                                applied_scope="none",
+                                grok_account_quota_exhausted=(
+                                    probe_failure_plan.grok_account_quota_exhausted
+                                ),
+                                kimi_failure_metadata=(
+                                    probe_failure_plan.kimi_failure_metadata
+                                ),
+                            )
                         intent.plan = probe_failure_plan
 
                     if skip_after_probe_wait:
@@ -3360,6 +3443,13 @@ async def handle_alias_route(  # noqa: PLR0915
                     failure_exc,
                     candidate=candidate,
                 ):
+                    continuation_evidence = getattr(
+                        failure_exc, _CURSOR_CONTINUATION_EVIDENCE_FIELD, None
+                    )
+                    if isinstance(continuation_evidence, dict):
+                        attempt_record[_CURSOR_CONTINUATION_EVIDENCE_FIELD] = dict(
+                            continuation_evidence
+                        )
                     continuation_error_class = (
                         _classify_codex_auto_agent_retryable_exhaustion(
                             failure_exc,
@@ -3421,6 +3511,11 @@ async def handle_alias_route(  # noqa: PLR0915
                             if replay_safety is not None
                             else True
                         )
+                        if not attempted_provider_call:
+                            provider_candidate_attempts = max(
+                                0,
+                                provider_candidate_attempts - 1,
+                            )
                         deterministically_ineligible_candidate_keys.add(cooldown_key)
                         last_retryable_exc = failure_exc
                         break
@@ -3580,6 +3675,12 @@ async def handle_alias_route(  # noqa: PLR0915
                         or (replay_safety is not None and replay_safety.safe)
                     )
                 ):
+                    if deterministic_exclusion_eligible:
+                        if xai_no_io_selection_skip_reason is None:
+                            provider_candidate_attempts = max(
+                                0,
+                                provider_candidate_attempts - 1,
+                            )
                     deterministically_ineligible_candidate_keys.add(cooldown_key)
                 last_retryable_exc = failure_exc
                 native_grok_recovery_candidate = (
@@ -3856,6 +3957,29 @@ async def handle_alias_route(  # noqa: PLR0915
                     candidate=candidate,
                     kimi_failure_metadata=kimi_failure_metadata,
                 )
+                if xai_no_io_selection_skip_reason is not None:
+                    _account_xai_no_io_selection(
+                        attempt_record=attempt_record,
+                        reason=xai_no_io_selection_skip_reason,
+                        budget_was_counted=selection_budget_counted,
+                        selection_provider_egress_reached=(
+                            selection_provider_egress_reached
+                        ),
+                    )
+                    if not xai_no_io_selection_reselect_eligible:
+                        attempt_record["status"] = "terminal_xai_no_io"
+                        _record_auto_agent_alias_attempt_failure(
+                            alias_family=alias_family,
+                            alias_model=alias_model,
+                            request=request,
+                            prepared_request_body=prepared_request_body,
+                            selection=selection,
+                            attempts=attempts,
+                            attempt_record=attempt_record,
+                            error_class=error_class,
+                            add_alias_metadata_fn=add_alias_metadata_fn,
+                        )
+                        _raise_terminal_alias_failure(failure_exc)
                 # D1-586: observational shadow action only. Does not change retry,
                 # failover, sleep, admission, or cooldown enforcement paths.
                 attempt_record["shadow_failure_action"] = (
@@ -3917,6 +4041,10 @@ async def handle_alias_route(  # noqa: PLR0915
                     cooldown_scope == "none"
                     and not _provider_owned_continuation()
                     and not deterministically_ineligible
+                    and (
+                        xai_no_io_selection_skip_reason is None
+                        or xai_no_io_selection_reselect_eligible
+                    )
                 ):
                     _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
                         request,
@@ -4124,6 +4252,11 @@ async def handle_alias_route(  # noqa: PLR0915
                         error_class,
                     )
                     break
+                if (
+                    failover_ordinal > 0
+                    and xai_no_io_selection_skip_reason is None
+                ):
+                    provider_candidate_attempts += 1
                 _record_auto_agent_alias_attempt_failure(
                     alias_family=alias_family,
                     alias_model=alias_model,
@@ -4219,6 +4352,16 @@ def _resolve_failure_plan(
         exc=exc,
         candidate=candidate,
     )
+    if _is_cursor_session_continuation_failure(exc, candidate=candidate):
+        # This is loss of one retained session, not evidence against unrelated
+        # requests. Bypass the evidence accumulator as well as timed cooldowns.
+        return CooldownPublicationPlan(
+            memory_keys=(),
+            durable_keys=(),
+            duration_seconds=0.0,
+            applied_scope="none",
+            request_local_action=None,
+        )
     if (
         _error_signals._is_codex_auto_agent_candidate_deterministically_ineligible(
             exc

@@ -21,6 +21,12 @@ from . import audit_build as _audit_build
 from . import audit_persist as _audit_persist
 from . import codex_oauth as _codex_oauth
 from . import selection as _selection
+from .codex_quota_balance import snapshot_selection
+from .selection import (
+    _attempt_has_provider_call,
+    _provider_attempt_count,
+    _provider_attempt_record_index,
+)
 
 _OPENAI_FAULT_PLAN_ENABLED_ENV = "AAWM_OPENAI_FAULT_PLAN_ENABLED"
 _OPENAI_FAULT_PLAN_ENVIRONMENT_ENV = "AAWM_LITELLM_ENVIRONMENT"
@@ -416,15 +422,25 @@ def _add_direct_openai_managed_metadata(
     for event in audit_events:
         if not isinstance(event, dict):
             continue
-        attempt_number = event.get("attempt_number")
+        attempt_record_index = event.get("attempt_record_index")
         if (
-            isinstance(attempt_number, int)
-            and 1 <= attempt_number <= len(attempts)
-            and isinstance(attempts[attempt_number - 1], dict)
+            isinstance(attempt_record_index, bool)
+            or not isinstance(attempt_record_index, int)
+            or not 0 <= attempt_record_index < len(attempts)
+            or not isinstance(attempts[attempt_record_index], dict)
+        ):
+            attempt_record_index = _provider_attempt_record_index(
+                attempts,
+                event.get("attempt_number"),
+            )
+        if (
+            isinstance(attempt_record_index, int)
+            and 0 <= attempt_record_index < len(attempts)
+            and isinstance(attempts[attempt_record_index], dict)
         ):
             _copy_direct_attempt_trace_to_event(
                 event,
-                attempts[attempt_number - 1],
+                attempts[attempt_record_index],
             )
     metadata_trace = {
         "replay_safety": trace["replay_safety"],
@@ -489,16 +505,7 @@ def _new_direct_attempt_record(
         lane_key=selection.get("lane_key"),
         reason=selection.get("selection_reason"),
     )
-    for field in (
-        "quota_snapshot_age_seconds",
-        "quota_windows",
-        "failover_ordinal",
-        "prior_account_outcome",
-        "terminal_reset",
-    ):
-        value = selection.get(field)
-        if value is not None:
-            attempt_record[field] = value
+    attempt_record.update(snapshot_selection(selection))
     attempt_record["attempted_provider_call"] = False
     _direct_attempts(request).append(attempt_record)
     setattr(
@@ -792,7 +799,16 @@ def note_direct_openai_managed_terminal_exhaustion(
         candidate=attempt_record,
         event_type="no_candidate_available",
         candidate_status="all_candidates_unavailable",
-        attempt_number=len(attempts),
+        attempt_number=(
+            _provider_attempt_count(attempts)
+            if _attempt_has_provider_call(attempt_record)
+            else None
+        ),
+        attempt_record_index=(
+            len(attempts) - 1
+            if attempts and attempts[-1] is attempt_record
+            else None
+        ),
         selected=True,
         selection_reason=selection.get("selection_reason"),
         lane_key=selection.get("lane_key"),
@@ -809,7 +825,7 @@ def note_direct_openai_managed_terminal_exhaustion(
         failure_phase=attempt_record.get("failure_phase"),
         attempted_provider_call=attempt_record.get("attempted_provider_call"),
     )
-    event["attempt_count"] = len(attempts)
+    event["attempt_count"] = _provider_attempt_count(attempts)
     _copy_direct_attempt_trace_to_event(event, attempt_record)
     event["attempts"] = [dict(attempt) for attempt in attempts]
     event["candidates"] = [dict(attempt) for attempt in attempts]

@@ -28,6 +28,7 @@ from .request_metadata import (
     _extract_auto_agent_alias_canonical_thread_id,
     _extract_auto_agent_alias_parent_thread_id,
 )
+from .selection import _attempt_has_provider_call, _provider_attempt_count
 from .schema_rejections import (
     SCHEMA_REJECTION_KEY,
     SchemaRejectionDiagnostic,
@@ -562,7 +563,7 @@ def _attach_kimi_managed_account_publication_telemetry(
     attempt_record["kimi_managed_account_publication"] = telemetry
 
 
-def _update_codex_auto_agent_retryable_attempt_record(
+def _update_codex_auto_agent_retryable_attempt_record(  # noqa: PLR0915
     *,
     attempt_record: dict[str, Any],
     exc: Any,
@@ -823,7 +824,16 @@ def _record_auto_agent_alias_attempt_failure(
             candidate=attempt_record,
             event_type="redispatch_required" if redispatch_required else "candidate_retryable_failure",
             candidate_status=attempt_record.get("status") or "cooldown_set",
-            attempt_number=len(attempts),
+            attempt_number=(
+                _provider_attempt_count(attempts)
+                if _attempt_has_provider_call(attempt_record)
+                else None
+            ),
+            attempt_record_index=(
+                len(attempts) - 1
+                if attempts and attempts[-1] is attempt_record
+                else None
+            ),
             selected=True,
             selection_reason=selection.get("selection_reason"),
             lane_key=selection.get("lane_key"),
@@ -913,7 +923,16 @@ def _record_auto_agent_alias_attempt_success(
             candidate=attempt_record,
             event_type="candidate_recovered",
             candidate_status=attempt_record.get("status") or "recovered",
-            attempt_number=len(attempts),
+            attempt_number=(
+                _provider_attempt_count(attempts)
+                if _attempt_has_provider_call(attempt_record)
+                else None
+            ),
+            attempt_record_index=(
+                len(attempts) - 1
+                if attempts and attempts[-1] is attempt_record
+                else None
+            ),
             selected=True,
             selection_reason=selection.get("selection_reason"),
             lane_key=selection.get("lane_key"),
@@ -933,9 +952,7 @@ def _record_auto_agent_alias_attempt_success(
     audit_event["candidate_status"] = attempt_record.get("status") or "recovered"
     audit_event["request_outcome"] = "recovered"
     audit_event["attempts"] = copy.deepcopy(attempts)
-    audit_event["attempt_count"] = sum(
-        isinstance(attempt, dict) for attempt in attempts
-    )
+    audit_event["attempt_count"] = _provider_attempt_count(attempts)
     _stamp_auto_agent_alias_request_identity(request=request, target=audit_event)
     _emit_auto_agent_alias_route_event(audit_event)
     return success_body

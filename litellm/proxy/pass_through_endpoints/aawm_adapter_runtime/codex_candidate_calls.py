@@ -51,6 +51,8 @@ _CURSOR_TOOL_CONTINUATION_CUE_MARKER = "_cursor_tool_continuation_cue"
 _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER = (
     "_cursor_session_continuation_failure"
 )
+_CURSOR_RETAINED_TRANSPORT_FAILURE_MARKER = "_cursor_retained_transport_failure"
+_CURSOR_CONTINUATION_EVIDENCE_FIELD = "cursor_continuation_evidence"
 _CURSOR_REPLAY_STATE_FIELD = "_cursor_replay_state"
 _CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD = "cursor_sanitized_proto_structure"
 _CURSOR_REPLAY_FRESH_DISPATCH_REJECT_FIELD = (
@@ -559,6 +561,9 @@ def _store_cursor_replay_state(
     messages: list[dict[str, Any]],
     tools: list[Any],
     retained_session: Any = None,
+    owner_scope: Optional[tuple[str, str]] = None,
+    pending_call_ids: Optional[list[str]] = None,
+    continuation_outcome: Optional[str] = None,
 ) -> None:
     now = time.monotonic()
     _prune_cursor_replay_registry(now)
@@ -570,6 +575,9 @@ def _store_cursor_replay_state(
         "messages": copy.deepcopy(messages),
         "tools": copy.deepcopy(tools),
         "retained_session": retained_session,
+        "owner_scope": owner_scope,
+        "pending_call_ids": list(pending_call_ids or []),
+        "continuation_outcome": continuation_outcome,
     }
     _CURSOR_REPLAY_REGISTRY[response_id] = state
     _schedule_cursor_replay_expiry(response_id, state)
@@ -577,6 +585,33 @@ def _store_cursor_replay_state(
     while len(_CURSOR_REPLAY_REGISTRY) > _CURSOR_REPLAY_MAX_SIZE:
         _evicted_id, evicted_state = _CURSOR_REPLAY_REGISTRY.popitem(last=False)
         _dispose_cursor_replay_state(evicted_state)
+
+
+def _record_cursor_replay_outcome(
+    response_id: str,
+    state: dict[str, Any],
+    outcome: str,
+) -> None:
+    # Reuse the registry's existing lifetime/count bounds without retaining the
+    # socket. An unavailable claimed or consumed generation is not replay loss.
+    _store_cursor_replay_state(
+        response_id,
+        messages=state["messages"],
+        tools=state["tools"],
+        owner_scope=state.get("owner_scope"),
+        pending_call_ids=state.get("pending_call_ids"),
+        continuation_outcome=outcome,
+    )
+
+
+def _reject_cursor_replay_outcome(state: dict[str, Any]) -> None:
+    from litellm.llms.cursor_agent.connect import CursorConnectError
+
+    if state.get("continuation_outcome") is not None:
+        raise CursorConnectError(
+            "Cursor Agent continuation generation is already claimed or consumed.",
+            status_code=409,
+        )
 
 
 def _peek_cursor_replay_state(response_id: str) -> dict[str, Any]:
@@ -600,6 +635,7 @@ def _peek_cursor_replay_state(response_id: str) -> dict[str, Any]:
         )
     _prune_cursor_replay_registry(now)
     _CURSOR_REPLAY_REGISTRY.move_to_end(response_id)
+    _reject_cursor_replay_outcome(state)
     return state
 
 
@@ -635,6 +671,7 @@ def _cursor_replay_state_snapshot(
             "messages": copy.deepcopy(state.get("messages")),
             "tools": copy.deepcopy(state.get("tools")),
             "retained_session": state.get("retained_session"),
+            "continuation_outcome": state.get("continuation_outcome"),
         }
     except Exception:  # noqa: BLE001
         return None
@@ -677,6 +714,64 @@ def _cursor_replay_failure_is_transient(
     if status_code in _CURSOR_REPLAY_PRESERVED_STATUS_CODES:
         return True
     return transport_failure and status_code is None
+
+
+def _mark_cursor_retained_transport_failure(
+    exc: Exception,
+    *,
+    session: Any,
+    replay_state: dict[str, Any],
+    full_history: bool,
+) -> None:
+    from h2.exceptions import H2Error
+    from httpx import TransportError
+
+    from litellm.llms.cursor_agent.connect import (
+        CursorConnectError,
+        CursorConnectProtocolError,
+    )
+
+    is_transport_loss = (
+        isinstance(exc, (OSError, TransportError, H2Error))
+        or (
+            isinstance(exc, CursorConnectError)
+            and not isinstance(exc, CursorConnectProtocolError)
+            and (
+                getattr(exc, "status_code", None) in {408, 500, 502, 503, 504, 529}
+                or str(exc)
+                == "Cursor Agent retained continuation session is closed."
+            )
+        )
+    )
+    if not is_transport_loss:
+        return
+    evidence = getattr(session, "continuation_evidence", None)
+    evidence = evidence if isinstance(evidence, Mapping) else {}
+    setattr(
+        exc,
+        _CURSOR_CONTINUATION_EVIDENCE_FIELD,
+        {
+            "continuation_invoked": True,
+            "result_bytes_written": (
+                evidence.get("result_bytes_written")
+                if isinstance(evidence.get("result_bytes_written"), bool)
+                else None
+            ),
+            "provider_progress_observed": (
+                evidence.get("provider_progress_observed")
+                if isinstance(evidence.get("provider_progress_observed"), bool)
+                else None
+            ),
+        },
+    )
+    if not full_history:
+        snapshot = _cursor_replay_state_snapshot(replay_state)
+        if snapshot is None:
+            return
+        snapshot["retained_session"] = None
+        snapshot["continuation_outcome"] = None
+        setattr(exc, _CURSOR_REPLAY_STATE_FIELD, snapshot)
+    setattr(exc, _CURSOR_RETAINED_TRANSPORT_FAILURE_MARKER, True)
 
 
 def _clear_cursor_replay_registry() -> None:
@@ -1552,7 +1647,7 @@ def _cursor_function_call_message(
             item=item,
         )
     function_calls[call_id] = name
-    return {
+    message: dict[str, Any] = {
         "role": "assistant",
         "content": _cursor_response_content_text(item.get("content")),
         "tool_calls": [
@@ -1566,6 +1661,10 @@ def _cursor_function_call_message(
             }
         ],
     }
+    namespace = item.get("namespace", function.get("namespace"))
+    if namespace is not None:
+        message["tool_calls"][0]["namespace"] = namespace
+    return message
 
 
 def _validate_cursor_returned_tool_calls(tool_calls: list[Any]) -> None:
@@ -1702,6 +1801,110 @@ def _cursor_function_call_outputs(
             output = item.get("content")
         outputs.append((call_id, _cursor_response_content_text(output)))
     return outputs
+
+
+def _cursor_retained_owner_scope(request: Any) -> Optional[tuple[str, str]]:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity import (
+        get_request_session_owner_lease,
+    )
+
+    lease = get_request_session_owner_lease(request)
+    if (
+        lease is None
+        or lease.released
+        or not lease.cache_key
+        or not lease.owner_id
+    ):
+        return None
+    return lease.cache_key, lease.owner_id
+
+
+def _find_cursor_full_history_retained_state(
+    request_body: dict[str, Any],
+    *,
+    owner_scope: Optional[tuple[str, str]],
+) -> Optional[tuple[str, dict[str, Any], list[tuple[str, str]]]]:
+    from litellm.llms.cursor_agent.connect import CursorConnectError
+
+    if owner_scope is None:
+        return None
+    _prune_cursor_replay_registry()
+    states = [
+        (response_id, state)
+        for response_id, state in _CURSOR_REPLAY_REGISTRY.items()
+        if state.get("owner_scope") == owner_scope
+        and (
+            state.get("retained_session") is not None
+            or state.get("continuation_outcome") is not None
+        )
+    ]
+    if not states:
+        return None
+
+    input_items = request_body.get("input")
+    if not isinstance(input_items, list):
+        raise CursorConnectError(
+            "Cursor Agent retained continuation requires valid complete tool history.",
+            status_code=409,
+        )
+    # Live continuation validates the trusted prefix, not the single-pair
+    # grammar used to authorize a provider-neutral fallback.
+    for item in input_items:
+        item_type = item.get("type") if isinstance(item, Mapping) else None
+        if item_type == "message":
+            validated = _cursor_replay_stock_codex_message_item(
+                item, allow_missing_metadata=True
+            )
+        elif item_type == "function_call":
+            validated = _cursor_replay_stock_codex_function_call_item(
+                item, allow_missing_metadata=True
+            )
+        elif item_type == "function_call_output":
+            validated = _cursor_replay_function_call_output_items(
+                {"input": [item]}, allow_missing_metadata=True
+            )
+        else:
+            validated = None
+        if validated is None or validated.rejection is not None:
+            raise CursorConnectError(
+                "Cursor Agent retained continuation requires valid complete tool history.",
+                status_code=409,
+            )
+    messages = _responses_input_to_cursor_messages(request_body)
+    if messages and messages[-1].get(_CURSOR_TOOL_CONTINUATION_CUE_MARKER):
+        messages.pop()
+    matches = []
+    for response_id, state in states:
+        pending_ids = set(state.get("pending_call_ids") or [])
+        prior = state.get("messages")
+        if not pending_ids or not isinstance(prior, list):
+            continue
+        if messages[:len(prior)] != prior:
+            continue
+        tail = messages[len(prior):]
+        if (
+            len(tail) != len(pending_ids)
+            or any(message.get("role") != "tool" for message in tail)
+            or {message.get("tool_call_id") for message in tail} != pending_ids
+            or (
+                isinstance(request_body.get("tools"), list)
+                and request_body["tools"] != state.get("tools")
+            )
+        ):
+            continue
+        outputs = [
+            (message["tool_call_id"], message["content"])
+            for message in tail
+        ]
+        matches.append((response_id, state, outputs))
+    if len(matches) != 1:
+        raise CursorConnectError(
+            "Cursor Agent retained continuation does not uniquely match its "
+            "guarded owner, unchanged assignment, tools, and pending calls.",
+            status_code=409,
+        )
+    _reject_cursor_replay_outcome(matches[0][1])
+    return matches[0]
 
 
 def _cursor_replay_function_call_output_items(
@@ -2936,6 +3139,27 @@ def _cursor_replay_build_stored_history_input(
             "fresh_body_copy",
             "replayed_input_container",
         )
+    # The shared chat converter predates namespace tools. Restore the qualified
+    # identity from the validated stored calls without changing that converter.
+    namespaces = {
+        call.get("id"): call["namespace"]
+        for message in messages
+        for call in message.get("tool_calls") or []
+        if isinstance(call, dict) and "namespace" in call
+    }
+    if any(
+        not isinstance(namespace, str)
+        or not namespace
+        or namespace != namespace.strip()
+        for namespace in namespaces.values()
+    ):
+        return _cursor_replay_rejected(
+            "fresh_body_copy",
+            "function_namespace",
+        )
+    for item in replayed_input:
+        if item.get("type") == "function_call" and item.get("call_id") in namespaces:
+            item["namespace"] = namespaces[item["call_id"]]
 
     # Stored history can end with an unresolved call because the current
     # request carries its outputs. Merge those outputs before the sole
@@ -3009,10 +3233,17 @@ def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
                 )
         elif (
             previous_response_id is None
-            and getattr(
-                continuation_exc,
-                _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
-                False,
+            and (
+                getattr(
+                    continuation_exc,
+                    _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
+                    False,
+                )
+                or getattr(
+                    continuation_exc,
+                    _CURSOR_RETAINED_TRANSPORT_FAILURE_MARKER,
+                    False,
+                )
             )
         ):
             full_history_result = _cursor_replay_stock_codex_full_history_input(
@@ -3040,6 +3271,11 @@ def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
             return _cursor_replay_build_rejected(
                 "fresh_body_copy",
                 "retained_session_present",
+            )
+        if replay_state.get("continuation_outcome") is not None:
+            return _cursor_replay_build_rejected(
+                "fresh_body_copy",
+                "missing_replay_state",
             )
 
         stored_history_result = _cursor_replay_build_stored_history_input(
@@ -3501,9 +3737,26 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             item={input_continuation_key: True},
         )
     replay_state: Optional[dict[str, Any]] = None
+    owner_scope = _cursor_retained_owner_scope(request)
+    cursor_tool_outputs = _cursor_function_call_outputs(request_body)
+    full_history_continuation = False
     previous_response_id = request_body.get("previous_response_id")
     if isinstance(previous_response_id, str) and previous_response_id:
         replay_state = _peek_cursor_replay_state(previous_response_id)
+        stored_scope = replay_state.get("owner_scope")
+        if stored_scope is not None and stored_scope != owner_scope:
+            raise CursorConnectError(
+                "Cursor Agent retained continuation owner does not match.",
+                status_code=409,
+            )
+    elif previous_response_id is None and cursor_tool_outputs:
+        matched = _find_cursor_full_history_retained_state(
+            request_body,
+            owner_scope=owner_scope,
+        )
+        if matched is not None:
+            previous_response_id, replay_state, cursor_tool_outputs = matched
+            full_history_continuation = True
     stored_messages = (
         replay_state.get("messages")
         if isinstance(replay_state, dict)
@@ -3545,7 +3798,6 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         if isinstance(replay_state, dict)
         else None
     )
-    cursor_tool_outputs = _cursor_function_call_outputs(request_body)
     if cursor_tool_outputs and retained_session is None:
         _raise_cursor_session_continuation_unavailable(
             previous_response_id=(
@@ -3562,6 +3814,7 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             replay_state.get("messages")
             if isinstance(replay_state, dict)
             and isinstance(replay_state.get("messages"), list)
+            and not full_history_continuation
             else None
         ),
     )
@@ -3572,6 +3825,7 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             expected_state=replay_state,
             close_retained_session=False,
         )
+        _record_cursor_replay_outcome(previous_response_id, replay_state, "claimed")
         try:
             result = await retained_session.continue_with_tool_outputs(
                 cursor_tool_outputs
@@ -3581,23 +3835,43 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
                 previous_response_id=None,
                 replay_state=None,
             )
-        except Exception:
+        except Exception as exc:
             await retained_session.aclose()
-            raise
-
-        try:
-            replay_messages = _cursor_messages_with_result_tool_calls(
-                messages,
-                result.tool_calls,
-                result.text,
+            _record_cursor_replay_outcome(
+                previous_response_id, replay_state, "consumed"
             )
-        except _CursorPostEgressOutputError as exc:
-            _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
+            _mark_cursor_retained_transport_failure(
+                exc,
+                session=retained_session,
+                replay_state=replay_state,
+                full_history=full_history_continuation,
+            )
+            raise
+        _record_cursor_replay_outcome(
+            previous_response_id, replay_state, "consumed"
+        )
+
         model = str(candidate.get("model") or request_body.get("model") or "")
         response_body = _cursor_responses_response_body(
             model=model,
             result=result,
         )
+        response_body, _ = _restore_adapted_namespace_tool_calls_in_response_body(
+            response_body,
+            request_body=restoration_request_body,
+            adapter_model=adapter_model,
+        )
+        try:
+            replay_messages = _cursor_messages_with_result_tool_calls(
+                messages,
+                [
+                    item for item in response_body["output"]
+                    if item.get("type") == "function_call"
+                ],
+                result.text,
+            )
+        except _CursorPostEgressOutputError as exc:
+            _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
         if result.tool_calls:
             next_session = result.retained_session
             _store_cursor_replay_state(
@@ -3605,16 +3879,13 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
                 messages=replay_messages,
                 tools=request_tools if isinstance(request_tools, list) else [],
                 retained_session=next_session,
+                owner_scope=owner_scope,
+                pending_call_ids=[call["call_id"] for call in result.tool_calls],
             )
             if next_session is None:
                 await retained_session.aclose()
         else:
             await retained_session.aclose()
-        response_body, _ = _restore_adapted_namespace_tool_calls_in_response_body(
-            response_body,
-            request_body=restoration_request_body,
-            adapter_model=adapter_model,
-        )
         _record_adapted_completed_route_rollup_turn(
             rollup_kwargs,
             adapter_label="Cursor Agent",
@@ -3709,11 +3980,19 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         response_body = _cursor_responses_response_body(model=model, result=result)
     except _CursorPostEgressOutputError as exc:
         _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
+    response_body, _ = _restore_adapted_namespace_tool_calls_in_response_body(
+        response_body,
+        request_body=restoration_request_body,
+        adapter_model=adapter_model,
+    )
     if result.tool_calls:
         try:
             replay_messages = _cursor_messages_with_result_tool_calls(
                 messages,
-                result.tool_calls,
+                [
+                    item for item in response_body["output"]
+                    if item.get("type") == "function_call"
+                ],
                 result.text,
             )
         except _CursorPostEgressOutputError as exc:
@@ -3723,12 +4002,9 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             messages=replay_messages,
             tools=request_tools if isinstance(request_tools, list) else [],
             retained_session=result.retained_session,
+            owner_scope=owner_scope,
+            pending_call_ids=[call["call_id"] for call in result.tool_calls],
         )
-    response_body, _ = _restore_adapted_namespace_tool_calls_in_response_body(
-        response_body,
-        request_body=restoration_request_body,
-        adapter_model=adapter_model,
-    )
     _record_adapted_completed_route_rollup_turn(
         rollup_kwargs,
         adapter_label="Cursor Agent",
@@ -3939,6 +4215,37 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
 
     attempted_provider_call: Optional[bool] = None
     ineligibility_summary = ""
+    if getattr(exc, _CURSOR_RETAINED_TRANSPORT_FAILURE_MARKER, False):
+        proxy_exc = ProxyException(
+            message=message,
+            type="upstream_error",
+            param="model",
+            code=status_code,
+        )
+        evidence = getattr(exc, _CURSOR_CONTINUATION_EVIDENCE_FIELD, {})
+        setattr(proxy_exc, "status_code", status_code)
+        setattr(proxy_exc, "candidate_status", "retryable")
+        setattr(proxy_exc, "failure_phase", "cursor_retained_transport")
+        # Unknown write status consumes the attempt budget conservatively.
+        setattr(
+            proxy_exc,
+            "attempted_provider_call",
+            evidence.get("result_bytes_written") is not False,
+        )
+        setattr(proxy_exc, _CURSOR_RETAINED_TRANSPORT_FAILURE_MARKER, True)
+        setattr(proxy_exc, _CURSOR_CONTINUATION_EVIDENCE_FIELD, dict(evidence))
+        replay_state = getattr(exc, _CURSOR_REPLAY_STATE_FIELD, None)
+        if isinstance(replay_state, dict):
+            setattr(proxy_exc, _CURSOR_REPLAY_STATE_FIELD, replay_state)
+        _set_mapped_detail(
+            proxy_exc,
+            {
+                "message": message,
+                "code": "cursor_retained_transport_unavailable",
+                _CURSOR_CONTINUATION_EVIDENCE_FIELD: dict(evidence),
+            },
+        )
+        raise proxy_exc from exc
     if getattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, False):
         detail_message = (
             "Cursor Agent candidate is ineligible: the requested tool-output "

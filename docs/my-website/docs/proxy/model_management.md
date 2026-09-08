@@ -339,6 +339,38 @@ non-Anthropic routes do not use this path.
 
 ## Managed Codex OAuth account failover
 
+Fresh managed Codex OAuth dispatches first retain the existing alias choice,
+including its model, provider, route, reasoning configuration, priority and
+distribution policy. Account balancing then operates only on inventory variants
+of that exact template. Direct requests use the same account policy.
+
+Comparison requires every eligible account to have a fresh `codex_quota_poll`
+weekly observation in the configured shared observation scope and requested
+quota family. Overall and Spark windows are independent. Each window must have
+a valid remaining percentage, an observation age between zero and the poll
+interval (default 600 seconds), consistent seven-day duration, and a current
+reset timestamp. Accounts need not reset together. Duplicate model/quota-key
+rows use the newest logical window; a newer unusable observation does not
+restore an older usable comparison.
+
+When the pool's highest minus lowest remaining percentage is at least
+`AAWM_CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_PCT` (default `10`), choose the
+highest remaining account and report `weekly_quota_balanced`. Equal maxima and
+smaller pool spreads retain inventory priority/declaration order and report
+`weekly_quota_priority_tie`. Thus priority-ordered values `85, 90, 10` select
+`90`, while `85, 90` select `85`. If any eligible account lacks comparable
+evidence, retain inventory order and report `weekly_quota_observation_fallback`.
+Unknown model scope also falls back; request counts and account weights are
+not consumption measurements.
+
+Five-hour and weekly exhaustion, credential eligibility, model support, and
+request-local exclusions remain hard gates. Missing comparison evidence does
+not clear these gates. Cooldown-only last-resort selection records its bypass
+without also reporting the winner as skipped. Account-bound continuations
+retain ownership; ordinary continuations bypass fresh balancing. Only existing
+server-authorized replay permits fresh reselection. Parent-session or
+diagnostic metadata cannot establish ownership of a genuinely fresh request.
+
 Managed Codex OAuth direct Responses requests preserve canonical session
 ownership and allow at most one replay-safe account move. The guard validates
 that the original durable owner still owns the session before clearing the
@@ -350,7 +382,11 @@ authenticated session-owner state.
 
 Attempt telemetry records actual upstream provider sends separately from
 selection and guard rejection outcomes. Guard rejections retain the exact
-failed predicate for diagnosis.
+failed predicate for diagnosis. Each attempt retains its own `quota_balancing`
+and outer-choice snapshot: account eligibility, observation scope, family, age,
+reset, unusable-evidence reason, threshold, gap and selected account. Client
+diagnostics redact account identity by named fields; no credentials enter the
+comparison record.
 
 After a failed fresh request, a released request-local reservation may still
 carry an `UNOWNED_RESERVED` or `RESERVATION_RENEWED` decision. Replay-safe
