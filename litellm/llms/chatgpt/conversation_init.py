@@ -232,6 +232,7 @@ _CANONICAL_ACCOUNT_HASH_RE = re.compile(
 _ACCOUNT_IDENTITY_CONTAINERS = ("user", "account", "profile", "membership")
 _IDENTITY_FIELD_NAMES = (
     "feature",
+    "feature_name",
     "feature_id",
     "featureId",
     "feature_slug",
