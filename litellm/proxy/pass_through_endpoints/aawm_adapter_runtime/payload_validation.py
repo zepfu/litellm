@@ -1376,6 +1376,9 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
         inherit_or_wrap_passthrough_streaming_response,
         is_repetitive_output_loop_failure,
     )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.deferred_success import (
+        inherit_deferred_success_holder,
+    )
 
     def _set_stream_validation_state(
         target: Any,
@@ -2078,7 +2081,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 or restored_custom_tool_count
                 or restored_namespace_tool_count
             ):
-                return Response(
+                repaired_response = Response(
                     content=json.dumps(response_body),
                     media_type=response.media_type or "application/json",
                     status_code=response.status_code,
@@ -2087,6 +2090,10 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                         for key, value in dict(response.headers).items()
                         if str(key).lower() != "content-length"
                     },
+                )
+                return inherit_deferred_success_holder(
+                    repaired_response,
+                    source_response=response,
                 )
         if not isinstance(response_body, dict):
             _raise_codex_auto_agent_invalid_responses_shape(
