@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, NoReturn, Optional, Protocol
 
@@ -17,6 +18,7 @@ class PreparePassthroughRequest(Protocol):
         self,
         request_body: Payload,
         *,
+        request: Optional[object] = None,
         sanitize_responses_request: bool = False,
     ) -> Awaitable[tuple[bool, Optional[str], Optional[str]]]: ...
 
@@ -46,6 +48,36 @@ class Runtime:
     provider_target: Any
 
 
+def _prepare_passthrough_request_accepts_request(
+    callback: Callable[..., Any],
+) -> bool:
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return False
+    return "request" in signature.parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
+async def _prepare_passthrough_request(
+    runtime: Runtime,
+    request_body: Payload,
+    *,
+    request: object,
+    sanitize_responses_request: bool = False,
+) -> tuple[bool, Optional[str], Optional[str]]:
+    kwargs: dict[str, Any] = {
+        "sanitize_responses_request": sanitize_responses_request,
+    }
+    if _prepare_passthrough_request_accepts_request(
+        runtime.prepare_passthrough_request
+    ):
+        kwargs["request"] = request
+    return await runtime.prepare_passthrough_request(request_body, **kwargs)
+
+
 async def prepare_responses_route(
     *,
     runtime: Runtime,
@@ -73,8 +105,10 @@ async def prepare_responses_route(
         translated_request_body
     )
     try:
-        prepared, target_base_url, api_key = await runtime.prepare_passthrough_request(
+        prepared, target_base_url, api_key = await _prepare_passthrough_request(
+            runtime,
             translated_request_body,
+            request=request,
             sanitize_responses_request=True,
         )
     except Exception as exc:
@@ -147,8 +181,10 @@ async def prepare_completion_route(
         span_name=config.span_name,
         target_endpoint_label=config.target_endpoint_label,
     )
-    prepared, target_base_url, api_key = await runtime.prepare_passthrough_request(
-        prepared_request_body
+    prepared, target_base_url, api_key = await _prepare_passthrough_request(
+        runtime,
+        prepared_request_body,
+        request=request,
     )
     if not prepared or target_base_url is None or api_key is None:
         raise Exception(

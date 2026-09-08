@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import hashlib
+import inspect
 import os
 import stat
 import time
@@ -22,6 +23,12 @@ from litellm.llms.anthropic.experimental_pass_through.providers.grok import (
 )
 from litellm.llms.xai.oauth import (
     build_grok_native_oauth_metadata as _build_grok_native_oauth_metadata,
+)
+from litellm.llms.xai.oauth import (
+    get_xai_oauth_snapshot_from_request as _get_xai_oauth_snapshot_from_request,
+)
+from litellm.llms.xai.oauth import (
+    bind_xai_oauth_snapshot_to_request as _bind_xai_oauth_snapshot_to_request,
 )
 from litellm.llms.xai.oauth import (
     get_grok_native_oauth_access_token as _get_grok_native_oauth_access_token,
@@ -103,6 +110,7 @@ class XAIRequestPrepRuntime:
     _sanitize_xai_responses_request_body_in_place: Callable[
         [Payload], tuple[list[str], list[dict[str, Any]]]
     ]
+    bind_xai_oauth_snapshot: Optional[Callable[[Any, Any], None]] = None
 
 
 XAI_REQUEST_PREP_SEAM_DISPOSITION = {
@@ -149,6 +157,7 @@ XAI_REQUEST_PREP_SEAM_DISPOSITION = {
     "_sanitize_xai_responses_request_body_in_place": (
         "runtime._sanitize_xai_responses_request_body_in_place"
     ),
+    "bind_xai_oauth_snapshot": "runtime.bind_xai_oauth_snapshot",
 }
 
 
@@ -204,6 +213,7 @@ def build_default_xai_request_prep_runtime(
     get_grok_native_oauth_access_token: Optional[
         Callable[[], Awaitable[str]]
     ] = None,
+    bind_xai_oauth_snapshot: Optional[Callable[[Any, Any], None]] = None,
 ) -> XAIRequestPrepRuntime:
     """Build production defaults while keeping every host callback explicit."""
 
@@ -216,6 +226,8 @@ def build_default_xai_request_prep_runtime(
         get_grok_native_oauth_access_token = (
             _get_grok_native_oauth_access_token
         )
+    if bind_xai_oauth_snapshot is None:
+        bind_xai_oauth_snapshot = _bind_xai_oauth_snapshot_to_request
 
     return XAIRequestPrepRuntime(
         is_oa_xai_model=_is_oa_xai_model,
@@ -257,6 +269,7 @@ def build_default_xai_request_prep_runtime(
         _sanitize_xai_responses_request_body_in_place=(
             sanitize_xai_responses_request_body_in_place
         ),
+        bind_xai_oauth_snapshot=bind_xai_oauth_snapshot,
     )
 
 
@@ -594,6 +607,7 @@ def _sanitize_xai_responses_request_body_in_place(
 async def _prepare_oa_xai_passthrough_request(
     request_body: dict[str, Any],
     *,
+    request: Optional[Request] = None,
     sanitize_responses_request: bool = False,
 ) -> tuple[bool, Optional[str], Optional[str]]:
     runtime = _require_runtime()
@@ -601,9 +615,57 @@ async def _prepare_oa_xai_passthrough_request(
         request_body.get("litellm_metadata"), dict
     ):
         request_body["litellm_metadata"] = {}
-    prepared = await runtime.prepare_oa_xai_request(request_body)
+    snapshot_out: dict[str, Any] = {}
+    request_snapshot = (
+        _get_xai_oauth_snapshot_from_request(request)
+        if request is not None
+        else None
+    )
+    prepare_fn = runtime.prepare_oa_xai_request
+    try:
+        prepare_signature = inspect.signature(prepare_fn)
+    except (TypeError, ValueError):
+        prepare_signature = None
+    accepts_snapshot_out = bool(
+        prepare_signature is not None
+        and (
+            "snapshot_out" in prepare_signature.parameters
+            or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in prepare_signature.parameters.values()
+            )
+        )
+    )
+    accepts_snapshot = bool(
+        prepare_signature is not None
+        and (
+            "snapshot" in prepare_signature.parameters
+            or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in prepare_signature.parameters.values()
+            )
+        )
+    )
+    if request_snapshot is not None and not accepts_snapshot:
+        raise ValueError(
+            "Managed xAI OAuth request preparation cannot preserve the bound "
+            "credential snapshot."
+        )
+    prepare_kwargs: dict[str, Any] = {}
+    if accepts_snapshot_out:
+        prepare_kwargs["snapshot_out"] = snapshot_out
+    if accepts_snapshot and request_snapshot is not None:
+        prepare_kwargs["snapshot"] = request_snapshot
+    prepared = await prepare_fn(request_body, **prepare_kwargs)
     if not prepared:
         return False, None, None
+    snapshot = snapshot_out.get("snapshot")
+    if (
+        request is not None
+        and snapshot is not None
+        and callable(getattr(runtime, "bind_xai_oauth_snapshot", None))
+    ):
+        runtime.bind_xai_oauth_snapshot(request, snapshot)
 
     if sanitize_responses_request:
         (
