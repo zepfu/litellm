@@ -3303,6 +3303,13 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
     request_tools = request_body.get("tools")
     if not isinstance(request_tools, list) and isinstance(replay_state, dict):
         request_tools = replay_state.get("tools")
+    adapter_model = str(candidate.get("model") or request_body.get("model") or "")
+    restoration_request_body = copy.deepcopy(request_body)
+    if (
+        not isinstance(restoration_request_body.get("tools"), list)
+        and isinstance(request_tools, list)
+    ):
+        restoration_request_body["tools"] = copy.deepcopy(request_tools)
 
     retained_session = (
         replay_state.get("retained_session")
@@ -3374,6 +3381,15 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
                 await retained_session.aclose()
         else:
             await retained_session.aclose()
+        restore_namespace = globals().get(
+            "_restore_adapted_namespace_tool_calls_in_response_body"
+        )
+        if callable(restore_namespace):
+            response_body, _ = restore_namespace(
+                response_body,
+                request_body=restoration_request_body,
+                adapter_model=adapter_model,
+            )
         _record_adapted_completed_route_rollup_turn(
             rollup_kwargs,
             adapter_label="Cursor Agent",
@@ -3391,8 +3407,16 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             media_type="application/json",
         )
 
-    if isinstance(request_tools, list):
-        optional_params["tools"] = request_tools
+    cursor_build_body = copy.deepcopy(restoration_request_body)
+    cursor_build_body["model"] = adapter_model
+    cursor_build_body, _adapted_namespace_tools = (
+        _adapt_codex_namespace_tools_to_functions_from_request_body(
+            cursor_build_body
+        )
+    )
+    build_tools = cursor_build_body.get("tools")
+    if isinstance(build_tools, list):
+        optional_params["tools"] = build_tools
     for source_names, cursor_name in (
         (("message_id", "messageId"), "message_id"),
         (("conversation_id", "conversationId"), "conversation_id"),
@@ -3456,7 +3480,7 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
     )
     try:
         _validate_cursor_returned_tool_calls(result.tool_calls)
-        model = str(candidate.get("model") or request_body.get("model") or "")
+        model = adapter_model
         response_body = _cursor_responses_response_body(model=model, result=result)
     except _CursorPostEgressOutputError as exc:
         _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
@@ -3474,6 +3498,15 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             messages=replay_messages,
             tools=request_tools if isinstance(request_tools, list) else [],
             retained_session=result.retained_session,
+        )
+    restore_namespace = globals().get(
+        "_restore_adapted_namespace_tool_calls_in_response_body"
+    )
+    if callable(restore_namespace):
+        response_body, _ = restore_namespace(
+            response_body,
+            request_body=restoration_request_body,
+            adapter_model=adapter_model,
         )
     _record_adapted_completed_route_rollup_turn(
         rollup_kwargs,
