@@ -74,6 +74,17 @@ credentials on the request path. Direct Nous inference reads
 `LITELLM_NOUS_OAUTH_AUTH_FILE`, else `LITELLM_HERMES_AUTH_FILE`, else
 `AAWM_HERMES_AUTH_FILE`, else `~/.hermes/auth.json`.
 
+### Native Grok OIDC request snapshots
+
+Native Grok request preparation reads the OIDC credential and client-version
+cache through immutable, process-local snapshots. Descriptor metadata checks,
+file reads, and JSON validation run off the request event loop. Each
+credential/version path has a single-flight validation lock; a file-generation
+change or route-safety expiry invalidates the cached snapshot before a later
+request rebuilds it. Missing, malformed, ambiguous-scope, expired, or
+near-expiry records fail closed. Request handling never refreshes or writes
+these files.
+
 ## OAuth refresh deadline contract
 
 Scheduled Grok OIDC, Codex OAuth, managed xAI OAuth, Kimi OAuth, and Nous

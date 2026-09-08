@@ -10,8 +10,12 @@ This module keeps private-mode credential writes for Hermes migration only.
 from __future__ import annotations
 
 import asyncio
+import errno
+import hashlib
 import json
 import os
+import stat
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, MutableMapping, Optional, Tuple
@@ -69,6 +73,33 @@ _XAI_UNSUPPORTED_INPUT_ITEM_TYPES = frozenset(
     {"reasoning", "tool_search_call", "tool_search_output"}
 )
 
+_GROK_NATIVE_CREDENTIAL_MAX_BYTES = 1_048_576
+
+
+@dataclass(frozen=True)
+class GrokNativeOAuthCredentialSnapshot:
+    """Immutable, validated native OIDC request snapshot."""
+
+    auth_file: Path = field(repr=False, compare=False)
+    scope: str
+    access_token: str = field(repr=False, compare=False)
+    expires_at: datetime
+    generation: str
+    file_fingerprint: Tuple[int, int, int, int, int] = field(
+        repr=False,
+        compare=False,
+    )
+
+
+_grok_native_snapshot_cache: Dict[
+    Tuple[str, str],
+    GrokNativeOAuthCredentialSnapshot,
+] = {}
+_grok_native_snapshot_locks: Dict[str, asyncio.Lock] = {}
+_grok_native_snapshot_flights: Dict[
+    Tuple[str, str],
+    "asyncio.Task[GrokNativeOAuthCredentialSnapshot]",
+] = {}
 _refresh_locks: Dict[str, asyncio.Lock] = {}
 
 
@@ -349,19 +380,297 @@ async def _get_xai_oauth_access_token_with_resolution(
 
 
 async def get_grok_native_oauth_access_token() -> str:
+    return (await get_grok_native_oauth_snapshot()).access_token
+
+
+async def get_grok_native_oauth_snapshot() -> GrokNativeOAuthCredentialSnapshot:
+    """Return one validated native OIDC snapshot without blocking the loop."""
+
+    credential_path, scope = await asyncio.to_thread(
+        _resolve_grok_native_snapshot_inputs_sync
+    )
+    return await _get_grok_native_oauth_snapshot_for_path(
+        credential_path=credential_path,
+        scope=scope,
+    )
+
+
+def _resolve_grok_native_snapshot_inputs_sync() -> Tuple[Path, str]:
     credential_path = default_grok_xai_oauth_auth_path()
     scope = (
         get_secret_str("LITELLM_XAI_GROK_OAUTH_SCOPE")
         or get_secret_str("LITELLM_XAI_OAUTH_SCOPE")
         or _DEFAULT_XAI_OAUTH_SCOPE
     )
-    lock_key = f"grok-native-read:{credential_path}:{scope}"
-    lock = _refresh_locks.setdefault(lock_key, asyncio.Lock())
+    # Keep path normalization, including getcwd() for relative overrides, off
+    # the request event loop.
+    return Path(os.path.abspath(os.fspath(credential_path))), scope
+
+
+def _grok_native_stat_fingerprint(
+    stat_result: os.stat_result,
+) -> Tuple[int, int, int, int, int]:
+    return (
+        int(stat_result.st_dev),
+        int(stat_result.st_ino),
+        int(stat_result.st_mtime_ns),
+        int(stat_result.st_ctime_ns),
+        int(stat_result.st_size),
+    )
+
+
+def _open_grok_native_credential_file(path: Path) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ValueError("Grok OIDC credential file cannot be opened safely.")
+    flags = os.O_RDONLY | nofollow
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    if cloexec is not None:
+        flags |= cloexec
+    try:
+        return os.open(os.fspath(path), flags)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            raise FileNotFoundError from None
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            raise ValueError("Grok OIDC credential file must not be a symlink.")
+        raise ValueError("Grok OIDC credential file is unreadable.") from None
+
+
+def _read_grok_native_credential_bytes(
+    file_descriptor: int,
+    *,
+    max_bytes: int = _GROK_NATIVE_CREDENTIAL_MAX_BYTES,
+) -> bytes:
+    chunks: list[bytes] = []
+    bytes_read = 0
+    while bytes_read <= max_bytes:
+        try:
+            chunk = os.read(
+                file_descriptor,
+                min(8192, max_bytes + 1 - bytes_read),
+            )
+        except OSError:
+            raise ValueError("Grok OIDC credential file could not be read.") from None
+        if not chunk:
+            break
+        chunks.append(chunk)
+        bytes_read += len(chunk)
+    if bytes_read > max_bytes:
+        raise ValueError("Grok OIDC credential file is too large.")
+    return b"".join(chunks)
+
+
+def _read_grok_native_credential_payload_secure(
+    path: Path,
+) -> Tuple[Dict[str, Any], os.stat_result, bytes]:
+    file_descriptor = _open_grok_native_credential_file(path)
+    try:
+        try:
+            before = os.fstat(file_descriptor)
+        except OSError:
+            raise ValueError("Grok OIDC credential metadata is unreadable.") from None
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("Grok OIDC credential path is not a regular file.")
+        if before.st_size > _GROK_NATIVE_CREDENTIAL_MAX_BYTES:
+            raise ValueError("Grok OIDC credential file is too large.")
+        raw_bytes = _read_grok_native_credential_bytes(file_descriptor)
+        try:
+            after = os.fstat(file_descriptor)
+        except OSError:
+            raise ValueError("Grok OIDC credential metadata is unreadable.") from None
+    finally:
+        try:
+            os.close(file_descriptor)
+        except OSError:
+            pass
+
+    if _grok_native_stat_fingerprint(before) != _grok_native_stat_fingerprint(
+        after
+    ):
+        raise ValueError("Grok OIDC credential changed while it was read.")
+    try:
+        payload = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise ValueError("Grok OIDC credential file is not valid JSON.") from None
+    if not isinstance(payload, dict):
+        raise ValueError("Grok OIDC credential file must contain a JSON object.")
+    return payload, after, raw_bytes
+
+
+def _stat_grok_native_credential_file(path: Path) -> os.stat_result:
+    file_descriptor = _open_grok_native_credential_file(path)
+    try:
+        try:
+            result = os.fstat(file_descriptor)
+        except OSError:
+            raise ValueError("Grok OIDC credential metadata is unreadable.") from None
+    finally:
+        try:
+            os.close(file_descriptor)
+        except OSError:
+            pass
+    if not stat.S_ISREG(result.st_mode):
+        raise ValueError("Grok OIDC credential path is not a regular file.")
+    if result.st_size > _GROK_NATIVE_CREDENTIAL_MAX_BYTES:
+        raise ValueError("Grok OIDC credential file is too large.")
+    return result
+
+
+def _grok_native_snapshot_key(
+    credential_path: Path,
+    scope: str,
+) -> Tuple[str, str]:
+    # The path is normalized by _resolve_grok_native_snapshot_inputs_sync().
+    # Do not resolve through the filesystem: the descriptor read below rejects
+    # a final symlink and fstat binds the opened file.
+    return (os.fspath(credential_path), scope)
+
+
+def _grok_native_snapshot_is_usable(
+    snapshot: GrokNativeOAuthCredentialSnapshot,
+) -> bool:
+    return datetime.now(timezone.utc) < snapshot.expires_at - timedelta(
+        seconds=_refresh_buffer_seconds()
+    )
+
+
+def _load_grok_native_snapshot_sync(
+    *,
+    credential_path: Path,
+    scope: str,
+) -> GrokNativeOAuthCredentialSnapshot:
+    payload, stat_result, raw_bytes = _read_grok_native_credential_payload_secure(
+        credential_path
+    )
+    credential = _select_credential_record(payload, scope)
+    token = _credential_access_token(credential)
+    if not token:
+        raise _grok_native_oauth_refresh_required_error(missing_token=True)
+    expires_at = _parse_expires_at(credential.get("expires_at"))
+    if (
+        expires_at is None
+        or datetime.now(timezone.utc)
+        >= expires_at - timedelta(seconds=_refresh_buffer_seconds())
+    ):
+        raise _grok_native_oauth_refresh_required_error(missing_token=False)
+    return GrokNativeOAuthCredentialSnapshot(
+        auth_file=credential_path,
+        scope=scope,
+        access_token=token,
+        expires_at=expires_at,
+        generation=f"sha256:{hashlib.sha256(raw_bytes).hexdigest()}",
+        file_fingerprint=_grok_native_stat_fingerprint(stat_result),
+    )
+
+
+async def _get_grok_native_oauth_snapshot_for_path(
+    *,
+    credential_path: Path,
+    scope: str,
+) -> GrokNativeOAuthCredentialSnapshot:
+    cache_key = _grok_native_snapshot_key(credential_path, scope)
+    lock_key = "\x1f".join(cache_key)
+    try:
+        observed_stat = await asyncio.to_thread(
+            _stat_grok_native_credential_file,
+            credential_path,
+        )
+    except FileNotFoundError as exc:
+        raise ValueError(
+            f"Grok OIDC credential file not found at {credential_path}. "
+            "Run the health/provider-status sidecar Grok OIDC refresh or "
+            "relogin with the Grok CLI before Grok native traffic can proceed."
+        ) from exc
+
+    observed_fingerprint = _grok_native_stat_fingerprint(observed_stat)
+    cached = _grok_native_snapshot_cache.get(cache_key)
+    if (
+        cached is not None
+        and cached.file_fingerprint == observed_fingerprint
+        and _grok_native_snapshot_is_usable(cached)
+    ):
+        return cached
+    if cached is not None:
+        _grok_native_snapshot_cache.pop(cache_key, None)
+
+    lock = _grok_native_snapshot_locks.setdefault(lock_key, asyncio.Lock())
     async with lock:
-        return _get_grok_native_oauth_access_token_read_only(
+        flight = _grok_native_snapshot_flights.get(cache_key)
+        if flight is None:
+            try:
+                observed_stat = await asyncio.to_thread(
+                    _stat_grok_native_credential_file,
+                    credential_path,
+                )
+            except FileNotFoundError as exc:
+                raise ValueError(
+                    f"Grok OIDC credential file not found at {credential_path}. "
+                    "Run the health/provider-status sidecar Grok OIDC refresh or "
+                    "relogin with the Grok CLI before Grok native traffic can proceed."
+                ) from exc
+            observed_fingerprint = _grok_native_stat_fingerprint(observed_stat)
+            cached = _grok_native_snapshot_cache.get(cache_key)
+            if (
+                cached is not None
+                and cached.file_fingerprint == observed_fingerprint
+                and _grok_native_snapshot_is_usable(cached)
+            ):
+                return cached
+            if cached is not None:
+                _grok_native_snapshot_cache.pop(cache_key, None)
+            flight = asyncio.create_task(
+                _run_grok_native_snapshot_flight(
+                    cache_key=cache_key,
+                    credential_path=credential_path,
+                    scope=scope,
+                )
+            )
+            _grok_native_snapshot_flights[cache_key] = flight
+            flight.add_done_callback(
+                lambda completed: _finish_grok_native_snapshot_flight(
+                    cache_key,
+                    completed,
+                )
+            )
+
+    try:
+        return await asyncio.shield(flight)
+    except FileNotFoundError as exc:
+        raise ValueError(
+            f"Grok OIDC credential file not found at {credential_path}. "
+            "Run the health/provider-status sidecar Grok OIDC refresh or "
+            "relogin with the Grok CLI before Grok native traffic can proceed."
+        ) from exc
+
+
+async def _run_grok_native_snapshot_flight(
+    *,
+    cache_key: Tuple[str, str],
+    credential_path: Path,
+    scope: str,
+) -> GrokNativeOAuthCredentialSnapshot:
+    try:
+        snapshot = await asyncio.to_thread(
+            _load_grok_native_snapshot_sync,
             credential_path=credential_path,
             scope=scope,
         )
+    except BaseException:
+        _grok_native_snapshot_cache.pop(cache_key, None)
+        raise
+    _grok_native_snapshot_cache[cache_key] = snapshot
+    return snapshot
+
+
+def _finish_grok_native_snapshot_flight(
+    cache_key: Tuple[str, str],
+    flight: "asyncio.Task[GrokNativeOAuthCredentialSnapshot]",
+) -> None:
+    if _grok_native_snapshot_flights.get(cache_key) is flight:
+        _grok_native_snapshot_flights.pop(cache_key, None)
+    if not flight.cancelled():
+        flight.exception()
 
 
 def _grok_native_oauth_refresh_required_error(*, missing_token: bool) -> ValueError:
@@ -399,21 +708,15 @@ def _xai_oauth_refresh_required_error(*, missing_token: bool) -> ValueError:
 
 def _read_grok_native_credential_payload(credential_path: Path) -> Dict[str, Any]:
     try:
-        with credential_path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
+        payload, _stat_result, _raw_bytes = (
+            _read_grok_native_credential_payload_secure(credential_path)
+        )
     except FileNotFoundError as exc:
         raise ValueError(
             f"Grok OIDC credential file not found at {credential_path}. "
             "Run the health/provider-status sidecar Grok OIDC refresh or "
             "relogin with the Grok CLI before Grok native traffic can proceed."
         ) from exc
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Grok OIDC credential file at {credential_path} is not valid JSON."
-        ) from exc
-
-    if not isinstance(payload, dict):
-        raise ValueError("Grok OIDC credential file must contain a JSON object.")
     return payload
 
 
