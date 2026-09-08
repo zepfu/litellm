@@ -3607,6 +3607,7 @@ def _resolve_failure_plan(
             cooldown_key=selection["cooldown_key"],
             exc=exc,
             attempt_record=attempt_record,
+            candidate=candidate,
             cooldown_seconds=(
                 cooldown_seconds if error_class == "usage_limit_reached" else None
             ),

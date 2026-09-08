@@ -2982,6 +2982,10 @@ _WORKER_CONTEXT_EXHAUSTION_BOOL_KEYS = _aawm_enrich._WORKER_CONTEXT_EXHAUSTION_B
 # rebind-order rule as Wave A2). The moved functions' __globals__ are rebound
 # to this namespace by each submodule's install() below, so cross-module and
 # cross-band free-name calls (and monkeypatches on this namespace) stay live. ---
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    error_signals as _aawm_alias_error_signals,
+)
+
 from . import interfaces as _aawm_interfaces  # noqa: F401 - typed seams (RateLimitObservation, ObservationExtractor, ...)
 from . import provider_errors as _aawm_provider_errors
 from . import rate_limit_base as _aawm_rate_limit_base
@@ -2989,6 +2993,9 @@ from . import provider_cache as _aawm_provider_cache
 from . import rate_limit_providers as _aawm_rate_limit_providers
 
 ProviderCacheState = _aawm_interfaces.ProviderCacheState
+_parse_xai_rate_limit_reset_wait_seconds = (
+    _aawm_alias_error_signals._parse_xai_rate_limit_reset_wait_seconds
+)
 
 # rebind installers: helper __globals__ -> this namespace (order: base ->
 # providers -> errors, mirroring the original definition order so any
@@ -3070,6 +3077,7 @@ _looks_like_xai_grok_oidc_rate_limit_context = _aawm_rate_limit_providers._looks
 _extract_xai_oauth_account_hash = _aawm_rate_limit_providers._extract_xai_oauth_account_hash
 _extract_xai_grok_oidc_account_hash = _aawm_rate_limit_providers._extract_xai_grok_oidc_account_hash
 _xai_oauth_header_remaining_pct = _aawm_rate_limit_providers._xai_oauth_header_remaining_pct
+_resolve_xai_rate_limit_reset_at = _aawm_rate_limit_providers._resolve_xai_rate_limit_reset_at
 _extract_xai_oauth_billing_period_end = _aawm_rate_limit_providers._extract_xai_oauth_billing_period_end
 _extract_xai_header_rate_limit_observations = _aawm_rate_limit_providers._extract_xai_header_rate_limit_observations
 _extract_xai_oauth_header_rate_limit_observations = (

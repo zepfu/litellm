@@ -250,6 +250,7 @@ class RecordCodexFailureEvidenceFn(Protocol):
         cooldown_key: str,
         exc: Exception,
         attempt_record: dict[str, Any],
+        candidate: Optional[dict[str, Any]] = None,
         cooldown_seconds: Optional[float] = None,
     ) -> None:
         ...

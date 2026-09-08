@@ -280,6 +280,7 @@ class PassThroughStreamingHandler:
     )
     _XAI_OAUTH_RATE_LIMIT_HEADER_NAMES = {
         "retry-after",
+        "x-rate-limit-reset",
     }
     _XAI_OAUTH_RATE_LIMIT_HEADERS_KEY = "xai_oauth_response_headers"
     _XAI_GROK_OIDC_RATE_LIMIT_HEADERS_KEY = "xai_grok_oidc_response_headers"

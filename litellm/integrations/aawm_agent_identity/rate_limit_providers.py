@@ -838,6 +838,41 @@ def _xai_oauth_header_remaining_pct(
     return round(max(0.0, min(100.0, (remaining / total) * 100.0)), 3)
 
 
+def _resolve_xai_rate_limit_reset_at(
+    reset_value: Any,
+    retry_after_value: Any,
+    observed_at: Any,
+) -> Tuple[Optional[datetime], Optional[float], Optional[str]]:
+    """Resolve xAI reset headers with the shared bounded wait semantics."""
+    observed_dt = _normalize_datetime(observed_at)
+    if observed_dt is None:
+        return None, None, None
+
+    now_epoch = observed_dt.timestamp()
+    retry_after_seconds = _parse_xai_rate_limit_reset_wait_seconds(
+        retry_after_value,
+        now_epoch=now_epoch,
+    )
+    if retry_after_seconds is not None:
+        return (
+            observed_dt + timedelta(seconds=retry_after_seconds),
+            retry_after_seconds,
+            "retry_after",
+        )
+
+    reset_wait_seconds = _parse_xai_rate_limit_reset_wait_seconds(
+        reset_value,
+        now_epoch=now_epoch,
+    )
+    if reset_wait_seconds is not None:
+        return (
+            observed_dt + timedelta(seconds=reset_wait_seconds),
+            None,
+            "response_header",
+        )
+    return None, None, None
+
+
 def _extract_xai_oauth_billing_period_end(
     *,
     candidate: Dict[str, Any],
@@ -972,7 +1007,9 @@ def _extract_xai_header_rate_limit_observations(
         lower_headers = _rate_limit_header_map(candidate)
         source = str(candidate.get("source") or "").lower()
         has_xai_header = any(
-            isinstance(key, str) and key.lower().startswith("x-ratelimit-") for key in list(candidate.keys())
+            isinstance(key, str)
+            and key.lower().startswith(("x-ratelimit-", "x-rate-limit-"))
+            for key in list(candidate.keys())
         )
         if source and source not in accepted_sources:
             continue
@@ -988,6 +1025,7 @@ def _extract_xai_header_rate_limit_observations(
                     "x-ratelimit-reset-requests",
                     "x-ratelimit-reset-request",
                     "x-ratelimit-reset",
+                    "x-rate-limit-reset",
                 ),
             ),
             (
@@ -998,28 +1036,37 @@ def _extract_xai_header_rate_limit_observations(
                     "x-ratelimit-reset-tokens",
                     "x-ratelimit-reset-token",
                     "x-ratelimit-reset",
+                    "x-rate-limit-reset",
                 ),
             ),
         ):
             total = _safe_int(_get_rate_limit_header_value(candidate, total_key, lower_headers=lower_headers))
             remaining = _safe_int(_get_rate_limit_header_value(candidate, remaining_key, lower_headers=lower_headers))
             reset_value = _get_rate_limit_header_value(candidate, *reset_keys, lower_headers=lower_headers)
-            reset_hint_seconds = _parse_reset_hint_seconds(
-                _get_rate_limit_header_value(candidate, "retry-after", lower_headers=lower_headers)
+            retry_after_value = _get_rate_limit_header_value(
+                candidate,
+                "retry-after",
+                lower_headers=lower_headers,
             )
-            if total is None and remaining is None and reset_value is None and reset_hint_seconds is None:
+            (
+                provider_resets_at,
+                retry_after_seconds,
+                reset_source,
+            ) = _resolve_xai_rate_limit_reset_at(
+                reset_value,
+                retry_after_value,
+                context["observed_at"],
+            )
+            reset_hint_seconds = (
+                int(retry_after_seconds)
+                if retry_after_seconds is not None and retry_after_seconds.is_integer()
+                else None
+            )
+            if total is None and remaining is None and provider_resets_at is None:
                 continue
             if total is not None and total <= 0:
                 continue
-            provider_resets_at, stale_reset = _resolve_rate_limit_reset_at(
-                reset_value,
-                context["observed_at"],
-                reset_hint_seconds,
-            )
-            if stale_reset:
-                continue
-            reset_source = "response_header" if provider_resets_at is not None else None
-            if provider_resets_at is None and reset_hint_seconds is None:
+            if provider_resets_at is None:
                 (
                     provider_resets_at,
                     reset_source,
@@ -1082,9 +1129,7 @@ def _extract_xai_header_rate_limit_observations(
                                 candidate, remaining_key, lower_headers=lower_headers
                             ),
                             "reset": reset_value,
-                            "retry-after": _get_rate_limit_header_value(
-                                candidate, "retry-after", lower_headers=lower_headers
-                            ),
+                            "retry-after": retry_after_value,
                             "billingPeriodEnd": _json_safe_rate_limit_value(
                                 _maybe_get_path(candidate, "config", "billingPeriodEnd")
                                 or candidate.get("billingPeriodEnd")
@@ -1116,7 +1161,7 @@ def _extract_xai_header_rate_limit_observations(
                                 "retry-after",
                             ],
                             "reset_absent": provider_resets_at is None,
-                            "reset_header_absent": (reset_value is None and reset_hint_seconds is None),
+                            "reset_header_absent": (reset_value is None and retry_after_value is None),
                             "reset_source": reset_source,
                             **account_binding_evidence,
                         },
@@ -1676,6 +1721,7 @@ _HOST_FUNCTION_NAMES = (
     "_extract_xai_oauth_account_hash",
     "_extract_xai_grok_oidc_account_hash",
     "_xai_oauth_header_remaining_pct",
+    "_resolve_xai_rate_limit_reset_at",
     "_extract_xai_oauth_billing_period_end",
     "_extract_xai_header_rate_limit_observations",
     "_extract_xai_oauth_header_rate_limit_observations",

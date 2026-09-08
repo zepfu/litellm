@@ -584,7 +584,10 @@ def _update_codex_auto_agent_retryable_attempt_record(  # noqa: PLR0915
     error_tokens = _extract_codex_auto_agent_error_tokens(exc)
     error_status_code = _extract_exception_status_code(exc)
     error_type, error_code = _extract_codex_auto_agent_error_type_and_code(exc)
-    retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(exc)
+    retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(
+        exc,
+        candidate=candidate,
+    )
     source_error = _get_codex_auto_agent_source_error_summary(
         exc,
         status_code=error_status_code,
@@ -724,6 +727,7 @@ def _record_codex_failure_evidence(
     cooldown_key: str,
     exc: Any,
     attempt_record: dict[str, Any],
+    candidate: Optional[dict[str, Any]] = None,
     cooldown_seconds: Optional[float] = None,
 ) -> None:
     """Classify and record the current Codex alias failure evidence.
@@ -752,7 +756,10 @@ def _record_codex_failure_evidence(
 
     error_status_code = _extract_exception_status_code(exc)
     source_error = _get_codex_auto_agent_source_error_summary(exc, status_code=error_status_code)
-    raw_retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(exc)
+    raw_retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(
+        exc,
+        candidate=candidate,
+    )
     effective_retry_after_seconds = cooldown_seconds
     if effective_retry_after_seconds is None:
         effective_retry_after_seconds = raw_retry_after_seconds

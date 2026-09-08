@@ -3179,13 +3179,15 @@ def build_shadow_failure_action_decision_from_exc(
     the candidate loop can stamp the same sanitized comparison fields without
     re-implementing classification inputs.
     """
-    del candidate  # reserved for future provider-neutral context; unused (no hardcoding)
     status_code = _extract_adapter_exception_status_code(exc)
     source_error = _get_codex_auto_agent_source_error_summary(
         exc,
         status_code=status_code,
     )
-    retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(exc)
+    retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(
+        exc,
+        candidate=candidate,
+    )
     return build_shadow_failure_action_decision(
         status_code=status_code,
         message=str(source_error or ""),
