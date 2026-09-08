@@ -202,6 +202,16 @@ const ORIGIN_FIELD_PRIORITY = new Set([
   "metadata",
 ]);
 
+const RECURSIVE_PROJECTION_KEYS = new Set([
+  "author",
+  "children",
+  "items",
+  "mapping",
+  "messages",
+  "page_info",
+  "warnings",
+]);
+
 const MESSAGE_ALLOWLIST = new Set([
   ...OBSERVATION_ALLOWLIST,
   ...METADATA_ALLOWLIST,
@@ -786,44 +796,73 @@ function projectObject(
       }
     }
 
-    // Project all other allowlisted siblings before entering metadata. This
-    // keeps identifiers and model fields available even when metadata
-    // diagnostics later exhaust the shared traversal budget.
-    for (const [rawKey, rawValue] of entries) {
-      const key = String(rawKey);
-      if (
-        key === "metadata" ||
-        ORIGIN_FIELD_PRIORITY.has(key) ||
-        isExcludedKey(key) ||
-        !allowlist.has(key)
-      ) {
-        continue;
-      }
-      const childPath = diagnosticPath(path, key, state);
-      const projected = projectField(key, rawValue, state, depth + 1, childPath);
-      if (projected !== undefined) {
-        out[key] = projected;
-      }
-    }
-
-    // Metadata retains its own origin-first/allowlisted-before-diagnostics
-    // ordering, but must not starve sibling fields at this object level.
+    // Project metadata's fixed allowlisted fields before recursive siblings,
+    // but defer its unknown-field walk. This preserves envelope origin
+    // evidence without allowing metadata diagnostics to starve identifiers.
     const metadataEntry = entries.find(([rawKey]) => rawKey === "metadata");
+    let deferredMetadata: {
+      value: Record<string, unknown>;
+      path: string;
+    } | null = null;
     if (metadataEntry !== undefined && allowlist.has("metadata")) {
       const [rawKey, rawValue] = metadataEntry;
       if (!isExcludedKey(rawKey)) {
         const childPath = diagnosticPath(path, rawKey, state);
+        const projected =
+          rawValue === null
+            ? null
+            : projectMetadataObject(rawValue, state, depth + 1, childPath, {
+                deferUnknown: true,
+              });
+        if (projected !== undefined) {
+          out[rawKey] = projected;
+        }
+        if (isPlainObject(rawValue)) {
+          deferredMetadata = { value: rawValue, path: childPath };
+        }
+      }
+    }
+
+    // Keep scalar identifiers and model fields ahead of recursive projections
+    // so a nested unknown subtree cannot make them disappear.
+    for (const recursive of [false, true]) {
+      for (const [rawKey, rawValue] of entries) {
+        const key = String(rawKey);
+        if (
+          key === "metadata" ||
+          ORIGIN_FIELD_PRIORITY.has(key) ||
+          isExcludedKey(key) ||
+          !allowlist.has(key) ||
+          RECURSIVE_PROJECTION_KEYS.has(key) !== recursive
+        ) {
+          continue;
+        }
+        const childPath = diagnosticPath(path, key, state);
         const projected = projectField(
-          rawKey,
+          key,
           rawValue,
           state,
           depth + 1,
           childPath,
         );
         if (projected !== undefined) {
-          out[rawKey] = projected;
+          out[key] = projected;
         }
       }
+    }
+
+    // Unknown metadata diagnostics remain part of the same bounded traversal,
+    // but run only after all sibling allowlisted evidence is retained.
+    if (deferredMetadata !== null) {
+      const { value: metadataValue, path: metadataPath } = deferredMetadata;
+      visitNode(state, metadataValue, depth + 1, metadataPath, () => {
+        projectMetadataUnknownFields(
+          metadataValue,
+          state,
+          depth + 1,
+          metadataPath,
+        );
+      });
     }
 
     for (const [rawKey, rawValue] of entries) {
@@ -924,6 +963,7 @@ function projectMetadataObject(
   state: TraversalState,
   depth: number,
   path: string,
+  options: { deferUnknown?: boolean } = {},
 ): Record<string, unknown> | undefined {
   if (!isPlainObject(value)) {
     markIncomplete(state, "invalid_type", path);
@@ -953,22 +993,33 @@ function projectMetadataObject(
       }
     }
 
-    for (const [rawKey, rawValue] of entries) {
-      const key = String(rawKey);
-      if (isExcludedKey(key)) {
-        recordExcludedSubtree(state, path, rawValue);
-        continue;
-      }
-      if (METADATA_ALLOWLIST.has(key)) {
-        continue;
-      }
-      const childPath = diagnosticPath(path, key, state);
-      recordSchemaEntry(state, childPath, rawValue);
-      walkUnknownValue(rawValue, state, depth + 1, childPath, false);
+    if (!options.deferUnknown) {
+      projectMetadataUnknownFields(value, state, depth, path);
     }
 
     return out;
   });
+}
+
+function projectMetadataUnknownFields(
+  value: Record<string, unknown>,
+  state: TraversalState,
+  depth: number,
+  path: string,
+): void {
+  for (const [rawKey, rawValue] of Object.entries(value)) {
+    const key = String(rawKey);
+    if (isExcludedKey(key)) {
+      recordExcludedSubtree(state, path, rawValue);
+      continue;
+    }
+    if (METADATA_ALLOWLIST.has(key)) {
+      continue;
+    }
+    const childPath = diagnosticPath(path, key, state);
+    recordSchemaEntry(state, childPath, rawValue);
+    walkUnknownValue(rawValue, state, depth + 1, childPath, false);
+  }
 }
 
 function projectAuthor(
