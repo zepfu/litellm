@@ -46,24 +46,34 @@ def select_xai_oauth_credential_record(
     """
 
     if not isinstance(payload, Mapping):
-        raise ValueError(f"{provider_label} auth file must contain a JSON object.")
+        raise ValueError(
+            f"{provider_label} credential selection failed: auth file must "
+            "contain a JSON object."
+        )
     if not isinstance(scope, str) or not scope.strip():
-        raise ValueError(f"{provider_label} credential scope must not be empty.")
+        raise ValueError(
+            f"{provider_label} credential selection failed: scope must not be "
+            "empty."
+        )
 
     if _is_unambiguous_flat_record(payload):
         if isinstance(payload, MutableMapping):
             return payload
-        raise ValueError(f"{provider_label} credential record is not mutable.")
+        raise ValueError(
+            f"{provider_label} credential selection failed: record is not "
+            "mutable."
+        )
 
     scoped_record = payload.get(scope)
     if not isinstance(scoped_record, MutableMapping):
         raise ValueError(
-            f"{provider_label} auth file does not contain the configured "
-            "credential scope. Exact scope matching is required."
+            f"{provider_label} credential selection failed: auth file does "
+            "not contain the configured scope. Exact scope matching is "
+            "required."
         )
     if not looks_like_xai_oauth_credential(scoped_record):
         raise ValueError(
-            f"{provider_label} credential scope does not contain a usable "
-            "credential record."
+            f"{provider_label} credential selection failed: scope does not "
+            "contain a usable credential record."
         )
     return scoped_record
