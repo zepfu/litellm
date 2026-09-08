@@ -1593,16 +1593,19 @@ class PassThroughStreamingHandler:
                     responses_sse_event_buffer = b""
                     held_responses_done_suffix = b""
 
+                synthetic_terminal: Optional[Dict[str, Any]] = None
+                if first_emitted_at is not None and not responses_terminal_seen:
+                    synthetic_terminal = (
+                        OpenAIPassthroughLoggingHandler._classify_responses_sse_clean_eof(
+                            responses_sse_tracker
+                        )
+                    )
                 metadata["aawm_stream_tracker_state"] = (
                     OpenAIPassthroughLoggingHandler._responses_sse_tracker_metadata(
                         responses_sse_tracker
                     )
                 )
-                if first_emitted_at is not None and not responses_terminal_seen:
-                    return OpenAIPassthroughLoggingHandler._classify_responses_sse_clean_eof(
-                        responses_sse_tracker
-                    )
-                return None
+                return synthetic_terminal
 
             async def _finalize_completed_stream() -> None:
                 nonlocal completion_bookkeeping_done, responses_sse_event_buffer
