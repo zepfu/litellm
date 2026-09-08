@@ -23,6 +23,7 @@ from litellm.proxy.aawm_route_logging import (
     _AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY,
     emit_aawm_route_status_event,
     record_aawm_route_rollup,
+    record_aawm_route_rollup_failure,
     record_aawm_route_rollup_turn,
 )
 from litellm.proxy.aawm_session_transfer.identity import extract_transfer_identity
@@ -30,6 +31,9 @@ from litellm.proxy.aawm_session_transfer.registry import (
     safe_finalize,
     safe_mark_phase,
     safe_record_chunks,
+)
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_delivered_disposition import (
+    get_delivered_wire_disposition,
 )
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
@@ -1427,6 +1431,17 @@ class PassThroughStreamingHandler:
                 custom_llm_provider=custom_llm_provider,
             )
             metadata["aawm_stream_raw_bytes_buffered"] = buffer_raw_bytes
+            delivered_wire_disposition = (
+                PassThroughStreamingHandler._get_delivered_wire_disposition(
+                    success_handler_kwargs,
+                )
+                if is_fork_owned_responses_stream
+                else None
+            )
+            if delivered_wire_disposition is not None:
+                metadata["aawm_delivered_wire_disposition"] = (
+                    delivered_wire_disposition
+                )
             transfer_identity = extract_transfer_identity(
                 request_body=request_body if isinstance(request_body, dict) else None,
                 logging_obj=litellm_logging_obj,
@@ -1876,10 +1891,20 @@ class PassThroughStreamingHandler:
                     "downstream_byte_count": downstream_byte_count,
                 },
             )
+            delivered_transfer_phase = (
+                delivered_wire_disposition.get("transfer_phase") or "completed"
+                if isinstance(delivered_wire_disposition, dict)
+                else "completed"
+            )
             await safe_finalize(
                 transfer_identity,
-                "completed",
+                delivered_transfer_phase,
                 extra={
+                    "delivered_disposition": (
+                        delivered_wire_disposition.get("delivered_disposition")
+                        if isinstance(delivered_wire_disposition, dict)
+                        else None
+                    ),
                     "upstream_chunk_count": chunk_count,
                     "upstream_byte_count": total_stream_bytes,
                     "downstream_chunk_count": downstream_chunk_count,
@@ -2711,6 +2736,9 @@ class PassThroughStreamingHandler:
         if classification:
             detail_parts.append(f"classification={classification}")
         detail_parts.append(f"message={exc}")
+        delivered_disposition = failure_context.get("delivered_disposition")
+        if delivered_disposition:
+            detail_parts.append(f"delivered_disposition={delivered_disposition}")
         detail = "; ".join(detail_parts)
         emit_aawm_route_status_event(
             alias_model=failure_context.get("model_alias") or model_label,
@@ -3012,6 +3040,15 @@ class PassThroughStreamingHandler:
         return handler_branch
 
     @staticmethod
+    def _get_delivered_wire_disposition(
+        success_handler_kwargs: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            return get_delivered_wire_disposition(success_handler_kwargs)
+        except Exception:
+            return None
+
+    @staticmethod
     def _reconcile_responses_stream_error_payload(
         *,
         all_chunks: List[str],
@@ -3062,6 +3099,7 @@ class PassThroughStreamingHandler:
         terminal_event_type: Optional[str],
         terminal_payload: Optional[Dict[str, Any]],
         handler_branch_state: List[str],
+        delivered_disposition: Optional[str] = None,
     ) -> None:
         metadata["aawm_route_rollup_turn_suppressed"] = True
         metadata["aawm_stream_interrupted"] = True
@@ -3084,6 +3122,8 @@ class PassThroughStreamingHandler:
             )
         if not sanitized_message:
             sanitized_message = classification
+        if delivered_disposition:
+            metadata["aawm_delivered_disposition"] = delivered_disposition
         metadata["aawm_responses_stream_failure_class"] = error_class
         metadata["aawm_responses_stream_failure_classification"] = classification
         metadata["aawm_responses_stream_failure_retryable"] = retryable
@@ -3097,6 +3137,7 @@ class PassThroughStreamingHandler:
         failure_context = {
             "failure_kind": classification,
             "stream_failure_stage": "responses_stream_failed",
+            "delivered_disposition": delivered_disposition,
             "error_class": error_class,
             "model": request_body.get("model") if isinstance(request_body, dict) else None,
         }
@@ -3294,6 +3335,32 @@ class PassThroughStreamingHandler:
                     )
                 )
             )
+            is_fork_owned_responses_stream = (
+                PassThroughStreamingHandler._is_openai_responses_stream(
+                    endpoint_type=endpoint_type,
+                    url_route=url_route,
+                    custom_llm_provider=custom_llm_provider,
+                )
+            )
+            wire_disposition = (
+                PassThroughStreamingHandler._get_delivered_wire_disposition(kwargs)
+                if is_fork_owned_responses_stream
+                else None
+            )
+            wire_disposition_value = (
+                wire_disposition.get("delivered_disposition")
+                if isinstance(wire_disposition, dict)
+                else None
+            )
+            if wire_disposition is not None:
+                metadata["aawm_delivered_wire_disposition"] = wire_disposition
+            if wire_disposition_value in {
+                "failed",
+                "incomplete",
+                "cancelled",
+                "disconnected",
+            }:
+                responses_failed = True
             if responses_failed:
                 await PassThroughStreamingHandler._finalize_failed_responses_stream(
                     litellm_logging_obj=litellm_logging_obj,
@@ -3306,6 +3373,7 @@ class PassThroughStreamingHandler:
                     terminal_event_type=terminal_event_type,
                     terminal_payload=terminal_payload,
                     handler_branch_state=handler_branch_state,
+                    delivered_disposition=wire_disposition_value,
                 )
                 return
             if synthetic_terminal_event_type == "response.incomplete":
@@ -3339,9 +3407,21 @@ class PassThroughStreamingHandler:
                         status="Incomplete",
                         message=message,
                     )
+                if wire_disposition_value is not None:
+                    metadata["aawm_route_rollup_turn_suppressed"] = True
+                    if not metadata.get("aawm_route_rollup_turn_recorded"):
+                        record_aawm_route_rollup_failure(
+                            kwargs,
+                            message=(
+                                "delivered_disposition="
+                                f"{wire_disposition_value}"
+                            ),
+                            status="Incomplete",
+                        )
             elif not (
                 metadata.get("aawm_stream_interrupted")
                 or metadata.get("aawm_route_rollup_turn_suppressed")
+                or wire_disposition_value in {"cancelled", "disconnected"}
             ):
                 record_aawm_route_rollup_turn(
                     kwargs,

@@ -13,11 +13,15 @@ from litellm.litellm_core_utils.redact_messages import (
     redact_message_input_output_from_logging,
 )
 from litellm.proxy.aawm_route_logging import record_aawm_route_rollup_turn
+from litellm.proxy.aawm_route_logging import record_aawm_route_rollup_failure
 from litellm.litellm_core_utils.litellm_logging import (
     Logging as LiteLLMLoggingObj,
     emit_standard_logging_payload,
 )
 from litellm.proxy._types import PassThroughEndpointLoggingResultValues
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_delivered_disposition import (
+    get_delivered_wire_disposition,
+)
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     PassthroughStandardLoggingPayload,
 )
@@ -968,6 +972,29 @@ class PassThroughEndpointLogging:
             passthrough_logging_payload=passthrough_logging_payload,
             kwargs=kwargs,
         )
+
+        delivered_wire_disposition = None
+        try:
+            delivered_wire_disposition = get_delivered_wire_disposition(kwargs)
+        except Exception:
+            delivered_wire_disposition = None
+        delivered_disposition = (
+            delivered_wire_disposition.get("delivered_disposition")
+            if isinstance(delivered_wire_disposition, dict)
+            else None
+        )
+        if delivered_disposition in {"failed", "cancelled", "disconnected"}:
+            return
+
+        if delivered_disposition == "incomplete":
+            record_aawm_route_rollup_failure(
+                kwargs,
+                message="delivered_disposition=incomplete",
+                status="Incomplete",
+            )
+            metadata = kwargs.get("litellm_params", {}).get("metadata")
+            if isinstance(metadata, dict):
+                metadata["aawm_route_rollup_turn_suppressed"] = True
 
         # Attach any validated Codex auto-review decision to private callback
         # kwargs (and record the rollup turn) BEFORE sync/async success

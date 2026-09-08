@@ -4072,6 +4072,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                     "method": request.method,
                     "body": _shallow_copy_request_dict(working_body),
                     "headers": request_headers or {},
+                    "_request": request,
                 },
             },
             "call_type": "pass_through_endpoint",
