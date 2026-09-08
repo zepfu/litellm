@@ -61,6 +61,21 @@ class OpenAIResponsesWireTrace:
     _finalize_transport: Optional[
         Callable[[OpenAIResponsesWireDisposition], Awaitable[None]]
     ] = field(default=None, repr=False, compare=False)
+    _terminal_body: Optional[bytes] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _done_body: Optional[bytes] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _finalization_task: Optional[Any] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def publish_request_commitment(self) -> None:
         request = self._request
@@ -108,6 +123,74 @@ class OpenAIResponsesWireTrace:
             "finalization_started": self.finalization_started,
             "finalized": self.finalized,
         }
+
+    def record_response_start_delivery(self) -> None:
+        """Record headers only after the ASGI send completed."""
+
+        self.response_start_sent = True
+        self.commitment = "headers"
+        self.state = OpenAIResponsesWireState.HEADERS_STARTED
+        self.publish_request_commitment()
+
+    def record_body_delivery(self, body: Any) -> None:
+        """Record body/terminal delivery only after the ASGI send completed."""
+
+        if isinstance(body, memoryview):
+            body = body.tobytes()
+        elif isinstance(body, bytearray):
+            body = bytes(body)
+        if not isinstance(body, bytes):
+            body = b""
+
+        self.first_body_sent = True
+        if self._terminal_body is not None and self._terminal_body in body:
+            self.terminal_sent = True
+            self.terminal_wire_committed = True
+            self.commitment = "terminal"
+            self.state = OpenAIResponsesWireState.TERMINAL_SENT
+        if self._done_body is not None and self._done_body in body:
+            self.done_sent = True
+            self.done_wire_committed = True
+            self.commitment = "done"
+            self.state = OpenAIResponsesWireState.DONE_SENT
+        elif self.commitment in {"none", "headers"}:
+            self.commitment = "body"
+            if self.state is OpenAIResponsesWireState.HEADERS_STARTED:
+                self.state = OpenAIResponsesWireState.BODY_STARTED
+        self.publish_request_commitment()
+
+    async def _finalize_disposition(
+        self,
+        disposition: OpenAIResponsesWireDisposition,
+        callback: Optional[Callable[..., Awaitable[None]]],
+    ) -> None:
+        """Run one shielded disposition callback and publish terminal state."""
+
+        if self.finalized:
+            return
+        finalization_task = self._finalization_task
+        if finalization_task is None:
+            self.finalization_started = True
+            self.disposition = disposition
+            self.publish_request_commitment()
+
+            async def _run_finalization() -> None:
+                try:
+                    if callback is not None:
+                        try:
+                            await callback(disposition, self)
+                        except Exception as exc:  # noqa: BLE001
+                            self.metadata["disposition_callback_error"] = type(
+                                exc
+                            ).__name__
+                finally:
+                    self.finalized = True
+                    self.commitment = "finalized"
+                    self.publish_request_commitment()
+
+            finalization_task = asyncio.create_task(_run_finalization())
+            self._finalization_task = finalization_task
+        await _await_shielded(finalization_task)
 
 
 WireDispositionCallback = Callable[
@@ -225,15 +308,25 @@ def _parse_sse_block(
             payload_type = decoded_payload.get("type")
             if (
                 event_type is not None
-                and isinstance(payload_type, str)
-                and event_type != payload_type.strip()
+                and (
+                    not isinstance(payload_type, str)
+                    or event_type != payload_type.strip()
+                )
             ):
                 malformed = True
-            if event_type is None and isinstance(payload_type, str):
-                event_type = payload_type.strip() or None
+            if event_type is None:
+                if not isinstance(payload_type, str) or not payload_type.strip():
+                    malformed = True
+                else:
+                    event_type = payload_type.strip()
         else:
             malformed = True
     elif saw_data_line and not saw_done:
+        malformed = True
+    elif event_type is not None:
+        malformed = True
+
+    if saw_done and event_type is not None:
         malformed = True
 
     if event_type in {
@@ -372,6 +465,7 @@ class OpenAIResponsesWireCoordinator:
         self._model = model
         self._buffer = b""
         self._closed = False
+        self._source_iterator: Optional[AsyncIterator[bytes]] = None
 
     async def _close_source(self) -> None:
         close_errors: list[str] = []
@@ -411,43 +505,27 @@ class OpenAIResponsesWireCoordinator:
         self,
         disposition: OpenAIResponsesWireDisposition,
     ) -> None:
-        if self.trace.finalized or self.trace.finalization_started:
+        await self.trace._finalize_disposition(disposition, self._on_disposition)
+
+    async def _resume_source_after_terminal(self) -> None:
+        """Resume stream finalization once before emitting canonical ``[DONE]``."""
+
+        source_iterator = self._source_iterator
+        if source_iterator is None:
+            source_iterator = self._source.__aiter__()
+            self._source_iterator = source_iterator
+        advance = getattr(source_iterator, "__anext__", None)
+        if not callable(advance):
             return
-        self.trace.finalization_started = True
-        self.trace.disposition = disposition
-        self.trace.publish_request_commitment()
         try:
-            if self._on_disposition is not None:
-                try:
-                    await _await_shielded(
-                        self._on_disposition(disposition, self.trace)
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    # The terminal and [DONE] have already been delivered. A
-                    # callback failure must not turn that committed stream into
-                    # a transport error; retain only a bounded error class.
-                    self.trace.metadata["disposition_callback_error"] = type(
-                        exc
-                    ).__name__
-        finally:
-            self.trace.finalized = True
-            self.trace.commitment = "finalized"
-            self.trace.publish_request_commitment()
-
-    async def _drain_source_after_terminal(self) -> None:
-        """Let downstream logging wrappers finish without another provider read.
-
-        The native passthrough chunk processor stops its upstream iterator after
-        yielding the terminal block.  Advancing this outer source to completion
-        resumes its normal post-stream logging/finalization path; it does not
-        read past the provider terminal.
-        """
-
-        try:
-            async for _discarded in self._source:
-                continue
+            discarded = await advance()
+        except StopAsyncIteration:
+            return
         except Exception as exc:  # noqa: BLE001
             self.trace.metadata["post_terminal_source_error"] = type(exc).__name__
+            return
+        if discarded:
+            self.trace.metadata["post_terminal_source_chunk_discarded"] = True
 
     def _select_terminal(
         self,
@@ -468,19 +546,12 @@ class OpenAIResponsesWireCoordinator:
         event_type: str,
         disposition: OpenAIResponsesWireDisposition,
     ) -> AsyncIterator[bytes]:
+        self.trace._terminal_body = block
+        self.trace._done_body = self._DONE
         self._select_terminal(event_type=event_type, disposition=disposition)
         yield block
-        self.trace.terminal_sent = True
-        self.trace.terminal_wire_committed = True
-        self.trace.state = OpenAIResponsesWireState.TERMINAL_SENT
-        self.trace.commitment = "terminal"
-        self.trace.publish_request_commitment()
+        await self._resume_source_after_terminal()
         yield self._DONE
-        self.trace.done_sent = True
-        self.trace.done_wire_committed = True
-        self.trace.state = OpenAIResponsesWireState.DONE_SENT
-        self.trace.commitment = "done"
-        self.trace.publish_request_commitment()
         await self._notify(disposition)
 
     async def _emit_synthetic_terminal(
@@ -508,7 +579,8 @@ class OpenAIResponsesWireCoordinator:
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         try:
-            async for raw_chunk in self._source:
+            self._source_iterator = self._source.__aiter__()
+            async for raw_chunk in self._source_iterator:
                 if not raw_chunk:
                     continue
                 self._buffer += bytes(raw_chunk)
@@ -604,7 +676,6 @@ class OpenAIResponsesWireCoordinator:
                             disposition=disposition,
                         ):
                             yield emitted
-                        await self._drain_source_after_terminal()
                         return
                     if saw_done:
                         self.trace.upstream_done_suppressed += 1
@@ -679,16 +750,9 @@ class OpenAIResponsesStreamingResponse(StreamingResponse):
             message_type = message.get("type")
             await send(message)
             if message_type == "http.response.start":
-                self.wire_trace.response_start_sent = True
-                self.wire_trace.commitment = "headers"
-                self.wire_trace.state = OpenAIResponsesWireState.HEADERS_STARTED
+                self.wire_trace.record_response_start_delivery()
             elif message_type == "http.response.body":
-                self.wire_trace.first_body_sent = True
-                if self.wire_trace.state is OpenAIResponsesWireState.HEADERS_STARTED:
-                    self.wire_trace.state = OpenAIResponsesWireState.BODY_STARTED
-                if self.wire_trace.commitment == "none":
-                    self.wire_trace.commitment = "body"
-            self.wire_trace.publish_request_commitment()
+                self.wire_trace.record_body_delivery(message.get("body"))
 
         try:
             await super().__call__(scope, receive, tracked_send)
@@ -714,21 +778,16 @@ class OpenAIResponsesStreamingResponse(StreamingResponse):
                         self.wire_trace.metadata[
                             "disposition_callback_error"
                         ] = type(exc).__name__
-                elif self._on_disposition is not None:
+                else:
                     try:
-                        await _await_shielded(
-                            self._on_disposition(
-                                OpenAIResponsesWireDisposition.DISCONNECTED,
-                                self.wire_trace,
-                            )
+                        await self.wire_trace._finalize_disposition(
+                            OpenAIResponsesWireDisposition.DISCONNECTED,
+                            self._on_disposition,
                         )
                     except Exception as exc:  # noqa: BLE001
                         self.wire_trace.metadata[
                             "disposition_callback_error"
                         ] = type(exc).__name__
-                self.wire_trace.finalized = True
-                self.wire_trace.commitment = "finalized"
-                self.wire_trace.publish_request_commitment()
             self.wire_trace.metadata.update(self.wire_trace.snapshot())
 
 
@@ -748,42 +807,24 @@ class OpenAIResponsesBufferedResponse(Response):
         self.wire_trace = wire_trace
         self._disposition = disposition
         self._on_disposition = on_disposition
-        self._finalization_started = False
 
     async def _finalize(
         self,
         disposition: OpenAIResponsesWireDisposition,
     ) -> None:
-        if self._finalization_started:
-            return
-        self._finalization_started = True
-        self.wire_trace.disposition = disposition
-        self.wire_trace.publish_request_commitment()
-        try:
-            await _await_shielded(self._on_disposition(disposition, self.wire_trace))
-        except Exception as exc:  # noqa: BLE001
-            self.wire_trace.metadata["disposition_callback_error"] = type(
-                exc
-            ).__name__
-        finally:
-            self.wire_trace.finalized = True
-            self.wire_trace.commitment = "finalized"
-            self.wire_trace.publish_request_commitment()
+        await self.wire_trace._finalize_disposition(
+            disposition,
+            self._on_disposition,
+        )
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         async def tracked_send(message: Dict[str, Any]) -> None:
             await send(message)
             message_type = message.get("type")
             if message_type == "http.response.start":
-                self.wire_trace.response_start_sent = True
-                self.wire_trace.commitment = "headers"
-                self.wire_trace.state = OpenAIResponsesWireState.HEADERS_STARTED
+                self.wire_trace.record_response_start_delivery()
             elif message_type == "http.response.body":
-                self.wire_trace.first_body_sent = True
-                self.wire_trace.terminal_wire_committed = True
-                self.wire_trace.state = OpenAIResponsesWireState.BODY_STARTED
-                self.wire_trace.commitment = "body"
-            self.wire_trace.publish_request_commitment()
+                self.wire_trace.record_body_delivery(message.get("body"))
 
         try:
             await super().__call__(scope, receive, tracked_send)
