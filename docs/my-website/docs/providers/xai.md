@@ -174,6 +174,12 @@ Reset values may be bounded durations, epoch timestamps, ISO timestamps, or
 HTTP-date values. Malformed, expired, non-finite, and unreasonably future
 values are ignored instead of creating a durable cooldown.
 
+When xAI supplies quota limit or remaining values without provider reset or
+billing-period evidence, LiteLLM leaves the reset time and quota period
+unknown. It does not synthesize a monthly boundary that could drive cooldown,
+availability, rollover, or forecasting. Explicit provider reset and billing
+period evidence remains authoritative.
+
 ## OAuth Credential Scope Selection
 
 Managed xAI OAuth and native Grok OIDC credential files must contain the exact
