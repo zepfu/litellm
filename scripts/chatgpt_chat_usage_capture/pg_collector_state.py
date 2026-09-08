@@ -145,13 +145,12 @@ class PgCollectorState:
         self.assert_safe_record(payload)
         now = datetime.now(timezone.utc)
         with self.ledger.connect() as conn, conn.cursor() as cur:
-            if self._active_lease(
+            self._require_active_lease(
                 cur,
                 account=account,
                 profile_id=profile,
                 expected=lease,
-            ) is None:
-                raise LedgerError("collector lease fence is stale")
+            )
             current = self._load_header(cur, account, profile, lock=True)
             if current is None:
                 if expected_state_version is not None:
@@ -262,13 +261,12 @@ class PgCollectorState:
         now = datetime.now(timezone.utc)
         expires = datetime.fromtimestamp(now.timestamp() + ttl_seconds, timezone.utc)
         with self.ledger.connect() as conn, conn.cursor() as cur:
-            if self._active_lease(
+            self._require_active_lease(
                 cur,
                 account=lease.collector_account_id,
                 profile_id=lease.profile_id,
                 expected=lease,
-            ) is None:
-                raise LedgerError("collector lease fence is stale")
+            )
             cur.execute(
                 """
                 UPDATE public.chatgpt_usage_collector_leases
@@ -342,13 +340,12 @@ class PgCollectorState:
             self.assert_safe_record(mutation)
         fingerprint = fingerprint_value(canonical_payload)
         with self.ledger.connect() as conn, conn.cursor() as cur:
-            if self._active_lease(
+            self._require_active_lease(
                 cur,
                 account=account,
                 profile_id=profile,
                 expected=lease,
-            ) is None:
-                raise LedgerError("collector lease fence is stale")
+            )
             binding = self._binding_for_scope(cur, scope, account, lease.binding)
             _lock_scope(cur, binding.scope_key)
             cur.execute(
@@ -525,13 +522,12 @@ class PgCollectorState:
         if len(mutations) > MAX_QUEUE_PAGE:
             raise LedgerError("candidate mutation batch exceeds the supported bound")
         with self.ledger.connect() as conn, conn.cursor() as cur:
-            if self._active_lease(
+            self._require_active_lease(
                 cur,
                 account=lease.collector_account_id,
                 profile_id=lease.profile_id,
                 expected=lease,
-            ) is None:
-                raise LedgerError("collector lease fence is stale")
+            )
             for rank, mutation in enumerate(mutations, start=1):
                 self.assert_safe_record(mutation)
                 self._apply_candidate_mutation(
@@ -545,13 +541,12 @@ class PgCollectorState:
     def finish_run(self, *, lease: CollectorLease, run_id: str) -> None:
         safe_run = _token(run_id, "run_id")
         with self.ledger.connect() as conn, conn.cursor() as cur:
-            if self._active_lease(
+            self._require_active_lease(
                 cur,
                 account=lease.collector_account_id,
                 profile_id=lease.profile_id,
                 expected=lease,
-            ) is None:
-                raise LedgerError("collector lease fence is stale")
+            )
             cur.execute(
                 """
                 UPDATE public.chatgpt_usage_collector_state
@@ -567,13 +562,12 @@ class PgCollectorState:
     def cancel(self, *, lease: CollectorLease, run_id: str) -> None:
         safe_run = _token(run_id, "run_id")
         with self.ledger.connect() as conn, conn.cursor() as cur:
-            if self._active_lease(
+            self._require_active_lease(
                 cur,
                 account=lease.collector_account_id,
                 profile_id=lease.profile_id,
                 expected=lease,
-            ) is None:
-                raise LedgerError("collector lease fence is stale")
+            )
             cur.execute(
                 """
                 UPDATE public.chatgpt_usage_collector_state
@@ -655,17 +649,18 @@ class PgCollectorState:
             "verified",
         )
 
-    def _active_lease(
+    def _require_active_lease(
         self,
         cur: psycopg.Cursor,
         *,
         account: str,
         profile_id: str,
         expected: CollectorLease,
-    ) -> bool:
+    ) -> None:
         cur.execute(
             """
-            SELECT lease_fencing_token, lease_expires_at
+            SELECT lease_fencing_token, lease_expires_at, scope_key,
+                   binding_generation
             FROM public.chatgpt_usage_collector_leases
             WHERE profile_id = %s AND collector_account_id = %s
             FOR UPDATE
@@ -673,12 +668,16 @@ class PgCollectorState:
             (profile_id, account),
         )
         row = cur.fetchone()
-        if row is None:
-            return False
-        return (
-            int(row[0]) == expected.lease_fencing_token
-            and ensure_utc(row[1]) > datetime.now(timezone.utc)
-        )
+        if (
+            row is None
+            or profile_id != expected.profile_id
+            or account != expected.collector_account_id
+            or int(row[0]) != expected.lease_fencing_token
+            or ensure_utc(row[1]) <= datetime.now(timezone.utc)
+            or str(row[2]) != expected.binding.scope_key
+            or int(row[3]) != expected.binding.binding_generation
+        ):
+            raise LedgerError("collector lease fence is stale")
 
     @staticmethod
     def _checkpoint_from_canonical(payload: Mapping[str, Any]) -> dict[str, Any]:
