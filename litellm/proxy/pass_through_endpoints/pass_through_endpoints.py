@@ -5712,21 +5712,6 @@ async def pass_through_request(  # noqa: PLR0915
 
             openai_send_request_fn = _send_prepared_openai_request
 
-        def _publish_openai_send_telemetry() -> None:
-            request_state = getattr(request, "state", None)
-            if request_state is None:
-                return
-            if openai_call_ledger is not None:
-                ledger_snapshot = (
-                    get_request_provider_call_ledger_snapshot(request)
-                    or openai_call_ledger.snapshot()
-                )
-                setattr(
-                    request_state,
-                    "aawm_openai_send_ledger_snapshot",
-                    ledger_snapshot,
-                )
-
         send_request_fn = openai_send_request_fn
         if managed_xai_oauth_request and send_request_fn is None:
             async def _send_managed_xai_request(

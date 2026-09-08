@@ -47,6 +47,10 @@ outcomes. The disposition is selected once, after the terminal event and
 `[DONE]` have been delivered for streams or after the response body has been
 sent for non-streaming Responses.
 
+Exit telemetry retains logical provider-call counts, transport connection
+failure counts, and hidden retry counts alongside the wire-enriched send-ledger
+snapshot.
+
 The internal callback contract is
 `on_disposition(disposition, trace)`. Consumers should read a copy from
 `trace.snapshot()` containing the wire state, response/body commitment,

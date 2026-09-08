@@ -161,6 +161,17 @@ snapshot on the next request; missing, malformed, ambiguous-scope, expired,
 or near-expiry records fail closed. LiteLLM does not refresh or write native
 credential files during request handling.
 
+## Managed OAuth Credential Snapshots
+
+Managed `oa_xai/*` request preparation uses an immutable, generation-aware
+snapshot of the configured credential file and exact scope. Configuration
+resolution, file metadata checks, reads, and JSON parsing run off the request
+event loop, and concurrent requests share one in-flight validation for the
+same generation. Atomic replacement or route-safety expiry invalidates the
+cached snapshot before a later request rebuilds it. Missing, malformed,
+ambiguous-scope, expired, and near-expiry records fail closed; request handling
+does not refresh or write the managed credential file.
+
 ## Rate-limit handling
 
 For an xAI provider `429`, LiteLLM uses a valid `Retry-After` value first.
@@ -173,6 +184,14 @@ is available.
 Reset values may be bounded durations, epoch timestamps, ISO timestamps, or
 HTTP-date values. Malformed, expired, non-finite, and unreasonably future
 values are ignored instead of creating a durable cooldown.
+
+Native Grok OIDC and managed xAI OAuth responses keep separate rate-limit
+observation identities. Native headers are captured under
+`xai_grok_oidc_response_headers` and labeled with the `xai_grok_oidc`
+credential family and `grok-build` client family; managed headers use
+`xai_oauth_response_headers` and the `xai_oauth` client family. A legacy
+native observation under the managed key is read only when native metadata
+proves ownership, and authorization or unrelated headers are excluded.
 
 When xAI supplies quota limit or remaining values without provider reset or
 billing-period evidence, LiteLLM leaves the reset time and quota period
@@ -261,6 +280,13 @@ native Grok and managed xAI Codex routes narrow `timeout_ms` from `number` to
 parser. Finite integral response values become JSON integers in both JSON and
 SSE output. Fractional values, unrelated numeric arguments, original tool names,
 and the caller's replay definitions remain unchanged.
+
+Native Grok and managed xAI Codex routes repair supported literal tool-call
+text in JSON and fully buffered Responses output. Once a stream is being
+forwarded lazily, malformed tool-call text instead fails closed before its
+successful terminal event and deferred session-owner promotion. LiteLLM does
+not replay already forwarded text as executable calls or buffer an unbounded
+response to repair it.
 
 ## Responses API Instructions
 

@@ -282,6 +282,10 @@ class PassThroughStreamingHandler:
     _XAI_OAUTH_RATE_LIMIT_HEADER_NAMES = {
         "retry-after",
     }
+    _XAI_OAUTH_RATE_LIMIT_HEADERS_KEY = "xai_oauth_response_headers"
+    _XAI_GROK_OIDC_RATE_LIMIT_HEADERS_KEY = "xai_grok_oidc_response_headers"
+    _XAI_OAUTH_RATE_LIMIT_SOURCE = "xai_oauth_response_headers"
+    _XAI_GROK_OIDC_RATE_LIMIT_SOURCE = "xai_grok_oidc_response_headers"
     _CLEAN_EOF_INCOMPLETE_REASON = "upstream_stream_ended_without_terminal_event"
     _RESPONSES_TERMINAL_EVENTS = {
         "response.completed",
@@ -1016,6 +1020,26 @@ class PassThroughStreamingHandler:
     def _sanitize_xai_oauth_rate_limit_headers(
         response_headers: httpx.Headers,
     ) -> Dict[str, str]:
+        return PassThroughStreamingHandler._sanitize_xai_rate_limit_headers(
+            response_headers,
+            source=PassThroughStreamingHandler._XAI_OAUTH_RATE_LIMIT_SOURCE,
+        )
+
+    @staticmethod
+    def _sanitize_xai_grok_oidc_rate_limit_headers(
+        response_headers: httpx.Headers,
+    ) -> Dict[str, str]:
+        return PassThroughStreamingHandler._sanitize_xai_rate_limit_headers(
+            response_headers,
+            source=PassThroughStreamingHandler._XAI_GROK_OIDC_RATE_LIMIT_SOURCE,
+        )
+
+    @staticmethod
+    def _sanitize_xai_rate_limit_headers(
+        response_headers: httpx.Headers,
+        *,
+        source: str,
+    ) -> Dict[str, str]:
         sanitized: Dict[str, str] = {}
         for header_name, header_value in response_headers.items():
             normalized_name = str(header_name).lower()
@@ -1029,14 +1053,31 @@ class PassThroughStreamingHandler:
                 continue
             sanitized[normalized_name] = str(header_value)
         if sanitized:
-            sanitized["source"] = "xai_oauth_response_headers"
+            sanitized["source"] = source
         return sanitized
 
     @staticmethod
+    def _is_grok_native_oauth_metadata(metadata: Dict[str, Any]) -> bool:
+        credential_family = str(metadata.get("credential_family") or "").lower()
+        if credential_family:
+            return credential_family == "xai_grok_oidc"
+        route_family = str(
+            metadata.get("passthrough_route_family")
+            or metadata.get("route_family")
+            or ""
+        ).lower()
+        if route_family:
+            if "xai_oauth" in route_family:
+                return False
+            if "grok_cli" in route_family or route_family in {"grok-build", "grok_build"}:
+                return True
+        return metadata.get("grok_native_oauth_managed") is True
+
+    @staticmethod
     def _is_xai_oauth_metadata(metadata: Dict[str, Any]) -> bool:
+        if PassThroughStreamingHandler._is_grok_native_oauth_metadata(metadata):
+            return False
         if metadata.get("xai_oauth_managed") is True:
-            return True
-        if metadata.get("grok_native_oauth_managed") is True:
             return True
         credential_family = str(metadata.get("credential_family") or "").lower()
         route_family = str(
@@ -1061,15 +1102,24 @@ class PassThroughStreamingHandler:
         metadata = PassThroughStreamingHandler._ensure_streaming_metadata(
             success_handler_kwargs
         )
-        if (
-            custom_llm_provider == "xai"
-            and PassThroughStreamingHandler._is_xai_oauth_metadata(metadata)
-        ):
-            sanitized_headers = PassThroughStreamingHandler._sanitize_xai_oauth_rate_limit_headers(
-                response.headers
-            )
-            if sanitized_headers:
-                metadata["xai_oauth_response_headers"] = sanitized_headers
+        if custom_llm_provider == "xai":
+            if PassThroughStreamingHandler._is_grok_native_oauth_metadata(metadata):
+                sanitized_headers = PassThroughStreamingHandler._sanitize_xai_grok_oidc_rate_limit_headers(
+                    response.headers
+                )
+                if sanitized_headers:
+                    metadata[
+                        PassThroughStreamingHandler._XAI_GROK_OIDC_RATE_LIMIT_HEADERS_KEY
+                    ] = sanitized_headers
+                return
+            if PassThroughStreamingHandler._is_xai_oauth_metadata(metadata):
+                sanitized_headers = PassThroughStreamingHandler._sanitize_xai_oauth_rate_limit_headers(
+                    response.headers
+                )
+                if sanitized_headers:
+                    metadata[
+                        PassThroughStreamingHandler._XAI_OAUTH_RATE_LIMIT_HEADERS_KEY
+                    ] = sanitized_headers
             return
         if endpoint_type == EndpointType.ANTHROPIC or custom_llm_provider == "anthropic":
             sanitized_headers = PassThroughStreamingHandler._sanitize_anthropic_rate_limit_headers(

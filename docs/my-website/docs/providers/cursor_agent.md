@@ -195,6 +195,12 @@ the response stream has reached its terminal lifecycle. Malformed, incomplete,
 failed, or prematurely closed responses release the pending reservation and do
 not establish durable affinity.
 
+When validation continues lazily after its bounded stream peek, it also rejects
+literal tool-call text before forwarding a successful terminal event. Already
+forwarded text is not replayed as executable calls; buffered-response repair
+remains separate. Rejection retains the existing malformed-tool-call error and
+cleanup path without promoting the pending owner.
+
 ## What this is not
 
 - Cloud Agents `/v0/agents` on `https://api.cursor.com`
