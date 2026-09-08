@@ -20,6 +20,9 @@
   logs, fixtures, or state.
 - Provider route and response schemas may change. Unknown shapes are marked
   `unrecognized` or `partial`; the adapter does not invent complete coverage.
+- Conflicting pagination aliases, a full page without terminal or total
+  evidence, and incomplete sanitizer projection all leave coverage partial;
+  they never prove complete history capture.
 - Project coverage and quota metadata are reported as unknown or not collected
   in Stage 1. No official remaining-quota value is inferred.
 - The fixture transport is deterministic synthetic support, not a provider
