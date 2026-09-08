@@ -443,6 +443,7 @@ class AsyncHTTPHandler:
         logging_obj: Optional[LiteLLMLoggingObject] = None,
         files: Optional[RequestFiles] = None,
         content: Any = None,
+        follow_redirects: Optional[bool] = None,
     ):
         start_time = time.time()
         try:
@@ -465,7 +466,10 @@ class AsyncHTTPHandler:
                 files=files,
                 content=request_content,
             )
-            response = await self.client.send(req, stream=stream)
+            send_kwargs: Dict[str, Any] = {"stream": stream}
+            if follow_redirects is not None:
+                send_kwargs["follow_redirects"] = follow_redirects
+            response = await self.client.send(req, **send_kwargs)
             response.raise_for_status()
             return response
         except (httpx.RemoteProtocolError, httpx.ConnectError):
@@ -482,6 +486,7 @@ class AsyncHTTPHandler:
                     params=params,
                     headers=headers,
                     stream=stream,
+                    follow_redirects=follow_redirects,
                 )
             finally:
                 await new_client.aclose()
@@ -709,6 +714,7 @@ class AsyncHTTPHandler:
         headers: Optional[dict] = None,
         stream: bool = False,
         content: Any = None,
+        follow_redirects: Optional[bool] = None,
     ):
         """
         Making POST request for a single connection client.
@@ -721,7 +727,10 @@ class AsyncHTTPHandler:
         req = client.build_request(
             "POST", url, data=request_data, json=json, params=params, headers=headers, content=request_content  # type: ignore
         )
-        response = await client.send(req, stream=stream)
+        send_kwargs: Dict[str, Any] = {"stream": stream}
+        if follow_redirects is not None:
+            send_kwargs["follow_redirects"] = follow_redirects
+        response = await client.send(req, **send_kwargs)
         response.raise_for_status()
         return response
 
@@ -1021,6 +1030,7 @@ class HTTPHandler:
         files: Optional[Union[dict, RequestFiles]] = None,
         content: Any = None,
         logging_obj: Optional[LiteLLMLoggingObject] = None,
+        follow_redirects: Optional[bool] = None,
     ):
         try:
             # Prepare data/content parameters to prevent httpx DeprecationWarning (memory leak fix)
@@ -1044,7 +1054,10 @@ class HTTPHandler:
                 req = self.client.build_request(
                     "POST", url, data=request_data, json=json, params=params, headers=headers, files=files, content=request_content  # type: ignore
                 )
-            response = self.client.send(req, stream=stream)
+            send_kwargs: Dict[str, Any] = {"stream": stream}
+            if follow_redirects is not None:
+                send_kwargs["follow_redirects"] = follow_redirects
+            response = self.client.send(req, **send_kwargs)
             response.raise_for_status()
             return response
         except httpx.TimeoutException:
