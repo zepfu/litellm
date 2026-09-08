@@ -1835,6 +1835,8 @@ def _normalize_named_collection(
     malformed = 0
     entries: List[Mapping[str, Any]] = []
     if isinstance(raw, Mapping):
+        if not raw:
+            return [], 0
         for key, value in raw.items():
             if isinstance(value, Mapping):
                 merged = dict(value)
@@ -1846,6 +1848,8 @@ def _normalize_named_collection(
                 malformed += 1
         return entries, malformed
     if isinstance(raw, list):
+        if not raw:
+            return [], 0
         for item in raw:
             if isinstance(item, Mapping):
                 entries.append(item)

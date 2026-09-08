@@ -2343,6 +2343,7 @@ def _cleanup_chatgpt_oracle_process(
     process: subprocess.Popen, temp_root: str,
 ) -> None:
     handles: Dict[int, int] = {}
+    cleanup_error: Optional[BaseException] = None
     try:
         _chatgpt_oracle_owned_handles(process, temp_root, handles)
         if process.stdin is not None:
@@ -2376,12 +2377,19 @@ def _cleanup_chatgpt_oracle_process(
                     raise RuntimeError("Oracle browser process cleanup timed out.")
             process.wait(timeout=1)
             _remove_chatgpt_oracle_scratch(temp_root)
+        except BaseException as exc:
+            cleanup_error = exc
+            raise
         finally:
             for handle in handles.values():
                 os.close(handle)
             for stream in (process.stdout, process.stderr):
                 if stream is not None:
                     stream.close()
+        if cleanup_error is not None:
+            raise RuntimeError(
+                "Oracle browser cleanup failed."
+            ) from cleanup_error
 
 
 @contextmanager
