@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 from dataclasses import fields
 from pathlib import Path
 from collections.abc import Generator
 from typing import Any, Callable, Optional, cast
+from unittest.mock import AsyncMock
 
 import pytest
 from starlette.requests import Request
@@ -535,8 +537,8 @@ def _assert_xai_agent_message_prepared_body(
         if isinstance(item, dict)
     )
     assert "encrypted_content" not in prepared_items[1]
-    assert prepared_items[2] is function_call_item
-    assert prepared_items[3] is function_call_output_item
+    assert prepared_items[2] == function_call_item
+    assert prepared_items[3] == function_call_output_item
     assert reasoning_item not in prepared_items
 
     metadata = prepared_body["litellm_metadata"]
@@ -627,8 +629,8 @@ async def test_xai_responses_prep_should_rewrite_agent_messages_for_both_routes(
     else:
         monkeypatch.setattr(
             request_prep,
-            "_get_grok_native_oauth_client_version",
-            lambda: "0.1.211",
+            "_get_grok_native_oauth_client_version_async",
+            AsyncMock(return_value="0.1.211"),
         )
         _configure(
             is_grok_native_oauth_model=lambda model: (
@@ -649,6 +651,14 @@ async def test_xai_responses_prep_should_rewrite_agent_messages_for_both_routes(
         assert result[1] == "https://grok.example/v1"
         assert result[2]["authorization"] == "Bearer oauth-token"
         prepared_body = result[3]
+        function_call_item = {
+            **function_call_item,
+            "arguments": json.dumps(function_call_item["arguments"]),
+        }
+        function_call_output_item = {
+            **function_call_output_item,
+            "output": json.dumps(function_call_output_item["output"]),
+        }
 
     _assert_xai_agent_message_prepared_body(
         prepared_body,
@@ -754,6 +764,7 @@ def test_sanitizer_should_decode_previous_id_and_report_metadata(
                 "tool_count": 1,
                 "tool_types": ["function"],
                 "previous_response_id_decoded": True,
+                "store_forced_false_image": False,
             },
         }
     ]
@@ -1524,7 +1535,7 @@ async def test_grok_prepare_should_preserve_exact_body_and_callback_order(
         events.append("xai-sanitize")
         return [], []
 
-    def build_headers(**kwargs: Any) -> dict[str, Any]:
+    async def build_headers(**kwargs: Any) -> dict[str, Any]:
         events.append("headers")
         return {"authorization": "Bearer access"}
 
@@ -1552,7 +1563,7 @@ async def test_grok_prepare_should_preserve_exact_body_and_callback_order(
     )
     monkeypatch.setattr(
         request_prep,
-        "_build_grok_native_oauth_headers",
+        "_build_grok_native_oauth_headers_async",
         build_headers,
     )
     original: Payload = {
@@ -1763,8 +1774,8 @@ async def test_grok_prepare_sanitize_seam_should_resolve_through_runtime(
 
     monkeypatch.setattr(
         request_prep,
-        '_get_grok_native_oauth_client_version',
-        lambda: '0.1.211',
+        '_get_grok_native_oauth_client_version_async',
+        AsyncMock(return_value='0.1.211'),
     )
     _configure(
         _sanitize_xai_responses_request_body_in_place=tracking_sanitize,

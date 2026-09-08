@@ -282,11 +282,13 @@ SSE output. Fractional values, unrelated numeric arguments, original tool names,
 and the caller's replay definitions remain unchanged.
 
 Native Grok and managed xAI Codex routes repair supported literal tool-call
-text in JSON and fully buffered Responses output. Once a stream is being
-forwarded lazily, malformed tool-call text instead fails closed before its
-successful terminal event and deferred session-owner promotion. LiteLLM does
-not replay already forwarded text as executable calls or buffer an unbounded
-response to repair it.
+text in JSON and fully buffered Responses output. Context notes explicitly
+marked as historical, non-executable data are never converted into calls;
+they remain unchanged for malformed-output validation. Once a stream is being
+forwarded lazily, malformed tool-call text fails closed before its successful
+terminal event and deferred session-owner promotion. LiteLLM does not replay
+already forwarded text as executable calls or buffer an unbounded response
+to repair it.
 
 ## Responses API Instructions
 
@@ -306,6 +308,15 @@ capability and a native Grok route family. Managed `oa_xai/*`, Cursor, Composer,
 Grok Build, and unprofiled future models do not inherit the native policy.
 Malformed native output remains request-local and does not create a durable
 candidate cooldown.
+
+Native `xai/grok-4.6` also declares `native_responses_tool_history`. Its native
+OIDC request projection preserves typed `function_call` and
+`function_call_output` pairs, their order, names, and `call_id` correlation.
+Arguments remain JSON strings; object arguments and outputs are serialized
+without replacing their contents. Output-only item IDs and status fields are
+omitted. Canonical replay remains unchanged. This replaces synthesized
+assistant history notes only on this capability-enabled native route;
+managed OAuth and other models retain their existing compatibility policy.
 
 ## Native Grok Continuation Recovery
 

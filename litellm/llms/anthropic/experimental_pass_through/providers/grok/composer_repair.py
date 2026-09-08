@@ -38,7 +38,8 @@ _LITERAL_INPUT_PAYLOAD_LINE_RE = re.compile(
     r"(?im)^Input payload:\s*(?P<payload>.+?)\s*$"
 )
 _LITERAL_CONTEXT_NOTE_LINE_RE = re.compile(
-    r"(?im)^\s*\[Context note - prior assistant step; not an executable tool invocation\]\s*$"
+    r"(?im)^\s*\[Context note - prior (?:assistant step|tool outcome); "
+    r"not an executable tool invocation\]\s*$"
 )
 _LITERAL_TOOL_ARGUMENT_METADATA_KEYS = frozenset({"description"})
 
@@ -230,6 +231,8 @@ def repair_literal_tool_calls_in_text(
     *,
     advertised_tools: AdvertisedTools,
 ) -> tuple[Optional[str], list[Payload]]:
+    if _LITERAL_CONTEXT_NOTE_LINE_RE.search(text):
+        return None, []
     blocks = parse_literal_tool_label_blocks(runtime, text)
     if not blocks:
         return None, []
@@ -335,6 +338,16 @@ def repair_literal_tool_calls_in_message_item(
         content_parts = content
     else:
         return [item], False
+
+    message_text = "\n".join(
+        part["text"]
+        for part in content_parts
+        if isinstance(part, dict)
+        and part.get("type") in {"text", "output_text"}
+        and isinstance(part.get("text"), str)
+    )
+    if _LITERAL_CONTEXT_NOTE_LINE_RE.search(message_text):
+        return None
 
     message_items: list[Payload] = []
     leftover_text_parts: list[str] = []

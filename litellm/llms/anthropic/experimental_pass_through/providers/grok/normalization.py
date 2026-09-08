@@ -149,6 +149,39 @@ def stringify_input_item_value(value: object) -> str:
         return str(value)
 
 
+def preserve_typed_function_history_in_place(request_body: Payload) -> None:
+    """Project native Responses history without synthesizing assistant prose."""
+    input_items = request_body.get("input")
+    if not isinstance(input_items, list):
+        return
+
+    updated_items: list[object] = []
+    changed = False
+    for item in input_items:
+        if not isinstance(item, dict) or item.get("type") not in {
+            "function_call",
+            "function_call_output",
+        }:
+            updated_items.append(item)
+            continue
+
+        # Native history carries call_id, not output-only item identity/status.
+        updated_item = {
+            key: value for key, value in item.items() if key not in {"id", "status"}
+        }
+        value_key = (
+            "arguments" if item["type"] == "function_call" else "output"
+        )
+        value = updated_item.get(value_key)
+        if isinstance(value, dict):
+            updated_item[value_key] = stringify_input_item_value(value)
+        updated_items.append(updated_item)
+        changed = changed or updated_item != item
+
+    if changed:
+        request_body["input"] = updated_items
+
+
 def format_function_call_input_message(
     item: Payload,
     *,
