@@ -32,8 +32,25 @@ MAX_FRAME_BYTES = 1024 * 1024
 MAX_TOTAL_BYTES = 16 * 1024 * 1024
 MAX_REQUESTS = 256
 MAX_REQUEST_ID_LENGTH = 128
+MAX_CURSOR_BYTES = 512
 DEFAULT_CHILD_TTL_SECONDS = 3600
 DEFAULT_WORKER_ROOT = "/app/scripts/chatgpt_chat_usage_capture/ts"
+DEFAULT_MODEL_MAPPING = {
+    "version": "initial-unmapped",
+    "canonicalFamilies": ["astra_pro", "sol_pro", "other_chat", "unknown"],
+    "rules": [],
+    "reviewStatus": "draft",
+    "source": "collector-empty-seed",
+    "createdAt": "2026-09-07T00:00:00.000Z",
+    "changeKind": "prospective",
+    "validFrom": None,
+    "validUntil": None,
+    "publishedAt": None,
+    "supersedesVersion": None,
+    "correctionOfVersion": None,
+    "provenance": {},
+    "warnings": [],
+}
 SUPPORTED_OPERATIONS = frozenset(
     {
         "loadState",
@@ -87,7 +104,9 @@ class BridgeConfig:
     collection_request: Mapping[str, Any] = field(
         default_factory=lambda: {"mode": "incremental"}
     )
-    mapping: Mapping[str, Any] = field(default_factory=dict)
+    mapping: Mapping[str, Any] = field(
+        default_factory=lambda: dict(DEFAULT_MODEL_MAPPING)
+    )
     history_preparer: Optional[HistoryPreparer] = field(
         default=None,
         repr=False,
@@ -105,12 +124,18 @@ class BridgeConfig:
         *,
         node_executable: str,
         worker_root: str = DEFAULT_WORKER_ROOT,
+        mapping: Optional[Mapping[str, Any]] = None,
         history_preparer: Optional[HistoryPreparer] = None,
         binding_bootstrapper: Optional[BindingBootstrapper] = None,
     ) -> "BridgeConfig":
         return cls(
             node_executable=node_executable,
             worker_root=worker_root,
+            mapping=(
+                dict(DEFAULT_MODEL_MAPPING)
+                if mapping is None
+                else dict(mapping)
+            ),
             history_preparer=history_preparer,
             binding_bootstrapper=binding_bootstrapper,
         )
@@ -118,6 +143,25 @@ class BridgeConfig:
     @property
     def worker_entrypoint(self) -> str:
         return str(Path(self.worker_root) / "dist" / "src" / "worker" / "main.js")
+
+    def __post_init__(self) -> None:
+        if not self.node_executable.strip():
+            raise ValueError("node executable must not be empty")
+        if not self.worker_root.strip():
+            raise ValueError("worker root must not be empty")
+        for value, name, maximum in (
+            (self.max_frame_bytes, "max_frame_bytes", MAX_FRAME_BYTES),
+            (self.max_total_bytes, "max_total_bytes", MAX_TOTAL_BYTES),
+            (self.max_requests, "max_requests", MAX_REQUESTS),
+            (self.child_ttl_seconds, "child_ttl_seconds", DEFAULT_CHILD_TTL_SECONDS),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+            if value > maximum:
+                raise ValueError(f"{name} cannot exceed the supported ceiling")
+        if self.max_frame_bytes > self.max_total_bytes:
+            raise ValueError("max_frame_bytes cannot exceed max_total_bytes")
+        _validate_model_mapping(self.mapping)
 
 
 class BridgeProtocolError(LedgerError):
@@ -140,6 +184,7 @@ class BridgeProtocolError(LedgerError):
 @dataclass
 class _Child:
     process: subprocess.Popen
+    process_group_id: int
     total_bytes: int
     request_count: int
     deadline_monotonic: float
@@ -158,6 +203,10 @@ class _RunContext:
     state_version: int
     trigger_id: Optional[str] = None
     prepared_history: Optional[Mapping[str, Any]] = None
+    verified_history: Optional[Mapping[str, Any]] = None
+    capabilities: Optional[Mapping[str, Any]] = None
+    capability_manifest: Optional[Mapping[str, Any]] = None
+    preparation_count: int = 0
     history_status: str = "unavailable"
     history_reason: Optional[str] = None
     retry_after_ms: Optional[int] = None
@@ -176,6 +225,47 @@ class TsWorkerBridge:
         self._children: dict[tuple[str, str], _Child] = {}
         self._lock = threading.Lock()
 
+    def _call_with_deadline(
+        self,
+        deadline_monotonic: float,
+        callback: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        self._check_deadline_monotonic(deadline_monotonic)
+        try:
+            result = callback(*args, **kwargs)
+        except BaseException:
+            self._check_deadline_monotonic(deadline_monotonic)
+            raise
+        self._check_deadline_monotonic(deadline_monotonic)
+        return result
+
+    def _call_context(
+        self,
+        context: _RunContext,
+        callback: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        self._check_deadline(context.child)
+        try:
+            result = callback(*args, **kwargs)
+        except BaseException:
+            self._check_deadline(context.child)
+            raise
+        self._check_deadline(context.child)
+        return result
+
+    @staticmethod
+    def _check_deadline_monotonic(deadline_monotonic: float) -> None:
+        if time.monotonic() >= deadline_monotonic:
+            raise BridgeProtocolError(
+                "worker deadline exceeded",
+                code="bounds_exceeded",
+                retryable=True,
+            )
+
     def run_once(
         self,
         *,
@@ -192,6 +282,7 @@ class TsWorkerBridge:
         profile = _metadata_token(profile_id, "profile_id")
         requested_scope = _scope_for_account(scope, account)
         run_id = str(uuid4())
+        deadline_monotonic = time.monotonic() + self.config.child_ttl_seconds
         lease: Optional[CollectorLease] = None
         child: Optional[_Child] = None
         context: Optional[_RunContext] = None
@@ -199,22 +290,22 @@ class TsWorkerBridge:
         key = (account, profile)
 
         try:
+            self._check_deadline_monotonic(deadline_monotonic)
             parent_scope, binding = self._capture_or_initialize_binding(
                 requested_scope,
                 seen_at=observed_at,
+                deadline_monotonic=deadline_monotonic,
             )
-            lease = self.state.claim_lease(
+            lease = self._call_with_deadline(
+                deadline_monotonic,
+                self.state.claim_lease,
                 collector_account_id=account,
                 profile_id=profile,
                 scope=parent_scope,
                 ttl_seconds=self.config.child_ttl_seconds,
                 expected_binding=binding,
             )
-            header, _ = self.state.load_state(
-                collector_account_id=account,
-                profile_id=profile,
-            )
-            child = self._start_child(key)
+            child = self._start_child(key, deadline_monotonic)
             context = _RunContext(
                 collector_account_id=account,
                 profile_id=profile,
@@ -222,16 +313,27 @@ class TsWorkerBridge:
                 scope=parent_scope,
                 lease=lease,
                 child=child,
-                state_version=header.state_version if header is not None else 0,
+                state_version=0,
             )
             with self._lock:
                 self._children[key] = child
+            header, _ = self._call_context(
+                context,
+                self.state.load_state,
+                collector_account_id=account,
+                profile_id=profile,
+            )
+            context.state_version = header.state_version if header is not None else 0
             self._send_start_run(
                 context,
                 schedule_options=schedule_options or self.config.schedule_options,
                 collection_request=collection_request
                 or self.config.collection_request,
-                mapping=mapping or self.config.mapping,
+                mapping=(
+                    self.config.mapping
+                    if mapping is None
+                    else mapping
+                ),
                 authentication_recovery_requested=authentication_recovery_requested,
             )
             result = self._serve_child(context)
@@ -257,6 +359,8 @@ class TsWorkerBridge:
                 context=context,
             )
         finally:
+            if context is not None:
+                self._close_prepared_history(context)
             if child is not None:
                 self._reap(key=key, child=child)
 
@@ -265,7 +369,9 @@ class TsWorkerBridge:
         scope: LedgerScope,
         *,
         seen_at: datetime,
+        deadline_monotonic: float,
     ) -> tuple[LedgerScope, Any]:
+        self._check_deadline_monotonic(deadline_monotonic)
         parent_scope: Optional[LedgerScope] = None
         try:
             parent_scope = _verified_scope_if_complete(scope)
@@ -273,7 +379,9 @@ class TsWorkerBridge:
             pass
         if parent_scope is not None:
             try:
-                binding = self.state.ledger.capture_binding(
+                binding = self._call_with_deadline(
+                    deadline_monotonic,
+                    self.state.ledger.capture_binding,
                     parent_scope,
                     seen_at=seen_at,
                 )
@@ -288,7 +396,12 @@ class TsWorkerBridge:
                 code="history_contract_unavailable",
                 retryable=True,
             )
-        bootstrapped_scope = bootstrapper(scope, seen_at)
+        bootstrapped_scope = self._call_with_deadline(
+            deadline_monotonic,
+            bootstrapper,
+            scope,
+            seen_at,
+        )
         if not isinstance(bootstrapped_scope, LedgerScope):
             raise BridgeProtocolError(
                 "binding bootstrap did not return a verified scope",
@@ -296,18 +409,26 @@ class TsWorkerBridge:
                 retryable=True,
             )
         parent_scope = _verified_scope(bootstrapped_scope, scope.collector_account_id)
-        self.state.ledger.initialize_binding(parent_scope, seen_at=seen_at)
-        return parent_scope, self.state.ledger.capture_binding(
+        self._call_with_deadline(
+            deadline_monotonic,
+            self.state.ledger.initialize_binding,
+            parent_scope,
+            seen_at=seen_at,
+        )
+        return parent_scope, self._call_with_deadline(
+            deadline_monotonic,
+            self.state.ledger.capture_binding,
             parent_scope,
             seen_at=seen_at,
         )
 
-    def _start_child(self, key: tuple[str, str]) -> _Child:
+    def _start_child(self, key: tuple[str, str], deadline_monotonic: float) -> _Child:
+        self._check_deadline_monotonic(deadline_monotonic)
         with self._lock:
             previous = self._children.get(key)
         if previous is not None:
             self._reap(key=key, child=previous)
-        deadline = time.monotonic() + self.config.child_ttl_seconds
+        self._check_deadline_monotonic(deadline_monotonic)
         process = subprocess.Popen(
             [
                 self.config.node_executable,
@@ -320,8 +441,18 @@ class TsWorkerBridge:
             bufsize=0,
             start_new_session=True,
         )
+        try:
+            process_group_id = os.getpgid(process.pid)
+        except OSError:
+            process_group_id = process.pid
         if process.stdin is None or process.stdout is None:
-            child = _Child(process, 0, 0, deadline)
+            child = _Child(
+                process,
+                process_group_id,
+                0,
+                0,
+                deadline_monotonic,
+            )
             self._reap(key=key, child=child)
             raise BridgeProtocolError(
                 "worker child streams are unavailable",
@@ -330,7 +461,15 @@ class TsWorkerBridge:
             )
         os.set_blocking(process.stdin.fileno(), False)
         os.set_blocking(process.stdout.fileno(), False)
-        return _Child(process, 0, 0, deadline)
+        child = _Child(
+            process,
+            process_group_id,
+            0,
+            0,
+            deadline_monotonic,
+        )
+        self._check_deadline_monotonic(deadline_monotonic)
+        return child
 
     def _send_start_run(
         self,
@@ -341,6 +480,13 @@ class TsWorkerBridge:
         mapping: Mapping[str, Any],
         authentication_recovery_requested: bool,
     ) -> None:
+        mapping = _validate_model_mapping(mapping)
+        if context.child.request_count >= self.config.max_requests:
+            raise BridgeProtocolError(
+                "worker request bound exceeded",
+                code="bounds_exceeded",
+                retryable=True,
+            )
         envelope = {
             "runId": context.run_id,
             "collectorAccountId": context.collector_account_id,
@@ -365,6 +511,7 @@ class TsWorkerBridge:
         if authentication_recovery_requested:
             request["authenticationRecoveryRequested"] = True
         assert_no_secrets(request)
+        context.child.request_count += 1
         self._write_frame(context.child, request)
 
     def _serve_child(self, context: _RunContext) -> dict[str, Any]:
@@ -417,6 +564,7 @@ class TsWorkerBridge:
         context: _RunContext,
         message: Mapping[str, Any],
     ) -> Optional[Mapping[str, Any]]:
+        self._consume_worker_request(context)
         control = message.get("control")
         request_id = _safe_request_id(message.get("requestId"))
         if control not in SUPPORTED_CONTROLS:
@@ -448,7 +596,7 @@ class TsWorkerBridge:
                     coverage_incomplete=True,
                 )
         if control == "inspectSessionIdentity":
-            if context.prepared_history is None:
+            if context.verified_history is None:
                 return _error_response(
                     request_id,
                     code="history_contract_unavailable",
@@ -457,7 +605,7 @@ class TsWorkerBridge:
                 )
             return _ok_response(
                 request_id,
-                _wire_history_identity(context.prepared_history),
+                _wire_history_identity(context.verified_history),
             )
         return _error_response(
             request_id,
@@ -480,15 +628,8 @@ class TsWorkerBridge:
                 coverage_incomplete=True,
             )
         try:
+            self._consume_worker_request(context)
             self._validate_worker_request(context, message)
-            self._check_deadline(context.child)
-            context.child.request_count += 1
-            if context.child.request_count > self.config.max_requests:
-                raise BridgeProtocolError(
-                    "worker request bound exceeded",
-                    code="bounds_exceeded",
-                    retryable=True,
-                )
             operation = message.get("operation")
             result = self._dispatch_operation(
                 context,
@@ -502,6 +643,16 @@ class TsWorkerBridge:
                 code=_failure_code(exc),
                 retryable=_retryable(exc),
                 coverage_incomplete=True,
+            )
+
+    def _consume_worker_request(self, context: _RunContext) -> None:
+        self._check_deadline(context.child)
+        context.child.request_count += 1
+        if context.child.request_count > self.config.max_requests:
+            raise BridgeProtocolError(
+                "worker request bound exceeded",
+                code="bounds_exceeded",
+                retryable=True,
             )
 
     def _validate_message_fence(
@@ -581,7 +732,9 @@ class TsWorkerBridge:
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
         kind = str(payload.get("kind") or "header")
-        header, _ = self.state.load_state(
+        header, _ = self._call_context(
+            context,
+            self.state.load_state,
             collector_account_id=context.collector_account_id,
             profile_id=context.profile_id,
         )
@@ -594,8 +747,6 @@ class TsWorkerBridge:
             }
         if kind == "schedule":
             state = header.schedule_transition if header is not None else None
-            if isinstance(state, Mapping):
-                self._observe_trigger(context, state)
             return {"stateVersion": state_version, "state": state}
         if kind == "candidates":
             limit = _bounded_limit(payload.get("limit"), default=64)
@@ -606,7 +757,9 @@ class TsWorkerBridge:
                     code="state_conflict",
                     retryable=True,
                 )
-            candidates = self.state.read_candidates(
+            candidates = self._call_context(
+                context,
+                self.state.read_candidates,
                 collector_account_id=context.collector_account_id,
                 profile_id=context.profile_id,
                 limit=limit,
@@ -630,7 +783,9 @@ class TsWorkerBridge:
         if kind not in {"schedule", "history", "checkpoint"}:
             raise BridgeProtocolError("unsupported state mutation kind")
         expected = _required_state_version(payload.get("expectedStateVersion"))
-        current, _ = self.state.load_state(
+        current, _ = self._call_context(
+            context,
+            self.state.load_state,
             collector_account_id=context.collector_account_id,
             profile_id=context.profile_id,
         )
@@ -662,10 +817,22 @@ class TsWorkerBridge:
                         code="fence_invalid",
                     )
                 active_trigger["runId"] = context.run_id
-                self._observe_trigger(context, state)
+                fencing_token = active_trigger.get("fencingToken")
+                if fencing_token is not None and fencing_token != (
+                    context.lease.lease_fencing_token
+                ):
+                    raise BridgeProtocolError(
+                        "schedule trigger fence does not match the parent lease",
+                        code="fence_invalid",
+                    )
+                active_trigger["fencingToken"] = (
+                    context.lease.lease_fencing_token
+                )
             elif active is not None:
                 raise BridgeProtocolError("schedule active trigger is invalid")
-        header = self.state.compare_and_set_state(
+        header = self._call_context(
+            context,
+            self.state.compare_and_set_state,
             collector_account_id=context.collector_account_id,
             profile_id=context.profile_id,
             expected_state_version=expected_for_pg,
@@ -673,8 +840,15 @@ class TsWorkerBridge:
             checkpoint=checkpoint,
             active_trigger=active_trigger,
             lease=context.lease,
-            )
+        )
         context.state_version = header.state_version
+        if kind == "schedule" and active_trigger is not None:
+            committed_trigger_id = _metadata_token(
+                active_trigger.get("triggerId"),
+                "triggerId",
+            )
+            context.trigger_id = committed_trigger_id
+            self._verify_committed_trigger(context, committed_trigger_id)
         return {
             "stateVersion": header.state_version,
             "state": (
@@ -689,6 +863,12 @@ class TsWorkerBridge:
         context: _RunContext,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
+        if context.preparation_count >= 1:
+            raise BridgeProtocolError(
+                "history preparation may only be requested once",
+                code="protocol_invalid",
+            )
+        context.preparation_count += 1
         claimed_trigger_id = _metadata_token(
             payload.get("claimedTriggerId"),
             "claimedTriggerId",
@@ -706,7 +886,9 @@ class TsWorkerBridge:
                 code="history_contract_unavailable",
                 retryable=True,
             )
-        prepared = preparer(
+        prepared = self._call_context(
+            context,
+            preparer,
             context.scope,
             context.collector_account_id,
             context.profile_id,
@@ -720,6 +902,9 @@ class TsWorkerBridge:
         assert_no_secrets(prepared)
         verified = _validate_prepared_history(context.scope, prepared)
         context.prepared_history = prepared
+        context.verified_history = verified
+        context.capabilities = verified["capabilities"]
+        context.capability_manifest = verified["capabilityManifest"]
         context.history_status = "ready"
         context.history_reason = None
         return verified
@@ -729,7 +914,9 @@ class TsWorkerBridge:
         context: _RunContext,
         trigger_id: str,
     ) -> None:
-        header, _ = self.state.load_state(
+        header, _ = self._call_context(
+            context,
+            self.state.load_state,
             collector_account_id=context.collector_account_id,
             profile_id=context.profile_id,
         )
@@ -738,17 +925,36 @@ class TsWorkerBridge:
                 "no committed active trigger exists",
                 code="fence_invalid",
             )
-        candidates = [header.active_trigger, header.schedule_transition]
-        for candidate in candidates:
-            if not isinstance(candidate, Mapping):
-                continue
-            active = candidate.get("active", candidate)
-            if isinstance(active, Mapping) and active.get("triggerId") == trigger_id:
-                return
-        raise BridgeProtocolError(
-            "claimed trigger is not active in durable state",
-            code="fence_invalid",
+        active = header.active_trigger
+        if (
+            not isinstance(active, Mapping)
+            or active.get("triggerId") != trigger_id
+            or active.get("runId") != context.run_id
+            or active.get("fencingToken") != context.lease.lease_fencing_token
+            or active.get("state", "active") not in {"active", "claimed", "running"}
+            or header.state_version != context.state_version
+        ):
+            raise BridgeProtocolError(
+                "claimed trigger is not active in durable state",
+                code="fence_invalid",
+            )
+        binding = self._call_context(
+            context,
+            self.state.ledger.capture_binding,
+            context.scope,
+            seen_at=datetime.now(timezone.utc),
         )
+        if (
+            binding.scope_key != context.lease.binding.scope_key
+            or binding.binding_generation
+            != context.lease.binding.binding_generation
+            or binding.binding_state != "active"
+            or binding.identity_state != "verified"
+        ):
+            raise BridgeProtocolError(
+                "claimed trigger binding is stale",
+                code="fence_invalid",
+            )
 
     def _read_history(
         self,
@@ -764,6 +970,23 @@ class TsWorkerBridge:
         kind = payload.get("kind")
         if kind not in {"index", "detail", "messages"}:
             raise BridgeProtocolError("unsupported history page kind")
+        required_capability = payload.get("requiredCapability")
+        if required_capability not in {"index", "modern_detail", "messages"}:
+            raise BridgeProtocolError(
+                "history request must declare a required capability",
+                code="history_contract_unavailable",
+                retryable=True,
+            )
+        if not _capability_is_available(
+            context.capabilities,
+            context.capability_manifest,
+            str(required_capability),
+        ):
+            raise BridgeProtocolError(
+                "requested history capability is unavailable",
+                code="history_contract_unavailable",
+                retryable=True,
+            )
         reader = context.prepared_history.get("readHistory")
         if not callable(reader):
             raise BridgeProtocolError(
@@ -773,7 +996,7 @@ class TsWorkerBridge:
             )
         if any(key in payload for key in ("url", "endpoint", "headers", "credentials")):
             raise BridgeProtocolError("history request contains forbidden transport fields")
-        result = reader(dict(payload))
+        result = self._call_context(context, reader, dict(payload))
         if not isinstance(result, Mapping):
             raise BridgeProtocolError(
                 "native history reader returned an invalid result",
@@ -821,7 +1044,9 @@ class TsWorkerBridge:
             payload.get("conversationId"),
             "conversationId",
         )
-        result = self.state.load_conversation_metadata(
+        result = self._call_context(
+            context,
+            self.state.load_conversation_metadata,
             collector_account_id=context.collector_account_id,
             conversation_id=conversation_id,
             limit=_bounded_limit(payload.get("limit"), default=32),
@@ -857,13 +1082,36 @@ class TsWorkerBridge:
             payload,
             expected_state_version=expected_version,
         )
-        ack: PageAck = self.state.commit_history_page(
+        if context.trigger_id is None:
+            raise BridgeProtocolError(
+                "page commit is not bound to a committed trigger",
+                code="fence_invalid",
+            )
+        ingest_operations = _bounded_sequence(
+            canonical_payload.get("ingestOperations"),
+            field_name="page commit ingestOperations",
+        )
+        candidate_mutations = _bounded_sequence(
+            canonical_payload.get("candidateMutations"),
+            field_name="page commit candidateMutations",
+        )
+        coverage_mutations = _bounded_sequence(
+            canonical_payload.get("coverageMutations"),
+            field_name="page commit coverageMutations",
+        )
+        ack: PageAck = self._call_context(
+            context,
+            self.state.commit_history_page,
             lease=context.lease,
             scope=context.scope,
             run_id=context.run_id,
             page_commit_id=page_commit_id,
             canonical_payload=canonical_payload,
             expected_state_version=expected_version,
+            trigger_id=context.trigger_id,
+            ingest_operations=ingest_operations,
+            candidate_mutations=candidate_mutations,
+            coverage_mutations=coverage_mutations,
         )
         context.state_version = int(ack.state_version)
         return {
@@ -878,7 +1126,9 @@ class TsWorkerBridge:
         context: _RunContext,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
-        result = self.state.load_report_snapshot(
+        result = self._call_context(
+            context,
+            self.state.load_report_snapshot,
             collector_account_id=context.collector_account_id,
             limit=_bounded_limit(payload.get("limit"), default=256),
             cursor=_optional_cursor(payload.get("cursor")),
@@ -909,7 +1159,9 @@ class TsWorkerBridge:
                 code="state_conflict",
                 retryable=True,
             )
-        header = self.state.finish_run(
+        header = self._call_context(
+            context,
+            self.state.finish_run,
             lease=context.lease,
             run_id=context.run_id,
             expected_state_version=expected,
@@ -936,7 +1188,9 @@ class TsWorkerBridge:
                 "cancel trigger does not match the claimed trigger",
                 code="fence_invalid",
             )
-        header = self.state.cancel(
+        header = self._call_context(
+            context,
+            self.state.cancel,
             lease=context.lease,
             run_id=context.run_id,
             expected_state_version=expected,
@@ -949,27 +1203,22 @@ class TsWorkerBridge:
         context.cancelled = True
         return {"cancelled": True, "stateVersion": header.state_version}
 
-    def _observe_trigger(
-        self,
-        context: _RunContext,
-        state: Mapping[str, Any],
-    ) -> None:
-        active = state.get("active")
-        if isinstance(active, Mapping):
-            trigger_id = active.get("triggerId")
-            if isinstance(trigger_id, str) and trigger_id.strip():
-                context.trigger_id = trigger_id
-
     def _await_child_exit(self, child: _Child) -> None:
         remaining = max(0.0, child.deadline_monotonic - time.monotonic())
         try:
-            child.process.wait(timeout=remaining)
+            return_code = child.process.wait(timeout=remaining)
         except subprocess.TimeoutExpired as exc:
             raise BridgeProtocolError(
                 "worker did not terminate after committed finish",
                 code="bounds_exceeded",
                 retryable=True,
             ) from exc
+        if return_code != 0:
+            raise BridgeProtocolError(
+                f"worker exited with status {return_code} after finish",
+                code="history_reader_failed",
+                retryable=True,
+            )
 
     def _send_parent_cancel(self, context: _RunContext, *, reason: str) -> None:
         if context.child.process.poll() is not None:
@@ -978,6 +1227,13 @@ class TsWorkerBridge:
             "protocolVersion": PROTOCOL_VERSION,
             "control": "cancelRun",
             "requestId": str(uuid4()),
+            "envelope": {
+                "runId": context.run_id,
+                "collectorAccountId": context.collector_account_id,
+                "profileId": context.profile_id,
+                "bindingGeneration": context.lease.binding.binding_generation,
+                "leaseFencingToken": context.lease.lease_fencing_token,
+            },
             "runId": context.run_id,
             "collectorAccountId": context.collector_account_id,
             "profileId": context.profile_id,
@@ -986,7 +1242,7 @@ class TsWorkerBridge:
             "reason": _metadata_token(reason, "reason"),
         }
         try:
-            self._write_frame(context.child, message)
+            self._write_frame(context.child, message, enforce_deadline=False)
         except Exception:
             return
 
@@ -1007,6 +1263,58 @@ class TsWorkerBridge:
             )
         except Exception:
             self._release_lease_quietly(context.lease)
+
+    def _close_prepared_history(self, context: _RunContext) -> None:
+        prepared = context.prepared_history
+        if not isinstance(prepared, Mapping):
+            return
+        targets: list[Any] = [prepared]
+        for key in ("lifecycle", "lifecycleCapability", "lifecycle_capability"):
+            target = prepared.get(key)
+            if target is not None:
+                targets.append(target)
+        seen: set[tuple[int, str]] = set()
+        for method_name in (
+            "cancelActiveOperations",
+            "cancel_active_operations",
+            "cancel",
+        ):
+            for target in targets:
+                callback = getattr(target, method_name, None)
+                if not callable(callback) and isinstance(target, Mapping):
+                    callback = target.get(method_name)
+                if not callable(callback):
+                    continue
+                marker = (id(target), method_name)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                try:
+                    callback()
+                except Exception:
+                    pass
+        for method_name in (
+            "retireNativeHistory",
+            "retire_native_history",
+            "closeResources",
+            "close_resources",
+            "close",
+            "release",
+        ):
+            for target in targets:
+                callback = getattr(target, method_name, None)
+                if not callable(callback) and isinstance(target, Mapping):
+                    callback = target.get(method_name)
+                if not callable(callback):
+                    continue
+                marker = (id(target), method_name)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                try:
+                    callback()
+                except Exception:
+                    pass
 
     def _track_snapshot(
         self,
@@ -1036,24 +1344,25 @@ class TsWorkerBridge:
         except Exception:
             return
 
-    def _write_frame(self, child: _Child, message: Mapping[str, Any]) -> None:
+    def _write_frame(
+        self,
+        child: _Child,
+        message: Mapping[str, Any],
+        *,
+        enforce_deadline: bool = True,
+    ) -> None:
         assert_no_secrets(message)
-        encoded = (
-            json.dumps(message, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
-            + b"\n"
-        )
-        if len(encoded) > self.config.max_frame_bytes:
-            raise BridgeProtocolError(
-                "worker frame exceeds the configured bound",
-                code="bounds_exceeded",
-                retryable=True,
-            )
-        if child.total_bytes + len(encoded) > self.config.max_total_bytes:
+        remaining_total = self.config.max_total_bytes - child.total_bytes
+        if remaining_total <= 0:
             raise BridgeProtocolError(
                 "worker total byte bound exceeded",
                 code="bounds_exceeded",
                 retryable=True,
             )
+        encoded = _encode_bounded_frame(
+            message,
+            max_bytes=min(self.config.max_frame_bytes, remaining_total),
+        )
         if child.process.stdin is None:
             raise BridgeProtocolError(
                 "worker stdin is unavailable",
@@ -1066,8 +1375,12 @@ class TsWorkerBridge:
         try:
             selector.register(fd, selectors.EVENT_WRITE)
             while view:
-                self._check_deadline(child)
-                events = selector.select(self._remaining_timeout(child))
+                if enforce_deadline:
+                    self._check_deadline(child)
+                    timeout = self._remaining_timeout(child)
+                else:
+                    timeout = 0.25
+                events = selector.select(timeout)
                 if not events:
                     raise BridgeProtocolError(
                         "worker write deadline exceeded",
@@ -1224,19 +1537,22 @@ class TsWorkerBridge:
 
     def _reap(self, *, key: tuple[str, str], child: _Child) -> None:
         process = child.process
-        _terminate_process_group(process)
         try:
-            process.wait(timeout=0.5)
-        except subprocess.TimeoutExpired:
-            _kill_process_group(process)
+            _terminate_process_group(process, child.process_group_id)
             try:
-                process.wait(timeout=1.0)
+                process.wait(timeout=0.5)
             except subprocess.TimeoutExpired:
-                _kill_process_group(process)
+                _kill_process_group(process, child.process_group_id)
                 try:
                     process.wait(timeout=1.0)
                 except subprocess.TimeoutExpired:
-                    return
+                    _kill_process_group(process, child.process_group_id)
+                    try:
+                        process.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+            if _process_group_exists(child.process_group_id):
+                _kill_process_group(process, child.process_group_id)
         finally:
             for stream in (process.stdin, process.stdout):
                 if stream is not None:
@@ -1256,16 +1572,30 @@ class TsWorkerBridge:
             self._reap(key=key, child=child)
 
 
-def _terminate_process_group(process: subprocess.Popen) -> None:
+def _process_group_exists(process_group_id: int) -> bool:
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process_group_id, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def _terminate_process_group(
+    process: subprocess.Popen,
+    process_group_id: Optional[int] = None,
+) -> None:
+    try:
+        os.killpg(process_group_id or process.pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
         return
 
 
-def _kill_process_group(process: subprocess.Popen) -> None:
+def _kill_process_group(
+    process: subprocess.Popen,
+    process_group_id: Optional[int] = None,
+) -> None:
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        os.killpg(process_group_id or process.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         return
 
@@ -1372,14 +1702,18 @@ def _validate_prepared_history(
             "history identity does not match the parent scope",
             code="fence_invalid",
         )
+    normalized_identity = _validate_identity_record(identity)
     provider_user_id = _first_value(identity, "providerUserId", "provider_user_id")
     workspace_id = _first_value(identity, "workspaceId", "workspace_id")
     quota_owner_id = _first_value(identity, "quotaOwnerId", "quota_owner_id")
+    surface = _first_value(identity, "surface")
     auth_state = _first_value(identity, "authState", "auth_state")
     if (
         provider_user_id != parent_scope.provider_user_id
         or workspace_id != parent_scope.workspace_id
         or quota_owner_id != parent_scope.quota_owner_id
+        or surface != parent_scope.surface
+        or surface != "chat"
         or auth_state not in {"ready", "verified"}
     ):
         raise BridgeProtocolError(
@@ -1387,37 +1721,198 @@ def _validate_prepared_history(
             code="history_contract_unavailable",
             retryable=True,
         )
-    if not _native_history_capability_is_verified(capabilities, manifest):
+    normalized_capabilities = _validate_capability_record(capabilities)
+    normalized_manifest = _validate_capability_manifest(
+        manifest,
+        normalized_identity,
+        normalized_capabilities,
+    )
+    if not _native_history_capability_is_verified(
+        normalized_capabilities,
+        normalized_manifest,
+    ):
         raise BridgeProtocolError(
             "native history capability is unavailable",
             code="history_contract_unavailable",
             retryable=True,
         )
     return {
-        "identity": dict(identity),
-        "capabilities": dict(capabilities),
-        "capabilityManifest": dict(manifest),
+        "identity": normalized_identity,
+        "capabilities": normalized_capabilities,
+        "capabilityManifest": normalized_manifest,
         "scope": _scope_wire(verified_scope),
     }
+
+
+def _validate_identity_record(value: Mapping[str, Any]) -> dict[str, Any]:
+    required = (
+        "providerUserId",
+        "workspaceId",
+        "quotaOwnerId",
+        "surface",
+        "authState",
+        "identityErrors",
+    )
+    if any(field_name not in value for field_name in required):
+        raise BridgeProtocolError(
+            "history identity record is incomplete",
+            code="history_contract_unavailable",
+            retryable=True,
+        )
+    for field_name in ("providerUserId", "workspaceId", "quotaOwnerId"):
+        if not isinstance(value[field_name], str) or not value[field_name].strip():
+            raise BridgeProtocolError(
+                "history identity record contains an invalid owner field",
+                code="history_contract_unavailable",
+                retryable=True,
+            )
+    if value["surface"] != "chat" or not isinstance(value["authState"], str):
+        raise BridgeProtocolError(
+            "history identity surface or auth state is invalid",
+            code="history_contract_unavailable",
+            retryable=True,
+        )
+    errors = value["identityErrors"]
+    if not isinstance(errors, list) or any(
+        not isinstance(item, str) for item in errors
+    ):
+        raise BridgeProtocolError(
+            "history identity errors are invalid",
+            code="history_contract_unavailable",
+            retryable=True,
+        )
+    return dict(value)
+
+
+def _validate_capability_record(value: Mapping[str, Any]) -> dict[str, Any]:
+    required = (
+        "adapterVersion",
+        "indexScopes",
+        "archiveBehavior",
+        "projectCoverage",
+        "modernDetail",
+        "pagination",
+        "legacySupport",
+        "branchVisibility",
+        "modelMetadata",
+        "quotaMetadata",
+        "warnings",
+    )
+    if any(field_name not in value for field_name in required):
+        raise BridgeProtocolError(
+            "history capability record is incomplete",
+            code="history_contract_unavailable",
+            retryable=True,
+        )
+    if not isinstance(value["adapterVersion"], str) or not value["adapterVersion"].strip():
+        raise BridgeProtocolError(
+            "history capability adapter version is invalid",
+            code="history_contract_unavailable",
+            retryable=True,
+        )
+    index_scopes = value["indexScopes"]
+    warnings = value["warnings"]
+    if (
+        not isinstance(index_scopes, list)
+        or not index_scopes
+        or any(not isinstance(item, str) or not item.strip() for item in index_scopes)
+        or not isinstance(warnings, list)
+        or any(not isinstance(item, str) for item in warnings)
+    ):
+        raise BridgeProtocolError(
+            "history capability inventory contains invalid arrays",
+            code="history_contract_unavailable",
+            retryable=True,
+        )
+    if value["projectCoverage"] not in {"complete", "partial", "unknown"}:
+        raise BridgeProtocolError(
+            "history capability project coverage is invalid",
+            code="history_contract_unavailable",
+            retryable=True,
+        )
+    for field_name in (
+        "archiveBehavior",
+        "modernDetail",
+        "pagination",
+        "legacySupport",
+        "branchVisibility",
+        "modelMetadata",
+        "quotaMetadata",
+    ):
+        if not isinstance(value[field_name], str) or not value[field_name].strip():
+            raise BridgeProtocolError(
+                "history capability inventory contains an invalid field",
+                code="history_contract_unavailable",
+                retryable=True,
+            )
+    return dict(value)
+
+
+def _validate_capability_manifest(
+    value: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    capabilities: Mapping[str, Any],
+) -> dict[str, Any]:
+    adapter_version = _first_value(value, "adapterVersion", "adapter_version")
+    surface = _first_value(value, "surface", "conversationSurface")
+    manifest_identity = value.get("identity")
+    native_history = _first_value(value, "nativeHistory", "native_history", "history")
+    if (
+        adapter_version != capabilities["adapterVersion"]
+        or surface != identity["surface"]
+        or not isinstance(manifest_identity, Mapping)
+        or native_history is None
+    ):
+        raise BridgeProtocolError(
+            "history capability manifest does not match its inventory",
+            code="history_contract_unavailable",
+            retryable=True,
+        )
+    for field_name in ("providerUserId", "workspaceId", "quotaOwnerId", "surface"):
+        if _first_value(
+            manifest_identity,
+            field_name,
+            _snake_case(field_name),
+        ) != identity[field_name]:
+            raise BridgeProtocolError(
+                "history capability manifest identity does not match the session",
+                code="history_contract_unavailable",
+                retryable=True,
+            )
+    return dict(value)
 
 
 def _native_history_capability_is_verified(
     capabilities: Mapping[str, Any],
     manifest: Mapping[str, Any],
 ) -> bool:
-    values = [
-        capabilities.get("nativeHistory"),
-        capabilities.get("native_history"),
-        capabilities.get("history"),
-        manifest.get("nativeHistory"),
-        manifest.get("native_history"),
-        manifest.get("history"),
-    ]
-    for value in values:
-        if isinstance(value, Mapping):
-            value = value.get("status") or value.get("state")
-        if value in {"available", "verified", "supported", True}:
-            return True
+    marker = _first_value(manifest, "nativeHistory", "native_history", "history")
+    if isinstance(marker, Mapping):
+        marker = marker.get("status") or marker.get("state")
+    if marker not in {"available", "verified", "supported", True}:
+        return False
+    return (
+        bool(capabilities.get("indexScopes"))
+        and capabilities.get("modernDetail") not in {"unavailable", "unknown"}
+        and capabilities.get("pagination") not in {"unavailable", "unknown"}
+    )
+
+
+def _capability_is_available(
+    capabilities: Optional[Mapping[str, Any]],
+    manifest: Optional[Mapping[str, Any]],
+    required_capability: str,
+) -> bool:
+    if capabilities is None or manifest is None:
+        return False
+    if not _native_history_capability_is_verified(capabilities, manifest):
+        return False
+    if required_capability == "index":
+        return bool(capabilities.get("indexScopes"))
+    if required_capability == "modern_detail":
+        return capabilities.get("modernDetail") not in {"unavailable", "unknown"}
+    if required_capability == "messages":
+        return capabilities.get("pagination") not in {"unavailable", "unknown"}
     return False
 
 
@@ -1459,6 +1954,13 @@ def _first_value(payload: Mapping[str, Any], *keys: str) -> Any:
     return None
 
 
+def _snake_case(value: str) -> str:
+    return value[0].lower() + "".join(
+        f"_{character.lower()}" if character.isupper() else character
+        for character in value[1:]
+    )
+
+
 def _nested_value(payload: Mapping[str, Any], outer: str, inner: str) -> Any:
     nested = payload.get(outer)
     return nested.get(inner) if isinstance(nested, Mapping) else None
@@ -1494,7 +1996,17 @@ def _safe_request_id(value: Any) -> str:
 def _optional_cursor(value: Any) -> Optional[str]:
     if value is None:
         return None
-    return _metadata_token(value, "cursor")
+    if not isinstance(value, str) or not value:
+        raise BridgeProtocolError("cursor must be a non-empty opaque string")
+    if len(value.encode("utf-8")) > MAX_CURSOR_BYTES:
+        raise BridgeProtocolError(
+            "cursor exceeds the supported bound",
+            code="bounds_exceeded",
+            retryable=True,
+        )
+    if any(character in value for character in ("\x00", "\r", "\n")):
+        raise BridgeProtocolError("cursor contains a forbidden control character")
+    return value
 
 
 def _bounded_limit(value: Any, *, default: int) -> int:
@@ -1534,15 +2046,292 @@ def _wall_deadline(child: _Child) -> datetime:
 def _bounded_summary(value: Any) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise BridgeProtocolError("finish summary must be an object")
-    serialized = json.dumps(value, separators=(",", ":"), default=str)
-    if len(serialized.encode("utf-8")) > 64 * 1024:
+    try:
+        _encode_bounded_frame(value, max_bytes=(64 * 1024) + 1)
+    except BridgeProtocolError as exc:
+        if exc.code == "bounds_exceeded":
+            raise BridgeProtocolError(
+                "finish summary exceeds the supported bound",
+                code="bounds_exceeded",
+                retryable=True,
+            ) from exc
+        raise
+    assert_no_secrets(value)
+    return dict(value)
+
+
+def _encode_bounded_frame(
+    value: Mapping[str, Any],
+    *,
+    max_bytes: int,
+) -> bytes:
+    """Encode one JSON frame without allocating an unbounded serialized copy."""
+    if max_bytes <= 1:
         raise BridgeProtocolError(
-            "finish summary exceeds the supported bound",
+            "worker frame bound is too small",
             code="bounds_exceeded",
             retryable=True,
         )
+    encoded = bytearray()
+    encoder = json.JSONEncoder(
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    try:
+        for chunk in encoder.iterencode(value):
+            encoded_chunk = chunk.encode("utf-8")
+            if len(encoded) + len(encoded_chunk) + 1 > max_bytes:
+                raise BridgeProtocolError(
+                    "worker frame exceeds the configured bound",
+                    code="bounds_exceeded",
+                    retryable=True,
+                )
+            encoded.extend(encoded_chunk)
+    except BridgeProtocolError:
+        raise
+    except (TypeError, UnicodeEncodeError, ValueError) as exc:
+        raise BridgeProtocolError(
+            "worker frame is not valid JSON",
+            code="protocol_invalid",
+        ) from exc
+    encoded.append(0x0A)
+    return bytes(encoded)
+
+
+def _validate_model_mapping(value: Any) -> dict[str, Any]:
+    """Validate and normalize the wire-level ModelMappingVersion contract."""
+    if not isinstance(value, Mapping):
+        raise BridgeProtocolError(
+            "model mapping must be an object",
+            code="protocol_invalid",
+        )
     assert_no_secrets(value)
-    return dict(value)
+    required_fields = {
+        "version",
+        "canonicalFamilies",
+        "rules",
+        "reviewStatus",
+        "source",
+        "createdAt",
+    }
+    optional_fields = {
+        "reviewedAt",
+        "reviewedBy",
+        "changeKind",
+        "validFrom",
+        "validUntil",
+        "publishedAt",
+        "supersedesVersion",
+        "correctionOfVersion",
+        "provenance",
+        "warnings",
+    }
+    unknown_fields = set(value) - required_fields - optional_fields
+    if unknown_fields:
+        raise BridgeProtocolError(
+            "model mapping contains unsupported fields",
+            code="protocol_invalid",
+        )
+    missing_fields = required_fields - set(value)
+    if missing_fields:
+        raise BridgeProtocolError(
+            "model mapping is missing required fields",
+            code="protocol_invalid",
+        )
+    normalized: dict[str, Any] = dict(value)
+    for field_name in ("version", "source", "createdAt"):
+        normalized[field_name] = _mapping_string(
+            value[field_name],
+            f"mapping.{field_name}",
+        )
+    review_status = value["reviewStatus"]
+    if not isinstance(review_status, str) or review_status not in {
+        "draft",
+        "approved",
+        "retired",
+    }:
+        raise BridgeProtocolError(
+            "model mapping reviewStatus is invalid",
+            code="protocol_invalid",
+        )
+    change_kind = value.get("changeKind")
+    if change_kind is not None and (
+        not isinstance(change_kind, str)
+        or change_kind not in {
+            "prospective",
+            "historical_correction",
+        }
+    ):
+        raise BridgeProtocolError(
+            "model mapping changeKind is invalid",
+            code="protocol_invalid",
+        )
+    normalized["changeKind"] = change_kind
+    normalized_families = _validate_mapping_families(value["canonicalFamilies"])
+    normalized["canonicalFamilies"] = normalized_families
+    normalized["rules"] = _validate_mapping_rules(
+        value["rules"],
+        normalized_families,
+    )
+    _normalize_mapping_optional_strings(value, normalized)
+    provenance = value.get("provenance", {})
+    if not isinstance(provenance, Mapping):
+        raise BridgeProtocolError(
+            "model mapping provenance must be an object",
+            code="protocol_invalid",
+        )
+    normalized["provenance"] = dict(provenance)
+    warnings = value.get("warnings", [])
+    if (
+        not isinstance(warnings, Sequence)
+        or isinstance(warnings, (str, bytes))
+        or len(warnings) > 64
+        or any(not isinstance(item, str) for item in warnings)
+    ):
+        raise BridgeProtocolError(
+            "model mapping warnings are invalid",
+            code="protocol_invalid",
+        )
+    normalized["warnings"] = list(warnings)
+    try:
+        _encode_bounded_frame(normalized, max_bytes=(64 * 1024) + 1)
+    except BridgeProtocolError as exc:
+        if exc.code == "bounds_exceeded":
+            raise BridgeProtocolError(
+                "model mapping exceeds the supported bound",
+                code="bounds_exceeded",
+                retryable=True,
+            ) from exc
+        raise
+    return normalized
+
+
+def _validate_mapping_families(value: Any) -> list[str]:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes))
+        or not value
+        or len(value) > 64
+    ):
+        raise BridgeProtocolError(
+            "model mapping canonicalFamilies is invalid",
+            code="protocol_invalid",
+        )
+    normalized: list[str] = []
+    for family in value:
+        normalized_family = _mapping_string(family, "mapping.canonicalFamilies[]")
+        if normalized_family in normalized:
+            raise BridgeProtocolError(
+                "model mapping canonicalFamilies contains duplicates",
+                code="protocol_invalid",
+            )
+        normalized.append(normalized_family)
+    return normalized
+
+
+def _validate_mapping_rules(
+    value: Any,
+    families: Sequence[str],
+) -> list[dict[str, Any]]:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes))
+        or len(value) > 256
+    ):
+        raise BridgeProtocolError(
+            "model mapping rules is invalid",
+            code="protocol_invalid",
+        )
+    allowed_fields = {
+        "slug",
+        "mode",
+        "reasoningEffort",
+        "family",
+        "collectorAccountId",
+        "reviewed",
+        "source",
+    }
+    normalized_rules: list[dict[str, Any]] = []
+    for index, raw_rule in enumerate(value):
+        if not isinstance(raw_rule, Mapping):
+            raise BridgeProtocolError(
+                f"model mapping rule {index} is not an object",
+                code="protocol_invalid",
+            )
+        if set(raw_rule) - allowed_fields:
+            raise BridgeProtocolError(
+                f"model mapping rule {index} contains unsupported fields",
+                code="protocol_invalid",
+            )
+        if "slug" not in raw_rule or "family" not in raw_rule:
+            raise BridgeProtocolError(
+                f"model mapping rule {index} is missing identity",
+                code="protocol_invalid",
+            )
+        rule = dict(raw_rule)
+        rule["slug"] = _mapping_string(
+            raw_rule["slug"],
+            f"mapping.rules[{index}].slug",
+        )
+        rule["family"] = _mapping_string(
+            raw_rule["family"],
+            f"mapping.rules[{index}].family",
+        )
+        if rule["family"] not in families:
+            raise BridgeProtocolError(
+                f"model mapping rule {index} names an unknown family",
+                code="protocol_invalid",
+            )
+        for field_name in ("mode", "reasoningEffort", "collectorAccountId", "source"):
+            if field_name in raw_rule and raw_rule[field_name] is not None:
+                rule[field_name] = _mapping_string(
+                    raw_rule[field_name],
+                    f"mapping.rules[{index}].{field_name}",
+                )
+        if "reviewed" in raw_rule and not isinstance(raw_rule["reviewed"], bool):
+            raise BridgeProtocolError(
+                f"model mapping rule {index} reviewed flag is invalid",
+                code="protocol_invalid",
+            )
+        normalized_rules.append(rule)
+    return normalized_rules
+
+
+def _normalize_mapping_optional_strings(
+    value: Mapping[str, Any],
+    normalized: dict[str, Any],
+) -> None:
+    for field_name in (
+        "reviewedAt",
+        "reviewedBy",
+        "validFrom",
+        "validUntil",
+        "publishedAt",
+        "supersedesVersion",
+        "correctionOfVersion",
+    ):
+        if field_name in value and value[field_name] is not None:
+            normalized[field_name] = _mapping_string(
+                value[field_name],
+                f"mapping.{field_name}",
+            )
+
+
+def _mapping_string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise BridgeProtocolError(
+            f"{field_name} must be a string",
+            code="protocol_invalid",
+        )
+    normalized = value.strip()
+    if not normalized or len(normalized.encode("utf-8")) > 512:
+        raise BridgeProtocolError(
+            f"{field_name} is outside the supported bound",
+            code="bounds_exceeded",
+            retryable=True,
+        )
+    return normalized
 
 
 def _bounded_sequence(

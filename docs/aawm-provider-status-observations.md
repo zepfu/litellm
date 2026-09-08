@@ -995,6 +995,38 @@ the shared browser session, preserving other sessions and prior observation
 rows. A deferred or failed capture is not fresh evidence and does not replace
 prior rows or establish account coverage.
 
+## ChatGPT usage bridge
+
+The optional ChatGPT usage bridge runs the bounded TypeScript history worker
+through the existing provider-status sidecar and writes account/model
+observations to the PostgreSQL collector ledger. It is disabled by default and
+does not send model messages. The Python parent launches exactly:
+
+```text
+<node executable> <worker root>/dist/src/worker/main.js --stdio-v1
+```
+
+`AAWM_CHATGPT_USAGE_BRIDGE_WORKER_ROOT` must point to the packaged worker
+project root; the default image path is
+`/app/scripts/chatgpt_chat_usage_capture/ts`. The worker-root setting is a
+filesystem path, not a URL or a profile directory. The sidecar passes the
+explicit `initial-unmapped` model mapping seed until an approved mapping
+version is configured by the integrated collector.
+
+Recurring bridge runs use the configured account/profile binding and never
+retarget a run to an arbitrary profile. The explicit
+`--chatgpt-usage-bridge-authentication-recovery-account` action may include
+`--chatgpt-usage-bridge-authentication-recovery-profile`, but that profile must
+match the selected account's configured profile. Recovery is one-shot and does
+not enable authentication recovery in the recurring scheduler. Failure events
+retain the selected configured profile for account attribution.
+
+The bridge reports `history_contract=unavailable` when the native history
+preparer or capability contract is not available. That state is not an empty
+successful history and does not advance a completed per-model count. Native
+reader activation, schema provisioning, deployment, and fresh per-account
+row verification remain separate gates.
+
 ## Alibaba Token Plan quota polling
 
 The provider-status sidecar can poll the authenticated ModelStudio Token Plan

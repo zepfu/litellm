@@ -16302,7 +16302,11 @@ def _run_chatgpt_usage_bridge_accounts(
         PgCollectorState,
     )
     from scripts.chatgpt_chat_usage_capture.pg_ledger import LedgerScope, PgLedger
-    from scripts.chatgpt_chat_usage_capture.ts_bridge import BridgeConfig, TsWorkerBridge
+    from scripts.chatgpt_chat_usage_capture.ts_bridge import (
+        DEFAULT_MODEL_MAPPING,
+        BridgeConfig,
+        TsWorkerBridge,
+    )
 
     ledger = PgLedger(
         _resolve_codex_quota_dsn(config),
@@ -16317,12 +16321,19 @@ def _run_chatgpt_usage_bridge_accounts(
         BridgeConfig.from_runtime(
             node_executable=config.chatgpt_usage_bridge_node_executable,
             worker_root=config.chatgpt_usage_bridge_worker_root,
+            mapping=dict(DEFAULT_MODEL_MAPPING),
         ),
     )
     results: list[Dict[str, Any]] = []
     try:
         for account_id, bound_scope in bindings.items():
+            configured_profile = str(bound_scope["profile_id"] or account_id)
             try:
+                selected_profile = _chatgpt_usage_bridge_selected_profile(
+                    account_id,
+                    bound_scope,
+                    profile_filter=profile_filter,
+                )
                 scope = LedgerScope(
                     collector_account_id=account_id,
                     provider=str(bound_scope["provider"] or "openai"),
@@ -16333,11 +16344,7 @@ def _run_chatgpt_usage_bridge_accounts(
                 )
                 result = bridge.run_once(
                     collector_account_id=account_id,
-                    profile_id=(
-                        profile_filter
-                        if profile_filter is not None
-                        else str(bound_scope["profile_id"] or account_id)
-                    ),
+                    profile_id=selected_profile,
                     scope=scope,
                     authentication_recovery_requested=(
                         authentication_recovery_requested
@@ -16345,10 +16352,37 @@ def _run_chatgpt_usage_bridge_accounts(
                 )
                 results.append(_chatgpt_usage_bridge_result(account_id, result))
             except Exception as exc:
-                results.append(_chatgpt_usage_bridge_failure(account_id, exc))
+                results.append(
+                    _chatgpt_usage_bridge_failure(
+                        account_id,
+                        exc,
+                        profile_id=configured_profile,
+                    )
+                )
     finally:
         bridge.close()
     return results
+
+
+def _chatgpt_usage_bridge_selected_profile(
+    account_id: str,
+    bound_scope: Mapping[str, Optional[str]],
+    *,
+    profile_filter: Optional[str],
+) -> str:
+    configured_profile = str(bound_scope["profile_id"] or account_id)
+    if profile_filter is None:
+        return configured_profile
+    requested_profile = _chatgpt_usage_bridge_binding_value(
+        profile_filter,
+        "profile_filter",
+    )
+    if requested_profile != configured_profile:
+        raise ValueError(
+            "requested ChatGPT usage bridge profile does not match the "
+            f"configured profile for account '{account_id}'"
+        )
+    return configured_profile
 
 
 def _chatgpt_usage_bridge_binding_value(value: Any, field_name: str) -> Optional[str]:
@@ -16384,13 +16418,15 @@ def _chatgpt_usage_bridge_result(
 def _chatgpt_usage_bridge_failure(
     account_id: str,
     error: BaseException,
+    *,
+    profile_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "account_id": account_id,
         "ok": False,
         "status": "failed",
         "run_id": None,
-        "profile_id": None,
+        "profile_id": profile_id,
         "coverage_incomplete": True,
         "history_contract": "unavailable",
         "history_reason": "account_run_failed",
