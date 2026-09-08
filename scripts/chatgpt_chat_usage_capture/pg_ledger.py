@@ -4526,25 +4526,20 @@ def _bounded_projection_truncations(
     return out
 
 
-def _projection_path_token(value: str) -> Optional[str]:
-    """Validate projector paths without treating path punctuation as identity syntax."""
-    if len(value) > 256 or not value.startswith("$."):
-        return None
+_PROJECTION_PATH_RE = re.compile(
+    r"^\$(?:\.[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}|\[[0-9]+\])*$"
+)
 
-    position = 2
-    while position < len(value):
-        field_match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", value[position:])
-        if field_match is None:
-            return None
-        position += field_match.end()
-        while position < len(value) and value[position] == "[":
-            index_match = re.match(r"\[[0-9]+\]", value[position:])
-            if index_match is None:
-                return None
-            position += index_match.end()
-        if position < len(value) and value[position] != ".":
-            return None
-        position += 1
+
+def _projection_path_token(value: str) -> Optional[str]:
+    """Validate paths exactly as the bounded projector emits them.
+
+    Projector segments are static identifiers, sanitized mapping keys, or array
+    indexes. Mapping keys may contain safe-token punctuation, including UUID
+    dashes, so path validation cannot assume identifier-only segments.
+    """
+    if len(value) > 256 or _PROJECTION_PATH_RE.fullmatch(value) is None:
+        return None
     return value
 
 

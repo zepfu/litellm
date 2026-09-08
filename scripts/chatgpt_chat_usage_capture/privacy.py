@@ -377,7 +377,8 @@ def _assert_no_secrets_walk(value: Any, *, path: str) -> None:
         for key, child in value.items():
             key_text = str(key)
             if SENSITIVE_KEY_RE.search(key_text) or _contains_secret_value(key_text):
-                raise PrivacyError(f"secret-like mapping key survived sanitization at {path}.{key_text}")
+                # Never echo the rejected key: it may itself carry the secret.
+                raise PrivacyError(f"secret-like mapping key survived sanitization at {path}")
             _assert_no_secrets_walk(child, path=f"{path}.{key_text}")
     elif isinstance(value, list):
         for idx, child in enumerate(value):
