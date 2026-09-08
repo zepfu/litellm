@@ -34,14 +34,16 @@ from litellm.secret_managers.credential_error_sanitizer import (
 )
 from litellm.secret_managers.xai_oauth_credentials import (
     DEFAULT_XAI_OAUTH_AUTH_FILE as _FOUNDATION_DEFAULT_XAI_OAUTH_AUTH_FILE,
+    DEFAULT_XAI_OAUTH_LOCK_FILE as _FOUNDATION_DEFAULT_XAI_OAUTH_LOCK_FILE,
     DEFAULT_XAI_OAUTH_SCOPE as _FOUNDATION_DEFAULT_XAI_OAUTH_SCOPE,
     resolve_xai_oauth_credentials,
+    resolve_xai_oauth_lock_path,
     select_xai_oauth_credential_record,
 )
 
 # Portable ~ defaults (expanded via Path.expanduser at use sites).
 DEFAULT_XAI_OAUTH_AUTH_FILE = _FOUNDATION_DEFAULT_XAI_OAUTH_AUTH_FILE
-DEFAULT_XAI_OAUTH_LOCK_FILE = "~/.litellm/xai/oauth-auth.json.lock"
+DEFAULT_XAI_OAUTH_LOCK_FILE = _FOUNDATION_DEFAULT_XAI_OAUTH_LOCK_FILE
 DEFAULT_XAI_OAUTH_SCOPE = _FOUNDATION_DEFAULT_XAI_OAUTH_SCOPE
 DEFAULT_XAI_OAUTH_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
 DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS = 300
@@ -327,10 +329,9 @@ def refresh_xai_oauth_auth_file(
         resolved_auth_file = resolution.auth_file
         resolved_scope = resolution.scope
         resolved_read_auth_file = resolution.canonical_auth_file
-        resolved_lock_file = (
-            Path(lock_file).expanduser()
-            if lock_file is not None
-            else resolved_auth_file.with_name(f"{resolved_auth_file.name}.lock")
+        resolved_lock_file = resolve_xai_oauth_lock_path(
+            resolution.canonical_auth_file,
+            lock_file,
         )
         with _credential_file_lock(resolved_lock_file):
             raw_payload = _read_credential_payload(resolved_read_auth_file)

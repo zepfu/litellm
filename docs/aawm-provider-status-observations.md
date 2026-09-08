@@ -481,6 +481,12 @@ threshold input. Valid lifetime metadata uses
 `max(300, issued_lifetime_seconds * 0.5)`; missing or malformed lifetime
 metadata uses the `300`-second degraded fallback.
 
+Managed xAI's omitted lock option is derived from the canonical resolved auth
+file and uses its `.lock` sibling. Distinct custom auth files therefore do not
+serialize each other, while relative or symlink aliases for one file share one
+lock identity. Explicit lock overrides remain supported and are validated before
+the refresh writer reads or mutates credentials.
+
 Rendered native defaults:
 
 - `AAWM_GROK_OIDC_REFRESH_ENABLED=1`

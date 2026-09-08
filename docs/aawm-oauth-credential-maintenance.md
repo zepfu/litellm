@@ -144,6 +144,12 @@ rotated and does not disclose raw paths, tokens, or file metadata. A
 configuration conflict has no selected identity and fails before credential or
 provider I/O.
 
+Managed xAI refresh writers derive the default lock from that same canonical
+auth-file target, using its `.lock` sibling. This lets unrelated custom auth
+files refresh concurrently while all aliases for one file share one advisory
+lock. `AAWM_XAI_OAUTH_LOCK_FILE` and `--xai-oauth-lock-file` remain explicit
+overrides; a lock symlink or a lock path equal to the auth file fails closed.
+
 ## Managed xAI egress headers
 
 Managed `oa_xai/*` requests send the selected access token only as
