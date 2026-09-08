@@ -1336,10 +1336,12 @@ def prepare_encrypted_function_output_items_for_openai_egress(
                 stripped_count += 1
                 changed = True
             if not _function_call_output_has_plaintext(clean_item):
-                if "output" not in clean_item or clean_item.get("output") is None:
-                    clean_item["output"] = ""
-                    item["output"] = ""
-                    changed = True
+                # Ciphertext may be the output value itself, not only an
+                # encrypted_content part nested inside a structured output.
+                # Preserve the call ID with the same harmless placeholder.
+                clean_item["output"] = ""
+                item["output"] = ""
+                changed = True
             normalized_input.append(clean_item)
             continue
 
