@@ -2462,9 +2462,8 @@ def _codex_oauth_quota_observation_from_row(
             evidence.get("upstream_limit_scope")
             or raw_provider_fields.get("limit_scope")
         ),
-        "window_minutes": _codex_oauth_quota_int(
-            raw_provider_fields.get("window_minutes")
-        ),
+        # Preserve malformed duration evidence instead of treating it as absent.
+        "window_minutes": raw_provider_fields.get("window_minutes"),
         "remaining_pct": remaining_pct,
         "observed_at": values.get("observed_at"),
         "expected_reset_at": values.get("expected_reset_at"),
