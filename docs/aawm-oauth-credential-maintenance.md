@@ -136,6 +136,14 @@ or refresh publication; migrate it by placing the intended record under the
 configured scope key. Diagnostics identify the selection failure without
 including credential contents.
 
+## Managed xAI egress headers
+
+Managed `oa_xai/*` requests send the selected access token only as
+`Authorization: Bearer ...`. Inbound authorization and duplicate
+`api-key`/`x-api-key` headers are excluded from the managed request, while
+`forward_headers=False` remains in force. The generic OpenAI/Azure header
+assembler is unchanged for callers that require `api-key`.
+
 ## Codex ordered account inventory (OPENAI-001)
 
 `LITELLM_CODEX_OAUTH_INVENTORY` is a versioned JSON object whose `accounts`

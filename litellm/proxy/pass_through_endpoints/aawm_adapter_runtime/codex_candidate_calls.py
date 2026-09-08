@@ -731,6 +731,8 @@ if TYPE_CHECKING:
         @staticmethod
         def _assemble_headers(**kwargs: Any) -> dict[str, Any]: ...
         @staticmethod
+        def _assemble_xai_oauth_headers(**kwargs: Any) -> dict[str, Any]: ...
+        @staticmethod
         def _normalize_endpoint_for_target(**kwargs: Any) -> str: ...
         @staticmethod
         def _join_url_paths(*args: Any) -> Any: ...
@@ -4959,7 +4961,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         response = await pass_through_request(
             request=request,
             target=updated_url,
-            custom_headers=BaseOpenAIPassThroughHandler._assemble_headers(
+            custom_headers=BaseOpenAIPassThroughHandler._assemble_xai_oauth_headers(
                 api_key=oa_xai_api_key,
                 request=request,
             ),
@@ -4970,6 +4972,11 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             custom_llm_provider=litellm.LlmProviders.XAI.value,
             egress_credential_family="xai",
             expected_target_family="xai",
+            blocked_pass_through_prefixed_headers=[
+                "authorization",
+                "api-key",
+                "x-api-key",
+            ],
             retryable_upstream_status_codes=[
                 429,
                 *_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES,
