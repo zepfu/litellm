@@ -2409,10 +2409,19 @@ def _chatgpt_oracle_browser_binding(
         raise RuntimeError("Oracle process-handle supervision is unavailable.") from exc
     process: Optional[subprocess.Popen] = None
     temp_root = tempfile.mkdtemp(prefix="aawm-oracle-owner-")
-    child_env = {
-        **os.environ, "TMPDIR": temp_root, CHATGPT_ORACLE_OWNER_ENV: temp_root,
-    }
     try:
+        private_home = Path(temp_root)
+        # Keep Chrome's desktop/config state separate from the sidecar user's home.
+        for directory_name in ("config", "cache"):
+            (private_home / directory_name).mkdir(mode=0o700)
+        child_env = {
+            **os.environ,
+            "HOME": temp_root,
+            "XDG_CONFIG_HOME": str(private_home / "config"),
+            "XDG_CACHE_HOME": str(private_home / "cache"),
+            "TMPDIR": temp_root,
+            CHATGPT_ORACLE_OWNER_ENV: temp_root,
+        }
         try:
             process = subprocess.Popen(
                 _chatgpt_oracle_startup_argv(binding),
@@ -14188,6 +14197,7 @@ def _new_chatgpt_conversation_init_account_coverage(
         "error_message": None,
         "cleanup_error_class": None,
         "cleanup_error_message": None,
+        "collector_failure_reason": None,
     }
 
 
@@ -14554,6 +14564,9 @@ def _record_chatgpt_collector_summary(
         collector_summary.get("account_identity_verified")
     )
     coverage["verified_account_hash"] = collector_summary.get("account_hash")
+    coverage["collector_failure_reason"] = _redacted_summary_field(
+        collector_summary.get("failure_reason")
+    )
 
 
 def _collect_bound_chatgpt_conversation_init_account(
@@ -14638,6 +14651,7 @@ def _collect_bound_chatgpt_conversation_init_account(
                     stage="capture",
                     error_class=(
                         collector_summary.get("error_class")
+                        or collector_summary.get("failure_reason")
                         or identity_error
                         or "ChatGPTConversationInitCaptureNotWritten"
                     ),

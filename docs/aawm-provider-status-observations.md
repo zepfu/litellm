@@ -898,7 +898,8 @@ only its private processes and files. It must not open the shared base profile
 as a competing persistent browser context. It runs headed Chrome with an Xvfb
 fallback when `DISPLAY` is absent; it is not a standalone service.
 The Linux caller checks process-handle support before launch, creates a private
-scratch root, and retains stable handles for its children through cancellation.
+scratch root, uses private `HOME`/XDG config and cache directories, and retains
+stable handles for its children through cancellation.
 Cleanup also runs after helper exit, stops residual owned children, and verifies
 scratch removal. Failed process or file cleanup is an explicit capture failure,
 not a silently successful poll. No shared Oracle session is terminated.
