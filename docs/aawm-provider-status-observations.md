@@ -529,6 +529,10 @@ launcher validates managed metadata from `stat` and, when the file is unreadable
 uses a disposable **read-only** `docker run` of the existing prod image with a
 read-only mount to validate JSON safely. No secrets are printed.
 
+Managed preflight uses the same exact-scope selector as the request and refresh
+paths. It rejects missing scopes in multi-record documents and does not select
+records by JSON key order; only an unambiguous legacy flat record is accepted.
+
 Combined credential/process health requires **both** credential records to have:
 
 - a current access credential (`key` or `access_token`)

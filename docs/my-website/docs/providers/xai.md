@@ -151,6 +151,14 @@ observability, routing, authentication, and session metadata remain in the
 separate `litellm_metadata` structure and are never merged into caller
 top-level `metadata`.
 
+## OAuth Credential Scope Selection
+
+Managed xAI OAuth and native Grok OIDC credential files must contain the exact
+configured scope when they contain multiple records. LiteLLM rejects a missing
+scope before provider or token I/O and never selects a record based on JSON key
+order. An explicitly unambiguous legacy flat record remains supported; mixed
+flat-and-nested documents must be migrated to an exact scope-keyed record.
+
 ## Responses API Image Retention
 
 For xAI Responses requests containing `input_image` or `image_url` content,

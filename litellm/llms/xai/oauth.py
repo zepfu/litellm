@@ -30,6 +30,9 @@ from litellm.secret_managers.grok_oidc_auth_path import (
     resolve_grok_oidc_auth_path,
 )
 from litellm.secret_managers.main import get_secret_str
+from litellm.secret_managers.xai_oauth_credentials import (
+    select_xai_oauth_credential_record,
+)
 
 OA_XAI_PROVIDER_PREFIX = _xai_route_descriptors.OA_XAI_PROVIDER_PREFIX
 XAI_OAUTH_ROUTE_FAMILY = _xai_route_descriptors.XAI_OAUTH_ROUTE_FAMILY
@@ -653,26 +656,10 @@ def _select_credential_record(
     payload: Dict[str, Any],
     scope: str,
 ) -> Dict[str, Any]:
-    if _looks_like_credential_record(payload):
-        return payload
-
-    scoped_record = payload.get(scope)
-    if isinstance(scoped_record, dict):
-        return scoped_record
-
-    for value in payload.values():
-        if isinstance(value, dict) and _looks_like_credential_record(value):
-            return value
-
-    raise ValueError(
-        "xAI OAuth credential file does not contain a usable credential record. "
-        "Expected a Grok-style scoped record or a flat object with key/access_token."
-    )
-
-
-def _looks_like_credential_record(value: Dict[str, Any]) -> bool:
-    return bool(
-        value.get("key") or value.get("access_token") or value.get("refresh_token")
+    return select_xai_oauth_credential_record(
+        payload,
+        scope,
+        provider_label="xAI OAuth",
     )
 
 
