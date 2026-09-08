@@ -1151,6 +1151,53 @@ async def handle_alias_route(  # noqa: PLR0915
             and not bool(selection.get("in_flight_session"))
         )
 
+    def _xai_no_io_selection_skip_reason(
+        *,
+        candidate: Mapping[str, Any],
+        exc: BaseException,
+        attempted_provider_call: bool,
+        selection: Mapping[str, Any],
+    ) -> Optional[str]:
+        """Classify only portable xAI failures that never reached egress."""
+        if (
+            str(candidate.get("provider") or "").strip().lower() != "xai"
+            or attempted_provider_call
+            or not (
+                _genuinely_fresh_dispatch(selection)
+                or _validated_unowned_replay(selection)
+            )
+        ):
+            return None
+        if _error_signals._is_codex_auto_agent_candidate_deterministically_ineligible(
+            exc
+        ):
+            return "candidate_ineligible"
+        if getattr(exc, "failure_phase", None) == "credential_readiness":
+            return "credential_readiness"
+        return None
+
+    def _account_xai_no_io_selection(
+        *,
+        attempt_record: dict[str, Any],
+        reason: str,
+        budget_was_counted: bool,
+    ) -> None:
+        """Refund one counted xAI selection and mark its bounded skip outcome."""
+        nonlocal provider_candidate_attempts
+        if (
+            attempt_record.get("terminal_disposition") == "skipped"
+            and attempt_record.get("skip_reason") == reason
+        ):
+            return
+        if budget_was_counted:
+            provider_candidate_attempts = max(
+                0,
+                provider_candidate_attempts - 1,
+            )
+        attempt_record["terminal_disposition"] = "skipped"
+        attempt_record["skip_reason"] = reason
+        attempt_record["provider_attempt_budget_refunded"] = budget_was_counted
+
     cursor_replay_rejection_request_shape_summary: Optional[dict[str, Any]] = None
     cursor_replay_fresh_dispatch_reject: Optional[dict[str, Any]] = None
 
@@ -2066,6 +2113,7 @@ async def handle_alias_route(  # noqa: PLR0915
                 # 6. Signal intent complete, remove from registry.
                 probe_failure_exc: Optional[Exception] = None
                 probe_failure_plan: Optional[CooldownPublicationPlan] = None
+                xai_no_io_selection_skip_reason: Optional[str] = None
                 skip_after_probe_wait = False
                 response: Optional[Response] = None
                 intent = None
@@ -2878,6 +2926,24 @@ async def handle_alias_route(  # noqa: PLR0915
                             cooldown_seconds_fn=_get_codex_auto_agent_cooldown_seconds,
                             fresh_codex_auth_error_class=fresh_codex_auth_error_class,
                         )
+                        xai_no_io_selection_skip_reason = (
+                            _xai_no_io_selection_skip_reason(
+                                candidate=candidate,
+                                exc=probe_failure_exc,
+                                attempted_provider_call=attempted_provider_call,
+                                selection=selection,
+                            )
+                        )
+                        if xai_no_io_selection_skip_reason is not None:
+                            probe_failure_plan = CooldownPublicationPlan(
+                                applied_scope="none",
+                                grok_account_quota_exhausted=(
+                                    probe_failure_plan.grok_account_quota_exhausted
+                                ),
+                                kimi_failure_metadata=(
+                                    probe_failure_plan.kimi_failure_metadata
+                                ),
+                            )
                         intent.plan = probe_failure_plan
 
                     if skip_after_probe_wait:
@@ -3487,10 +3553,11 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                 ):
                     if deterministic_exclusion_eligible:
-                        provider_candidate_attempts = max(
-                            0,
-                            provider_candidate_attempts - 1,
-                        )
+                        if xai_no_io_selection_skip_reason is None:
+                            provider_candidate_attempts = max(
+                                0,
+                                provider_candidate_attempts - 1,
+                            )
                     deterministically_ineligible_candidate_keys.add(cooldown_key)
                 last_retryable_exc = failure_exc
                 native_grok_recovery_candidate = (
@@ -3765,6 +3832,12 @@ async def handle_alias_route(  # noqa: PLR0915
                     candidate=candidate,
                     kimi_failure_metadata=kimi_failure_metadata,
                 )
+                if xai_no_io_selection_skip_reason is not None:
+                    _account_xai_no_io_selection(
+                        attempt_record=attempt_record,
+                        reason=xai_no_io_selection_skip_reason,
+                        budget_was_counted=failover_ordinal == 0,
+                    )
                 # D1-586: observational shadow action only. Does not change retry,
                 # failover, sleep, admission, or cooldown enforcement paths.
                 attempt_record["shadow_failure_action"] = (
@@ -4034,7 +4107,10 @@ async def handle_alias_route(  # noqa: PLR0915
                         error_class,
                     )
                     break
-                if failover_ordinal > 0:
+                if (
+                    failover_ordinal > 0
+                    and xai_no_io_selection_skip_reason is None
+                ):
                     provider_candidate_attempts += 1
                 _record_auto_agent_alias_attempt_failure(
                     alias_family=alias_family,

@@ -430,7 +430,7 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
     return {key: value for key, value in event.items() if value is not None}
 
 
-def _build_auto_agent_alias_audit_events(
+def _build_auto_agent_alias_audit_events(  # noqa: PLR0915
     *,
     alias_family: str,
     alias_model: str,
@@ -440,10 +440,25 @@ def _build_auto_agent_alias_audit_events(
     attempts: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
+
+    def _identity(candidate: Mapping[str, Any]) -> tuple[str, str, str]:
+        return tuple(
+            str(candidate.get(field) or "")
+            for field in ("provider", "model", "route_family")
+        )
+
+    terminal_skipped_attempt_identities = {
+        _identity(attempt)
+        for attempt in attempts
+        if isinstance(attempt, dict)
+        and attempt.get("terminal_disposition") == "skipped"
+    }
     skipped_candidates = selection.get("skipped")
     if isinstance(skipped_candidates, list):
         for skipped_candidate in skipped_candidates:
             if not isinstance(skipped_candidate, dict):
+                continue
+            if _identity(skipped_candidate) in terminal_skipped_attempt_identities:
                 continue
             reason = str(skipped_candidate.get("reason") or "cooldown")
             event_type = (
@@ -501,12 +516,52 @@ def _build_auto_agent_alias_audit_events(
             "terminal_in_flight_cooldown_set",
             "terminal_in_flight_token_invalidated",
         }
-        if redispatch_required:
+        terminal_skipped = attempt.get("terminal_disposition") == "skipped"
+        if terminal_skipped:
+            skip_reason = str(
+                attempt.get("skip_reason")
+                or attempt.get("reason")
+                or "unavailable"
+            )
+            event_type = (
+                "candidate_skipped_provider_degraded"
+                if skip_reason == "auth_degraded"
+                else "candidate_skipped_cooldown"
+            )
+            if (
+                skip_reason == "candidate_ineligible"
+                and attempt.get("candidate_semantic_ineligibility_reason")
+                is not None
+            ):
+                event_type = "candidate_skipped_semantic_ineligible"
+            candidate_status = f"skipped_{skip_reason}"
+            selected = False
+            skipped = True
+            selection_reason = skip_reason
+        elif redispatch_required:
             event_type = "redispatch_required"
+            candidate_status = status or "selected"
+            selected = True
+            skipped = False
+            selection_reason = (
+                attempt.get("reason") or selection.get("selection_reason")
+            )
         elif failure_class or status == "cooldown_set":
             event_type = "candidate_retryable_failure"
+            candidate_status = status or "selected"
+            selected = True
+            skipped = False
+            selection_reason = (
+                attempt.get("reason") or selection.get("selection_reason")
+            )
         else:
             event_type = "candidate_selected"
+            candidate_status = status or "selected"
+            selected = True
+            skipped = False
+            selection_reason = (
+                attempt.get("reason") or selection.get("selection_reason")
+            )
         events.append(
             _build_auto_agent_alias_audit_event(
                 alias_family=alias_family,
@@ -516,11 +571,11 @@ def _build_auto_agent_alias_audit_events(
                 selection=selection,
                 candidate=attempt,
                 event_type=event_type,
-                candidate_status=status or "selected",
+                candidate_status=candidate_status,
                 attempt_number=index,
-                selected=True,
-                skipped=False,
-                selection_reason=attempt.get("reason") or selection.get("selection_reason"),
+                selected=selected,
+                skipped=skipped,
+                selection_reason=selection_reason,
                 lane_key=attempt.get("lane_key") or selection.get("lane_key"),
                 # RR-054 #51: attach the attempt's own cooldown key (fall back to selection).
                 cooldown_key=(
@@ -538,7 +593,11 @@ def _build_auto_agent_alias_audit_events(
                 source_error=attempt.get("source_error"),
                 retry_after_seconds=attempt.get("retry_after_seconds"),
                 failure_phase=attempt.get("failure_phase"),
-                attempted_provider_call=attempt.get("attempted_provider_call"),
+                attempted_provider_call=(
+                    False
+                    if terminal_skipped
+                    else attempt.get("attempted_provider_call")
+                ),
                 redispatch_required=redispatch_required,
             )
         )

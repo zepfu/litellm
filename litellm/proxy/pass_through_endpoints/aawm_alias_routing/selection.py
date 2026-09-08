@@ -699,6 +699,8 @@ def _build_auto_agent_terminal_candidate_inventory(
         "candidate_semantic_ineligibility_reason",
         "candidate_semantic_ineligibility_state_source",
         "candidate_semantic_ineligibility_remaining_seconds",
+        "skip_reason",
+        "provider_attempt_budget_refunded",
     )
 
     inventory: list[dict[str, Any]] = []
@@ -711,6 +713,25 @@ def _build_auto_agent_terminal_candidate_inventory(
             shaped["reasoning_effort"] = candidate["reasoning_effort"]
         if candidate_attempts:
             last_attempt = candidate_attempts[-1]
+            terminal_skip = (
+                last_attempt.get("terminal_disposition") == "skipped"
+                and not any(
+                    attempt.get("attempted_provider_call") is True
+                    for attempt in candidate_attempts
+                )
+            )
+            if terminal_skip:
+                for field in skip_metadata_fields:
+                    if field in last_attempt:
+                        shaped[field] = last_attempt[field]
+                shaped["terminal_disposition"] = "skipped"
+                shaped["attempted_provider_call"] = False
+                shaped["reason"] = (
+                    last_attempt.get("skip_reason")
+                    or last_attempt.get("reason")
+                    or "unavailable"
+                )
+                continue
             outcome = (
                 last_attempt.get("status")
                 or last_attempt.get("error_class")
