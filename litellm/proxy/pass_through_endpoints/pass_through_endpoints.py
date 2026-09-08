@@ -149,7 +149,7 @@ from .aawm_adapter_runtime.repetitive_output import (
     maybe_reject_passthrough_responses_body,
     maybe_wrap_passthrough_responses_stream,
 )
-from .aawm_adapter_runtime.openai_responses_wire import (
+from .aawm_adapter_runtime.openai_responses_body import (
     get_bound_openai_responses_wire_body,
     sanitize_wire_envelope,
 )
@@ -4256,6 +4256,11 @@ def _aawm_apply_openai_encrypted_reasoning_pre_send(
     session_identity = sa.resolve_canonical_session_identity(
         request, identity_source
     )
+
+    def _scoped_route_identity_sanitizer(body: dict[str, Any]) -> dict[str, Any]:
+        sanitized, _ = sanitize_wire_envelope(body)
+        return sanitized if isinstance(sanitized, dict) else body
+
     compiled_wire_body = get_bound_openai_responses_wire_body(
         request, send_body
     )
@@ -4281,6 +4286,7 @@ def _aawm_apply_openai_encrypted_reasoning_pre_send(
                         request_body=identity_source,
                     )
                 ),
+                strip_route_identity_fn=_scoped_route_identity_sanitizer,
             )
         except HTTPException as exc:
             _emit_openai_encrypted_reasoning_redispatch_terminal_error(
@@ -4649,18 +4655,28 @@ async def pass_through_request(  # noqa: PLR0915
         # Skip body parsing for multipart requests - make_multipart_http_request will handle it
         # But if custom_body is provided (e.g., JSON parsed despite multipart content-type), use it
         is_multipart = (
-            HttpPassThroughEndpointHelpers.is_multipart(request) and not custom_body
+            HttpPassThroughEndpointHelpers.is_multipart(request)
+            and custom_body is None
         )
 
-        if custom_body:
+        if custom_body is not None:
             compiled_wire_body = get_bound_openai_responses_wire_body(
                 request,
                 custom_body,
             )
-            _parsed_body = (
-                copy.deepcopy(custom_body)
+            observability_body = (
+                getattr(compiled_wire_body, "observability_body", None)
                 if compiled_wire_body is not None
-                else _copy_custom_body_for_passthrough(custom_body)
+                else None
+            )
+            _parsed_body = (
+                copy.deepcopy(observability_body)
+                if isinstance(observability_body, dict)
+                else (
+                    copy.deepcopy(custom_body)
+                    if compiled_wire_body is not None
+                    else _copy_custom_body_for_passthrough(custom_body)
+                )
             )
         elif is_multipart:
             # Don't parse multipart body here - it will be handled by make_multipart_http_request

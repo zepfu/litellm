@@ -1160,7 +1160,7 @@ async def _perform_codex_auto_agent_alias_candidate_request(
         # still need the protocol-owned sidecar removal before their provider
         # translators run, but must not recursively inspect user/tool data.
         if str(candidate.get("provider") or "").strip().lower() != "openai":
-            from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+            from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_body import (
                 sanitize_wire_envelope,
             )
 
@@ -4335,7 +4335,7 @@ async def _perform_codex_auto_agent_native_openai_request(
     request_body: dict[str, Any],
     custom_headers: Optional[dict[str, str]] = None,
 ) -> Response:
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_body import (
         bind_openai_responses_wire_body,
         compile_openai_responses_wire_body,
     )
@@ -5563,6 +5563,27 @@ async def _perform_codex_zai_coding_plan_adapter_call(
 
     _ = config
     _annotate_request_scope_for_adapted_access_log(request, httpx.URL(str(target_url)))
+    _watermark_intake = None
+    try:
+        _watermark_intake = getattr(
+            getattr(request, "state", None), "watermark_intake", None
+        )
+    except Exception:
+        _watermark_intake = None
+    _watermark_metadata = (
+        litellm_metadata if isinstance(litellm_metadata, dict) else {}
+    )
+    _watermark_egress = apply_request_watermark_egress(
+        body=completion_kwargs,
+        intake=_watermark_intake,
+        config=_get_runtime_text_watermark_config(),
+        endpoint=_watermark_endpoint_from_path("chat/completions", target_url),
+        direction="request",
+        metadata=_watermark_metadata,
+        litellm_metadata=_watermark_metadata,
+    )
+    if isinstance(getattr(_watermark_egress, "body", None), dict):
+        completion_kwargs = _watermark_egress.body
     completion_response = await litellm.acompletion(
         **completion_kwargs,
         api_key=api_key,
@@ -6739,6 +6760,18 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
         "api_base": "https://inference-api.nousresearch.com/v1",
         "litellm_metadata": litellm_metadata,
     }
+    _watermark_metadata = litellm_metadata if isinstance(litellm_metadata, dict) else {}
+    _watermark_egress = apply_request_watermark_egress(
+        body=completion_call_kwargs,
+        intake=getattr(getattr(request, "state", None), "watermark_intake", None),
+        config=_get_runtime_text_watermark_config(),
+        endpoint=_watermark_endpoint_from_path("chat/completions", target_url),
+        direction="request",
+        metadata=_watermark_metadata,
+        litellm_metadata=_watermark_metadata,
+    )
+    if isinstance(getattr(_watermark_egress, "body", None), dict):
+        completion_call_kwargs = _watermark_egress.body
     try:
         completion_response = await litellm.acompletion(**completion_call_kwargs)
     except Exception as exc:
@@ -6818,7 +6851,7 @@ async def _perform_codex_auto_agent_openrouter_completion_request(  # noqa: PLR0
         )
 
     if isinstance(request_body, dict):
-        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_body import (
             sanitize_wire_envelope,
         )
 

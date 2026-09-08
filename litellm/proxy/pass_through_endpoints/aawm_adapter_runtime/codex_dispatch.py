@@ -468,7 +468,7 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
         prepared_request_body=prepared_request_body,
     )
     _sid = _sa.resolve_canonical_session_identity(request, prepared_request_body)
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_body import (
         sanitize_wire_envelope,
     )
 
@@ -927,7 +927,7 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
             prepared_request_body.clear()
             prepared_request_body.update(normalized_request_body)
 
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_body import (
         bind_openai_responses_wire_body,
         compile_openai_responses_wire_body,
     )

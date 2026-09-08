@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import base64
 import json
-from typing import Any, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, Callable, Mapping, MutableMapping, Optional, Sequence
 
 from fastapi import HTTPException
 
@@ -829,6 +829,8 @@ def stamp_route_identity_in_response(
 
 def prepare_encrypted_reasoning_items_for_openai_egress(
     request_body: Mapping[str, Any] | dict[str, Any],
+    *,
+    strip_route_identity_fn: Optional[Callable[[dict[str, Any]], Any]] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Unwrap stamped ciphertext for egress while collecting disposition metadata.
 
@@ -845,7 +847,12 @@ def prepare_encrypted_reasoning_items_for_openai_egress(
             ),
         }
 
-    request_body = strip_route_identity_from_request_body(request_body)
+    if strip_route_identity_fn is None:
+        request_body = strip_route_identity_from_request_body(request_body)
+    else:
+        scoped_request_body = strip_route_identity_fn(request_body)
+        if isinstance(scoped_request_body, dict):
+            request_body = scoped_request_body
     if not isinstance(request_body, dict):
         return request_body, {
             "encrypted_reasoning_item_count": 0,
@@ -1519,6 +1526,7 @@ def guard_openai_encrypted_reasoning_egress(
     custom_llm_provider: Any = None,
     selected_route_family: Any = None,
     model: Any = None,
+    strip_route_identity_fn: Optional[Callable[[dict[str, Any]], Any]] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Prepare body and fail closed on known-incompatible encrypted reasoning.
 
@@ -1528,7 +1536,8 @@ def guard_openai_encrypted_reasoning_egress(
     prior-owner source; this layer fail-closes without one.
     """
     prepared, disposition = prepare_encrypted_reasoning_items_for_openai_egress(
-        request_body if isinstance(request_body, dict) else dict(request_body or {})
+        request_body if isinstance(request_body, dict) else dict(request_body or {}),
+        strip_route_identity_fn=strip_route_identity_fn,
     )
     prepared = restore_codex_agent_message_payloads_for_openai_egress(prepared)
     prepared, function_output_disposition = (

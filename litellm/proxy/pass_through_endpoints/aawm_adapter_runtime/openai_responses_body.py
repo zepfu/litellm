@@ -24,6 +24,7 @@ Design contract (from the OPENAI-044 Oracle egress evidence):
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional
@@ -34,6 +35,7 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.direct_openai_fun
     normalize_direct_openai_legacy_function_call_history_ids,
 )
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+    PROVENANCE_ITEM_FIELD,
     ROUTE_IDENTITY_FIELD,
     guard_openai_encrypted_reasoning_egress,
 )
@@ -44,7 +46,7 @@ from litellm.responses.function_name_sanitization import (
 
 # Internal provenance sidecar carried on items for local observability. It is
 # server-owned and must never reach the provider wire body.
-_PROVENANCE_ITEM_FIELD = "aawm_erp"
+_PROVENANCE_ITEM_FIELD = PROVENANCE_ITEM_FIELD
 
 #: Known internal server-owned top-level keys removed from the wire body.
 #: These are LiteLLM/AAWM server context, never caller Responses fields. This
@@ -53,6 +55,17 @@ _PROVENANCE_ITEM_FIELD = "aawm_erp"
 _INTERNAL_ENVELOPE_KEYS: tuple[str, ...] = (
     "litellm_logging_obj",
     ROUTE_IDENTITY_FIELD,
+    "aawm_session_id",
+    "canonical_session_identity",
+    "codex_session_id",
+    "session_id",
+    "codex_oauth_account_label",
+    "codex_oauth_account_hash",
+    "codex_oauth_lane_key",
+    "codex_auto_agent_selected_account_label",
+    "codex_auto_agent_selected_account_hash",
+    "codex_auto_agent_selected_account_lane",
+    "codex_auto_agent_selected_account_display",
 )
 
 
@@ -78,8 +91,8 @@ def sanitize_wire_envelope(body: Any) -> tuple[Any, bool]:
     """Strip known server state at protocol-owned surfaces only.
 
     Removes internal envelope keys and per-item route-identity/provenance
-    sidecars from top-level ``input`` items. Does not recurse into user or
-    tool structures. Returns ``(body, changed)``.
+    sidecars from top-level ``input``/``output`` items. Does not recurse into
+    user or tool structures. Returns ``(body, changed)``.
     """
     if not isinstance(body, dict):
         return body, False
@@ -94,19 +107,22 @@ def sanitize_wire_envelope(body: Any) -> tuple[Any, bool]:
             changed = True
 
     source = updated if updated is not None else body
-    input_items = source.get("input")
-    if isinstance(input_items, list):
+    for item_key in ("input", "output"):
+        items = source.get(item_key)
+        if not isinstance(items, list):
+            continue
         new_items: Optional[list[Any]] = None
-        for index, item in enumerate(input_items):
+        for index, item in enumerate(items):
             clean_item = _strip_item_internal_fields(item)
             if clean_item is not item:
                 if new_items is None:
-                    new_items = list(input_items)
+                    new_items = list(items)
                 new_items[index] = clean_item
         if new_items is not None:
             if updated is None:
                 updated = dict(body)
-            updated["input"] = new_items
+            updated[item_key] = new_items
+            source = updated
             changed = True
 
     return (updated if updated is not None else body), changed
@@ -118,11 +134,13 @@ class OpenAIResponsesWireBody:
 
     ``body`` is the exact object to serialize to the provider. Diagnostics
     and restoration state are carried separately so they cannot re-enter the
-    wire body.
+    wire body. ``observability_body`` is a request-local copy for hooks and
+    logging; it is never used for provider serialization.
     """
 
     body: dict[str, Any]
     context: "OpenAIResponsesWireContext"
+    observability_body: Optional[dict[str, Any]] = None
     encrypted_reasoning_disposition: Mapping[str, Any] = field(
         default_factory=lambda: MappingProxyType({})
     )
@@ -185,14 +203,26 @@ def get_bound_openai_responses_wire_body(
 
 
 def _strip_litellm_context_fields(body: dict[str, Any]) -> dict[str, Any]:
-    """Remove canonical LiteLLM context fields before provider serialization."""
+    """Remove server context while preserving client OpenAI ``metadata``."""
 
-    if not any(key in body for key in all_litellm_params):
+    # ``metadata`` is both a LiteLLM logging input and a supported OpenAI
+    # Responses request field. It must remain on the provider wire; the
+    # server-owned ``litellm_metadata`` namespace is removed below.
+    context_keys = tuple(
+        key for key in all_litellm_params if key != "metadata"
+    )
+    if not any(key in body for key in context_keys):
         return body
     updated = dict(body)
-    for key in all_litellm_params:
+    for key in context_keys:
         updated.pop(key, None)
     return updated
+
+
+def _scoped_route_identity_sanitizer(body: dict[str, Any]) -> dict[str, Any]:
+    """Adapter for the encrypted-reasoning guard's request-body callback."""
+    sanitized, _ = sanitize_wire_envelope(body)
+    return sanitized if isinstance(sanitized, dict) else body
 
 
 def _apply_watermark_egress(
@@ -286,9 +316,10 @@ def compile_openai_responses_wire_body(
     (copying it back into the caller-owned send dict when an in-place object
     is required).
     """
-    body: dict[str, Any] = (
-        dict(source_body) if isinstance(source_body, Mapping) else {}
+    source_snapshot: dict[str, Any] = (
+        copy.deepcopy(dict(source_body)) if isinstance(source_body, Mapping) else {}
     )
+    body: dict[str, Any] = copy.deepcopy(source_snapshot)
 
     # 1. Scoped sanitation of known server state at protocol-owned surfaces.
     body, _ = sanitize_wire_envelope(body)
@@ -299,6 +330,13 @@ def compile_openai_responses_wire_body(
     # 3. Resolved-model unsupported Codex request-parameter removal.
     dropped_params: tuple[str, ...] = ()
     if drop_codex_request_params_fn is not None:
+        if (
+            isinstance(resolved_model, str)
+            and resolved_model
+            and body.get("model") != resolved_model
+        ):
+            body = dict(body)
+            body["model"] = resolved_model
         body, dropped = drop_codex_request_params_fn(body)
         if isinstance(dropped, (list, tuple)):
             dropped_params = tuple(str(item) for item in dropped)
@@ -328,10 +366,10 @@ def compile_openai_responses_wire_body(
         egress_credential_family=egress_credential_family,
         custom_llm_provider=custom_llm_provider,
         model=resolved_model,
+        strip_route_identity_fn=_scoped_route_identity_sanitizer,
     )
-    # The guard composes primitives that may perform their own recursive
-    # route-identity strip; re-assert the scoped envelope invariant so the
-    # returned body carries no server state regardless of helper behavior.
+    # Re-assert the scoped envelope invariant after provider-state preparation
+    # so the returned body carries no server state at protocol-owned surfaces.
     body, _ = sanitize_wire_envelope(body)
     body = _strip_litellm_context_fields(body)
 
@@ -369,6 +407,7 @@ def compile_openai_responses_wire_body(
                 str(session_identity) if session_identity is not None else None
             ),
         ),
+        observability_body=source_snapshot,
         encrypted_reasoning_disposition=MappingProxyType(dict(disposition)),
         function_name_rewrite=name_rewrite if name_rewrite.changed else None,
         dropped_codex_request_params=dropped_params,
