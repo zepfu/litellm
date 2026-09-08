@@ -167,6 +167,15 @@ stays on `provider-cursor_agent`. Anthropic coverage remains
 Anthropic-native (`anthropic_messages`); Codex ingress still drops that
 family.
 
+Auto-agent xAI dispatch has a closed route-family pair per ingress:
+`codex_xai_oauth_responses_adapter` /
+`codex_grok_native_responses_adapter` for Codex, and
+`anthropic_xai_oauth_responses_adapter` /
+`anthropic_grok_native_responses_adapter` for Anthropic. There is no xAI
+wildcard fallback. A missing, misspelled, or unregistered xAI route is a local
+`route_family_validation` ineligibility with
+`attempted_provider_call=false`, before credential reads or provider egress.
+
 Harness v2 publishes these ids on `compiled_aliases` and in group
 `provider_coverage`. Operational Ohmypi orchestration still uses the
 thirteen mixed `orchestration_children`. Provider coverage is selected with

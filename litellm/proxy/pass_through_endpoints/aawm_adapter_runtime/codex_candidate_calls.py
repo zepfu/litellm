@@ -1225,6 +1225,12 @@ async def _perform_codex_auto_agent_alias_candidate_request(
             request_body=candidate_body,
         )
 
+    from functools import partial
+
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.alias_candidate_dispatch import (
+        _reject_xai_alias_route_family,
+    )
+
     async def _opencode() -> Response:
         return await _handle_codex_opencode_zen_adapter_route(
             endpoint=endpoint,
@@ -1403,8 +1409,15 @@ async def _perform_codex_auto_agent_alias_candidate_request(
             },
             _CODEX_AUTO_AGENT_XAI_PROVIDER: {
                 "codex_xai_oauth_responses_adapter": _xai_oauth,
-                "*": _grok_native,
+                "codex_grok_native_responses_adapter": _grok_native,
             },
+        },
+        unsupported_route_family_handlers={
+            _CODEX_AUTO_AGENT_XAI_PROVIDER: partial(
+                _reject_xai_alias_route_family,
+                candidate=candidate,
+                ingress="codex",
+            ),
         },
         default_handler=_native,
     )
