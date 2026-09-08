@@ -63,6 +63,11 @@ from litellm.llms.custom_httpx.http_handler import (
     _get_httpx_client,
     get_async_httpx_client,
 )
+from litellm.llms.xai.route_descriptors import (
+    XAI_OAUTH_CREDENTIAL_FAMILY,
+    XAI_OAUTH_ROUTE_FAMILY,
+    validate_xai_oauth_api_target,
+)
 from litellm.responses.streaming_iterator import (
     BaseResponsesAPIStreamingIterator,
     MockResponsesAPIStreamingIterator,
@@ -152,6 +157,120 @@ else:
 
 class BaseLLMHTTPHandler:
     @staticmethod
+    def _is_managed_xai_oauth_request(litellm_params: dict) -> bool:
+        metadata = litellm_params.get("litellm_metadata")
+        if not isinstance(metadata, dict):
+            metadata = litellm_params.get("metadata")
+        if not isinstance(metadata, dict):
+            return False
+        return (
+            metadata.get("xai_oauth_managed") is True
+            and metadata.get("auth_mode") == "oauth"
+            and metadata.get("credential_family") == XAI_OAUTH_CREDENTIAL_FAMILY
+            and metadata.get("route_family") == XAI_OAUTH_ROUTE_FAMILY
+        )
+
+    @staticmethod
+    def _validate_managed_xai_oauth_request_target(
+        api_base: str,
+        provider_config: BaseConfig,
+    ) -> None:
+        try:
+            validate_xai_oauth_api_target(api_base)
+        except (TypeError, ValueError):
+            raise provider_config.get_error_class(
+                error_message="Blocked managed xAI OAuth request target.",
+                status_code=500,
+                headers={},
+            ) from None
+
+    @staticmethod
+    async def _raise_managed_xai_oauth_transport_error(
+        response: httpx.Response,
+        provider_config: BaseConfig,
+        *,
+        error_message: str,
+    ) -> None:
+        try:
+            await response.aclose()
+        except Exception:
+            verbose_logger.debug(
+                "Failed to close rejected managed xAI OAuth response",
+                exc_info=True,
+            )
+        raise provider_config.get_error_class(
+            error_message=error_message,
+            status_code=500,
+            headers={},
+        ) from None
+
+    @staticmethod
+    def _raise_managed_xai_oauth_transport_error_sync(
+        response: httpx.Response,
+        provider_config: BaseConfig,
+        *,
+        error_message: str,
+    ) -> None:
+        try:
+            response.close()
+        except Exception:
+            verbose_logger.debug(
+                "Failed to close rejected managed xAI OAuth response",
+                exc_info=True,
+            )
+        raise provider_config.get_error_class(
+            error_message=error_message,
+            status_code=500,
+            headers={},
+        ) from None
+
+    @staticmethod
+    async def _validate_managed_xai_oauth_response(
+        response: httpx.Response,
+        provider_config: BaseConfig,
+    ) -> None:
+        if 300 <= response.status_code < 400:
+            await BaseLLMHTTPHandler._raise_managed_xai_oauth_transport_error(
+                response=response,
+                provider_config=provider_config,
+                error_message=(
+                    "Blocked managed xAI OAuth redirect response before "
+                    "follow-up request."
+                ),
+            )
+        try:
+            validate_xai_oauth_api_target(response.url)
+        except (TypeError, ValueError):
+            await BaseLLMHTTPHandler._raise_managed_xai_oauth_transport_error(
+                response=response,
+                provider_config=provider_config,
+                error_message="Blocked managed xAI OAuth response target.",
+            )
+
+    @staticmethod
+    def _validate_managed_xai_oauth_response_sync(
+        response: httpx.Response,
+        provider_config: BaseConfig,
+    ) -> None:
+        if 300 <= response.status_code < 400:
+            BaseLLMHTTPHandler._raise_managed_xai_oauth_transport_error_sync(
+                response=response,
+                provider_config=provider_config,
+                error_message=(
+                    "Blocked managed xAI OAuth redirect response before "
+                    "follow-up request."
+                ),
+            )
+        try:
+            validate_xai_oauth_api_target(response.url)
+        except (TypeError, ValueError):
+            BaseLLMHTTPHandler._raise_managed_xai_oauth_transport_error_sync(
+                response=response,
+                provider_config=provider_config,
+                error_message="Blocked managed xAI OAuth response target.",
+            )
+
+    @staticmethod
     def _resolve_shared_session_for_http_client(
         litellm_params: Optional[dict],
         shared_session: Optional["ClientSession"] = None,
@@ -180,6 +299,14 @@ class BaseLLMHTTPHandler:
         max_retry_on_unprocessable_entity_error = (
             provider_config.max_retry_on_unprocessable_entity_error
         )
+        managed_xai_oauth_request = self._is_managed_xai_oauth_request(
+            litellm_params
+        )
+        if managed_xai_oauth_request:
+            self._validate_managed_xai_oauth_request_target(
+                api_base=api_base,
+                provider_config=provider_config,
+            )
 
         response: Optional[httpx.Response] = None
         for i in range(max(max_retry_on_unprocessable_entity_error, 1)):
@@ -195,8 +322,16 @@ class BaseLLMHTTPHandler:
                     timeout=timeout,
                     stream=stream,
                     logging_obj=logging_obj,
+                    follow_redirects=(
+                        False if managed_xai_oauth_request else None
+                    ),
                 )
             except httpx.HTTPStatusError as e:
+                if managed_xai_oauth_request:
+                    await self._validate_managed_xai_oauth_response(
+                        response=e.response,
+                        provider_config=provider_config,
+                    )
                 hit_max_retry = i + 1 == max_retry_on_unprocessable_entity_error
                 should_retry = provider_config.should_retry_llm_api_inside_llm_translation_on_http_error(
                     e=e, litellm_params=litellm_params
@@ -221,6 +356,12 @@ class BaseLLMHTTPHandler:
                 headers={},
             )
 
+        if managed_xai_oauth_request:
+            await self._validate_managed_xai_oauth_response(
+                response=response,
+                provider_config=provider_config,
+            )
+
         return response
 
     def _make_common_sync_call(
@@ -239,6 +380,14 @@ class BaseLLMHTTPHandler:
         max_retry_on_unprocessable_entity_error = (
             provider_config.max_retry_on_unprocessable_entity_error
         )
+        managed_xai_oauth_request = self._is_managed_xai_oauth_request(
+            litellm_params
+        )
+        if managed_xai_oauth_request:
+            self._validate_managed_xai_oauth_request_target(
+                api_base=api_base,
+                provider_config=provider_config,
+            )
 
         response: Optional[httpx.Response] = None
 
@@ -255,8 +404,16 @@ class BaseLLMHTTPHandler:
                     timeout=timeout,
                     stream=stream,
                     logging_obj=logging_obj,
+                    follow_redirects=(
+                        False if managed_xai_oauth_request else None
+                    ),
                 )
             except httpx.HTTPStatusError as e:
+                if managed_xai_oauth_request:
+                    self._validate_managed_xai_oauth_response_sync(
+                        response=e.response,
+                        provider_config=provider_config,
+                    )
                 hit_max_retry = i + 1 == max_retry_on_unprocessable_entity_error
                 should_retry = provider_config.should_retry_llm_api_inside_llm_translation_on_http_error(
                     e=e, litellm_params=litellm_params
@@ -279,6 +436,12 @@ class BaseLLMHTTPHandler:
                 error_message="No response from the API",
                 status_code=422,  # don't retry on this error
                 headers={},
+            )
+
+        if managed_xai_oauth_request:
+            self._validate_managed_xai_oauth_response_sync(
+                response=response,
+                provider_config=provider_config,
             )
 
         return response

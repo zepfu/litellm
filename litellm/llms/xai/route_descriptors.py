@@ -15,6 +15,7 @@ XAIAuthMode = Literal["oauth", "grok_oidc"]
 
 OA_XAI_PROVIDER_PREFIX = "oa_xai/"
 XAI_OAUTH_API_HOST = "api.x.ai"
+GROK_CLI_CHAT_PROXY_HOST = "cli-chat-proxy.grok.com"
 XAI_OAUTH_API_BASE_PATHS = frozenset({"", "/", "/v1"})
 XAI_OAUTH_API_ALLOWED_PATHS = frozenset(
     {
@@ -101,6 +102,29 @@ def validate_xai_oauth_api_target(url: Any) -> None:
         )
     if parsed.query:
         raise ValueError("xAI OAuth API target must not include query parameters.")
+
+
+def get_xai_target_route_family(url: Any) -> Optional[XAIRouteFamily]:
+    """Resolve only canonical xAI targets; leave configured proxies generic."""
+
+    if isinstance(url, httpx.URL):
+        raw_url = str(url)
+    elif isinstance(url, str):
+        raw_url = url.strip()
+    else:
+        raw_url = ""
+    if not raw_url:
+        return None
+
+    try:
+        hostname = (urlsplit(raw_url).hostname or "").casefold()
+    except ValueError:
+        return None
+    if hostname == XAI_OAUTH_API_HOST:
+        return XAI_OAUTH_ROUTE_FAMILY
+    if hostname == GROK_CLI_CHAT_PROXY_HOST or hostname.endswith(".grok.com"):
+        return GROK_NATIVE_OAUTH_ROUTE_FAMILY
+    return None
 
 
 def _managed_descriptor(

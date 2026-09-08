@@ -22,7 +22,9 @@ from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 from litellm.llms.xai.route_descriptors import (
     GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+    GROK_NATIVE_OAUTH_ROUTE_FAMILY,
     XAI_OAUTH_CREDENTIAL_FAMILY,
+    XAI_OAUTH_ROUTE_FAMILY,
 )
 from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
     load_text_watermark_config,
@@ -4939,7 +4941,7 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
             custom_body=grok_prepared_body,
             custom_llm_provider=litellm.LlmProviders.XAI.value,
             egress_credential_family=GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
-            expected_target_family="xai",
+            expected_target_family=GROK_NATIVE_OAUTH_ROUTE_FAMILY,
             retryable_upstream_status_codes=[
                 429,
                 *_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES,
@@ -5037,7 +5039,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             custom_body=oa_xai_prepared_body,
             custom_llm_provider=litellm.LlmProviders.XAI.value,
             egress_credential_family=XAI_OAUTH_CREDENTIAL_FAMILY,
-            expected_target_family="xai",
+            expected_target_family=XAI_OAUTH_ROUTE_FAMILY,
             managed_xai_oauth_request=True,
             blocked_pass_through_prefixed_headers=[
                 "authorization",

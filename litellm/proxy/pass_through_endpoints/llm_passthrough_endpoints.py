@@ -83,6 +83,7 @@ from litellm.llms.xai.oauth import (
 )
 from litellm.llms.xai.route_descriptors import (
     GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+    GROK_NATIVE_OAUTH_ROUTE_FAMILY,
 )
 from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 from litellm.proxy._types import *
@@ -4288,7 +4289,7 @@ async def grok_proxy_route(
         stream="stream" in str(target_url),
         custom_llm_provider=litellm.LlmProviders.XAI.value,
         egress_credential_family=GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
-        expected_target_family="xai",
+        expected_target_family=GROK_NATIVE_OAUTH_ROUTE_FAMILY,
         allowed_forward_headers=list(_GROK_CLI_FORWARD_HEADER_ALLOWLIST),
         raw_body_passthrough=raw_body_passthrough,
         passthrough_logging_metadata=passthrough_logging_metadata,
