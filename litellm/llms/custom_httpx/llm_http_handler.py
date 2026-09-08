@@ -4750,11 +4750,29 @@ class BaseLLMHTTPHandler:
                 headers=error_headers,
             )
 
-        raise provider_config.get_error_class(
-            error_message=error_text,
-            status_code=status_code,
-            headers=error_headers,
-        )
+        def _preserve_http_status_response(error: BaseException) -> None:
+            if not isinstance(e, httpx.HTTPStatusError):
+                return
+            # Provider configs can replace the upstream error with a synthetic
+            # response. Keep the original response for pre-commit retry proof.
+            try:
+                setattr(error, "request", e.request)
+                setattr(error, "response", e.response)
+            except Exception:
+                pass
+
+        try:
+            mapped_error = provider_config.get_error_class(
+                error_message=error_text,
+                status_code=status_code,
+                headers=error_headers,
+            )
+        except BaseException as mapped_error:
+            _preserve_http_status_response(mapped_error)
+            raise
+
+        _preserve_http_status_response(mapped_error)
+        raise mapped_error
 
     async def async_realtime(
         self,
