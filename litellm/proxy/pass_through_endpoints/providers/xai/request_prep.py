@@ -675,11 +675,6 @@ def _get_grok_native_oauth_session_id(
     runtime = _require_runtime()
     metadata = request_body.get("litellm_metadata")
     if isinstance(metadata, dict):
-        owner_session_id = metadata.get(
-            _GROK_NATIVE_OAUTH_OWNER_SESSION_ID_METADATA_KEY
-        )
-        if isinstance(owner_session_id, str) and owner_session_id.strip():
-            return owner_session_id.strip()
         session_id = metadata.get("session_id")
         if isinstance(session_id, str) and session_id.strip():
             return session_id.strip()
@@ -715,6 +710,26 @@ def _get_grok_native_oauth_owner_session_id(request: Request) -> Optional[str]:
             + session_identity.strip()
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _bind_grok_native_oauth_owner_session_header(
+    headers: dict[str, Any],
+    *,
+    request: Request,
+) -> dict[str, Any]:
+    """Replace caller session headers only when a server owner lease exists."""
+
+    owner_session_id = _get_grok_native_oauth_owner_session_id(request)
+    if owner_session_id is None:
+        return headers
+
+    bound_headers = {
+        key: value
+        for key, value in headers.items()
+        if str(key).lower() != "x-grok-session-id"
+    }
+    bound_headers["x-grok-session-id"] = owner_session_id
+    return bound_headers
 
 
 def _get_grok_native_oauth_request_id(request: Request) -> str:

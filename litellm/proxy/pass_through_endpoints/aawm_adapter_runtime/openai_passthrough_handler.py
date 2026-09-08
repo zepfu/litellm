@@ -451,6 +451,7 @@ class BaseOpenAIPassThroughHandler:
         endpoint_custom_body: Optional[dict[str, Any]] = None
         canonical_managed_oa_xai_request_body: Optional[dict[str, Any]] = None
         bound_codex_oauth_identity: Optional[dict[str, str]] = None
+        grok_native_oauth_request = False
         try:
             from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
                 _get_bound_codex_oauth_candidate_identity as _get_bound_identity,
@@ -620,6 +621,7 @@ class BaseOpenAIPassThroughHandler:
                 )
                 if grok_native_context is not None:
                     body_was_prepared = True
+                    grok_native_oauth_request = True
                     (
                         base_target_url,
                         extra_headers,
@@ -676,27 +678,6 @@ class BaseOpenAIPassThroughHandler:
             if request.method == "POST"
             and rt.is_openai_responses_endpoint_fn(endpoint)
             else "stream" in str(updated_url)
-        )
-
-        ## CREATE PASS-THROUGH
-        assemble_headers = (
-            BaseOpenAIPassThroughHandler._assemble_xai_oauth_headers
-            if egress_credential_family == XAI_OAUTH_CREDENTIAL_FAMILY
-            else BaseOpenAIPassThroughHandler._assemble_headers
-        )
-        endpoint_func = rt.create_pass_through_route_fn(
-            endpoint=endpoint,
-            target=str(updated_url),
-            custom_headers=assemble_headers(
-                api_key=api_key, request=request, extra_headers=extra_headers
-            ),
-            _forward_headers=forward_headers,
-            is_streaming_request=is_streaming_request,  # type: ignore
-            custom_llm_provider=custom_llm_provider.value
-            if isinstance(custom_llm_provider, litellm.LlmProviders)
-            else custom_llm_provider,
-            egress_credential_family=egress_credential_family,
-            expected_target_family=expected_target_family,
         )
 
         # D1-612: request-scoped session-owner guard for direct OpenAI fallthrough.
@@ -908,6 +889,34 @@ class BaseOpenAIPassThroughHandler:
         session_owner_lease = _sa.get_request_session_owner_lease(request)
 
         try:
+            if grok_native_oauth_request and isinstance(extra_headers, dict):
+                from litellm.proxy.pass_through_endpoints.providers.xai.request_prep import (
+                    _bind_grok_native_oauth_owner_session_header,
+                )
+
+                extra_headers = _bind_grok_native_oauth_owner_session_header(
+                    extra_headers,
+                    request=request,
+                )
+            assemble_headers = (
+                BaseOpenAIPassThroughHandler._assemble_xai_oauth_headers
+                if egress_credential_family == XAI_OAUTH_CREDENTIAL_FAMILY
+                else BaseOpenAIPassThroughHandler._assemble_headers
+            )
+            endpoint_func = rt.create_pass_through_route_fn(
+                endpoint=endpoint,
+                target=str(updated_url),
+                custom_headers=assemble_headers(
+                    api_key=api_key, request=request, extra_headers=extra_headers
+                ),
+                _forward_headers=forward_headers,
+                is_streaming_request=is_streaming_request,  # type: ignore
+                custom_llm_provider=custom_llm_provider.value
+                if isinstance(custom_llm_provider, litellm.LlmProviders)
+                else custom_llm_provider,
+                egress_credential_family=egress_credential_family,
+                expected_target_family=expected_target_family,
+            )
             response = await endpoint_func(
                 request,
                 fastapi_response,
