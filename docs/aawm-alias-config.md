@@ -175,6 +175,10 @@ Auto-agent xAI dispatch has a closed route-family pair per ingress:
 wildcard fallback. A missing, misspelled, or unregistered xAI route is a local
 `route_family_validation` ineligibility with
 `attempted_provider_call=false`, before credential reads or provider egress.
+Local managed xAI OAuth credential readiness errors use
+`failure_phase=credential_readiness` and
+`attempted_provider_call=false`; provider budget and ordinal accounting remain
+the separate provider-neutral contract.
 
 Harness v2 publishes these ids on `compiled_aliases` and in group
 `provider_coverage`. Operational Ohmypi orchestration still uses the
