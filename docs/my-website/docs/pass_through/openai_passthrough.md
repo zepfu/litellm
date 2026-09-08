@@ -50,10 +50,12 @@ sent for non-streaming Responses.
 The internal callback contract is
 `on_disposition(disposition, trace)`. Consumers should read a copy from
 `trace.snapshot()` containing the wire state, response/body commitment,
-terminal and `[DONE]` markers, final disposition, and bounded malformed,
-duplicate, partial-frame, and close-error fields. Consumers must not promote
-ownership, write legacy affinity, or infer success independently from the
-provider response.
+terminal and `[DONE]` markers, final disposition, and bounded duplicate,
+partial-frame, and close-error fields. Detailed malformed-frame metadata
+remains on `trace.metadata`; a malformed frame is converted to synthetic
+`response.failed` before any later success can be selected. Consumers must
+not promote ownership, write legacy affinity, or infer success independently
+from the provider response.
 
 ## When to use this?
 
