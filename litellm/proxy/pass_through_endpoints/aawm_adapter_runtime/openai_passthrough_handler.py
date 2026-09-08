@@ -915,6 +915,11 @@ class BaseOpenAIPassThroughHandler:
                 else custom_llm_provider,
                 egress_credential_family=egress_credential_family,
                 expected_target_family=expected_target_family,
+                blocked_pass_through_prefixed_headers=(
+                    ["authorization", "api-key", "x-api-key"]
+                    if managed_xai_oauth_request
+                    else None
+                ),
             )
             response = await endpoint_func(
                 request,

@@ -4952,6 +4952,11 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             custom_llm_provider=litellm.LlmProviders.XAI.value,
             egress_credential_family="xai",
             expected_target_family="xai",
+            blocked_pass_through_prefixed_headers=[
+                "authorization",
+                "api-key",
+                "x-api-key",
+            ],
             retryable_upstream_status_codes=[
                 429,
                 *_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES,
