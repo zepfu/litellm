@@ -4857,6 +4857,25 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         if existing_affinity is not None:
             affinity_bypassed = True
 
+    account_identity_pinned = has_account_bound_state
+    account_failover_context = (
+        _get_codex_oauth_request_local_failover_context(
+            request,
+            candidate=affinity,
+        )
+        if isinstance(affinity, dict)
+        else None
+    )
+    if (
+        account_failover_context is not None
+        and account_failover_context.get("portable_replay")
+    ):
+        account_identity_pinned = False
+
+    affinity = _apply_codex_oauth_inventory_affinity_policy(
+        affinity,
+        account_bound=account_identity_pinned,
+    )
     if provider_owned_continuation and affinity is None:
         owner_state = (
             sa._record_state(session_owner_record)
@@ -4896,26 +4915,6 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             ),
             request=request,
         )
-
-    account_identity_pinned = has_account_bound_state
-    account_failover_context = (
-        _get_codex_oauth_request_local_failover_context(
-            request,
-            candidate=affinity,
-        )
-        if isinstance(affinity, dict)
-        else None
-    )
-    if (
-        account_failover_context is not None
-        and account_failover_context.get("portable_replay")
-    ):
-        account_identity_pinned = False
-
-    affinity = _apply_codex_oauth_inventory_affinity_policy(
-        affinity,
-        account_bound=account_identity_pinned,
-    )
     if affinity is not None:
         affinity_candidate = _find_codex_auto_agent_affinity_candidate(
             affinity,
