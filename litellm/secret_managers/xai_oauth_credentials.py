@@ -78,8 +78,8 @@ def _clean_string(value: Any) -> Optional[str]:
 
 
 def _expand_path(value: str) -> Path:
-    expanded_path = Path(value).expanduser()
-    return Path(os.path.abspath(os.path.normpath(os.fspath(expanded_path))))
+    # Preserve lexical parent traversal for the secure O_NOFOLLOW credential open.
+    return Path(value).expanduser()
 
 
 def resolve_xai_oauth_auth_path(

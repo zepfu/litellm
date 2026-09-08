@@ -471,9 +471,11 @@ def _snapshot_cache_key(
     credential_path: Path,
     scope: str,
 ) -> tuple[str, str, str]:
+    # Match the path passed to the secure open. Normalizing ``..`` can cross a
+    # symlinked parent and collide with a different credential file.
     return (
         credential_family,
-        os.path.abspath(os.path.normpath(os.fspath(credential_path))),
+        os.fspath(credential_path),
         scope,
     )
 
