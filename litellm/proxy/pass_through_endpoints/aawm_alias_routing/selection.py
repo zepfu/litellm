@@ -2195,9 +2195,7 @@ def _find_codex_auto_agent_affinity_candidate(
     for candidate in pool:
         if candidate.get("model") == affinity_model:
             return dict(candidate)
-    if affinity.get("affinity_state_source") == (
-        "authenticated_continuation_token"
-    ):
+    if _codex_oauth_affinity_is_authenticated_token(affinity):
         return None
     return dict(pool[0])
 
@@ -2326,13 +2324,20 @@ def _candidate_matches_affinity(
         return False
     if not _route_families_compatible_for_affinity(candidate, affinity):
         return False
-    if affinity.get("affinity_state_source") == (
-        "authenticated_continuation_token"
-    ):
+    if _codex_oauth_affinity_is_authenticated_token(affinity):
         return candidate.get("model") == affinity.get("model")
     # OPENAI-020: model and OpenAI account are mutable on the same hosted
     # provider. Do not require candidate.model or account_label/hash/lane.
     return True
+
+
+def _codex_oauth_affinity_is_authenticated_token(
+    affinity: Mapping[str, Any],
+) -> bool:
+    return (
+        affinity.get("affinity_state_source")
+        == "authenticated_continuation_token"
+    )
 
 
 def _apply_codex_oauth_inventory_affinity_policy(
@@ -4122,7 +4127,6 @@ def _raise_codex_auto_agent_in_flight_cooldown(
         lane_key=lane_key,
         cooldown_seconds=cooldown_seconds,
         reason="in_flight_session_affinity_cooldown",
-        include_account_identity=False,
     )
     raise HTTPException(
         status_code=429,
@@ -4212,7 +4216,7 @@ def _build_auto_agent_redispatch_http_exception_detail(
         lane_key=lane_key,
         cooldown_seconds=cooldown_seconds,
         reason="in_flight_retryable_provider_exhaustion",
-        include_account_identity=False,
+        include_account_identity=alias_family != "codex_auto_agent",
     )
     detail: dict[str, Any] = {
         "error": {
@@ -4257,27 +4261,42 @@ def _build_auto_agent_redispatch_http_exception_detail(
         detail["failure_phase"] = failure_phase
     if attempted_provider_call is not None:
         detail["attempted_provider_call"] = attempted_provider_call
+    redact_account_identity = alias_family == "codex_auto_agent"
     if isinstance(audit_events, list):
         detail["aawm_alias_routing_audit_events"] = (
             _redact_auto_agent_account_identity(
                 audit_events,
-                redact_cooldown_keys=alias_family == "codex_auto_agent",
+                redact_cooldown_keys=redact_account_identity,
             )
+            if redact_account_identity
+            else audit_events
         )
     if isinstance(attempts, list):
-        detail["attempts"] = _redact_auto_agent_account_identity(
-            attempts,
-            redact_cooldown_keys=alias_family == "codex_auto_agent",
+        detail["attempts"] = (
+            _redact_auto_agent_account_identity(
+                attempts,
+                redact_cooldown_keys=True,
+            )
+            if redact_account_identity
+            else attempts
         )
     if isinstance(skipped_candidates, list):
-        detail["skipped_candidates"] = _redact_auto_agent_account_identity(
-            skipped_candidates,
-            redact_cooldown_keys=alias_family == "codex_auto_agent",
+        detail["skipped_candidates"] = (
+            _redact_auto_agent_account_identity(
+                skipped_candidates,
+                redact_cooldown_keys=True,
+            )
+            if redact_account_identity
+            else skipped_candidates
         )
     if isinstance(terminal_reset, dict):
-        detail["terminal_reset"] = _redact_auto_agent_account_identity(
-            terminal_reset,
-            redact_cooldown_keys=alias_family == "codex_auto_agent",
+        detail["terminal_reset"] = (
+            _redact_auto_agent_account_identity(
+                terminal_reset,
+                redact_cooldown_keys=True,
+            )
+            if redact_account_identity
+            else terminal_reset
         )
     return detail
 
@@ -4790,20 +4809,18 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         )
 
     if isinstance(session_owner_record, dict) and sa._record_state(session_owner_record) == "owned":
-        affinity = sa.owner_record_as_affinity_hint(
+        owner_affinity = sa.owner_record_as_affinity_hint(
             session_owner_record,
             preserve_account_identity=True,
         )
-        if _codex_oauth_mod._codex_oauth_affinity_conflicts(
-            affinity,
-            token_affinity,
-        ):
-            raise _codex_oauth_mod._codex_oauth_affinity_token_invalid_exception(
-                message=(
-                    "Codex OAuth continuation affinity state conflicts "
-                    "with durable session ownership."
-                )
-            )
+        affinity = _codex_oauth_mod._codex_oauth_resolve_affinity(
+            durable_affinity=owner_affinity,
+            token_affinity=token_affinity,
+            conflict_message=(
+                "Codex OAuth continuation affinity state conflicts "
+                "with durable session ownership."
+            ),
+        )
         session_owner_guard_meta.update(
             {
                 "decision": "compatible_owner",
@@ -4872,20 +4889,17 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         if existing_affinity is not None:
             affinity_bypassed = True
 
-    if _codex_oauth_mod._codex_oauth_affinity_conflicts(
-        affinity,
-        token_affinity,
-    ):
-        raise _codex_oauth_mod._codex_oauth_affinity_token_invalid_exception(
-            message=(
-                "Codex OAuth continuation affinity state conflicts "
-                "with durable session affinity."
-            )
-        )
-    if affinity is None:
-        affinity = token_affinity
+    affinity = _codex_oauth_mod._codex_oauth_resolve_affinity(
+        durable_affinity=affinity,
+        token_affinity=token_affinity,
+        conflict_message=(
+            "Codex OAuth continuation affinity state conflicts "
+            "with durable session affinity."
+        ),
+    )
 
     account_identity_pinned = has_account_bound_state
+    authenticated_token_affinity = token_affinity is not None
     account_failover_context = (
         _get_codex_oauth_request_local_failover_context(
             request,
@@ -4921,6 +4935,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             if (
                 isinstance(session_owner_record, dict)
                 and sa._record_state(session_owner_record) == "owned"
+                and not authenticated_token_affinity
                 and (
                     # Preserve ordinary account-bound owner pinning while
                     # allowing portable auto-review history to move under its
@@ -4959,10 +4974,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 ):
                     if affinity.get(field) is not None:
                         pinned_candidate_shape[field] = affinity.get(field)
-                if (
-                    affinity_selection_reason
-                    == "authenticated_continuation_token_pin"
-                ):
+                if authenticated_token_affinity:
                     _raise_codex_auto_agent_authenticated_continuation_unavailable(
                         candidate=pinned_candidate_shape,
                         lane_key=affinity.get("codex_oauth_lane_key"),
@@ -5080,6 +5092,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         if (
             isinstance(session_owner_record, dict)
             and sa._record_state(session_owner_record) == "owned"
+            and not authenticated_token_affinity
         ):
             if account_identity_pinned and _candidate_matches_affinity(
                 affinity_state["candidate"],
@@ -5106,10 +5119,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 mismatch_reason="session_owner: owner candidate unavailable",
             )
         if account_identity_pinned and _affinity_pins_account_identity(affinity):
-            if (
-                affinity_selection_reason
-                == "authenticated_continuation_token_pin"
-            ):
+            if authenticated_token_affinity:
                 _raise_codex_auto_agent_authenticated_continuation_unavailable(
                     candidate=dict(affinity_state.get("candidate") or affinity),
                     lane_key=affinity_state.get("lane_key")
@@ -5140,16 +5150,17 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             )
         if affinity_state["cooldown_seconds"] > 0:
             # Owned/cooldown owner is unavailable: fail before free selection.
-            if session_owner_record is not None and sa._record_state(session_owner_record) == "owned":
+            if (
+                session_owner_record is not None
+                and sa._record_state(session_owner_record) == "owned"
+                and not authenticated_token_affinity
+            ):
                 return await _reselect_owned_affinity_with_effective_identity(
                     candidate=affinity_state.get("candidate"),
                     failure_phase="session_owner_owner_cooldown",
                     mismatch_reason="session_owner: owner unavailable (cooldown)",
                 )
-            if (
-                affinity_selection_reason
-                == "authenticated_continuation_token_pin"
-            ):
+            if authenticated_token_affinity:
                 _raise_codex_auto_agent_authenticated_continuation_unavailable(
                     candidate=affinity_state["candidate"],
                     lane_key=affinity_state.get("lane_key"),
@@ -5178,10 +5189,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             redispatch_candidate["_codex_oauth_terminal_reset"] = (
                 terminal_reset
             )
-        if (
-            affinity_selection_reason
-            == "authenticated_continuation_token_pin"
-        ):
+        if authenticated_token_affinity:
             _raise_codex_auto_agent_authenticated_continuation_unavailable(
                 candidate=redispatch_candidate,
                 lane_key=affinity_state.get("lane_key"),
@@ -5868,6 +5876,7 @@ _HOST_FUNCTION_NAMES = (
     "_affinity_pins_account_identity",
     "_attach_account_bound_selection_metadata",
     "_candidate_matches_affinity",
+    "_codex_oauth_affinity_is_authenticated_token",
     "_apply_codex_oauth_inventory_affinity_policy",
     "_resolve_codex_oauth_account_candidate_contexts",
     "_get_anthropic_auto_agent_candidate_cooldown_state",

@@ -1059,6 +1059,27 @@ def _codex_oauth_affinity_selection_reason(
     return None
 
 
+def _codex_oauth_resolve_affinity(
+    *,
+    durable_affinity: Optional[Mapping[str, Any]],
+    token_affinity: Optional[Mapping[str, Any]],
+    conflict_message: str = (
+        "Codex OAuth continuation affinity state conflicts "
+        "with durable session affinity."
+    ),
+) -> Optional[dict[str, Any]]:
+    """Validate durable compatibility, then preserve authenticated token scope."""
+    if _codex_oauth_affinity_conflicts(durable_affinity, token_affinity):
+        raise _codex_oauth_affinity_token_invalid_exception(
+            message=conflict_message
+        )
+    if token_affinity is not None:
+        return dict(token_affinity)
+    if durable_affinity is None:
+        return None
+    return dict(durable_affinity)
+
+
 def _get_codex_oauth_affinity_continuation_state(
     request: Request,
     *,
@@ -1089,32 +1110,33 @@ def _get_codex_oauth_affinity_continuation_state(
     if isinstance(existing, CodexOAuthAffinityContinuation):
         if existing.invalid:
             return existing
-        if (
-            (
-                existing.model
-                and normalized_model
-                and existing.model != normalized_model
-            )
-            or existing.session_identity != normalized_session
-            or (
-                token_declared
-                and existing.token_digest != token_digest
-            )
-        ):
-            invalid = CodexOAuthAffinityContinuation(
-                declared=existing.declared or token_declared,
-                invalid=True,
-                token_digest=token_digest or existing.token_digest,
-                model=normalized_model,
-                session_identity=normalized_session,
-            )
-            setattr(
-                request.state,
-                _CODEX_OAUTH_AFFINITY_CONTINUATION_STATE_ATTR,
-                invalid,
-            )
-            return invalid
-        return existing
+        if existing.declared:
+            if (
+                (
+                    existing.model
+                    and normalized_model
+                    and existing.model != normalized_model
+                )
+                or existing.session_identity != normalized_session
+                or (
+                    token_declared
+                    and existing.token_digest != token_digest
+                )
+            ):
+                invalid = CodexOAuthAffinityContinuation(
+                    declared=True,
+                    invalid=True,
+                    token_digest=token_digest or existing.token_digest,
+                    model=normalized_model or existing.model,
+                    session_identity=normalized_session,
+                )
+                setattr(
+                    request.state,
+                    _CODEX_OAUTH_AFFINITY_CONTINUATION_STATE_ATTR,
+                    invalid,
+                )
+                return invalid
+            return existing
 
     if not token_declared:
         state = CodexOAuthAffinityContinuation(
@@ -1145,11 +1167,12 @@ def _get_codex_oauth_affinity_continuation_state(
                 tuple(sorted(affinity.items())) if affinity is not None else ()
             ),
         )
-    setattr(
-        request.state,
-        _CODEX_OAUTH_AFFINITY_CONTINUATION_STATE_ATTR,
-        state,
-    )
+    if token_declared:
+        setattr(
+            request.state,
+            _CODEX_OAUTH_AFFINITY_CONTINUATION_STATE_ATTR,
+            state,
+        )
     return state
 
 
@@ -1628,7 +1651,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             )
         )
     token_affinity = continuation.as_affinity()
-    affinity: Optional[dict[str, Any]] = None
+    owner_affinity: Optional[dict[str, Any]] = None
     if session_identity is not None:
         owner_record, _cache_key, owner_error = await _sa.get_session_owner_record(
             session_identity=session_identity,
@@ -1641,16 +1664,14 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                 ),
                 model=model,
             )
-            if _codex_oauth_affinity_conflicts(owner_affinity, token_affinity):
-                raise _codex_oauth_affinity_token_invalid_exception(
-                    message=(
-                        "Codex OAuth continuation affinity state conflicts "
-                        "with durable session ownership."
-                    )
-                )
-            affinity = owner_affinity
-    if affinity is None:
-        affinity = token_affinity
+    affinity = _codex_oauth_resolve_affinity(
+        durable_affinity=owner_affinity,
+        token_affinity=token_affinity,
+        conflict_message=(
+            "Codex OAuth continuation affinity state conflicts "
+            "with durable session ownership."
+        ),
+    )
 
     affinity_selection_reason: Optional[str] = None
     if affinity is not None:
