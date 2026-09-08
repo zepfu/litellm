@@ -487,9 +487,19 @@ class BaseOpenAIPassThroughHandler:
                 pass
             prepared_request_body = request_body
             body_was_prepared = False
+            is_responses_endpoint = rt.is_openai_responses_endpoint_fn(endpoint)
+            if is_responses_endpoint:
+                # Reject unreadable child assignments before any route or
+                # session-owner classification, including API-key OpenAI.
+                normalized_request_body = (
+                    normalize_codex_collaboration_dispatch_body(request_body)
+                )
+                if normalized_request_body is not request_body:
+                    request_body = normalized_request_body
+                    prepared_request_body = normalized_request_body
             is_codex_responses_request = (
                 rt.request_uses_codex_native_auth_fn(request)
-                and rt.is_openai_responses_endpoint_fn(endpoint)
+                and is_responses_endpoint
             ) or bound_codex_oauth_identity is not None
             codex_auto_agent_alias_model = (
                 rt.resolve_codex_auto_agent_alias_model_fn(

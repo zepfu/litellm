@@ -350,6 +350,12 @@ def _targeted_tool_name(
     parameters: Any,
     namespace_context: Optional[str] = None,
 ) -> Optional[str]:
+    if namespace is not None and (
+        not isinstance(namespace, str)
+        or namespace not in _COLLABORATION_NAMESPACES
+    ):
+        # An explicit non-Codex namespace owns its bare tool names.
+        return None
     if namespace_context in _V1_NAMESPACES:
         return None
 
@@ -542,14 +548,13 @@ def _validate_visible_agent_message(
     message_type, task_name, sender, payload_offset = envelope
     _validate_envelope_identity(item, task_name=task_name, sender=sender)
     remainder = visible_text[payload_offset:]
+    if message_type == "FINAL_ANSWER":
+        # A child result is content, even when its text happens to begin with
+        # a representation-looking prefix. Never reinterpret it as a task.
+        return None
     if not remainder:
-        if message_type == "FINAL_ANSWER":
-            return None
         raise CodexCollaborationDispatchError("invalid_envelope")
-    if (
-        message_type != "FINAL_ANSWER"
-        and _is_opaque_representation(remainder)
-    ):
+    if _is_opaque_representation(remainder):
         raise CodexCollaborationDispatchError("opaque")
     if _FRAME_PREFIX_PATTERN.match(remainder):
         assignment = parse_codex_collaboration_text_frame(remainder)
@@ -627,10 +632,9 @@ def _normalize_agent_message_item(item: dict[str, Any]) -> tuple[dict[str, Any],
 
     if len(content) == 1 and isinstance(content[0], dict):
         visible_part = content[0]
-        if (
-            set(visible_part) == {"type", "text"}
-            and visible_part.get("type") in {"input_text", "text"}
-        ):
+        if visible_part.get("type") in {"input_text", "text"}:
+            if set(visible_part) != {"type", "text"}:
+                raise CodexCollaborationDispatchError("invalid_envelope")
             visible_text = visible_part.get("text")
             if isinstance(visible_text, str) and _is_opaque_representation(
                 visible_text
