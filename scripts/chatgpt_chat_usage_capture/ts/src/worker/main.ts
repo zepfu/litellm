@@ -11,6 +11,7 @@ import type {
 } from "../contracts/records.js";
 import type {
   HistoryCollectionRequest,
+  HistoryMetadataPage,
   HistoryReader,
   RevisitEntry,
 } from "../contracts/history.js";
@@ -18,6 +19,11 @@ import type {
   LedgerScope,
   ModelMappingVersion,
 } from "../ledger/types.js";
+import {
+  buildUsageReport,
+  type UsageReportRequest,
+  type UsageReportSnapshot,
+} from "../counting/report.js";
 import {
   AuthenticationRequiredError,
   RateLimitedError,
@@ -36,49 +42,67 @@ import {
   MAX_REQUEST_ID_LENGTH,
   WORKER_PROTOCOL_VERSION,
   type CollectorRunEnvelope,
+  type CommitPagePayload,
   type OpaquePageRequest,
   type PreparedHistory,
-  type WorkerBounds,
   type WorkerControlMessage,
+  type WorkerErrorCode,
   type WorkerResponse,
   type WorkerStartRun,
 } from "./contracts.js";
 import type { WorkerBridge, WorkerOperation } from "./contracts.js";
 import type {
   BridgeStateEnvelope,
-  BridgePageMutation,
 } from "../history/bridge-checkpoints.js";
 
 const MAX_QUEUE_PAGES = 16;
+const MAX_REPORT_PAGES = 100;
 
 export async function runStdioWorker(
   input: NodeJS.ReadableStream = process.stdin,
   output: NodeJS.WritableStream = process.stdout,
 ): Promise<void> {
-  const inbox = new FrameInbox(input);
+  const budget = new WireBudget(DEFAULT_WORKER_BOUNDS);
+  const inbox = new FrameInbox(input, budget);
   const first = await inbox.next();
+  budget.consumeRequest();
   const start = parseStartRun(first);
-  inbox.setBounds(start.bounds);
-  const app = new WorkerClientApplication(start, inbox, output);
-  await app.run();
+  const deadlineAt = monotonicNow() + start.bounds.remainingMs;
+  budget.configure(start.bounds, deadlineAt);
+  inbox.setBounds();
+  const app = new WorkerClientApplication(
+    start,
+    deadlineAt,
+    budget,
+    inbox,
+    output,
+  );
+  try {
+    await app.run();
+  } finally {
+    app.close();
+  }
 }
 
 class WorkerClientApplication {
   private readonly controller = new AbortController();
   private readonly bridge: ParentWorkerBridge;
   private triggerId: string | null = null;
-  private stateVersion = 0;
+  private finishRequested = false;
 
   constructor(
     private readonly start: WorkerStartRun,
+    private readonly deadlineAt: number,
+    budget: WireBudget,
     private readonly inbox: FrameInbox,
     private readonly output: NodeJS.WritableStream,
   ) {
     this.bridge = new ParentWorkerBridge(
       start.envelope,
-      start.bounds,
+      budget,
       inbox,
       output,
+      this.controller.signal,
       (message) => this.handleControl(message),
     );
   }
@@ -121,31 +145,51 @@ class WorkerClientApplication {
           maxFrameBytes: this.start.bounds.maxFrameBytes,
           maxTotalBytes: this.start.bounds.maxTotalBytes,
           maxRequests: this.start.bounds.maxRequests,
-          deadlineAt: monotonicNow() + this.start.bounds.remainingMs,
+          deadlineAt: this.deadlineAt,
         },
         signal: this.controller.signal,
       });
-      const completion = completionFor(collection.result, Date.now());
+      const report = this.start.reportRequest
+        ? await this.collectReport(this.start.reportRequest)
+        : null;
+      const completion = completionFor(
+        collection.result,
+        Date.now(),
+        report?.truncated === true,
+      );
       const completed = await schedule.completeTrigger(
         scope,
         Date.now(),
         completion,
       );
+      if (!completed.applied) {
+        throw new BoundedWorkerError("state_conflict", true, true);
+      }
       scheduleState = completed.state ?? scheduleState;
-      this.stateVersion = this.bridge.stateVersion;
-      await this.bridge.finishRun({
-        expectedVersion: this.stateVersion,
+      this.finishRequested = true;
+      const finished = await this.bridge.finishRun({
+        expectedVersion: this.bridge.stateVersion,
         triggerId: this.triggerId,
         outcome: completion.outcome,
         summary: {
           status: collection.result.status,
-          coverageIncomplete: collection.coverageIncomplete,
-          warnings: collection.warnings,
+          coverageIncomplete:
+            collection.coverageIncomplete || report?.truncated === true,
+          warnings: [
+            ...collection.warnings,
+            ...(report?.warnings ?? []),
+          ],
           scheduleState,
+          ...(report?.report === undefined
+            ? {}
+            : { report: report.report }),
         },
       });
+      if (!finished.finished) {
+        throw new BoundedWorkerError("protocol_invalid", false, true);
+      }
     } catch (error) {
-      if (this.triggerId !== null) {
+      if (this.triggerId !== null && !this.finishRequested && !this.bridge.remoteCancelled) {
         try {
           await this.bridge.cancel({
             expectedVersion: this.bridge.stateVersion,
@@ -161,7 +205,132 @@ class WorkerClientApplication {
         }
       }
       throw error;
+    } finally {
+      this.close();
     }
+  }
+
+  close(): void {
+    this.bridge.close();
+  }
+
+  private async collectReport(
+    request: Record<string, unknown>,
+  ): Promise<{
+    report?: Record<string, unknown>;
+    truncated: boolean;
+    warnings: string[];
+  }> {
+    const attempts: UsageReportSnapshot["attempts"][number][] = [];
+    let snapshotId: string | null = null;
+    let cursor: string | null = null;
+    let first: Record<string, unknown> | null = null;
+    let truncated = false;
+    const warnings: string[] = [];
+    const seenCursors = new Set<string>();
+    let expectedSnapshotId: string | null | undefined;
+    let snapshotInitialized = false;
+
+    for (let page = 0; page < MAX_REPORT_PAGES; page += 1) {
+      let current: Record<string, unknown>;
+      try {
+        current = await this.bridge.loadReportSnapshot({
+          cursor,
+          snapshotId,
+          limit: 256,
+        });
+      } catch (error) {
+        if (error instanceof BoundedWorkerError && error.code === "bounds_exceeded") {
+          truncated = true;
+          warnings.push("report_snapshot_truncated");
+          break;
+        }
+        throw error;
+      }
+      first ??= current;
+      if (!snapshotInitialized) {
+        expectedSnapshotId =
+          typeof current.snapshotId === "string" || current.snapshotId === null
+            ? current.snapshotId
+            : undefined;
+        snapshotInitialized = true;
+      } else if (current.snapshotId !== expectedSnapshotId) {
+        truncated = true;
+        warnings.push("report_snapshot_changed");
+        break;
+      }
+      if (
+        !Array.isArray(current.attempts) ||
+        current.attempts.some((attempt) => !isRecord(attempt))
+      ) {
+        truncated = true;
+        warnings.push("report_snapshot_invalid_attempts");
+        break;
+      }
+      const pageAttempts = current.attempts;
+      attempts.push(...pageAttempts as UsageReportSnapshot["attempts"][number][]);
+      truncated ||= current.truncated === true;
+      if (current.hasMore === false) {
+        if (
+          current.nextCursor !== undefined &&
+          current.nextCursor !== null
+        ) {
+          truncated = true;
+          warnings.push("report_snapshot_contradictory_continuation");
+        }
+        break;
+      }
+      if (current.hasMore !== true) {
+        truncated = true;
+        warnings.push("report_snapshot_missing_continuation_state");
+        break;
+      }
+      const nextCursor =
+        typeof current.nextCursor === "string" ? current.nextCursor : null;
+      const nextSnapshot: string | null =
+        typeof current.snapshotId === "string"
+          ? current.snapshotId
+          : snapshotId;
+      if (
+        nextCursor === null ||
+        nextSnapshot === null ||
+        seenCursors.has(nextCursor)
+      ) {
+        truncated = true;
+        warnings.push("report_snapshot_invalid_continuation");
+        break;
+      }
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+      snapshotId = nextSnapshot;
+      if (page === MAX_REPORT_PAGES - 1) {
+        truncated = true;
+        warnings.push("report_snapshot_page_budget_exhausted");
+      }
+    }
+
+    if (!first) {
+      return {
+        truncated: true,
+        warnings: [...warnings, "report_snapshot_unavailable"],
+      };
+    }
+    const snapshot = reportSnapshotFromWire(
+      first,
+      this.start.envelope.collectorAccountId,
+      attempts,
+      truncated,
+      warnings,
+    );
+    const report = buildUsageReport(
+      snapshot,
+      request as unknown as UsageReportRequest,
+    );
+    return {
+      report: report as unknown as Record<string, unknown>,
+      truncated,
+      warnings,
+    };
   }
 
   private createScheduleStore(): ScheduleBridgeStore {
@@ -196,64 +365,62 @@ class WorkerClientApplication {
       throw new BoundedWorkerError("protocol_invalid", false, true);
     }
     validateEnvelope(controlEnvelope(message), this.start.envelope);
+    this.bridge.markRemoteCancellation();
     this.controller.abort();
   }
 }
 
 class ParentWorkerBridge implements WorkerBridge {
   private requestSequence = 0;
+  private pendingRequestId: string | null = null;
+  private closed = false;
+  remoteCancelled = false;
   stateVersion = 0;
 
   constructor(
     private readonly envelope: CollectorRunEnvelope,
-    private readonly bounds: WorkerStartRun["bounds"],
+    private readonly budget: WireBudget,
     private readonly inbox: FrameInbox,
     private readonly output: NodeJS.WritableStream,
+    private readonly signal: AbortSignal,
     private readonly onControl: (message: WorkerControlMessage) => void,
-  ) {}
+  ) {
+    this.inbox.setAbortSignal(signal);
+  }
 
   async requestRaw(
     operation: WorkerOperation,
     payload: unknown,
   ): Promise<Record<string, unknown>> {
+    this.assertRequestAvailable();
     const requestId = this.nextRequestId();
-    await writeFrame(
-      this.output,
-      {
-        protocolVersion: WORKER_PROTOCOL_VERSION,
-        requestId,
-        ...this.envelope,
-        operation,
-        payload,
-      },
-      this.bounds,
-    );
-    while (true) {
-      const message = await this.inbox.next();
-      if (isControlMessage(message)) {
-        this.onControl(message);
-        continue;
-      }
-      const response = parseWorkerResponse(message);
-      if (response.requestId !== requestId) {
-        throw new BoundedWorkerError("protocol_invalid", false, true);
-      }
-      if (!response.ok) {
-        throw new BoundedWorkerError(
-          response.error.code,
-          response.error.retryable,
-          response.error.coverageIncomplete,
-        );
-      }
-      const result = isRecord(response.result) ? response.result : {};
+    this.beginRequest(requestId);
+    try {
+      this.budget.consumeRequest();
+      await writeFrame(
+        this.output,
+        {
+          protocolVersion: WORKER_PROTOCOL_VERSION,
+          requestId,
+          ...this.envelope,
+          operation,
+          payload,
+        },
+        this.budget,
+        this.signal,
+      );
+      const result = await this.readResponse(requestId);
       if (typeof result.stateVersion === "number") {
         this.stateVersion = result.stateVersion;
       }
       return result;
+    } finally {
+      this.endRequest(requestId);
     }
   }
 
   async prepareHistory(triggerId: string): Promise<PreparedHistory> {
+    this.assertRequestAvailable();
     const result = await this.requestControl(
       "prepareHistory",
       { claimedTriggerId: triggerId },
@@ -269,22 +436,43 @@ class ParentWorkerBridge implements WorkerBridge {
       expectedStateVersion?: number;
     } = {},
   ): Promise<BridgeStateEnvelope | null> {
-    const headerResult = await this.requestRaw("loadState", {
-      kind: "header",
-    });
-    const stateVersion =
-      typeof headerResult.stateVersion === "number"
-        ? headerResult.stateVersion
-        : 0;
-    const state = stateFromHeader(
-      headerResult.header,
-      this.envelope.collectorAccountId,
-      stateVersion,
+    const kind = request.kind ?? "header";
+    if (kind === "header") {
+      const headerResult = await this.requestRaw("loadState", { kind });
+      const stateVersion = requiredStateVersion(
+        headerResult.stateVersion ?? 0,
+      );
+      const state = stateFromHeader(
+        headerResult.header,
+        this.envelope.collectorAccountId,
+        stateVersion,
+      );
+      if (state === null && stateVersion !== 0) {
+        throw new BoundedWorkerError("protocol_invalid", false, true);
+      }
+      this.headerState = state;
+      this.stateVersion = stateVersion;
+      return state;
+    }
+    if (kind !== "candidates") {
+      throw new BoundedWorkerError("operation_unsupported", false, true);
+    }
+    const expectedStateVersion = requiredStateVersion(
+      request.expectedStateVersion,
     );
-    const candidates = await this.readCandidateQueue(stateVersion);
-    mergeQueueItems(state, candidates.items);
-    state.queueCoverage = candidates.complete ? "complete" : "partial";
-    this.stateVersion = stateVersion;
+    if (
+      this.headerState === null ||
+      this.headerState.stateVersionCounter !== expectedStateVersion
+    ) {
+      throw new BoundedWorkerError("state_conflict", true, true);
+    }
+    const state = structuredClone(this.headerState);
+    const candidates = await this.readCandidateQueue(expectedStateVersion);
+    const merged = mergeQueueItems(state, candidates.items);
+    state.queueCoverage = candidates.complete && merged ? "complete" : "partial";
+    if (!candidates.complete) {
+      return state;
+    }
     return state;
   }
 
@@ -297,47 +485,15 @@ class ParentWorkerBridge implements WorkerBridge {
       expectedStateVersion: envelope.expectedStateVersion,
       state: envelope.next,
     });
-    const stateVersion = Number(result.stateVersion);
-    if (!Number.isSafeInteger(stateVersion)) {
-      throw new BoundedWorkerError("protocol_invalid", false, true);
-    }
+    const stateVersion = requiredStateVersion(result.stateVersion);
     this.stateVersion = stateVersion;
     return { stateVersion };
   }
 
   async readHistory(request: OpaquePageRequest) {
     const result = await this.requestRaw("readHistory", request);
-    if (result.status === "blocked" || result.status === "unavailable") {
-      if (result.reason === "authentication") {
-        throw new AuthenticationRequiredError(
-          "native Chat history requires authentication",
-          { status: 401, path: "history" },
-        );
-      }
-      if (result.reason === "cooldown") {
-        const retryAfterMs =
-          typeof result.retryAfterMs === "number" &&
-          Number.isFinite(result.retryAfterMs) &&
-          result.retryAfterMs >= 0
-            ? result.retryAfterMs
-            : null;
-        throw new RateLimitedError(
-          "native Chat history is rate limited",
-          {
-            ...(retryAfterMs === null
-              ? {}
-              : { retryAfter: new Date(Date.now() + retryAfterMs).toISOString() }),
-            path: "history",
-          },
-        );
-      }
-      throw new BoundedWorkerError(
-        "history_contract_unavailable",
-        true,
-        true,
-      );
-    }
-    return typedReadResultFromWire(result);
+    throwIfDomainBlocked(result, "history");
+    return typedReadResultFromWire(result, request.kind);
   }
 
   async loadConversationMetadata(request: {
@@ -345,23 +501,29 @@ class ParentWorkerBridge implements WorkerBridge {
     cursor?: string | null;
     limit?: number;
     snapshotId?: string | null;
-  }) {
+  }): Promise<HistoryMetadataPage> {
     const result = await this.requestRaw("loadConversationMetadata", request);
+    throwIfDomainBlocked(result, "history_metadata");
     return parseConversationMetadata(result, request.conversationId);
   }
 
-  async commitPage(payload: {
-    pageCommitId: string;
-    expectedStateVersion?: number;
-    source?: unknown;
-    mutations: BridgePageMutation;
-  }): Promise<{ acknowledged: true; stateVersion?: number }> {
+  async commitPage(
+    payload: CommitPagePayload,
+  ): Promise<{ acknowledged: true; stateVersion: number; pageCommitId: string }> {
     const result = await this.requestRaw("commitPage", payload);
+    const stateVersion = requiredStateVersion(result.stateVersion);
+    if (
+      result.acknowledged !== true ||
+      typeof result.pageCommitId !== "string" ||
+      result.pageCommitId !== payload.pageCommitId ||
+      stateVersion <= payload.expectedStateVersion
+    ) {
+      throw new BoundedWorkerError("protocol_invalid", false, true);
+    }
     return {
       acknowledged: true,
-      ...(typeof result.stateVersion === "number"
-        ? { stateVersion: result.stateVersion }
-        : {}),
+      stateVersion,
+      pageCommitId: result.pageCommitId,
     };
   }
 
@@ -370,7 +532,9 @@ class ParentWorkerBridge implements WorkerBridge {
     limit?: number;
     snapshotId?: string | null;
   } = {}): Promise<Record<string, unknown>> {
-    return this.requestRaw("loadReportSnapshot", request);
+    const result = await this.requestRaw("loadReportSnapshot", request);
+    throwIfDomainBlocked(result, "history_report");
+    return result;
   }
 
   async finishRun(payload: {
@@ -378,13 +542,15 @@ class ParentWorkerBridge implements WorkerBridge {
     triggerId: string;
     outcome: "success" | "failure" | "authentication";
     summary?: Record<string, unknown>;
-  }): Promise<{ finished: true; stateVersion?: number }> {
+  }): Promise<{ finished: true; stateVersion: number }> {
     const result = await this.requestRaw("finishRun", payload);
+    const stateVersion = requiredStateVersion(result.stateVersion);
+    if (result.finished !== true || stateVersion <= payload.expectedVersion) {
+      throw new BoundedWorkerError("protocol_invalid", false, true);
+    }
     return {
       finished: true,
-      ...(typeof result.stateVersion === "number"
-        ? { stateVersion: result.stateVersion }
-        : {}),
+      stateVersion,
     };
   }
 
@@ -393,21 +559,38 @@ class ParentWorkerBridge implements WorkerBridge {
     triggerId: string;
     outcome?: string;
     summary?: Record<string, unknown>;
-  }): Promise<{ cancelled: true; stateVersion?: number }> {
+  }): Promise<{ cancelled: true; stateVersion: number }> {
     const result = await this.requestRaw("cancel", payload);
+    const stateVersion = requiredStateVersion(result.stateVersion);
+    if (result.cancelled !== true || stateVersion <= payload.expectedVersion) {
+      throw new BoundedWorkerError("protocol_invalid", false, true);
+    }
     return {
       cancelled: true,
-      ...(typeof result.stateVersion === "number"
-        ? { stateVersion: result.stateVersion }
-        : {}),
+      stateVersion,
     };
   }
+
+  markRemoteCancellation(): void {
+    this.remoteCancelled = true;
+  }
+
+  close(): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    this.inbox.close();
+  }
+
+  private headerState: BridgeStateEnvelope | null = null;
 
   private async readCandidateQueue(
     expectedStateVersion: number,
   ): Promise<{ items: Record<string, unknown>[]; complete: boolean }> {
     const items: Record<string, unknown>[] = [];
     let cursor: string | null = null;
+    const seenCursors = new Set<string>();
     for (let page = 0; page < MAX_QUEUE_PAGES; page += 1) {
       const result = await this.requestRaw("loadState", {
         kind: "candidates",
@@ -415,17 +598,27 @@ class ParentWorkerBridge implements WorkerBridge {
         limit: 64,
         expectedStateVersion,
       });
+      if (requiredStateVersion(result.stateVersion) !== expectedStateVersion) {
+        throw new BoundedWorkerError("state_conflict", true, true);
+      }
       const pageItems = Array.isArray(result.items)
         ? result.items.filter(isRecord)
         : [];
       items.push(...pageItems);
-      if (result.hasMore !== true) {
+      if (result.hasMore === false) {
+        if (result.nextCursor !== undefined && result.nextCursor !== null) {
+          return { items, complete: false };
+        }
         return { items, complete: true };
       }
-      cursor = typeof result.nextCursor === "string" ? result.nextCursor : null;
-      if (cursor === null) {
+      if (result.hasMore !== true) {
         return { items, complete: false };
       }
+      cursor = typeof result.nextCursor === "string" ? result.nextCursor : null;
+      if (cursor === null || seenCursors.has(cursor)) {
+        return { items, complete: false };
+      }
+      seenCursors.add(cursor);
     }
     return { items, complete: false };
   }
@@ -434,22 +627,37 @@ class ParentWorkerBridge implements WorkerBridge {
     control: "prepareHistory",
     payload: unknown,
   ): Promise<Record<string, unknown>> {
+    this.assertRequestAvailable();
     const requestId = this.nextRequestId();
-    await writeFrame(
-      this.output,
-      {
-        protocolVersion: WORKER_PROTOCOL_VERSION,
-        control,
-        requestId,
-        envelope: this.envelope,
-        payload,
-      },
-      this.bounds,
-    );
+    this.beginRequest(requestId);
+    try {
+      this.budget.consumeRequest();
+      await writeFrame(
+        this.output,
+        {
+          protocolVersion: WORKER_PROTOCOL_VERSION,
+          control,
+          requestId,
+          envelope: this.envelope,
+          payload,
+        },
+        this.budget,
+        this.signal,
+      );
+      return await this.readResponse(requestId);
+    } finally {
+      this.endRequest(requestId);
+    }
+  }
+
+  private async readResponse(
+    requestId: string,
+  ): Promise<Record<string, unknown>> {
     while (true) {
-      const message = await this.inbox.next();
+      const message = await this.inbox.next(this.signal);
       if (isControlMessage(message)) {
         this.onControl(message);
+        this.assertRequestAvailable();
         continue;
       }
       const response = parseWorkerResponse(message);
@@ -465,6 +673,26 @@ class ParentWorkerBridge implements WorkerBridge {
       }
       return isRecord(response.result) ? response.result : {};
     }
+  }
+
+  private beginRequest(requestId: string): void {
+    if (this.pendingRequestId !== null) {
+      throw new BoundedWorkerError("protocol_invalid", false, true);
+    }
+    this.pendingRequestId = requestId;
+  }
+
+  private endRequest(requestId: string): void {
+    if (this.pendingRequestId === requestId) {
+      this.pendingRequestId = null;
+    }
+  }
+
+  private assertRequestAvailable(): void {
+    if (this.closed || this.remoteCancelled || this.signal.aborted) {
+      throw new BoundedWorkerError("cancelled", false, true);
+    }
+    this.budget.assertActive(this.signal);
   }
 
   private nextRequestId(): string {
@@ -558,34 +786,123 @@ class ParentHistoryReader implements HistoryReader {
   }
 }
 
-class FrameInbox {
-  private maxFrameBytes = DEFAULT_WORKER_BOUNDS.maxFrameBytes;
-  private maxTotalBytes = DEFAULT_WORKER_BOUNDS.maxTotalBytes;
+class WireBudget {
+  private maxFrameBytes: number;
+  private maxTotalBytes: number;
+  private maxRequests: number;
+  private deadlineAt = Number.POSITIVE_INFINITY;
   private totalBytes = 0;
-  private buffer = Buffer.alloc(0);
+  private requestCount = 0;
+  private largestFrameBytes = 0;
+
+  constructor(bounds: {
+    maxFrameBytes: number;
+    maxTotalBytes: number;
+    maxRequests: number;
+  }) {
+    this.maxFrameBytes = bounds.maxFrameBytes;
+    this.maxTotalBytes = bounds.maxTotalBytes;
+    this.maxRequests = bounds.maxRequests;
+  }
+
+  configure(
+    bounds: WorkerStartRun["bounds"],
+    deadlineAt: number,
+  ): void {
+    this.maxFrameBytes = boundedValue(
+      bounds.maxFrameBytes,
+      DEFAULT_WORKER_BOUNDS.maxFrameBytes,
+      "maxFrameBytes",
+    );
+    this.maxTotalBytes = boundedValue(
+      bounds.maxTotalBytes,
+      DEFAULT_WORKER_BOUNDS.maxTotalBytes,
+      "maxTotalBytes",
+    );
+    this.maxRequests = boundedValue(
+      bounds.maxRequests,
+      DEFAULT_WORKER_BOUNDS.maxRequests,
+      "maxRequests",
+    );
+    this.deadlineAt = deadlineAt;
+    if (
+      this.totalBytes > this.maxTotalBytes ||
+      this.largestFrameBytes > this.maxFrameBytes
+    ) {
+      throw new BoundedWorkerError("bounds_exceeded", true, true);
+    }
+    this.assertActive();
+  }
+
+  consumeRequest(): void {
+    this.requestCount += 1;
+    if (this.requestCount > this.maxRequests) {
+      throw new BoundedWorkerError("bounds_exceeded", true, true);
+    }
+    this.assertActive();
+  }
+
+  consumeBytes(bytes: number): void {
+    if (!Number.isSafeInteger(bytes) || bytes < 0) {
+      throw new BoundedWorkerError("protocol_invalid", false, true);
+    }
+    this.totalBytes += bytes;
+    if (this.totalBytes > this.maxTotalBytes) {
+      throw new BoundedWorkerError("bounds_exceeded", true, true);
+    }
+    this.assertActive();
+  }
+
+  assertFrameSize(bytes: number): void {
+    this.largestFrameBytes = Math.max(this.largestFrameBytes, bytes);
+    if (bytes > this.maxFrameBytes) {
+      throw new BoundedWorkerError("bounds_exceeded", true, true);
+    }
+  }
+
+  assertActive(signal?: AbortSignal): void {
+    if (signal?.aborted) {
+      throw new BoundedWorkerError("cancelled", false, true);
+    }
+    if (monotonicNow() >= this.deadlineAt) {
+      throw new BoundedWorkerError("bounds_exceeded", true, true);
+    }
+  }
+
+  remainingMs(): number {
+    return Math.max(0, this.deadlineAt - monotonicNow());
+  }
+}
+
+class FrameInbox {
   private readonly frames: unknown[] = [];
+  private buffer = Buffer.alloc(0);
   private readonly waiters: Array<{
     resolve: (value: unknown) => void;
     reject: (error: unknown) => void;
   }> = [];
   private closedError: Error | null = null;
+  private closed = false;
 
-  constructor(input: NodeJS.ReadableStream) {
+  constructor(
+    private readonly input: NodeJS.ReadableStream,
+    private readonly budget: WireBudget,
+  ) {
     void this.pump(input);
   }
 
-  setBounds(bounds: WorkerStartRun["bounds"]): void {
-    this.maxFrameBytes = Math.min(
-      this.maxFrameBytes,
-      positiveBound(bounds.maxFrameBytes, DEFAULT_WORKER_BOUNDS.maxFrameBytes),
-    );
-    this.maxTotalBytes = Math.min(
-      this.maxTotalBytes,
-      positiveBound(bounds.maxTotalBytes, DEFAULT_WORKER_BOUNDS.maxTotalBytes),
-    );
+  setBounds(): void {
+    this.budget.assertFrameSize(this.buffer.length + 1);
+    this.budget.assertActive();
   }
 
-  next(): Promise<unknown> {
+  setAbortSignal(_signal: AbortSignal): void {
+    // The bridge passes its signal to each bounded read; no stream-wide
+    // listener is retained here, which keeps cancellation cleanup deterministic.
+  }
+
+  next(signal?: AbortSignal): Promise<unknown> {
+    this.budget.assertActive(signal);
     if (this.frames.length > 0) {
       return Promise.resolve(this.frames.shift());
     }
@@ -593,22 +910,74 @@ class FrameInbox {
       return Promise.reject(this.closedError);
     }
     return new Promise((resolve, reject) => {
-      this.waiters.push({ resolve, reject });
+      let entry:
+        | {
+            resolve: (value: unknown) => void;
+            reject: (error: unknown) => void;
+        }
+        | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const cleanup = (): void => {
+        signal?.removeEventListener("abort", onAbort);
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
+      };
+      const onAbort = (): void => {
+        const index = entry === undefined ? -1 : this.waiters.indexOf(entry);
+        if (index >= 0) {
+          this.waiters.splice(index, 1);
+        }
+        cleanup();
+        reject(new BoundedWorkerError("cancelled", false, true));
+      };
+      if (signal) {
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+      }
+      entry = {
+        resolve: (value) => {
+          cleanup();
+          resolve(value);
+        },
+        reject: (error) => {
+          cleanup();
+          reject(error);
+        },
+      };
+      this.waiters.push(entry);
+      const remaining = this.budget.remainingMs();
+      if (Number.isFinite(remaining)) {
+        timer = setTimeout(() => {
+          const index = this.waiters.indexOf(entry!);
+          if (index >= 0) {
+            this.waiters.splice(index, 1);
+          }
+          cleanup();
+          reject(new BoundedWorkerError("bounds_exceeded", true, true));
+        }, Math.max(1, remaining));
+      }
     });
   }
 
   private async pump(input: NodeJS.ReadableStream): Promise<void> {
     try {
       for await (const chunk of input as AsyncIterable<Buffer | string>) {
+        if (this.closed) {
+          return;
+        }
         const bytes = Buffer.isBuffer(chunk)
           ? chunk
           : Buffer.from(chunk, "utf8");
-        this.totalBytes += bytes.length;
-        if (this.totalBytes > this.maxTotalBytes) {
-          throw new BoundedWorkerError("bounds_exceeded", true, true);
-        }
+        this.budget.consumeBytes(bytes.length);
         this.buffer = Buffer.concat([this.buffer, bytes]);
         this.drainFrames();
+      }
+      if (this.closed) {
+        return;
       }
       if (this.buffer.length > 0) {
         throw new BoundedWorkerError("protocol_invalid", false, true);
@@ -623,16 +992,15 @@ class FrameInbox {
     while (true) {
       const newline = this.buffer.indexOf(0x0a);
       if (newline < 0) {
-        if (this.buffer.length >= this.maxFrameBytes) {
+        this.budget.assertFrameSize(this.buffer.length + 1);
+        if (this.buffer.length >= DEFAULT_WORKER_BOUNDS.maxFrameBytes) {
           throw new BoundedWorkerError("bounds_exceeded", true, true);
         }
         return;
       }
       const frame = this.buffer.subarray(0, newline);
       this.buffer = this.buffer.subarray(newline + 1);
-      if (frame.length + 1 > this.maxFrameBytes) {
-        throw new BoundedWorkerError("bounds_exceeded", true, true);
-      }
+      this.budget.assertFrameSize(frame.length + 1);
       let value: unknown;
       try {
         value = JSON.parse(frame.toString("utf8")) as unknown;
@@ -653,7 +1021,7 @@ class FrameInbox {
   }
 
   private fail(error: Error): void {
-    if (this.closedError) {
+    if (this.closed || this.closedError) {
       return;
     }
     this.closedError = error;
@@ -661,26 +1029,87 @@ class FrameInbox {
       waiter.reject(error);
     }
   }
+
+  close(): void {
+    if (this.closed) {
+      return;
+    }
+    this.frames.splice(0);
+    this.fail(new BoundedWorkerError("cancelled", false, true));
+    this.closed = true;
+    const destroyable = this.input as NodeJS.ReadableStream & {
+      destroy?: (error?: Error) => void;
+    };
+    destroyable.destroy?.();
+  }
 }
 
 async function writeFrame(
   output: NodeJS.WritableStream,
   value: Record<string, unknown>,
-  bounds: WorkerStartRun["bounds"],
+  budget: WireBudget,
+  signal: AbortSignal,
 ): Promise<void> {
+  budget.assertActive(signal);
   const encoded = `${JSON.stringify(value)}\n`;
-  if (
-    Buffer.byteLength(encoded, "utf8") >
-    positiveBound(bounds.maxFrameBytes, DEFAULT_WORKER_BOUNDS.maxFrameBytes)
-  ) {
-    throw new BoundedWorkerError("bounds_exceeded", true, true);
-  }
+  const bytes = Buffer.byteLength(encoded, "utf8");
+  budget.assertFrameSize(bytes);
+  budget.consumeBytes(bytes);
   const writable = output as NodeJS.WritableStream & {
     write(chunk: string): boolean;
     once(event: string, listener: () => void): void;
+    removeListener?(event: string, listener: () => void): void;
   };
   if (!writable.write(encoded)) {
-    await new Promise<void>((resolve) => writable.once("drain", resolve));
+    await new Promise<void>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
+      const cleanup = (): void => {
+        signal.removeEventListener("abort", onAbort);
+        writable.removeListener?.("drain", onDrain);
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
+      };
+      const onAbort = (): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        reject(new BoundedWorkerError("cancelled", false, true));
+      };
+      const onDrain = (): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        try {
+          budget.assertActive(signal);
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      const remaining = budget.remainingMs();
+      if (Number.isFinite(remaining)) {
+        timer = setTimeout(() => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          cleanup();
+          reject(new BoundedWorkerError("bounds_exceeded", true, true));
+        }, Math.max(1, remaining));
+      }
+      writable.once("drain", onDrain);
+    });
   }
 }
 
@@ -699,8 +1128,17 @@ function parseStartRun(value: unknown): WorkerStartRun {
   }
   const envelope = parseEnvelope(value.envelope);
   const remainingMs = Number(value.bounds.remainingMs);
-  if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+  if (!Number.isSafeInteger(remainingMs) || remainingMs <= 0) {
     throw new BoundedWorkerError("bounds_exceeded", true, true);
+  }
+  const reportRequest =
+    value.reportRequest === undefined
+      ? undefined
+      : isRecord(value.reportRequest)
+        ? value.reportRequest
+        : null;
+  if (reportRequest === null) {
+    throw new BoundedWorkerError("protocol_invalid", false, true);
   }
   return {
     protocolVersion: WORKER_PROTOCOL_VERSION,
@@ -709,21 +1147,25 @@ function parseStartRun(value: unknown): WorkerStartRun {
     scheduleOptions: value.scheduleOptions,
     collectionRequest: value.collectionRequest,
     mapping: value.mapping as unknown as ModelMappingVersion,
+    ...(reportRequest === undefined ? {} : { reportRequest }),
     ...(value.authenticationRecoveryRequested === true
       ? { authenticationRecoveryRequested: true }
       : {}),
     bounds: {
-      maxFrameBytes: positiveBound(
+      maxFrameBytes: boundedValue(
         value.bounds.maxFrameBytes,
         DEFAULT_WORKER_BOUNDS.maxFrameBytes,
+        "maxFrameBytes",
       ),
-      maxTotalBytes: positiveBound(
+      maxTotalBytes: boundedValue(
         value.bounds.maxTotalBytes,
         DEFAULT_WORKER_BOUNDS.maxTotalBytes,
+        "maxTotalBytes",
       ),
-      maxRequests: positiveBound(
+      maxRequests: boundedValue(
         value.bounds.maxRequests,
         DEFAULT_WORKER_BOUNDS.maxRequests,
+        "maxRequests",
       ),
       remainingMs,
     },
@@ -736,6 +1178,16 @@ function parseWorkerResponse(value: unknown): WorkerResponse {
     value.protocolVersion !== WORKER_PROTOCOL_VERSION ||
     typeof value.requestId !== "string" ||
     typeof value.ok !== "boolean"
+  ) {
+    throw new BoundedWorkerError("protocol_invalid", false, true);
+  }
+  if (
+    value.ok === false &&
+    (!isRecord(value.error) ||
+      typeof value.error.code !== "string" ||
+      typeof value.error.retryable !== "boolean" ||
+      typeof value.error.coverageIncomplete !== "boolean" ||
+      !isWorkerErrorCode(value.error.code))
   ) {
     throw new BoundedWorkerError("protocol_invalid", false, true);
   }
@@ -789,20 +1241,24 @@ function parsePreparedHistory(
       true,
     );
   }
-  const identity = value.identity as unknown as IdentityRecord;
-  const scope = scopeFromWire(value.scope, accountId);
+  const identity = parseIdentity(value.identity);
+  const scope = scopeFromWire(value.scope);
   if (
     identity.authState !== "ready" ||
     identity.surface !== "chat" ||
-    scope.collectorAccountId !== accountId
+    scope.collectorAccountId !== accountId ||
+    scope.providerUserId !== identity.providerUserId ||
+    scope.workspaceId !== identity.workspaceId ||
+    scope.quotaOwnerId !== identity.quotaOwnerId ||
+    scope.surface !== identity.surface
   ) {
     throw new BoundedWorkerError(
-      "history_contract_unavailable",
-      true,
+      "fence_invalid",
+      false,
       true,
     );
   }
-  const capabilities = value.capabilities as unknown as CapabilityRecord;
+  const capabilities = parseCapabilities(value.capabilities);
   if (!capabilities.adapterVersion || capabilities.indexScopes.length === 0) {
     throw new BoundedWorkerError(
       "history_contract_unavailable",
@@ -818,32 +1274,113 @@ function parsePreparedHistory(
   };
 }
 
+function parseIdentity(value: unknown): IdentityRecord {
+  if (
+    !isRecord(value) ||
+    !("providerUserId" in value) ||
+    !("workspaceId" in value) ||
+    !("quotaOwnerId" in value) ||
+    !isSurface(value.surface) ||
+    !isAuthState(value.authState) ||
+    !Array.isArray(value.identityErrors) ||
+    value.identityErrors.some((item) => typeof item !== "string")
+  ) {
+    throw new BoundedWorkerError("history_contract_unavailable", true, true);
+  }
+  const fields = ["providerUserId", "workspaceId", "quotaOwnerId"] as const;
+  if (
+    fields.some(
+      (field) =>
+        value[field] !== null && typeof value[field] !== "string",
+    )
+  ) {
+    throw new BoundedWorkerError("history_contract_unavailable", true, true);
+  }
+  return {
+    providerUserId: value.providerUserId as string | null,
+    workspaceId: value.workspaceId as string | null,
+    quotaOwnerId: value.quotaOwnerId as string | null,
+    surface: value.surface,
+    authState: value.authState,
+    identityErrors: [...value.identityErrors],
+  };
+}
+
+function parseCapabilities(value: unknown): CapabilityRecord {
+  if (
+    !isRecord(value) ||
+    typeof value.adapterVersion !== "string" ||
+    !Array.isArray(value.indexScopes) ||
+    value.indexScopes.some((item) => typeof item !== "string") ||
+    typeof value.archiveBehavior !== "string" ||
+    typeof value.projectCoverage !== "string" ||
+    typeof value.modernDetail !== "string" ||
+    typeof value.pagination !== "string" ||
+    typeof value.legacySupport !== "string" ||
+    typeof value.branchVisibility !== "string" ||
+    typeof value.modelMetadata !== "string" ||
+    typeof value.quotaMetadata !== "string" ||
+    !Array.isArray(value.warnings) ||
+    value.warnings.some((item) => typeof item !== "string")
+  ) {
+    throw new BoundedWorkerError("history_contract_unavailable", true, true);
+  }
+  return {
+    adapterVersion: value.adapterVersion,
+    indexScopes: [...value.indexScopes],
+    archiveBehavior: value.archiveBehavior,
+    projectCoverage: value.projectCoverage as CapabilityRecord["projectCoverage"],
+    modernDetail: value.modernDetail,
+    pagination: value.pagination,
+    legacySupport: value.legacySupport,
+    branchVisibility: value.branchVisibility,
+    modelMetadata: value.modelMetadata,
+    quotaMetadata: value.quotaMetadata,
+    warnings: [...value.warnings],
+  };
+}
+
 function stateFromHeader(
   rawHeader: unknown,
   accountId: string,
   stateVersionCounter: number,
-): BridgeStateEnvelope {
+): BridgeStateEnvelope | null {
+  if (!isRecord(rawHeader) || !isRecord(rawHeader.checkpoint)) {
+    return null;
+  }
   const empty: BridgeStateEnvelope = {
     stateVersion: 1,
     collectorAccountId: accountId,
     stateVersionCounter,
     discovery: {},
     revisits: [],
-    queueCoverage: "complete",
+    queueCoverage: "partial",
   };
-  if (!isRecord(rawHeader) || !isRecord(rawHeader.checkpoint)) {
-    return empty;
-  }
   const checkpoint = rawHeader.checkpoint;
   if (
     checkpoint.stateVersion === 1 &&
     checkpoint.collectorAccountId === accountId &&
-    isRecord(checkpoint.discovery) &&
-    Array.isArray(checkpoint.revisits)
+    isRecord(checkpoint.discovery)
   ) {
+    const discovery: BridgeStateEnvelope["discovery"] = {};
+    for (const scope of ["active", "archived"] as const) {
+      const rawCheckpoint = checkpoint.discovery[scope];
+      if (!isRecord(rawCheckpoint)) {
+        continue;
+      }
+      const { candidateQueue: _candidateQueue, ...headerCheckpoint } =
+        rawCheckpoint;
+      discovery[scope] = headerCheckpoint as unknown as NonNullable<
+        BridgeStateEnvelope["discovery"][typeof scope]
+      >;
+    }
+    const accountState = isRecord(checkpoint.accountState)
+      ? (checkpoint.accountState as unknown as BridgeStateEnvelope["accountState"])
+      : undefined;
     return {
       ...empty,
-      ...(checkpoint as unknown as BridgeStateEnvelope),
+      discovery,
+      ...(accountState ? { accountState } : {}),
       stateVersionCounter,
     };
   }
@@ -851,26 +1388,32 @@ function stateFromHeader(
     (checkpoint.scope === "active" || checkpoint.scope === "archived") &&
     typeof checkpoint.accountId === "string"
   ) {
+    const { candidateQueue: _candidateQueue, ...headerCheckpoint } = checkpoint;
     return {
       ...empty,
       discovery: {
-        [checkpoint.scope]: checkpoint as never,
+        [checkpoint.scope]: headerCheckpoint as never,
       },
     };
   }
-  return empty;
+  throw new BoundedWorkerError("protocol_invalid", false, true);
 }
 
 function mergeQueueItems(
   state: BridgeStateEnvelope,
   items: readonly Record<string, unknown>[],
-): void {
+): boolean {
   const revisits = new Map(
     state.revisits.map((entry) => [entry.conversationId, entry]),
   );
+  let complete = true;
   for (const item of items) {
+    if (item.operation === "remove") {
+      continue;
+    }
     const payload = isRecord(item.payload) ? item.payload : item;
     const queueKind =
+      item.queueKind ??
       payload.queueKind ??
       (String(item.candidateKey).startsWith("revisit:")
         ? "revisit"
@@ -883,6 +1426,12 @@ function mergeQueueItems(
     const candidate = isRecord(payload.candidate)
       ? payload.candidate
       : payload;
+    const outerScope =
+      item.scope === "active" || item.scope === "archived"
+        ? item.scope
+        : payload.scope === "active" || payload.scope === "archived"
+          ? payload.scope
+          : null;
     const candidateSummary = isRecord(candidate.summary)
       ? candidate.summary
       : null;
@@ -892,17 +1441,21 @@ function mergeQueueItems(
         ? candidateSummary.conversationId
         : null;
     const scope =
+      outerScope === "archived" ||
       candidate.scope === "archived" ||
       candidateSummary?.isArchived === true
         ? "archived"
-        : candidate.scope === "active"
+        : outerScope === "active" ||
+            candidate.scope === "active"
           ? "active"
           : null;
     if (!scope || !candidateSummary || candidateConversationId === null) {
+      complete = false;
       continue;
     }
     const checkpoint = state.discovery[scope];
     if (!checkpoint) {
+      complete = false;
       continue;
     }
     const queue = checkpoint.candidateQueue ?? [];
@@ -919,16 +1472,42 @@ function mergeQueueItems(
     }
   }
   state.revisits = [...revisits.values()];
+  return complete;
 }
 
 function typedReadResultFromWire(
   result: Record<string, unknown>,
+  kind: OpaquePageRequest["kind"],
 ): ReturnType<typeof typedReadResult> {
-  const items = Array.isArray(result.items)
-    ? result.items.filter(isRecord)
-    : [];
+  const shapeWarnings: string[] = [];
+  const rawItems = result.items;
+  const rawMessages = result.messages;
+  const itemsAreValid =
+    Array.isArray(rawItems) && rawItems.every((item) => isRecord(item));
+  const messagesAreValid =
+    Array.isArray(rawMessages) &&
+    rawMessages.every((message) => isRecord(message));
+  if (rawItems !== undefined && !itemsAreValid) {
+    shapeWarnings.push("history_items_shape_invalid");
+  }
+  if (rawMessages !== undefined && !messagesAreValid) {
+    shapeWarnings.push("history_messages_shape_invalid");
+  }
+  const items = itemsAreValid
+    ? rawItems.filter(isRecord)
+    : messagesAreValid
+      ? rawMessages.filter(isRecord)
+      : [];
+  const messages = messagesAreValid ? rawMessages.filter(isRecord) : [];
+  const detail = isRecord(result.detail) ? result.detail : undefined;
+  const summary = isRecord(result.summary) ? result.summary : undefined;
+  const source = isRecord(result.source) ? result.source : undefined;
   const normalized = {
     items,
+    ...(detail ? { detail } : {}),
+    ...(summary ? { summary } : {}),
+    ...(messages.length > 0 ? { messages } : {}),
+    ...(source ? { source } : {}),
     continuation:
       typeof result.continuation === "string" ||
       typeof result.continuation === "number"
@@ -942,12 +1521,65 @@ function typedReadResultFromWire(
       typeof result.schemaVersion === "string"
         ? result.schemaVersion
         : "chatgpt-chat-history-v1",
-    coverage: isCoverage(result.coverage) ? result.coverage : "unrecognized",
+    coverage:
+      shapeWarnings.length > 0 ||
+      (kind === "index" && !itemsAreValid) ||
+      (kind === "messages" && !itemsAreValid && !messagesAreValid)
+        ? "unrecognized"
+        : isCoverage(result.coverage)
+          ? result.coverage
+          : "unrecognized",
     warnings: Array.isArray(result.warnings)
-      ? result.warnings.filter((item): item is string => typeof item === "string")
-      : [],
+      ? [
+          ...shapeWarnings,
+          ...result.warnings.filter(
+            (item): item is string => typeof item === "string",
+          ),
+        ]
+      : shapeWarnings,
+    ...(typeof result.snapshotId === "string" || result.snapshotId === null
+      ? { snapshotId: result.snapshotId }
+      : {}),
+    ...(typeof result.nextCursor === "string" || result.nextCursor === null
+      ? { nextCursor: result.nextCursor }
+      : {}),
+    ...(typeof result.hasMore === "boolean"
+      ? { hasMore: result.hasMore }
+      : {}),
+    ...(typeof result.truncated === "boolean"
+      ? { truncated: result.truncated }
+      : {}),
+    ...(isRecord(result.coverageDetails)
+      ? { coverageDetails: result.coverageDetails }
+      : {}),
   } as unknown as Awaited<ReturnType<HistoryReader["listConversations"]>>;
-  return typedReadResult(normalized);
+  const typed = typedReadResult(normalized);
+  return {
+    ...typed,
+    ...(detail ? { detail: detail as unknown as ConversationDetailProjection } : {}),
+    ...(summary ? { summary: summary as unknown as ConversationSummary } : {}),
+    ...(messages.length > 0
+      ? { messages: messages as unknown as MessageRecord[] }
+      : {}),
+    ...(source
+      ? { source: source as unknown as import("../ledger/types.js").IngestContext }
+      : {}),
+    ...(typeof result.snapshotId === "string" || result.snapshotId === null
+      ? { snapshotId: result.snapshotId }
+      : {}),
+    ...(typeof result.nextCursor === "string" || result.nextCursor === null
+      ? { nextCursor: result.nextCursor }
+      : {}),
+    ...(typeof result.hasMore === "boolean"
+      ? { hasMore: result.hasMore }
+      : {}),
+    ...(typeof result.truncated === "boolean"
+      ? { truncated: result.truncated }
+      : {}),
+    ...(isRecord(result.coverageDetails)
+      ? { coverageDetails: result.coverageDetails }
+      : {}),
+  };
 }
 
 function pageFromWire<T>(
@@ -969,53 +1601,226 @@ function pageFromWire<T>(
 function parseConversationMetadata(
   result: Record<string, unknown>,
   conversationId: string,
-): {
-  summary: ConversationSummary;
-  messages?: MessageRecord[];
-  attempts?: import("../ledger/types.js").ReconstructedAttempt[];
-} {
+): HistoryMetadataPage {
+  const shapeWarnings: string[] = [];
   const summary = isRecord(result.summary)
     ? (result.summary as unknown as ConversationSummary)
     : null;
-  const items = Array.isArray(result.items)
-    ? result.items.filter(isRecord)
+  const rawItems = result.items;
+  if (rawItems !== undefined && !Array.isArray(rawItems)) {
+    shapeWarnings.push("retained_metadata_items_shape_invalid");
+  }
+  const items = Array.isArray(rawItems)
+    ? rawItems.filter(isRecord)
     : [];
+  if (Array.isArray(rawItems) && items.length !== rawItems.length) {
+    shapeWarnings.push("retained_metadata_items_shape_invalid");
+  }
   const firstSummary =
     summary ??
     (items.find(
       (item) => "conversationId" in item && "isArchived" in item,
     ) as unknown as ConversationSummary | undefined);
-  if (!firstSummary) {
-    throw new BoundedWorkerError("conversation_not_found", true, true);
+  const itemConversationIds = items
+    .flatMap((item) => {
+      const direct = item.conversationId;
+      const payload = isRecord(item.payload) ? item.payload.conversationId : undefined;
+      return [
+        ...(typeof direct === "string" ? [direct] : []),
+        ...(typeof payload === "string" ? [payload] : []),
+      ];
+    })
+    .filter((item, index, all) => all.indexOf(item) === index);
+  if (itemConversationIds.some((item) => item !== conversationId)) {
+    throw new BoundedWorkerError("protocol_invalid", false, true);
   }
-  const messages = Array.isArray(result.messages)
-    ? result.messages.filter(isRecord)
+  if (firstSummary && firstSummary.conversationId !== conversationId) {
+    throw new BoundedWorkerError("protocol_invalid", false, true);
+  }
+  const rawMessages = result.messages;
+  if (rawMessages !== undefined && !Array.isArray(rawMessages)) {
+    shapeWarnings.push("retained_metadata_messages_shape_invalid");
+  }
+  const messages = Array.isArray(rawMessages)
+    ? rawMessages.filter(isRecord)
     : items.flatMap((item) =>
         Array.isArray(item.messages)
           ? item.messages.filter(isRecord)
           : [],
       );
-  const attempts = Array.isArray(result.attempts)
-    ? result.attempts.filter(isRecord)
+  if (Array.isArray(rawMessages) && messages.length !== rawMessages.length) {
+    shapeWarnings.push("retained_metadata_messages_shape_invalid");
+  }
+  const rawAttempts = result.attempts;
+  if (rawAttempts !== undefined && !Array.isArray(rawAttempts)) {
+    shapeWarnings.push("retained_metadata_attempts_shape_invalid");
+  }
+  const attempts = Array.isArray(rawAttempts)
+    ? rawAttempts.filter(isRecord)
+    : undefined;
+  if (
+    Array.isArray(rawAttempts) &&
+    attempts !== undefined &&
+    attempts.length !== rawAttempts.length
+  ) {
+    shapeWarnings.push("retained_metadata_attempts_shape_invalid");
+  }
+  const source = isRecord(result.source)
+    ? (result.source as unknown as HistoryMetadataPage["source"])
     : undefined;
   return {
-    summary: {
-      ...firstSummary,
-      conversationId:
-        firstSummary.conversationId === conversationId
-          ? conversationId
-          : firstSummary.conversationId,
-    },
+    ...(firstSummary
+      ? {
+          summary: {
+            ...firstSummary,
+            conversationId,
+          },
+        }
+      : {}),
     ...(messages.length > 0
       ? { messages: messages as unknown as MessageRecord[] }
       : {}),
     ...(attempts
       ? {
           attempts:
-            attempts as unknown as import("../ledger/types.js").ReconstructedAttempt[],
+          attempts as unknown as import("../ledger/types.js").ReconstructedAttempt[],
         }
       : {}),
+    ...(items.length > 0 ? { items } : {}),
+    ...(source ? { source } : {}),
+    ...(typeof result.schemaVersion === "string"
+      ? { schemaVersion: result.schemaVersion }
+      : {}),
+    ...(isRecord(result.coverageDetails)
+      ? { coverageDetails: result.coverageDetails }
+      : {}),
+    ...(typeof result.snapshotId === "string" || result.snapshotId === null
+      ? { snapshotId: result.snapshotId }
+      : {}),
+    ...(typeof result.nextCursor === "string" || result.nextCursor === null
+      ? { nextCursor: result.nextCursor }
+      : {}),
+    ...(typeof result.hasMore === "boolean"
+      ? { hasMore: result.hasMore }
+      : {}),
+    ...(result.coverage === "complete" ||
+    result.coverage === "partial" ||
+    result.coverage === "unknown"
+      ? { coverage: result.coverage }
+      : {}),
+    ...(typeof result.truncated === "boolean"
+      ? { truncated: result.truncated }
+      : {}),
+    warnings: [
+      ...shapeWarnings,
+      ...(Array.isArray(result.warnings)
+        ? result.warnings.filter(
+            (item): item is string => typeof item === "string",
+          )
+        : []),
+    ],
   };
+}
+
+function reportSnapshotFromWire(
+  first: Record<string, unknown>,
+  accountId: string,
+  attempts: UsageReportSnapshot["attempts"],
+  truncated: boolean,
+  warnings: readonly string[],
+): UsageReportSnapshot {
+  if (
+    first.snapshotVersion !== 1 ||
+    first.collectorAccountId !== accountId ||
+    !isRecord(first.coverage)
+  ) {
+    throw new BoundedWorkerError("protocol_invalid", false, true);
+  }
+  const coverage = parseUsageCoverage(first.coverage);
+  if (truncated) {
+    coverage.overall = coverage.overall === "complete" ? "partial" : coverage.overall;
+    coverage.history =
+      coverage.history === "complete" ? "partial" : coverage.history;
+    coverage.gaps = [
+      ...new Set([...coverage.gaps, "report_snapshot_truncated", ...warnings]),
+    ];
+  }
+  const historyCoverage = isRecord(first.historyCoverage)
+    ? (first.historyCoverage as unknown as UsageReportSnapshot["historyCoverage"])
+    : undefined;
+  return {
+    snapshotVersion: 1,
+    collectorAccountId: accountId,
+    attempts,
+    coverage,
+    ...(historyCoverage ? { historyCoverage } : {}),
+  };
+}
+
+function parseUsageCoverage(
+  value: Record<string, unknown>,
+): UsageReportSnapshot["coverage"] {
+  const levels = ["history", "overall", "projects", "branches"] as const;
+  if (
+    levels.some(
+      (key) =>
+        value[key] !== "complete" &&
+        value[key] !== "partial" &&
+        value[key] !== "unknown",
+    ) ||
+    !Array.isArray(value.gaps) ||
+    value.gaps.some((gap) => typeof gap !== "string")
+  ) {
+    throw new BoundedWorkerError("protocol_invalid", false, true);
+  }
+  return {
+    history: value.history as UsageReportSnapshot["coverage"]["history"],
+    overall: value.overall as UsageReportSnapshot["coverage"]["overall"],
+    projects: value.projects as UsageReportSnapshot["coverage"]["projects"],
+    branches: value.branches as UsageReportSnapshot["coverage"]["branches"],
+    gaps: [...value.gaps],
+  };
+}
+
+function throwIfDomainBlocked(
+  result: Record<string, unknown>,
+  path: string,
+): void {
+  if (result.status !== "blocked" && result.status !== "unavailable") {
+    return;
+  }
+  if (result.reason === "authentication") {
+    throw new AuthenticationRequiredError(
+      `native Chat history authentication is required for ${path}`,
+      { status: 401, path },
+    );
+  }
+  if (result.reason === "cooldown") {
+    const retryAfterMs =
+      typeof result.retryAfterMs === "number" &&
+      Number.isFinite(result.retryAfterMs) &&
+      result.retryAfterMs >= 0
+        ? result.retryAfterMs
+        : null;
+    throw new RateLimitedError(
+      `native Chat history is rate limited for ${path}`,
+      {
+        ...(retryAfterMs === null
+          ? {}
+          : {
+              retryAfter: new Date(
+                Date.now() + retryAfterMs,
+              ).toISOString(),
+            }),
+        path,
+      },
+    );
+  }
+  throw new BoundedWorkerError(
+    "history_contract_unavailable",
+    true,
+    true,
+  );
 }
 
 function scheduleScope(envelope: CollectorRunEnvelope): ScheduleScope {
@@ -1035,6 +1840,7 @@ function completionFor(
     };
   },
   now: number,
+  reportIncomplete = false,
 ): CompleteTriggerRequest {
   const retryAfterMs =
     result.accountState.cooldownUntil === null
@@ -1047,7 +1853,7 @@ function completionFor(
     outcome:
       result.accountState.reason === "authentication"
         ? "authentication"
-        : result.status === "complete"
+        : result.status === "complete" && !reportIncomplete
           ? "success"
           : "failure",
     retryAfterMs,
@@ -1056,15 +1862,36 @@ function completionFor(
 
 function scopeFromWire(
   value: Record<string, unknown>,
-  accountId: string,
 ): LedgerScope {
+  if (
+    typeof value.collectorAccountId !== "string" ||
+    value.collectorAccountId.trim() === "" ||
+    typeof value.provider !== "string" ||
+    value.provider.trim() === "" ||
+    !isSurface(value.surface)
+  ) {
+    throw new BoundedWorkerError("history_contract_unavailable", true, true);
+  }
+  const nullableFields = [
+    "providerUserId",
+    "workspaceId",
+    "quotaOwnerId",
+  ] as const;
+  if (
+    nullableFields.some(
+      (field) =>
+        value[field] !== null && typeof value[field] !== "string",
+    )
+  ) {
+    throw new BoundedWorkerError("history_contract_unavailable", true, true);
+  }
   return {
-    collectorAccountId: accountId,
-    provider: String(value.provider ?? ""),
-    providerUserId: stringOrNull(value.providerUserId ?? value.provider_user_id),
-    workspaceId: stringOrNull(value.workspaceId ?? value.workspace_id),
-    quotaOwnerId: stringOrNull(value.quotaOwnerId ?? value.quota_owner_id),
-    surface: String(value.surface ?? "unknown") as LedgerScope["surface"],
+    collectorAccountId: value.collectorAccountId,
+    provider: value.provider,
+    providerUserId: value.providerUserId as string | null,
+    workspaceId: value.workspaceId as string | null,
+    quotaOwnerId: value.quotaOwnerId as string | null,
+    surface: value.surface,
   };
 }
 
@@ -1099,7 +1926,7 @@ function isControlMessage(value: unknown): value is WorkerControlMessage {
   return (
     isRecord(value) &&
     value.protocolVersion === WORKER_PROTOCOL_VERSION &&
-    (value.control === "cancelRun" || value.control === "prepareHistory")
+    value.control === "cancelRun"
   );
 }
 
@@ -1130,9 +1957,58 @@ function stringOrNull(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
-function positiveBound(value: unknown, fallback: number): number {
+function boundedValue(value: unknown, maximum: number, label: string): number {
   const parsed = Number(value);
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+  if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > maximum) {
+    throw new BoundedWorkerError("bounds_exceeded", true, true);
+  }
+  return parsed;
+}
+
+function requiredStateVersion(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new BoundedWorkerError("protocol_invalid", false, true);
+  }
+  return value as number;
+}
+
+function isWorkerErrorCode(value: unknown): value is WorkerErrorCode {
+  return (
+    value === "protocol_invalid" ||
+    value === "fence_invalid" ||
+    value === "state_conflict" ||
+    value === "history_contract_unavailable" ||
+    value === "history_reader_failed" ||
+    value === "bounds_exceeded" ||
+    value === "conversation_not_found" ||
+    value === "operation_unsupported" ||
+    value === "cancelled"
+  );
+}
+
+function isSurface(value: unknown): value is IdentityRecord["surface"] {
+  return (
+    value === "chat" ||
+    value === "work" ||
+    value === "codex" ||
+    value === "deep_research" ||
+    value === "agent_mode" ||
+    value === "voice" ||
+    value === "image_generation" ||
+    value === "unknown"
+  );
+}
+
+function isAuthState(value: unknown): value is IdentityRecord["authState"] {
+  return (
+    value === "unconfigured" ||
+    value === "ready" ||
+    value === "auth_required" ||
+    value === "identity_mismatch" ||
+    value === "browser_unavailable" ||
+    value === "schema_unavailable" ||
+    value === "paused"
+  );
 }
 
 function monotonicNow(): number {

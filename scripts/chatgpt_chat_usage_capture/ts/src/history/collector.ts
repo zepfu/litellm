@@ -46,6 +46,7 @@ import type {
   MessageRecord,
   PaginationState,
 } from "../contracts/records.js";
+import type { ReconstructedAttempt } from "../ledger/types.js";
 import { resolveRequestedRange } from "./range.js";
 
 interface Candidate {
@@ -64,6 +65,7 @@ interface ScopeDiscoveryResult {
 interface DetailAcquisition {
   detail: ConversationDetailProjection | null;
   messages: MessageRecord[];
+  retainedAttempts: ReconstructedAttempt[];
   revisit: RevisitEntry | null;
   coverage: AcquiredConversation["coverage"];
   warnings: string[];
@@ -95,7 +97,7 @@ export class HistoryCollector {
   private readonly maxIndexPagesPerScope: number;
   private readonly maxMessagePagesPerConversation: number;
   private readonly legacyFallbackApproved: boolean;
-  private readonly committedConversationIds = new Set<string>();
+  private readonly committedCompleteConversationIds = new Set<string>();
 
   constructor(
     private readonly reader: HistoryReader,
@@ -175,7 +177,7 @@ export class HistoryCollector {
       requestedRange = frozenAcquisition.range;
     }
 
-    const identity = await this.readIdentity();
+    const identity = await this.readIdentity(now);
 
     if (identity.authState !== "ready" || identity.surface !== "chat") {
       return blockedResult(
@@ -195,14 +197,31 @@ export class HistoryCollector {
     let pagesFetched = 0;
 
     for (const scope of ["active", "archived"] as const) {
-      const discovery = await this.discoverScopeDurable(
-        scope,
-        request,
-        requestedRange,
-        now,
-        scanStartedAt,
-        identity,
-      );
+      let discovery: ScopeDiscoveryResult;
+      try {
+        discovery = await this.discoverScopeDurable(
+          scope,
+          request,
+          requestedRange,
+          now,
+          scanStartedAt,
+          identity,
+        );
+      } catch (error) {
+        if (!isAccountBlockingError(error)) {
+          throw error;
+        }
+        await this.pauseAccount(error, now);
+        return blockedResult(
+          this.options.accountId,
+          request.mode,
+          requestedRange,
+          scanStartedAt,
+          identity,
+          errorCode(error),
+          this.options.store.loadAccountState(),
+        );
+      }
       scopeResults.push(discovery.coverage);
       pagesFetched += discovery.coverage.pagesFetched;
       warnings.push(...discovery.warnings);
@@ -247,14 +266,31 @@ export class HistoryCollector {
     let detailPagesFetched = 0;
     let blocked = false;
     for (const candidate of candidates.values()) {
-      const acquisition = await this.acquireConversation(
-        candidate,
-        now,
-        request,
-        identity,
-        scanStartedAt,
-        requestedRange,
-      );
+      let acquisition: DetailAcquisition;
+      try {
+        acquisition = await this.acquireConversation(
+          candidate,
+          now,
+          request,
+          identity,
+          scanStartedAt,
+          requestedRange,
+        );
+      } catch (error) {
+        if (!isAccountBlockingError(error)) {
+          throw error;
+        }
+        await this.pauseAccount(error, now);
+        return blockedResult(
+          this.options.accountId,
+          request.mode,
+          requestedRange,
+          scanStartedAt,
+          identity,
+          errorCode(error),
+          this.options.store.loadAccountState(),
+        );
+      }
       detailPagesFetched += acquisition.detailPagesFetched;
       blocked ||= acquisition.blocked;
       conversations.push({
@@ -303,10 +339,13 @@ export class HistoryCollector {
     };
   }
 
-  private async readIdentity(): Promise<IdentityRecord> {
+  private async readIdentity(now: Date): Promise<IdentityRecord> {
     try {
       return await this.reader.inspectSessionIdentity();
     } catch (error) {
+      if (isAccountBlockingError(error)) {
+        await this.pauseAccount(error, now);
+      }
       return {
         providerUserId: null,
         workspaceId: null,
@@ -516,6 +555,10 @@ export class HistoryCollector {
           pendingPage = { offset: 0, page: headPage };
         }
       } catch (error) {
+        if (isAccountBlockingError(error)) {
+          await this.pauseAccount(error, now);
+          throw error;
+        }
         warnings.push(`index_head_${errorCode(error)}`);
         status = "partial";
         paginationState = "unknown";
@@ -555,6 +598,10 @@ export class HistoryCollector {
             order: "updated",
           });
         } catch (error) {
+          if (isAccountBlockingError(error)) {
+            await this.pauseAccount(error, now);
+            throw error;
+          }
           warnings.push(`index_${errorCode(error)}`);
           status = "partial";
           paginationState = "unknown";
@@ -670,6 +717,10 @@ export class HistoryCollector {
           await saveCheckpoint(status, paginationState, continuation);
         }
       } catch (error) {
+        if (isAccountBlockingError(error)) {
+          await this.pauseAccount(error, now);
+          throw error;
+        }
         status = "partial";
         paginationState = "unknown";
         continuation = null;
@@ -801,6 +852,10 @@ export class HistoryCollector {
           order: "updated",
         });
       } catch (error) {
+        if (isAccountBlockingError(error)) {
+          await this.pauseAccount(error, now);
+          throw error;
+        }
         warnings.push(`older_history_audit_${errorCode(error)}`);
         state = {
           ...state,
@@ -915,6 +970,7 @@ export class HistoryCollector {
     const implicitUpperBound =
       request.mode === "incremental" && request.range === undefined;
     let retainedMessages: MessageRecord[] = [];
+    let retainedAttempts: ReconstructedAttempt[] = [];
     if (this.options.loadConversationMetadata) {
       try {
         const retained = await this.options.loadConversationMetadata(
@@ -922,14 +978,30 @@ export class HistoryCollector {
         );
         if (retained) {
           retainedMessages = dedupeMessages(retained.messages ?? []);
-          if (isMoreRecent(retained.summary.updatedAt, candidate.summary.updatedAt)) {
+          retainedAttempts = [...(retained.attempts ?? [])];
+          if (
+            retained.summary &&
+            isMoreRecent(retained.summary.updatedAt, candidate.summary.updatedAt)
+          ) {
             candidate.summary = retained.summary;
           }
+          if (retained.coverage !== "complete" || retained.truncated === true) {
+            warnings.push("retained_metadata_coverage_incomplete");
+          }
+          warnings.push(...(retained.warnings ?? []));
         }
       } catch (error) {
+        if (isAccountBlockingError(error)) {
+          await this.pauseAccount(error, now);
+          throw error;
+        }
         warnings.push(`retained_metadata_${errorCode(error)}`);
+        warnings.push("retained_metadata_evidence_unavailable");
       }
     }
+    const retainedMetadataIncomplete = warnings.some((warning) =>
+      warning.startsWith("retained_metadata_"),
+    );
     const existingRevisit =
       this.options.store
         .listRevisits()
@@ -957,7 +1029,7 @@ export class HistoryCollector {
       );
       const blockedByAccount = isAccountBlockingError(error);
       if (blockedByAccount) {
-        this.pauseAccount(error, now);
+        await this.pauseAccount(error, now);
       }
       await this.commitPage({
         accountId: this.options.accountId,
@@ -971,6 +1043,7 @@ export class HistoryCollector {
           retainedMessages,
           implicitUpperBound ? requestedRange.end : null,
         ),
+        retainedAttempts,
         coverage: "partial",
         warnings: [...warnings, `detail_${errorCode(error)}`],
         pageKind: "detail",
@@ -978,15 +1051,13 @@ export class HistoryCollector {
         nextContinuation: revisit.continuation,
         revisit,
       });
-      if (!blockedByAccount) {
-        this.pauseAccount(error, now);
-      }
       return {
         detail: null,
         messages: messagesBeforeExclusiveEnd(
           retainedMessages,
           implicitUpperBound ? requestedRange.end : null,
         ),
+        retainedAttempts,
         revisit,
         coverage: "partial",
         warnings: [...warnings, `detail_${errorCode(error)}`],
@@ -1003,7 +1074,28 @@ export class HistoryCollector {
     const continuationRevision = conversationRevision(detail);
     const detailReason = detailRevisitReason(detail);
     let detailRevisit = existingRevisit;
-    if (detailReason) {
+    const savedContinuationRevision = existingRevisit?.continuationRevision ?? null;
+    const savedContinuation = existingRevisit?.continuation ?? null;
+    const revisionChanged =
+      savedContinuation !== null &&
+      (savedContinuationRevision === null ||
+        savedContinuationRevision !== continuationRevision);
+    if (revisionChanged) {
+      warnings.push("conversation_revision_changed_restart");
+      detailRevisit = this.saveRevisit(
+        candidate,
+        now,
+        "bad_continuation",
+        0,
+        null,
+        existingRevisit,
+        {
+          continuation: null,
+          continuationRevision,
+          incrementAttempt: false,
+        },
+      );
+    } else if (detailReason) {
       detailRevisit = this.saveRevisit(
         candidate,
         now,
@@ -1017,27 +1109,6 @@ export class HistoryCollector {
         },
       );
     }
-    if (
-      detailRevisit !== null &&
-      detailRevisit.continuation !== null &&
-      detailRevisit.continuationRevision !== null &&
-      detailRevisit.continuationRevision !== continuationRevision
-    ) {
-      warnings.push("conversation_revision_changed_restart");
-      detailRevisit = this.saveRevisit(
-        candidate,
-        now,
-        "bad_continuation",
-        0,
-        null,
-        detailRevisit,
-        {
-          continuation: null,
-          continuationRevision,
-          incrementAttempt: false,
-        },
-      );
-    }
     if (detail.detailRoute === "legacy") {
       const revisit = this.finalizeRevisit(
         candidate,
@@ -1045,6 +1116,8 @@ export class HistoryCollector {
         messages,
         detailRevisit,
         detailReason,
+        0,
+        true,
       );
       await this.commitPage({
         accountId: this.options.accountId,
@@ -1055,8 +1128,11 @@ export class HistoryCollector {
         scopes: [...candidate.scopes].sort(),
         detail: { ...detail, messages, continuation: null },
         messages,
+        retainedAttempts,
         coverage:
-          revisit || detail.coverage !== "validated_page"
+          revisit ||
+          retainedMetadataIncomplete ||
+          detail.coverage !== "validated_page"
             ? "partial"
             : "complete",
         warnings: [
@@ -1074,12 +1150,15 @@ export class HistoryCollector {
       return {
         detail,
         messages,
+        retainedAttempts,
         revisit,
         coverage:
-          revisit || detail.coverage !== "validated_page"
+          revisit ||
+          retainedMetadataIncomplete ||
+          detail.coverage !== "validated_page"
             ? "partial"
             : "complete",
-        warnings: detail.warnings,
+        warnings: [...warnings, ...detail.warnings],
         detailPagesFetched: 0,
         blocked: false,
       };
@@ -1099,6 +1178,7 @@ export class HistoryCollector {
         scopes: [...candidate.scopes].sort(),
         detail: { ...detail, messages },
         messages,
+        retainedAttempts,
         coverage: "partial",
         warnings: [...warnings, ...detail.warnings],
         pageKind: "detail",
@@ -1124,13 +1204,17 @@ export class HistoryCollector {
       identity,
       scanStartedAt,
       implicitUpperBound ? requestedRange.end : null,
+      retainedAttempts,
     );
     return {
       detail: { ...detail, messages: pageResult.messages },
       messages: pageResult.messages,
+      retainedAttempts,
       revisit: pageResult.revisit,
       coverage:
-        pageResult.revisit || detail.coverage !== "validated_page"
+        pageResult.revisit ||
+        retainedMetadataIncomplete ||
+        detail.coverage !== "validated_page"
           ? "partial"
           : "complete",
       warnings: [...warnings, ...detail.warnings, ...pageResult.warnings],
@@ -1150,6 +1234,7 @@ export class HistoryCollector {
     identity: IdentityRecord,
     scanStartedAt: string,
     rangeEnd: string | null,
+    retainedAttempts: ReconstructedAttempt[],
   ): Promise<{
     messages: MessageRecord[];
     revisit: RevisitEntry | null;
@@ -1180,6 +1265,10 @@ export class HistoryCollector {
           },
         );
       } catch (error) {
+        if (isAccountBlockingError(error)) {
+          await this.pauseAccount(error, now);
+          throw error;
+        }
         const reason = classifyRevisitReason(error);
         warnings.push(`messages_${errorCode(error)}`);
         const revisit = this.saveRevisit(
@@ -1212,6 +1301,7 @@ export class HistoryCollector {
             warnings: [...detail.warnings, ...warnings],
           },
           messages: dedupeMessages(messages),
+          retainedAttempts,
           coverage: "partial",
           warnings: uniqueWarnings([...detail.warnings, ...warnings]),
           pageKind: "messages",
@@ -1283,6 +1373,9 @@ export class HistoryCollector {
             retainedPageReason ??
             pageRevisitReason,
           1,
+          page.coverage === "validated_page" &&
+            page.paginationState === "complete" &&
+            page.warnings.length === 0,
         );
         const pageWarnings = uniqueWarnings([...detail.warnings, ...warnings]);
         await this.commitPage({
@@ -1304,6 +1397,7 @@ export class HistoryCollector {
             warnings: pageWarnings,
           },
           messages: mergedMessages,
+          retainedAttempts,
           coverage: revisit ? "partial" : detail.coverage === "validated_page" && page.coverage === "validated_page" ? "complete" : "partial",
           warnings: pageWarnings,
           pageKind: "messages",
@@ -1363,6 +1457,7 @@ export class HistoryCollector {
             warnings: [...detail.warnings, ...warnings],
           },
           messages: mergedMessages,
+          retainedAttempts,
           coverage: "partial",
           warnings: uniqueWarnings([...detail.warnings, ...warnings]),
           pageKind: "messages",
@@ -1416,6 +1511,7 @@ export class HistoryCollector {
             warnings: [...detail.warnings, ...warnings],
           },
           messages: mergedMessages,
+          retainedAttempts,
           coverage: "partial",
           warnings: uniqueWarnings([...detail.warnings, ...warnings]),
           pageKind: "messages",
@@ -1469,6 +1565,7 @@ export class HistoryCollector {
               warnings: [...detail.warnings, ...warnings],
             },
             messages: mergedMessages,
+            retainedAttempts,
             coverage: "partial",
             warnings: uniqueWarnings([...detail.warnings, ...warnings]),
             pageKind: "messages",
@@ -1512,6 +1609,7 @@ export class HistoryCollector {
             warnings: [...detail.warnings, ...warnings],
           },
           messages: mergedMessages,
+          retainedAttempts,
           coverage: "partial",
           warnings: uniqueWarnings([...detail.warnings, ...warnings]),
           pageKind: "messages",
@@ -1577,6 +1675,7 @@ export class HistoryCollector {
           warnings: [...detail.warnings, ...warnings],
         },
         messages: mergedMessages,
+        retainedAttempts,
         coverage: "partial",
         warnings: uniqueWarnings([...detail.warnings, ...warnings]),
         pageKind: "messages",
@@ -1681,6 +1780,7 @@ export class HistoryCollector {
     existing: RevisitEntry | null,
     detailReason: RevisitReason | null,
     detailPagesFetched = 0,
+    clearMalformedPage = false,
   ): RevisitEntry | null {
     const reason = hasOutstandingGeneration(messages)
       ? "nonterminal_generation"
@@ -1700,6 +1800,21 @@ export class HistoryCollector {
         },
       );
     }
+    if (existing?.malformedPage && !clearMalformedPage) {
+      return this.saveRevisit(
+        candidate,
+        now,
+        existing.reason,
+        0,
+        existing.lastError,
+        existing,
+        {
+          continuation: existing.continuation,
+          continuationRevision: existing.continuationRevision,
+          incrementAttempt: false,
+        },
+      );
+    }
     this.options.store.completeRevisit(
       this.options.accountId,
       candidate.summary.conversationId,
@@ -1707,10 +1822,10 @@ export class HistoryCollector {
     return null;
   }
 
-  private pauseAccount(error: unknown, now: Date): void {
+  private async pauseAccount(error: unknown, now: Date): Promise<void> {
     const nowIso = now.toISOString();
     if (error instanceof AuthenticationRequiredError) {
-      this.setAccountState({
+      await this.setAccountState({
         status: "paused",
         reason: "authentication",
         pausedAt: nowIso,
@@ -1720,7 +1835,7 @@ export class HistoryCollector {
       return;
     }
     if (error instanceof RateLimitedError) {
-      this.setAccountState({
+      await this.setAccountState({
         status: "paused",
         reason: "cooldown",
         pausedAt: nowIso,
@@ -1730,10 +1845,10 @@ export class HistoryCollector {
     }
   }
 
-  private setAccountState(state: HistoryAccountState): void {
+  private async setAccountState(state: HistoryAccountState): Promise<void> {
     this.options.store.saveAccountState(state);
     if (this.options.onAccountStateCommit) {
-      void this.options.onAccountStateCommit(state);
+      await this.options.onAccountStateCommit(state);
     }
   }
 
@@ -1777,14 +1892,22 @@ export class HistoryCollector {
     };
     if (this.options.onPageCommit) {
       await this.options.onPageCommit(committedPage);
-      this.committedConversationIds.add(committedPage.summary.conversationId);
+      if (committedPage.coverage === "complete" && committedPage.revisit === null) {
+        this.committedCompleteConversationIds.add(
+          committedPage.summary.conversationId,
+        );
+      }
       return;
     }
     this.options.store.acknowledgeCandidates(
       committedPage.summary.conversationId,
       committedPage.scopes,
     );
-    this.committedConversationIds.add(committedPage.summary.conversationId);
+    if (committedPage.coverage === "complete" && committedPage.revisit === null) {
+      this.committedCompleteConversationIds.add(
+        committedPage.summary.conversationId,
+      );
+    }
   }
 
   private buildCoverage(
@@ -1836,7 +1959,9 @@ export class HistoryCollector {
     if (
       conversations.some(
         (conversation) =>
-          !this.committedConversationIds.has(conversation.summary.conversationId),
+          !this.committedCompleteConversationIds.has(
+            conversation.summary.conversationId,
+          ),
       )
     ) {
       gaps.push("uncommitted_conversation_details");

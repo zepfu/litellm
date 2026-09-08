@@ -5,8 +5,18 @@ import type {
   IdentityRecord,
   MessageRecord,
 } from "../contracts/records.js";
-import type { HistoryReader } from "../contracts/history.js";
-import type { BridgePageMutation, BridgeStateEnvelope } from "../history/bridge-checkpoints.js";
+import type {
+  HistoryDiscoveryPageCommit,
+  HistoryMetadataPage,
+  HistoryPageCommit,
+  HistoryReader,
+} from "../contracts/history.js";
+import type {
+  BridgeCandidateMutation,
+  BridgeCheckpointMutation,
+  BridgeCoverageMutation,
+  BridgeStateEnvelope,
+} from "../history/bridge-checkpoints.js";
 import type {
   IngestContext,
   LedgerScope,
@@ -87,6 +97,7 @@ export interface WorkerStartRun {
   scheduleOptions: Record<string, unknown>;
   collectionRequest: Record<string, unknown>;
   mapping: ModelMappingVersion;
+  reportRequest?: Record<string, unknown>;
   authenticationRecoveryRequested?: boolean;
   bounds: {
     maxFrameBytes: number;
@@ -140,13 +151,25 @@ export interface TypedReadResult {
   warnings: string[];
   schemaVersion?: string;
   records: Array<ConversationSummary | MessageRecord>;
+  source?: IngestContext;
+  snapshotId?: string | null;
+  nextCursor?: string | null;
+  hasMore?: boolean;
+  truncated?: boolean;
+  coverageDetails?: Record<string, unknown>;
 }
 
 export interface CommitPagePayload {
   pageCommitId: string;
-  expectedStateVersion?: number;
-  source?: IngestContext;
-  mutations: BridgePageMutation;
+  expectedStateVersion: number;
+  kind: "discovery" | "detail";
+  source: IngestContext;
+  discovery?: HistoryDiscoveryPageCommit;
+  page?: HistoryPageCommit;
+  attempts?: readonly ReconstructedAttempt[];
+  checkpointMutations?: BridgeCheckpointMutation;
+  candidateMutations?: readonly BridgeCandidateMutation[];
+  coverageMutations?: readonly BridgeCoverageMutation[];
 }
 
 export interface WorkerBounds {
@@ -181,15 +204,11 @@ export type WorkerBridge = {
     cursor?: string | null;
     limit?: number;
     snapshotId?: string | null;
-  }): Promise<{
-    summary: ConversationSummary;
-    messages?: MessageRecord[];
-    attempts?: ReconstructedAttempt[];
-    source?: IngestContext;
-  }>;
+  }): Promise<HistoryMetadataPage>;
   commitPage(payload: CommitPagePayload): Promise<{
     acknowledged: true;
-    stateVersion?: number;
+    stateVersion: number;
+    pageCommitId: string;
   }>;
   stateVersion?: number;
   loadReportSnapshot(request?: {
@@ -202,13 +221,13 @@ export type WorkerBridge = {
     triggerId: string;
     outcome: "success" | "failure" | "authentication";
     summary?: Record<string, unknown>;
-  }): Promise<{ finished: true; stateVersion?: number }>;
+  }): Promise<{ finished: true; stateVersion: number }>;
   cancel(payload: {
     expectedVersion: number;
     triggerId: string;
     outcome?: string;
     summary?: Record<string, unknown>;
-  }): Promise<{ cancelled: true; stateVersion?: number }>;
+  }): Promise<{ cancelled: true; stateVersion: number }>;
 };
 
 export interface PreparedHistory {

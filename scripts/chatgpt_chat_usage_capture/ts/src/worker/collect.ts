@@ -4,13 +4,19 @@ import type {
   AcquiredConversation,
   HistoryCollectionRequest,
   HistoryCollectionResult,
+  HistoryMetadataPage,
   HistoryReader,
 } from "../contracts/history.js";
 import type {
   ConversationSummary,
   MessageRecord,
 } from "../contracts/records.js";
-import type { LedgerScope, ModelMappingVersion } from "../ledger/types.js";
+import type {
+  IngestContext,
+  LedgerScope,
+  ModelMappingVersion,
+  ReconstructedAttempt,
+} from "../ledger/types.js";
 import { reconstructAttempts } from "../normalize/reconstruct.js";
 import type {
   BridgeCandidateMutation,
@@ -27,6 +33,8 @@ import type {
   WorkerBounds,
 } from "./contracts.js";
 import { DEFAULT_WORKER_BOUNDS } from "./contracts.js";
+
+const MAX_METADATA_PAGES = 100;
 
 export interface CollectorRunContext {
   envelope: CollectorRunEnvelope;
@@ -53,7 +61,6 @@ export async function runBoundedCollector(
   let requestCount = 0;
   let bytesRead = 0;
   let bridgeStateVersion = 0;
-  let stateChanged = false;
   const account = context.envelope.collectorAccountId;
   const store = new BridgeCheckpointStore();
 
@@ -65,9 +72,21 @@ export async function runBoundedCollector(
     return result;
   };
 
-  const initial = await bridgeCall(() =>
+  const header = await bridgeCall(() =>
     context.bridge.loadState({ kind: "header" }),
   );
+  let initial = header;
+  if (header !== null) {
+    initial = await bridgeCall(() =>
+      context.bridge.loadState({
+        kind: "candidates",
+        expectedStateVersion: header.stateVersionCounter,
+      }),
+    );
+  }
+  if (initial !== null && initial.queueCoverage !== "complete") {
+    throw new BoundedWorkerError("bounds_exceeded", true, true);
+  }
   store.hydrate(initial);
   bridgeStateVersion = initial?.stateVersionCounter ?? 0;
 
@@ -93,28 +112,50 @@ export async function runBoundedCollector(
     queueMutations: readonly BridgeCandidateMutation[],
   ): Promise<void> => {
     const expectedStateVersion = bridgeStateVersion;
+    const source = mutation.source;
+    if (!source) {
+      throw new BoundedWorkerError("protocol_invalid", false, true);
+    }
+    const kind = mutation.discovery
+      ? "discovery"
+      : mutation.page
+        ? "detail"
+        : "discovery";
+    if (
+      (kind === "discovery" && mutation.page !== undefined) ||
+      (kind === "detail" && mutation.discovery !== undefined)
+    ) {
+      throw new BoundedWorkerError("protocol_invalid", false, true);
+    }
     const acknowledgment = await bridgeCall(() =>
       context.bridge.commitPage({
         pageCommitId: mutation.pageCommitId,
         expectedStateVersion,
-        ...(mutation.source ? { source: mutation.source } : {}),
-        mutations: {
-          ...mutation,
-          expectedStateVersion,
-          checkpointMutations: {
-            kind: "history",
-            value: store.snapshot(account, expectedStateVersion),
-          },
-          candidateMutations: queueMutations,
+        kind,
+        source,
+        ...(mutation.discovery ? { discovery: mutation.discovery } : {}),
+        ...(mutation.page ? { page: mutation.page } : {}),
+        ...(mutation.attempts ? { attempts: mutation.attempts } : {}),
+        checkpointMutations: {
+          kind: "history",
+          value: store.snapshot(account, expectedStateVersion, "complete"),
         },
+        candidateMutations: queueMutations,
+        ...(mutation.coverageMutations
+          ? { coverageMutations: mutation.coverageMutations }
+          : {}),
       }),
     );
-    bridgeStateVersion =
-      typeof acknowledgment.stateVersion === "number"
-        ? acknowledgment.stateVersion
-        : expectedStateVersion + 1;
+    if (
+      acknowledgment.acknowledged !== true ||
+      !Number.isSafeInteger(acknowledgment.stateVersion) ||
+      acknowledgment.stateVersion <= expectedStateVersion ||
+      acknowledgment.pageCommitId !== mutation.pageCommitId
+    ) {
+      throw new BoundedWorkerError("protocol_invalid", false, true);
+    }
+    bridgeStateVersion = acknowledgment.stateVersion;
     store.acknowledgeQueueMutations(queueMutations);
-    stateChanged = true;
     assertBounds(requestCount, bytesRead, bounds, signal);
   };
 
@@ -124,13 +165,139 @@ export async function runBoundedCollector(
     ...context.request,
     scope: context.scope,
     mapping: context.mapping,
-    loadConversationMetadata: (conversationId) =>
-      bridgeCall(() =>
-        context.bridge.loadConversationMetadata({
-          conversationId,
-          limit: 64,
-        }),
-      ),
+    loadConversationMetadata: async (
+      conversationId,
+    ): Promise<HistoryMetadataPage | null> => {
+      let cursor: string | null = null;
+      let snapshotId: string | null = null;
+      let first: HistoryMetadataPage | null = null;
+      const messages: MessageRecord[] = [];
+      const attempts: ReconstructedAttempt[] = [];
+      const items: Array<Record<string, unknown>> = [];
+      const warnings: string[] = [];
+      const seenCursors = new Set<string>();
+      let coverage: HistoryMetadataPage["coverage"] = "complete";
+      let truncated = false;
+      let source: HistoryMetadataPage["source"];
+      let schemaVersion: string | undefined;
+      let coverageDetails: Record<string, unknown> | undefined;
+      let expectedSnapshotId: string | null | undefined;
+      let sourceInitialized = false;
+      let schemaInitialized = false;
+      let snapshotInitialized = false;
+
+      for (let page = 0; page < MAX_METADATA_PAGES; page += 1) {
+        const current = await bridgeCall(() =>
+          context.bridge.loadConversationMetadata({
+            conversationId,
+            limit: 256,
+            cursor,
+            snapshotId,
+          }),
+        );
+        first ??= current;
+        if (!snapshotInitialized) {
+          expectedSnapshotId = current.snapshotId;
+          snapshotInitialized = true;
+        } else if (current.snapshotId !== expectedSnapshotId) {
+          warnings.push("retained_metadata_snapshot_changed");
+          coverage = "partial";
+          truncated = true;
+          break;
+        }
+        if (current.snapshotId !== undefined) {
+          snapshotId = current.snapshotId;
+        }
+        items.push(...(current.items ?? []));
+        messages.push(...(current.messages ?? []));
+        attempts.push(...(current.attempts ?? []));
+        warnings.push(...(current.warnings ?? []));
+        if (!sourceInitialized) {
+          source = current.source;
+          sourceInitialized = true;
+        } else if (!sameValue(source, current.source)) {
+          warnings.push("retained_metadata_source_changed");
+          coverage = "partial";
+        }
+        if (!schemaInitialized) {
+          schemaVersion = current.schemaVersion;
+          schemaInitialized = true;
+        } else if (schemaVersion !== current.schemaVersion) {
+          warnings.push("retained_metadata_schema_changed");
+          coverage = "partial";
+        }
+        coverageDetails ??= current.coverageDetails;
+        if (coverageDetails && current.coverageDetails) {
+          coverageDetails = {
+            ...coverageDetails,
+            ...current.coverageDetails,
+          };
+        }
+        if (current.coverage === "unknown") {
+          coverage = "unknown";
+        } else if (current.coverage !== "complete" && coverage !== "unknown") {
+          coverage = "partial";
+        }
+        truncated ||= current.truncated === true;
+        if (current.hasMore === false) {
+          if (current.nextCursor !== undefined && current.nextCursor !== null) {
+            warnings.push("retained_metadata_contradictory_continuation");
+            coverage = "partial";
+            truncated = true;
+          }
+          break;
+        }
+        if (current.hasMore !== true) {
+          warnings.push("retained_metadata_missing_continuation_state");
+          coverage = "partial";
+          truncated = true;
+          break;
+        }
+
+        const nextCursor = current.nextCursor ?? null;
+        const nextSnapshot: string | null =
+          current.snapshotId ?? snapshotId;
+        if (
+          nextCursor === null ||
+          nextSnapshot === null ||
+          seenCursors.has(nextCursor)
+        ) {
+          warnings.push("retained_metadata_invalid_continuation");
+          coverage = "partial";
+          truncated = true;
+          break;
+        }
+        seenCursors.add(nextCursor);
+        cursor = nextCursor;
+        snapshotId = nextSnapshot;
+        if (page === MAX_METADATA_PAGES - 1) {
+          warnings.push("retained_metadata_page_budget_exhausted");
+          coverage = "partial";
+          truncated = true;
+        }
+      }
+
+      if (!first) {
+        return null;
+      }
+      return {
+        ...first,
+        ...(items.length > 0 ? { items } : {}),
+        ...(messages.length > 0 ? { messages } : {}),
+        ...(attempts.length > 0 ? { attempts } : {}),
+        ...(source ? { source } : {}),
+        ...(schemaVersion ? { schemaVersion } : {}),
+        ...(coverageDetails ? { coverageDetails } : {}),
+        ...(warnings.length > 0
+          ? { warnings: [...new Set(warnings)] }
+          : {}),
+        coverage,
+        truncated,
+        snapshotId,
+        nextCursor: cursor,
+        hasMore: truncated,
+      };
+    },
     onDiscoveryPageCommit: async (page) => {
       const source = sourceFor(
         context.envelope.runId,
@@ -143,14 +310,6 @@ export async function runBoundedCollector(
         scopes: [page.checkpoint.scope],
         source,
         discovery: page,
-        observations: [
-          {
-            payload: {
-              kind: "history_discovery_page",
-              ...page,
-            },
-          },
-        ],
       } satisfies BridgePageMutation;
       await commitMutation(mutation, store.pendingQueueMutationsSnapshot());
     },
@@ -161,11 +320,14 @@ export async function runBoundedCollector(
         `${page.summary.conversationId}:${page.pageKind}:${page.pageNumber}`,
         page.scanStartedAt,
       );
-      const attempts = reconstructAttempts(page.messages, {
-        scope: context.scope,
-        conversationId: page.summary.conversationId,
-        mapping: context.mapping,
-      });
+      const attempts = mergeAttempts(
+        reconstructAttempts(page.messages, {
+          scope: context.scope,
+          conversationId: page.summary.conversationId,
+          mapping: context.mapping,
+        }),
+        page.retainedAttempts ?? [],
+      );
       const mutation = {
         pageCommitId: stablePageCommitId("page", context.envelope.runId, page),
         conversationId: page.summary.conversationId,
@@ -173,32 +335,30 @@ export async function runBoundedCollector(
         source,
         page,
         attempts,
-        observations: [
-          {
-            payload: {
-              kind: "history_page",
-              ...page,
-            },
-          },
-        ],
         coverageMutations: [coverageMutationFor(page, source)],
       } satisfies BridgePageMutation;
       await commitMutation(mutation, store.pendingQueueMutationsSnapshot());
+    },
+    onAccountStateCommit: async () => {
+      const expectedStateVersion = bridgeStateVersion;
+      const acknowledgment = await bridgeCall(() =>
+        context.bridge.compareAndSetState({
+          expectedStateVersion,
+          next: store.snapshot(account, expectedStateVersion, "complete"),
+        }),
+      );
+      if (
+        !Number.isSafeInteger(acknowledgment.stateVersion) ||
+        acknowledgment.stateVersion <= expectedStateVersion
+      ) {
+        throw new BoundedWorkerError("protocol_invalid", false, true);
+      }
+      bridgeStateVersion = acknowledgment.stateVersion;
     },
   });
 
   try {
     const result = await withAbort(collector.collect(context.request), signal);
-    if (stateChanged) {
-      const finalState = store.snapshot(account, bridgeStateVersion);
-      const acknowledgment = await bridgeCall(() =>
-        context.bridge.compareAndSetState({
-          expectedStateVersion: bridgeStateVersion,
-          next: finalState,
-        }),
-      );
-      bridgeStateVersion = acknowledgment.stateVersion;
-    }
     return {
       result,
       requestCount,
@@ -292,6 +452,24 @@ function canonicalize(value: unknown): unknown {
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([key, item]) => [key, canonicalize(item)]),
   );
+}
+
+function sameValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(canonicalize(left)) === JSON.stringify(canonicalize(right));
+}
+
+function mergeAttempts(
+  current: readonly ReconstructedAttempt[],
+  retained: readonly ReconstructedAttempt[],
+): ReconstructedAttempt[] {
+  const byId = new Map<string, ReconstructedAttempt>();
+  for (const attempt of retained) {
+    byId.set(attempt.attemptId, attempt);
+  }
+  for (const attempt of current) {
+    byId.set(attempt.attemptId, attempt);
+  }
+  return [...byId.values()];
 }
 
 export class BoundedWorkerError extends Error {

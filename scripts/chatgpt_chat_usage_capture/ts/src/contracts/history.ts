@@ -185,6 +185,7 @@ export interface HistoryPageCommit {
   scopes: HistoryScope[];
   detail: ConversationDetailProjection | null;
   messages: MessageRecord[];
+  retainedAttempts?: ReconstructedAttempt[];
   coverage: AcquiredConversation["coverage"];
   warnings: string[];
   pageKind: "detail" | "messages";
@@ -193,6 +194,26 @@ export interface HistoryPageCommit {
   revisit: RevisitEntry | null;
   accountState: HistoryAccountState;
   source?: IngestContext;
+}
+
+/**
+ * A parent-owned retained-history page. Snapshot and coverage fields are
+ * preserved so a bounded or incomplete read cannot become false complete data.
+ */
+export interface HistoryMetadataPage {
+  summary?: ConversationSummary;
+  items?: Array<Record<string, unknown>>;
+  messages?: MessageRecord[];
+  attempts?: ReconstructedAttempt[];
+  source?: IngestContext;
+  schemaVersion?: string;
+  coverageDetails?: Record<string, unknown>;
+  snapshotId?: string | null;
+  nextCursor?: string | null;
+  hasMore?: boolean;
+  coverage?: "complete" | "partial" | "unknown";
+  truncated?: boolean;
+  warnings?: string[];
 }
 
 export interface HistoryReader {
@@ -253,11 +274,7 @@ export interface HistoryCollectionOptions {
   mapping?: ModelMappingVersion;
   loadConversationMetadata?: (
     conversationId: string,
-  ) => Promise<{
-    summary: ConversationSummary;
-    messages?: MessageRecord[];
-    attempts?: ReconstructedAttempt[];
-  } | null>;
+  ) => Promise<HistoryMetadataPage | null>;
 }
 
 export interface ScopeCoverageResult {

@@ -54,9 +54,7 @@ export interface BridgePageMutation {
   source?: IngestContext;
   discovery?: HistoryDiscoveryPageCommit;
   page?: HistoryPageCommit;
-  observations?: readonly Record<string, unknown>[];
   attempts?: readonly ReconstructedAttempt[];
-  ingestOperations?: readonly Record<string, unknown>[];
   checkpointMutations?: BridgeCheckpointMutation;
   candidateMutations?: readonly BridgeCandidateMutation[];
   coverageMutations?: readonly BridgeCoverageMutation[];
@@ -89,6 +87,13 @@ export class BridgeCheckpointStore implements HistoryCheckpointStore {
       this.discovery.clear();
       this.revisits.clear();
       this.pendingQueueMutations.clear();
+      this.accountState = {
+        status: "ready",
+        reason: null,
+        pausedAt: null,
+        cooldownUntil: null,
+        lastError: null,
+      };
       return;
     }
     validateEnvelope(state);
@@ -221,6 +226,7 @@ export class BridgeCheckpointStore implements HistoryCheckpointStore {
   snapshot(
     collectorAccountId: string,
     stateVersionCounter: number,
+    queueCoverage: "complete" | "partial" = "partial",
   ): BridgeStateEnvelope {
     const discovery: Partial<Record<HistoryScope, DiscoveryCheckpoint>> = {};
     for (const scope of ["active", "archived"] as const) {
@@ -238,7 +244,7 @@ export class BridgeCheckpointStore implements HistoryCheckpointStore {
       discovery,
       revisits: this.listRevisits(),
       accountState: clone(this.accountState),
-      queueCoverage: "complete",
+      queueCoverage,
     };
   }
 
@@ -284,7 +290,7 @@ export class BridgeCheckpointStore implements HistoryCheckpointStore {
           operation: "replace",
           queueKind: "candidate",
           scope,
-          payload: { candidate },
+          payload: { candidate, scope },
         },
       );
     }
