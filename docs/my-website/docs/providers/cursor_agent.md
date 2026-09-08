@@ -115,6 +115,34 @@ sidecar does not execute or depend on the Cursor CLI. If no exchangeable
 or unusable access token. Optional usage polling remains disabled and is not
 auth-refresh evidence.
 
+## Stock Codex child agents
+
+Stock Codex child-agent requests arrive from Cursor as ExecServerMessage field
+28 (`SubagentArgs`). LiteLLM bridges the portable fields to the advertised
+`spawn_agent` tool:
+
+| SubagentArgs field | spawn_agent argument |
+|---|---|
+| `subagent_type` | `agent_type` |
+| `model_id` | `model` |
+| `prompt` | `message` |
+| `readonly` | `readonly` |
+
+When Cursor advertises `spawn_agent`, its input schema must be an object with
+`properties`. The bridged properties must use the canonical names above, declare
+the matching scalar types, and accept the requested values. Required properties
+that cannot be represented, ambiguous schema definitions, invalid schema
+payloads, and explicit `readonly` values that the schema cannot represent are
+rejected before child dispatch. Without an advertised schema, LiteLLM uses the
+canonical argument names.
+
+Unsupported subagent fields and schema failures are deterministic candidate
+ineligibility (`aawm_codex_auto_agent_candidate_ineligible`) with no candidate
+cooldown. LiteLLM does not forward unsupported child-agent context such as
+credentials, resume/fork state, selected context, parent state, environment,
+or model parameters. Protocol framing and transport failures remain separate
+upstream errors.
+
 ## What this is not
 
 - Cloud Agents `/v0/agents` on `https://api.cursor.com`

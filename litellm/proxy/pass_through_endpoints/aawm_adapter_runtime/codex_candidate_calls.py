@@ -71,6 +71,11 @@ _CURSOR_REQUEST_SCHEMA_REJECTION_CATEGORIES = frozenset(
 _CURSOR_REQUEST_SCHEMA_REJECTION_OBJECT_TYPES = frozenset(
     {"function_call", "function_call_output", "object", "unknown"}
 )
+_CURSOR_SUBAGENT_SCHEMA_REJECTION_PREFIXES = (
+    "Cursor Agent advertised ",
+    "Cursor Agent subagent operation requires the advertised spawn_agent tool.",
+    "Cursor Agent subagent operation requests readonly execution, ",
+)
 _CURSOR_REQUEST_SCHEMA_SAFE_KEYS = frozenset(
     {
         "arguments",
@@ -3583,6 +3588,9 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
     to the ``aawm_codex_auto_agent_candidate_ineligible`` contract so the
     candidate loop records a no-cooldown ineligibility instead of a transient
     upstream retry.
+    Advertised ``spawn_agent`` schema failures use the same deterministic
+    ineligibility contract; malformed Connect framing and transport failures
+    remain on their existing upstream error paths.
     Transport/upstream 500/502/503/529 keep their status and map to the
     existing transient/timeout classification so a Cursor blip advances to
     the next candidate instead of publishing a durable candidate cooldown.
@@ -3706,6 +3714,14 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
         attempted_provider_call = True
         ineligibility_summary = (
             "the Cursor Agent session requested an unsupported operation"
+        )
+    elif isinstance(exc, CursorConnectProtocolError) and message.startswith(
+        _CURSOR_SUBAGENT_SCHEMA_REJECTION_PREFIXES
+    ):
+        attempted_provider_call = True
+        ineligibility_summary = (
+            "the Cursor Agent session advertised an unsupported "
+            "spawn_agent schema"
         )
     if isinstance(exc, _CursorPostEgressOutputError):
         error_message = (
