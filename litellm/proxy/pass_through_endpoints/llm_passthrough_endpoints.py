@@ -3670,6 +3670,26 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             ),
         )
 
+    def _record_authenticated_token_pin_nonportable_rejection() -> None:
+        if not isinstance(candidate, dict):
+            return
+        _aawm_selection._plan_codex_oauth_account_failover(
+            request,
+            candidate=candidate,
+            selection=selection,
+            attempt_record=retry_attempt_record,
+            error_class=error_class,
+            has_continuation_state=has_continuation_state,
+            has_previous_response_id=bool(
+                request_body.get("previous_response_id")
+            ),
+            has_account_bound_state=True,
+            account_failover_replay_safe=False,
+            provider_status_code=retry_attempt_record.get(
+                "error_status_code"
+            ),
+        )
+
     if is_token_invalidated and isinstance(candidate, dict):
         account_label = str(candidate.get("codex_oauth_account_label") or "")
         account_hash = str(candidate.get("codex_oauth_account_hash") or "")
@@ -3738,6 +3758,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
         and not account_failover_replay_safe
     ):
         if authenticated_token_pin:
+            _record_authenticated_token_pin_nonportable_rejection()
             _raise_authenticated_continuation_unavailable(
                 failure_phase="token_invalidated_continuation",
             )
