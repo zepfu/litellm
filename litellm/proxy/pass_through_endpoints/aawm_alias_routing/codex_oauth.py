@@ -1866,6 +1866,9 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         extra_fields={
             "openai_passthrough_route_family": "codex_responses",
             "codex_oauth_direct_inventory": True,
+            "codex_oauth_quota_balancing": selected_state.get(
+                "quota_balancing",
+            ),
             "codex_oauth_account_label": selected_auth.account_label,
             "codex_oauth_account_hash": selected_auth.account_hash,
             "codex_oauth_lane_key": selected_auth.lane_key,
