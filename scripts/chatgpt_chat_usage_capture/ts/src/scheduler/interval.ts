@@ -6,7 +6,7 @@ export interface ParsedRefreshInterval {
 }
 
 const INTERVAL_PATTERN = /^PT(?:(\d+)H)?(?:(\d+)M)?$/;
-const MINIMUM_INTERVAL_MS = 60_000;
+const MINIMUM_INTERVAL_MS = 300_000;
 
 export function parseRefreshInterval(
   value: string = DEFAULT_REFRESH_INTERVAL,
@@ -30,7 +30,7 @@ export function parseRefreshInterval(
   if (milliseconds < MINIMUM_INTERVAL_MS) {
     throw new SchedulerTransitionError(
       "invalid_request",
-      "interval must be at least one minute",
+      "interval must be at least five minutes",
     );
   }
   return { spec: formatInterval(milliseconds), milliseconds };
@@ -40,7 +40,7 @@ export function formatInterval(milliseconds: number): string {
   if (!Number.isSafeInteger(milliseconds) || milliseconds < MINIMUM_INTERVAL_MS) {
     throw new SchedulerTransitionError(
       "invalid_request",
-      "interval must be a safe integer of at least one minute",
+      "interval must be a safe integer of at least five minutes",
     );
   }
   const hours = Math.floor(milliseconds / 3_600_000);

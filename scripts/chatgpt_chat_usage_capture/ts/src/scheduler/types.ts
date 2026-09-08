@@ -22,6 +22,7 @@ export interface SchedulePending {
   readonly kind: TriggerKind;
   readonly missedCount: number;
   readonly requestedAt: number;
+  readonly triggerId?: string;
 }
 
 export type TriggerKind = "scheduled" | "manual" | "coalesced";

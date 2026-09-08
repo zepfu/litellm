@@ -61,21 +61,11 @@ export function requestRefresh(
 ): RefreshRequestResult {
   validateScope(state.scope);
   validateEpoch(context.at, "at");
-  if (state.active !== null) {
-    return { queued: true, coalesced: true, state };
-  }
   const pending = combinePending(state.pending, { kind: "manual", missedCount: 0 });
   return {
     queued: true,
-    coalesced: state.pending !== null,
-    state: {
-      ...state,
-      pending: {
-        kind: pending.kind,
-        missedCount: pending.missedCount,
-        requestedAt: state.pending?.requestedAt ?? context.at,
-      },
-    },
+    coalesced: state.active !== null || state.pending !== null,
+    state: withPending(state, pending, state.pending?.requestedAt ?? context.at),
   };
 }
 
@@ -87,7 +77,7 @@ export function claimTrigger(
   validateScope(state.scope);
   validateEpoch(context.at, "at");
   validateNonNegativeInteger(fencingToken, "fencingToken");
-  if ((state.authPausedUntil !== null && state.authPausedUntil > context.at) ||
+  if (state.authPausedUntil !== null ||
       (state.retryNotBefore !== null && state.retryNotBefore > context.at) ||
       (state.serverRetryNotBefore !== null && state.serverRetryNotBefore > context.at)) {
     return null;
@@ -119,7 +109,7 @@ export function claimTrigger(
     return null;
   }
   const trigger: ActiveTrigger = {
-    triggerId: `scheduled-${state.nextTickIndex}-${context.at}`,
+    triggerId: state.pending?.triggerId ?? `scheduled-${state.nextTickIndex}-${context.at}`,
     kind: triggerKindForClaim(state.pending, dueCount),
     missedCount: (state.pending?.missedCount ?? 0) + dueCount,
     dueAt: dueCount > 0 ? state.nextDueAt : null,
@@ -159,6 +149,7 @@ export function completeTrigger(
     return { applied: false, state };
   }
 
+  const serverRetryDeadline = retryDeadline(context.at, request.retryAfterMs);
   let failureStreak = state.failureStreak;
   let retryNotBefore = state.retryNotBefore;
   let serverRetryNotBefore = state.serverRetryNotBefore;
@@ -171,19 +162,19 @@ export function completeTrigger(
     authPausedUntil = null;
   } else {
     failureStreak = Math.min(MAX_FAILURE_STREAK, failureStreak + 1);
-    retryNotBefore = context.at + retryBackoffMs(failureStreak);
-    pending = pending ?? {
-      kind: state.active.kind,
-      missedCount: 1,
-      requestedAt: context.at,
-    };
-    if (request.retryAfterMs !== null) {
-      serverRetryNotBefore = request.retryAfterMs;
-    }
+    retryNotBefore = addDuration(context.at, retryBackoffMs(failureStreak), "retry backoff");
+    pending = pendingWithRequestedAt(
+      combinePending(state.pending, {
+        kind: state.active.kind,
+        missedCount: Math.max(1, state.active.missedCount),
+        triggerId: state.active.triggerId,
+      }),
+      state.pending?.requestedAt ?? context.at,
+    );
+    serverRetryNotBefore = laterDeadline(serverRetryNotBefore, serverRetryDeadline);
   }
   if (request.outcome === "authentication") {
     authPausedUntil = Number.MAX_SAFE_INTEGER;
-    serverRetryNotBefore = request.retryAfterMs;
   }
 
   return {
@@ -201,6 +192,24 @@ export function completeTrigger(
   };
 }
 
+export function recoverAuthentication(
+  state: ScheduleState,
+  context: ScheduleContext,
+): ScheduleMutationResult {
+  validateScope(state.scope);
+  validateEpoch(context.at, "at");
+  if (state.authPausedUntil === null) {
+    return { applied: false, state };
+  }
+  return {
+    applied: true,
+    state: {
+      ...state,
+      authPausedUntil: null,
+    },
+  };
+}
+
 export function materializeDue(
   state: ScheduleState,
   context: ScheduleContext,
@@ -211,16 +220,20 @@ export function materializeDue(
   }
   const pending = combinePending(state.pending, { kind: "scheduled", missedCount: dueCount });
   const nextTickIndex = state.nextTickIndex + dueCount;
-  return {
-    ...state,
-    nextTickIndex,
-    nextDueAt: scheduledDueAt(state.anchorAt, state.intervalMs, nextTickIndex, state.jitterMs),
-    pending: {
-      kind: pending.kind,
-      missedCount: pending.missedCount,
-      requestedAt: state.pending?.requestedAt ?? context.at,
+  return withPending(
+    {
+      ...state,
+      nextTickIndex,
+      nextDueAt: scheduledDueAt(
+        state.anchorAt,
+        state.intervalMs,
+        nextTickIndex,
+        state.jitterMs,
+      ),
     },
-  };
+    pending,
+    state.pending?.requestedAt ?? context.at,
+  );
 }
 
 export function reconcileSchedule(
@@ -228,33 +241,80 @@ export function reconcileSchedule(
   options: ScheduleOptions,
   context: ScheduleContext,
 ): ScheduleState {
+  validateScope(state.scope);
+  validateEpoch(context.at, "at");
+  const caughtUp = materializeDue(state, context);
   const interval = parseRefreshInterval(options.interval ?? state.interval);
   const jitterSeconds = validateJitterSeconds(options.jitterSeconds ?? state.jitterSeconds);
   const anchorAt = validateEpoch(options.anchorAt ?? state.anchorAt, "anchorAt");
-  const jitterMs = options.jitterSeconds === undefined
-    ? state.jitterMs
-    : sampleJitter(jitterSeconds);
-  const nextTickIndex = firstFutureTickIndex(anchorAt, interval.milliseconds, jitterMs, context.at);
-  return {
-    ...state,
+  const intervalChanged = interval.milliseconds !== state.intervalMs;
+  const anchorChanged = anchorAt !== state.anchorAt;
+  const jitterChanged = jitterSeconds !== state.jitterSeconds;
+  if (!intervalChanged && !anchorChanged && !jitterChanged) {
+    return caughtUp;
+  }
+
+  const jitterMs = jitterChanged ? sampleJitter(jitterSeconds) : state.jitterMs;
+  const nextTickIndex = anchorChanged ? 1 : caughtUp.nextTickIndex;
+  const reconfigured = {
+    ...caughtUp,
     interval: interval.spec,
     intervalMs: interval.milliseconds,
     anchorAt,
     jitterSeconds,
     jitterMs,
     nextTickIndex,
-    nextDueAt: scheduledDueAt(anchorAt, interval.milliseconds, nextTickIndex, jitterMs),
+    nextDueAt: scheduledDueAt(
+      anchorAt,
+      interval.milliseconds,
+      nextTickIndex,
+      jitterMs,
+    ),
   };
+  return materializeDue(reconfigured, context);
 }
 
 function combinePending(
   current: SchedulePending | null,
-  incoming: Pick<SchedulePending, "kind" | "missedCount">,
+  incoming: Pick<SchedulePending, "kind" | "missedCount"> &
+    Partial<Pick<SchedulePending, "triggerId">>,
 ): SchedulePending {
-  return {
+  const combined: SchedulePending = {
     kind: current === null || current.kind === incoming.kind ? incoming.kind : "coalesced",
     missedCount: (current?.missedCount ?? 0) + incoming.missedCount,
     requestedAt: current?.requestedAt ?? 0,
+  };
+  const triggerId = current?.triggerId ?? incoming.triggerId;
+  return triggerId === undefined ? combined : { ...combined, triggerId };
+}
+
+function withPending(
+  state: ScheduleState,
+  pending: SchedulePending,
+  requestedAt: number,
+): ScheduleState {
+  return {
+    ...state,
+    pending: pendingWithRequestedAt(pending, requestedAt),
+  };
+}
+
+function pendingWithRequestedAt(
+  pending: SchedulePending,
+  requestedAt: number,
+): SchedulePending {
+  if (pending.triggerId === undefined) {
+    return {
+      kind: pending.kind,
+      missedCount: pending.missedCount,
+      requestedAt,
+    };
+  }
+  return {
+    kind: pending.kind,
+    missedCount: pending.missedCount,
+    requestedAt,
+    triggerId: pending.triggerId,
   };
 }
 
@@ -317,21 +377,33 @@ function retryBackoffMs(failureStreak: number): number {
   return Math.min(300_000, 1_000 * 2 ** Math.min(6, failureStreak));
 }
 
-function firstFutureTickIndex(
-  anchorAt: number,
-  intervalMs: number,
-  jitterMs: number,
-  now: number,
-): number {
-  const elapsed = now - anchorAt - jitterMs;
-  let index = elapsed < 0 ? 1 : Math.floor(elapsed / intervalMs) + 1;
-  if (index < 1) {
-    index = 1;
+function retryDeadline(at: number, retryAfterMs: number | null): number | null {
+  if (retryAfterMs === null) {
+    return null;
   }
-  while (scheduledDueAt(anchorAt, intervalMs, index, jitterMs) <= now) {
-    index += 1;
+  return addDuration(at, retryAfterMs, "retryAfterMs");
+}
+
+function addDuration(at: number, duration: number, label: string): number {
+  validateEpoch(at, "at");
+  const validatedDuration = validateNonNegativeInteger(duration, label);
+  if (at > Number.MAX_SAFE_INTEGER - validatedDuration) {
+    throw new SchedulerTransitionError(
+      "invalid_request",
+      `${label} exceeds the safe epoch range`,
+    );
   }
-  return index;
+  return at + validatedDuration;
+}
+
+function laterDeadline(
+  current: number | null,
+  incoming: number | null,
+): number | null {
+  if (incoming === null) {
+    return current;
+  }
+  return current === null || incoming > current ? incoming : current;
 }
 
 function validateNonNegativeInteger(value: number, label: string): number {

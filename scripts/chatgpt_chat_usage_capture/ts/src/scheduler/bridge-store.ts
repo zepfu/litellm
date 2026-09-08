@@ -48,7 +48,11 @@ export class ScheduleBridgeStore {
   ): Promise<ScheduleState> {
     const loaded = await this.load(scope);
     if (loaded.state) {
-      const reconciled = scheduleTransitions.reconcileSchedule(loaded.state, options, { at });
+      const current = requireState(scope, loaded.state);
+      const reconciled = scheduleTransitions.reconcileSchedule(current, options, { at });
+      if (reconciled === current) {
+        return current;
+      }
       return await this.cas(scope, loaded.stateVersion, reconciled, at) ?? reconciled;
     }
     const next = scheduleTransitions.createScheduleState(
@@ -63,10 +67,8 @@ export class ScheduleBridgeStore {
 
   async requestRefresh(scope: ScheduleScope, at: number): Promise<RefreshRequestResult> {
     return this.mutate(scope, at, (state) => {
-      if (!state) {
-        throw new SchedulerTransitionError("invalid_schedule_state", "schedule state is missing");
-      }
-      const result = scheduleTransitions.requestRefresh(state, { at });
+      const current = requireState(scope, state);
+      const result = scheduleTransitions.requestRefresh(current, { at });
       return { result, nextState: result.state };
     });
   }
@@ -92,12 +94,29 @@ export class ScheduleBridgeStore {
     request: CompleteTriggerRequest,
   ): Promise<ScheduleMutationResult> {
     return this.mutate(scope, at, (state) => {
+      if (state && !sameScope(state.scope, scope)) {
+        throw new SchedulerTransitionError(
+          "invalid_schedule_state",
+          "schedule state scope does not match requested scope",
+        );
+      }
       const result = scheduleTransitions.completeTrigger(
         state,
         { at },
         this.envelope.leaseFencingToken,
         request,
       );
+      return { result, nextState: result.state };
+    });
+  }
+
+  async recoverAuthentication(
+    scope: ScheduleScope,
+    at: number,
+  ): Promise<ScheduleMutationResult> {
+    return this.mutate(scope, at, (state) => {
+      const current = requireState(scope, state);
+      const result = scheduleTransitions.recoverAuthentication(current, { at });
       return { result, nextState: result.state };
     });
   }
@@ -149,5 +168,18 @@ function requireState(scope: ScheduleScope, state: ScheduleState | null): Schedu
   if (!state) {
     throw new SchedulerTransitionError("invalid_schedule_state", "schedule state is missing");
   }
+  if (!sameScope(state.scope, scope)) {
+    throw new SchedulerTransitionError(
+      "invalid_schedule_state",
+      "schedule state scope does not match requested scope",
+    );
+  }
   return state;
+}
+
+function sameScope(left: ScheduleScope, right: ScheduleScope): boolean {
+  return (
+    left.collectorAccountId === right.collectorAccountId &&
+    left.profileId === right.profileId
+  );
 }
