@@ -121,10 +121,12 @@ never sets `last_success_at`. When a scheduled refresh failure belongs to the
 same nonsecret `credential_identity`, the passive row retains degraded
 refresh-state and sanitized scheduler error evidence even if the old access
 credential is locally usable. A differing passive identity is reread once to
-reject a stale snapshot. Only a confirmed different usable generation clears
-the failed state and either exact terminal suppression class:
-`invalid_grant` or `refresh_token_reused`. Other xAI refresh errors remain
-retryable and do not receive terminal suppression.
+reject a stale snapshot. Only a successful actual refresh or a confirmed
+different usable generation clears the failed state and either exact terminal
+suppression class, `invalid_grant` or `refresh_token_reused`. A failed refresh
+also remains authoritative through later not-due scheduler cycles that make no
+token-endpoint attempt. Other xAI refresh errors remain retryable and do not
+receive terminal suppression.
 
 ## Cursor Agent Auth Refresh
 
