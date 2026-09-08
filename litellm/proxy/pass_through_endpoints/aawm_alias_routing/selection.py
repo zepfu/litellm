@@ -4127,6 +4127,7 @@ def _raise_codex_auto_agent_in_flight_cooldown(
         lane_key=lane_key,
         cooldown_seconds=cooldown_seconds,
         reason="in_flight_session_affinity_cooldown",
+        include_account_identity=False,
     )
     raise HTTPException(
         status_code=429,
@@ -4158,7 +4159,6 @@ def _raise_anthropic_auto_agent_in_flight_cooldown(
         lane_key=lane_key,
         cooldown_seconds=cooldown_seconds,
         reason="in_flight_session_affinity_cooldown",
-        include_account_identity=False,
     )
     raise HTTPException(
         status_code=429,
@@ -5051,6 +5051,19 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 excluded_candidate_keys=excluded_candidate_keys,
             )
             if affinity_state["cooldown_seconds"] > 0:
+                if authenticated_token_affinity:
+                    _raise_codex_auto_agent_authenticated_continuation_unavailable(
+                        candidate=affinity_state["candidate"],
+                        lane_key=affinity_state.get("lane_key"),
+                        cooldown_seconds=affinity_state["cooldown_seconds"],
+                        alias_model=alias_model,
+                        failure_phase=affinity_state.get("failure_phase")
+                        or "affinity_account_cooldown",
+                        skipped_candidates=_build_auto_agent_skipped_candidates_from_states(
+                            [affinity_state]
+                        ),
+                        terminal_reset=affinity_state.get("terminal_reset"),
+                    )
                 _raise_codex_auto_agent_in_flight_cooldown(
                     candidate=affinity_state["candidate"],
                     lane_key=affinity_state.get("lane_key"),
