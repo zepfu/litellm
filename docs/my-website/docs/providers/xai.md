@@ -202,6 +202,13 @@ responses. Name collisions use the established deterministic policy; retries
 start from the caller's original tool definitions, so conversions are not
 applied twice.
 
+For stock `collaboration.wait_agent` and its supported namespace/tool aliases,
+native Grok and managed xAI Codex routes narrow `timeout_ms` from `number` to
+`integer` in derived build/restoration schemas to match the client's integer
+parser. Finite integral response values become JSON integers in both JSON and
+SSE output. Fractional values, unrelated numeric arguments, original tool names,
+and the caller's replay definitions remain unchanged.
+
 ## Responses API Instructions
 
 xAI Responses does not accept OpenAI's top-level `instructions` field. On
