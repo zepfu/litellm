@@ -15,14 +15,13 @@ and sanitizer were superseded by the same preserved Stage 2 tree.
 | `src/ledger/identity.ts` | `fb51bf0287` | Stable scope/attempt identity and canonical JSON helpers. |
 | `src/ledger/types.ts` | `fb51bf0287` | Ledger scope, mapping, and reconstructed-attempt types. |
 | `src/normalize/model-mapping.ts` | `fb51bf0287` | Versioned model mapping resolution. |
-| `src/normalize/reconstruct.ts` | `920c18cc5a`; identical hardened body at `6c1eae83ae` | Pure generation graph reconstruction and evidence linkage. |
+| `src/normalize/reconstruct.ts` | `920c18cc5a`, hardened at `6c1eae83ae`, with local D1-752 reconstruction fixes | Pure generation graph reconstruction and evidence linkage. |
 | `src/accounting/quota.ts` | `fb51bf0287` | Corrected pure quota estimation semantics. |
 | `src/accounting/windows.ts` | `fb51bf0287` | Pure reset-window resolution and interval membership. |
 
-`6c1eae83ae` hardened reconstruction behavior in its own tree, while its
-`src/normalize/reconstruct.ts` blob is byte-identical to `920c18cc5a`. The
-assignment therefore records both provenance sources and restores one
-authoritative body.
+`6c1eae83ae` hardened reconstruction behavior in its own tree. The current
+local fixes normalize connected evidence components, avoid backward prompt
+attribution, and preserve imported/copied metadata.
 
 The new `src/counting/index.ts` is the package-internal export surface for a
 future bounded worker. It deliberately does not define a transport protocol or
