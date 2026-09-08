@@ -2460,8 +2460,16 @@ class BaseLLMHTTPHandler:
                     timeout=timeout
                     or float(response_api_optional_request_params.get("timeout", 0)),
                     stream=stream,
+                    follow_redirects=(
+                        False if managed_xai_oauth_request else None
+                    ),
                     validate_request_fn=validate_request_fn,
                 )
+                if managed_xai_oauth_request:
+                    self._validate_managed_xai_oauth_response_sync(
+                        response=response,
+                        provider_config=responses_api_provider_config,
+                    )
                 if fake_stream is True:
                     return MockResponsesAPIStreamingIterator(
                         response=response,
@@ -2492,8 +2500,16 @@ class BaseLLMHTTPHandler:
                     json=data,
                     timeout=timeout
                     or float(response_api_optional_request_params.get("timeout", 0)),
+                    follow_redirects=(
+                        False if managed_xai_oauth_request else None
+                    ),
                     validate_request_fn=validate_request_fn,
                 )
+                if managed_xai_oauth_request:
+                    self._validate_managed_xai_oauth_response_sync(
+                        response=response,
+                        provider_config=responses_api_provider_config,
+                    )
         except Exception as e:
             raise self._handle_error(
                 e=e,
@@ -2634,8 +2650,16 @@ class BaseLLMHTTPHandler:
                     timeout=timeout
                     or float(response_api_optional_request_params.get("timeout", 0)),
                     stream=stream,
+                    follow_redirects=(
+                        False if managed_xai_oauth_request else None
+                    ),
                     validate_request_fn=validate_request_fn,
                 )
+                if managed_xai_oauth_request:
+                    await self._validate_managed_xai_oauth_response(
+                        response=response,
+                        provider_config=responses_api_provider_config,
+                    )
 
                 if fake_stream is True:
                     return MockResponsesAPIStreamingIterator(
@@ -2668,8 +2692,16 @@ class BaseLLMHTTPHandler:
                     json=data,
                     timeout=timeout
                     or float(response_api_optional_request_params.get("timeout", 0)),
+                    follow_redirects=(
+                        False if managed_xai_oauth_request else None
+                    ),
                     validate_request_fn=validate_request_fn,
                 )
+                if managed_xai_oauth_request:
+                    await self._validate_managed_xai_oauth_response(
+                        response=response,
+                        provider_config=responses_api_provider_config,
+                    )
 
         except Exception as e:
             raise self._handle_error(

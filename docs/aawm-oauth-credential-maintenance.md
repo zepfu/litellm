@@ -153,6 +153,44 @@ metadata distinguishes provider-call ordinal from account-traversal ordinal;
 rate observations use inventory-derived account and scope identities and reject
 inbound replacements.
 
+### Managed xAI concrete-send accounting
+
+Managed xAI request accounting is request-scoped and observational. A send is
+recorded only after the exact target and request headers pass the managed-route
+egress guard and immediately before the concrete HTTP transport send. The
+counter is not a retry budget, does not authorize another candidate, and does
+not accept account identity from inbound metadata. Connection-level retries
+that construct a new concrete request are recorded as separate sends.
+
+Managed xAI candidate attempt metadata may include:
+
+- `xai_oauth_actual_send_count`: the number of concrete managed xAI sends
+  produced by that candidate attempt.
+- `xai_oauth_actual_send_ordinal`: the request-global ordinal of the last
+  concrete send in the attempt, when at least one send occurred.
+- `xai_oauth_provider_attempt_ordinal`: the same concrete-send ordinal used
+  for provider-attempt accounting; it is distinct from
+  `xai_oauth_account_traversal_ordinal`.
+- `xai_oauth_actual_send_counter`: a bounded snapshot containing
+  `actual_send_count`, `next_send_ordinal`, `last_send_ordinal`,
+  `max_records`, and credential-free `records`.
+
+Each bounded record contains only `ordinal`, the validated
+`account_hash`/`lane_key`, a truncated `target_fingerprint`, and the
+low-cardinality `route_family`. It never contains tokens, raw account IDs,
+authorization headers, or raw target URLs. The record window is capped at 32
+entries; the monotonic total and ordinals remain authoritative after older
+records roll out of the window.
+
+An attempt with zero concrete sends reports
+`xai_oauth_actual_send_count=0`, omits send ordinals, and retains
+`attempted_provider_call=false`. Local route, credential-readiness, validation,
+or transport-construction failures before the guarded send do not advance the
+counter. Managed Responses requests disable automatic redirects so a 3xx
+response is rejected by the existing managed xAI redirect contract rather than
+creating an unobserved credential-bearing follow-up send. Generic provider
+requests keep their existing redirect behavior.
+
 ## OAuth refresh deadline contract
 
 Scheduled Grok OIDC, Codex OAuth, managed xAI OAuth, Kimi OAuth, and Nous
