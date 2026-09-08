@@ -730,6 +730,8 @@ if TYPE_CHECKING:
         @staticmethod
         def _assemble_headers(**kwargs: Any) -> dict[str, Any]: ...
         @staticmethod
+        def _assemble_xai_oauth_headers(**kwargs: Any) -> dict[str, Any]: ...
+        @staticmethod
         def _normalize_endpoint_for_target(**kwargs: Any) -> str: ...
         @staticmethod
         def _join_url_paths(*args: Any) -> Any: ...
@@ -4932,7 +4934,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         response = await pass_through_request(
             request=request,
             target=updated_url,
-            custom_headers=BaseOpenAIPassThroughHandler._assemble_headers(
+            custom_headers=BaseOpenAIPassThroughHandler._assemble_xai_oauth_headers(
                 api_key=oa_xai_api_key,
                 request=request,
             ),
