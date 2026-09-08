@@ -14,6 +14,11 @@ from typing import Any, Mapping, Optional
 
 import yaml
 
+from litellm.llms.xai.route_descriptors import (
+    XAI_OAUTH_CREDENTIAL_FAMILY,
+    XAI_OAUTH_ROUTE_FAMILY,
+)
+
 DEFAULT_OUTPUT_GUARDS_YAML = Path(__file__).with_name("output_guards.yaml")
 
 OPENAI_PASSTHROUGH_RESPONSES_INGRESS = "openai_passthrough_responses"
@@ -23,6 +28,7 @@ XAI_OUTPUT_GUARD_ROUTE_FAMILIES: frozenset[str] = frozenset(
         "codex_xai_oauth_responses_adapter",
         "codex_auto_agent_xai_oauth_responses",
         "codex_auto_agent_grok_native_responses",
+        XAI_OAUTH_ROUTE_FAMILY,
     }
 )
 
@@ -183,7 +189,7 @@ def is_resolved_xai_identity(context: OutputGuardRequestContext) -> bool:
     if provider == "xai":
         return True
     credential_family = str(context.egress_credential_family or "").strip().lower()
-    if credential_family == "xai":
+    if credential_family in {"xai", XAI_OAUTH_CREDENTIAL_FAMILY}:
         return True
     route_family = str(context.route_family or "").strip()
     return route_family in XAI_OUTPUT_GUARD_ROUTE_FAMILIES

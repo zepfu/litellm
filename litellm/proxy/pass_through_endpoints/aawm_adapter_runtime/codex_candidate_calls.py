@@ -20,6 +20,9 @@ from dataclasses import dataclass
 from types import FunctionType
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
+from litellm.llms.xai.route_descriptors import (
+    XAI_OAUTH_CREDENTIAL_FAMILY,
+)
 from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
     load_text_watermark_config,
 )
@@ -723,6 +726,8 @@ if TYPE_CHECKING:
         @staticmethod
         def _assemble_headers(**kwargs: Any) -> dict[str, Any]: ...
         @staticmethod
+        def _assemble_xai_oauth_headers(**kwargs: Any) -> dict[str, Any]: ...
+        @staticmethod
         def _normalize_endpoint_for_target(**kwargs: Any) -> str: ...
         @staticmethod
         def _join_url_paths(*args: Any) -> Any: ...
@@ -1029,6 +1034,7 @@ def _maybe_wrap_xai_passthrough_responses_stream(
     request_body: dict[str, Any],
     route_family: str,
     resolved_model: Any = None,
+    egress_credential_family: str = "xai",
 ) -> Response:
     """Live-forward CFG-025 wrap for xAI alias Responses SSE."""
     from fastapi.responses import StreamingResponse
@@ -1046,7 +1052,7 @@ def _maybe_wrap_xai_passthrough_responses_stream(
         ingress_path=str(getattr(getattr(request, "url", None), "path", "") or ""),
         method=str(getattr(request, "method", None) or "POST"),
         custom_llm_provider=litellm.LlmProviders.XAI.value,
-        egress_credential_family="xai",
+        egress_credential_family=egress_credential_family,
         route_family=route_family,
         resolved_model=resolved_model,
         request_body=request_body,
@@ -4567,7 +4573,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         response = await pass_through_request(
             request=request,
             target=updated_url,
-            custom_headers=BaseOpenAIPassThroughHandler._assemble_headers(
+            custom_headers=BaseOpenAIPassThroughHandler._assemble_xai_oauth_headers(
                 api_key=oa_xai_api_key,
                 request=request,
             ),
@@ -4576,7 +4582,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             stream=bool(oa_xai_prepared_body.get("stream")),
             custom_body=oa_xai_prepared_body,
             custom_llm_provider=litellm.LlmProviders.XAI.value,
-            egress_credential_family="xai",
+            egress_credential_family=XAI_OAUTH_CREDENTIAL_FAMILY,
             expected_target_family="xai",
             retryable_upstream_status_codes=[
                 429,
@@ -4595,6 +4601,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         route_family="codex_auto_agent_xai_oauth_responses",
         resolved_model=oa_xai_prepared_body.get("model")
         or canonical_request_body.get("model"),
+        egress_credential_family=XAI_OAUTH_CREDENTIAL_FAMILY,
     )
     return await _validate_codex_auto_agent_responses_payload(
         response,

@@ -59,6 +59,10 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.aawm_passthrough_shape_capture import (
     capture_passthrough_shape,
 )
+from litellm.llms.xai.route_descriptors import (
+    XAI_OAUTH_CREDENTIAL_FAMILY,
+    validate_xai_oauth_api_target,
+)
 
 _capture_passthrough_error_shape = capture_passthrough_shape
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
@@ -3479,6 +3483,15 @@ async def chat_completion_pass_through_endpoint(  # noqa: PLR0915
 
 class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
     @staticmethod
+    def _is_managed_xai_oauth_egress(
+        credential_family: Optional[str],
+    ) -> bool:
+        return (
+            str(credential_family or "").strip().lower()
+            == XAI_OAUTH_CREDENTIAL_FAMILY
+        )
+
+    @staticmethod
     def _raise_egress_guard_block(
         *,
         detail: str,
@@ -3602,6 +3615,24 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         credential_family: Optional[str] = None,
         expected_target_family: Optional[str] = None,
     ) -> None:
+        managed_xai_oauth_egress = (
+            HttpPassThroughEndpointHelpers._is_managed_xai_oauth_egress(
+                credential_family
+            )
+        )
+        if managed_xai_oauth_egress:
+            try:
+                validate_xai_oauth_api_target(url)
+            except ValueError as exc:
+                HttpPassThroughEndpointHelpers._raise_egress_guard_block(
+                    detail=f"Blocked managed xAI OAuth egress: {exc}",
+                    url=url,
+                    credential_family=credential_family,
+                    target_family=HttpPassThroughEndpointHelpers.get_target_provider_family(
+                        url
+                    ),
+                )
+
         target_family = HttpPassThroughEndpointHelpers.get_target_provider_family(url)
         if (
             expected_target_family is not None
@@ -3618,10 +3649,13 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 target_family=target_family,
             )
 
+        credential_target_family = (
+            "xai" if managed_xai_oauth_egress else credential_family
+        )
         if (
-            credential_family is not None
+            credential_target_family is not None
             and target_family != "generic"
-            and target_family != credential_family
+            and target_family != credential_target_family
         ):
             HttpPassThroughEndpointHelpers._raise_egress_guard_block(
                 detail=(
@@ -3653,6 +3687,42 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 target_family=target_family,
                 marker_families=cross_provider_markers,
             )
+
+    @staticmethod
+    async def reject_managed_xai_redirect_response(
+        *,
+        response: httpx.Response,
+        url: Union[str, httpx.URL],
+        credential_family: Optional[str],
+        expected_target_family: Optional[str],
+    ) -> None:
+        """Reject 3xx responses before any credential-bearing follow-up."""
+        if not (
+            HttpPassThroughEndpointHelpers._is_managed_xai_oauth_egress(
+                credential_family
+            )
+            and 300 <= response.status_code < 400
+        ):
+            return
+        try:
+            await response.aclose()
+        except Exception:  # noqa: BLE001
+            verbose_proxy_logger.debug(
+                "Failed to close rejected managed xAI redirect response",
+                exc_info=True,
+            )
+        HttpPassThroughEndpointHelpers._raise_egress_guard_block(
+            detail=(
+                "Blocked managed xAI OAuth redirect response before "
+                "follow-up request."
+            ),
+            url=url,
+            credential_family=credential_family,
+            target_family=(
+                expected_target_family
+                or HttpPassThroughEndpointHelpers.get_target_provider_family(url)
+            ),
+        )
 
     @staticmethod
     def get_masked_passthrough_headers(headers: Optional[dict]) -> dict:
@@ -3810,6 +3880,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         headers: dict,
         requested_query_params: Optional[dict] = None,
         custom_body: Optional[dict] = None,
+        follow_redirects: Optional[bool] = None,
     ) -> httpx.Response:
         """
         Make a non-streaming HTTP request
@@ -3817,23 +3888,29 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         If request is GET, don't include a JSON body
         """
         if request.method == "GET":
-            response = await async_client.request(
-                method=request.method,
-                url=url,
-                headers=headers,
-                params=requested_query_params,
-            )
+            request_kwargs: dict[str, Any] = {
+                "method": request.method,
+                "url": url,
+                "headers": headers,
+                "params": requested_query_params,
+            }
+            if follow_redirects is not None:
+                request_kwargs["follow_redirects"] = follow_redirects
+            response = await async_client.request(**request_kwargs)
         else:
             json_headers, _removed_content_type = _headers_for_json_passthrough_egress(
                 headers
             )
-            response = await async_client.request(
-                method=request.method,
-                url=url,
-                headers=json_headers,
-                params=requested_query_params,
-                json=custom_body,
-            )
+            request_kwargs = {
+                "method": request.method,
+                "url": url,
+                "headers": json_headers,
+                "params": requested_query_params,
+                "json": custom_body,
+            }
+            if follow_redirects is not None:
+                request_kwargs["follow_redirects"] = follow_redirects
+            response = await async_client.request(**request_kwargs)
         return response
 
     @staticmethod
@@ -3846,6 +3923,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         _parsed_body: Optional[dict] = None,
         raw_body: Optional[bytes] = None,
         prefer_stream_for_unknown_content: bool = False,
+        follow_redirects: Optional[bool] = None,
     ) -> httpx.Response:
         """
         Handle non-streaming HTTP requests
@@ -3857,12 +3935,15 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         buffering the body (enables SSE handoff without full-body buffer).
         """
         if request.method == "GET":
-            response = await async_client.request(
-                method=request.method,
-                url=url,
-                headers=headers,
-                params=requested_query_params,
-            )
+            request_kwargs: dict[str, Any] = {
+                "method": request.method,
+                "url": url,
+                "headers": headers,
+                "params": requested_query_params,
+            }
+            if follow_redirects is not None:
+                request_kwargs["follow_redirects"] = follow_redirects
+            response = await async_client.request(**request_kwargs)
         elif raw_body is not None:
             if prefer_stream_for_unknown_content:
                 req = async_client.build_request(
@@ -3872,15 +3953,21 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                     params=requested_query_params,
                     content=raw_body,
                 )
-                response = await async_client.send(req, stream=True)
+                send_kwargs: dict[str, Any] = {"stream": True}
+                if follow_redirects is not None:
+                    send_kwargs["follow_redirects"] = follow_redirects
+                response = await async_client.send(req, **send_kwargs)
             else:
-                response = await async_client.request(
-                    method=request.method,
-                    url=url,
-                    headers=headers,
-                    params=requested_query_params,
-                    content=raw_body,
-                )
+                request_kwargs = {
+                    "method": request.method,
+                    "url": url,
+                    "headers": headers,
+                    "params": requested_query_params,
+                    "content": raw_body,
+                }
+                if follow_redirects is not None:
+                    request_kwargs["follow_redirects"] = follow_redirects
+                response = await async_client.request(**request_kwargs)
         elif (
             HttpPassThroughEndpointHelpers.is_multipart(request) is True
             and not _parsed_body
@@ -3894,6 +3981,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 headers=headers,
                 requested_query_params=requested_query_params,
                 prefer_stream_for_unknown_content=prefer_stream_for_unknown_content,
+                follow_redirects=follow_redirects,
             )
         else:
             # Generic httpx method
@@ -3908,15 +3996,21 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                     params=requested_query_params,
                     json=_parsed_body,
                 )
-                response = await async_client.send(req, stream=True)
+                send_kwargs = {"stream": True}
+                if follow_redirects is not None:
+                    send_kwargs["follow_redirects"] = follow_redirects
+                response = await async_client.send(req, **send_kwargs)
             else:
-                response = await async_client.request(
-                    method=request.method,
-                    url=url,
-                    headers=json_headers,
-                    params=requested_query_params,
-                    json=_parsed_body,
-                )
+                request_kwargs = {
+                    "method": request.method,
+                    "url": url,
+                    "headers": json_headers,
+                    "params": requested_query_params,
+                    "json": _parsed_body,
+                }
+                if follow_redirects is not None:
+                    request_kwargs["follow_redirects"] = follow_redirects
+                response = await async_client.request(**request_kwargs)
         return response
 
     @staticmethod
@@ -3940,6 +4034,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         headers: dict,
         requested_query_params: Optional[dict] = None,
         prefer_stream_for_unknown_content: bool = False,
+        follow_redirects: Optional[bool] = None,
     ) -> httpx.Response:
         """Process multipart/form-data requests, handling both files and form fields.
 
@@ -3975,16 +4070,22 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 files=files,
                 data=form_data_dict,
             )
-            return await async_client.send(req, stream=True)
+            send_kwargs: dict[str, Any] = {"stream": True}
+            if follow_redirects is not None:
+                send_kwargs["follow_redirects"] = follow_redirects
+            return await async_client.send(req, **send_kwargs)
 
-        response = await async_client.request(
-            method=request.method,
-            url=url,
-            headers=headers_copy,
-            params=requested_query_params,
-            files=files,
-            data=form_data_dict,
-        )
+        request_kwargs: dict[str, Any] = {
+            "method": request.method,
+            "url": url,
+            "headers": headers_copy,
+            "params": requested_query_params,
+            "files": files,
+            "data": form_data_dict,
+        }
+        if follow_redirects is not None:
+            request_kwargs["follow_redirects"] = follow_redirects
+        response = await async_client.request(**request_kwargs)
         return response
 
     @staticmethod
@@ -4610,6 +4711,11 @@ async def pass_through_request(  # noqa: PLR0915
             credential_family=egress_credential_family,
             expected_target_family=expected_target_family,
         )
+        managed_xai_oauth_egress = (
+            HttpPassThroughEndpointHelpers._is_managed_xai_oauth_egress(
+                egress_credential_family
+            )
+        )
 
         endpoint_type: EndpointType = HttpPassThroughEndpointHelpers.get_endpoint_type(
             str(url)
@@ -5094,7 +5200,16 @@ async def pass_through_request(  # noqa: PLR0915
                     params=requested_query_params,
                     headers=stream_headers,
                 )
-                response = await async_client.send(req, stream=stream)
+                send_kwargs: dict[str, Any] = {"stream": stream}
+                if managed_xai_oauth_egress:
+                    send_kwargs["follow_redirects"] = False
+                response = await async_client.send(req, **send_kwargs)
+                await HttpPassThroughEndpointHelpers.reject_managed_xai_redirect_response(
+                    response=response,
+                    url=url,
+                    credential_family=egress_credential_family,
+                    expected_target_family=expected_target_family,
+                )
                 try:
                     response.raise_for_status()
                 except httpx.HTTPStatusError as e:
@@ -5303,7 +5418,16 @@ async def pass_through_request(  # noqa: PLR0915
                     _parsed_body=provider_bound_body,
                     raw_body=raw_body,
                     prefer_stream_for_unknown_content=True,
+                    follow_redirects=(
+                        False if managed_xai_oauth_egress else None
+                    ),
                 )
+            )
+            await HttpPassThroughEndpointHelpers.reject_managed_xai_redirect_response(
+                response=response,
+                url=url,
+                credential_family=egress_credential_family,
+                expected_target_family=expected_target_family,
             )
             if _is_streaming_response(response) is True:
                 try:
