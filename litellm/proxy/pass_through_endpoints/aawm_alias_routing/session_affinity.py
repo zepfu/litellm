@@ -877,6 +877,18 @@ def derive_session_owner_effective_identity(
     )
 
 
+def is_session_owner_redispatch_effective_identity(
+    session_identity: Optional[str],
+) -> bool:
+    """Return whether an identity is already a first-generation derived id."""
+
+    identity = _clean_optional_str(session_identity)
+    return bool(
+        identity
+        and identity.startswith(_SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX)
+    )
+
+
 def derive_session_owner_base_identity(
     effective_session_identity: Optional[str],
 ) -> Optional[str]:
@@ -3800,6 +3812,24 @@ _REQUEST_STATE_LEASE_ATTR = "_aawm_session_owner_lease"
 _REQUEST_STATE_GUARDED_ATTR = "_aawm_session_owner_guarded"
 
 
+def _cursor_replay_body_fingerprint(body: Any) -> Optional[str]:
+    """Return a stable digest for a JSON request body, without retaining values."""
+
+    if not isinstance(body, dict):
+        return None
+    try:
+        encoded = json.dumps(
+            body,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def get_request_session_owner_lease(request: Any) -> Optional[SessionOwnerLease]:
     if request is None:
         return None
@@ -3856,9 +3886,16 @@ def validate_cursor_replay_matches_body(
         "_aawm_validated_cursor_replay",
         None,
     )
+    if (
+        not isinstance(validation, Mapping)
+        or validation.get("body_ref") is not body
+        or validation.get("body_id") != id(body)
+    ):
+        return False
+    fingerprint = _cursor_replay_body_fingerprint(body)
     return (
-        isinstance(validation, Mapping)
-        and validation.get("body_id") == id(body)
+        fingerprint is not None
+        and validation.get("body_fingerprint") == fingerprint
     )
 
 
@@ -3880,7 +3917,9 @@ def set_validated_cursor_replay(
         state,
         "_aawm_validated_cursor_replay",
         {
+            "body_ref": body,
             "body_id": id(body),
+            "body_fingerprint": _cursor_replay_body_fingerprint(body),
             "stage": stage,
             "reason": reason,
         },
@@ -3911,7 +3950,7 @@ def clear_non_held_request_session_owner_lease(request: Any) -> bool:
     if state is None:
         return False
     lease = get_request_session_owner_lease(request)
-    if lease is not None and lease.held_reservation:
+    if lease is not None and (lease.held_reservation or lease.promoted):
         return False
     setattr(state, _REQUEST_STATE_LEASE_ATTR, None)
     setattr(state, _REQUEST_STATE_GUARDED_ATTR, False)
@@ -3933,11 +3972,15 @@ def clear_expected_non_held_request_session_owner_lease(
     lease = get_request_session_owner_lease(request)
     if lease is None:
         return True
+    expected = _clean_optional_str(expected_session_identity)
+    lease_identity = _clean_optional_str(lease.session_identity)
+    if expected is None or lease_identity is None:
+        return False
     if (
         lease.held_reservation
         or lease.promoted
-        or lease.released
-        or lease.session_identity != expected_session_identity
+        or _strip_legacy_affinity_prefixes(lease_identity)
+        != _strip_legacy_affinity_prefixes(expected)
     ):
         return False
     return clear_non_held_request_session_owner_lease(request)

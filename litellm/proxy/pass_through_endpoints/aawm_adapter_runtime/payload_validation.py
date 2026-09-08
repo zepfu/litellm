@@ -798,7 +798,12 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
         try:
             response_body = json.loads(_decode_http_response_body(response.body))  # noqa: F821
         except Exception:
-            return response
+            _raise_codex_auto_agent_invalid_responses_shape(
+                response_body=response.body,
+                adapter_model=adapter_model,
+                adapter=adapter,
+                adapter_label=adapter_label,
+            )
         if not _is_responses_shaped_body(response_body):
             _raise_codex_auto_agent_invalid_responses_shape(
                 response_body=response_body,

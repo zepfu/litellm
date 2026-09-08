@@ -341,9 +341,13 @@ def _resolve_codex_request_mode_and_ordinal(
     *,
     has_continuation_state: bool,
     request_body: dict[str, Any],
+    server_validated_replay: bool = False,
 ) -> tuple[str, Optional[int]]:
     redispatch_ordinal = _extract_codex_request_redispatch_ordinal(request_body)
-    if redispatch_ordinal is not None:
+    # The ordinal is client-visible telemetry only. A fresh redispatch mode is
+    # authorized solely by server-owned validation bound to the exact rebuilt
+    # replay body.
+    if server_validated_replay:
         return "fresh_redispatch", redispatch_ordinal
     if has_continuation_state:
         return "ordinary_continuation", None
@@ -4444,17 +4448,17 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
     has_continuation_state = _has_continuation_state(request_body)
     has_previous_response_id = bool(request_body.get("previous_response_id"))
     has_account_bound_state = _has_account_bound_state(request_body)
+    server_validated_replay = sa.validate_cursor_replay_matches_body(
+        request,
+        body=request_body,
+    )
     request_mode, redispatch_ordinal = _resolve_codex_request_mode_and_ordinal(
         has_continuation_state=has_continuation_state,
         request_body=request_body,
+        server_validated_replay=server_validated_replay,
     )
     provider_owned_continuation = (
-        has_continuation_state
-        and request_mode == "ordinary_continuation"
-        and not sa.validate_cursor_replay_matches_body(
-            request,
-            body=request_body,
-        )
+        has_continuation_state and not server_validated_replay
     )
 
     # Read-path ownership check before free selection. Reservation happens at
@@ -4489,7 +4493,24 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             request=request,
         )
 
-    if provider_owned_continuation and session_owner_record is None:
+    if provider_owned_continuation and (
+        not isinstance(session_owner_record, dict)
+        or sa._record_state(session_owner_record) != "owned"
+    ):
+        owner_state = (
+            sa._record_state(session_owner_record)
+            if isinstance(session_owner_record, dict)
+            else None
+        )
+        owner_id = (
+            session_owner_record.get("owner")
+            if isinstance(session_owner_record, dict)
+            else None
+        )
+        mismatch_reason = (
+            "session_owner: provider-owned continuation requires an "
+            f"owned durable owner record (state={owner_state or 'missing'})"
+        )
         sa.raise_session_owner_redispatch_required(
             session_identity=session_owner_identity,
             alias_model=alias_model,
@@ -4500,56 +4521,19 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 session_identity=session_owner_identity,
                 cache_key=_cache_key,
                 owner_record=session_owner_record,
-                owner_id=None,
-                mismatch_reason=(
-                    "session_owner: provider-owned continuation has no owner record or affinity"
-                ),
+                owner_id=owner_id,
+                mismatch_reason=mismatch_reason,
                 provenance=sa.build_session_owner_provenance(
                     session_identity=session_owner_identity,
                     decision="redispatch_required",
                     owner_record=session_owner_record,
-                    mismatch_reason=(
-                        "session_owner: provider-owned continuation has no owner record or affinity"
-                    ),
+                    owner_id=owner_id,
+                    mismatch_reason=mismatch_reason,
                     cache_key=_cache_key,
                 ),
             ),
             request=request,
         )
-
-    if (
-        provider_owned_continuation
-        and isinstance(session_owner_record, dict)
-        and sa._record_state(session_owner_record) is None
-    ):
-        existing_affinity = await _get_codex_session_affinity(session_key)
-        if existing_affinity is None:
-            sa.raise_session_owner_redispatch_required(
-                session_identity=session_owner_identity,
-                alias_model=alias_model,
-                candidate=None,
-                failure_phase="session_owner_continuation_no_owner_affinity",
-                guard=sa.SessionOwnerGuardResult(
-                    decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
-                    session_identity=session_owner_identity,
-                    cache_key=_cache_key,
-                    owner_record=session_owner_record,
-                    owner_id=session_owner_record.get("owner"),
-                    mismatch_reason=(
-                        "session_owner: provider-owned continuation has no owner record or affinity"
-                    ),
-                    provenance=sa.build_session_owner_provenance(
-                        session_identity=session_owner_identity,
-                        decision="redispatch_required",
-                        owner_record=session_owner_record,
-                        mismatch_reason=(
-                            "session_owner: provider-owned continuation has no owner record or affinity"
-                        ),
-                        cache_key=_cache_key,
-                    ),
-                ),
-                request=request,
-            )
 
     affinity = None
     affinity_bypassed = False
@@ -4711,8 +4695,14 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             )
             == "cursor"
         ):
-            cursor_effective_identity = sa.derive_session_owner_effective_identity(
+            cursor_effective_identity = (
                 session_owner_identity
+                if sa.is_session_owner_redispatch_effective_identity(
+                    session_owner_identity
+                )
+                else sa.derive_session_owner_effective_identity(
+                    session_owner_identity
+                )
             )
             if cursor_effective_identity is None:
                 sa.raise_session_owner_redispatch_required(
@@ -4736,16 +4726,86 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     wait_for_foreign_reservation=True,
                 )
             )
-            if (
-                cursor_effective_error is not None
-                or not isinstance(cursor_effective_record, dict)
-                or sa._record_state(cursor_effective_record) is None
-            ):
-                sa.activate_session_owner_redispatch_effective_identity(
+            if cursor_effective_error is not None:
+                sa.raise_session_owner_redispatch_required(
+                    session_identity=cursor_effective_identity,
+                    alias_model=alias_model,
+                    failure_phase="session_owner_rediscovery_unavailable",
+                    guard=sa.SessionOwnerGuardResult(
+                        decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                        session_identity=cursor_effective_identity,
+                        cache_key=cursor_effective_cache_key,
+                        owner_record=cursor_effective_record,
+                        owner_id=(
+                            cursor_effective_record.get("owner")
+                            if isinstance(cursor_effective_record, dict)
+                            else None
+                        ),
+                        mismatch_reason=cursor_effective_error,
+                    ),
                     request=request,
-                    base_session_identity=session_owner_identity,
-                    replace_existing_auto_review_owner=is_auto_review,
                 )
+            if cursor_effective_record is None:
+                # The base Cursor owner remains authoritative for the initial
+                # request. Do not activate an unproven derived identity.
+                if sa.is_session_owner_redispatch_effective_identity(
+                    session_owner_identity
+                ):
+                    sa.raise_session_owner_redispatch_required(
+                        session_identity=session_owner_identity,
+                        alias_model=alias_model,
+                        failure_phase="session_owner_rediscovery_unavailable",
+                        guard=sa.SessionOwnerGuardResult(
+                            decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                            session_identity=session_owner_identity,
+                            cache_key=_cache_key,
+                            owner_record=session_owner_record,
+                            owner_id=session_owner_record.get("owner"),
+                            mismatch_reason=(
+                                "session_owner: derived Cursor owner record unavailable"
+                            ),
+                        ),
+                        request=request,
+                    )
+                affinity = sa.owner_record_as_strict_affinity_hint(
+                    session_owner_record,
+                    preserve_account_identity=True,
+                )
+            elif sa._record_state(cursor_effective_record) == "owned":
+                if cursor_effective_identity != session_owner_identity:
+                    activated_identity = (
+                        sa.activate_session_owner_redispatch_effective_identity(
+                            request=request,
+                            base_session_identity=session_owner_identity,
+                            replace_existing_auto_review_owner=is_auto_review,
+                        )
+                    )
+                    if activated_identity != cursor_effective_identity:
+                        sa.raise_session_owner_redispatch_required(
+                            session_identity=session_owner_identity,
+                            alias_model=alias_model,
+                            failure_phase="session_owner_effective_identity_conflict",
+                            guard=sa.SessionOwnerGuardResult(
+                                decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                                session_identity=session_owner_identity,
+                                cache_key=_cache_key,
+                                owner_record=session_owner_record,
+                                owner_id=session_owner_record.get("owner"),
+                                mismatch_reason=(
+                                    "session_owner: Cursor derived identity could "
+                                    "not be activated"
+                                ),
+                            ),
+                            request=request,
+                        )
+                session_owner_identity = cursor_effective_identity
+                session_owner_record = cursor_effective_record
+                _cache_key = cursor_effective_cache_key
+                affinity = sa.owner_record_as_strict_affinity_hint(
+                    cursor_effective_record,
+                    preserve_account_identity=True,
+                )
+            else:
                 sa.raise_session_owner_redispatch_required(
                     session_identity=cursor_effective_identity,
                     alias_model=alias_model,
@@ -4761,16 +4821,11 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                             else None
                         ),
                         mismatch_reason=(
-                            cursor_effective_error
-                            or "session_owner: Cursor rediscovery record unavailable"
+                            "session_owner: Cursor derived owner is not owned"
                         ),
                     ),
                     request=request,
                 )
-            affinity = sa.owner_record_as_strict_affinity_hint(
-                cursor_effective_record,
-                preserve_account_identity=True,
-            )
         else:
             affinity = sa.owner_record_as_affinity_hint(
                 session_owner_record,

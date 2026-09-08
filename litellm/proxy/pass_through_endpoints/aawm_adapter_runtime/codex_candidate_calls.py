@@ -62,6 +62,7 @@ _CURSOR_REQUEST_SCHEMA_REJECTION_REASONS = frozenset(
         "unresolved_call_id",
         "item_not_object",
         "item_type",
+        "cursor_continuation_identifier",
     }
 )
 _CURSOR_REQUEST_SCHEMA_REJECTION_CATEGORIES = frozenset(
@@ -2114,6 +2115,15 @@ def _cursor_replay_stock_codex_full_history_input(
     request_body: dict[str, Any],
 ) -> _CursorReplayValidationResult:
     input_items = request_body.get("input")
+    continuation_rejection = _cursor_replay_continuation_identifier_rejection(
+        input_items,
+        stage="stock_full_history",
+    )
+    if continuation_rejection is not None:
+        return _CursorReplayValidationResult(
+            value=None,
+            rejection=continuation_rejection,
+        )
     if not isinstance(input_items, list):
         return _cursor_replay_rejected(
             "stock_full_history",
@@ -2426,6 +2436,23 @@ def _cursor_replay_input_contains_cursor_continuation_identifier(
     return None
 
 
+def _cursor_replay_continuation_identifier_rejection(
+    value: Any,
+    *,
+    stage: str,
+) -> Optional[_CursorReplayFreshDispatchReject]:
+    continuation_key = _cursor_replay_input_contains_cursor_continuation_identifier(
+        value
+    )
+    if continuation_key is None:
+        return None
+    return _cursor_replay_rejection(
+        stage,
+        "cursor_continuation_identifier",
+        item={continuation_key: True},
+    )
+
+
 def _cursor_replay_canonicalize_stock_tool_search(
     tool: Mapping[str, Any],
 ) -> Optional[dict[str, Any]]:
@@ -2660,6 +2687,18 @@ def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
             "request_body_shape",
         )
 
+    input_continuation_rejection = (
+        _cursor_replay_continuation_identifier_rejection(
+            request_body.get("input"),
+            stage="fresh_body_copy",
+        )
+    )
+    if input_continuation_rejection is not None:
+        return _CursorReplayFreshDispatchBuildResult(
+            body=None,
+            rejection=input_continuation_rejection,
+        )
+
     replay_state = getattr(
         continuation_exc,
         _CURSOR_REPLAY_STATE_FIELD,
@@ -2726,6 +2765,17 @@ def _build_cursor_replay_safe_fresh_dispatch_body_result(  # noqa: PLR0915
             return _cursor_replay_build_rejected(
                 "fresh_body_copy",
                 "messages_container",
+            )
+        messages_continuation_rejection = (
+            _cursor_replay_continuation_identifier_rejection(
+                messages,
+                stage="fresh_body_copy",
+            )
+        )
+        if messages_continuation_rejection is not None:
+            return _CursorReplayFreshDispatchBuildResult(
+                body=None,
+                rejection=messages_continuation_rejection,
             )
         if not messages:
             return _cursor_replay_build_rejected(
@@ -3172,10 +3222,47 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         rollup_kwargs=rollup_kwargs,
         adapter_label="Cursor Agent",
     )
+    input_continuation_key = (
+        _cursor_replay_input_contains_cursor_continuation_identifier(
+            request_body.get("input")
+        )
+    )
+    if input_continuation_key is not None:
+        raise _CursorRequestSchemaError(
+            (
+                "Cursor Agent request input contains unsupported nested "
+                f"continuation identifier {input_continuation_key!r}."
+            ),
+            reason="cursor_continuation_identifier",
+            category="request_shape",
+            object_type="object",
+            item={input_continuation_key: True},
+        )
     replay_state: Optional[dict[str, Any]] = None
     previous_response_id = request_body.get("previous_response_id")
     if isinstance(previous_response_id, str) and previous_response_id:
         replay_state = _peek_cursor_replay_state(previous_response_id)
+    stored_messages = (
+        replay_state.get("messages")
+        if isinstance(replay_state, dict)
+        else None
+    )
+    stored_messages_continuation_key = (
+        _cursor_replay_input_contains_cursor_continuation_identifier(
+            stored_messages
+        )
+    )
+    if stored_messages_continuation_key is not None:
+        raise _CursorRequestSchemaError(
+            (
+                "Cursor Agent stored messages contain unsupported nested "
+                f"continuation identifier {stored_messages_continuation_key!r}."
+            ),
+            reason="cursor_continuation_identifier",
+            category="request_shape",
+            object_type="object",
+            item={stored_messages_continuation_key: True},
+        )
     request_tools = request_body.get("tools")
     if not isinstance(request_tools, list) and isinstance(replay_state, dict):
         request_tools = replay_state.get("tools")
@@ -4532,6 +4619,7 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
                 *_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES,
             ],
             caller_managed_hidden_retry=True,
+            defer_session_owner_promotion=True,
         )
     except Exception as exc:
         if _grok_native_candidate_unavailable_detail(exc) is not None:
@@ -4619,6 +4707,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
                 *_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES,
             ],
             caller_managed_hidden_retry=True,
+            defer_session_owner_promotion=True,
         )
     except Exception as exc:
         if _xai_oauth_candidate_unavailable_detail(exc) is not None:

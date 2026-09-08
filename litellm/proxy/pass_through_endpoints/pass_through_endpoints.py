@@ -4326,6 +4326,7 @@ async def _aawm_session_owner_pre_send_guard(
     expected_target_family: Optional[str],
     url: Optional[httpx.URL],
     provider_bound_body: Optional[dict] = None,
+    defer_session_owner_promotion: bool = False,
 ) -> None:
     """Ensure tokenized session-owner reservation before upstream send.
 
@@ -4362,7 +4363,10 @@ async def _aawm_session_owner_pre_send_guard(
         # Renew held reservation before potentially long upstream I/O.
         lease = sa.get_request_session_owner_lease(request)
         if lease is not None and lease.held_reservation and not lease.promoted:
-            if (egress_credential_family or "").casefold() == "xai":
+            if (
+                (egress_credential_family or "").casefold() == "xai"
+                and not defer_session_owner_promotion
+            ):
                 sa.raise_session_owner_redispatch_required(
                     session_identity=lease.session_identity,
                     candidate=lease.attributes,
@@ -4447,7 +4451,10 @@ async def _aawm_session_owner_on_upstream_result(
     *,
     request: Request,
     success: bool,
+    defer_session_owner_promotion: bool = False,
 ) -> None:
+    if defer_session_owner_promotion:
+        return
     sa = _session_affinity_mod()
     if success:
         await sa.finalize_request_session_owner_lease(
@@ -4510,6 +4517,7 @@ async def pass_through_request(  # noqa: PLR0915
     blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
     retryable_upstream_status_codes: Optional[list[int]] = None,
     caller_managed_hidden_retry: bool = False,
+    defer_session_owner_promotion: bool = False,
     raw_body_passthrough: bool = False,
     passthrough_logging_metadata: Optional[dict[str, Any]] = None,
 ):
@@ -4536,6 +4544,8 @@ async def pass_through_request(  # noqa: PLR0915
             caller, so generic passthrough failure logging should be deferred to the adapter layer
         caller_managed_hidden_retry: When true, disables shared pre-first-byte hidden retries so
             adapter/candidate-rotation callers do not double-retry upstream failures
+        defer_session_owner_promotion: When true, the caller owns lease
+            promotion after validating the complete candidate response.
         raw_body_passthrough: Forward the original request body as bytes while
             using a small synthetic body for logging. This is intended for
             native binary/protobuf side-channel endpoints.
@@ -5020,6 +5030,7 @@ async def pass_through_request(  # noqa: PLR0915
                     if isinstance(provider_bound_body, dict)
                     else None
                 ),
+                defer_session_owner_promotion=defer_session_owner_promotion,
             )
             upstream_wait_started_at = datetime.now()
             try:
@@ -5161,12 +5172,16 @@ async def pass_through_request(  # noqa: PLR0915
                 )
             except ResponsesStreamPreCommitFailure as pre_commit_exc:
                 await _aawm_session_owner_on_upstream_result(
-                    request=request, success=False
+                    request=request,
+                    success=False,
+                    defer_session_owner_promotion=defer_session_owner_promotion,
                 )
                 raise pre_commit_exc.as_http_exception() from pre_commit_exc
             except Exception:
                 await _aawm_session_owner_on_upstream_result(
-                    request=request, success=False
+                    request=request,
+                    success=False,
+                    defer_session_owner_promotion=defer_session_owner_promotion,
                 )
                 raise
             # First upstream byte path succeeded enough to return a response object.
@@ -5174,7 +5189,9 @@ async def pass_through_request(  # noqa: PLR0915
                 getattr(response, "status_code", 500) < 300
             )
             await _aawm_session_owner_on_upstream_result(
-                request=request, success=status_ok
+                request=request,
+                success=status_ok,
+                defer_session_owner_promotion=defer_session_owner_promotion,
             )
             if not status_ok:
                 # Keep existing error handling below.
@@ -5251,6 +5268,7 @@ async def pass_through_request(  # noqa: PLR0915
                 if isinstance(provider_bound_body, dict)
                 else None
             ),
+            defer_session_owner_promotion=defer_session_owner_promotion,
         )
         upstream_wait_started_at = datetime.now()
 
@@ -5398,12 +5416,16 @@ async def pass_through_request(  # noqa: PLR0915
             )
         except Exception:
             await _aawm_session_owner_on_upstream_result(
-                request=request, success=False
+                request=request,
+                success=False,
+                defer_session_owner_promotion=defer_session_owner_promotion,
             )
             raise
         status_ok = bool(getattr(response, "status_code", 500) < 300)
         await _aawm_session_owner_on_upstream_result(
-            request=request, success=status_ok
+            request=request,
+            success=status_ok,
+            defer_session_owner_promotion=defer_session_owner_promotion,
         )
         upstream_wait_completed_at = datetime.now()
         _record_passthrough_duration(
