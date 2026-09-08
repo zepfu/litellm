@@ -177,9 +177,10 @@ from .aawm_adapter_runtime.provider_call_ledger import (
     ProviderCallLedgerExhausted,
     close_active_upstream_response,
     current_candidate_context,
+    get_openai_wire_commitment,
     get_or_create_openai_provider_call_ledger,
     publish_reservation_metadata,
-    record_transport_connection_attempt,
+    record_transport_connection_failure,
     register_active_upstream_response,
     clear_active_upstream_response,
 )
@@ -1788,8 +1789,14 @@ def _record_passthrough_hidden_retry_metadata(
         attempt_record["failure_classification"] = failure_classification
     attempts.append(attempt_record)
 
-    metadata["aawm_passthrough_hidden_retry_count"] = len(attempts)
-    metadata["aawm_passthrough_hidden_logical_retry_count"] = len(attempts)
+    attempt_numbers = [
+        record.get("attempt")
+        for record in attempts
+        if isinstance(record, dict) and isinstance(record.get("attempt"), int)
+    ]
+    retry_count = max(0, max(attempt_numbers, default=attempt_number) - 1)
+    metadata["aawm_passthrough_hidden_retry_count"] = retry_count
+    metadata["aawm_passthrough_hidden_logical_retry_count"] = retry_count
     if final_outcome is not None:
         metadata["aawm_passthrough_hidden_retry_final_outcome"] = final_outcome
     if failure_classification is not None:
@@ -4669,6 +4676,43 @@ async def pass_through_request(  # noqa: PLR0915
         for status_code in (retryable_upstream_status_codes or [])
         if isinstance(status_code, int)
     }
+    openai_call_ledger = None
+
+    def _publish_openai_send_telemetry() -> None:
+        request_state = getattr(request, "state", None)
+        if request_state is None:
+            return
+        if openai_call_ledger is not None:
+            ledger_snapshot = openai_call_ledger.snapshot()
+            setattr(
+                request_state,
+                "aawm_openai_send_ledger_snapshot",
+                ledger_snapshot,
+            )
+            setattr(
+                request_state,
+                "aawm_openai_logical_provider_calls",
+                ledger_snapshot["logical_provider_calls"],
+            )
+            setattr(
+                request_state,
+                "aawm_openai_transport_connection_failures",
+                ledger_snapshot["transport_connection_failures"],
+            )
+        retry_metadata = _ensure_passthrough_metadata(kwargs)
+        setattr(
+            request_state,
+            "aawm_passthrough_hidden_retry_count",
+            retry_metadata.get("aawm_passthrough_hidden_retry_count", 0),
+        )
+        setattr(
+            request_state,
+            "aawm_passthrough_hidden_logical_retry_count",
+            retry_metadata.get(
+                "aawm_passthrough_hidden_logical_retry_count",
+                retry_metadata.get("aawm_passthrough_hidden_retry_count", 0),
+            ),
+        )
 
     #########################################################
     try:
@@ -5117,7 +5161,13 @@ async def pass_through_request(  # noqa: PLR0915
                 prepared_request: httpx.Request,
                 send_stream: bool,
             ) -> httpx.Response:
+                openai_call_ledger.ensure_reservation_allowed(
+                    wire_commitment=get_openai_wire_commitment(request)
+                )
                 await close_active_upstream_response(request)
+                openai_call_ledger.ensure_reservation_allowed(
+                    wire_commitment=get_openai_wire_commitment(request)
+                )
                 request_state = getattr(request, "state", None)
                 reason = (
                     getattr(
@@ -5128,11 +5178,16 @@ async def pass_through_request(  # noqa: PLR0915
                     if request_state is not None
                     else None
                 )
+                wire_commitment = get_openai_wire_commitment(request)
+                openai_call_ledger.ensure_reservation_allowed(
+                    wire_commitment=wire_commitment
+                )
                 reservation = openai_call_ledger.reserve(
                     target=prepared_request.url,
                     reason=reason or "passthrough_provider_request",
                     candidate_context=current_candidate_context(request),
                     prior_response_closed=True,
+                    wire_commitment=wire_commitment,
                 )
                 publish_reservation_metadata(
                     request,
@@ -5146,48 +5201,12 @@ async def pass_through_request(  # noqa: PLR0915
                         follow_redirects=False,
                     )
                 except (httpx.ConnectError, httpx.ConnectTimeout):
-                    record_transport_connection_attempt(request)
+                    record_transport_connection_failure(request)
                     raise
                 register_active_upstream_response(request, response)
                 return response
 
             openai_send_request_fn = _send_prepared_openai_request
-
-        def _publish_openai_send_telemetry() -> None:
-            request_state = getattr(request, "state", None)
-            if request_state is None:
-                return
-            if openai_call_ledger is not None:
-                ledger_snapshot = openai_call_ledger.snapshot()
-                setattr(
-                    request_state,
-                    "aawm_openai_send_ledger_snapshot",
-                    ledger_snapshot,
-                )
-                setattr(
-                    request_state,
-                    "aawm_openai_logical_provider_calls",
-                    ledger_snapshot["logical_provider_calls"],
-                )
-                setattr(
-                    request_state,
-                    "aawm_openai_transport_connection_attempts",
-                    ledger_snapshot["transport_connection_attempts"],
-                )
-            retry_metadata = _ensure_passthrough_metadata(kwargs)
-            setattr(
-                request_state,
-                "aawm_passthrough_hidden_retry_count",
-                retry_metadata.get("aawm_passthrough_hidden_retry_count", 0),
-            )
-            setattr(
-                request_state,
-                "aawm_passthrough_hidden_logical_retry_count",
-                retry_metadata.get(
-                    "aawm_passthrough_hidden_logical_retry_count",
-                    retry_metadata.get("aawm_passthrough_hidden_retry_count", 0),
-                ),
-            )
 
         if stream:
             await _aawm_session_owner_pre_send_guard(
@@ -5250,6 +5269,7 @@ async def pass_through_request(  # noqa: PLR0915
                             upstream_url=str(url) if url is not None else None,
                         ),
                         namespace=get_aawm_alias_routing_state_namespace(),
+                        account_context=current_candidate_context(request),
                     )
                 )
 
@@ -5462,6 +5482,7 @@ async def pass_through_request(  # noqa: PLR0915
                         upstream_url=str(url) if url is not None else None,
                     ),
                     namespace=get_aawm_alias_routing_state_namespace(),
+                    account_context=current_candidate_context(request),
                 )
             )
 

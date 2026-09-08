@@ -859,6 +859,10 @@ async def handle_alias_route(  # noqa: PLR0915
                 upstream_url=_lpe._codex_oauth_responses_target_url(),
             ),
             namespace=get_aawm_alias_routing_state_namespace(),
+            account_context={
+                "account_hash": candidate.get("codex_oauth_account_hash"),
+                "lane_key": candidate.get("codex_oauth_lane_key"),
+            },
         )
 
     def _classify_codex_auto_agent_retryable_exhaustion(
@@ -1944,21 +1948,25 @@ async def handle_alias_route(  # noqa: PLR0915
                                 else None
                             )
                             ledger_start_count = (
-                                request_ledger.logical_provider_calls
+                                len(request_ledger.reservations)
                                 if request_ledger is not None
                                 else 0
                             )
                             attempts.append(attempt_record)
-                            attempt_record["attempted_provider_call"] = True
-                            attempted_provider_call = True
+                            attempt_record["attempted_provider_call"] = False
+                            attempted_provider_call = False
+                            perform_exc: Optional[BaseException] = None
                             try:
-                                return await perform_candidate_request_fn(
+                                response = await perform_candidate_request_fn(
                                     candidate=candidate,
                                     candidate_body=candidate_body,
                                 )
-                            except Exception as perform_exc:
-                                attempt_record["hidden_logical_retry_count"] = (
-                                    getattr(
+                            except BaseException as caught_exc:
+                                perform_exc = caught_exc
+                                if isinstance(caught_exc, Exception):
+                                    attempt_record[
+                                        "hidden_logical_retry_count"
+                                    ] = getattr(
                                         request.state,
                                         "aawm_passthrough_hidden_logical_retry_count",
                                         getattr(
@@ -1967,23 +1975,13 @@ async def handle_alias_route(  # noqa: PLR0915
                                             0,
                                         ),
                                     )
-                                )
-                                if (
-                                    getattr(
-                                        perform_exc,
-                                        "attempted_provider_call",
-                                        None,
-                                    )
-                                    is False
-                                ):
-                                    attempt_record["attempted_provider_call"] = False
-                                    attempted_provider_call = False
                                 raise
                             finally:
                                 if request_ledger is None and candidate_is_openai:
                                     request_ledger = (
                                         get_request_provider_call_ledger(request)
                                     )
+                                ordinals: list[int] = []
                                 if request_ledger is not None:
                                     new_reservations = request_ledger.reservations[
                                         ledger_start_count:
@@ -1992,22 +1990,62 @@ async def handle_alias_route(  # noqa: PLR0915
                                         reservation.ordinal
                                         for reservation in new_reservations
                                     ]
+                                    attempt_record[
+                                        "logical_provider_send_count"
+                                    ] = len(ordinals)
                                     if ordinals:
-                                        attempt_record["send_ledger_ordinals"] = (
-                                            ordinals
-                                        )
+                                        attempt_record["send_ledger_ordinals"] = ordinals
                                         attempt_record["send_ledger_ordinal"] = (
                                             ordinals[-1]
                                         )
+                                    if (
+                                        perform_exc is not None
+                                        and getattr(
+                                            perform_exc,
+                                            "aawm_call_ledger_exhausted",
+                                            False,
+                                        )
+                                        and not ordinals
+                                    ):
                                         attempt_record[
-                                            "logical_provider_send_count"
-                                        ] = len(ordinals)
+                                            "send_ledger_reservation_rejected"
+                                        ] = True
                                     attempt_record["send_ledger_snapshot"] = (
                                         request_ledger.snapshot()
                                     )
                                     attempt_record[
-                                        "transport_connection_attempts"
-                                    ] = request_ledger.transport_connection_attempts
+                                        "transport_connection_failures"
+                                    ] = request_ledger.transport_connection_failures
+                                if ordinals or perform_exc is None:
+                                    attempted_provider_call = True
+                                else:
+                                    explicit_attempted_provider_call = getattr(
+                                        perform_exc,
+                                        "attempted_provider_call",
+                                        None,
+                                    )
+                                    if isinstance(
+                                        explicit_attempted_provider_call,
+                                        bool,
+                                    ):
+                                        attempted_provider_call = (
+                                            explicit_attempted_provider_call
+                                        )
+                                    else:
+                                        attempted_provider_call = bool(
+                                            getattr(
+                                                perform_exc,
+                                                "_aawm_provider_returned",
+                                                False,
+                                            )
+                                            or isinstance(
+                                                perform_exc,
+                                                ProxyException,
+                                            )
+                                        )
+                                attempt_record["attempted_provider_call"] = (
+                                    attempted_provider_call
+                                )
                                 if "hidden_logical_retry_count" not in attempt_record:
                                     attempt_record["hidden_logical_retry_count"] = (
                                         getattr(
@@ -2020,6 +2058,7 @@ async def handle_alias_route(  # noqa: PLR0915
                                             ),
                                         )
                                     )
+                            return response
 
                         async def _run_candidate_operation() -> Response:
                             run_with_lease_renewal = getattr(
@@ -2580,7 +2619,12 @@ async def handle_alias_route(  # noqa: PLR0915
                     attempt_record["status"] = (
                         "terminal_request_call_ledger_exhausted"
                     )
-                    attempt_record["attempted_provider_call"] = False
+                    attempted_provider_call = bool(
+                        attempt_record.get("attempted_provider_call")
+                    )
+                    attempt_record["attempted_provider_call"] = (
+                        attempted_provider_call
+                    )
                     attempt_record["request_call_ledger"] = (
                         getattr(failure_exc, "ledger_snapshot", None)
                     )

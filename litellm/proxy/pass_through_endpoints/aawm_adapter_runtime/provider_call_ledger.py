@@ -26,6 +26,7 @@ _MAX_LOGICAL_PROVIDER_CALLS_LIMIT = 32
 _ACTIVE_RESPONSE_STATE_KEY = "aawm_openai_active_upstream_response"
 _CANDIDATE_CONTEXT_STATE_KEY = "aawm_openai_candidate_context"
 _LEDGER_STATE_KEY = "aawm_openai_provider_call_ledger"
+_WIRE_COMMITMENT_STATE_KEY = "_aawm_openai_responses_wire_commitment"
 
 
 def _safe_context_value(value: Any, *, maximum: int = 128) -> Optional[str]:
@@ -228,7 +229,7 @@ class ProviderCallLedger:
         self._started_at_monotonic = time.monotonic()
         self._next_ordinal = 1
         self._logical_provider_calls = 0
-        self._transport_connection_attempts = 0
+        self._transport_connection_failures = 0
         self._records: list[ProviderCallReservation] = []
         self._request_fingerprint = uuid4().hex[:16]
 
@@ -237,12 +238,25 @@ class ProviderCallLedger:
         return self._logical_provider_calls
 
     @property
+    def transport_connection_failures(self) -> int:
+        return self._transport_connection_failures
+
+    @property
     def transport_connection_attempts(self) -> int:
-        return self._transport_connection_attempts
+        """Backward-compatible alias for the failure-only counter."""
+
+        return self.transport_connection_failures
 
     @property
     def reservations(self) -> tuple[ProviderCallReservation, ...]:
         return tuple(self._records)
+
+    def ensure_reservation_allowed(self, *, wire_commitment: Any = None) -> None:
+        """Reject sends after the final OpenAI Responses wire is committed."""
+
+        reason = _wire_commitment_denial_reason(wire_commitment)
+        if reason is not None:
+            raise ProviderCallLedgerExhausted(ledger=self, reason=reason)
 
     def reserve(
         self,
@@ -251,11 +265,13 @@ class ProviderCallLedger:
         reason: str = "provider_request",
         candidate_context: Optional[dict[str, Any]] = None,
         prior_response_closed: bool,
+        wire_commitment: Any = None,
     ) -> ProviderCallReservation:
         if not prior_response_closed:
             raise RuntimeError(
                 "provider call reservation requires prior response closure"
             )
+        self.ensure_reservation_allowed(wire_commitment=wire_commitment)
         elapsed_seconds = time.monotonic() - self._started_at_monotonic
         if (
             self.deadline_seconds is not None
@@ -293,10 +309,15 @@ class ProviderCallLedger:
         self._next_ordinal += 1
         return reservation
 
-    def record_transport_connection_attempt(self) -> None:
+    def record_transport_connection_failure(self) -> None:
         """Record an observable connection failure separately from sends."""
 
-        self._transport_connection_attempts += 1
+        self._transport_connection_failures += 1
+
+    def record_transport_connection_attempt(self) -> None:
+        """Backward-compatible alias for the failure-only counter."""
+
+        self.record_transport_connection_failure()
 
     def snapshot(self) -> dict[str, Any]:
         remaining = max(
@@ -311,11 +332,71 @@ class ProviderCallLedger:
             "logical_provider_calls": self._logical_provider_calls,
             "remaining_logical_provider_calls": remaining,
             "next_attempt_ordinal": self._next_ordinal,
-            "transport_connection_attempts": self._transport_connection_attempts,
+            "transport_connection_failures": self._transport_connection_failures,
             "deadline_seconds": self.deadline_seconds,
             "elapsed_seconds": round(max(0.0, elapsed_seconds), 3),
             "reservations": [record.to_metadata() for record in self._records],
         }
+
+
+def get_openai_wire_commitment(request: Request) -> Optional[dict[str, Any]]:
+    """Return the live wire-owner snapshot without importing its implementation."""
+
+    state = _request_state(request)
+    if state is None:
+        return None
+    commitment = getattr(state, _WIRE_COMMITMENT_STATE_KEY, None)
+    if isinstance(commitment, dict):
+        return dict(commitment)
+    trace = getattr(state, "_aawm_openai_responses_wire_trace", None)
+    snapshot = getattr(trace, "snapshot", None)
+    if not callable(snapshot):
+        return None
+    try:
+        value = snapshot()
+    except Exception:
+        return None
+    return dict(value) if isinstance(value, dict) else None
+
+
+def _wire_commitment_denial_reason(
+    wire_commitment: Any,
+) -> Optional[str]:
+    if not isinstance(wire_commitment, dict):
+        return None
+
+    disposition = str(wire_commitment.get("disposition") or "").strip().lower()
+    if disposition in {"cancelled", "disconnected"}:
+        return f"wire_{disposition}"
+
+    commitment = str(wire_commitment.get("commitment") or "").strip().lower()
+    if commitment in {"headers", "body", "terminal", "done", "finalized"}:
+        return f"wire_commitment_{commitment}"
+
+    state = str(wire_commitment.get("state") or "").strip().lower()
+    if state in {
+        "headers_started",
+        "body_started",
+        "terminal_selected",
+        "terminal_sent",
+        "done_sent",
+    }:
+        return f"wire_state_{state}"
+
+    for field in (
+        "response_start_sent",
+        "first_body_sent",
+        "terminal_selected",
+        "terminal_sent",
+        "done_sent",
+        "terminal_wire_committed",
+        "done_wire_committed",
+        "finalization_started",
+        "finalized",
+    ):
+        if wire_commitment.get(field) is True:
+            return f"wire_{field}"
+    return None
 
 
 def get_or_create_openai_provider_call_ledger(
@@ -376,14 +457,20 @@ def publish_reservation_metadata(
         )
 
 
-def record_transport_connection_attempt(request: Request) -> None:
+def record_transport_connection_failure(request: Request) -> None:
     ledger = get_request_provider_call_ledger(request)
     if ledger is None:
         return
-    ledger.record_transport_connection_attempt()
+    ledger.record_transport_connection_failure()
     state = _request_state(request)
     if state is not None:
         setattr(state, "aawm_openai_send_ledger_snapshot", ledger.snapshot())
+
+
+def record_transport_connection_attempt(request: Request) -> None:
+    """Backward-compatible alias for the failure-only telemetry."""
+
+    record_transport_connection_failure(request)
 
 
 def register_active_upstream_response(
@@ -436,11 +523,13 @@ __all__ = [
     "clear_active_upstream_response",
     "close_active_upstream_response",
     "current_candidate_context",
+    "get_openai_wire_commitment",
     "get_or_create_openai_provider_call_ledger",
     "get_request_provider_call_ledger",
     "get_request_provider_call_ledger_snapshot",
     "is_openai_logical_send_target",
     "publish_reservation_metadata",
+    "record_transport_connection_failure",
     "record_transport_connection_attempt",
     "register_active_upstream_response",
 ]
