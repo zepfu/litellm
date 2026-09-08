@@ -24,6 +24,7 @@ export interface BridgeStateEnvelope {
   revisits?: RevisitEntry[];
   accountState?: HistoryAccountState;
   queueCoverage?: "complete" | "partial";
+  /** Durable keyset position for the next queue page; null starts a new pass. */
   nextCursor?: string | null;
   hasMore?: boolean;
 }
@@ -76,6 +77,7 @@ export interface BridgePageMutation {
 export class BridgeCheckpointStore implements HistoryCheckpointStore {
   private readonly discovery = new Map<HistoryScope, DiscoveryCheckpoint>();
   private readonly revisits = new Map<string, RevisitEntry>();
+  private nextCursor: string | null = null;
   private readonly pendingQueueMutations = new Map<
     string,
     BridgeCandidateMutation
@@ -93,6 +95,7 @@ export class BridgeCheckpointStore implements HistoryCheckpointStore {
       this.discovery.clear();
       this.revisits.clear();
       this.pendingQueueMutations.clear();
+      this.nextCursor = null;
       this.accountState = {
         status: "ready",
         reason: null,
@@ -103,6 +106,7 @@ export class BridgeCheckpointStore implements HistoryCheckpointStore {
       return;
     }
     validateEnvelope(state);
+    this.nextCursor = state.nextCursor ?? null;
     if (state.accountState) {
       this.accountState = validateAccountState(state.accountState);
     }
@@ -250,6 +254,7 @@ export class BridgeCheckpointStore implements HistoryCheckpointStore {
       discovery,
       accountState: clone(this.accountState),
       queueCoverage,
+      nextCursor: this.nextCursor,
     };
   }
 

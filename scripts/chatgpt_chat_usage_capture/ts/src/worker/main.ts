@@ -59,6 +59,8 @@ import type {
 const MAX_REPORT_PAGES = 100;
 const TERMINAL_REQUEST_RESERVE = 3;
 const TERMINAL_FRAME_RESERVE = 6;
+// Terminal state/summary objects share PostgreSQL's 64 KiB state-field bound.
+const MAX_TERMINAL_FRAME_BYTES = 64 * 1024 + 4 * 1024;
 
 export async function runStdioWorker(
   input: NodeJS.ReadableStream = process.stdin,
@@ -532,6 +534,9 @@ class ParentWorkerBridge implements WorkerBridge {
       this.candidateStateVersion !== expectedStateVersion
     ) {
       this.candidateState = structuredClone(this.headerState);
+      for (const checkpoint of Object.values(this.candidateState.discovery)) {
+        checkpoint.candidateQueue = [];
+      }
       this.candidateStateVersion = expectedStateVersion;
     }
     const state = this.candidateState;
@@ -882,7 +887,8 @@ class WireBudget {
     this.maxTotalBytes = bounds.maxTotalBytes;
     this.maxRequests = bounds.maxRequests;
     this.terminalBytesReserve =
-      TERMINAL_FRAME_RESERVE * this.maxFrameBytes;
+      TERMINAL_FRAME_RESERVE *
+      Math.min(this.maxFrameBytes, MAX_TERMINAL_FRAME_BYTES);
   }
 
   configure(
@@ -905,7 +911,8 @@ class WireBudget {
       "maxRequests",
     );
     this.terminalBytesReserve =
-      TERMINAL_FRAME_RESERVE * this.maxFrameBytes;
+      TERMINAL_FRAME_RESERVE *
+      Math.min(this.maxFrameBytes, MAX_TERMINAL_FRAME_BYTES);
     this.deadlineAt = deadlineAt;
     this.terminalPhase = false;
     if (
@@ -1522,6 +1529,10 @@ function stateFromHeader(
       ...empty,
       discovery,
       ...(accountState ? { accountState } : {}),
+      nextCursor:
+        typeof checkpoint.nextCursor === "string"
+          ? checkpoint.nextCursor
+          : null,
       stateVersionCounter,
     };
   }
@@ -1923,8 +1934,8 @@ function parseConversationMetadata(
   const truncated =
     typeof result.truncated === "boolean"
       ? result.truncated
-      : isRecord(rawCoverage) && rawCoverage.truncated === true
-        ? true
+      : isRecord(rawCoverage) && typeof rawCoverage.truncated === "boolean"
+        ? rawCoverage.truncated
         : undefined;
   return {
     ...(firstSummary
