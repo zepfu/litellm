@@ -1000,6 +1000,12 @@ provider/provider-user/workspace/quota-owner/surface; an unverified identity
 remains collector-local. Identical projection fingerprints deduplicate;
 changed evidence appends an immutable revision. Alias collisions become
 coverage gaps rather than silently merging attempts.
+Identity is tracked through versioned collector-to-scope bindings. A verified
+refinement can retire and redirect a provisional scope while preserving its
+evidence; active attempts with stronger identity evidence can retire weaker
+provisional aliases, and ambiguous collisions remain quarantined. Duplicate
+occurrences retain immutable evidence while refreshing bounded provenance
+freshness; stale observations never replace a newer current projection.
 
 `count_attempts(account, model_family=..., window_start=..., window_end=...)`
 uses one PostgreSQL statement snapshot, counts only non-tombstoned ordinary

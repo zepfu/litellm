@@ -428,56 +428,25 @@ class PgLedger:
         window_start: Optional[datetime] = None,
         window_end: Optional[datetime] = None,
     ) -> UsageCounts:
-        clauses = [
-            "scope_key IN ("
-            "SELECT scope_key FROM public.chatgpt_usage_scopes "
-            "WHERE collector_account_id = %s)",
-            "NOT tombstone",
-        ]
-        params: list[Any] = [account]
-        if model_family is not None:
-            clauses.append(
-                "(requested_family = %s OR recorded_final_family = %s "
-                "OR resolved_family = %s)"
-            )
-            params.extend((model_family, model_family, model_family))
-        if window_start is not None:
-            clauses.append(
-                "COALESCE(attempt_time, earliest_possible_at, latest_possible_at) >= %s"
-            )
-            params.append(ensure_utc(window_start))
-        if window_end is not None:
-            clauses.append(
-                "COALESCE(attempt_time, earliest_possible_at, latest_possible_at) < %s"
-            )
-            params.append(ensure_utc(window_end))
-        where = " AND ".join(clauses)
-        with self.connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT COUNT(*) FROM public.chatgpt_usage_attempts "
-                f"WHERE {where}",
-                params,
-            )
-            total_row = cur.fetchone()
-            if total_row is None:
-                raise LedgerError("count query returned no row")
-            total = int(total_row[0])
-            cur.execute(
-                "SELECT COUNT(*) FROM public.chatgpt_usage_attempts "
-                f"WHERE {where} AND completed_answer",
-                params,
-            )
-            completed_row = cur.fetchone()
-            if completed_row is None:
-                raise LedgerError("completed count query returned no row")
-            completed = int(completed_row[0])
-            result = UsageCounts(total=total, completed=completed)
-            for field_name, column in _COUNT_COLUMNS:
-                cur.execute(
-                    "SELECT "
-                    f"{column}, COUNT(*) FROM public.chatgpt_usage_attempts "
-                    f"WHERE {where} AND {column} IS NOT NULL GROUP BY {column}",
-                    params,
+        account_token = _required_token(account, "account")
+        family_token = (
+            _required_token(model_family, "model_family")
+            if model_family is not None
+            else None
+        )
+        start = ensure_utc(window_start) if window_start is not None else None
+        end = ensure_utc(window_end) if window_end is not None else None
+        if start is not None and end is not None and start >= end:
+            raise LedgerError("window_start must be before window_end")
+        time_state_sql, time_params = _time_state_sql(start, end)
+        model_clause = ""
+        params: list[Any] = [account_token]
+        if family_token is not None:
+            model_clause = """
+                AND (
+                    requested_family = %s
+                    OR recorded_final_family = %s
+                    OR resolved_family = %s
                 )
             """
             params.extend((family_token, family_token, family_token))
@@ -488,9 +457,10 @@ class PgLedger:
                 FROM public.chatgpt_usage_attempts AS attempts
                 WHERE EXISTS (
                     SELECT 1
-                    FROM public.chatgpt_usage_scopes AS scopes
-                    WHERE scopes.scope_key = attempts.scope_key
-                      AND scopes.collector_account_id = %s
+                    FROM public.chatgpt_usage_scope_bindings AS bindings
+                    WHERE bindings.scope_key = attempts.scope_key
+                      AND bindings.collector_account_id = %s
+                      AND bindings.binding_state = 'active'
                 )
                   AND NOT attempts.tombstone
                   {model_clause}
@@ -865,16 +835,17 @@ class PgLedgerPage:
         payload: Mapping[str, Any],
     ) -> tuple[str, bool]:
         binding = self.bind_scope(scope, seen_at=context.observed_at)
-        sanitized = sanitize_mapping(payload)
+        sanitized = _observation_envelope(payload)
         self.ledger.assert_safe_record(sanitized)
         provenance = sanitize_provenance(
-            {
-                **(context.provenance or {}),
-                "collector_account_id": scope.collector_account_id,
-                "schema_version": context.schema_version,
-                "source_id": context.source_id,
-                "source_kind": context.source_kind,
-            }
+                {
+                    **(context.provenance or {}),
+                    "collector_account_id": scope.collector_account_id,
+                    "schema_version": context.schema_version,
+                    "source_id": context.source_id,
+                    "source_kind": context.source_kind,
+                    "transfer_schema_version": TRANSFER_SCHEMA_VERSION,
+                }
         )
         self.ledger.assert_safe_record(provenance)
         stable_payload = _without_keys(sanitized, "provenance", "run_id")
@@ -1206,7 +1177,7 @@ class PgLedgerPage:
         seen_at: datetime,
     ) -> str:
         binding = self.bind_scope(scope, seen_at=seen_at)
-        safe_details = sanitize_mapping(details or {})
+        safe_details = _coverage_details_envelope(details or {})
         self.ledger.assert_safe_record(safe_details)
         gap_id = stable_id(binding.scope_key, source_kind, source_id, reason)
         observed_at = ensure_utc(seen_at)
@@ -1689,7 +1660,7 @@ def _record_identity_gap(
     details: Mapping[str, Any],
     seen_at: datetime,
 ) -> None:
-    safe_details = sanitize_mapping(details)
+    safe_details = _coverage_details_envelope(details)
     page.ledger.assert_safe_record(safe_details)
     gap_id = stable_id(scope_key_value, "attempt_identity", source_id, reason)
     cur.execute(
@@ -2026,6 +1997,7 @@ def _attempt_payload(
     attempt_id: Optional[str] = None,
 ) -> dict[str, Any]:
     return {
+        "transferSchemaVersion": TRANSFER_SCHEMA_VERSION,
         "attemptId": attempt_id or attempt.attempt_id,
         "conversationId": attempt.conversation_id,
         "identityBasis": attempt.identity_basis,
