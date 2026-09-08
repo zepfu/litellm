@@ -1365,9 +1365,9 @@ def prepare_encrypted_function_output_items_for_openai_egress(
                     clean_item.get("output")
                 )
             ):
-                # Ciphertext may be the output value itself, not only an
-                # encrypted_content part nested inside a structured output.
-                # Preserve the call ID with the same harmless placeholder.
+                # No supported plaintext or structured output remains after
+                # sanitization. Preserve the call ID with the same harmless
+                # placeholder.
                 clean_item["output"] = ""
                 item["output"] = ""
                 changed = True
