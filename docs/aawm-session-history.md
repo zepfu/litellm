@@ -2778,6 +2778,15 @@ Native Grok passthrough session identity prefers an explicit
 `x-grok-conv-id` header as the persisted `session_id` so usage-bearing Grok TUI
 rows remain reportable under a stable conversation identifier.
 
+For a native Grok request with a live server-owned session lease, LiteLLM
+replaces the outbound `x-grok-session-id` with a domain-separated SHA-256
+digest of that lease identity. This provider-safe value overrides every
+caller-supplied session header or metadata value without exposing the raw
+internal identity. Direct native requests without an authoritative lease retain
+the legacy header and conversation-id resolution above. Caller metadata alone
+never establishes owner binding, and parent, child, and auto-review identity
+selection remains owned by the shared session-affinity policy.
+
 Native Grok passthrough model attribution prefers `x-grok-model-override`.
 When that header is absent but the JSON request body contains a supported
 native Grok model such as `grok-composer-2.5-fast`, LiteLLM promotes that body
