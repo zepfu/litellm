@@ -14,17 +14,26 @@ rewritten.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-from typing import Any, Mapping, Optional
+from dataclasses import dataclass
+from typing import Any, Mapping, MutableSequence, Optional
 
 from fastapi import HTTPException
+
+from litellm.responses.function_name_sanitization import (
+    ResponsesFunctionIdentity,
+)
 
 
 COLLABORATION_MESSAGE_PROPERTY = "message"
 COLLABORATION_FRAME_VERSION = 1
 COLLABORATION_TEXT_ENCODING = "text"
 ASSIGNMENT_UNREADABLE_ERROR_CODE = "aawm_codex_assignment_unreadable"
+CODEX_COLLABORATION_TOOL_IDENTITIES_STATE_FIELD = (
+    "_aawm_codex_collaboration_tool_identities"
+)
 
 _MAX_FRAME_CHARS = 4 * 1024 * 1024
 _COLLABORATION_NAMESPACES = frozenset(
@@ -94,6 +103,149 @@ class CodexCollaborationDispatchError(ValueError):
 
 class _NormalizedCodexAgentMessage(dict[str, Any]):
     """Python-only marker for an already materialized collaboration payload."""
+
+
+@dataclass(frozen=True)
+class CodexCollaborationToolAlias:
+    """A validated client identity and its native OpenAI wire alias."""
+
+    original: ResponsesFunctionIdentity
+    upstream_name: str
+
+
+def bind_codex_collaboration_tool_identities(
+    request: Any,
+    identities: MutableSequence[ResponsesFunctionIdentity]
+    | tuple[ResponsesFunctionIdentity, ...],
+) -> None:
+    """Keep validated collaboration identities beside, never inside, the body."""
+    if not identities:
+        return
+    state = getattr(request, "state", None)
+    if state is None:
+        return
+    existing = getattr(
+        state,
+        CODEX_COLLABORATION_TOOL_IDENTITIES_STATE_FIELD,
+        (),
+    )
+    if not isinstance(existing, tuple):
+        existing = ()
+    merged = tuple(dict.fromkeys((*existing, *identities)))
+    try:
+        setattr(
+            state,
+            CODEX_COLLABORATION_TOOL_IDENTITIES_STATE_FIELD,
+            merged,
+        )
+    except Exception:
+        return
+
+
+def get_bound_codex_collaboration_tool_identities(
+    request: Any,
+) -> tuple[ResponsesFunctionIdentity, ...]:
+    """Return request-local validated identities without exposing body state."""
+    state = getattr(request, "state", None)
+    identities = getattr(
+        state,
+        CODEX_COLLABORATION_TOOL_IDENTITIES_STATE_FIELD,
+        (),
+    )
+    if not isinstance(identities, tuple):
+        return ()
+    return tuple(
+        identity
+        for identity in identities
+        if isinstance(identity, ResponsesFunctionIdentity)
+    )
+
+
+def _codex_alias_token(value: Optional[str], *, fallback: str) -> str:
+    if value is None:
+        return fallback
+    token = re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_")
+    return token or fallback
+
+
+def build_codex_collaboration_wire_aliases(
+    identities: tuple[ResponsesFunctionIdentity, ...]
+    | list[ResponsesFunctionIdentity],
+    *,
+    reserved_names: Optional[set[str] | frozenset[str]] = None,
+) -> tuple[CodexCollaborationToolAlias, ...]:
+    """Build stable, nonreserved aliases for validated V2 tool identities."""
+    aliases: list[CodexCollaborationToolAlias] = []
+    used_upstream_names: set[str] = set()
+    reserved_names = reserved_names or frozenset()
+    for identity in sorted(
+        set(identities),
+        key=lambda value: (value.namespace or "", value.name),
+    ):
+        namespace_token = _codex_alias_token(
+            identity.namespace,
+            fallback="default",
+        )
+        name_token = _codex_alias_token(identity.name, fallback="tool")
+        candidate = f"aawm_cfg047_v1_{namespace_token}_{name_token}"
+        if len(candidate) > 64:
+            digest = hashlib.sha256(
+                f"{identity.namespace or ''}\0{identity.name}".encode("utf-8")
+            ).hexdigest()[:16]
+            candidate = f"aawm_cfg047_v1_{digest}"
+        if candidate in used_upstream_names or candidate in reserved_names:
+            raise_codex_assignment_unreadable(
+                reason="collaboration_tool_alias_collision"
+            )
+        used_upstream_names.add(candidate)
+        aliases.append(
+            CodexCollaborationToolAlias(
+                original=identity,
+                upstream_name=candidate,
+            )
+        )
+    return tuple(aliases)
+
+
+def collect_codex_collaboration_advertised_tool_names(
+    body: Mapping[str, Any],
+) -> frozenset[str]:
+    """Return function names advertised by the request's tool definitions."""
+    names: set[str] = set()
+
+    def visit(tool: Any, *, allow_legacy_function: bool) -> None:
+        if not isinstance(tool, dict):
+            return
+        if tool.get("type") == "namespace":
+            children = tool.get("tools")
+            if isinstance(children, list):
+                for child in children:
+                    visit(child, allow_legacy_function=False)
+            return
+        tool_type = tool.get("type")
+        if tool_type is not None and tool_type != "function":
+            return
+        function = tool.get("function")
+        name = (
+            function.get("name")
+            if isinstance(function, dict)
+            else tool.get("name")
+        )
+        if isinstance(name, str):
+            names.add(name)
+        elif allow_legacy_function:
+            legacy_name = tool.get("name")
+            if isinstance(legacy_name, str):
+                names.add(legacy_name)
+
+    for key in ("tools", "functions"):
+        definitions = body.get(key)
+        if not isinstance(definitions, list):
+            continue
+        allow_legacy_function = key == "functions"
+        for tool in definitions:
+            visit(tool, allow_legacy_function=allow_legacy_function)
+    return frozenset(names)
 
 
 def raise_codex_assignment_unreadable(
@@ -285,8 +437,14 @@ def _normalize_targeted_parameters(
 
 def _function_tool_parts(
     tool: dict[str, Any],
+    *,
+    allow_legacy_function: bool = False,
 ) -> Optional[tuple[dict[str, Any], dict[str, Any], str, Any]]:
-    if tool.get("type") != "function":
+    if tool.get("type") == "namespace":
+        return None
+    if tool.get("type") != "function" and not (
+        allow_legacy_function and tool.get("type") is None
+    ):
         return None
     function = tool.get("function")
     if isinstance(function, dict):
@@ -305,6 +463,26 @@ def _tool_namespace(tool: Mapping[str, Any], function: Mapping[str, Any]) -> Any
     if namespace is None:
         namespace = function.get("namespace")
     return namespace
+
+
+def _collaboration_identity_parts(
+    name: str,
+    *,
+    explicit_namespace: Any,
+    namespace_context: Optional[str],
+) -> tuple[str, Optional[str], Optional[str], Optional[str]]:
+    namespace = (
+        explicit_namespace
+        if explicit_namespace is not None
+        else namespace_context
+    )
+    if namespace is not None:
+        return name, namespace if isinstance(namespace, str) else None, None, None
+    if "." in name:
+        qualified_namespace, qualified_name = name.rsplit(".", 1)
+        if qualified_namespace in _COLLABORATION_NAMESPACES:
+            return qualified_name, qualified_namespace, name, None
+    return name, None, None, None
 
 
 def _is_v1_spawn_schema(parameters: Any) -> bool:
@@ -391,8 +569,15 @@ def _normalize_function_tool(
     tool: dict[str, Any],
     *,
     namespace_context: Optional[str] = None,
+    allow_legacy_function: bool = False,
+    identity_collector: Optional[
+        MutableSequence[ResponsesFunctionIdentity]
+    ] = None,
 ) -> tuple[dict[str, Any], bool]:
-    parts = _function_tool_parts(tool)
+    parts = _function_tool_parts(
+        tool,
+        allow_legacy_function=allow_legacy_function,
+    )
     if parts is None:
         return tool, False
     _, function, name, parameters = parts
@@ -424,6 +609,26 @@ def _normalize_function_tool(
     )
     if not changed:
         return tool, False
+    if identity_collector is not None:
+        explicit_namespace = _tool_namespace(tool, function)
+        (
+            identity_name,
+            identity_namespace,
+            original_name,
+            original_namespace,
+        ) = _collaboration_identity_parts(
+            name,
+            explicit_namespace=explicit_namespace,
+            namespace_context=namespace_context,
+        )
+        identity_collector.append(
+            ResponsesFunctionIdentity(
+                name=identity_name,
+                namespace=identity_namespace,
+                original_name=original_name,
+                original_namespace=original_namespace,
+            )
+        )
 
     normalized_tool = dict(tool)
     if function is tool:
@@ -435,7 +640,13 @@ def _normalize_function_tool(
     return normalized_tool, True
 
 
-def _normalize_namespace_tool(tool: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+def _normalize_namespace_tool(
+    tool: dict[str, Any],
+    *,
+    identity_collector: Optional[
+        MutableSequence[ResponsesFunctionIdentity]
+    ] = None,
+) -> tuple[dict[str, Any], bool]:
     namespace = tool.get("name")
     if namespace not in _COLLABORATION_NAMESPACES:
         return tool, False
@@ -453,6 +664,7 @@ def _normalize_namespace_tool(tool: dict[str, Any]) -> tuple[dict[str, Any], boo
         normalized_child, child_changed = _normalize_function_tool(
             child,
             namespace_context=namespace,
+            identity_collector=identity_collector,
         )
         if child_changed:
             normalized_children[index] = normalized_child
@@ -464,21 +676,46 @@ def _normalize_namespace_tool(tool: dict[str, Any]) -> tuple[dict[str, Any], boo
     return normalized_tool, True
 
 
-def _normalize_tool_definition(tool: Any) -> tuple[Any, bool]:
+def _normalize_tool_definition(
+    tool: Any,
+    *,
+    allow_legacy_function: bool = False,
+    identity_collector: Optional[
+        MutableSequence[ResponsesFunctionIdentity]
+    ] = None,
+) -> tuple[Any, bool]:
     if not isinstance(tool, dict):
         return tool, False
     if tool.get("type") == "namespace":
-        return _normalize_namespace_tool(tool)
-    return _normalize_function_tool(tool)
+        return _normalize_namespace_tool(
+            tool,
+            identity_collector=identity_collector,
+        )
+    return _normalize_function_tool(
+        tool,
+        allow_legacy_function=allow_legacy_function,
+        identity_collector=identity_collector,
+    )
 
 
-def _normalize_tool_list(tools: Any) -> tuple[Any, bool]:
+def _normalize_tool_list(
+    tools: Any,
+    *,
+    allow_legacy_function: bool = False,
+    identity_collector: Optional[
+        MutableSequence[ResponsesFunctionIdentity]
+    ] = None,
+) -> tuple[Any, bool]:
     if not isinstance(tools, list):
         return tools, False
     normalized_tools = list(tools)
     changed = False
     for index, tool in enumerate(tools):
-        normalized_tool, tool_changed = _normalize_tool_definition(tool)
+        normalized_tool, tool_changed = _normalize_tool_definition(
+            tool,
+            allow_legacy_function=allow_legacy_function,
+            identity_collector=identity_collector,
+        )
         if tool_changed:
             normalized_tools[index] = normalized_tool
             changed = True
@@ -487,12 +724,18 @@ def _normalize_tool_list(tools: Any) -> tuple[Any, bool]:
 
 def _normalize_tool_schemas_without_error_mapping(
     body: dict[str, Any],
+    *,
+    identity_collector: Optional[
+        MutableSequence[ResponsesFunctionIdentity]
+    ] = None,
 ) -> dict[str, Any]:
     normalized_body = body
     changed = False
     for key in ("tools", "functions"):
         normalized_tools, tools_changed = _normalize_tool_list(
-            normalized_body.get(key)
+            normalized_body.get(key),
+            allow_legacy_function=key == "functions",
+            identity_collector=identity_collector,
         )
         if not tools_changed:
             continue
@@ -505,10 +748,17 @@ def _normalize_tool_schemas_without_error_mapping(
 
 def normalize_codex_collaboration_tool_schemas(
     body: dict[str, Any],
+    *,
+    identity_collector: Optional[
+        MutableSequence[ResponsesFunctionIdentity]
+    ] = None,
 ) -> dict[str, Any]:
     """Normalize only recognized V2 collaboration message schemas."""
     try:
-        return _normalize_tool_schemas_without_error_mapping(body)
+        return _normalize_tool_schemas_without_error_mapping(
+            body,
+            identity_collector=identity_collector,
+        )
     except CodexCollaborationDispatchError as exc:
         raise_codex_assignment_unreadable(reason=exc.reason)
     raise AssertionError("unreachable")
@@ -697,6 +947,10 @@ def normalize_codex_collaboration_input(body: dict[str, Any]) -> dict[str, Any]:
 
 def normalize_codex_collaboration_dispatch_body(
     request_body: Mapping[str, Any],
+    *,
+    identity_collector: Optional[
+        MutableSequence[ResponsesFunctionIdentity]
+    ] = None,
 ) -> dict[str, Any]:
     """Normalize schemas and assignments, failing closed before provider send."""
     if not isinstance(request_body, dict):
@@ -705,7 +959,10 @@ def normalize_codex_collaboration_dispatch_body(
         return {}
 
     try:
-        body = _normalize_tool_schemas_without_error_mapping(request_body)
+        body = _normalize_tool_schemas_without_error_mapping(
+            request_body,
+            identity_collector=identity_collector,
+        )
         return _normalize_input_without_error_mapping(body)
     except CodexCollaborationDispatchError as exc:
         raise_codex_assignment_unreadable(reason=exc.reason)

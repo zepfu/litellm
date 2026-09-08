@@ -173,6 +173,15 @@ retries or profile changes cannot repair an existing ciphertext blob. Other
 envelope shapes, encrypted reasoning, and provider-owned continuation state
 remain subject to the existing ownership guards.
 
+For native OpenAI Responses egress, reserved `collaboration.*` function names
+are replaced only for the recognized V2 identities with deterministic,
+request-local `aawm_cfg047_v1_...` wire aliases. The inverse preserves the exact
+function name and namespace in JSON and SSE responses. Alias collisions with an
+unrelated advertised function fail closed; foreign-provider tool names and
+ordinary encrypted state are not rewritten. A source request that already
+contains an unreadable assignment still requires regeneration rather than
+retrying the old ciphertext.
+
 At the Cursor boundary, stock `agent_message` items with an author, recipient,
 and entirely plaintext `input_text` content become user messages in the derived
 chat history. The canonical Responses items are not rewritten. Mixed opaque

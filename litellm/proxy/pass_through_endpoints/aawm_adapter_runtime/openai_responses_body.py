@@ -35,6 +35,11 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.direct_openai_fun
 )
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
     _NormalizedCodexAgentMessage,
+    bind_codex_collaboration_tool_identities,
+    build_codex_collaboration_wire_aliases,
+    collect_codex_collaboration_advertised_tool_names,
+    get_bound_codex_collaboration_tool_identities,
+    normalize_codex_collaboration_dispatch_body,
 )
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
     PROVENANCE_ITEM_FIELD,
@@ -435,6 +440,28 @@ def compile_openai_responses_wire_body(
         copy.deepcopy(dict(source_body)) if isinstance(source_body, Mapping) else {}
     )
     body: dict[str, Any] = copy.deepcopy(source_snapshot)
+    discovered_collaboration_identities = []
+    body = normalize_codex_collaboration_dispatch_body(
+        body,
+        identity_collector=discovered_collaboration_identities,
+    )
+    if request is not None:
+        bind_codex_collaboration_tool_identities(
+            request,
+            discovered_collaboration_identities,
+        )
+    collaboration_identities = (
+        get_bound_codex_collaboration_tool_identities(request)
+        if request is not None
+        else tuple(discovered_collaboration_identities)
+    )
+    collaboration_aliases = build_codex_collaboration_wire_aliases(
+        collaboration_identities,
+        reserved_names=collect_codex_collaboration_advertised_tool_names(body),
+    )
+    forced_identity_rewrites = {
+        alias.original: alias.upstream_name for alias in collaboration_aliases
+    }
 
     # 1. Legacy function-history id normalization (direct + alias contract).
     body = normalize_direct_openai_legacy_function_call_history_ids(body)
@@ -454,7 +481,10 @@ def compile_openai_responses_wire_body(
             dropped_params = tuple(str(item) for item in dropped)
 
     # 3. Function-name sanitization; restoration map stays off the wire body.
-    name_rewrite = sanitize_responses_function_names(body)
+    name_rewrite = sanitize_responses_function_names(
+        body,
+        forced_identity_rewrites=forced_identity_rewrites,
+    )
     if name_rewrite.changed and isinstance(name_rewrite.body, dict):
         body = name_rewrite.body
 

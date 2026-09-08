@@ -15,6 +15,7 @@ from fastapi import Request, Response
 
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+    bind_codex_collaboration_tool_identities,
     normalize_codex_collaboration_dispatch_body,
 )
 
@@ -177,6 +178,10 @@ def install(
     host_globals.setdefault(
         "normalize_codex_collaboration_dispatch_body",
         normalize_codex_collaboration_dispatch_body,
+    )
+    host_globals.setdefault(
+        "bind_codex_collaboration_tool_identities",
+        bind_codex_collaboration_tool_identities,
     )
     for _name in _HOST_FUNCTION_NAMES:
         _obj = _mod[_name]
@@ -467,8 +472,14 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
     """
     import litellm
 
+    codex_collaboration_identities = []
     normalized_request_body = normalize_codex_collaboration_dispatch_body(
-        prepared_request_body
+        prepared_request_body,
+        identity_collector=codex_collaboration_identities,
+    )
+    bind_codex_collaboration_tool_identities(
+        request,
+        codex_collaboration_identities,
     )
     if normalized_request_body is not prepared_request_body:
         prepared_request_body.clear()

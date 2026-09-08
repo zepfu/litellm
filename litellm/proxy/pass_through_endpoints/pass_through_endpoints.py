@@ -391,17 +391,28 @@ def _restore_responses_sse_payload(
     restored = restore_function_names_in_responses_body(
         payload,
         rewrite.upstream_to_original,
+        rewrite.upstream_to_original_identities,
     )
     if not isinstance(restored, dict):
         return restored
     if restored.get("type") != "response.function_call_arguments.done":
         return restored
     name = restored.get("name")
-    original_name = rewrite.restore_name(name)
-    if original_name == name:
+    original_name, original_namespace = rewrite.restore_identity(
+        name,
+        restored.get("namespace"),
+    )
+    if (
+        original_name == name
+        and original_namespace == restored.get("namespace")
+    ):
         return restored
     updated = dict(restored)
     updated["name"] = original_name
+    if original_namespace is None:
+        updated.pop("namespace", None)
+    else:
+        updated["namespace"] = original_namespace
     return updated
 
 
@@ -409,9 +420,9 @@ def _restore_responses_sse_frame(
     frame: bytes,
     rewrite: ResponsesFunctionNameRewrite,
 ) -> bytes:
-    updated_lines: list[bytes] = []
-    changed = False
-    for line in frame.splitlines(keepends=True):
+    data_lines: list[tuple[int, bytes, bytes, bytes]] = []
+    saw_done = False
+    for index, line in enumerate(frame.splitlines(keepends=True)):
         line_ending = b""
         content = line
         if line.endswith(b"\r\n"):
@@ -421,34 +432,49 @@ def _restore_responses_sse_frame(
             content = line[:-1]
             line_ending = b"\n"
         if not content.startswith(b"data:"):
-            updated_lines.append(line)
             continue
 
         prefix = b"data: " if content.startswith(b"data: ") else b"data:"
         payload_bytes = content[len(prefix) :]
         if payload_bytes.strip() == b"[DONE]":
-            updated_lines.append(line)
+            saw_done = True
             continue
-        try:
-            payload = json.loads(payload_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            updated_lines.append(line)
-            continue
-        restored = _restore_responses_sse_payload(payload, rewrite)
-        if restored is payload:
-            updated_lines.append(line)
-            continue
-        updated_lines.append(
-            prefix
-            + json.dumps(
-                restored,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-            + line_ending
+        data_lines.append((index, prefix, payload_bytes, line_ending))
+
+    if not data_lines or saw_done:
+        return frame
+
+    try:
+        payload = json.loads(
+            b"\n".join(payload_bytes for _, _, payload_bytes, _ in data_lines).decode(
+                "utf-8"
+            )
         )
-        changed = True
-    return b"".join(updated_lines) if changed else frame
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return frame
+
+    restored = _restore_responses_sse_payload(payload, rewrite)
+    if restored is payload:
+        return frame
+
+    first_data_index = data_lines[0][0]
+    data_line_indexes = {index for index, _, _, _ in data_lines}
+    first_prefix = data_lines[0][1]
+    first_line_ending = data_lines[0][3]
+    rendered_payload = json.dumps(
+        restored,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    updated_lines: list[bytes] = []
+    for index, line in enumerate(frame.splitlines(keepends=True)):
+        if index not in data_line_indexes:
+            updated_lines.append(line)
+        elif index == first_data_index:
+            updated_lines.append(
+                first_prefix + rendered_payload + first_line_ending
+            )
+    return b"".join(updated_lines)
 
 
 def _next_sse_frame_boundary(buffer: bytes) -> Optional[tuple[int, int]]:
@@ -6110,8 +6136,24 @@ async def pass_through_request(  # noqa: PLR0915
             url=url,
             custom_llm_provider=custom_llm_provider,
         ):
+            from .aawm_adapter_runtime.codex_collaboration_dispatch import (
+                build_codex_collaboration_wire_aliases,
+                collect_codex_collaboration_advertised_tool_names,
+                get_bound_codex_collaboration_tool_identities,
+            )
+
+            collaboration_aliases = build_codex_collaboration_wire_aliases(
+                get_bound_codex_collaboration_tool_identities(request),
+                reserved_names=collect_codex_collaboration_advertised_tool_names(
+                    provider_bound_body
+                ),
+            )
             responses_function_name_rewrite = sanitize_responses_function_names(
-                provider_bound_body
+                provider_bound_body,
+                forced_identity_rewrites={
+                    alias.original: alias.upstream_name
+                    for alias in collaboration_aliases
+                },
             )
             if responses_function_name_rewrite.changed:
                 provider_bound_body = responses_function_name_rewrite.body
@@ -7395,6 +7437,7 @@ async def pass_through_request(  # noqa: PLR0915
             restored_response_body = restore_function_names_in_responses_body(
                 response_body,
                 responses_function_name_rewrite.upstream_to_original,
+                responses_function_name_rewrite.upstream_to_original_identities,
             )
             if restored_response_body is not response_body:
                 response_body = restored_response_body

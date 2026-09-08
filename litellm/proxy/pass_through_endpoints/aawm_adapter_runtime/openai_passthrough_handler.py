@@ -40,6 +40,7 @@ from litellm.llms.xai.route_descriptors import (
     XAI_OAUTH_ROUTE_FAMILY,
 )
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_collaboration_dispatch import (
+    bind_codex_collaboration_tool_identities,
     normalize_codex_collaboration_dispatch_body,
 )
 from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
@@ -472,6 +473,7 @@ class BaseOpenAIPassThroughHandler:
 
         if request.method == "POST":
             request_body = await rt.get_request_body_fn(request)
+            codex_collaboration_identities = []
             watermark_intake = apply_request_watermark_intake(
                 body=request_body,
                 config=_get_runtime_text_watermark_config(),
@@ -492,11 +494,19 @@ class BaseOpenAIPassThroughHandler:
                 # Reject unreadable child assignments before any route or
                 # session-owner classification, including API-key OpenAI.
                 normalized_request_body = (
-                    normalize_codex_collaboration_dispatch_body(request_body)
+                    normalize_codex_collaboration_dispatch_body(
+                        request_body,
+                        identity_collector=codex_collaboration_identities,
+                    )
                 )
                 if normalized_request_body is not request_body:
                     request_body = normalized_request_body
                     prepared_request_body = normalized_request_body
+                    body_was_prepared = True
+                bind_codex_collaboration_tool_identities(
+                    request,
+                    codex_collaboration_identities,
+                )
             is_codex_responses_request = (
                 rt.request_uses_codex_native_auth_fn(request)
                 and is_responses_endpoint
@@ -564,11 +574,16 @@ class BaseOpenAIPassThroughHandler:
             ):
                 normalized_request_body = (
                     normalize_codex_collaboration_dispatch_body(
-                        prepared_request_body
+                        prepared_request_body,
+                        identity_collector=codex_collaboration_identities,
                     )
                 )
                 if normalized_request_body is not prepared_request_body:
                     prepared_request_body = normalized_request_body
+                bind_codex_collaboration_tool_identities(
+                    request,
+                    codex_collaboration_identities,
+                )
                 if (
                     is_managed_oa_xai_request
                     or direct_codex_kimi_adapter_model is not None
