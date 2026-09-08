@@ -54,9 +54,17 @@ interface PromptContext {
   branchRoots: string[];
 }
 
-interface GenerationCandidates {
+interface OwnerCandidates {
   ids: Set<string>;
   ambiguous: boolean;
+}
+
+interface FinalAnswerEvidence {
+  selected: GraphNode | null;
+  possible: GraphNode[];
+  completed: boolean;
+  ambiguous: boolean;
+  modelConflict: boolean;
 }
 
 export function reconstructAttempts(
@@ -136,7 +144,8 @@ function buildAttempt(
 ): ReconstructedAttempt {
   const usePromptEvidence = user !== null;
   const nodes = sortedNodes(group.nodes);
-  const final = finalAnswer(nodes);
+  const terminal = finalAnswer(nodes);
+  const final = terminal.selected;
   const generationIds = uniqueStrings(nodes.map((node) => node.record.generationId));
   const requestIds = uniqueStrings(nodes.map((node) => node.record.requestId));
   const promptKeys = contexts.flatMap((context) =>
@@ -162,16 +171,20 @@ function buildAttempt(
   const requestedReasoningEffortRaw = usePromptEvidence
     ? user?.requestedReasoningEffortRaw ?? null
     : null;
-  const recordedFinalModelRaw = final?.record.recordedFinalModelRaw ?? null;
-  const resolvedModelRaw = firstMetadataString(
-    final?.record.metadata,
-    [
-      ...(usePromptEvidence && user ? [user.metadata] : []),
-      ...nodes.map((node) => node.record.metadata),
-    ],
-    ["resolved_model", "resolved_model_slug"],
+  const recordedFinalModelRaw = agreedValue(
+    terminal.possible.map((node) => node.record.recordedFinalModelRaw),
   );
-  const timing = timingFor(user, nodes, final, usePromptEvidence);
+  const resolvedModelRaw = terminal.ambiguous
+    ? agreedValue(terminal.possible.map((node) => resolvedModelFor(node)))
+    : firstMetadataString(
+      final?.record.metadata,
+      [
+        ...(usePromptEvidence && user ? [user.metadata] : []),
+        ...nodes.map((node) => node.record.metadata),
+      ],
+      ["resolved_model", "resolved_model_slug"],
+    );
+  const timing = timingFor(user, nodes, final, usePromptEvidence, terminal.completed);
   const requestedFamily = mapModelEvidence(
     {
       slug: requestedModelRaw,
@@ -203,7 +216,7 @@ function buildAttempt(
     { at: timing.attemptTime },
   );
   const generationStarted = generationStartedFor(nodes);
-  const outcome = outcomeFor(nodes, final, generationStarted);
+  const outcome = outcomeFor(nodes, terminal.completed, generationStarted);
   const contextualRecords = [
     ...contexts.map((context) => context.user),
     ...nodes.map((node) => node.record),
@@ -220,8 +233,14 @@ function buildAttempt(
   if (contexts.length > 0 && !usePromptEvidence && hasGenerationSpecificIdentity(group)) {
     warnings.push("prompt_evidence_not_linked");
   }
-  if (!final && generationStarted) {
+  if (!terminal.completed && generationStarted) {
     warnings.push("terminal_answer_not_observed");
+  }
+  if (terminal.ambiguous) {
+    warnings.push("terminal_selection_ambiguous");
+  }
+  if (terminal.modelConflict) {
+    warnings.push("terminal_model_conflict");
   }
   if (surface !== "chat") {
     warnings.push(`surface:${surface}`);
@@ -248,7 +267,7 @@ function buildAttempt(
     resolvedFamily,
     mappingVersion: options.mapping.version,
     outcome,
-    completedAnswer: final !== null,
+    completedAnswer: terminal.completed,
     generationStarted,
     surface,
     origin,
@@ -440,7 +459,7 @@ function groupsForNodes(
   const requestCandidates = nodes.filter((node) =>
     !assigned.has(node.key) && !unresolved.has(node.key),
   );
-  const componentRoots = connectedComponentRoots(requestCandidates, graph);
+  const componentRoots = connectedComponentRoots(requestCandidates, graph, true);
   const requestGroups = new Map<string, NodeGroup>();
   const requestOwners = new Map<string, string>();
   for (const node of requestCandidates) {
@@ -464,9 +483,9 @@ function groupsForNodes(
       continue;
     }
     const owners = nearestOwnersFor(node, requestCandidates, requestOwners, graph);
-    if (owners.size === 1) {
-      requestGroups.get([...owners][0]!)!.nodes.push(node);
-    } else if (owners.size > 1) {
+    if (!owners.ambiguous && owners.ids.size === 1) {
+      requestGroups.get([...owners.ids][0]!)!.nodes.push(node);
+    } else if (owners.ambiguous || owners.ids.size > 1) {
       unresolved.add(node.key);
     }
   }
@@ -509,20 +528,22 @@ function nearestOwnersFor(
   candidates: GraphNode[],
   owners: ReadonlyMap<string, string>,
   graph: AttemptGraph,
-): Set<string> {
-  const result = new Set<string>();
+): OwnerCandidates {
+  const result: OwnerCandidates = { ids: new Set(), ambiguous: false };
+  const uncertainIds = new Set<string>();
   for (const direction of ["parents", "children"] as const) {
     const visited = new Set<string>();
-    const queue = [node];
+    const queue = [{ node, uncertain: false }];
     while (queue.length > 0) {
-      const current = queue.shift()!;
-      if (visited.has(current.key)) {
+      const { node: current, uncertain } = queue.shift()!;
+      const key = JSON.stringify([current.key, uncertain]);
+      if (visited.has(key)) {
         continue;
       }
-      visited.add(current.key);
+      visited.add(key);
       const owner = owners.get(current.key);
       if (owner !== undefined) {
-        result.add(owner);
+        (uncertain ? uncertainIds : result.ids).add(owner);
         continue;
       }
       if (direction === "children" && isTerminalNode(current)) {
@@ -533,22 +554,27 @@ function nearestOwnersFor(
           !(direction === "parents" && isTerminalNode(neighbor)) &&
           (neighbor.ownerKey === node.ownerKey || neighbor.ownerKey === null ||
             neighbor.record.generationId !== null),
-        ));
+        ).map((neighbor) => ({
+          node: neighbor,
+          uncertain: uncertain || (direction === "children" && !isGenerationFragment(current)),
+        })));
     }
   }
+  result.ambiguous = result.ids.size > 1 ||
+    [...uncertainIds].some((id) => !result.ids.has(id));
   return result;
 }
 
 function generationLinksFor(
   nodes: GraphNode[],
   graph: AttemptGraph,
-): Map<string, GenerationCandidates> {
-  const links = new Map<string, GenerationCandidates>();
+): Map<string, OwnerCandidates> {
+  const links = new Map<string, OwnerCandidates>();
   for (const node of nodes) {
     if (node.record.generationId !== null) {
       continue;
     }
-    const result: GenerationCandidates = {
+    const result: OwnerCandidates = {
       ids: new Set(),
       ambiguous: node.ownerKey === null,
     };
@@ -632,7 +658,7 @@ function generationLinksFor(
     }
     const expected = JSON.stringify(["generation", [...result.ids][0]]);
     const candidates = nearestOwnersFor(node, nodes, boundaries, graph);
-    if (candidates.size !== 1 || !candidates.has(expected)) {
+    if (candidates.ambiguous || candidates.ids.size !== 1 || !candidates.ids.has(expected)) {
       result.ambiguous = true;
     }
   }
@@ -695,6 +721,7 @@ function linkedNodes(
 function connectedComponentRoots(
   nodes: GraphNode[],
   graph: AttemptGraph,
+  stopAtTerminal = false,
 ): Map<string, string> {
   const byKey = new Map(nodes.map((node) => [node.key, node]));
   const remaining = new Set(nodes.map((node) => node.key));
@@ -717,6 +744,11 @@ function connectedComponentRoots(
         continue;
       }
       for (const neighbor of graphNeighbors(node, nodes, graph)) {
+        if (stopAtTerminal &&
+          ((graph.children.get(node.key)?.has(neighbor.key) && isTerminalNode(node)) ||
+            (graph.parents.get(node.key)?.has(neighbor.key) && isTerminalNode(neighbor)))) {
+          continue;
+        }
         if (remaining.has(neighbor.key) && neighbor.ownerKey === node.ownerKey) {
           queue.push(neighbor.key);
         }
@@ -839,7 +871,7 @@ function firstNodeTime(group: NodeGroup, graph: AttemptGraph): number | null {
   return Math.min(...times.map((time) => Date.parse(time!)));
 }
 
-function finalAnswer(nodes: GraphNode[]): GraphNode | null {
+function finalAnswer(nodes: GraphNode[]): FinalAnswerEvidence {
   const candidates = nodes.filter((node) => {
     const record = node.record;
     return (
@@ -849,7 +881,34 @@ function finalAnswer(nodes: GraphNode[]): GraphNode | null {
       isTerminalSuccess(record.status)
     );
   });
-  return candidates.sort(compareNodes).at(-1) ?? null;
+  const times = candidates.map((node) => node.record.createdAt);
+  const ordered = times.length > 0 &&
+    times.every((time) => time !== null && validTime(time));
+  const latest = ordered ? Math.max(...times.map((time) => Date.parse(time!))) : null;
+  const possible = ordered
+    ? candidates.filter((node) => Date.parse(node.record.createdAt!) === latest)
+    : candidates;
+  return {
+    selected: possible.length === 1 ? possible[0]! : null,
+    possible,
+    completed: candidates.length > 0,
+    ambiguous: possible.length > 1,
+    modelConflict: uniqueStrings(possible.map((node) => node.record.recordedFinalModelRaw)).length > 1 ||
+      uniqueStrings(possible.map((node) => resolvedModelFor(node))).length > 1,
+  };
+}
+
+function agreedValue(values: ReadonlyArray<string | null>): string | null {
+  const first = values[0] ?? null;
+  return values.every((value) => value === first) ? first : null;
+}
+
+function resolvedModelFor(node: GraphNode): string | null {
+  return firstMetadataString(
+    node.record.metadata,
+    [],
+    ["resolved_model", "resolved_model_slug"],
+  );
 }
 
 function isTerminalSuccess(status: string | null): boolean {
@@ -862,7 +921,7 @@ function isTerminalSuccess(status: string | null): boolean {
 
 function outcomeFor(
   nodes: GraphNode[],
-  final: GraphNode | null,
+  completedAnswer: boolean,
   generationStarted: boolean,
 ): string {
   const statuses = new Set(
@@ -870,7 +929,7 @@ function outcomeFor(
       .map((node) => (node.record.status ?? "").trim().toLowerCase())
       .filter(Boolean),
   );
-  if (final) {
+  if (completedAnswer) {
     return "completed";
   }
   if (!generationStarted) {
@@ -908,6 +967,7 @@ function timingFor(
   nodes: GraphNode[],
   final: GraphNode | null,
   usePromptEvidence: boolean,
+  completedAnswer: boolean,
 ): {
   attemptTime: string | null;
   timeBasis: string;
@@ -931,7 +991,7 @@ function timingFor(
     .map((node) => node.record.createdAt)
     .filter((value): value is string => value !== null && validTime(value))
     .sort();
-  if (final !== null && preFinalTimes.length > 0 && times.length > 0) {
+  if (completedAnswer && preFinalTimes.length > 0 && times.length > 0) {
     return {
       attemptTime: null,
       timeBasis: "response_observed",

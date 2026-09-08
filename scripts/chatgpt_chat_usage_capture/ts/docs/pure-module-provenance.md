@@ -51,6 +51,19 @@ provisional evidence, before projecting the requested model and submission time.
 Synthesized prompt aliases use the existing tuple-hashing helper so their
 unambiguous identity also satisfies the storage token contract.
 
+Request components stop at terminal response boundaries, so a reused request
+cannot combine a completed original and its later response. Forward attachment
+to a request owner requires continuation/fragment evidence; unknown status,
+channel, and turn state leave that relationship unresolved.
+
+Terminal observations preserve completion independently of final-node selection.
+With multiple terminal nodes, complete valid timestamp ordering must identify
+a unique latest node. Tied or missing timestamps retain all plausible terminal
+observations, expose
+`terminal_selection_ambiguous`, and project only model evidence on which those
+observations agree. Conflicting recorded/resolved models additionally expose
+`terminal_model_conflict`; message IDs never decide the final model.
+
 The new `src/counting/index.ts` is the package-internal export surface for a
 future bounded worker. It deliberately does not define a transport protocol or
 connect a live runtime. No `ledger/store.ts`, SQLite package dependency,
