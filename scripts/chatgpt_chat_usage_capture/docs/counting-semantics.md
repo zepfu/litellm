@@ -27,6 +27,8 @@ merely rename a stale aggregate payload.
 The PostgreSQL ledger resolves retired provisional scopes through their
 canonical scope redirects and accepts ownership only from the active collector
 binding. Missing canonical provider-user, workspace, or quota-owner identity is
-reported as `unknown_identity`. Unknown and excluded classes retain activity
-whose time evidence is ambiguous or unknown, but omit rows proven outside the
-requested half-open window.
+reported as `unknown_identity`. Attempts with a non-clear quarantine state are
+also classified as `unknown_identity`, so they remain auditable without
+contributing to definite totals or model breakdowns. Unknown and excluded
+classes retain activity whose time evidence is ambiguous or unknown, but omit
+rows proven outside the requested half-open window.

@@ -82,9 +82,7 @@ _ALLOWED_OUTCOMES = frozenset(
         "unknown",
     }
 )
-_ALLOWED_ALIAS_KINDS = frozenset(
-    {"generation", "request", "prompt", "message", "branch"}
-)
+_ALLOWED_ALIAS_KINDS = frozenset({"generation", "request", "prompt", "message", "branch"})
 _STRONG_ALIAS_KINDS = frozenset({"generation", "message", "branch"})
 _ALLOWED_GAP_STATES = frozenset({"open", "resolved", "unknown"})
 _ALLOWED_QUARANTINE_STATES = frozenset({"clear", "quarantined", "unknown"})
@@ -622,6 +620,8 @@ class PgLedger:
                 SELECT
                     scoped.*,
                     CASE
+                        WHEN COALESCE(quarantine_state, 'unknown') <> 'clear'
+                            THEN 'unknown_identity'
                         WHEN canonical_surface = 'unknown'
                           OR surface = 'unknown'
                             THEN 'unknown_surface'
@@ -910,9 +910,7 @@ class PgLedgerPage:
 
         cached = self._bindings.get(normalized_scope.collector_account_id)
         if cached is not None and cached.scope_key != key:
-            raise LedgerError(
-                "scope binding changed within a page; capture a new binding fence"
-            )
+            raise LedgerError("scope binding changed within a page; capture a new binding fence")
         if cached is not None and cached.scope_key == key:
             with self.conn.cursor() as cur:
                 cur.execute(
@@ -1064,12 +1062,8 @@ class PgLedgerPage:
             prior = _latest_observation(cur, binding.scope_key, safe_context)
             current = _current_observation(cur, binding.scope_key, safe_context)
             if prior is not None and prior["revision_fingerprint"] == revision_fingerprint:
-                should_promote = (
-                    current is None
-                    or (
-                        current["observation_id"] != prior["observation_id"]
-                        and observed_at >= current["last_seen_at"]
-                    )
+                should_promote = current is None or (
+                    current["observation_id"] != prior["observation_id"] and observed_at >= current["last_seen_at"]
                 )
                 if should_promote and current is not None:
                     cur.execute(
@@ -1251,9 +1245,7 @@ class PgLedgerPage:
                     "quarantined",
                     identity_conflicts + 1,
                 )
-            quarantine_state = (
-                "quarantined" if quarantine_reason is not None else "clear"
-            )
+            quarantine_state = "quarantined" if quarantine_reason is not None else "clear"
             if quarantine_reason is not None and current is not None:
                 cur.execute(
                     """
@@ -1285,10 +1277,7 @@ class PgLedgerPage:
                     "quarantined",
                     identity_conflicts + conflicts,
                 )
-            if (
-                current is not None
-                and current["projection_fingerprint"] == projection_fingerprint
-            ):
+            if current is not None and current["projection_fingerprint"] == projection_fingerprint:
                 cur.execute(
                     """
                     UPDATE public.chatgpt_usage_attempts
@@ -1764,13 +1753,13 @@ def _current_observation(
         return None
     return dict(
         zip(
-                (
-                    "observation_id",
-                    "observed_at",
-                    "last_seen_at",
-                    "occurrence_number",
-                    "revision_fingerprint",
-                ),
+            (
+                "observation_id",
+                "observed_at",
+                "last_seen_at",
+                "occurrence_number",
+                "revision_fingerprint",
+            ),
             row,
         )
     )
@@ -1853,12 +1842,8 @@ def _resolve_attempt_identity(
     seen_at: datetime,
 ) -> tuple[str, int, Optional[str], Optional[str]]:
     incoming_id = attempt.attempt_id
-    strong_aliases = [
-        alias for alias in aliases if alias[0] in _STRONG_ALIAS_KINDS
-    ]
-    weak_aliases = [
-        alias for alias in aliases if alias[0] not in _STRONG_ALIAS_KINDS
-    ]
+    strong_aliases = [alias for alias in aliases if alias[0] in _STRONG_ALIAS_KINDS]
+    weak_aliases = [alias for alias in aliases if alias[0] not in _STRONG_ALIAS_KINDS]
     strong_matches = _matching_alias_ids(cur, scope_key_value, strong_aliases)
     if strong_matches:
         matches = strong_matches
@@ -2403,9 +2388,7 @@ def _assert_active_binding(
     )
     row = cur.fetchone()
     if row is None or (
-        str(row[0]) != scope_key_value
-        or int(row[1]) != int(binding_generation)
-        or str(row[2]) != "active"
+        str(row[0]) != scope_key_value or int(row[1]) != int(binding_generation) or str(row[2]) != "active"
     ):
         raise LedgerError("scope binding fence is stale")
 
