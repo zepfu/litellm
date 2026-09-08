@@ -1538,28 +1538,25 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 text = text[:-1]
                 trailing_cr = True
             normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-            while normalized:
-                delimiter_index = normalized.find("\n\n")
+            pending = sse_buffer + normalized
+            sse_buffer = ""
+            while pending:
+                delimiter_index = pending.find("\n\n")
                 if delimiter_index < 0:
-                    candidate = sse_buffer + normalized
-                    if len(candidate.encode("utf-8")) > max_event_buffered_bytes:
+                    if len(pending.encode("utf-8")) > max_event_buffered_bytes:
                         buffer_limit_exceeded = True
                         sse_buffer = ""
                         _invalidate_stream(target, state, "byte_limit")
                         return
-                    sse_buffer = candidate
-                    normalized = ""
-                    continue
-                event_fragment = normalized[:delimiter_index]
-                candidate = sse_buffer + event_fragment
-                if len(candidate.encode("utf-8")) > max_event_buffered_bytes:
+                    sse_buffer = pending
+                    break
+                event_block = pending[:delimiter_index]
+                if len(event_block.encode("utf-8")) > max_event_buffered_bytes:
                     buffer_limit_exceeded = True
                     sse_buffer = ""
                     _invalidate_stream(target, state, "byte_limit")
                     return
-                sse_buffer = candidate
-                normalized = normalized[delimiter_index + 2 :]
-                event_block, sse_buffer = sse_buffer, ""
+                pending = pending[delimiter_index + 2 :]
                 _record_event_block(event_block)
             if final:
                 if trailing_cr:
