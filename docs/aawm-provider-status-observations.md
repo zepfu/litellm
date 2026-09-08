@@ -990,6 +990,18 @@ sidecar plus Chrome and its temporary profile. Keep copied profiles on private
 ephemeral storage; do not mount the base profile writable. Deployment and
 per-account recurring persistence require separate operational verification.
 
+The sidecar image also packages the preserved D1-752 TypeScript counting
+runtime in `/app/scripts/chatgpt_chat_usage_capture/ts`. Build reproducibility
+comes from the existing pinned `package-lock.json`. The image installs the
+pinned production dependencies and compiles TypeScript during the image build;
+it does not package browser profiles, credentials, fixtures, tests, the
+legacy standalone API, or SQLite runtime. The packaged `/usr/local/bin/node`
+is exposed through `AAWM_CHATGPT_ORACLE_NODE_EXECUTABLE`, remaining compatible
+with a mounted executable override. Compiled worker paths remain provisional
+until the bridge owner integrates the executable entrypoint. The history
+reader remains disabled until authenticated native-contract evidence is
+verified; packaging does not activate collection or schema changes.
+
 Polling uses a 600-second default cadence. `Retry-After` and backoff apply to
 the shared browser session, preserving other sessions and prior observation
 rows. A deferred or failed capture is not fresh evidence and does not replace
