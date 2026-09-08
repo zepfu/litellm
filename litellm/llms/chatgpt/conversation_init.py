@@ -5477,7 +5477,23 @@ def _native_history_process_reaped(
 ) -> bool:
     """Retire a worker tree without borrowing a later phase."""
 
+    def direct_child_reaped() -> bool:
+        if getattr(process, "pid", None) is None:
+            return True
+        try:
+            process.join(timeout=0)
+        except (AssertionError, OSError):
+            return False
+        return (
+            not _native_history_process_alive(process)
+            and getattr(process, "exitcode", None) is not None
+        )
+
     def scope_reaped() -> bool:
+        # A capability-level scope proof covers descendants, but never
+        # substitutes for reaping this directly owned multiprocessing child.
+        if not direct_child_reaped():
+            return False
         if (
             scope_reaped_state is not None
             and scope_reaped_state.get("proven") is True
@@ -5510,15 +5526,6 @@ def _native_history_process_reaped(
             if scope_alive is False and scope_reaped_state is not None:
                 scope_reaped_state["proven"] = True
             return scope_alive is False
-        try:
-            process.join(timeout=0)
-        except (AssertionError, OSError):
-            return False
-        if (
-            _native_history_process_alive(process)
-            or getattr(process, "exitcode", None) is None
-        ):
-            return False
         if poll_only and group_id > 0:
             # A post-leader group scan is a blocking inventory operation. In
             # poll-only servicing, rely on prior sealed scope evidence or the
@@ -5557,8 +5564,8 @@ def _native_history_process_reaped(
         if scope_reaped():
             return True
     if poll_only:
-        if time.monotonic() < kill_deadline:
-            return scope_reaped()
+        # Poll-only servicing may not restart the TERM grace window. Once its
+        # cutoff passes, escalate immediately and only observe retirement.
         _signal_native_history_worker(
             process,
             private_process_group,
@@ -5807,16 +5814,26 @@ def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle 
                 ),
             }
             try:
-                lifecycle_capability.terminate_native_history_process_scope(
-                    registration_id=registration.registration_id,
-                    term_deadline=plan["term_deadline"],
-                    kill_deadline=plan["kill_deadline"],
-                    reap_deadline=plan["reap_deadline"],
-                    poll_only=phase_poll_only,
+                scope_proof = bool(
+                    lifecycle_capability.terminate_native_history_process_scope(
+                        registration_id=registration.registration_id,
+                        term_deadline=plan["term_deadline"],
+                        kill_deadline=plan["kill_deadline"],
+                        reap_deadline=plan["reap_deadline"],
+                        poll_only=phase_poll_only,
+                    )
                 )
             except Exception as exc:
                 registration.cleanup_failure = str(exc)
                 return False
+            if scope_proof:
+                # Retain the actual owner result even when the directly owned
+                # multiprocessing child still needs a later join.
+                scope_reaped_state["proven"] = True
+                if is_closer and close_scope is not None:
+                    close_scope.scope_reaped_proven = True
+                else:
+                    registration.worker_scope_reaped_proven = True
             if _native_history_process_reaped(
                 process,
                 private_process_group,

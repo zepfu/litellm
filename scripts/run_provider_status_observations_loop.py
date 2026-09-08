@@ -2681,76 +2681,161 @@ def _adopt_chatgpt_oracle_descendants(  # noqa: PLR0915 - bounded inventory adop
                 known_process_start_times=known_process_start_times,
                 process_start_time=candidate.process_start_time,
             )
-    for pid, candidate in list(candidates.items()):
-        parent = candidate.parent_pid
-        handle = candidate.handle
-        if parent in handles:
-            # A recorded parent identity is sufficient to retain a candidate
-            # when the bounded adoption pass ran out of time. This preserves
-            # the owned pidfd for later role-scoped termination only when the
-            # observed parent start time is still the identity recorded for
-            # that retained handle. A numeric parent PID alone is never
-            # enough to transfer ownership after the scan cutoff.
-            reason = unresolved.get(str(pid))
-            parent_identity_valid = (
-                candidate.parent_start_time is not None
-                and known_process_start_times is not None
-                and known_process_start_times.get(parent)
-                == candidate.parent_start_time
-            )
-            if parent_identity_valid and reason not in {
-                "candidate_identity_mismatch",
-                "predecessor_identity_mismatch",
-                "predecessor_pidfd_unreadable",
-                "predecessor_identity_unavailable",
-            }:
-                inventory_complete = False
-                unresolved[str(pid)] = reason or (
-                    "owned_descendant_inventory_unresolved"
-                )
-                parent_role = (
-                    known_process_roles.get(parent)
-                    if known_process_roles is not None
-                    else None
-                )
-                _record_chatgpt_oracle_owned_pid(
-                    pid,
-                    handle,
-                    handles,
-                    known_process_roles,
-                    role=(
-                        parent_role
-                        if _chatgpt_oracle_registration_driver_role(parent_role)
-                        else "descendant"
-                    ),
-                    known_process_start_times=known_process_start_times,
-                    process_start_time=candidate.process_start_time,
-                )
-                candidates.pop(pid, None)
+    # Resolve the remaining candidate graph independently of /proc ordering.
+    # An unrelated child may be enumerated before its unrelated parent; that
+    # chain must remain unrelated rather than poisoning the owned inventory.
+    resolutions: Dict[int, tuple[str, Optional[str]]] = {}
+    identity_failures = {
+        "candidate_identity_mismatch",
+        "predecessor_identity_mismatch",
+        "predecessor_pidfd_unreadable",
+        "predecessor_identity_unavailable",
+    }
+
+    def resolve_candidate(  # noqa: PLR0915 - bounded graph resolver
+        pid: int,
+    ) -> tuple[str, Optional[str]]:
+        existing = resolutions.get(pid)
+        if existing is not None:
+            return existing
+        path: list[int] = []
+        path_index: Dict[int, int] = {}
+        current = pid
+        while True:
+            if current in resolutions:
+                break
+            cycle_index = path_index.get(current)
+            if cycle_index is not None:
+                for cycle_pid in path[cycle_index:]:
+                    resolutions[cycle_pid] = ("unresolved", "candidate_cycle")
+                path = path[:cycle_index]
+                break
+            candidate = candidates.get(current)
+            if candidate is None:
+                break
+            path_index[current] = len(path)
+            path.append(current)
+            if unresolved.get(str(current)) in identity_failures:
+                break
+            parent = candidate.parent_pid
+            if parent not in candidates or parent in resolutions:
+                break
+            current = parent
+
+        for candidate_pid in reversed(path):
+            if candidate_pid in resolutions:
                 continue
-            inventory_complete = False
-            unresolved[str(pid)] = reason or (
-                "owned_descendant_identity_unresolved"
+            candidate = candidates[candidate_pid]
+            prior_reason = unresolved.get(str(candidate_pid))
+            if prior_reason in identity_failures:
+                result = "unresolved", prior_reason
+            else:
+                parent = candidate.parent_pid
+                if parent in handles:
+                    parent_start_time = (
+                        known_process_start_times.get(parent)
+                        if known_process_start_times is not None
+                        else None
+                    )
+                    if (
+                        candidate.parent_start_time is None
+                        or parent_start_time != candidate.parent_start_time
+                    ):
+                        result = "unresolved", "predecessor_identity_mismatch"
+                    else:
+                        parent_role = (
+                            known_process_roles.get(parent)
+                            if known_process_roles is not None
+                            else None
+                        )
+                        result = (
+                            "owned",
+                            parent_role
+                            if _chatgpt_oracle_registration_driver_role(
+                                parent_role
+                            )
+                            else "descendant",
+                        )
+                elif parent in candidates:
+                    parent_status, parent_role = resolutions.get(
+                        parent,
+                        ("unresolved", "predecessor_candidate_unresolved"),
+                    )
+                    if parent_status == "unrelated":
+                        result = "unrelated", None
+                    elif parent_status != "owned":
+                        result = "unresolved", parent_role or (
+                            "predecessor_candidate_unresolved"
+                        )
+                    else:
+                        predecessor = candidates[parent]
+                        if (
+                            candidate.parent_start_time is None
+                            or predecessor.process_start_time is None
+                            or candidate.parent_start_time
+                            != predecessor.process_start_time
+                        ):
+                            result = "unresolved", "predecessor_identity_mismatch"
+                        else:
+                            result = "owned", parent_role
+                else:
+                    result = "unrelated", None
+            resolutions[candidate_pid] = result
+        return resolutions.get(pid, ("unresolved", "candidate_cycle"))
+
+    def retain_owned_candidate(pid: int) -> None:
+        chain: list[int] = []
+        current = pid
+        while current in candidates:
+            chain.append(current)
+            parent = candidates[current].parent_pid
+            if (
+                parent not in candidates
+                or resolutions.get(parent, ("", None))[0] != "owned"
+            ):
+                break
+            current = parent
+        for candidate_pid in reversed(chain):
+            candidate = candidates.pop(candidate_pid)
+            reason = unresolved.get(
+                str(candidate_pid),
+            ) or "owned_descendant_inventory_unresolved"
+            unresolved[str(candidate_pid)] = reason
+            _record_chatgpt_oracle_owned_pid(
+                candidate_pid,
+                candidate.handle,
+                handles,
+                known_process_roles,
+                role=resolutions[candidate_pid][1] or "descendant",
+                known_process_start_times=known_process_start_times,
+                process_start_time=candidate.process_start_time,
             )
-            candidates.pop(pid, None)
-            _close_chatgpt_oracle_pidfd(handle)
-        elif parent in candidates:
+
+    for pid in list(candidates):
+        status, _ = resolve_candidate(pid)
+        if status == "owned":
             inventory_complete = False
-            unresolved[str(pid)] = unresolved.get(
-                str(pid),
-                "predecessor_candidate_unresolved",
-            )
-            candidates.pop(pid, None)
-            _close_chatgpt_oracle_pidfd(handle)
-        else:
+            retain_owned_candidate(pid)
+
+    for pid, candidate in list(candidates.items()):
+        status, reason = resolutions.get(
+            pid,
+            ("unresolved", "owned_descendant_identity_unresolved"),
+        )
+        candidates.pop(pid, None)
+        if status == "unrelated":
             # No marker or identity-bound predecessor links this candidate to
-            # the private owner; preserve only the unrelated diagnostic.
+            # the private owner. Preserve only the unrelated diagnostic.
             if unresolved_inventory is not None:
                 unresolved_inventory.pop(str(pid), None)
             unresolved.pop(str(pid), None)
             unresolved[f"unrelated:{pid}"] = "unattributed_candidate"
-            candidates.pop(pid, None)
-            _close_chatgpt_oracle_pidfd(handle)
+        else:
+            inventory_complete = False
+            unresolved[str(pid)] = reason or (
+                "owned_descendant_identity_unresolved"
+            )
+        _close_chatgpt_oracle_pidfd(candidate.handle)
     return inventory_complete, unresolved
 
 
@@ -3201,6 +3286,23 @@ class _ChatGPTOracleBrowserOwner:
         if deadline is not None and now >= deadline:
             return False
         self._retain_registered_history_process_handles()
+        admission_closed = (
+            self.closing
+            or self.transferred
+            or (
+                self.supervisor_state is not None
+                and self.supervisor_state.chatgpt_oracle_browser_owners_stopping
+            )
+        )
+        # A final scan is only a sealing scan when every known producer was
+        # already observed exited before enumeration began. If the scan finds
+        # a newly live browser, a later pass must retire it and rescan.
+        producers_exited_before_scan = (
+            final_inventory_deadline is not None
+            and admission_closed
+            and self._browser_producers_exited()
+        )
+        browser_pids_before_scan = set(self._browser_process_handles())
         unresolved: Dict[str, str] = {}
         try:
             inventory_complete, discovered_unresolved = (
@@ -3228,24 +3330,30 @@ class _ChatGPTOracleBrowserOwner:
         else:
             self.browser_discovery_complete = True
         self.inventory_unresolved = unresolved
+        browser_pids_after_scan = set(self._browser_process_handles())
+        newly_live_browser = False
+        for pid in browser_pids_after_scan - browser_pids_before_scan:
+            handle = self.handles.get(pid)
+            if handle is None:
+                continue
+            try:
+                if not select.select([handle], [], [], 0)[0]:
+                    newly_live_browser = True
+                    break
+            except (OSError, ValueError):
+                newly_live_browser = True
+                break
         if (
             final_inventory_deadline is not None
             and self.browser_discovery_complete
             and not self._owned_inventory_is_unresolved()
-            and (
-                self.closing
-                or self.transferred
-                or (
-                    self.supervisor_state is not None
-                    and self.supervisor_state.chatgpt_oracle_browser_owners_stopping
-                )
-            )
-            and self._browser_producers_exited()
+            and admission_closed
+            and producers_exited_before_scan
+            and not newly_live_browser
         ):
-            # A discovery pass is only terminal evidence after admission is
-            # closed and every known browser producer has exited. Drivers are
-            # intentionally excluded from this scope and remain owned by
-            # their native-history registration until target safety is proven.
+            # Drivers are intentionally excluded from this scope and remain
+            # owned by their native-history registration until target safety
+            # is proven. Producer exit was established before this scan.
             self.browser_terminal_inventory = {
                 pid: self.known_process_start_times[pid]
                 for pid in self._browser_process_handles()
@@ -3506,6 +3614,12 @@ class _ChatGPTOracleBrowserOwner:
         if not self.cleanup_gate.acquire(False):
             return False
         try:
+            if not poll_only:
+                # Registration publishes the direct worker objects before
+                # their pidfds are necessarily in the owner map. Discover
+                # those handles on the first admitted cleanup pass.
+                self._retain_registered_history_process_handles()
+                self._reconcile_owned_browser_handles(term_deadline)
             handles = self._registration_process_handles(registration_id)
             if not handles:
                 # A missing handle set is not retirement proof. Discovery is
@@ -3516,16 +3630,14 @@ class _ChatGPTOracleBrowserOwner:
                 _signal_chatgpt_oracle_handles(handles, signal.SIGTERM)
                 if time.monotonic() < term_deadline:
                     return False
-                if time.monotonic() < kill_deadline:
-                    return False
+                # Poll-only servicing never restarts TERM grace or waits for a
+                # later phase deadline. Escalate at its absolute cutoff and
+                # leave only nonblocking retirement observation to callers.
                 _signal_chatgpt_oracle_handles(handles, signal.SIGKILL)
-                if time.monotonic() < reap_deadline:
-                    return False
                 return all(
                     bool(select.select([handle], [], [], 0)[0])
                     for handle in handles.values()
                 )
-            self._reconcile_owned_browser_handles(term_deadline)
             _signal_chatgpt_oracle_handles(handles, signal.SIGTERM)
             if time.monotonic() < term_deadline:
                 self._wait_for_owned_handles(
@@ -3591,14 +3703,12 @@ class _ChatGPTOracleBrowserOwner:
         if poll_only:
             if time.monotonic() < term_deadline:
                 return False
-            if time.monotonic() < kill_deadline:
-                return False
+            # KILL is due at the end of the TERM grace period. The later
+            # deadlines are observation cutoffs, not a renewed grace window.
             _signal_chatgpt_oracle_handles(
                 self._browser_process_handles(),
                 signal.SIGKILL,
             )
-            if time.monotonic() < reap_deadline:
-                return False
             if self._owned_handles_reaped():
                 self.browser_termination_proven = True
                 return True
@@ -4170,26 +4280,43 @@ def _drain_pending_chatgpt_oracle_browser_owners(
 ) -> bool:
     """Give retained browser owners one bounded shutdown cleanup window."""
 
-    shutdown_deadline = (
+    operation_limit = (
         time.monotonic() + DEFAULT_CHATGPT_ORACLE_CLEANUP_TIMEOUT_SECONDS
         if deadline is None
         else float(deadline)
     )
     state.chatgpt_oracle_browser_owners_stopping = True
     state.chatgpt_oracle_browser_shutdown_deadline = (
-        shutdown_deadline
+        operation_limit
         if state.chatgpt_oracle_browser_shutdown_deadline is None
         else min(
             state.chatgpt_oracle_browser_shutdown_deadline,
-            shutdown_deadline,
+            operation_limit,
         )
     )
-    shutdown_deadline = state.chatgpt_oracle_browser_shutdown_deadline
+    def effective_shutdown_deadline() -> float:
+        current_cutoff = state.chatgpt_oracle_browser_shutdown_deadline
+        return min(
+            operation_limit,
+            float(current_cutoff)
+            if current_cutoff is not None
+            else operation_limit,
+        )
+
+    shutdown_deadline = effective_shutdown_deadline()
     with state.pending_chatgpt_oracle_browser_owners_lock:
         owners = list(state.pending_chatgpt_oracle_browser_owners.values())
     for owner in owners:
         owner.request_shutdown(deadline=shutdown_deadline)
     while True:
+        # The shared cancellation cutoff can be tightened by the outer
+        # supervisor while this drain is servicing owners. Never let an inner
+        # pass extend that original operation limit.
+        shutdown_deadline = effective_shutdown_deadline()
+        with state.pending_chatgpt_oracle_browser_owners_lock:
+            owners = list(state.pending_chatgpt_oracle_browser_owners.values())
+        for owner in owners:
+            owner.request_shutdown(deadline=shutdown_deadline)
         _service_pending_chatgpt_oracle_browser_owners(
             state,
             deadline=shutdown_deadline,
@@ -4198,6 +4325,7 @@ def _drain_pending_chatgpt_oracle_browser_owners(
             pending = bool(state.pending_chatgpt_oracle_browser_owners)
         if not pending:
             return True
+        shutdown_deadline = effective_shutdown_deadline()
         remaining = shutdown_deadline - time.monotonic()
         if remaining <= 0:
             return False
