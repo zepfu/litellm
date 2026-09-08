@@ -140,6 +140,15 @@ async def prepare_responses_route(
         api_key=api_key,
         request=request,
     )
+    # Managed xAI accepts bearer authorization only. Keep provider-specific
+    # header ownership explicit even when a shared runtime assembles headers.
+    if isinstance(custom_headers, dict):
+        custom_headers = {
+            key: value
+            for key, value in custom_headers.items()
+            if str(key).lower() not in {"authorization", "api-key", "x-api-key"}
+        }
+        custom_headers["authorization"] = f"Bearer {api_key}"
 
     def handle_exception(exc: Exception) -> None:
         if use_alias_candidate_probe and runtime.unavailable_detail(exc) is not None:
@@ -156,6 +165,12 @@ async def prepare_responses_route(
             "custom_llm_provider": runtime.provider,
             "egress_credential_family": "xai",
             "expected_target_family": "xai",
+            "managed_xai_oauth_request": True,
+            "blocked_pass_through_prefixed_headers": [
+                "authorization",
+                "api-key",
+                "x-api-key",
+            ],
         },
         handle_exception=handle_exception,
     )
@@ -213,5 +228,8 @@ async def prepare_completion_route(
         api_key=api_key,
         api_base=target_base_url,
         client_requested_stream=client_requested_stream,
-        perform_kwargs={"custom_llm_provider": runtime.provider},
+        perform_kwargs={
+            "custom_llm_provider": runtime.provider,
+            "managed_xai_oauth_request": True,
+        },
     )

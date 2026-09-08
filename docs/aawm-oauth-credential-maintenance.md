@@ -97,6 +97,15 @@ snapshot before a later request rebuilds it. Missing, malformed, ambiguous-
 scope, expired, or near-expiry records fail closed; request handling never
 refreshes or writes the managed credential file.
 
+When managed xAI returns a provider-owned `401` before response commitment,
+alias routing, direct LiteLLM async routes, OpenAI passthrough, and the
+Anthropic compatibility adapters may make one recovery attempt. The retry
+reuses the exact request body and the exact bound file and scope. It is
+allowed only when a forced reread reports a changed trusted generation with
+the same non-secret account identity. An unchanged generation, a second
+`401`, missing or unproven account evidence, or a different account ends
+recovery; native Grok OIDC does not use this policy.
+
 ## OAuth refresh deadline contract
 
 Scheduled Grok OIDC, Codex OAuth, managed xAI OAuth, Kimi OAuth, and Nous
