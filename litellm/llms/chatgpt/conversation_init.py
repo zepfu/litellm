@@ -1354,12 +1354,25 @@ def _redact_value(
     if isinstance(value, bool):
         return value, {"kind": "bool", "value": value}, 0
     if isinstance(value, int):
+        finite_value = _finite_float(value)
+        if finite_value is None:
+            return None, {"kind": "redacted"}, 1
         return value, {"kind": "int", "value": value}, 0
     if isinstance(value, float):
-        if value != value or value in {float("inf"), float("-inf")}:
+        if _finite_float(value) is None:
             return None, {"kind": "redacted"}, 1
         return value, {"kind": "float", "value": value}, 0
     if isinstance(value, str):
+        if _is_safe_usage_number_string(parent_key, value):
+            stripped = value.strip()
+            try:
+                numeric_value = float(stripped)
+            except (OverflowError, ValueError):
+                numeric_value = None
+            if numeric_value is not None and isfinite(numeric_value):
+                kind = "float" if not numeric_value.is_integer() else "int"
+                projected: Any = int(numeric_value) if kind == "int" else numeric_value
+                return projected, {"kind": kind, "value": projected}, 0
         if not _is_safe_string_value(
             value,
             field_name=parent_key,
@@ -1962,9 +1975,19 @@ def _parse_usage_number(value: Any) -> Optional[float]:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    if number != number or number < 0:
+    if not isfinite(number) or number < 0:
         return None
     return number
+
+
+def _finite_float(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return number if isfinite(number) else None
 
 
 def _parse_usage_timestamp(value: Any) -> Optional[datetime]:
@@ -1972,7 +1995,7 @@ def _parse_usage_timestamp(value: Any) -> Optional[datetime]:
         return None
     if isinstance(value, (int, float)):
         numeric = float(value)
-        if numeric != numeric:
+        if not isfinite(numeric):
             return None
         if numeric > 10_000_000_000:
             numeric /= 1000.0
@@ -2002,9 +2025,10 @@ def _safe_identity(value: Any) -> Optional[str]:
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if value != value:
+        finite_value = _finite_float(value)
+        if finite_value is None:
             return None
-        text = str(int(value)) if float(value).is_integer() else str(value)
+        text = str(int(finite_value)) if finite_value.is_integer() else str(finite_value)
     elif isinstance(value, str):
         text = value.strip()
     else:
@@ -2032,16 +2056,32 @@ def _is_secret_key(name: str, value: Any = None) -> bool:
 
 def _is_safe_numeric_token_value(name: str, value: Any) -> bool:
     """Allow finite numeric token counters while rejecting token material."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return False
-    if isinstance(value, float) and (
-        value != value or value in {float("inf"), float("-inf")}
-    ):
+    if _finite_float(value) is None:
         return False
     normalized = _normalize_key(name)
     return "token" in normalized and any(
         marker in normalized.split("_")
         for marker in _SAFE_NUMERIC_TOKEN_KEY_MARKERS
+    )
+
+
+def _is_safe_usage_number_string(field_name: Optional[str], value: str) -> bool:
+    """Permit provider-supplied numeric usage values, including JSON numbers."""
+
+    normalized = _normalize_key(field_name)
+    return any(
+        marker in normalized
+        for marker in (
+            "limit",
+            "quota",
+            "max",
+            "total",
+            "remaining",
+            "left",
+            "used",
+            "usage",
+            "consumed",
+        )
     )
 
 
