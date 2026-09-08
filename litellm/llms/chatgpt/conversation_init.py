@@ -325,6 +325,10 @@ _USAGE_NUMBER_FIELD_ALIASES = (
     *_USED_KEYS,
 )
 _NAMED_USAGE_COLLECTIONS = frozenset({"model_limits", "limits_progress"})
+_NAMED_COLLECTION_IDENTITY_FIELDS = {
+    "limits_progress": "feature",
+    "model_limits": "model",
+}
 _CONVERSATION_INIT_MARKERS = {
     "model_limits",
     "limits_progress",
@@ -1428,8 +1432,25 @@ def _redact_mapping(
                 malformed_fields.append(malformed_usage_field)
             redacted_count += 1
             continue
+        redaction_value = value
+        if collection_map and isinstance(value, Mapping):
+            identity_field = _NAMED_COLLECTION_IDENTITY_FIELDS.get(
+                parent_normalized
+            )
+            identity = _safe_identity(name)
+            if (
+                identity_field is not None
+                and identity is not None
+                and not any(
+                    _normalize_key(existing_key)
+                    == _normalize_key(identity_field)
+                    for existing_key in value
+                )
+            ):
+                redaction_value = dict(value)
+                redaction_value[identity_field] = identity
         redacted_value, node, nested_redacted = _redact_value(
-            value,
+            redaction_value,
             depth=depth + 1,
             parent_key=child_parent_key,
             collection_entry=(
@@ -1986,6 +2007,21 @@ def _normalize_named_collection(
     if isinstance(raw, list):
         for item in raw:
             if isinstance(item, Mapping):
+                if len(item) == 1 and _entry_identity(item) is None:
+                    key, value = next(iter(item.items()))
+                    identity = _safe_identity(key)
+                    if identity is not None and isinstance(value, Mapping):
+                        merged = dict(value)
+                        merged.setdefault("_identity", identity)
+                        entries.append(merged)
+                        continue
+                    if identity is not None and (
+                        isinstance(value, (int, float, str)) or value is None
+                    ):
+                        entries.append(
+                            {"_identity": identity, "remaining": value}
+                        )
+                        continue
                 entries.append(item)
             elif isinstance(item, str):
                 entries.append({"_identity": item})
@@ -3615,9 +3651,13 @@ def collect_conversation_init_snapshot(  # noqa: PLR0915 - collector state
         else None
     )
     summary["native_capture_error"] = sanitized.get("native_capture_error")
-    writable = _snapshot_is_persistable(sanitized)
+    persistability_failure_reason = _snapshot_persistability_failure_reason(
+        sanitized
+    )
+    writable = persistability_failure_reason is None
     reusable = _destination_has_reusable_snapshot(source_path)
     if not writable:
+        summary["failure_reason"] = persistability_failure_reason
         summary["telemetry_status"] = _failure_telemetry_status(sanitized)
         summary["telemetry_class"] = _failure_telemetry_class(sanitized)
         summary["last_good_state_retained"] = reusable
@@ -3626,6 +3666,7 @@ def collect_conversation_init_snapshot(  # noqa: PLR0915 - collector state
     try:
         write_conversation_init_snapshot(source_path, sanitized)
     except ChatGPTConversationInitError as exc:
+        summary["failure_reason"] = "snapshot_write_failed"
         summary["telemetry_class"] = exc.telemetry_class
         summary["last_good_state_retained"] = True
         return summary
@@ -3883,17 +3924,17 @@ def _collect_bound_conversation_init_snapshot(  # noqa: PLR0915 - bound state
         "account_identity_verification_source"
     ]
     summary["live_authenticated_oracle_browser"] = True
-    writable = _snapshot_is_persistable(
+    persistability_failure_reason = _snapshot_persistability_failure_reason(
         sanitized,
         expected_account_hash=expected_account_hash,
         require_verified_identity=True,
     )
-    if not writable:
+    if persistability_failure_reason is not None:
         return _bound_capture_failure(
             summary,
             source_path=source_path,
             expected_account_hash=expected_account_hash,
-            error="current_snapshot_not_persistable",
+            error=persistability_failure_reason,
             telemetry_status=_failure_telemetry_status(sanitized),
             telemetry_class=_failure_telemetry_class(sanitized),
             reusable=reusable,
@@ -3950,6 +3991,7 @@ def _bound_capture_failure(
     summary["written"] = False
     summary["snapshot_fresh"] = False
     summary["last_good_state_retained"] = reusable
+    summary["failure_reason"] = error
     summary["account_identity_verification_error"] = error
     summary["telemetry_status"] = telemetry_status
     summary["telemetry_class"] = telemetry_class
@@ -3979,6 +4021,7 @@ def _collector_summary(contract: Mapping[str, Any], source_path: str) -> Dict[st
         "account_identity_hash_length": None,
         "account_identity_verification_source": None,
         "account_identity_verification_error": None,
+        "failure_reason": None,
         "native_capture": None,
         "native_capture_error": None,
         "browser_challenge": False,
@@ -4049,10 +4092,26 @@ def _snapshot_is_persistable(
     expected_account_hash: Optional[str] = None,
     require_verified_identity: bool = False,
 ) -> bool:
+    return (
+        _snapshot_persistability_failure_reason(
+            sanitized,
+            expected_account_hash=expected_account_hash,
+            require_verified_identity=require_verified_identity,
+        )
+        is None
+    )
+
+
+def _snapshot_persistability_failure_reason(
+    sanitized: Mapping[str, Any],
+    *,
+    expected_account_hash: Optional[str] = None,
+    require_verified_identity: bool = False,
+) -> Optional[str]:
     if sanitized.get("browser_challenge") is True:
-        return False
+        return "browser_challenge"
     if sanitized.get("native_capture_error"):
-        return False
+        return "native_capture_error"
     if (
         sanitized.get("account_identity_source")
         == CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
@@ -4061,14 +4120,16 @@ def _snapshot_is_persistable(
             sanitized.get("account_hash"),
         )
     ):
-        return False
+        return "native_identity_unverified"
     if _http_status_failure(sanitized.get("status_code")) is not None:
-        return False
+        return "http_error"
     if sanitized.get("payload_state") != "present":
-        return False
+        return "payload_not_present"
     payload = sanitized.get("payload")
-    if not isinstance(payload, Mapping) or not looks_like_conversation_init_payload(payload):
-        return False
+    if not isinstance(payload, Mapping):
+        return "payload_not_mapping"
+    if not looks_like_conversation_init_payload(payload):
+        return "payload_marker_missing"
     if _collections_are_wholly_malformed(
         _parse_collections(
             payload,
@@ -4079,19 +4140,21 @@ def _snapshot_is_persistable(
             },
         )
     ):
-        return False
+        return "collections_wholly_malformed"
     if require_verified_identity:
-        return bool(
-            _is_verified_bound_identity(
-                sanitized,
-                sanitized.get("account_hash"),
-            )
-            and (
-                expected_account_hash is None
-                or sanitized.get("account_hash") == expected_account_hash
-            )
-        )
-    return bool(sanitized.get("account_hash") or sanitized.get("source_identity_hash"))
+        if not _is_verified_bound_identity(
+            sanitized,
+            sanitized.get("account_hash"),
+        ):
+            return "account_identity_unverified"
+        if (
+            expected_account_hash is not None
+            and sanitized.get("account_hash") != expected_account_hash
+        ):
+            return "account_identity_mismatch"
+    elif not sanitized.get("account_hash") and not sanitized.get("source_identity_hash"):
+        return "account_identity_missing"
+    return None
 
 
 def _snapshot_fits_write_budget(sanitized: Mapping[str, Any]) -> bool:
