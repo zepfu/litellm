@@ -1024,6 +1024,18 @@ appears, the result explicitly uses `observation_state=no_history_observed`;
 auth, throttle, challenge, identity, boundary, and body failures use an
 explicit failed observation state and preserve only a safe retry-after value.
 
+The sidecar has an explicit opt-in entrypoint for this observer. Supply
+`--chatgpt-native-history-probe-account-label account1` (or the matching
+`AAWM_CHATGPT_NATIVE_HISTORY_PROBE_ACCOUNT_LABEL` environment value) together
+with an Oracle profile binding for that exact label. The label must resolve to
+exactly one enabled Codex OAuth inventory record whose pinned account hash is
+`8e92854835c4`; a CDP-only binding is rejected because native history requires
+the private profile owner's supervised lifecycle capability. This action runs
+before provider observations and all other sidecar tasks, performs no database
+setup or persistence, and emits one structural observation event with the
+existing fixed classification fields only. It is a one-shot foreground action,
+not a recurring schedule.
+
 ## Alibaba Token Plan quota polling
 
 The provider-status sidecar can poll the authenticated ModelStudio Token Plan
