@@ -529,6 +529,13 @@ launcher validates managed metadata from `stat` and, when the file is unreadable
 uses a disposable **read-only** `docker run` of the existing prod image with a
 read-only mount to validate JSON safely. No secrets are printed.
 
+Managed preflight resolves the same configured xAI scope as the request and
+refresh paths and uses their shared exact-scope selector. A document with
+multiple nested credential records must contain that exact key; preflight never
+chooses the first record by JSON order. An unambiguous legacy flat record is
+accepted, but migrating a multi-record document requires moving the intended
+record under the configured scope key before activation.
+
 Combined credential/process health requires **both** credential records to have:
 
 - a current access credential (`key` or `access_token`)

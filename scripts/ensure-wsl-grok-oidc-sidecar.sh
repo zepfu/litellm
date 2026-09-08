@@ -253,8 +253,10 @@ validate_managed_credential_json() {
   # The Python program is supplied with -c so stdin remains available for the
   # credential JSON from either a host file redirect or read-only docker pipe.
   python3 -c '
+import importlib.util
 import json
 import sys
+from pathlib import Path
 
 try:
     payload = json.load(sys.stdin)
@@ -264,20 +266,35 @@ except Exception as exc:
 if not isinstance(payload, dict):
     raise SystemExit("managed credential payload must be a JSON object")
 
-scope = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
+selector_path = Path(sys.argv[1])
+if not selector_path.is_file():
+    raise SystemExit("managed credential selector is unavailable")
+selector_spec = importlib.util.spec_from_file_location(
+    "_aawm_xai_oauth_credentials",
+    selector_path,
+)
+if selector_spec is None or selector_spec.loader is None:
+    raise SystemExit("managed credential selector is unavailable")
+selector = importlib.util.module_from_spec(selector_spec)
+sys.modules[selector_spec.name] = selector
+try:
+    selector_spec.loader.exec_module(selector)
+except Exception as exc:
+    raise SystemExit(
+        f"managed credential selector is unavailable: {exc.__class__.__name__}"
+    ) from exc
+
+try:
+    scope = selector.resolve_xai_oauth_scope().scope
+    record = selector.select_xai_oauth_credential_record(
+        payload,
+        scope,
+        provider_label="managed xAI OAuth",
+    )
+except ValueError as exc:
+    raise SystemExit(f"managed credential selection failed: {exc}") from exc
+
 client = "b1a00492-073a-47ea-816f-4c329264a828"
-record = payload.get(scope) if isinstance(payload.get(scope), dict) else None
-if record is None and (
-    payload.get("key") or payload.get("access_token") or payload.get("refresh_token")
-):
-    record = payload
-if record is None:
-    for value in payload.values():
-        if isinstance(value, dict) and (
-            value.get("key") or value.get("access_token") or value.get("refresh_token")
-        ):
-            record = value
-            break
 if not isinstance(record, dict):
     raise SystemExit("managed credential missing usable OAuth record")
 cid = record.get("oidc_client_id") or record.get("client_id")
@@ -290,7 +307,7 @@ if not record.get("refresh_token"):
 if not (record.get("key") or record.get("access_token")):
     raise SystemExit("managed credential record missing current access credential")
 print("managed_credential_metadata_ok")
-'
+' "$repo_root/litellm/secret_managers/xai_oauth_credentials.py"
 }
 
 read_managed_credential_via_docker() {

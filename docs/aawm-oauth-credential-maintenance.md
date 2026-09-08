@@ -147,6 +147,30 @@ Managed Codex proxy consumers require the explicit inventory below and do not
 fall back to `~/.codex/auth.json`, directory scans, backup files, path globs, or
 `api.openai.com`.
 
+## Managed xAI credential selection
+
+Managed xAI resolves its auth file in this order: `AAWM_XAI_OAUTH_AUTH_FILE`,
+an explicit non-default CLI/config value, `LITELLM_XAI_OAUTH_AUTH_FILE`,
+`LITELLM_XAI_OAUTH_MIGRATED_AUTH_FILE`, then the portable default. It resolves
+scope as an explicit value, `AAWM_XAI_OAUTH_SCOPE`,
+`LITELLM_XAI_OAUTH_SCOPE`, then the default subscription scope. Conflicting
+configured values fail closed instead of silently selecting one source.
+
+A scoped JSON document must contain the exact resolved scope key. LiteLLM,
+refresh helpers, health checks, and the WSL managed preflight never select the
+first nested credential-like record. A legacy flat object remains compatible
+only when it is unambiguous: it contains credential fields itself and no nested
+credential-like records. To migrate a multi-record document, place the intended
+record under the configured scope key; do not rely on JSON key order.
+
+Route safety and proactive refresh remain separate decisions. A route becomes
+unusable inside the configured route-safety buffer, while refresh is due at
+`max(buffer, issued_lifetime_seconds * 0.5)` when lifetime metadata is valid.
+Thus a refresh-due credential can still serve traffic until its route-safety
+deadline. The canonical lock is the resolved auth-file sibling
+`<auth-file>.lock`; do not retain the portable-default lock for a custom auth
+file, point the lock at the auth file, or use a symlink lock path.
+
 ## Codex ordered account inventory (OPENAI-001)
 
 `LITELLM_CODEX_OAUTH_INVENTORY` is a versioned JSON object whose `accounts`
