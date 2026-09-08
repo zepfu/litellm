@@ -995,6 +995,104 @@ the shared browser session, preserving other sessions and prior observation
 rows. A deferred or failed capture is not fresh evidence and does not replace
 prior rows or establish account coverage.
 
+## ChatGPT usage ledger storage
+
+`scripts/chatgpt_chat_usage_capture/pg_ledger.py` defines a source-only,
+metadata-only PostgreSQL contract for ordinary-Chat usage. Construction does
+not resolve a DSN, connect, activate a schedule, or write. Callers must
+explicitly invoke `PgLedger.ensure_schema()` or apply
+`scripts/apply_chatgpt_usage_ledger_2026_09_08.sql`.
+
+The adapter accepts the versioned `chatgpt-chat-history-v1` transfer contract.
+Observation, attempt, provenance, coverage, and alias inputs are projected
+through fixed allowlists before any database write. The envelope preserves
+coverage/quarantine state, requested, recorded-final, and resolved raw model
+evidence separately, and keeps bounded `items`, `messages`, and `mapping`
+collections after recursive content sanitization. Unknown fields are also
+represented by bounded structural counts and provenance. Secret-like values,
+content, titles, credentials, browser state, and unallowlisted metadata are
+rejected or dropped before persistence.
+Opaque pagination cursors retain their exact bounded value, not identifier
+normalization. A page must contain a supported collection before it can
+establish completeness; a missing collection is not an empty collection.
+A rejected non-null cursor, malformed collection, unsupported transfer, or
+incomplete projection cannot establish exhaustion. Flat and nested
+quarantine indicators combine conservatively. Truncation paths preserve root,
+indexed, and sanitized mapping-key forms; rejected path records retain explicit
+incompleteness without retaining unsafe text. Privacy diagnostics use structural
+positions, never caller paths, rejected keys, or conversion exception text.
+
+Verified identities converge by
+provider/provider-user/workspace/quota-owner/surface; an unverified identity
+remains collector-local. Identical projection fingerprints deduplicate;
+changed evidence appends an immutable revision. Alias collisions become
+coverage gaps rather than silently merging attempts.
+Identity is tracked through versioned collector-to-scope bindings. A collector
+binding is a generation fence: capture it before network work and pass the
+expected binding to the page transaction; a stale generation is rejected
+instead of silently rebinding the collector, and one page cannot switch scopes
+without an explicit new fence. Refinement can fill missing identity components
+but cannot drop or change any known provider, user, workspace, quota owner, or
+surface. Compatible refinements retire and redirect prior scopes while
+preserving their attempts and aliases; readers follow those redirects so
+retained history remains visible under the active collector binding. Strong
+generation aliases establish generation identity. Message, branch, request,
+and prompt associations cannot override different generation anchors. Distinct
+generations sharing an association retain their independent generation aliases;
+only the contested association is withheld. An unanchored observation cannot
+use that association to select one generation. Multiple different generation
+anchors on one input are contradictory, not a compound identity.
+Request or prompt matches alone never establish equivalence between different
+attempts, even when there is only one current candidate; merging requires
+positive generation, message, branch, or retained-retirement evidence.
+Alias preflight includes every proposed donor's aliases. Contested associations
+retain coverage-gap evidence before donor retirement.
+Active attempts with stronger identity evidence can retire weaker provisional
+aliases. Retirement records retain the successor's physical scope and attempt
+ID. Aliasless replays consult that retained proof across compatible scope
+lineage; matching live attempt IDs alone do not establish equivalence.
+Duplicate current fingerprints advance the current projection's observation
+watermark. Differing older evidence remains non-current without advancing that
+watermark; an exact fingerprint/timestamp/source/schema/collector replay adds
+no further revision, but a fresh recurrence can become current. All accepted
+sightings retain collector provenance. Validated identity can strengthen
+without replacing fresher outcome, model, or time evidence. Equal-time
+contradictions retain quarantine; local revision numbers and physical keys
+cannot clear it. Quarantined input cannot transfer aliases or retire attempts.
+Safe source identity/time/outcome tokens remain in revision JSONB separately
+from interpreted classifications, including unknown tokens.
+
+The migration bootstrap creates generation 1 only for collectors with no
+existing binding, selecting one deterministic legacy scope per collector. It
+is therefore idempotent across reruns and preserves later active or retired
+generations. Quarantined attempts remain auditable but are not definite usage
+evidence; count readers must keep them out of definite totals while exposing
+the retained uncertainty for reconciliation.
+
+`count_attempts(account, model_family=..., window_start=..., window_end=...)`
+uses one PostgreSQL statement snapshot, resolves retired scopes to the
+canonical scope owned by the active collector binding, counts only
+non-tombstoned ordinary Chat attempts with generation evidence, and returns
+separate requested, recorded-final, and resolved raw-model/family maps. It does
+not count provider charges or capacity snapshots. Definite totals use exact
+timestamps or fully contained evidence intervals; crossing intervals and
+one-sided bounds are reported as `ambiguous` or `unknown_time`, never assigned
+to a window by fallback timestamp selection. Unknown and excluded counters keep
+ambiguous or unknown-time activity but omit rows proven outside the window. The
+result also exposes excluded non-Chat/shared activity, unknown
+identity/surface/origin/model classes, uncertain outcomes, and observed model
+mismatches. A nongeneration record connected to multiple distinct generation
+identities contributes unknown identity, not another definite attempt; the
+known generations remain independently countable. Anchored generations do not
+connect separate unanchored components. Equal-time conflicting projections
+remain uncertain under the same policy as ingestion.
+Contested request and prompt associations also make an unanchored component
+uncertain immediately, without waiting for its next observation. These weak
+associations never merge components or select a generation for counting.
+
+These tables are independent of `rate_limit_observations`, which remains the
+capacity-only observation store. Source delivery requires separate operational
+integration and database activation.
 ## Alibaba Token Plan quota polling
 
 The provider-status sidecar can poll the authenticated ModelStudio Token Plan
