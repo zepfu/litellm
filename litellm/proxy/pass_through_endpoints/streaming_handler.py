@@ -1946,6 +1946,12 @@ class PassThroughStreamingHandler:
 
                 if terminal_chunks:
                     held_responses_done_suffix = b""
+                    # The native Responses coordinator closes this source
+                    # after delivering the synthetic incomplete terminal. Mark
+                    # the terminal before yielding so GeneratorExit takes the
+                    # non-reading bookkeeping path instead of disconnecting.
+                    responses_terminal_seen = True
+                    _mark_responses_terminal_pending()
                     for terminal_chunk in terminal_chunks:
                         _record_responses_wire_chunk(terminal_chunk)
                         yield terminal_chunk
