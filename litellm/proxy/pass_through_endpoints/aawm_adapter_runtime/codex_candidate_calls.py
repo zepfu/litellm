@@ -3468,11 +3468,11 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
     """Translate a Cursor Agent failure while preserving upstream semantics.
 
     Pre-egress request-conversion ``ValueError`` failures and Cursor Connect
-    protocol rejections of unsupported exec/interactive operations are
-    deterministic candidate ineligibility, not upstream 502s: they map to
-    the ``aawm_codex_auto_agent_candidate_ineligible`` contract so the
-    candidate loop records a no-cooldown ineligibility instead of a
-    transient upstream retry.
+    protocol rejections of unsupported exec/interactive/subagent operations
+    are deterministic candidate ineligibility, not upstream 502s: they map
+    to the ``aawm_codex_auto_agent_candidate_ineligible`` contract so the
+    candidate loop records a no-cooldown ineligibility instead of a transient
+    upstream retry.
     Transport/upstream 500/502/503/529 keep their status and map to the
     existing transient/timeout classification so a Cursor blip advances to
     the next candidate instead of publishing a durable candidate cooldown.
@@ -3590,6 +3590,7 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
             "Cursor Agent requested unsupported external exec field ",
             "Cursor Agent requested unsupported local exec operation ",
             "Cursor Agent requested an unsupported interactive client response.",
+            "Cursor Agent subagent operation contains unsupported optional field(s):",
         )
     ):
         attempted_provider_call = True
