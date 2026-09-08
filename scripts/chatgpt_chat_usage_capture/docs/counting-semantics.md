@@ -15,7 +15,8 @@ Unknown windows use `show_activity_only`. Working used/remaining stay `null`, no
 
 Generation IDs are stronger attempt identity than request IDs. Distinct generations
 that reuse one request ID remain separate attempts; exact repeats of one generation
-remain idempotent. Failed, cancelled, rejected-after-start, and in-progress assistant nodes remain
+remain idempotent. This remains true when one component bridges multiple generation
+keys. Failed, cancelled, rejected-after-start, and in-progress assistant nodes remain
 uncertain until an explicit successful terminal is observed, so they are not
 completed answers or default working-estimate contributions.
 
