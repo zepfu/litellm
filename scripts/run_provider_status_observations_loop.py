@@ -19086,6 +19086,7 @@ _CHATGPT_NATIVE_HISTORY_PROBE_OBSERVATION_KEYS = frozenset(
         "traversal",
         "failure_reason",
         "warnings",
+        "blocked_request",
     }
 )
 _CHATGPT_NATIVE_HISTORY_PROBE_CLEANUP_SUBREASONS = {
