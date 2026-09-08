@@ -5714,6 +5714,17 @@ async def pass_through_request(  # noqa: PLR0915
                     url, getattr(getattr(request, "url", None), "path", None)
                 ),
             )
+            wrapper_setup_failure: Optional[BaseException] = None
+            if is_native_openai_responses_route:
+                try:
+                    await processed_chunks.__anext__()
+                except StopAsyncIteration:
+                    processed_chunks = iter(())
+                except (asyncio.CancelledError, httpx.ReadTimeout):
+                    raise
+                except BaseException as exc:
+                    wrapper_setup_failure = exc
+                    processed_chunks = iter(())
             response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
                 headers=response.headers,
                 litellm_call_id=litellm_call_id,
@@ -5729,18 +5740,19 @@ async def pass_through_request(  # noqa: PLR0915
                         trace=trace,
                     )
 
-                processed_chunks, wire_trace = wrap_openai_responses_stream(
-                    processed_chunks,
-                    upstream_response=response,
-                    on_disposition=_on_native_wire_disposition,
-                    trace=wire_trace,
-                    model=(
-                        str(provider_bound_body.get("model"))
-                        if isinstance(provider_bound_body, dict)
-                        and provider_bound_body.get("model") is not None
-                        else None
-                    ),
-                )
+                if wrapper_setup_failure is None:
+                    processed_chunks, wire_trace = wrap_openai_responses_stream(
+                        processed_chunks,
+                        upstream_response=response,
+                        on_disposition=_on_native_wire_disposition,
+                        trace=wire_trace,
+                        model=(
+                            str(provider_bound_body.get("model"))
+                            if isinstance(provider_bound_body, dict)
+                            and provider_bound_body.get("model") is not None
+                            else None
+                        ),
+                    )
                 if stream_bookkeeping_state is not None:
 
                     async def _run_post_delivery_bookkeeping(
@@ -5766,19 +5778,64 @@ async def pass_through_request(  # noqa: PLR0915
                             success_handler_kwargs=kwargs,
                             local_prepare_ms=local_prepare_ms,
                             error_log_context=error_log_context,
+                            upstream_prefix_bytes=getattr(response, "_prefix", None),
                         )
 
                     wire_trace.register_post_finalization_callback(
                         _run_post_delivery_bookkeeping
                     )
-                bind_openai_responses_wire_trace_to_request(request, wire_trace)
-                stream_response = OpenAIResponsesStreamingResponse(
-                    processed_chunks,
-                    wire_trace=wire_trace,
-                    on_disposition=_on_native_wire_disposition,
-                    headers=response_headers,
-                    status_code=response.status_code,
-                )
+                    if wrapper_setup_failure is not None:
+                        terminal_payload = {
+                            "type": "response.failed",
+                            "response": {
+                                "object": "response",
+                                "status": "failed",
+                                "error": {
+                                    "type": type(wrapper_setup_failure).__name__,
+                                    "code": "aawm_stream_wrapper_setup_failed",
+                                    "message": str(wrapper_setup_failure),
+                                    "param": None,
+                                },
+                                "metadata": {},
+                            },
+                        }
+                        terminal_chunks = [
+                            (
+                                b"event: response.failed\ndata: "
+                                + json.dumps(
+                                    terminal_payload,
+                                    separators=(",", ":"),
+                                ).encode("utf-8")
+                                + b"\n\ndata: [DONE]\n\n"
+                            )
+                        ]
+                        wire_trace.terminal_event_type = "response.failed"
+                        wire_trace.terminal_selected = True
+                        wire_trace.terminal_sent = True
+                        wire_trace.terminal_wire_committed = True
+                        wire_trace.metadata[
+                            "aawm_stream_wrapper_setup_failed"
+                        ] = type(wrapper_setup_failure).__name__
+                        stream_response = OpenAIResponsesBufferedResponse(
+                            content=b"".join(terminal_chunks),
+                            wire_trace=wire_trace,
+                            disposition=OpenAIResponsesWireDisposition.FAILED,
+                            on_disposition=_on_native_wire_disposition,
+                            status_code=status.HTTP_502_BAD_GATEWAY,
+                            headers=response_headers,
+                        )
+                    else:
+                        bind_openai_responses_wire_trace_to_request(
+                            request,
+                            wire_trace,
+                        )
+                        stream_response = OpenAIResponsesStreamingResponse(
+                            processed_chunks,
+                            wire_trace=wire_trace,
+                            on_disposition=_on_native_wire_disposition,
+                            headers=response_headers,
+                            status_code=response.status_code,
+                        )
             else:
                 stream_response = StreamingResponse(
                     processed_chunks,
@@ -6078,6 +6135,7 @@ async def pass_through_request(  # noqa: PLR0915
                             success_handler_kwargs=kwargs,
                             local_prepare_ms=local_prepare_ms,
                             error_log_context=error_log_context,
+                            upstream_prefix_bytes=getattr(response, "_prefix", None),
                         )
 
                     wire_trace.register_post_finalization_callback(

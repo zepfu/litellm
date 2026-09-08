@@ -2219,6 +2219,7 @@ class PassThroughStreamingHandler:
         success_handler_kwargs: Optional[Dict[str, Any]] = None,
         local_prepare_ms: Optional[float] = None,
         error_log_context: Optional[Dict[str, Any]] = None,
+        upstream_prefix_bytes: Optional[List[bytes]] = None,
     ) -> None:
         """Finish native stream bookkeeping when the body iterator never starts."""
 
@@ -2278,8 +2279,8 @@ class PassThroughStreamingHandler:
             request_body=request_body or {},
             endpoint_type=endpoint_type,
             start_time=start_time,
-            raw_bytes=[],
-            precomputed_lines=[],
+            raw_bytes=upstream_prefix_bytes or [],
+            precomputed_lines=None,
             end_time=datetime.now(),
             passthrough_logging_payload=passthrough_logging_payload,
             custom_llm_provider=custom_llm_provider,

@@ -55,6 +55,18 @@ class OpenAIResponsesWireState(str, Enum):
     CLOSED = "closed"
 
 
+_KNOWN_POLICY_FAILURE_CODES = frozenset(
+    {
+        "aawm_repetitive_output_loop",
+        "aawm_watermark_output_rejected",
+    }
+)
+
+
+def _is_local_policy_failure_code(code: Any) -> bool:
+    return str(code or "").strip() in _KNOWN_POLICY_FAILURE_CODES
+
+
 @dataclass
 class OpenAIResponsesWireTrace:
     """Bounded lifecycle trace shared by the ASGI and body iterators."""
@@ -209,8 +221,10 @@ class OpenAIResponsesWireTrace:
             error = payload.get("error")
         if not isinstance(error, dict):
             error = {}
-        kind = metadata.get("failure_kind")
         code = error.get("code") or metadata.get("error_code")
+        if not _is_local_policy_failure_code(code):
+            return False
+        kind = metadata.get("failure_kind")
         classification = (
             metadata.get("failure_class")
             or metadata.get("policy_failure_class")
@@ -236,17 +250,20 @@ class OpenAIResponsesWireTrace:
         error = marker.get("error")
         if not isinstance(error, dict):
             error = {}
+        marker_code = (
+            error.get("code")
+            or metadata.get("error_code")
+            or marker.get("policy_failure_code")
+        )
+        if not _is_local_policy_failure_code(marker_code):
+            return False
         return self.record_policy_failure(
             kind=(
                 metadata.get("failure_kind")
                 or metadata.get("policy_failure_kind")
                 or marker.get("policy_failure_kind")
             ),
-            code=(
-                error.get("code")
-                or metadata.get("error_code")
-                or marker.get("policy_failure_code")
-            ),
+            code=marker_code,
             classification=(
                 metadata.get("failure_class")
                 or metadata.get("policy_failure_class")
