@@ -5016,11 +5016,6 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
             intake_context=grok_intake_context,
             rollup_kwargs=grok_rollup_kwargs,
         )
-        response = _bind_xai_responses_wire_stream(
-            response,
-            request=request,
-            adapter_model=grok_adapter_model,
-        )
     response = _maybe_wrap_xai_passthrough_responses_stream(
         response,
         request=request,
@@ -5037,6 +5032,12 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
         intake_context=grok_intake_context,
         request_body=canonical_request_body,
     )
+    if isinstance(validated_response, StreamingResponse):
+        validated_response = _bind_xai_responses_wire_stream(
+            validated_response,
+            request=request,
+            adapter_model=grok_adapter_model,
+        )
     if getattr(validated_response, "body_iterator", None) is not None:
         setattr(validated_response, "_aawm_session_owner_promotion_deferred", True)
     return validated_response
@@ -5149,11 +5150,6 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             intake_context=xai_intake_context,
             rollup_kwargs=xai_rollup_kwargs,
         )
-        response = _bind_xai_responses_wire_stream(
-            response,
-            request=request,
-            adapter_model=xai_adapter_model,
-        )
     response = _maybe_wrap_xai_passthrough_responses_stream(
         response,
         request=request,
@@ -5171,6 +5167,12 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         intake_context=xai_intake_context,
         request_body=canonical_request_body,
     )
+    if isinstance(validated_response, StreamingResponse):
+        validated_response = _bind_xai_responses_wire_stream(
+            validated_response,
+            request=request,
+            adapter_model=xai_adapter_model,
+        )
     if getattr(validated_response, "body_iterator", None) is not None:
         setattr(validated_response, "_aawm_session_owner_promotion_deferred", True)
     return validated_response

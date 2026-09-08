@@ -6870,6 +6870,7 @@ async def pass_through_request(  # noqa: PLR0915
                     headers=response_headers,
                     status_code=response.status_code,
                 )
+            setattr(stream_response, "_aawm_upstream_response", response)
             _publish_openai_send_telemetry()
             return bind_output_guard_to_streaming_response(
                 bind_deferred_success_holder(
@@ -6973,6 +6974,10 @@ async def pass_through_request(  # noqa: PLR0915
                 credential_family=egress_credential_family,
                 expected_target_family=expected_target_family,
             )
+            if is_xai_responses_wire_owned_route:
+                extensions = getattr(response, "extensions", None)
+                if isinstance(extensions, dict):
+                    extensions["aawm_responses_wire_owned"] = True
             if _is_streaming_response(response) is True:
                 try:
                     response.raise_for_status()
@@ -7329,6 +7334,7 @@ async def pass_through_request(  # noqa: PLR0915
                     headers=response_headers,
                     status_code=response.status_code,
                 )
+            setattr(stream_response, "_aawm_upstream_response", response)
             _publish_openai_send_telemetry()
             return bind_output_guard_to_streaming_response(
                 bind_deferred_success_holder(

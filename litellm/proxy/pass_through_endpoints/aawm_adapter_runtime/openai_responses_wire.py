@@ -9,6 +9,7 @@ share one first-terminal-wins state.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from dataclasses import dataclass, field
 from enum import Enum
@@ -992,6 +993,12 @@ class OpenAIResponsesStreamingResponse(StreamingResponse):
             await _await_shielded(close())
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        background = self.background
+        # Starlette skips background callbacks when the body raises or the
+        # client disconnects. Own the callback here so every response path
+        # executes it once, after the body attempt and wire finalization.
+        self.background = None
+
         async def tracked_send(message: Dict[str, Any]) -> None:
             message_type = message.get("type")
             await send(message)
@@ -1043,6 +1050,17 @@ class OpenAIResponsesStreamingResponse(StreamingResponse):
                 self.wire_trace.metadata[
                     "post_finalization_callback_error"
                 ] = type(exc).__name__
+            if background is not None:
+                try:
+                    result = background()
+                    if inspect.isawaitable(result):
+                        await _await_shielded(result)
+                except BaseException as exc:  # noqa: BLE001
+                    self.wire_trace.metadata["background_callback_error"] = type(
+                        exc
+                    ).__name__
+                    if "asgi_error" not in self.wire_trace.metadata:
+                        raise
             self.wire_trace.metadata.update(self.wire_trace.snapshot())
 
 
@@ -1078,6 +1096,9 @@ class OpenAIResponsesBufferedResponse(Response):
         await self.wire_trace._finalize_disposition(disposition, self._on_disposition)
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        background = self.background
+        self.background = None
+
         async def tracked_send(message: Dict[str, Any]) -> None:
             await send(message)
             message_type = message.get("type")
@@ -1109,6 +1130,17 @@ class OpenAIResponsesBufferedResponse(Response):
                 self.wire_trace.metadata[
                     "post_finalization_callback_error"
                 ] = type(exc).__name__
+            if background is not None:
+                try:
+                    result = background()
+                    if inspect.isawaitable(result):
+                        await _await_shielded(result)
+                except BaseException as exc:  # noqa: BLE001
+                    self.wire_trace.metadata["background_callback_error"] = type(
+                        exc
+                    ).__name__
+                    if "asgi_error" not in self.wire_trace.metadata:
+                        raise
             self.wire_trace.metadata.update(self.wire_trace.snapshot())
 
 
