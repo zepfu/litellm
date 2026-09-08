@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -4452,6 +4453,8 @@ def _bounded_projection_truncations(
         record: dict[str, Any] = {}
         for key in ("path", "reason"):
             token = _optional_token(item.get(key))
+            if key == "path" and token is None and isinstance(item.get(key), str):
+                token = _projection_path_token(item[key])
             if token is not None:
                 record[key] = token
         for key in ("retained_count", "source_count"):
@@ -4463,6 +4466,28 @@ def _bounded_projection_truncations(
         if "path" in record and "reason" in record:
             out.append(record)
     return out
+
+
+def _projection_path_token(value: str) -> Optional[str]:
+    """Validate projector paths without treating path punctuation as identity syntax."""
+    if len(value) > 256 or not value.startswith("$."):
+        return None
+
+    position = 2
+    while position < len(value):
+        field_match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", value[position:])
+        if field_match is None:
+            return None
+        position += field_match.end()
+        while position < len(value) and value[position] == "[":
+            index_match = re.match(r"\[[0-9]+\]", value[position:])
+            if index_match is None:
+                return None
+            position += index_match.end()
+        if position < len(value) and value[position] != ".":
+            return None
+        position += 1
+    return value
 
 
 def _safe_len(value: Any) -> Optional[int]:

@@ -371,21 +371,25 @@ def assert_no_secrets(value: Any, *, path: str = "root") -> None:
 
 def _assert_no_secrets_walk(value: Any, *, path: str) -> None:
     if isinstance(value, str):
-        lowered = value.lower()
-        for needle in ("bearer ", "set-cookie", "authorization", "eyj"):
-            if needle in lowered:
-                raise PrivacyError(f"secret-like value survived sanitization at {path}")
-        if EMAIL_RE.search(value):
-            raise PrivacyError(f"email survived sanitization at {path}")
+        if _contains_secret_value(value):
+            raise PrivacyError(f"secret-like value survived sanitization at {path}")
     elif isinstance(value, dict):
         for key, child in value.items():
             key_text = str(key)
-            if SENSITIVE_KEY_RE.search(key_text) or EMAIL_RE.search(key_text):
+            if SENSITIVE_KEY_RE.search(key_text) or _contains_secret_value(key_text):
                 raise PrivacyError(f"secret-like mapping key survived sanitization at {path}.{key_text}")
             _assert_no_secrets_walk(child, path=f"{path}.{key_text}")
     elif isinstance(value, list):
         for idx, child in enumerate(value):
             _assert_no_secrets_walk(child, path=f"{path}[{idx}]")
+
+
+def _contains_secret_value(value: str) -> bool:
+    lowered = value.lower()
+    return bool(
+        any(needle in lowered for needle in ("bearer ", "set-cookie", "authorization", "eyj"))
+        or EMAIL_RE.search(value)
+    )
 
 
 def evidence_identity(source_kind: str, source_id: str, revision: str) -> str:
