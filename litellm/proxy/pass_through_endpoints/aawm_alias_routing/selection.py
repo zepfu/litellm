@@ -410,6 +410,44 @@ def _codex_auto_agent_candidate_public_shape(
     return shaped
 
 
+def _attempt_has_provider_call(attempt: Mapping[str, Any]) -> bool:
+    """Treat explicit no-I/O records as skips; preserve legacy missing flags."""
+    if attempt.get("terminal_disposition") == "skipped":
+        return False
+    return attempt.get("attempted_provider_call") is not False
+
+
+def _provider_attempt_count(attempts: Sequence[Any]) -> int:
+    return sum(
+        isinstance(attempt, Mapping) and _attempt_has_provider_call(attempt)
+        for attempt in attempts
+    )
+
+
+def _provider_attempt_record_index(
+    attempts: Sequence[Any],
+    attempt_number: Any,
+) -> Optional[int]:
+    if isinstance(attempt_number, bool):
+        return None
+    try:
+        target = int(attempt_number)
+    except (TypeError, ValueError):
+        return None
+    if target < 1:
+        return None
+    provider_attempt_number = 0
+    for raw_index, attempt in enumerate(attempts):
+        if not isinstance(attempt, Mapping) or not _attempt_has_provider_call(
+            attempt
+        ):
+            continue
+        provider_attempt_number += 1
+        if provider_attempt_number == target:
+            return raw_index
+    return None
+
+
 _AUTO_AGENT_ACCOUNT_IDENTITY_FIELDS = frozenset(
     {
         "account",
@@ -626,7 +664,7 @@ def _build_auto_agent_skipped_candidates_from_states(
     return skipped
 
 
-def _build_auto_agent_terminal_candidate_inventory(
+def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
     *,
     request: Request,
     alias_model: str,
@@ -704,6 +742,8 @@ def _build_auto_agent_terminal_candidate_inventory(
         "candidate_semantic_ineligibility_reason",
         "candidate_semantic_ineligibility_state_source",
         "candidate_semantic_ineligibility_remaining_seconds",
+        "skip_reason",
+        "provider_attempt_budget_refunded",
     )
 
     inventory: list[dict[str, Any]] = []
@@ -716,6 +756,26 @@ def _build_auto_agent_terminal_candidate_inventory(
             shaped["reasoning_effort"] = candidate["reasoning_effort"]
         if candidate_attempts:
             last_attempt = candidate_attempts[-1]
+            terminal_skip = (
+                last_attempt.get("terminal_disposition") == "skipped"
+                and not any(
+                    attempt.get("attempted_provider_call") is True
+                    for attempt in candidate_attempts
+                )
+            )
+            if terminal_skip:
+                for field in skip_metadata_fields:
+                    if field in last_attempt:
+                        shaped[field] = last_attempt[field]
+                shaped["terminal_disposition"] = "skipped"
+                shaped["attempted_provider_call"] = False
+                shaped["reason"] = (
+                    last_attempt.get("skip_reason")
+                    or last_attempt.get("reason")
+                    or "unavailable"
+                )
+                inventory.append(shaped)
+                continue
             outcome = (
                 last_attempt.get("status")
                 or last_attempt.get("error_class")
@@ -724,7 +784,7 @@ def _build_auto_agent_terminal_candidate_inventory(
             shaped.update(
                 {
                     "terminal_disposition": "attempted",
-                    "attempt_count": len(candidate_attempts),
+                    "attempt_count": _provider_attempt_count(candidate_attempts),
                     "outcome": outcome,
                 }
             )
