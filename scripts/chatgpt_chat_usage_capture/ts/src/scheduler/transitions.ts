@@ -61,7 +61,11 @@ export function requestRefresh(
 ): RefreshRequestResult {
   validateScope(state.scope);
   validateEpoch(context.at, "at");
-  const pending = combinePending(state.pending, { kind: "manual", missedCount: 0 });
+  const pending = combinePending(state.pending, {
+    kind: "manual",
+    missedCount: 0,
+    dueAt: null,
+  });
   return {
     queued: true,
     coalesced: state.active !== null || state.pending !== null,
@@ -113,7 +117,7 @@ export function claimTrigger(
     kind: triggerKindForClaim(state.pending, dueCount),
     missedCount: (state.pending?.missedCount ?? 0) + dueCount,
     dueAt: claimedDueAt(state.pending, state.nextDueAt, dueCount),
-    jitterMs: claimedJitterMs(state.pending, state.jitterMs, dueCount),
+    jitterMs: claimedJitterMs(state.pending, state.jitterMs, state.nextDueAt, dueCount),
     claimedAt: context.at,
     fencingToken,
   };
@@ -220,7 +224,12 @@ export function materializeDue(
   if (dueCount === 0) {
     return state;
   }
-  const pending = combinePending(state.pending, { kind: "scheduled", missedCount: dueCount });
+  const pending = combinePending(state.pending, {
+    kind: "scheduled",
+    missedCount: dueCount,
+    dueAt: state.nextDueAt,
+    jitterMs: state.jitterMs,
+  });
   const nextTickIndex = state.nextTickIndex + dueCount;
   return withPending(
     {
@@ -365,13 +374,13 @@ function mergedDueAt(
   if (current === null) {
     return incoming.dueAt;
   }
-  if (current.dueAt === undefined) {
+  if (current.dueAt === undefined || incoming.dueAt === undefined) {
     return undefined;
   }
   if (current.dueAt === null) {
-    return incoming.dueAt === undefined ? null : incoming.dueAt;
+    return incoming.dueAt;
   }
-  if (incoming.dueAt === undefined || incoming.dueAt === null) {
+  if (incoming.dueAt === null) {
     return current.dueAt;
   }
   return Math.min(current.dueAt, incoming.dueAt);
@@ -382,26 +391,35 @@ function mergedJitterMs(
   incoming: Partial<Pick<SchedulePending, "dueAt" | "jitterMs">>,
   dueAt: number | null | undefined,
 ): number | undefined {
-  if (dueAt === undefined || dueAt === null) {
-    return undefined;
+  if (dueAt === undefined) {
+    if (current?.dueAt === undefined && current?.jitterMs !== undefined) {
+      return current.jitterMs;
+    }
+    if (incoming.dueAt === undefined && incoming.jitterMs !== undefined) {
+      return incoming.jitterMs;
+    }
+    return current?.jitterMs ?? incoming.jitterMs;
+  }
+  if (dueAt === null) {
+    return current?.jitterMs ?? incoming.jitterMs;
   }
   if (
     current?.dueAt !== undefined &&
     current.dueAt !== null &&
     current.dueAt <= dueAt
   ) {
-    return current.jitterMs;
+    return current.jitterMs ?? incoming.jitterMs;
   }
-  return incoming.jitterMs;
+  return incoming.jitterMs ?? current?.jitterMs;
 }
 
 function claimedDueAt(
   pending: SchedulePending | null,
   nextDueAt: number,
   dueCount: number,
-): number | null {
+): number | null | undefined {
   if (pending?.dueAt === undefined) {
-    return pending === null && dueCount > 0 ? nextDueAt : null;
+    return pending === null && dueCount > 0 ? nextDueAt : undefined;
   }
   if (pending.dueAt === null) {
     return dueCount > 0 ? nextDueAt : null;
@@ -412,12 +430,19 @@ function claimedDueAt(
 function claimedJitterMs(
   pending: SchedulePending | null,
   scheduleJitterMs: number,
+  nextDueAt: number,
   dueCount: number,
 ): number {
-  if (pending?.dueAt === undefined || pending.dueAt === null) {
-    return dueCount > 0 ? scheduleJitterMs : pending?.jitterMs ?? scheduleJitterMs;
+  if (pending?.dueAt === undefined) {
+    return pending?.jitterMs ?? scheduleJitterMs;
   }
-  return pending.jitterMs ?? scheduleJitterMs;
+  if (pending.dueAt === null) {
+    return dueCount > 0 ? scheduleJitterMs : pending.jitterMs ?? scheduleJitterMs;
+  }
+  if (dueCount === 0 || pending.dueAt <= nextDueAt) {
+    return pending.jitterMs ?? scheduleJitterMs;
+  }
+  return scheduleJitterMs;
 }
 
 function countDueTicks(state: ScheduleState, now: number): number {

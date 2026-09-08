@@ -23,7 +23,7 @@ export interface SchedulePending {
   readonly missedCount: number;
   readonly requestedAt: number;
   readonly triggerId?: string;
-  readonly dueAt?: number | null;
+  readonly dueAt?: number | null | undefined;
   readonly jitterMs?: number;
 }
 
@@ -33,7 +33,7 @@ export interface ActiveTrigger {
   readonly triggerId: string;
   readonly kind: TriggerKind;
   readonly missedCount: number;
-  readonly dueAt: number | null;
+  readonly dueAt: number | null | undefined;
   readonly jitterMs: number;
   readonly claimedAt: number;
   readonly fencingToken: number;
