@@ -172,6 +172,22 @@ def _selected_account_matches_candidate(
     )
 
 
+def _same_xai_oauth_selected_account(
+    left: XaiOAuthSelectedAccount,
+    right: XaiOAuthSelectedAccount,
+) -> bool:
+    return (
+        left.label == right.label
+        and left.account_hash == right.account_hash
+        and left.scope_identity == right.scope_identity
+        and left.lane_key == right.lane_key
+        and left.record.auth_path == right.record.auth_path
+        and left.record.scope == right.record.scope
+        and left.record.expected_account_identity
+        == right.record.expected_account_identity
+    )
+
+
 def _xai_oauth_snapshot_matches_selected_account(
     snapshot: Any,
     selected: XaiOAuthSelectedAccount,
@@ -214,6 +230,32 @@ def preserve_xai_oauth_candidate_context(
         contexts = {}
         setattr(state, _XAI_OAUTH_SELECTED_ACCOUNT_CONTEXTS_STATE, contexts)
     contexts[key] = (selected, snapshot)
+
+
+def preserve_xai_oauth_snapshot_refresh_context(
+    request: Any,
+    snapshot: Any,
+) -> None:
+    """Persist a trusted reread snapshot for all matching request candidates."""
+
+    selected = get_bound_xai_oauth_selected_account(request)
+    if selected is None or not _xai_oauth_snapshot_matches_selected_account(
+        snapshot,
+        selected,
+    ):
+        return
+    state = getattr(request, "state", None)
+    contexts = getattr(state, _XAI_OAUTH_SELECTED_ACCOUNT_CONTEXTS_STATE, None)
+    if not isinstance(contexts, dict):
+        return
+    for key, context in tuple(contexts.items()):
+        if not isinstance(context, tuple) or len(context) != 2:
+            continue
+        context_selected, _context_snapshot = context
+        if not isinstance(context_selected, XaiOAuthSelectedAccount):
+            continue
+        if _same_xai_oauth_selected_account(context_selected, selected):
+            contexts[key] = (context_selected, snapshot)
 
 
 def _get_preserved_xai_oauth_candidate_context(
@@ -791,6 +833,7 @@ __all__ = [
     "get_xai_oauth_snapshot_for_selected_account",
     "is_managed_xai_oauth_candidate",
     "preserve_xai_oauth_candidate_context",
+    "preserve_xai_oauth_snapshot_refresh_context",
     "resolve_xai_oauth_direct_continuation_account",
     "resolve_xai_oauth_selected_account_identity",
     "select_xai_oauth_account_record",

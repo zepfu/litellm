@@ -337,6 +337,14 @@ async def route_request(  # noqa: PLR0915 - Complex routing function, refactorin
                 if refreshed_snapshot is None:
                     raise
                 bind_xai_oauth_snapshot_to_request(request, refreshed_snapshot)
+                from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
+                    preserve_xai_oauth_snapshot_refresh_context,
+                )
+
+                preserve_xai_oauth_snapshot_refresh_context(
+                    request,
+                    refreshed_snapshot,
+                )
                 data["api_key"] = refreshed_snapshot.access_token
                 retry_invocation = route_fn(**data)
                 if inspect.isawaitable(retry_invocation):

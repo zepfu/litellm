@@ -799,8 +799,7 @@ async def _try_managed_xai_oauth_generation_retry(
         reread_xai_oauth_snapshot_after_401,
     )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.xai_oauth import (
-        get_bound_xai_oauth_selected_account,
-        preserve_xai_oauth_candidate_context,
+        preserve_xai_oauth_snapshot_refresh_context,
     )
 
     snapshot = get_xai_oauth_snapshot_from_request(request)
@@ -815,16 +814,7 @@ async def _try_managed_xai_oauth_generation_retry(
     if refreshed_snapshot is None:
         return None
     bind_xai_oauth_snapshot_to_request(request, refreshed_snapshot)
-    selected_account = get_bound_xai_oauth_selected_account(request)
-    if selected_account is not None:
-        # Persist trusted reread provenance so the next candidate bind cannot
-        # replace it with the older selection-time snapshot.
-        preserve_xai_oauth_candidate_context(
-            request,
-            candidate,
-            selected_account,
-            refreshed_snapshot,
-        )
+    preserve_xai_oauth_snapshot_refresh_context(request, refreshed_snapshot)
     return refreshed_snapshot
 
 
