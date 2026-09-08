@@ -288,15 +288,46 @@ def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
             for attempt in attempts or []
             if isinstance(attempt, dict)
         ]
-        attempted_provider_call = any(
+        request_attempted_provider_call = any(
             attempt.get("attempted_provider_call") is True
             for attempt in normalized_attempts
         )
+        # A request can have prior provider I/O while this terminal candidate
+        # was rejected before egress; keep those evidence scopes separate.
+        matching_keys = tuple(
+            key
+            for key in ("provider", "model", "route_family", "lane_key")
+            if terminal_candidate.get(key) is not None
+        )
+        terminal_attempted_provider_call = terminal_candidate.get(
+            "attempted_provider_call"
+        )
+        if not isinstance(terminal_attempted_provider_call, bool):
+            terminal_attempted_provider_call = None
+        if (
+            terminal_attempted_provider_call is None
+            and matching_keys
+            and normalized_attempts
+            and all(
+                normalized_attempts[-1].get(key) == terminal_candidate.get(key)
+                for key in matching_keys
+            )
+        ):
+            prior_terminal_attempted_provider_call = normalized_attempts[-1].get(
+                "attempted_provider_call"
+            )
+            if isinstance(prior_terminal_attempted_provider_call, bool):
+                terminal_attempted_provider_call = (
+                    prior_terminal_attempted_provider_call
+                )
+        if terminal_attempted_provider_call is None:
+            terminal_attempted_provider_call = False
+
         terminal_attempt = dict(terminal_candidate)
         terminal_attempt.update(
             {
                 "status": candidate_status,
-                "attempted_provider_call": attempted_provider_call,
+                "attempted_provider_call": terminal_attempted_provider_call,
                 "error_status_code": error_status_code,
                 "failure_phase": failure_phase,
             }
@@ -316,13 +347,8 @@ def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
             )
         if extra_fields:
             terminal_attempt.update(extra_fields)
-        terminal_attempt["attempted_provider_call"] = attempted_provider_call
+        terminal_attempt["attempted_provider_call"] = terminal_attempted_provider_call
 
-        matching_keys = tuple(
-            key
-            for key in ("provider", "model", "route_family", "lane_key")
-            if terminal_candidate.get(key) is not None
-        )
         if matching_keys and normalized_attempts and all(
             normalized_attempts[-1].get(key) == terminal_candidate.get(key)
             for key in matching_keys
@@ -346,7 +372,7 @@ def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
                 "candidate_status": candidate_status,
                 "failure_phase": failure_phase,
                 "error_status_code": int(error_status_code),
-                "attempted_provider_call": attempted_provider_call,
+                "attempted_provider_call": request_attempted_provider_call,
                 "redispatch_required": bool(redispatch_required),
                 "terminal_outcome": (
                     "redispatch_required" if redispatch_required else "failed"
@@ -364,7 +390,7 @@ def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
             event["error_code"] = str(error_code)
         if extra_fields:
             event.update(copy.deepcopy(dict(extra_fields)))
-        event["attempted_provider_call"] = attempted_provider_call
+        event["attempted_provider_call"] = request_attempted_provider_call
         if schema_rejection is not None:
             event[SCHEMA_REJECTION_KEY] = schema_rejection.to_dict()
             event["failure_class"], event["error_code"] = (
