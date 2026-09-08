@@ -115,6 +115,20 @@ Relevant environment variables:
 - `AAWM_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS`: minimum seconds between
   inspections; defaults to `3600`.
 
+For managed xAI OAuth, passive inspection is explicitly not a refresh-success
+signal. It records local-file health and usability in separate metadata and
+never sets `last_success_at`. When a scheduled refresh failure belongs to the
+same stable `credential_identity` and `credential_generation`, the passive row
+retains degraded refresh-state and sanitized scheduler error evidence even if
+the old access credential is locally usable. A differing generation is reread
+once to reject a stale snapshot, and the replacement is accepted only when its
+stable identity still matches. Only a successful actual refresh or a confirmed
+different usable generation clears the failed state and either exact terminal
+suppression class, `invalid_grant` or `refresh_token_reused`. A failed refresh
+also remains authoritative through later not-due scheduler cycles that make no
+token-endpoint attempt. Other xAI refresh errors remain retryable and do not
+receive terminal suppression.
+
 ## Cursor Agent Auth Refresh
 
 The sidecar owns automatic maintenance of the Cursor Agent credential in
@@ -553,8 +567,10 @@ read-only file/scope resolver. It checks every supplied path and scope value for
 agreement before selecting the documented precedence winner. A resolved
 `credential_identity` is a nonsecret hash of the canonical auth-file target and
 exact scope only; it is stable across token rotation and does not contain raw
-paths, credential fields, or filesystem metadata. Configuration conflicts return
-sanitized errors without selecting an identity or contacting the provider.
+paths, credential fields, or filesystem metadata. The separate nonsecret
+`credential_generation` digest includes only published file metadata and safe
+lifecycle fields, never token values. Configuration conflicts return sanitized
+errors without selecting an identity or contacting the provider.
 
 Combined credential/process health requires **both** credential records to have:
 
@@ -1365,10 +1381,11 @@ The detail endpoint is undocumented and provider-owned; shape may change without
 With `--once`, enabled `grok_oidc_refresh`, per-account
 `codex_oauth_refresh`, `xai_oauth_refresh`, and `nous_oauth_refresh` events
 are required tasks. A successful refresh or successful no-op/skipped refresh
-satisfies the task. For Nous Portal OAuth, a later cycle that skips because
-the previous attempt returned `invalid_grant` / `refresh_token_reused` on the
-same credential identity is a successful skip, not a second token-endpoint
-call. Any required failure returns a non-zero process status.
+satisfies the task. For managed xAI OAuth and Nous Portal OAuth, a later cycle
+that skips because the previous attempt returned `invalid_grant` /
+`refresh_token_reused` on the same credential identity is a successful skip,
+not a second token-endpoint call. Any required failure returns a non-zero
+process status.
 Telemetry, metadata repair, passive health, Kimi work, and aggregate events
 are optional; their failures are reported as optional degradation without
 changing the required exit status. Native Grok OIDC, managed xAI OAuth, and

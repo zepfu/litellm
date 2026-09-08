@@ -161,6 +161,26 @@ snapshot on the next request; missing, malformed, ambiguous-scope, expired,
 or near-expiry records fail closed. LiteLLM does not refresh or write native
 credential files during request handling.
 
+## Managed OAuth Credential Snapshots
+
+Managed `oa_xai/*` request preparation uses an immutable, generation-aware
+snapshot of the configured credential file and exact scope. Configuration
+resolution, file metadata checks, reads, and JSON parsing run off the request
+event loop, and concurrent requests share one in-flight validation for the
+same generation. Atomic replacement or route-safety expiry invalidates the
+cached snapshot before a later request rebuilds it. Missing, malformed,
+ambiguous-scope, expired, and near-expiry records fail closed; request handling
+does not refresh or write the managed credential file.
+
+For a provider-owned managed xAI `401` before response bytes are committed,
+LiteLLM may reread the exact bound file and scope and retry once on alias,
+direct async, OpenAI passthrough, or Anthropic compatibility routes. The
+reread must produce a changed trusted generation with the same non-secret
+account identity, and the retry reuses the original request body. Unchanged
+generations, a second `401`, missing or unproven account evidence, and
+different-account material are not retried. Native `xai/*` Grok OIDC traffic
+does not use this managed OAuth recovery.
+
 ## Rate-limit handling
 
 For an xAI provider `429`, LiteLLM uses a valid `Retry-After` value first.
@@ -173,6 +193,14 @@ is available.
 Reset values may be bounded durations, epoch timestamps, ISO timestamps, or
 HTTP-date values. Malformed, expired, non-finite, and unreasonably future
 values are ignored instead of creating a durable cooldown.
+
+Native Grok OIDC and managed xAI OAuth responses keep separate rate-limit
+observation identities. Native headers are captured under
+`xai_grok_oidc_response_headers` and labeled with the `xai_grok_oidc`
+credential family and `grok-build` client family; managed headers use
+`xai_oauth_response_headers` and the `xai_oauth` client family. A legacy
+native observation under the managed key is read only when native metadata
+proves ownership, and authorization or unrelated headers are excluded.
 
 When xAI supplies quota limit or remaining values without provider reset or
 billing-period evidence, LiteLLM leaves the reset time and quota period
@@ -197,6 +225,9 @@ precedence is an explicit configured scope, `AAWM_XAI_OAUTH_SCOPE`,
 configured values fail closed. Resolution metadata uses a nonsecret
 `credential_identity` derived from the canonical file target and exact scope;
 credential contents and raw paths are never included in that identity.
+Refresh and passive-health metadata also carries a separate nonsecret
+`credential_generation` digest for the published file generation; token values
+are excluded from both identifiers.
 
 Managed credential lifecycle is evaluated by one side-effect-free policy shared
 by request readiness, refresh eligibility, and passive health. It reports
@@ -261,6 +292,13 @@ native Grok and managed xAI Codex routes narrow `timeout_ms` from `number` to
 parser. Finite integral response values become JSON integers in both JSON and
 SSE output. Fractional values, unrelated numeric arguments, original tool names,
 and the caller's replay definitions remain unchanged.
+
+Native Grok and managed xAI Codex routes repair supported literal tool-call
+text in JSON and fully buffered Responses output. Once a stream is being
+forwarded lazily, malformed tool-call text instead fails closed before its
+successful terminal event and deferred session-owner promotion. LiteLLM does
+not replay already forwarded text as executable calls or buffer an unbounded
+response to repair it.
 
 ## Responses API Instructions
 

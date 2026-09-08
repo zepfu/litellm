@@ -4,6 +4,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     AsyncIterator,
+    Callable,
     Coroutine,
     Dict,
     List,
@@ -185,6 +186,16 @@ class BaseLLMHTTPHandler:
             ) from None
 
     @staticmethod
+    def _validate_managed_xai_oauth_prepared_request(
+        prepared_request: httpx.Request,
+        provider_config: BaseConfig,
+    ) -> None:
+        BaseLLMHTTPHandler._validate_managed_xai_oauth_request_target(
+            api_base=str(prepared_request.url),
+            provider_config=provider_config,
+        )
+
+    @staticmethod
     async def _raise_managed_xai_oauth_transport_error(
         response: httpx.Response,
         provider_config: BaseConfig,
@@ -308,6 +319,19 @@ class BaseLLMHTTPHandler:
                 provider_config=provider_config,
             )
 
+        validate_request_fn: Optional[Callable[[httpx.Request], None]] = None
+        if managed_xai_oauth_request:
+
+            def _validate_prepared_request(
+                prepared_request: httpx.Request,
+            ) -> None:
+                self._validate_managed_xai_oauth_prepared_request(
+                    prepared_request=prepared_request,
+                    provider_config=provider_config,
+                )
+
+            validate_request_fn = _validate_prepared_request
+
         response: Optional[httpx.Response] = None
         for i in range(max(max_retry_on_unprocessable_entity_error, 1)):
             try:
@@ -325,6 +349,7 @@ class BaseLLMHTTPHandler:
                     follow_redirects=(
                         False if managed_xai_oauth_request else None
                     ),
+                    validate_request_fn=validate_request_fn,
                 )
             except httpx.HTTPStatusError as e:
                 if managed_xai_oauth_request:
@@ -389,6 +414,19 @@ class BaseLLMHTTPHandler:
                 provider_config=provider_config,
             )
 
+        validate_request_fn: Optional[Callable[[httpx.Request], None]] = None
+        if managed_xai_oauth_request:
+
+            def _validate_prepared_request(
+                prepared_request: httpx.Request,
+            ) -> None:
+                self._validate_managed_xai_oauth_prepared_request(
+                    prepared_request=prepared_request,
+                    provider_config=provider_config,
+                )
+
+            validate_request_fn = _validate_prepared_request
+
         response: Optional[httpx.Response] = None
 
         for i in range(max(max_retry_on_unprocessable_entity_error, 1)):
@@ -407,6 +445,7 @@ class BaseLLMHTTPHandler:
                     follow_redirects=(
                         False if managed_xai_oauth_request else None
                     ),
+                    validate_request_fn=validate_request_fn,
                 )
             except httpx.HTTPStatusError as e:
                 if managed_xai_oauth_request:

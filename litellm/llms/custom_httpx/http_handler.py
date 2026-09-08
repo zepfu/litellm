@@ -466,6 +466,7 @@ class AsyncHTTPHandler:
         files: Optional[RequestFiles] = None,
         content: Any = None,
         follow_redirects: Optional[bool] = None,
+        validate_request_fn: Optional[Callable[[httpx.Request], None]] = None,
     ):
         start_time = time.time()
         try:
@@ -491,6 +492,8 @@ class AsyncHTTPHandler:
             send_kwargs: Dict[str, Any] = {"stream": stream}
             if follow_redirects is not None:
                 send_kwargs["follow_redirects"] = follow_redirects
+            if validate_request_fn is not None:
+                validate_request_fn(req)
             response = await self.client.send(req, **send_kwargs)
             response.raise_for_status()
             return response
@@ -509,6 +512,7 @@ class AsyncHTTPHandler:
                     headers=headers,
                     stream=stream,
                     follow_redirects=follow_redirects,
+                    validate_request_fn=validate_request_fn,
                 )
             except BaseException:
                 await new_client.aclose()
@@ -745,6 +749,7 @@ class AsyncHTTPHandler:
         stream: bool = False,
         content: Any = None,
         follow_redirects: Optional[bool] = None,
+        validate_request_fn: Optional[Callable[[httpx.Request], None]] = None,
     ):
         """
         Making POST request for a single connection client.
@@ -760,6 +765,8 @@ class AsyncHTTPHandler:
         send_kwargs: Dict[str, Any] = {"stream": stream}
         if follow_redirects is not None:
             send_kwargs["follow_redirects"] = follow_redirects
+        if validate_request_fn is not None:
+            validate_request_fn(req)
         response = await client.send(req, **send_kwargs)
         response.raise_for_status()
         return response
@@ -1061,6 +1068,7 @@ class HTTPHandler:
         content: Any = None,
         logging_obj: Optional[LiteLLMLoggingObject] = None,
         follow_redirects: Optional[bool] = None,
+        validate_request_fn: Optional[Callable[[httpx.Request], None]] = None,
     ):
         try:
             # Prepare data/content parameters to prevent httpx DeprecationWarning (memory leak fix)
@@ -1087,6 +1095,8 @@ class HTTPHandler:
             send_kwargs: Dict[str, Any] = {"stream": stream}
             if follow_redirects is not None:
                 send_kwargs["follow_redirects"] = follow_redirects
+            if validate_request_fn is not None:
+                validate_request_fn(req)
             response = self.client.send(req, **send_kwargs)
             response.raise_for_status()
             return response

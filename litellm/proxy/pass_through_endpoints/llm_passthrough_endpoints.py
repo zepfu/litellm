@@ -84,6 +84,8 @@ from litellm.llms.xai.oauth import (
 from litellm.llms.xai.route_descriptors import (
     GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
     GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+    XAI_OAUTH_CREDENTIAL_FAMILY,  # noqa: F401 - codex candidate host binding
+    XAI_OAUTH_ROUTE_FAMILY,  # noqa: F401 - codex candidate host binding
 )
 from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 from litellm.proxy._types import *
