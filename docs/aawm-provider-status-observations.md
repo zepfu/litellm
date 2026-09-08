@@ -981,6 +981,60 @@ prior rows or establish account coverage.
 
 ## Alibaba Token Plan quota polling
 
+`scripts/chatgpt_chat_usage_capture/pg_ledger.py` defines the source-only
+PostgreSQL contract for ordinary-Chat usage metadata. It does not resolve a DSN,
+connect, activate a schedule, or write on construction. The matching schema is
+`scripts/apply_chatgpt_usage_ledger_2026_09_08.sql`, and callers must explicitly
+invoke `PgLedger.ensure_schema()` or apply that SQL before using the adapter.
+
+The adapter reuses the existing privacy sanitizer and rejects secret-like
+payloads before persistence. Verified identities converge by
+provider/provider-user/workspace/quota-owner/surface; an unverified identity
+remains collector-local. Attempts preserve requested, recorded-final, and
+resolved raw model evidence and mapped family fields separately. Identical
+projection fingerprints deduplicate; changed evidence appends an immutable
+revision. Alias collisions become coverage gaps rather than silently merging
+attempts. Provenance is projected to an explicit allowlist.
+
+`count_attempts(account, model_family=..., window_start=..., window_end=...)`
+returns active-attempt totals, completed-attempt totals, and separate raw-model
+and mapped-family maps over the half-open elapsed window. It counts distinct
+attempts, not provider charges or capacity snapshots, and classifies unknown or
+ambiguous time evidence as outside the definite totals when time bounds are
+insufficient.
+
+The tables are independent of `rate_limit_observations`, which remains the
+capacity-only observation store. Source delivery with this adapter requires
+separate operational integration and database activation.
+
+## ChatGPT usage ledger storage
+
+`scripts/chatgpt_chat_usage_capture/pg_ledger.py` defines the source-only
+PostgreSQL contract for ordinary-Chat usage metadata. It does not resolve a DSN,
+connect, activate a schedule, or write on construction. The matching schema is
+`scripts/apply_chatgpt_usage_ledger_2026_09_08.sql`, and callers must explicitly
+invoke `PgLedger.ensure_schema()` or apply that SQL before using the adapter.
+
+The adapter reuses the existing privacy sanitizer and rejects secret-like
+payloads before persistence. Verified identities converge by
+provider/provider-user/workspace/quota-owner/surface; an unverified identity
+remains collector-local. Attempts preserve requested, recorded-final, and
+resolved raw model evidence and mapped family fields separately. Identical
+projection fingerprints deduplicate; changed evidence appends an immutable
+revision. Alias collisions become coverage gaps rather than silently merging
+attempts. Provenance is projected to an explicit allowlist.
+
+`count_attempts(account, model_family=..., window_start=..., window_end=...)`
+returns active-attempt totals, completed-attempt totals, and separate raw-model
+and mapped-family maps over the half-open elapsed window. It counts distinct
+attempts, not provider charges or capacity snapshots, and classifies unknown or
+ambiguous time evidence as outside the definite totals when time bounds are
+insufficient.
+
+The tables are independent of `rate_limit_observations`, which remains the
+capacity-only observation store. Source delivery with this adapter requires
+separate operational integration and database activation.
+
 The provider-status sidecar can poll the authenticated ModelStudio Token Plan
 console contract without sending inference traffic. It records the provider's
 5-hour and 7-day Credit usage windows as:
@@ -1539,3 +1593,31 @@ WHERE start_time >= toDateTime64('2026-07-01 00:00:00', 3)
 
 This repo's backfill scripts already use `metadata[...]` patterns; ad-hoc probes
 and sibling dashboards should follow the same shape.
+
+## ChatGPT usage ledger storage
+
+`scripts/chatgpt_chat_usage_capture/pg_ledger.py` defines the source-only
+PostgreSQL contract for ordinary-Chat usage metadata. It does not resolve a DSN,
+connect, activate a schedule, or write on construction. The matching schema is
+`scripts/apply_chatgpt_usage_ledger_2026_09_08.sql`, and callers must explicitly
+invoke `PgLedger.ensure_schema()` or apply that SQL before using the adapter.
+
+The adapter reuses the existing privacy sanitizer and rejects secret-like
+payloads before persistence. Verified identities converge by
+provider/provider-user/workspace/quota-owner/surface; an unverified identity
+remains collector-local. Attempts preserve requested, recorded-final, and
+resolved raw model evidence and mapped family fields separately. Identical
+projection fingerprints deduplicate; changed evidence appends an immutable
+revision. Alias collisions become coverage gaps rather than silently merging
+attempts. Provenance is projected to an explicit allowlist.
+
+`count_attempts(account, model_family=..., window_start=..., window_end=...)`
+returns active-attempt totals, completed-attempt totals, and separate raw-model
+and mapped-family maps over the half-open elapsed window. It counts distinct
+attempts, not provider charges or capacity snapshots, and classifies unknown or
+ambiguous time evidence as outside the definite totals when time bounds are
+insufficient.
+
+The tables are independent of `rate_limit_observations`, which remains the
+capacity-only observation store. Source delivery with this adapter requires
+separate operational integration and database activation.
