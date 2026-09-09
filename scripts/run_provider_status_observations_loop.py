@@ -4647,6 +4647,10 @@ def _build_passive_provider_auth_observation(
             config.provider_auth_health_poll_interval_seconds
         ),
     }
+    if auth_family == "codex_oauth":
+        metadata["codex_oauth_inventory_generation"] = event.get(
+            "codex_oauth_inventory_generation"
+        )
     if auth_family == "xai_oauth":
         metadata.update(
             {
@@ -7728,6 +7732,9 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
             _codex_account_aggregate_event(
                 event_name="codex_quota_poll_aggregate",
                 config=config,
+                inventory_generation=codex_oauth_inventory_generation_digest(
+                    inventory
+                ),
                 records=records,
                 usable_by_label=state.codex_quota_usable_by_label,
                 status_by_label=state.codex_quota_status_by_label,
@@ -8652,9 +8659,9 @@ def _build_zai_coding_plan_quota_rate_limit_payloads(  # noqa: PLR0915
             continue
         if remaining_pct is None:
             continue
-        remaining_pct = round(remaining_pct, 0) if quota_type == "credits" else float(remaining_pct)
-        if quota_type == "credits":
-            remaining_pct = float(int(remaining_pct)) if remaining_pct == int(remaining_pct) else float(remaining_pct)
+        # Preserve provider precision for control decisions; presentation layers
+        # may round the persisted value independently.
+        remaining_pct = float(remaining_pct)
         raw_provider_fields = {
             "limit_type": limit_type,
             "quota_period": period,
@@ -14248,6 +14255,9 @@ def _persist_codex_passive_auth_observation(
         {
             "account_label": record.label,
             "account_hash": record.expected_account_hash,
+            "codex_oauth_inventory_generation": event.get(
+                "codex_oauth_inventory_generation"
+            ),
         }
     )
     return _persist_passive_provider_auth_observation(config, observation)
@@ -14449,6 +14459,7 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
             "source_task": "provider_auth_health_poll",
             "observed_at": _utc_timestamp(),
             "environment": config.environment,
+            "codex_oauth_inventory_generation": inventory_generation,
             **summary,
         }
         persisted, inserted_count, skip_error_class, skip_reason = (
@@ -14474,6 +14485,7 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
             _codex_account_aggregate_event(
                 event_name="codex_oauth_health_aggregate",
                 config=config,
+                inventory_generation=inventory_generation,
                 records=records,
                 usable_by_label=state.codex_auth_health_usable_by_label,
                 status_by_label=state.codex_auth_health_status_by_label,

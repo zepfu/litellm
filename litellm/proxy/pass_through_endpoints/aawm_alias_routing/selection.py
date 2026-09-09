@@ -2965,6 +2965,7 @@ async def _resolve_codex_oauth_account_candidate_contexts(
     )
     from litellm.secret_managers.codex_oauth_inventory import (
         CodexOAuthInventoryError,
+        codex_oauth_inventory_generation_digest,
         load_codex_oauth_inventory,
     )
 
@@ -3030,6 +3031,9 @@ async def _resolve_codex_oauth_account_candidate_contexts(
                 inventory.routing.credential_affinity
             ),
             "codex_oauth_selection_strategy": inventory.routing.strategy,
+            "codex_oauth_inventory_generation": (
+                codex_oauth_inventory_generation_digest(inventory)
+            ),
         }
         if pinned_label is not None and (
             not interchangeable_affinity or pin_interchangeable_account

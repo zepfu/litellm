@@ -43,6 +43,7 @@ from typing import Any, Optional, Sequence
 import yaml
 
 from litellm.secret_managers.codex_oauth_inventory import (
+    CodexOAuthInventoryError,
     codex_oauth_inventory_generation_digest,
     load_codex_oauth_inventory,
 )
@@ -693,6 +694,13 @@ def get_startup_status() -> dict[str, Any]:
         active_snapshot if active_snapshot is not None else startup_snapshot
     )
 
+    try:
+        inventory_generation = codex_oauth_inventory_generation_digest(
+            load_codex_oauth_inventory()
+        )
+    except CodexOAuthInventoryError:
+        # Legacy single-credential deployments do not have an inventory.
+        inventory_generation = None
     return {
         "state": "active",
         "config_hash": identity_snapshot.config_hash,
@@ -701,9 +709,7 @@ def get_startup_status() -> dict[str, Any]:
         "files": list(files_loaded),
         "aliases": sorted(identity_snapshot.aliases.keys()),
         "alias_count": len(identity_snapshot.aliases),
-        "codex_oauth_inventory_generation": (
-            codex_oauth_inventory_generation_digest(load_codex_oauth_inventory())
-        ),
+        "codex_oauth_inventory_generation": inventory_generation,
         "activation_result": "success",
     }
 
