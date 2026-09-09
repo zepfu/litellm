@@ -727,8 +727,7 @@ class PassThroughStreamingHandler:
         ):
             return "usage_limit_reached", "usage_limit_reached", False
         if (
-            openai_alpha_capacity_retry_enabled
-            and error_code in {"server_is_overloaded", "capacity_exhausted"}
+            error_code in {"server_is_overloaded", "capacity_exhausted"}
             and error_type not in {
                 "authentication_error",
                 "authorization_error",
