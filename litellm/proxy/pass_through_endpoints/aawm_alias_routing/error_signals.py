@@ -2786,8 +2786,14 @@ def _is_openai_alpha_capacity_retry_enabled(
     candidate: Any,
     is_codex_alias: bool,
 ) -> bool:
-    """Return whether the alpha OpenAI capacity extension is explicitly eligible."""
-    if os.getenv("AAWM_LITELLM_ENVIRONMENT", "").strip() != "litellm-alpha":
+    """Return whether the OpenAI capacity extension is explicitly eligible."""
+    policy_value = os.getenv("AAWM_OPENAI_CAPACITY_RETRY_ENABLED")
+    if policy_value is not None and policy_value.strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
         return False
     if not is_codex_alias or not isinstance(candidate, Mapping):
         return False
