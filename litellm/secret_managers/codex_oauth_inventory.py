@@ -8,6 +8,7 @@ without following a final symlink, and are never discovered by directory scan.
 from __future__ import annotations
 
 import base64
+import asyncio
 import errno
 import hashlib
 import json
@@ -15,6 +16,8 @@ import math
 import os
 import re
 import stat
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -24,6 +27,7 @@ CODEX_OAUTH_INVENTORY_SCHEMA_VERSION = 1
 CODEX_OAUTH_ACCOUNT_HASH_LENGTH = 12
 CODEX_OAUTH_AUTH_FILE_MODE = 0o600
 CODEX_OAUTH_AUTH_FILE_MAX_BYTES = 1_048_576
+CODEX_OAUTH_SNAPSHOT_CACHE_MAX_ENTRIES = 128
 
 _SAFE_LABEL_RE = re.compile(r"\A[a-z][a-z0-9._-]{0,63}\Z")
 _ACCOUNT_HASH_RE = re.compile(
@@ -198,6 +202,52 @@ class CodexOAuthCredentialSnapshot:
     access_token: str = field(repr=False)
     account_id: str = field(repr=False)
     account_display: Optional[str] = None
+
+
+_SNAPSHOT_CACHE: dict[
+    tuple[str, str, str, str], tuple[tuple[int, int, int], CodexOAuthCredentialSnapshot]
+] = {}
+_SNAPSHOT_CACHE_LOCK = threading.Lock()
+
+
+def read_codex_oauth_snapshot_sync(
+    record: CodexOAuthCredentialRecord,
+) -> CodexOAuthCredentialSnapshot:
+    """Read one validated credential generation with bounded reuse."""
+    key = (
+        record.label,
+        os.fspath(record.auth_path),
+        os.fspath(record.lock_path),
+        record.expected_account_hash,
+    )
+    try:
+        stat_result = os.lstat(record.auth_path)
+        identity = (
+            stat_result.st_ino,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+        )
+    except OSError:
+        identity = (0, 0, 0)
+    with _SNAPSHOT_CACHE_LOCK:
+        cached = _SNAPSHOT_CACHE.get(key)
+    if cached is not None and cached[0] == identity:
+        snapshot = cached[1]
+        if snapshot.expires_at is None or snapshot.expires_at > time.time():
+            return snapshot
+    snapshot = load_codex_oauth_credential(record)
+    with _SNAPSHOT_CACHE_LOCK:
+        _SNAPSHOT_CACHE[key] = (identity, snapshot)
+        while len(_SNAPSHOT_CACHE) > CODEX_OAUTH_SNAPSHOT_CACHE_MAX_ENTRIES:
+            _SNAPSHOT_CACHE.pop(next(iter(_SNAPSHOT_CACHE)))
+    return snapshot
+
+
+async def read_codex_oauth_snapshot(
+    record: CodexOAuthCredentialRecord,
+) -> CodexOAuthCredentialSnapshot:
+    """Read credential facts without blocking the async request thread."""
+    return await asyncio.to_thread(read_codex_oauth_snapshot_sync, record)
 
 
 def codex_oauth_account_identity_hash(account_id: Any) -> str:
@@ -836,6 +886,8 @@ __all__ = [
     "get_codex_oauth_token_data",
     "get_codex_oauth_token_expiry",
     "load_codex_oauth_credential",
+    "read_codex_oauth_snapshot",
+    "read_codex_oauth_snapshot_sync",
     "load_codex_oauth_inventory",
     "parse_codex_oauth_inventory",
     "validate_codex_oauth_account_identity",
