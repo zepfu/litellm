@@ -2786,7 +2786,7 @@ def _is_openai_alpha_capacity_retry_enabled(
     candidate: Any,
     is_codex_alias: bool,
 ) -> bool:
-    """Return whether the OpenAI capacity extension is explicitly eligible."""
+    """Return whether this candidate is an OpenAI Responses capacity target."""
     policy_value = os.getenv("AAWM_OPENAI_CAPACITY_RETRY_ENABLED")
     if policy_value is not None and policy_value.strip().lower() in {
         "0",
@@ -2795,12 +2795,12 @@ def _is_openai_alpha_capacity_retry_enabled(
         "off",
     }:
         return False
-    if not is_codex_alias or not isinstance(candidate, Mapping):
+    # Capacity coordination follows the OpenAI Responses route, not the
+    # inbound alias family. Requiring codex_responses here leaves native
+    # OpenAI auto-agent candidates as terminal instead of retriable.
+    if not isinstance(candidate, Mapping):
         return False
-    if (
-        candidate.get("provider") != "openai"
-        or candidate.get("route_family") != "codex_responses"
-    ):
+    if candidate.get("provider") != "openai":
         return False
     incoming_path = str(getattr(getattr(request, "url", None), "path", "") or "")
     return incoming_path.rstrip("/") in {
