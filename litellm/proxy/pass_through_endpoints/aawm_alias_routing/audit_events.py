@@ -355,10 +355,16 @@ def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
             terminal_attempt.update(extra_fields)
         terminal_attempt["attempted_provider_call"] = terminal_attempted_provider_call
 
-        if matching_keys and normalized_attempts and all(
+        same_attempt = matching_keys and normalized_attempts and all(
             normalized_attempts[-1].get(key) == terminal_candidate.get(key)
             for key in matching_keys
-        ):
+        )
+        preserve_prior_provider_attempt = (
+            same_attempt
+            and normalized_attempts[-1].get("attempted_provider_call") is True
+            and terminal_attempted_provider_call is False
+        )
+        if same_attempt and not preserve_prior_provider_attempt:
             normalized_attempts[-1].update(terminal_attempt)
         else:
             normalized_attempts.append(terminal_attempt)
