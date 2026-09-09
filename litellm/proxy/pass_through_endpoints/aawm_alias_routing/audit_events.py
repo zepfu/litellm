@@ -325,6 +325,9 @@ def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
                 )
         if terminal_attempted_provider_call is None:
             terminal_attempted_provider_call = False
+        request_attempted_provider_call = (
+            request_attempted_provider_call or terminal_attempted_provider_call
+        )
 
         terminal_attempt = dict(terminal_candidate)
         terminal_attempt.update(

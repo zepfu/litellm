@@ -5739,16 +5739,16 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 ),
                 request=request,
             )
-        review_replay_safety_kwarg = (
-            {"_replay_safety": review_replay_safety}
-            if review_replay_safety is not None
+        replay_safety_kwarg = (
+            {"_replay_safety": replay_safety}
+            if replay_safety is not None
             else {}
         )
         return await _select_codex_auto_agent_candidate(
             request=request,
             request_body=request_body,
             excluded_candidate_keys=excluded_candidate_keys,
-            **review_replay_safety_kwarg,
+            **replay_safety_kwarg,
         )
 
     if isinstance(session_owner_record, dict) and sa._record_state(session_owner_record) == "owned":
