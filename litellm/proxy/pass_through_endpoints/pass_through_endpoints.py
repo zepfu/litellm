@@ -4021,7 +4021,6 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
 
         canonical = httpx.Headers(retained)
         for name, value in protected_items:
-            del canonical[name]
             canonical[name] = value
         return canonical
 
@@ -4363,11 +4362,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         if (
             prepared_request.url.scheme != expected_openai_url.scheme
             or prepared_request.url.host != expected_openai_url.host
-            or prepared_request.url.effective_port
-            != expected_openai_url.effective_port
+            or prepared_request.url.port != expected_openai_url.port
             or prepared_request.url.raw_path != expected_openai_url.raw_path
-            or prepared_request.url.raw_fragment
-            != expected_openai_url.raw_fragment
+            or prepared_request.url.fragment != expected_openai_url.fragment
         ):
             HttpPassThroughEndpointHelpers._raise_egress_guard_block(
                 detail=(
