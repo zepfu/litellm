@@ -325,6 +325,7 @@ sequencing, stream validation, and response finalization, are package-owned:
 | Model resolution and adapter model normalization | `aawm_adapter_runtime/model_resolution.py` |
 | Response-body inspection, malformed intake context, Grok Composer repair, schema validation, custom-tool argument parsing | `aawm_adapter_runtime/request_build.py` |
 | Provider-neutral Responses SSE framing, parsing, summaries, repaired IDs, and Anthropic stream wrappers | `aawm_adapter_runtime/sse.py` |
+| Native OpenAI/ChatGPT passthrough Responses typed event parsing and bounded raw diagnostics | `aawm_adapter_runtime/openai_responses_events.py` |
 | Custom and namespace tool-call restoration for response bodies and SSE streams | `aawm_adapter_runtime/tool_call_restore.py` |
 | Responses stream accumulation, output merging, finalization, and empty-success diagnostics | `aawm_adapter_runtime/stream_collect.py` |
 | Responses payload validation, failure taxonomy, bounded replay, and malformed/empty-success rejection | `aawm_adapter_runtime/payload_validation.py` |
