@@ -466,6 +466,17 @@ def _load_codex_oauth_headers_for_record_sync(
     )
 
 
+def _load_locked_codex_oauth_headers_for_record_sync(
+    request: Request,
+    record: CodexOAuthCredentialRecord,
+) -> CodexOAuthRequestAuth:
+    """Acquire the writer lock and read one credential without blocking async."""
+    from litellm.secret_managers.credential_file_lock import credential_file_lock
+
+    with credential_file_lock(record.lock_path):
+        return _load_codex_oauth_headers_for_record_sync(request, record)
+
+
 async def _load_local_codex_auth_selection(
     request: Request,
     *,
@@ -682,10 +693,7 @@ async def reload_codex_oauth_credential_after_token_invalidated(
             outcome="unchanged_already_reloaded",
         )
         return None
-    from litellm.secret_managers.credential_file_lock import (
-        CredentialFileLockError,
-        credential_file_lock,
-    )
+    from litellm.secret_managers.credential_file_lock import CredentialFileLockError
 
     try:
         inventory = load_codex_oauth_inventory()
@@ -700,11 +708,11 @@ async def reload_codex_oauth_credential_after_token_invalidated(
     deadline = time.monotonic() + _CODEX_OAUTH_RELOAD_LOCK_WAIT_SECONDS
     while True:
         try:
-            with credential_file_lock(record.lock_path):
-                selection = _load_codex_oauth_headers_for_record_sync(
-                    request,
-                    record,
-                )
+            selection = await asyncio.to_thread(
+                _load_locked_codex_oauth_headers_for_record_sync,
+                request,
+                record,
+            )
             break
         except CredentialFileLockError:
             remaining = deadline - time.monotonic()
