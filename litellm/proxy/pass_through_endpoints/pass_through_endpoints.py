@@ -19,6 +19,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    Mapping,
     Optional,
     Tuple,
     Union,
@@ -265,6 +266,18 @@ _MANAGED_XAI_OAUTH_BLOCKED_PASSTHROUGH_HEADERS = (
     "api-key",
     "x-api-key",
 )
+_OPENAI_PROTECTED_PASSTHROUGH_HEADERS = (
+    "authorization",
+    "api-key",
+    "x-api-key",
+    "proxy-authorization",
+    "chatgpt-account-id",
+    "openai-organization",
+    "openai-project",
+    "session_id",
+    "session-id",
+)
+_OPENAI_ALLOWED_REDIRECT_STATUS_CODES = frozenset()
 
 
 def _is_xai_egress_credential_family(value: Optional[str]) -> bool:
@@ -3959,6 +3972,60 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         }
 
     @staticmethod
+    def _is_openai_bound_egress(
+        *,
+        custom_llm_provider: Optional[str],
+        egress_credential_family: Optional[str],
+        expected_target_family: Optional[str],
+        url: Union[str, httpx.URL],
+    ) -> bool:
+        provider = str(custom_llm_provider or "").strip().casefold()
+        credential_family = str(
+            egress_credential_family or ""
+        ).strip().casefold()
+        target_family = str(expected_target_family or "").strip().casefold()
+        return (
+            provider == "openai"
+            or credential_family == "codex_oauth"
+            or target_family == "openai"
+            or HttpPassThroughEndpointHelpers.get_target_provider_family(url)
+            == "openai"
+        )
+
+    @staticmethod
+    def canonicalize_openai_protected_headers(
+        headers: dict,
+        *,
+        protected_headers: Mapping[str, str],
+    ) -> httpx.Headers:
+        """Install server-owned protected headers last on one canonical map."""
+
+        incoming_items: list[tuple[str, str]] = [
+            (str(name), str(value)) for name, value in dict(headers).items()
+        ]
+        protected_items: list[tuple[str, str]] = [
+            (str(name), str(value))
+            for name, value in dict(protected_headers).items()
+        ]
+        selected_names = {name.casefold() for name, _value in protected_items}
+        protected_names = set(_OPENAI_PROTECTED_PASSTHROUGH_HEADERS)
+        protected_names.update(selected_names)
+
+        retained: list[tuple[str, str]] = []
+        for name, value in incoming_items:
+            normal_name = name.casefold()
+            if normal_name not in protected_names:
+                retained.append((name, value))
+            elif normal_name in selected_names:
+                selected_names.discard(normal_name)
+
+        canonical = httpx.Headers(retained)
+        for name, value in protected_items:
+            del canonical[name]
+            canonical[name] = value
+        return canonical
+
+    @staticmethod
     def _sanitize_egress_guard_target(url: Union[str, httpx.URL]) -> str:
         try:
             parsed_url = urlparse(str(url))
@@ -4269,6 +4336,94 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         )
 
     @staticmethod
+    def validate_openai_final_send_binding(
+        *,
+        prepared_request: httpx.Request,
+        expected_url: Union[str, httpx.URL],
+        custom_llm_provider: Optional[str],
+        egress_credential_family: Optional[str],
+        expected_target_family: Optional[str],
+        expected_account_hash: Optional[str] = None,
+        expected_lane_key: Optional[str] = None,
+        selected_account_context: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Validate the immutable native/Codex OpenAI send contract."""
+
+        if not HttpPassThroughEndpointHelpers._is_openai_bound_egress(
+            custom_llm_provider=custom_llm_provider,
+            egress_credential_family=egress_credential_family,
+            expected_target_family=expected_target_family,
+            url=expected_url,
+        ):
+            return
+
+        expected_openai_url = httpx.URL(str(expected_url)).copy_with(
+            query=prepared_request.url.query
+        )
+        if (
+            prepared_request.url.scheme != expected_openai_url.scheme
+            or prepared_request.url.host != expected_openai_url.host
+            or prepared_request.url.effective_port
+            != expected_openai_url.effective_port
+            or prepared_request.url.raw_path != expected_openai_url.raw_path
+            or prepared_request.url.raw_fragment
+            != expected_openai_url.raw_fragment
+        ):
+            HttpPassThroughEndpointHelpers._raise_egress_guard_block(
+                detail=(
+                    "Blocked OpenAI egress: final-send target differs from "
+                    "the server-selected target."
+                ),
+                url=prepared_request.url,
+                credential_family=egress_credential_family,
+                target_family=(
+                    expected_target_family
+                    or HttpPassThroughEndpointHelpers.get_target_provider_family(
+                        expected_openai_url
+                    )
+                ),
+            )
+
+        selected_hash = None
+        selected_lane = None
+        if isinstance(selected_account_context, Mapping):
+            raw_hash = selected_account_context.get("account_hash")
+            raw_lane = selected_account_context.get("lane_key")
+            selected_hash = str(raw_hash) if raw_hash not in (None, "") else None
+            selected_lane = str(raw_lane) if raw_lane not in (None, "") else None
+        if (
+            expected_account_hash is not None
+            and selected_hash != expected_account_hash
+        ) or (
+            expected_lane_key is not None and selected_lane != expected_lane_key
+        ):
+            HttpPassThroughEndpointHelpers._raise_egress_guard_block(
+                detail=(
+                    "Blocked OpenAI egress: selected account differs from "
+                    "the server-selected account."
+                ),
+                url=expected_openai_url,
+                credential_family=egress_credential_family,
+                target_family=(
+                    expected_target_family
+                    or HttpPassThroughEndpointHelpers.get_target_provider_family(
+                        expected_openai_url
+                    )
+                ),
+            )
+
+        validate_credential_family = egress_credential_family
+        if validate_credential_family is None:
+            validate_credential_family = (
+                "codex_oauth" if selected_hash is not None else "openai"
+            )
+        HttpPassThroughEndpointHelpers.validate_prepared_request_egress(
+            prepared_request=prepared_request,
+            credential_family=validate_credential_family,
+            expected_target_family=expected_target_family,
+        )
+
+    @staticmethod
     async def reject_managed_xai_redirect_response(
         *,
         response: httpx.Response,
@@ -4277,12 +4432,46 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         expected_target_family: Optional[str],
     ) -> None:
         """Reject 3xx responses before any credential-bearing follow-up."""
-        if not (
-            HttpPassThroughEndpointHelpers._is_managed_xai_oauth_egress(
-                credential_family
+        is_managed_xai = HttpPassThroughEndpointHelpers._is_managed_xai_oauth_egress(
+            credential_family
+        )
+        is_openai_redirect = (
+            not is_managed_xai
+            and HttpPassThroughEndpointHelpers._is_openai_bound_egress(
+                custom_llm_provider=None,
+                egress_credential_family=credential_family,
+                expected_target_family=expected_target_family,
+                url=url,
             )
             and 300 <= response.status_code < 400
+            and response.status_code
+            not in _OPENAI_ALLOWED_REDIRECT_STATUS_CODES
+        )
+        if not (
+            is_managed_xai
+            and 300 <= response.status_code < 400
         ):
+            if not is_openai_redirect:
+                return
+            try:
+                await response.aclose()
+            except Exception:  # noqa: BLE001
+                verbose_proxy_logger.debug(
+                    "Failed to close rejected OpenAI redirect response",
+                    exc_info=True,
+                )
+            HttpPassThroughEndpointHelpers._raise_egress_guard_block(
+                detail=(
+                    "Blocked OpenAI redirect response before any follow-up "
+                    "request."
+                ),
+                url=url,
+                credential_family=credential_family,
+                target_family=(
+                    expected_target_family
+                    or HttpPassThroughEndpointHelpers.get_target_provider_family(url)
+                ),
+            )
             return
         try:
             await response.aclose()
@@ -5643,6 +5832,7 @@ async def pass_through_request(  # noqa: PLR0915
     egress_credential_family: Optional[str] = None,
     expected_target_family: Optional[str] = None,
     managed_xai_oauth_request: bool = False,
+    egress_selected_openai_headers: Optional[dict] = None,
     allowed_forward_headers: Optional[list[str]] = None,
     allowed_pass_through_prefixed_headers: Optional[list[str]] = None,
     blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
@@ -5794,6 +5984,11 @@ async def pass_through_request(  # noqa: PLR0915
         )
         managed_xai_oauth_request = (
             managed_xai_oauth_request or managed_xai_oauth_egress
+        )
+        selected_openai_account_context = getattr(
+            getattr(request, "state", None),
+            "aawm_codex_oauth_selected_account",
+            None,
         )
         validate_prepared_request_fn: Optional[
             Callable[[httpx.Request], None]
@@ -6408,6 +6603,14 @@ async def pass_through_request(  # noqa: PLR0915
                     )
                     if request_state is not None
                     else None
+                )
+                HttpPassThroughEndpointHelpers.validate_openai_final_send_binding(
+                    prepared_request=prepared_request,
+                    expected_url=url,
+                    custom_llm_provider=custom_llm_provider,
+                    egress_credential_family=egress_credential_family,
+                    expected_target_family=expected_target_family,
+                    selected_account_context=selected_openai_account_context,
                 )
                 reservation = openai_call_ledger.reserve(
                     target=prepared_request.url,

@@ -462,6 +462,7 @@ class BaseOpenAIPassThroughHandler:
         )
         egress_credential_family: Optional[str] = None
         expected_target_family: Optional[str] = None
+        selected_openai_headers: Optional[dict[str, str]] = None
         endpoint_custom_body: Optional[dict[str, Any]] = None
         canonical_managed_oa_xai_request_body: Optional[dict[str, Any]] = None
         bound_codex_oauth_identity: Optional[dict[str, str]] = None
@@ -516,6 +517,20 @@ class BaseOpenAIPassThroughHandler:
                 rt.request_uses_codex_native_auth_fn(request)
                 and is_responses_endpoint
             ) or bound_codex_oauth_identity is not None
+            if is_codex_responses_request:
+                from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
+                    _load_bound_codex_oauth_auth,
+                )
+
+                selected_auth = await _load_bound_codex_oauth_auth(request)
+                selected_openai_headers = dict(selected_auth.headers)
+                if bound_codex_oauth_identity is None:
+                    bound_codex_oauth_identity = {
+                        "account_label": selected_auth.account_label,
+                        "account_hash": selected_auth.account_hash,
+                        "lane_key": selected_auth.lane_key,
+                        "model": "",
+                    }
             codex_auto_agent_alias_model = (
                 rt.resolve_codex_auto_agent_alias_model_fn(
                     prepared_request_body,
@@ -973,6 +988,17 @@ class BaseOpenAIPassThroughHandler:
                     extra_headers,
                     request=request,
                 )
+            if selected_openai_headers is not None:
+                from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+                    HttpPassThroughEndpointHelpers,
+                )
+
+                extra_headers = dict(
+                    HttpPassThroughEndpointHelpers.canonicalize_openai_protected_headers(
+                        dict(extra_headers or {}),
+                        protected_headers=selected_openai_headers,
+                    )
+                )
             assemble_headers = (
                 BaseOpenAIPassThroughHandler._assemble_xai_oauth_headers
                 if managed_xai_oauth_request
@@ -998,7 +1024,16 @@ class BaseOpenAIPassThroughHandler:
                     managed_xai_oauth_request=managed_xai_oauth_request,
                     defer_session_owner_promotion=defer_managed_xai_promotion,
                     blocked_pass_through_prefixed_headers=(
-                        ["authorization", "api-key", "x-api-key"]
+                        [
+                            "authorization",
+                            "api-key",
+                            "x-api-key",
+                            "chatgpt-account-id",
+                            "openai-organization",
+                            "openai-project",
+                            "session-id",
+                            "session_id",
+                        ]
                         if managed_xai_oauth_request
                         else None
                     ),
