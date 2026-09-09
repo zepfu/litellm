@@ -781,6 +781,14 @@ restart event.
 
 ## Implementation map
 
+The validated inventory exposes
+`codex_oauth_inventory_generation`: a full SHA-256 digest of its canonical
+nonsecret configuration, including credential path topology. The proxy,
+readiness status, and sidecar inventory events use this same identity. The
+digest changes with meaningful inventory configuration and does not change with
+credential rotation. A mismatch between two runtime identities is observable in
+those outputs and does not route-block requests.
+
 | Area | Location |
 | --- | --- |
 | Shared lock | `litellm/secret_managers/credential_file_lock.py` |

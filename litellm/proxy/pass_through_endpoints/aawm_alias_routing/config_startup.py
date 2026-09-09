@@ -42,6 +42,11 @@ from typing import Any, Optional, Sequence
 
 import yaml
 
+from litellm.secret_managers.codex_oauth_inventory import (
+    codex_oauth_inventory_generation_digest,
+    load_codex_oauth_inventory,
+)
+
 from .config_compiler import compile_yaml
 from .config_snapshot import RoutingSnapshot
 from .snapshot_select import (
@@ -696,6 +701,9 @@ def get_startup_status() -> dict[str, Any]:
         "files": list(files_loaded),
         "aliases": sorted(identity_snapshot.aliases.keys()),
         "alias_count": len(identity_snapshot.aliases),
+        "codex_oauth_inventory_generation": (
+            codex_oauth_inventory_generation_digest(load_codex_oauth_inventory())
+        ),
         "activation_result": "success",
     }
 
