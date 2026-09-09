@@ -302,6 +302,14 @@ class PassThroughStreamingHandler:
     )
 
     @staticmethod
+    def _is_openai_capacity_retry_policy_enabled() -> bool:
+        policy_value = os.getenv("AAWM_OPENAI_CAPACITY_RETRY_ENABLED")
+        return not (
+            policy_value is not None
+            and policy_value.strip().lower() in {"0", "false", "no", "off"}
+        )
+
+    @staticmethod
     def _is_openai_responses_stream(
         *,
         endpoint_type: EndpointType,
@@ -3419,6 +3427,7 @@ class PassThroughStreamingHandler:
         terminal_payload: Optional[Dict[str, Any]],
         handler_branch_state: List[str],
         delivered_wire_disposition: Optional[Dict[str, Any]] = None,
+        openai_alpha_capacity_retry_enabled: bool = False,
     ) -> None:
         metadata["aawm_route_rollup_turn_suppressed"] = True
         metadata["aawm_stream_interrupted"] = True
@@ -3459,7 +3468,10 @@ class PassThroughStreamingHandler:
             metadata["aawm_provider_terminal_payload"] = dict(terminal_payload)
         error_class, classification, retryable = (
             PassThroughStreamingHandler._classify_responses_pre_commit_error(
-                error_payload
+                error_payload,
+                openai_alpha_capacity_retry_enabled=(
+                    openai_alpha_capacity_retry_enabled
+                ),
             )
         )
         if policy_failure_kind or policy_failure_code or policy_failure_class:
@@ -3535,6 +3547,9 @@ class PassThroughStreamingHandler:
             setattr(failure_exc, "policy_failure_code", policy_failure_code)
         if policy_failure_class:
             setattr(failure_exc, "policy_failure_class", policy_failure_class)
+        if delivered_disposition is not None and delivered_disposition != "completed":
+            failure_exc.retryable = False
+            failure_exc.pre_commit_retry_exhausted = True
         failure_context = {
             "failure_kind": classification,
             "stream_failure_stage": "responses_stream_failed",
@@ -3812,6 +3827,9 @@ class PassThroughStreamingHandler:
                     terminal_payload=terminal_payload,
                     handler_branch_state=handler_branch_state,
                     delivered_wire_disposition=delivered_wire_disposition,
+                    openai_alpha_capacity_retry_enabled=(
+                        PassThroughStreamingHandler._is_openai_capacity_retry_policy_enabled()
+                    ),
                 )
                 return
             if synthetic_terminal_event_type == "response.incomplete":
