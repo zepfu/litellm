@@ -5534,7 +5534,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         else sa.classify_session_owner_replay_safety_body(request_body)
     )
     replay_safe = replay_safety.safe
-    if not replay_safe:
+    if is_auto_review and not replay_safe:
         sa.raise_session_owner_redispatch_required(
             session_identity=resolved_session_identity,
             alias_model=alias_model,

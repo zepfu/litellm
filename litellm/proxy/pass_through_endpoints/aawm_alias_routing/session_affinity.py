@@ -4004,6 +4004,7 @@ def _emit_session_owner_redispatch_observability(
     request: Any,
     attempted_provider_call: bool = False,
     terminal_marker: Any = None,
+    replay_safety: Optional[SessionOwnerReplaySafetyResult] = None,
 ) -> None:
     """Emit one proxy ERROR and one rollup failure. Never raises."""
     summary = _build_session_owner_redispatch_summary(
@@ -4097,10 +4098,17 @@ def _emit_session_owner_redispatch_observability(
                 "session_id": session_identity,
                 "trace_id": request_context.get("trace_id"),
                 "litellm_call_id": request_call_id,
-                "replay_safety": _bounded_replay_safety_detail(replay_safety),
                 "mismatch_reason": mismatch_reason,
             },
+            extra_fields={
+                "session_id": session_identity,
+                "trace_id": request_context.get("trace_id"),
+                "litellm_call_id": request_call_id,
+                "replay_safety": _bounded_replay_safety_detail(replay_safety),
+                "attempted_provider_call": bool(attempted_provider_call),
+            },
             failure_class="session_owner_redispatch",
+            attempts=[],
             redispatch_required=True,
         )
     except Exception:
@@ -4378,6 +4386,7 @@ def raise_session_owner_redispatch_required(
             if terminal_marker is not None
             else getattr(request, "state", None)
         ),
+        replay_safety=replay_safety,
     )
     # Direct OpenAI / nested Codex guards raise 409 before
     # pass_through_request registers ACCESS replacement. Register once so
