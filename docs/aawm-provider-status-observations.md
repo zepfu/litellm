@@ -1046,10 +1046,14 @@ one-shot foreground action, not a recurring schedule. A
 distinct bounded outcome and exits zero.
 
 Unknown mutating requests remain blocked without ending observation of
-already-permitted reads. A blocked-request diagnostic alone does not count as
-an observed history request; expiration without a history request still
-returns `no_history_observed`. Known model and conversation-mutation paths
-still stop observation; no additional route or method is permitted or retried.
+already-permitted reads. Unknown same-origin `GET` backend/API routes are
+observed and continued without storing their payloads; known model and
+conversation-mutation paths, non-GET mutations, unexpected documents, auth,
+challenge, throttle, and identity failures still stop observation. No
+additional route or method is permitted or retried, and no endpoint-specific
+request is made.
+Unknown same-origin `GET` observation does not count as a history request;
+expiration without one still returns `no_history_observed`.
 `blocked_request` records the first blocking branch (`mutating_method` or
 `model_or_mutation_path`), a fixed HTTP method, resource type, origin category,
 and route family. Categories distinguish existing bootstrap-read paths,

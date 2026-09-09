@@ -4517,7 +4517,11 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
                 parsed.path.startswith("/backend-api/")
                 or parsed.path.startswith("/api/")
             )
-            and parsed.path not in _NATIVE_HISTORY_BOOTSTRAP_READ_PATHS
+            and (
+                method != "GET"
+                or parsed.path in _NATIVE_HISTORY_BOOTSTRAP_READ_PATHS
+                or is_conversation_detail_path(parsed.path)
+            )
         ):
             blocked = True
             set_boundary("bootstrap_route_blocked")
