@@ -212,6 +212,45 @@ def codex_oauth_account_identity_hash(account_id: Any) -> str:
     ]
 
 
+def codex_oauth_inventory_generation_digest(
+    inventory: CodexOAuthInventory,
+) -> str:
+    """Return a stable non-secret identity for the inventory contents.
+
+    The input is the validated configuration, including credential path
+    topology, but not credential contents or identities read from those files.
+    Record declaration order is retained because it is the validated fallback
+    ordering for equal priorities.
+    """
+    payload = {
+        "schema_version": CODEX_OAUTH_INVENTORY_SCHEMA_VERSION,
+        "routing": {
+            "credential_affinity": inventory.routing.credential_affinity,
+            "strategy": inventory.routing.strategy,
+        },
+        "accounts": [
+            {
+                "label": record.label,
+                "auth_path": record.auth_path.as_posix(),
+                "lock_path": record.lock_path.as_posix(),
+                "priority": record.priority,
+                "weight": record.weight,
+                "enabled": record.enabled,
+                "models": list(record.models),
+                "expected_account_hash": record.expected_account_hash,
+            }
+            for record in inventory.records
+        ],
+    }
+    canonical_json = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+
 def codex_oauth_masked_account_display(email: Any) -> Optional[str]:
     """Return a bounded display form for an untrusted email claim.
 
@@ -793,6 +832,7 @@ __all__ = [
     "CodexOAuthRoutingPolicy",
     "codex_oauth_account_identity_hash",
     "codex_oauth_masked_account_display",
+    "codex_oauth_inventory_generation_digest",
     "get_codex_oauth_token_data",
     "get_codex_oauth_token_expiry",
     "load_codex_oauth_credential",

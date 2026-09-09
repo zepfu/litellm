@@ -111,6 +111,7 @@ from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthCredentialRecord,
     CodexOAuthCredentialSnapshot,
     CodexOAuthInventory,
+    codex_oauth_inventory_generation_digest,
     load_codex_oauth_credential,
     load_codex_oauth_inventory,
 )
@@ -5004,6 +5005,9 @@ def _build_codex_auth_observation(
     metadata = {
         "auth_file_hash_algorithm": "sha256",
         "auth_file_source": auth_file_source,
+        "codex_oauth_inventory_generation": event.get(
+            "codex_oauth_inventory_generation"
+        ),
         "account_label": _redacted_summary_field(account_label),
         "account_hash": _redacted_summary_field(account_hash),
         "refresh_buffer_seconds": config.codex_refresh_buffer_seconds,
@@ -13656,6 +13660,7 @@ def _codex_account_aggregate_event(
     *,
     event_name: str,
     config: ProviderStatusLoopConfig,
+    inventory_generation: str,
     records: Sequence[CodexOAuthCredentialRecord],
     usable_by_label: Mapping[str, bool],
     status_by_label: Mapping[str, str],
@@ -13691,6 +13696,7 @@ def _codex_account_aggregate_event(
         "event": event_name,
         "observed_at": _utc_timestamp(),
         "environment": config.environment,
+        "codex_oauth_inventory_generation": inventory_generation,
         "health": health,
         "account_count": len(accounts),
         "usable_count": usable_count,
@@ -13713,11 +13719,13 @@ def _run_codex_oauth_refresh_task(
     records = inventory.ordered_records(enabled_only=True)
     events: list[Dict[str, Any]] = []
     if not records:
+        inventory_generation = codex_oauth_inventory_generation_digest(inventory)
         events.append(
             {
                 "event": "codex_oauth_refresh",
                 "observed_at": _utc_timestamp(),
                 "environment": config.environment,
+                "codex_oauth_inventory_generation": inventory_generation,
                 "attempted": True,
                 "refreshed": False,
                 "skipped": False,
@@ -13729,6 +13737,7 @@ def _run_codex_oauth_refresh_task(
             _codex_account_aggregate_event(
                 event_name="codex_oauth_refresh_aggregate",
                 config=config,
+                inventory_generation=inventory_generation,
                 records=records,
                 usable_by_label=state.codex_oauth_usable_by_label,
                 status_by_label=state.codex_oauth_status_by_label,
@@ -13784,6 +13793,9 @@ def _run_codex_oauth_refresh_task(
             "event": "codex_oauth_refresh",
             "observed_at": _scheduler_timestamp(wall_now),
             "environment": config.environment,
+            "codex_oauth_inventory_generation": (
+                codex_oauth_inventory_generation_digest(inventory)
+            ),
             "attempted": bool(summary.get("attempted")),
             "refreshed": bool(summary.get("refreshed")),
             "skipped": bool(summary.get("skipped")) or (
@@ -13831,6 +13843,9 @@ def _run_codex_oauth_refresh_task(
             _codex_account_aggregate_event(
                 event_name="codex_oauth_refresh_aggregate",
                 config=config,
+                inventory_generation=codex_oauth_inventory_generation_digest(
+                    inventory
+                ),
                 records=records,
                 usable_by_label=state.codex_oauth_usable_by_label,
                 status_by_label=state.codex_oauth_status_by_label,

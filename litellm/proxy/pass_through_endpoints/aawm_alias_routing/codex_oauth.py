@@ -33,6 +33,7 @@ from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthCredentialSnapshot,
     CodexOAuthInventoryError,
     CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY,
+    codex_oauth_inventory_generation_digest,
     load_codex_oauth_credential,
     load_codex_oauth_inventory,
 )
@@ -1978,6 +1979,11 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             "codex_oauth_account_label": selected_auth.account_label,
             "codex_oauth_account_hash": selected_auth.account_hash,
             "codex_oauth_lane_key": selected_auth.lane_key,
+            "codex_oauth_inventory_generation": (
+                codex_oauth_inventory_generation_digest(
+                    load_codex_oauth_inventory()
+                )
+            ),
             "codex_oauth_account_display": selected_auth.account_display,
             "codex_auto_agent_selected_provider": CODEX_AUTO_AGENT_NATIVE_PROVIDER,
             "codex_auto_agent_selected_model": model,
