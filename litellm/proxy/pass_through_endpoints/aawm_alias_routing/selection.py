@@ -5528,17 +5528,13 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         raise _codex_oauth_mod._codex_oauth_affinity_token_invalid_exception()
     token_affinity = codex_oauth_continuation.as_affinity()
 
-    review_replay_safety = None
-    if is_auto_review:
-        review_replay_safety = (
-            _replay_safety
-            if _replay_safety is not None
-            else sa.classify_session_owner_replay_safety_body(request_body)
-        )
-        replay_safe = review_replay_safety.safe
-    else:
-        replay_safe = sa.is_replay_safe_session_owner_redispatch_body(request_body)
-    if review_replay_safety is not None and not replay_safe:
+    replay_safety = (
+        _replay_safety
+        if _replay_safety is not None
+        else sa.classify_session_owner_replay_safety_body(request_body)
+    )
+    replay_safe = replay_safety.safe
+    if not replay_safe:
         sa.raise_session_owner_redispatch_required(
             session_identity=resolved_session_identity,
             alias_model=alias_model,
@@ -5549,7 +5545,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 "or unsafe opaque rs_* provider state."
             ),
             request=request,
-            replay_safety=review_replay_safety,
+            replay_safety=replay_safety,
         )
 
     client_product_label = _extract_client_product_label(request, request_body)
@@ -5639,11 +5635,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         mismatch_reason: str,
     ) -> dict[str, Any]:
         if not replay_safe:
-            replay_safety_detail = (
-                {"replay_safety": review_replay_safety}
-                if review_replay_safety is not None
-                else {}
-            )
+            replay_safety_detail = {"replay_safety": replay_safety}
             sa.raise_session_owner_redispatch_required(
                 session_identity=session_owner_identity,
                 alias_model=alias_model,
