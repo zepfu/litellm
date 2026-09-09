@@ -4019,8 +4019,9 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
                 ],
                 result.text,
             )
-        except _CursorPostEgressOutputError as exc:
-            _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
+        except BaseException:
+            await retained_session.aclose()
+            raise
         if result.tool_calls:
             next_session = result.retained_session
             _store_cursor_replay_state(
@@ -4144,8 +4145,9 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
                 ],
                 result.text,
             )
-        except _CursorPostEgressOutputError as exc:
-            _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
+        except BaseException:
+            await result.retained_session.aclose()
+            raise
         _store_cursor_replay_state(
             response_body["id"],
             messages=replay_messages,
