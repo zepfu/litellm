@@ -8,6 +8,7 @@ depends on the pass-through header prefix constant).
 from __future__ import annotations
 
 import ast
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -62,6 +63,7 @@ _PROXY_OWNED_ACCOUNT_DISPLAY_METADATA_KEYS = (
     "codex_auto_agent_selected_account_display",
 )
 _CODEX_OAUTH_AFFINITY_TOKEN_BODY_KEY = "aawm_codex_affinity_token"
+_CODEX_OAUTH_RELOAD_LOCK_WAIT_SECONDS = 1.0
 _CODEX_OAUTH_AFFINITY_TOKEN_TYPE = "aawm_codex_account_affinity"
 _CODEX_OAUTH_AFFINITY_TOKEN_VERSION = 1
 _CODEX_OAUTH_AFFINITY_TOKEN_ISSUER = "litellm.aawm.codex_oauth"
@@ -570,7 +572,12 @@ def get_codex_oauth_credential_reload_outcome(
     if not isinstance(outcomes, dict):
         return "not_attempted"
     outcome = outcomes.get(cleaned_label)
-    if outcome not in {"not_attempted", "reloaded", "unchanged_already_reloaded"}:
+    if outcome not in {
+        "not_attempted",
+        "reloaded",
+        "unchanged_already_reloaded",
+        "lock_contention",
+    }:
         return "not_attempted"
     return str(outcome)
 
@@ -599,8 +606,9 @@ async def reload_codex_oauth_credential_after_token_invalidated(
     returns fresh auth only when the token material changed since dispatch.
     Returns ``None`` (never raises) when the material is unchanged, the
     account was already re-read for this request, no dispatch fingerprint
-    exists, or the credential is not readable; callers then traverse other
-    eligible accounts (replay-safe requests) or signal redispatch-required.
+    exists, the credential is not readable, or brief lock contention outlasts
+    the bounded delay; callers then traverse other eligible accounts
+    (replay-safe requests) or signal redispatch-required.
     """
     cleaned_label = _clean_codex_auth_value(account_label)
     if cleaned_label is None:
@@ -626,8 +634,6 @@ async def reload_codex_oauth_credential_after_token_invalidated(
             outcome="unchanged_already_reloaded",
         )
         return None
-    reloaded.add(cleaned_label)
-
     from litellm.secret_managers.credential_file_lock import (
         CredentialFileLockError,
         credential_file_lock,
@@ -643,18 +649,34 @@ async def reload_codex_oauth_credential_after_token_invalidated(
             outcome="unchanged_already_reloaded",
         )
         return None
-    try:
-        with credential_file_lock(record.lock_path):
-            selection = await _load_codex_oauth_headers_for_record(
-                request, record
+    deadline = time.monotonic() + _CODEX_OAUTH_RELOAD_LOCK_WAIT_SECONDS
+    while True:
+        try:
+            with credential_file_lock(record.lock_path):
+                selection = await _load_codex_oauth_headers_for_record(
+                    request, record
+                )
+            break
+        except CredentialFileLockError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _record_codex_oauth_credential_reload_outcome(
+                    request,
+                    account_label=cleaned_label,
+                    outcome="lock_contention",
+                )
+                return None
+            await asyncio.sleep(min(remaining, 0.025))
+        except HTTPException:
+            reloaded.add(cleaned_label)
+            _record_codex_oauth_credential_reload_outcome(
+                request,
+                account_label=cleaned_label,
+                outcome="unchanged_already_reloaded",
             )
-    except (HTTPException, CredentialFileLockError):
-        _record_codex_oauth_credential_reload_outcome(
-            request,
-            account_label=cleaned_label,
-            outcome="unchanged_already_reloaded",
-        )
-        return None
+            return None
+
+    reloaded.add(cleaned_label)
     if _codex_oauth_auth_fingerprint(selection) == prior_fingerprint:
         _record_codex_oauth_credential_reload_outcome(
             request,
