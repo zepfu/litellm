@@ -4,8 +4,4 @@ defaults: {}
 
 aliases:
   - name: provider-openrouter
-    candidates:
-      - provider: openrouter
-        model: openrouter/cohere/north-mini-code:free
-        route_family: codex_openrouter_completion_adapter
-        priority: 90
+    candidates: []
