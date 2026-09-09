@@ -4511,20 +4511,6 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             # Reject this request without stopping unrelated permitted reads.
             blocked = True
             mutation_block_branch = "mutating_method"
-        elif (
-            parsed.netloc == "chatgpt.com"
-            and (
-                parsed.path.startswith("/backend-api/")
-                or parsed.path.startswith("/api/")
-            )
-            and (
-                method == "GET"
-                and parsed.path not in _NATIVE_HISTORY_BOOTSTRAP_READ_PATHS
-                and not is_conversation_detail_path(parsed.path)
-            )
-        ):
-            blocked = True
-            set_boundary("bootstrap_route_blocked")
         elif parsed.path == CHATGPT_NATIVE_HISTORY_INDEX_PATH and method != "GET":
             blocked = True
             set_boundary("history_request_invalid_method")
