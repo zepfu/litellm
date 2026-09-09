@@ -4093,12 +4093,14 @@ def _emit_session_owner_redispatch_observability(
             failure_phase=failure_phase,
             error_status_code=_SESSION_OWNER_LOG_STATUS_CODE,
             error_code=_SESSION_OWNER_REDISPATCH_ERROR_CODE,
-            candidate=shaped_candidate,
+            candidate={
+                **dict(shaped_candidate),
+                "attempted_provider_call": bool(attempted_provider_call),
+            },
             detail={
                 "session_id": session_identity,
                 "trace_id": request_context.get("trace_id"),
                 "litellm_call_id": request_call_id,
-                "mismatch_reason": mismatch_reason,
             },
             extra_fields={
                 "session_id": session_identity,
@@ -4106,9 +4108,13 @@ def _emit_session_owner_redispatch_observability(
                 "litellm_call_id": request_call_id,
                 "replay_safety": _bounded_replay_safety_detail(replay_safety),
                 "attempted_provider_call": bool(attempted_provider_call),
+                "session_owner_mismatch_reason": _sanitize_session_owner_log_label(
+                    mismatch_reason,
+                    max_length=_SESSION_OWNER_LOG_MAX_REASON_CHARS,
+                ),
             },
             failure_class="session_owner_redispatch",
-            attempts=[],
+            attempts=None,
             redispatch_required=True,
         )
     except Exception:
