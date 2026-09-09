@@ -3366,7 +3366,6 @@ async def handle_alias_route(  # noqa: PLR0915
                         request
                     )
                 ):
-                    token_invalidated_reload_attempts.add(reload_label)
                     token_invalidated_reload = (
                         await _codex_oauth_mod.reload_codex_oauth_credential_after_token_invalidated(
                             request,
@@ -3376,6 +3375,14 @@ async def handle_alias_route(  # noqa: PLR0915
                             expected_lane_key=reload_lane_key,
                         )
                     )
+                    if (
+                        _codex_oauth_mod.get_codex_oauth_credential_reload_outcome(
+                            request,
+                            account_label=reload_label,
+                        )
+                        != "lock_contention"
+                    ):
+                        token_invalidated_reload_attempts.add(reload_label)
                     if token_invalidated_reload is not None:
                         if (
                             token_invalidated_reload.account_label != reload_label

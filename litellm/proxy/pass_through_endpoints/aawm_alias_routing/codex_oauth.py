@@ -418,6 +418,54 @@ async def _load_codex_oauth_headers_for_record(
     )
 
 
+def _load_codex_oauth_headers_for_record_sync(
+    request: Request,
+    record: CodexOAuthCredentialRecord,
+) -> CodexOAuthRequestAuth:
+    """Run the read-only credential loader without an async credential path."""
+    try:
+        credential = load_codex_oauth_credential(record)
+    except CodexOAuthInventoryError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from None
+
+    if not _codex_oauth_credential_snapshot_is_valid(credential):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Codex OAuth credential '{record.label}' "
+                f"(account_hash={credential.account_hash}) is expired or "
+                "invalid. The "
+                "provider-status sidecar owns Codex auth refresh; confirm the "
+                "configured account can be refreshed."
+            ),
+        )
+
+    headers = _safe_get_request_headers(request)
+    assert _get_request_header_or_passthrough_alias is not None
+    session_id = (
+        _get_request_header_or_passthrough_alias(request, "session_id")
+        or headers.get("x-claude-code-session-id")
+        or headers.get("X-Claude-Code-Session-Id")
+    )
+
+    return CodexOAuthRequestAuth(
+        account_label=record.label,
+        account_hash=credential.account_hash,
+        lane_key=_codex_oauth_account_lane_key(
+            account_label=record.label,
+            account_hash=credential.account_hash,
+        ),
+        headers=get_chatgpt_default_headers(
+            access_token=credential.access_token,
+            account_id=credential.account_id,
+            session_id=session_id,
+        ),
+        account_display=(
+            credential.account_display or CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY
+        ),
+    )
+
+
 async def _load_local_codex_auth_selection(
     request: Request,
     *,
@@ -653,8 +701,9 @@ async def reload_codex_oauth_credential_after_token_invalidated(
     while True:
         try:
             with credential_file_lock(record.lock_path):
-                selection = await _load_codex_oauth_headers_for_record(
-                    request, record
+                selection = _load_codex_oauth_headers_for_record_sync(
+                    request,
+                    record,
                 )
             break
         except CredentialFileLockError:
