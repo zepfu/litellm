@@ -72,6 +72,10 @@ resolved upstream and disables fallback. Scan candidate logs for tracebacks,
 with a rollback checkpoint, prove the live canary, then delete the checkpoint.
 This gate applies only to `litellm-dev`; never touch `aawm-litellm`.
 
+`Dockerfile.dev` owns application source and model capability assets. The dev
+Compose file retains runtime configuration, prompt data, credentials, identity,
+and state mounts; rebuild after source or capability changes.
+
 ## D1-622 `litellm-dev` Transport Binding
 
 Use this sequence for the D1-622 service transport: install once, apply before every

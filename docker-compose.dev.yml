@@ -33,9 +33,9 @@ services:
       - "127.0.0.1:4001:4001"
       - "100.109.19.233:4001:4001"
     volumes:
-      # Dockerfile.dev copies all application source into the image. The
-      # remaining mounts are runtime configuration, credentials, or state.
-      - ./model_prices_and_context_window.json:/app/model_prices_and_context_window.json
+      # Dockerfile.dev copies application source and capability assets into the
+      # image. The remaining mounts are runtime configuration, prompt data,
+      # credentials, identity, or state.
       - ./context-replacement:/app/context-replacement
       - ./litellm-dev-config.yaml:/app/litellm-dev-config.yaml
       # Repo-local error intake for managed LiteLLM runtime errors.
