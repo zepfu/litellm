@@ -4074,6 +4074,38 @@ def _emit_session_owner_redispatch_observability(
     except Exception:  # noqa: BLE001
         pass
     try:
+        from .audit_events import (
+            _emit_auto_agent_alias_pre_attempt_terminal_event,
+        )
+
+        _emit_auto_agent_alias_pre_attempt_terminal_event(
+            alias_family=(
+                owner_attrs.get("state_format")
+                or owner_attrs.get("route_family")
+                or "session_owner"
+            ),
+            alias_model=alias_model or "unknown",
+            request=request,
+            request_body={},
+            event_type="redispatch_required",
+            candidate_status="redispatch_required",
+            failure_phase=failure_phase,
+            error_status_code=_SESSION_OWNER_LOG_STATUS_CODE,
+            error_code=_SESSION_OWNER_REDISPATCH_ERROR_CODE,
+            candidate=shaped_candidate,
+            detail={
+                "session_id": session_identity,
+                "trace_id": request_context.get("trace_id"),
+                "litellm_call_id": request_call_id,
+                "replay_safety": _bounded_replay_safety_detail(replay_safety),
+                "mismatch_reason": mismatch_reason,
+            },
+            failure_class="session_owner_redispatch",
+            redispatch_required=True,
+        )
+    except Exception:
+        pass
+    try:
         # Keep the bounded summary for the durable route rollup. It is
         # intentionally separate from the operator ERROR field allowlist.
         verbose_proxy_logger.debug(
