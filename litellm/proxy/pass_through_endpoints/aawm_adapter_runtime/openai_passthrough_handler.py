@@ -1021,6 +1021,7 @@ class BaseOpenAIPassThroughHandler:
                     else custom_llm_provider,
                     egress_credential_family=egress_credential_family,
                     expected_target_family=expected_target_family,
+                    egress_selected_openai_headers=selected_openai_headers,
                     managed_xai_oauth_request=managed_xai_oauth_request,
                     defer_session_owner_promotion=defer_managed_xai_promotion,
                     blocked_pass_through_prefixed_headers=(

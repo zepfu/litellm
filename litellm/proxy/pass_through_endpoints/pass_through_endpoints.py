@@ -4279,7 +4279,11 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         credential_target_family = (
             "xai"
             if _is_xai_egress_credential_family(credential_family)
-            else credential_family
+            else (
+                "openai"
+                if credential_family == "codex_oauth"
+                else credential_family
+            )
         )
         if (
             credential_target_family is not None
@@ -4356,9 +4360,10 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         ):
             return
 
-        expected_openai_url = httpx.URL(str(expected_url)).copy_with(
-            query=prepared_request.url.query
-        )
+        # Query parameters may be added by the provider transport after route
+        # selection; the immutable egress binding is the authority/endpoint
+        # path, not transport-specific query decoration.
+        expected_openai_url = httpx.URL(str(expected_url)).copy_with(query=None)
         if (
             prepared_request.url.scheme != expected_openai_url.scheme
             or prepared_request.url.host != expected_openai_url.host
@@ -5918,10 +5923,16 @@ async def pass_through_request(  # noqa: PLR0915
         request_state = getattr(request, "state", None)
         if request_state is None:
             return
-        if openai_call_ledger is not None:
+        if openai_call_ledger is not None or openai_bound_egress:
             ledger_snapshot = get_request_provider_call_ledger_snapshot(request)
-            if ledger_snapshot is None:
+            if ledger_snapshot is None and openai_call_ledger is not None:
                 ledger_snapshot = openai_call_ledger.snapshot()
+            if ledger_snapshot is None:
+                ledger_snapshot = {
+                    "logical_provider_calls": 0,
+                    "transport_connection_attempts": 0,
+                    "transport_connection_failures": 0,
+                }
             transport_connection_attempts = ledger_snapshot.get(
                 "transport_connection_attempts",
                 ledger_snapshot.get("transport_connection_failures", 0),
@@ -5982,11 +5993,19 @@ async def pass_through_request(  # noqa: PLR0915
         managed_xai_oauth_request = (
             managed_xai_oauth_request or managed_xai_oauth_egress
         )
+        openai_bound_egress = HttpPassThroughEndpointHelpers._is_openai_bound_egress(
+            custom_llm_provider=custom_llm_provider,
+            egress_credential_family=egress_credential_family,
+            expected_target_family=expected_target_family,
+            url=url,
+        )
         selected_openai_account_context = getattr(
             getattr(request, "state", None),
             "aawm_codex_oauth_selected_account",
             None,
         )
+        if isinstance(selected_openai_account_context, Mapping):
+            selected_openai_account_context = dict(selected_openai_account_context)
         validate_prepared_request_fn: Optional[
             Callable[[httpx.Request], None]
         ] = None
@@ -6012,6 +6031,20 @@ async def pass_through_request(  # noqa: PLR0915
         if managed_xai_oauth_egress:
             effective_blocked_pass_through_prefixed_headers.extend(
                 _MANAGED_XAI_OAUTH_BLOCKED_PASSTHROUGH_HEADERS
+            )
+        if openai_bound_egress:
+            effective_blocked_pass_through_prefixed_headers.extend(
+                [
+                    "authorization",
+                    "api-key",
+                    "x-api-key",
+                    "proxy-authorization",
+                    "chatgpt-account-id",
+                    "openai-organization",
+                    "openai-project",
+                    "session-id",
+                    "session_id",
+                ]
             )
         headers = HttpPassThroughEndpointHelpers.forward_headers_from_request(
             request_headers=_safe_get_request_headers(request).copy(),
@@ -6601,25 +6634,52 @@ async def pass_through_request(  # noqa: PLR0915
                     if request_state is not None
                     else None
                 )
+                if openai_bound_egress and egress_selected_openai_headers:
+                    prepared_request.headers = (
+                        HttpPassThroughEndpointHelpers.canonicalize_openai_protected_headers(
+                            dict(prepared_request.headers),
+                            protected_headers=egress_selected_openai_headers,
+                        )
+                    )
+                current_selected_account_context = getattr(
+                    getattr(request, "state", None),
+                    "aawm_codex_oauth_selected_account",
+                    None,
+                )
+                if isinstance(current_selected_account_context, Mapping):
+                    current_selected_account_context = dict(
+                        current_selected_account_context
+                    )
                 HttpPassThroughEndpointHelpers.validate_openai_final_send_binding(
                     prepared_request=prepared_request,
                     expected_url=url,
                     custom_llm_provider=custom_llm_provider,
                     egress_credential_family=egress_credential_family,
                     expected_target_family=expected_target_family,
-                    selected_account_context=selected_openai_account_context,
+                    expected_account_hash=(
+                        selected_openai_account_context.get("account_hash")
+                        if isinstance(selected_openai_account_context, Mapping)
+                        else None
+                    ),
+                    expected_lane_key=(
+                        selected_openai_account_context.get("lane_key")
+                        if isinstance(selected_openai_account_context, Mapping)
+                        else None
+                    ),
+                    selected_account_context=current_selected_account_context,
                 )
-                reservation = openai_call_ledger.reserve(
-                    target=prepared_request.url,
-                    reason=reason or "passthrough_provider_request",
-                    candidate_context=current_candidate_context(request),
-                    prior_response_closed=True,
-                )
-                publish_reservation_metadata(
-                    request,
-                    reservation=reservation,
-                    metadata=passthrough_metadata,
-                )
+                if openai_call_ledger is not None:
+                    reservation = openai_call_ledger.reserve(
+                        target=prepared_request.url,
+                        reason=reason or "passthrough_provider_request",
+                        candidate_context=current_candidate_context(request),
+                        prior_response_closed=True,
+                    )
+                    publish_reservation_metadata(
+                        request,
+                        reservation=reservation,
+                        metadata=passthrough_metadata,
+                    )
                 try:
                     if managed_xai_oauth_request:
                         _record_xai_oauth_send_auth_shape(
@@ -6648,6 +6708,7 @@ async def pass_through_request(  # noqa: PLR0915
                         url=url,
                         credential_family=egress_credential_family,
                         expected_target_family=expected_target_family,
+                        custom_llm_provider=custom_llm_provider,
                     )
                 except (httpx.ConnectError, httpx.ConnectTimeout):
                     record_transport_connection_attempt(request)
@@ -6687,6 +6748,7 @@ async def pass_through_request(  # noqa: PLR0915
                     url=url,
                     credential_family=egress_credential_family,
                     expected_target_family=expected_target_family,
+                    custom_llm_provider=custom_llm_provider,
                 )
                 return response
 
@@ -6802,7 +6864,7 @@ async def pass_through_request(  # noqa: PLR0915
                     if validate_prepared_request_fn is not None:
                         validate_prepared_request_fn(req)
                     send_kwargs: dict[str, Any] = {"stream": stream}
-                    if managed_xai_oauth_egress:
+                    if managed_xai_oauth_egress or openai_bound_egress:
                         send_kwargs["follow_redirects"] = False
                     response = await async_client.send(req, **send_kwargs)
                 await HttpPassThroughEndpointHelpers.reject_managed_xai_redirect_response(
@@ -6810,6 +6872,7 @@ async def pass_through_request(  # noqa: PLR0915
                     url=url,
                     credential_family=egress_credential_family,
                     expected_target_family=expected_target_family,
+                    custom_llm_provider=custom_llm_provider,
                 )
                 try:
                     response.raise_for_status()
@@ -7240,7 +7303,7 @@ async def pass_through_request(  # noqa: PLR0915
                     raw_body=raw_body,
                     prefer_stream_for_unknown_content=True,
                     follow_redirects=(
-                        False if managed_xai_oauth_egress else None
+                        False if (managed_xai_oauth_egress or openai_bound_egress) else None
                     ),
                     validate_request_fn=validate_prepared_request_fn,
                     send_request_fn=send_request_fn,
@@ -7251,6 +7314,7 @@ async def pass_through_request(  # noqa: PLR0915
                 url=url,
                 credential_family=egress_credential_family,
                 expected_target_family=expected_target_family,
+                custom_llm_provider=custom_llm_provider,
             )
             if is_xai_responses_wire_owned_route:
                 extensions = getattr(response, "extensions", None)
@@ -8637,6 +8701,7 @@ def create_pass_through_route(
     egress_credential_family: Optional[str] = None,
     expected_target_family: Optional[str] = None,
     managed_xai_oauth_request: bool = False,
+    egress_selected_openai_headers: Optional[dict] = None,
     allowed_forward_headers: Optional[list[str]] = None,
     allowed_pass_through_prefixed_headers: Optional[list[str]] = None,
     blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
@@ -8723,6 +8788,7 @@ def create_pass_through_route(
                 "egress_credential_family": egress_credential_family,
                 "expected_target_family": expected_target_family,
                 "managed_xai_oauth_request": managed_xai_oauth_request,
+                "egress_selected_openai_headers": egress_selected_openai_headers,
                 "allowed_forward_headers": allowed_forward_headers,
                 "allowed_pass_through_prefixed_headers": allowed_pass_through_prefixed_headers,
                 "blocked_pass_through_prefixed_headers": blocked_pass_through_prefixed_headers,
@@ -8817,6 +8883,7 @@ def create_pass_through_route(
                     Optional[str], param_expected_target_family
                 ),
                 managed_xai_oauth_request=bool(param_managed_xai_oauth_request),
+                egress_selected_openai_headers=egress_selected_openai_headers,
                 allowed_forward_headers=cast(
                     Optional[list[str]], param_allowed_forward_headers
                 ),
