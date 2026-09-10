@@ -34,10 +34,13 @@ from litellm.llms.cursor_agent.constants import (
 from litellm.llms.cursor_agent.connect import (
     CursorAgentConnectClient,
     CursorConnectError,
+    _ProtoConnectFrameDecoder,
     _decode_proto_fields,
     _decode_proto_string,
+    _encode_request_context_exec_response,
     _proto_last_field,
     decode_connect_proto_frames,
+    encode_connect_proto_frame,
     ensure_cursor_http2_available,
 )
 from litellm.llms.cursor_agent.dashboard import cursor_agent_user_agent
@@ -77,6 +80,8 @@ _FORWARDED_REQUEST_HEADERS = {
     "x-ghost-mode",
     "x-request-id",
 }
+_MAX_LOGGED_AGENTN_DATA_CHUNKS = 8
+
 
 def _connect_header_flush_frame() -> bytes:
     """Empty ASGI body that still flushes Hypercorn HTTP/2 HEADERS.
@@ -86,6 +91,82 @@ def _connect_header_flush_frame() -> bytes:
     dummy Connect envelope would poison the CLI stream.
     """
     return b""
+
+
+def _summarize_connect_chunk(chunk: bytes) -> str:
+    """Describe Connect envelopes without retaining protobuf field values."""
+    try:
+        frames = decode_connect_proto_frames(chunk)
+    except Exception:
+        return f"head={chunk[:24].hex()}"
+    if not frames:
+        return f"head={chunk[:24].hex()}"
+    parts: List[str] = []
+    for frame in frames:
+        field_numbers: List[str] = []
+        nested: List[str] = []
+        if not frame.is_end_stream:
+            try:
+                decoded = _decode_proto_fields(frame.payload)
+            except Exception:
+                decoded = []
+            field_numbers = [str(number) for number, _wire, _value in decoded]
+            for number, wire_type, value in decoded:
+                if wire_type != 2 or not isinstance(value, bytes) or number not in {1, 2, 4, 5, 7}:
+                    continue
+                try:
+                    inner = _decode_proto_fields(value)
+                except Exception:
+                    continue
+                nested.append(
+                    f"{number}:[{','.join(str(inner_number) for inner_number, _w, _v in inner)}]"
+                )
+        parts.append(
+            "flags={flags} end={end} len={length} fields={fields} nested={nested}".format(
+                flags=frame.flags,
+                end=int(frame.is_end_stream),
+                length=len(frame.payload),
+                fields=",".join(field_numbers) or "-",
+                nested=";".join(nested) or "-",
+            )
+        )
+    return " ".join(parts)
+
+
+def _request_context_exec_replies(
+    chunk: bytes,
+    decoder: _ProtoConnectFrameDecoder,
+) -> List[bytes]:
+    """Answer agentn exec_server_message request-context queries.
+
+    Native CLI answers these on a direct agentn stream. Through the inbound
+    proxy the CLI never emits that reply, so agentn waits on heartbeats.
+    """
+    try:
+        frames = decoder.feed(chunk)
+    except Exception:
+        return []
+    replies: List[bytes] = []
+    for frame in frames:
+        if frame.is_end_stream:
+            continue
+        try:
+            fields = _decode_proto_fields(frame.payload)
+        except Exception:
+            continue
+        exec_server = _proto_last_field(fields, 2, wire_type=2)
+        if not isinstance(exec_server, bytes):
+            continue
+        try:
+            exec_fields = _decode_proto_fields(exec_server)
+        except Exception:
+            continue
+        request_context_args = _proto_last_field(exec_fields, 10, wire_type=2)
+        if not isinstance(request_context_args, bytes):
+            continue
+        for payload in _encode_request_context_exec_response(exec_fields):
+            replies.append(encode_connect_proto_frame(payload))
+    return replies
 
 
 def is_cursor_agent_cli_run_scope(scope: Mapping[str, Any]) -> bool:
@@ -412,6 +493,9 @@ class _AgentnH2Session:
         self._incoming: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
         self._read_task: Optional[asyncio.Task[None]] = None
         self._closed = False
+        self._logged_data_chunks = 0
+        self._agentn_body_decoder = _ProtoConnectFrameDecoder()
+        self._auto_replies: List[bytes] = []
 
     async def _flush_connection(self) -> None:
         writer = self.writer
@@ -516,26 +600,41 @@ class _AgentnH2Session:
         for event in events:
             if isinstance(event, ResponseReceived):
                 status = "200"
+                header_names: List[str] = []
                 for name, value in event.headers:
                     if name == ":status":
                         status = value
-                        break
+                    elif not str(name).startswith(":"):
+                        header_names.append(str(name))
                 try:
                     self.response_status = int(status)
                 except ValueError:
                     self.response_status = 502
                 self._headers_event.set()
                 verbose_proxy_logger.info(
-                    "cursor_agent_cli_inbound agentn response status=%s",
+                    "cursor_agent_cli_inbound agentn response status=%s headers=%s",
                     self.response_status,
+                    ",".join(header_names),
                 )
             elif isinstance(event, DataReceived):
                 if event.data:
-                    chunks.append(bytes(event.data))
-                    verbose_proxy_logger.info(
-                        "cursor_agent_cli_inbound agentn data bytes=%s",
-                        len(event.data),
+                    payload = bytes(event.data)
+                    chunks.append(payload)
+                    self._auto_replies.extend(
+                        _request_context_exec_replies(payload, self._agentn_body_decoder)
                     )
+                    if self._logged_data_chunks < _MAX_LOGGED_AGENTN_DATA_CHUNKS:
+                        self._logged_data_chunks += 1
+                        verbose_proxy_logger.info(
+                            "cursor_agent_cli_inbound agentn data bytes=%s %s",
+                            len(payload),
+                            _summarize_connect_chunk(payload),
+                        )
+                    else:
+                        verbose_proxy_logger.info(
+                            "cursor_agent_cli_inbound agentn data bytes=%s",
+                            len(payload),
+                        )
                 if self.connection is not None:
                     self.connection.acknowledge_received_data(
                         event.flow_controlled_length,
@@ -577,7 +676,15 @@ class _AgentnH2Session:
                         break
                     events = self.connection.receive_data(incoming)
                     chunks, ended = self._dispatch_h2_events(events)
+                    auto_replies = self._auto_replies
+                    self._auto_replies = []
                     await self._flush_connection()
+                for reply in auto_replies:
+                    verbose_proxy_logger.info(
+                        "cursor_agent_cli_inbound auto-answered request_context bytes=%s",
+                        len(reply),
+                    )
+                    await self.write_request(reply, end_stream=False)
                 for chunk in chunks:
                     await self._incoming.put(chunk)
                 if ended:

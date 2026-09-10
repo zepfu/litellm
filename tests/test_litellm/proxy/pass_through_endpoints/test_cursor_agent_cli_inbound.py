@@ -10,7 +10,14 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from litellm.llms.cursor_agent.connect import encode_cursor_run_request
+from litellm.llms.cursor_agent.connect import (
+    _ProtoConnectFrameDecoder,
+    _encode_proto_message_field,
+    _encode_proto_varint_field,
+    decode_connect_proto_frames,
+    encode_connect_proto_frame,
+    encode_cursor_run_request,
+)
 from litellm.llms.cursor_agent.constants import CURSOR_CLI_KEY_ENV
 from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
     CURSOR_AGENT_CLI_INBOUND_PROVIDER,
@@ -19,6 +26,8 @@ from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
     CursorAgentCliInboundMiddleware,
     InboundCursorAgentCliAuthError,
     _connect_header_flush_frame,
+    _request_context_exec_replies,
+    _summarize_connect_chunk,
     build_inbound_cli_session_history_kwargs,
     inbound_cli_auth_error_payload,
     proxy_inbound_cli_run,
@@ -314,6 +323,46 @@ def test_connect_header_flush_frame_is_empty_asgi_body() -> None:
     assert frame == b""
 
 
+def _heartbeat_chunk() -> bytes:
+    interaction = _encode_proto_message_field(13, b"")
+    return encode_connect_proto_frame(_encode_proto_message_field(1, interaction))
+
+
+def _request_context_chunk() -> bytes:
+    exec_server = b"".join(
+        (
+            _encode_proto_message_field(10, b""),
+            _encode_proto_varint_field(19, 1),
+            _encode_proto_message_field(55, b""),
+        )
+    )
+    return encode_connect_proto_frame(_encode_proto_message_field(2, exec_server))
+
+
+def test_summarize_connect_chunk_reports_field_numbers_not_payload() -> None:
+    chunk = _request_context_chunk()
+    summary = _summarize_connect_chunk(chunk)
+    assert "flags=0" in summary
+    assert "fields=2" in summary
+    assert "nested=2:[10,19,55]" in summary
+    assert chunk.hex() not in summary
+
+
+def test_request_context_exec_replies_answers_agentn_query() -> None:
+    decoder = _ProtoConnectFrameDecoder()
+    replies = _request_context_exec_replies(_request_context_chunk(), decoder)
+    assert len(replies) == 2
+    payloads = [frame.payload for frame in decode_connect_proto_frames(b"".join(replies))]
+    assert [_decode_top_fields(payload) for payload in payloads] == [[2], [5]]
+    assert _request_context_exec_replies(_heartbeat_chunk(), _ProtoConnectFrameDecoder()) == []
+
+
+def _decode_top_fields(payload: bytes) -> List[int]:
+    from litellm.llms.cursor_agent.connect import _decode_proto_fields
+
+    return [number for number, _wire, _value in _decode_proto_fields(payload)]
+
+
 @pytest.mark.asyncio
 async def test_proxy_inbound_cli_run_starts_response_before_client_end_body() -> None:
     session = _FakeSession()
@@ -533,17 +582,24 @@ def test_agentn_session_dispatches_data_received_without_dropping() -> None:
         _AgentnH2Session,
     )
 
+    class _AckConnection:
+        def acknowledge_received_data(self, *_args, **_kwargs) -> None:
+            return None
+
     session = _AgentnH2Session("https://agentn.global.api5.cursor.sh")
+    session.connection = _AckConnection()
     headers = object.__new__(ResponseReceived)
-    headers.headers = [(":status", "200")]
+    headers.headers = [(":status", "200"), ("content-type", "application/connect+proto")]
+    payload = _request_context_chunk()
     data = object.__new__(DataReceived)
-    data.data = b"upstream-connect-bytes"
+    data.data = payload
     data.flow_controlled_length = len(data.data)
     data.stream_id = 1
     chunks, ended = session._dispatch_h2_events([headers, data])
     assert session.response_status == 200
-    assert chunks == [b"upstream-connect-bytes"]
+    assert chunks == [payload]
     assert ended is False
+    assert len(session._auto_replies) == 2
 
 
 def test_proxy_server_wraps_inbound_cli_run_as_raw_asgi() -> None:
