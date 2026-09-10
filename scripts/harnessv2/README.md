@@ -126,14 +126,14 @@ python scripts/harnessv2/run.py \
 ```
 
 Minimal Codex OpenAI-egress check (parent `gpt-5.6-luna` dispatches
-`readbasic`; overlay only, not the default Codex orch walk):
+`basicread`; overlay only, not the default Codex orch walk):
 
 ```text
 python scripts/harnessv2/run.py \
   --instance litellm-alpha \
   --tui codex \
   --test orchestration \
-  --overlay scripts/harnessv2/config/overlays/codex_luna_readbasic.yaml \
+  --overlay scripts/harnessv2/config/overlays/codex_luna_basicread.yaml \
   --dry-run
 ```
 

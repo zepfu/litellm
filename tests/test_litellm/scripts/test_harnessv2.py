@@ -1077,9 +1077,9 @@ def test_should_plan_codex_catalog_model_and_orchestration_as_non_stub(hv, confi
     assert "agent=sota-xai" not in work.extra["orchestration_prompt_template"]
 
 
-def test_should_plan_codex_luna_readbasic_overlay_orchestration(hv, config) -> None:
+def test_should_plan_codex_luna_basicread_overlay_orchestration(hv, config) -> None:
     _skip_unless_codex_tui_shipped(config)
-    overlay = _HV2 / "config" / "overlays" / "codex_luna_readbasic.yaml"
+    overlay = _HV2 / "config" / "overlays" / "codex_luna_basicread.yaml"
     assert overlay.is_file()
     merged = hv.load_config(overlay=overlay)
     plan = hv.build_plan(
@@ -1095,14 +1095,14 @@ def test_should_plan_codex_luna_readbasic_overlay_orchestration(hv, config) -> N
     )
     assert plan.container == "litellm-alpha"
     assert list(plan.orchestration_parents) == ["gpt-5.6-luna"]
-    assert list(plan.orchestration_children) == ["readbasic"]
+    assert list(plan.orchestration_children) == ["basicread"]
     prompt = plan.extra["orchestration_prompt_template"]
-    assert "model=readbasic" in prompt
+    assert "model=basicread" in prompt
     assert "Call spawn_agent" in prompt
     assert "hv2-codex-child" in prompt
     assert "`pwd`" in prompt
     assert "Do not run the command yourself" in prompt
-    assert "model=basicread" not in prompt
+    assert "model=readbasic" not in prompt
     assert "model=basic " not in prompt
     assert "model=basic\n" not in prompt
     argv = [
@@ -1116,7 +1116,7 @@ def test_should_plan_codex_luna_readbasic_overlay_orchestration(hv, config) -> N
     assert plan.extra["tools_for_orchestration"] is True
     payload = plan.as_dict()
     assert payload["orchestration_parents"] == ["gpt-5.6-luna"]
-    assert payload["orchestration_children"] == ["readbasic"]
+    assert payload["orchestration_children"] == ["basicread"]
     assert payload["orchestration_prompt"] == prompt
 
 
