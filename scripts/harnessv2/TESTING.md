@@ -482,7 +482,7 @@ From `config/tuis.yaml`:
 | tmux socket | `tmux37` (`wait_reply_seconds` 600, `wait_idle_seconds` 180) |
 | Default models | `basic` |
 | Default orch | parent `basic`; `--orchestration-children` required |
-| Minimal OpenAI egress overlay | `config/overlays/codex_luna_basicread.yaml`: parent `gpt-5.6-luna`, child `basicread`, prompt `codex_luna_basicread`. Not the default Codex orch walk. |
+| Minimal OpenAI egress overlay | `config/overlays/codex_luna_readbasic.yaml`: parent `gpt-5.6-luna`, child `readbasic`, prompt `codex_luna_readbasic`. Not the default Codex orch walk. |
 | Forbid | `-p`, `--print`, `--profile`, `exec` |
 | Model tools | on (not `--no-tools` PONG) |
 | Orchestration tools | on |
