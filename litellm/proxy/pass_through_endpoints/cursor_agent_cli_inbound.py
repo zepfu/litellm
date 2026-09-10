@@ -38,6 +38,7 @@ from litellm.llms.cursor_agent.connect import (
     _decode_proto_string,
     _proto_last_field,
     decode_connect_proto_frames,
+    encode_connect_proto_frame,
     ensure_cursor_http2_available,
 )
 from litellm.llms.cursor_agent.dashboard import cursor_agent_user_agent
@@ -77,6 +78,25 @@ _FORWARDED_REQUEST_HEADERS = {
     "x-ghost-mode",
     "x-request-id",
 }
+
+def _connect_header_flush_frame() -> bytes:
+    """Non-empty Connect envelope so Hypercorn emits HTTP/2 HEADERS.
+
+    Hypercorn's HTTP/2 ASGI adapter holds ``http.response.start`` until the
+    first non-empty ``http.response.body``. An empty body is dropped, which
+    leaves the Cursor Agent CLI waiting for Connect headers until it
+    reconnects.
+    """
+    return encode_connect_proto_frame(b"")
+
+
+def is_cursor_agent_cli_run_scope(scope: Mapping[str, Any]) -> bool:
+    if scope.get("type") != "http":
+        return False
+    if str(scope.get("method") or "").upper() != "POST":
+        return False
+    path = str(scope.get("path") or "")
+    return path == CURSOR_AGENT_RUN_PATH or path.endswith(CURSOR_AGENT_RUN_PATH)
 
 
 class InboundCursorAgentCliAuthError(Exception):
@@ -539,6 +559,9 @@ def _upstream_request_headers(
                 continue
             forwarded.append((lowered, str(value)))
             seen.add(lowered)
+    if "te" not in seen:
+        inbound_te = _get_header(headers, "te")
+        forwarded.append(("te", inbound_te or "trailers"))
     return forwarded
 
 
@@ -588,27 +611,46 @@ async def proxy_inbound_cli_run(
             )
             return
 
+        verbose_proxy_logger.info(
+            "cursor_agent_cli_inbound Run http_version=%s client=%s",
+            http_version,
+            client_host,
+        )
         session = session_factory() if session_factory is not None else _AgentnH2Session(turn_base)
         await session.open(_upstream_request_headers(headers, access_token))
+        to_agentn: asyncio.Queue[Optional[Tuple[bytes, bool]]] = asyncio.Queue()
 
         async def pump_client() -> None:
+            try:
+                while True:
+                    message = await receive()
+                    message_type = message.get("type")
+                    if message_type == "http.disconnect":
+                        await to_agentn.put((b"", True))
+                        return
+                    if message_type != "http.request":
+                        continue
+                    body = message.get("body") or b""
+                    end_stream = not message.get("more_body", False)
+                    if body:
+                        if len(sniff_buffer) < 65536:
+                            remaining = 65536 - len(sniff_buffer)
+                            sniff_buffer.extend(body[:remaining])
+                            sniffed.update(_sniff_run_metadata(bytes(sniff_buffer)))
+                    await to_agentn.put((bytes(body), end_stream))
+                    if end_stream:
+                        return
+            finally:
+                await to_agentn.put(None)
+
+        async def pump_to_agentn() -> None:
             while True:
-                message = await receive()
-                message_type = message.get("type")
-                if message_type == "http.disconnect":
-                    await session.write_request(b"", end_stream=True)
+                item = await to_agentn.get()
+                if item is None:
                     return
-                if message_type != "http.request":
-                    continue
-                body = message.get("body") or b""
-                if body:
-                    if len(sniff_buffer) < 65536:
-                        remaining = 65536 - len(sniff_buffer)
-                        sniff_buffer.extend(body[:remaining])
-                        sniffed.update(_sniff_run_metadata(bytes(sniff_buffer)))
-                    await session.write_request(bytes(body), end_stream=False)
-                if not message.get("more_body", False):
-                    await session.write_request(b"", end_stream=True)
+                data, end_stream = item
+                await session.write_request(data, end_stream=end_stream)
+                if end_stream:
                     return
 
         async def pump_upstream() -> None:
@@ -621,6 +663,13 @@ async def proxy_inbound_cli_run(
                         (b"content-type", CURSOR_AGENT_CONNECT_CONTENT_TYPE.encode("ascii")),
                         (b"connect-protocol-version", b"1"),
                     ],
+                }
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": _connect_header_flush_frame(),
+                    "more_body": True,
                 }
             )
             response_started = True
@@ -638,7 +687,7 @@ async def proxy_inbound_cli_run(
                     status_code = session.response_status
             await send({"type": "http.response.body", "body": b"", "more_body": False})
 
-        await asyncio.gather(pump_client(), pump_upstream())
+        await asyncio.gather(pump_client(), pump_to_agentn(), pump_upstream())
         if session.response_status >= 400:
             status_code = session.response_status
             error_message = f"upstream_http_{session.response_status}"
@@ -692,6 +741,31 @@ async def proxy_inbound_cli_run(
             start_time=start_time,
             error=error_message,
         )
+
+
+
+class CursorAgentCliInboundMiddleware:
+    """Outermost ASGI intercept for inbound HTTP/2 Connect ``Run``.
+
+    FastAPI ``request_response`` waits for the handler to return before the
+    custom Response ASGI cycle starts. Connect bidi does not EndBody until
+    response headers arrive, so the FastAPI route deadlocks. This middleware
+    bypasses FastAPI for ``POST /agent.v1.AgentService/Run``.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(
+        self,
+        scope: Mapping[str, Any],
+        receive: Callable[[], Awaitable[Mapping[str, Any]]],
+        send: Callable[[Mapping[str, Any]], Awaitable[None]],
+    ) -> None:
+        if is_cursor_agent_cli_run_scope(scope):
+            await proxy_inbound_cli_run(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
 
 
 class CursorAgentCliInboundResponse(Response):

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, patch
 
@@ -14,7 +16,9 @@ from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
     CURSOR_AGENT_CLI_INBOUND_PROVIDER,
     CURSOR_AGENT_CLI_INBOUND_ROUTE_FAMILY,
     CURSOR_AGENT_CLI_INBOUND_TRACE_NAME,
+    CursorAgentCliInboundMiddleware,
     InboundCursorAgentCliAuthError,
+    _connect_header_flush_frame,
     build_inbound_cli_session_history_kwargs,
     inbound_cli_auth_error_payload,
     proxy_inbound_cli_run,
@@ -223,6 +227,7 @@ async def test_proxy_inbound_cli_run_forwards_bearer_and_body() -> None:
 
     assert session.opened_headers is not None
     assert ("authorization", "Bearer cursor-access-token") in session.opened_headers
+    assert ("te", "trailers") in session.opened_headers
     assert any(b"cursor-access-token" != chunk for chunk in session.written) or session.written
     assert b"raw-key" not in b"".join(session.written)
     assert session.ended is True
@@ -302,6 +307,140 @@ async def test_proxy_inbound_cli_run_rejects_http1() -> None:
         )
     start = next(message for message in sent if message.get("type") == "http.response.start")
     assert start["status"] == 505
+
+
+def test_connect_header_flush_frame_is_non_empty_connect_envelope() -> None:
+    frame = _connect_header_flush_frame()
+    assert isinstance(frame, bytes)
+    assert len(frame) >= 5
+    assert frame != b""
+
+
+@pytest.mark.asyncio
+async def test_proxy_inbound_cli_run_starts_response_before_client_end_body() -> None:
+    session = _FakeSession()
+    sent: List[Dict[str, Any]] = []
+    response_started = asyncio.Event()
+    client_ended = asyncio.Event()
+    first_chunk = {"type": "http.request", "body": _run_frame(), "more_body": True}
+
+    async def receive():
+        if first_chunk:
+            message = dict(first_chunk)
+            first_chunk.clear()
+            return message
+        await response_started.wait()
+        client_ended.set()
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+        if message.get("type") == "http.response.start":
+            response_started.set()
+
+    persist = AsyncMock()
+    with patch(
+        "litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound._persist_inbound_cli_turn",
+        persist,
+    ):
+        await asyncio.wait_for(
+            proxy_inbound_cli_run(
+                {
+                    "type": "http",
+                    "http_version": "2",
+                    "method": "POST",
+                    "path": "/agent.v1.AgentService/Run",
+                    "headers": [
+                        (b"authorization", b"Bearer cursor-access-token"),
+                        (b"content-type", b"application/connect+proto"),
+                    ],
+                    "client": ("127.0.0.1", 9),
+                },
+                receive,
+                send,
+                session_factory=lambda: session,
+            ),
+            timeout=2,
+        )
+
+    assert response_started.is_set()
+    assert client_ended.is_set()
+    start = next(message for message in sent if message.get("type") == "http.response.start")
+    assert start["status"] == 200
+    bodies = [
+        message.get("body")
+        for message in sent
+        if message.get("type") == "http.response.body" and message.get("body")
+    ]
+    assert _connect_header_flush_frame() in bodies
+    persist.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inbound_middleware_bypasses_fastapi_before_end_body() -> None:
+    inner_called = False
+
+    async def inner(scope, receive, send):
+        nonlocal inner_called
+        inner_called = True
+        await asyncio.sleep(3600)
+
+    middleware = CursorAgentCliInboundMiddleware(inner)
+    session = _FakeSession()
+    sent: List[Dict[str, Any]] = []
+    response_started = asyncio.Event()
+    first_chunk = {"type": "http.request", "body": _run_frame(), "more_body": True}
+
+    async def receive():
+        if first_chunk:
+            message = dict(first_chunk)
+            first_chunk.clear()
+            return message
+        await response_started.wait()
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+        if message.get("type") == "http.response.start":
+            response_started.set()
+
+    persist = AsyncMock()
+    with patch(
+        "litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound._persist_inbound_cli_turn",
+        persist,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound._AgentnH2Session",
+        side_effect=lambda *args, **kwargs: session,
+    ):
+        await asyncio.wait_for(
+            middleware(
+                {
+                    "type": "http",
+                    "http_version": "2",
+                    "method": "POST",
+                    "path": "/agent.v1.AgentService/Run",
+                    "headers": [
+                        (b"authorization", b"Bearer cursor-access-token"),
+                        (b"content-type", b"application/connect+proto"),
+                    ],
+                    "client": ("127.0.0.1", 9),
+                },
+                receive,
+                send,
+            ),
+            timeout=2,
+        )
+
+    assert inner_called is False
+    assert any(message.get("type") == "http.response.start" for message in sent)
+
+
+def test_proxy_server_wraps_inbound_cli_run_as_raw_asgi() -> None:
+    source = (
+        Path(__file__).resolve().parents[4] / "litellm" / "proxy" / "proxy_server.py"
+    ).read_text(encoding="utf-8")
+    assert "CursorAgentCliInboundMiddleware" in source
+    assert "add_middleware(CursorAgentCliInboundMiddleware)" in source
 
 
 def test_parse_cursor_cli_user_agent() -> None:
