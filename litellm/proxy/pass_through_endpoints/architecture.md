@@ -128,9 +128,13 @@ ledger reserves a monotonic logical-call ordinal immediately before the final
 `AsyncClient.send`, so hidden retries, candidate changes, and OAuth-account
 changes share one immutable budget. The default maximum is three logical
 provider calls; `AAWM_OPENAI_MAX_LOGICAL_PROVIDER_CALLS` may lower or raise it
-within the bounded range 1-32. OpenAI ledger exhaustion is raised before a
-fourth send and is terminal: it does not trigger candidate cooldown, account
-failover, or another hidden retry.
+within the bounded range 1-32. A classified precommit OpenAI capacity failure
+may grant one additional send under the original coordinator deadline, but only
+for the same reserved target, model, account, and lane. That send consumes the
+one-use authorization and preserves its logical ordinal; it does not change the
+ordinary call cap. Without that authorization, ledger exhaustion is raised
+before another send and is terminal: it does not trigger candidate cooldown,
+account failover, or another hidden retry.
 
 Reservation closes any previously active upstream response first and disables
 opaque redirects for ledger-owned sends. Observable connection failures are

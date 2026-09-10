@@ -101,9 +101,6 @@ services:
       - AAWM_TAP_MODEL_HOST=${AAWM_TAP_MODEL_HOST:-mahaf.tailf1878c.ts.net}
       - LITELLM_LOCAL_MODEL_COST_MAP=${LITELLM_LOCAL_MODEL_COST_MAP:-True}
       - AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR=${AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR:-/home/zepfu/.analysis/full-payload-captures/runtime}
-      # Capacity retries may span the two-hour OpenAI coordinator deadline;
-      # keep the logical-send guard from terminating them after three sends.
-      - AAWM_OPENAI_MAX_LOGICAL_PROVIDER_CALLS=${AAWM_OPENAI_MAX_LOGICAL_PROVIDER_CALLS:-1000}
       # AAWM runtime database access goes through shared PgBouncer. Keep
       # AAWM_DIRECT_DATABASE_URL on direct Postgres for admin/backfill paths.
       - AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-pgbouncer-aawm-dev}

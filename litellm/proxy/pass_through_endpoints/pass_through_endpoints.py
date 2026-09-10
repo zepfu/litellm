@@ -2450,7 +2450,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 and capacity_failure
             ):
                 last_capacity_exception = exc
-                if not openai_capacity_coordinator.within_deadline():
+                remaining_seconds = openai_capacity_coordinator.remaining_seconds
+                if remaining_seconds <= 0.0:
                     terminal_exception = (
                         _mark_passthrough_capacity_exception_terminal(exc)
                     )
@@ -2493,7 +2494,10 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         elapsed_seconds=openai_capacity_coordinator.elapsed_seconds,
                     )
                     raise terminal_exception
-                wait_seconds = openai_capacity_coordinator.next_wait_seconds()
+                wait_seconds = min(
+                    openai_capacity_coordinator.next_wait_seconds(),
+                    remaining_seconds,
+                )
                 should_retry = True
             elif openai_capacity_coordinator is not None:
                 # The coordinator owns only OpenAI/Codex capacity retries. Do
@@ -6610,6 +6614,102 @@ async def pass_through_request(  # noqa: PLR0915
         openai_send_request_fn: Optional[
             Callable[[httpx.Request, bool], Awaitable[httpx.Response]]
         ] = None
+
+        async def _retire_openai_precommit_response(
+            response: Optional[httpx.Response],
+        ) -> bool:
+            """Close and clear the exact raw response registered by the send."""
+
+            if response is None:
+                return True
+            closed = True
+            try:
+                await response.aclose()
+            except BaseException:
+                closed = False
+                verbose_proxy_logger.debug(
+                    "Failed to close OpenAI precommit response",
+                    exc_info=True,
+                )
+            finally:
+                clear_active_upstream_response(request, response=response)
+            return closed
+
+        def _authorize_openai_capacity_retry(
+            failure: ResponsesStreamPreCommitFailure,
+            response: Optional[httpx.Response],
+        ) -> None:
+            if (
+                openai_call_ledger is None
+                or capacity_retry_coordinator is None
+                or not failure.retryable
+                or failure.error_class
+                not in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
+            ):
+                return
+            response_request = (
+                getattr(response, "request", None) if response is not None else None
+            )
+            response_target = getattr(response_request, "url", None) or url
+            if not openai_call_ledger.authorize_capacity_retry(
+                target=response_target,
+                candidate_context=current_candidate_context(request),
+                deadline_at_monotonic=(
+                    capacity_retry_coordinator.deadline_at_monotonic
+                ),
+            ):
+                return
+            request_state = getattr(request, "state", None)
+            if request_state is not None:
+                setattr(
+                    request_state,
+                    "aawm_openai_send_ledger_snapshot",
+                    get_request_provider_call_ledger_snapshot(request),
+                )
+
+        def _classify_json_responses_precommit_failure(
+            response_body: Any,
+        ) -> Optional[ResponsesStreamPreCommitFailure]:
+            if not isinstance(response_body, dict):
+                return None
+            nested_response = response_body.get("response")
+            response_payloads = [response_body]
+            if isinstance(nested_response, dict):
+                response_payloads.append(nested_response)
+            if not any(
+                str(payload.get("status") or "").strip().lower() == "failed"
+                for payload in response_payloads
+            ):
+                return None
+            for payload in response_payloads:
+                output = payload.get("output")
+                if isinstance(output, list) and output:
+                    return None
+                if output not in (None, "", []):
+                    return None
+                output_text = payload.get("output_text")
+                if isinstance(output_text, str) and output_text.strip():
+                    return None
+            error_payload = (
+                PassThroughStreamingHandler._extract_responses_stream_error_payload(
+                    "response.failed",
+                    response_body,
+                )
+            )
+            if error_payload is None:
+                return None
+            failure = PassThroughStreamingHandler._build_responses_pre_commit_failure(
+                error_payload=error_payload,
+                event_type="response.failed",
+                openai_alpha_capacity_retry_enabled=True,
+            )
+            if (
+                not failure.retryable
+                or failure.error_class not in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
+            ):
+                return None
+            return failure
+
         if openai_call_ledger is not None:
 
             async def _send_prepared_openai_request(
@@ -6675,6 +6775,7 @@ async def pass_through_request(  # noqa: PLR0915
                         reason=reason or "passthrough_provider_request",
                         candidate_context=current_candidate_context(request),
                         prior_response_closed=True,
+                        allow_capacity_retry=capacity_retry_coordinator is not None,
                     )
                     publish_reservation_metadata(
                         request,
@@ -6832,100 +6933,116 @@ async def pass_through_request(  # noqa: PLR0915
             async def _send_stream_pre_first_byte() -> Tuple[
                 httpx.Response, httpx.Request
             ]:
-                stream_headers = headers
-                if use_json_egress:
-                    (
-                        stream_headers,
-                        removed_content_type,
-                    ) = _headers_for_json_passthrough_egress(headers)
-                    if removed_content_type:
-                        _merge_passthrough_request_shape_metadata(
-                            passthrough_metadata,
-                            request=request,
-                            parsed_body=_parsed_body,
-                            provider_bound_body=provider_bound_body,
-                            json_egress_content_type_removed=removed_content_type,
-                        )
-                        if error_log_context is not None:
-                            error_log_context.update(
-                                _build_passthrough_error_log_request_shape_context(
-                                    passthrough_metadata
-                                )
-                            )
-                req = async_client.build_request(
-                    "POST",
-                    url,
-                    json=provider_bound_body,
-                    params=requested_query_params,
-                    headers=stream_headers,
-                )
-                if send_request_fn is not None:
-                    response = await send_request_fn(req, stream)
-                else:
-                    if validate_prepared_request_fn is not None:
-                        validate_prepared_request_fn(req)
-                    send_kwargs: dict[str, Any] = {"stream": stream}
-                    if managed_xai_oauth_egress or openai_bound_egress:
-                        send_kwargs["follow_redirects"] = False
-                    response = await async_client.send(req, **send_kwargs)
-                await HttpPassThroughEndpointHelpers.reject_managed_xai_redirect_response(
-                    response=response,
-                    url=url,
-                    credential_family=egress_credential_family,
-                    expected_target_family=expected_target_family,
-                    custom_llm_provider=custom_llm_provider,
-                )
+                raw_response: Optional[httpx.Response] = None
                 try:
-                    response.raise_for_status()
-                except httpx.HTTPStatusError as e:
-                    error_content = await e.response.aread()
-                    await e.response.aclose()
-                    clear_active_upstream_response(request, response=e.response)
-                    _capture_passthrough_error_shape(
-                        mode="stream_error",
-                        provider=custom_llm_provider or endpoint_type.value,
+                    stream_headers = headers
+                    if use_json_egress:
+                        (
+                            stream_headers,
+                            removed_content_type,
+                        ) = _headers_for_json_passthrough_egress(headers)
+                        if removed_content_type:
+                            _merge_passthrough_request_shape_metadata(
+                                passthrough_metadata,
+                                request=request,
+                                parsed_body=_parsed_body,
+                                provider_bound_body=provider_bound_body,
+                                json_egress_content_type_removed=removed_content_type,
+                            )
+                            if error_log_context is not None:
+                                error_log_context.update(
+                                    _build_passthrough_error_log_request_shape_context(
+                                        passthrough_metadata
+                                    )
+                                )
+                    req = async_client.build_request(
+                        "POST",
+                        url,
+                        json=provider_bound_body,
+                        params=requested_query_params,
+                        headers=stream_headers,
+                    )
+                    if send_request_fn is not None:
+                        response = await send_request_fn(req, stream)
+                    else:
+                        if validate_prepared_request_fn is not None:
+                            validate_prepared_request_fn(req)
+                        send_kwargs: dict[str, Any] = {"stream": stream}
+                        if managed_xai_oauth_egress or openai_bound_egress:
+                            send_kwargs["follow_redirects"] = False
+                        response = await async_client.send(req, **send_kwargs)
+                    raw_response = response
+                    await HttpPassThroughEndpointHelpers.reject_managed_xai_redirect_response(
+                        response=response,
+                        url=url,
+                        credential_family=egress_credential_family,
+                        expected_target_family=expected_target_family,
+                        custom_llm_provider=custom_llm_provider,
+                    )
+                    try:
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError as e:
+                        error_content = await e.response.aread()
+                        await e.response.aclose()
+                        clear_active_upstream_response(request, response=e.response)
+                        raw_response = None
+                        _capture_passthrough_error_shape(
+                            mode="stream_error",
+                            provider=custom_llm_provider or endpoint_type.value,
+                            endpoint_type=endpoint_type,
+                            url_route=str(url),
+                            request_body=_parsed_body,
+                            response=e.response,
+                            upstream_request=getattr(e.response, "request", None) or req,
+                            response_content=error_content,
+                            litellm_call_id=litellm_call_id,
+                            extra_metadata={
+                                "stream": True,
+                                **_xai_oauth_send_auth_shape_metadata(
+                                    request
+                                ),
+                            },
+                        )
+                        raise _build_http_exception_from_upstream_status_error(
+                            e,
+                            error_content,
+                        ) from e
+                    if is_xai_responses_wire_owned_route:
+                        extensions = getattr(response, "extensions", None)
+                        if isinstance(extensions, dict):
+                            extensions["aawm_responses_wire_owned"] = True
+                    if PassThroughStreamingHandler._is_openai_responses_stream(
                         endpoint_type=endpoint_type,
                         url_route=str(url),
-                        request_body=_parsed_body,
-                        response=e.response,
-                        upstream_request=getattr(e.response, "request", None) or req,
-                        response_content=error_content,
-                        litellm_call_id=litellm_call_id,
-                        extra_metadata={
-                            "stream": True,
-                            **_xai_oauth_send_auth_shape_metadata(
-                                request
+                        custom_llm_provider=custom_llm_provider,
+                    ):
+                        (
+                            response,
+                            pre_commit_failure,
+                        ) = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+                            response,
+                            openai_alpha_capacity_retry_enabled=(
+                                capacity_retry_coordinator is not None
+                                and response.status_code == status.HTTP_200_OK
                             ),
-                        },
-                    )
-                    raise _build_http_exception_from_upstream_status_error(
-                        e,
-                        error_content,
-                    ) from e
-                if is_xai_responses_wire_owned_route:
-                    extensions = getattr(response, "extensions", None)
-                    if isinstance(extensions, dict):
-                        extensions["aawm_responses_wire_owned"] = True
-                if PassThroughStreamingHandler._is_openai_responses_stream(
-                    endpoint_type=endpoint_type,
-                    url_route=str(url),
-                    custom_llm_provider=custom_llm_provider,
-                ):
-                    (
-                        response,
-                        pre_commit_failure,
-                    ) = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
-                        response,
-                        openai_alpha_capacity_retry_enabled=(
-                            capacity_retry_coordinator is not None
-                            and response.status_code == status.HTTP_200_OK
-                        ),
-                    )
-                    if pre_commit_failure is not None:
-                        await response.aclose()
-                        clear_active_upstream_response(request, response=response)
-                        raise pre_commit_failure
-                return response, req
+                        )
+                        if pre_commit_failure is not None:
+                            retired_response = raw_response
+                            response_retired = (
+                                await _retire_openai_precommit_response(raw_response)
+                            )
+                            raw_response = None
+                            if response_retired:
+                                _authorize_openai_capacity_retry(
+                                    pre_commit_failure,
+                                    retired_response,
+                                )
+                            raise pre_commit_failure
+                    return response, req
+                except BaseException:
+                    if raw_response is not None:
+                        await _retire_openai_precommit_response(raw_response)
+                    raise
 
             try:
                 (
@@ -7269,67 +7386,137 @@ async def pass_through_request(  # noqa: PLR0915
                 )
             )
 
-        async def _send_non_stream_pre_first_byte() -> httpx.Response:
-            non_stream_headers = headers
-            if use_json_egress:
-                (
-                    non_stream_headers,
-                    removed_content_type,
-                ) = _headers_for_json_passthrough_egress(headers)
-                if removed_content_type:
-                    _merge_passthrough_request_shape_metadata(
-                        passthrough_metadata,
-                        request=request,
-                        parsed_body=_parsed_body,
-                        provider_bound_body=provider_bound_body,
-                        json_egress_content_type_removed=removed_content_type,
-                    )
-                    if error_log_context is not None:
-                        error_log_context.update(
-                            _build_passthrough_error_log_request_shape_context(
-                                passthrough_metadata
-                            )
+        async def _send_non_stream_pre_first_byte() -> httpx.Response:  # noqa: PLR0915
+            raw_response: Optional[httpx.Response] = None
+            try:
+                non_stream_headers = headers
+                if use_json_egress:
+                    (
+                        non_stream_headers,
+                        removed_content_type,
+                    ) = _headers_for_json_passthrough_egress(headers)
+                    if removed_content_type:
+                        _merge_passthrough_request_shape_metadata(
+                            passthrough_metadata,
+                            request=request,
+                            parsed_body=_parsed_body,
+                            provider_bound_body=provider_bound_body,
+                            json_egress_content_type_removed=removed_content_type,
                         )
-            # Prefer stream=True so if upstream replies with SSE we can hand off
-            # without buffering the full body first (RR-056 #6). Non-SSE bodies
-            # are still fully read later via response.aread().
-            response = (
-                await HttpPassThroughEndpointHelpers.non_streaming_http_request_handler(
-                    request=request,
-                    async_client=async_client,
-                    url=url,
-                    headers=non_stream_headers,
-                    requested_query_params=requested_query_params,
-                    _parsed_body=provider_bound_body,
-                    raw_body=raw_body,
-                    prefer_stream_for_unknown_content=True,
-                    follow_redirects=(
-                        False if (managed_xai_oauth_egress or openai_bound_egress) else None
-                    ),
-                    validate_request_fn=validate_prepared_request_fn,
-                    send_request_fn=send_request_fn,
+                        if error_log_context is not None:
+                            error_log_context.update(
+                                _build_passthrough_error_log_request_shape_context(
+                                    passthrough_metadata
+                                )
+                            )
+                # Prefer stream=True so if upstream replies with SSE we can hand off
+                # without buffering the full body first (RR-056 #6). Non-SSE bodies
+                # are still fully read later via response.aread().
+                response = (
+                    await HttpPassThroughEndpointHelpers.non_streaming_http_request_handler(
+                        request=request,
+                        async_client=async_client,
+                        url=url,
+                        headers=non_stream_headers,
+                        requested_query_params=requested_query_params,
+                        _parsed_body=provider_bound_body,
+                        raw_body=raw_body,
+                        prefer_stream_for_unknown_content=True,
+                        follow_redirects=(
+                            False
+                            if (managed_xai_oauth_egress or openai_bound_egress)
+                            else None
+                        ),
+                        validate_request_fn=validate_prepared_request_fn,
+                        send_request_fn=send_request_fn,
+                    )
                 )
-            )
-            await HttpPassThroughEndpointHelpers.reject_managed_xai_redirect_response(
-                response=response,
-                url=url,
-                credential_family=egress_credential_family,
-                expected_target_family=expected_target_family,
-                custom_llm_provider=custom_llm_provider,
-            )
-            if is_xai_responses_wire_owned_route:
-                extensions = getattr(response, "extensions", None)
-                if isinstance(extensions, dict):
-                    extensions["aawm_responses_wire_owned"] = True
-            if _is_streaming_response(response) is True:
+                raw_response = response
+                await HttpPassThroughEndpointHelpers.reject_managed_xai_redirect_response(
+                    response=response,
+                    url=url,
+                    credential_family=egress_credential_family,
+                    expected_target_family=expected_target_family,
+                    custom_llm_provider=custom_llm_provider,
+                )
+                if is_xai_responses_wire_owned_route:
+                    extensions = getattr(response, "extensions", None)
+                    if isinstance(extensions, dict):
+                        extensions["aawm_responses_wire_owned"] = True
+                if _is_streaming_response(response) is True:
+                    try:
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError as e:
+                        error_content = await e.response.aread()
+                        await e.response.aclose()
+                        clear_active_upstream_response(request, response=e.response)
+                        raw_response = None
+                        _capture_passthrough_error_shape(
+                            mode="stream_error",
+                            provider=custom_llm_provider or endpoint_type.value,
+                            endpoint_type=endpoint_type,
+                            url_route=str(url),
+                            request_body=_parsed_body,
+                            response=e.response,
+                            upstream_request=getattr(e.response, "request", None),
+                            response_content=error_content,
+                            litellm_call_id=litellm_call_id,
+                            extra_metadata={
+                                "stream": True,
+                                **_xai_oauth_send_auth_shape_metadata(
+                                    request
+                                ),
+                            },
+                        )
+                        raise _build_http_exception_from_upstream_status_error(
+                            e,
+                            error_content,
+                        ) from e
+                    if (
+                        response.status_code == status.HTTP_200_OK
+                        and capacity_retry_coordinator is not None
+                        and PassThroughStreamingHandler._is_openai_responses_stream(
+                            endpoint_type=endpoint_type,
+                            url_route=str(url),
+                            custom_llm_provider=custom_llm_provider,
+                        )
+                    ):
+                        (
+                            response,
+                            pre_commit_failure,
+                        ) = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+                            response,
+                            openai_alpha_capacity_retry_enabled=True,
+                        )
+                        if pre_commit_failure is not None:
+                            retired_response = raw_response
+                            response_retired = (
+                                await _retire_openai_precommit_response(raw_response)
+                            )
+                            raw_response = None
+                            if response_retired:
+                                _authorize_openai_capacity_retry(
+                                    pre_commit_failure,
+                                    retired_response,
+                                )
+                            raise pre_commit_failure
+                    return response
+
                 try:
                     response.raise_for_status()
                 except httpx.HTTPStatusError as e:
+                    # prefer_stream_for_unknown_content uses stream=True for non-GET,
+                    # so non-SSE error bodies must be drained with aread() (RR-056 #6).
                     error_content = await e.response.aread()
                     await e.response.aclose()
                     clear_active_upstream_response(request, response=e.response)
+                    raw_response = None
+                    try:
+                        error_text = error_content.decode("utf-8", errors="replace")
+                    except Exception:
+                        error_text = str(error_content)
                     _capture_passthrough_error_shape(
-                        mode="stream_error",
+                        mode="nonstream_error",
                         provider=custom_llm_provider or endpoint_type.value,
                         endpoint_type=endpoint_type,
                         url_route=str(url),
@@ -7339,7 +7526,7 @@ async def pass_through_request(  # noqa: PLR0915
                         response_content=error_content,
                         litellm_call_id=litellm_call_id,
                         extra_metadata={
-                            "stream": True,
+                            "stream": False,
                             **_xai_oauth_send_auth_shape_metadata(
                                 request
                             ),
@@ -7347,64 +7534,36 @@ async def pass_through_request(  # noqa: PLR0915
                     )
                     raise _build_http_exception_from_upstream_status_error(
                         e,
-                        error_content,
+                        error_text,
                     ) from e
                 if (
                     response.status_code == status.HTTP_200_OK
                     and capacity_retry_coordinator is not None
-                    and PassThroughStreamingHandler._is_openai_responses_stream(
-                        endpoint_type=endpoint_type,
-                        url_route=str(url),
-                        custom_llm_provider=custom_llm_provider,
-                    )
+                    and is_native_openai_responses_route
                 ):
-                    (
-                        response,
-                        pre_commit_failure,
-                    ) = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
-                        response,
-                        openai_alpha_capacity_retry_enabled=True,
+                    await response.aread()
+                    pre_commit_failure = (
+                        _classify_json_responses_precommit_failure(
+                            get_response_body(response)
+                        )
                     )
                     if pre_commit_failure is not None:
-                        await response.aclose()
-                        clear_active_upstream_response(request, response=response)
+                        retired_response = raw_response
+                        response_retired = (
+                            await _retire_openai_precommit_response(raw_response)
+                        )
+                        raw_response = None
+                        if response_retired:
+                            _authorize_openai_capacity_retry(
+                                pre_commit_failure,
+                                retired_response,
+                            )
                         raise pre_commit_failure
                 return response
-
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as e:
-                # prefer_stream_for_unknown_content uses stream=True for non-GET,
-                # so non-SSE error bodies must be drained with aread() (RR-056 #6).
-                error_content = await e.response.aread()
-                await e.response.aclose()
-                clear_active_upstream_response(request, response=e.response)
-                try:
-                    error_text = error_content.decode("utf-8", errors="replace")
-                except Exception:
-                    error_text = str(error_content)
-                _capture_passthrough_error_shape(
-                    mode="nonstream_error",
-                    provider=custom_llm_provider or endpoint_type.value,
-                    endpoint_type=endpoint_type,
-                    url_route=str(url),
-                    request_body=_parsed_body,
-                    response=e.response,
-                    upstream_request=getattr(e.response, "request", None),
-                    response_content=error_content,
-                    litellm_call_id=litellm_call_id,
-                    extra_metadata={
-                        "stream": False,
-                        **_xai_oauth_send_auth_shape_metadata(
-                            request
-                        ),
-                    },
-                )
-                raise _build_http_exception_from_upstream_status_error(
-                    e,
-                    error_text,
-                ) from e
-            return response
+            except BaseException:
+                if raw_response is not None:
+                    await _retire_openai_precommit_response(raw_response)
+                raise
 
         try:
             response = await _aawm_run_with_session_owner_lease_renewal(
@@ -8831,10 +8990,10 @@ def create_pass_through_route(
                 "blocked_pass_through_prefixed_headers",
                 blocked_pass_through_prefixed_headers,
             )
-            param_caller_managed_hidden_retry = target_params.get(
-                "caller_managed_hidden_retry",
-                caller_managed_hidden_retry,
-            )
+            # Retry ownership is executable control flow. Route metadata must
+            # not turn a direct native OpenAI request into a caller-managed
+            # retry with no outer owner; callers must opt in explicitly.
+            param_caller_managed_hidden_retry = bool(caller_managed_hidden_retry)
 
             # Construct the full target URL with subpath if needed
             full_target = (

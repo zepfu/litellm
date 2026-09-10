@@ -26,7 +26,6 @@ from .durable import get_aawm_alias_routing_state_namespace
 from .retry import (
     OpenAIAlphaCapacityRetryBudget,
     openai_alpha_capacity_retry_wait_seconds,
-    openai_alpha_capacity_retry_within_deadline,
 )
 
 logger = logging.getLogger("LiteLLMProxy")
@@ -588,6 +587,11 @@ class OpenAIAlphaCapacityRetryCoordinator:
         return self._budget.deadline_seconds
 
     @property
+    def deadline_at_monotonic(self) -> float:
+        """Return the original request deadline without starting a new timer."""
+        return self._start_monotonic + self.deadline_seconds
+
+    @property
     def budget(self) -> OpenAIAlphaCapacityRetryBudget:
         return self._budget
 
@@ -612,11 +616,7 @@ class OpenAIAlphaCapacityRetryCoordinator:
         return openai_alpha_capacity_retry_wait_seconds(self.retry_count)
 
     def within_deadline(self) -> bool:
-        return openai_alpha_capacity_retry_within_deadline(
-            elapsed_seconds=self.elapsed_seconds,
-            next_wait_seconds=self.next_wait_seconds(),
-            deadline_seconds=self.deadline_seconds,
-        )
+        return self.remaining_seconds > 0.0
 
     async def signal_success(self) -> None:
         """Signal a successful connection to wake waiting requests."""

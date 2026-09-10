@@ -155,6 +155,7 @@ class ProviderCallReservation:
     reason: str
     target_fingerprint: Optional[str]
     candidate_fingerprint: Optional[str]
+    model_fingerprint: Optional[str]
     account_fingerprint: Optional[str]
     reserved_at_monotonic: float
 
@@ -165,7 +166,33 @@ class ProviderCallReservation:
             "reason": self.reason,
             "target_fingerprint": self.target_fingerprint,
             "candidate_fingerprint": self.candidate_fingerprint,
+            "model_fingerprint": self.model_fingerprint,
             "account_fingerprint": self.account_fingerprint,
+        }
+
+
+@dataclass(frozen=True)
+class _CapacityRetryAuthorization:
+    """One-use admission granted by a classified precommit capacity failure."""
+
+    prior_ordinal: int
+    target_fingerprint: str
+    model_fingerprint: str
+    account_fingerprint: str
+    deadline_at_monotonic: float
+    authorized_at_monotonic: float
+
+    def to_metadata(self) -> dict[str, Any]:
+        remaining_seconds = max(
+            0.0,
+            self.deadline_at_monotonic - time.monotonic(),
+        )
+        return {
+            "prior_ordinal": self.prior_ordinal,
+            "target_fingerprint": self.target_fingerprint,
+            "model_fingerprint": self.model_fingerprint,
+            "account_fingerprint": self.account_fingerprint,
+            "remaining_seconds": round(remaining_seconds, 3),
         }
 
 
@@ -203,6 +230,12 @@ class ProviderCallLedgerExhausted(RuntimeError):
                 "remaining_logical_provider_calls": self.ledger_snapshot[
                     "remaining_logical_provider_calls"
                 ],
+                "ordinary_calls_available": self.ledger_snapshot[
+                    "ordinary_calls_available"
+                ],
+                "capacity_retry_authorized": self.ledger_snapshot[
+                    "capacity_retry_authorized"
+                ],
             }
         }
         super().__init__(
@@ -238,6 +271,9 @@ class ProviderCallLedger:
         self._logical_provider_calls = 0
         self._transport_connection_failures = 0
         self._records: list[ProviderCallReservation] = []
+        self._capacity_retry_authorization: Optional[
+            _CapacityRetryAuthorization
+        ] = None
         self._request_fingerprint = uuid4().hex[:16]
 
     @property
@@ -258,6 +294,93 @@ class ProviderCallLedger:
     def reservations(self) -> tuple[ProviderCallReservation, ...]:
         return tuple(self._records)
 
+    @staticmethod
+    def _model_fingerprint(context: Mapping[str, Any]) -> Optional[str]:
+        return _fingerprint(context.get("model"))
+
+    @staticmethod
+    def _account_fingerprint(context: Mapping[str, Any]) -> Optional[str]:
+        account_hash = _safe_context_value(context.get("account_hash"))
+        lane_key = _safe_context_value(context.get("lane_key"))
+        if account_hash is None and lane_key is None:
+            return None
+        return _fingerprint(
+            "|".join(
+                value or ""
+                for value in (
+                    account_hash,
+                    lane_key,
+                )
+            )
+        )
+
+    def authorize_capacity_retry(
+        self,
+        *,
+        target: Any,
+        candidate_context: Optional[dict[str, Any]],
+        deadline_at_monotonic: float,
+    ) -> bool:
+        """Grant one narrowly-bound send after a classified precommit failure.
+
+        The grant is tied to the latest reservation and cannot be used for a
+        changed target, model, account, or lane.  The caller supplies the
+        coordinator's original absolute deadline; this method never starts a
+        new retry timer.
+        """
+
+        if self._capacity_retry_authorization is not None:
+            return False
+        if not self._records:
+            return False
+        prior = self._records[-1]
+        context = candidate_context or {}
+        target_fingerprint = _fingerprint(target)
+        model_fingerprint = self._model_fingerprint(context)
+        account_fingerprint = self._account_fingerprint(context)
+        if (
+            target_fingerprint is None
+            or model_fingerprint is None
+            or account_fingerprint is None
+            or prior.target_fingerprint != target_fingerprint
+            or prior.model_fingerprint != model_fingerprint
+            or prior.account_fingerprint != account_fingerprint
+        ):
+            return False
+        deadline_at_monotonic = float(deadline_at_monotonic)
+        if deadline_at_monotonic <= time.monotonic():
+            return False
+        self._capacity_retry_authorization = _CapacityRetryAuthorization(
+            prior_ordinal=prior.ordinal,
+            target_fingerprint=target_fingerprint,
+            model_fingerprint=model_fingerprint,
+            account_fingerprint=account_fingerprint,
+            deadline_at_monotonic=deadline_at_monotonic,
+            authorized_at_monotonic=time.monotonic(),
+        )
+        return True
+
+    def _capacity_retry_authorization_matches(
+        self,
+        authorization: _CapacityRetryAuthorization,
+        *,
+        target_fingerprint: Optional[str],
+        model_fingerprint: Optional[str],
+        account_fingerprint: Optional[str],
+    ) -> bool:
+        if not self._records:
+            return False
+        prior = self._records[-1]
+        return (
+            prior.ordinal == authorization.prior_ordinal
+            and target_fingerprint == authorization.target_fingerprint
+            and model_fingerprint == authorization.model_fingerprint
+            and account_fingerprint == authorization.account_fingerprint
+            and prior.target_fingerprint == authorization.target_fingerprint
+            and prior.model_fingerprint == authorization.model_fingerprint
+            and prior.account_fingerprint == authorization.account_fingerprint
+        )
+
     def reserve(
         self,
         *,
@@ -265,6 +388,7 @@ class ProviderCallLedger:
         reason: str = "provider_request",
         candidate_context: Optional[dict[str, Any]] = None,
         prior_response_closed: bool,
+        allow_capacity_retry: bool = False,
     ) -> ProviderCallReservation:
         if not prior_response_closed:
             raise RuntimeError(
@@ -279,27 +403,55 @@ class ProviderCallLedger:
                 ledger=self,
                 reason="deadline_exhausted",
             )
-        if self._logical_provider_calls >= self.max_logical_provider_calls:
+        context = candidate_context or {}
+        target_fingerprint = _fingerprint(target)
+        model_fingerprint = self._model_fingerprint(context)
+        account_fingerprint = self._account_fingerprint(context)
+        capacity_retry_authorized = False
+        authorization = self._capacity_retry_authorization
+        if authorization is not None and allow_capacity_retry:
+            if time.monotonic() >= authorization.deadline_at_monotonic:
+                self._capacity_retry_authorization = None
+                raise ProviderCallLedgerExhausted(
+                    ledger=self,
+                    reason="capacity_retry_deadline_exhausted",
+                )
+            if not self._capacity_retry_authorization_matches(
+                authorization,
+                target_fingerprint=target_fingerprint,
+                model_fingerprint=model_fingerprint,
+                account_fingerprint=account_fingerprint,
+            ):
+                self._capacity_retry_authorization = None
+                raise ProviderCallLedgerExhausted(
+                    ledger=self,
+                    reason="capacity_retry_authorization_mismatch",
+                )
+            capacity_retry_authorized = True
+        if (
+            self._logical_provider_calls >= self.max_logical_provider_calls
+            and not capacity_retry_authorized
+        ):
             raise ProviderCallLedgerExhausted(
                 ledger=self,
                 reason="logical_call_cap_exhausted",
             )
 
-        context = candidate_context or {}
+        if capacity_retry_authorized:
+            self._capacity_retry_authorization = None
         reservation = ProviderCallReservation(
             ordinal=self._next_ordinal,
             provider=self.provider,
             reason=_safe_context_value(reason) or "provider_request",
-            target_fingerprint=_fingerprint(target),
+            target_fingerprint=target_fingerprint,
             candidate_fingerprint=_fingerprint(
                 "|".join(
                     str(context.get(key) or "")
                     for key in ("provider", "model", "route_family", "config_epoch_tag")
                 )
             ),
-            account_fingerprint=_fingerprint(
-                context.get("account_hash") or context.get("lane_key")
-            ),
+            model_fingerprint=model_fingerprint,
+            account_fingerprint=account_fingerprint,
             reserved_at_monotonic=time.monotonic(),
         )
         self._records.append(reservation)
@@ -323,17 +475,38 @@ class ProviderCallLedger:
             self.max_logical_provider_calls - self._logical_provider_calls,
         )
         elapsed_seconds = time.monotonic() - self._started_at_monotonic
+        capacity_authorization = self._capacity_retry_authorization
+        capacity_remaining_seconds = (
+            max(
+                0.0,
+                capacity_authorization.deadline_at_monotonic
+                - time.monotonic(),
+            )
+            if capacity_authorization is not None
+            else 0.0
+        )
         return {
             "request_fingerprint": self._request_fingerprint,
             "provider": self.provider,
             "max_logical_provider_calls": self.max_logical_provider_calls,
             "logical_provider_calls": self._logical_provider_calls,
             "remaining_logical_provider_calls": remaining,
+            "ordinary_calls_available": remaining > 0,
+            "capacity_retry_authorized": capacity_authorization is not None,
+            "capacity_retry_remaining_seconds": round(
+                capacity_remaining_seconds,
+                3,
+            ),
             "next_attempt_ordinal": self._next_ordinal,
             "transport_connection_failures": self._transport_connection_failures,
             "deadline_seconds": self.deadline_seconds,
             "elapsed_seconds": round(max(0.0, elapsed_seconds), 3),
             "reservations": [record.to_metadata() for record in self._records],
+            "capacity_retry_authorization": (
+                capacity_authorization.to_metadata()
+                if capacity_authorization is not None
+                else None
+            ),
         }
 
 
