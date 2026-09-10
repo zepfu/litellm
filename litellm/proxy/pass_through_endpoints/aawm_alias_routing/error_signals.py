@@ -74,7 +74,6 @@ from .types import Payload
 from .retry import (
     OpenAIAlphaCapacityRetryBudget,
     openai_alpha_capacity_retry_wait_seconds,
-    openai_alpha_capacity_retry_within_deadline,
 )
 
 
@@ -2868,11 +2867,8 @@ def plan_responses_pre_commit_retry(
             if budget is not None
             else 7200.0
         )
-        if not openai_alpha_capacity_retry_within_deadline(
-            elapsed_seconds=elapsed_seconds,
-            next_wait_seconds=next_wait,
-            deadline_seconds=deadline,
-        ):
+        remaining = max(0.0, deadline - max(0.0, elapsed_seconds))
+        if remaining <= 0.0:
             return {
                 "action": "deadline_exhausted",
                 "retry_same_account": False,
@@ -2886,7 +2882,7 @@ def plan_responses_pre_commit_retry(
             "action": "retry_same_account",
             "retry_same_account": True,
             "apply_account_exhaustion_cooldown": False,
-            "wait_seconds": next_wait,
+            "wait_seconds": min(next_wait, remaining),
             "http_status": 503,
             "retryable": True,
             "error_class": normalized,
