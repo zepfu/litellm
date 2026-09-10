@@ -5,9 +5,8 @@ The host ``cursoral`` / ``cursoralt`` / ``cursorala`` launchers aim
 (``POST /agent.v1.AgentService/Run``) lands on the named container.
 
 Cloud Agents ``/cursor/{endpoint:path}`` stays the ``api.cursor.com`` ``/v0``
-product. HTTP/1.1 ``RunSSE`` + ``BidiAppend`` is a later compatibility lane
-and is not registered with this HTTP/2 ``Run`` landing. ``RunPoll`` is not
-the ``--print`` path.
+product. HTTP/1.1 ``RunSSE`` + ``BidiAppend`` is the CLI compatibility lane
+and is registered without claiming ``RunPoll`` as the ``--print`` path.
 """
 
 from __future__ import annotations
@@ -32,9 +31,19 @@ def test_inbound_agent_cli_connect_run_is_registered() -> None:
     """Default CLI turn path is registered on the inbound FastAPI router."""
     paths = _route_paths()
     assert "/agent.v1.AgentService/Run" in paths
-    assert CURSOR_AGENT_RUNSSE_PATH not in paths
-    assert CURSOR_AGENT_BIDI_APPEND_PATH not in paths
+    assert CURSOR_AGENT_RUNSSE_PATH in paths
+    assert CURSOR_AGENT_BIDI_APPEND_PATH in paths
     assert "/agent.v1.AgentService/RunPoll" not in paths
+
+
+def test_inbound_http1_handlers_do_not_claim_runpoll() -> None:
+    runsse = lpe.cursor_agent_cli_runsse_route
+    bidi = lpe.cursor_agent_cli_bidi_append_route
+    for handler in (runsse, bidi):
+        doc = handler.__doc__ or ""
+        assert "HTTP/1.1" in doc
+        assert "RunPoll" in doc
+        assert "/v0/agents" not in doc
 
 
 def test_cursor_passthrough_handler_is_cloud_agents_not_agent_cli() -> None:

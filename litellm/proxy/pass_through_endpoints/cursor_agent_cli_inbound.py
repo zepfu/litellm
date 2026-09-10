@@ -34,9 +34,14 @@ from litellm.llms.cursor_agent.constants import (
 from litellm.llms.cursor_agent.connect import (
     CursorAgentConnectClient,
     CursorConnectError,
+    CursorConnectProtocolError,
     _ProtoConnectFrameDecoder,
     _decode_proto_fields,
     _decode_proto_string,
+    _encode_proto_bytes_field,
+    _encode_proto_message_field,
+    _encode_proto_string_field,
+    _encode_proto_varint_field,
     _encode_request_context_exec_response,
     _proto_last_field,
     decode_connect_proto_frames,
@@ -56,6 +61,9 @@ CURSOR_AGENT_CLI_INBOUND_TAGS = (
 )
 CURSOR_AGENT_RUNSSE_PATH = "/agent.v1.AgentService/RunSSE"
 CURSOR_AGENT_BIDI_APPEND_PATH = "/aiserver.v1.BidiService/BidiAppend"
+CURSOR_AGENT_HTTP1_COMPAT_METHODS = frozenset({"RunSSE", "BidiAppend"})
+_MAX_HTTP1_LANE_BODY_BYTES = 16 * 1024 * 1024
+_MAX_HTTP1_LANE_SESSIONS = 64
 
 _HOP_BY_HOP = {
     "connection",
@@ -187,13 +195,36 @@ def _request_context_exec_replies(
     return replies, b"".join(forwarded)
 
 
+def _asgi_path(scope: Mapping[str, Any]) -> str:
+    return str(scope.get("path") or "")
+
+
+def _path_matches(path: str, expected: str) -> bool:
+    return path == expected or path.endswith(expected)
+
+
 def is_cursor_agent_cli_run_scope(scope: Mapping[str, Any]) -> bool:
     if scope.get("type") != "http":
         return False
     if str(scope.get("method") or "").upper() != "POST":
         return False
-    path = str(scope.get("path") or "")
-    return path == CURSOR_AGENT_RUN_PATH or path.endswith(CURSOR_AGENT_RUN_PATH)
+    return _path_matches(_asgi_path(scope), CURSOR_AGENT_RUN_PATH)
+
+
+def is_cursor_agent_cli_runsse_scope(scope: Mapping[str, Any]) -> bool:
+    if scope.get("type") != "http":
+        return False
+    if str(scope.get("method") or "").upper() != "POST":
+        return False
+    return _path_matches(_asgi_path(scope), CURSOR_AGENT_RUNSSE_PATH)
+
+
+def is_cursor_agent_cli_bidi_append_scope(scope: Mapping[str, Any]) -> bool:
+    if scope.get("type") != "http":
+        return False
+    if str(scope.get("method") or "").upper() != "POST":
+        return False
+    return _path_matches(_asgi_path(scope), CURSOR_AGENT_BIDI_APPEND_PATH)
 
 
 class InboundCursorAgentCliAuthError(Exception):
@@ -278,6 +309,173 @@ def inbound_cli_auth_error_payload(exc: InboundCursorAgentCliAuthError) -> Dict[
         "reason": exc.reason,
         "detail": exc.message,
     }
+
+
+def inbound_cli_http1_error_payload(*, reason: str, detail: str) -> Dict[str, str]:
+    return {
+        "error": "cursor_agent_cli_inbound_http1",
+        "reason": reason,
+        "detail": detail,
+    }
+
+
+def _payload_from_http_body(body: bytes, content_type: str) -> bytes:
+    lowered = content_type.lower()
+    if "connect+proto" not in lowered:
+        return body
+    try:
+        frames = decode_connect_proto_frames(body)
+    except Exception:
+        return body
+    for frame in frames:
+        if not frame.is_end_stream:
+            return frame.payload
+    return b""
+
+
+def parse_bidi_request_id(body: bytes, content_type: str = CURSOR_AGENT_CONNECT_CONTENT_TYPE) -> str:
+    """Parse ``aiserver.v1.BidiRequestId.request_id`` from a RunSSE body."""
+    payload = _payload_from_http_body(body, content_type)
+    if not payload:
+        return ""
+    try:
+        fields = _decode_proto_fields(payload)
+    except Exception:
+        return ""
+    return _decode_proto_string(_proto_last_field(fields, 1, wire_type=2) or b"")
+
+
+def encode_bidi_request_id(request_id: str) -> bytes:
+    """Connect-proto envelope for the HTTP/1.1 RunSSE first client message."""
+    return encode_connect_proto_frame(_encode_proto_string_field(1, request_id, include_empty=True))
+
+
+def parse_bidi_append_request(
+    body: bytes,
+    content_type: str = "application/proto",
+) -> Dict[str, Any]:
+    """Parse the CLI HTTP/1.1 ``BidiAppend`` unary body.
+
+    Field 4 ``data_binary`` is the AgentClientMessage protobuf. Field 1 ``data``
+    is the same payload as lowercase hex when binary encoding is off.
+    """
+    payload = _payload_from_http_body(body, content_type)
+    parsed: Dict[str, Any] = {
+        "request_id": "",
+        "append_seqno": 0,
+        "client_message": b"",
+        "binary": False,
+    }
+    if not payload:
+        return parsed
+    try:
+        fields = _decode_proto_fields(payload)
+    except Exception as exc:
+        raise CursorConnectProtocolError("HTTP/1.1 BidiAppend body is not valid protobuf.") from exc
+    data_hex = _decode_proto_string(_proto_last_field(fields, 1, wire_type=2) or b"")
+    request_id_msg = _proto_last_field(fields, 2, wire_type=2)
+    if isinstance(request_id_msg, bytes):
+        try:
+            parsed["request_id"] = _decode_proto_string(
+                _proto_last_field(_decode_proto_fields(request_id_msg), 1, wire_type=2) or b""
+            )
+        except Exception:
+            parsed["request_id"] = ""
+    seqno = _proto_last_field(fields, 3, wire_type=0)
+    if isinstance(seqno, int):
+        parsed["append_seqno"] = seqno
+    data_binary = _proto_last_field(fields, 4, wire_type=2)
+    if isinstance(data_binary, bytes) and data_binary:
+        parsed["client_message"] = data_binary
+        parsed["binary"] = True
+    elif data_hex:
+        try:
+            parsed["client_message"] = bytes.fromhex(data_hex)
+        except ValueError as exc:
+            raise CursorConnectProtocolError("HTTP/1.1 BidiAppend data hex is invalid.") from exc
+    return parsed
+
+
+def encode_bidi_append_request(
+    request_id: str,
+    append_seqno: int,
+    client_message: bytes,
+    *,
+    binary: bool = True,
+) -> bytes:
+    """Encode ``aiserver.v1.BidiAppendRequest`` protobuf (unary body, not Connect)."""
+    request_id_msg = _encode_proto_string_field(1, request_id, include_empty=True)
+    parts = [
+        _encode_proto_message_field(2, request_id_msg),
+        _encode_proto_varint_field(3, append_seqno, include_default=True),
+    ]
+    if binary:
+        parts.insert(0, _encode_proto_bytes_field(4, client_message, include_empty=True))
+    else:
+        parts.insert(0, _encode_proto_string_field(1, client_message.hex(), include_empty=True))
+    return b"".join(parts)
+
+
+class _Http1AgentnLane:
+    """One HTTP/1.1 RunSSE stream plus its later unary BidiAppend writes."""
+
+    def __init__(self, request_id: str) -> None:
+        self.request_id = request_id
+        self.session: Optional[_AgentnH2Session] = None
+        self.opened = asyncio.Event()
+        self.closed = False
+        self.sniffed: Dict[str, str] = {}
+
+    async def write_client_message(self, message: bytes) -> None:
+        await asyncio.wait_for(self.opened.wait(), timeout=10.0)
+        session = self.session
+        if self.closed or session is None:
+            raise CursorConnectError(
+                "HTTP/1.1 Agent CLI lane is closed.",
+                status_code=404,
+            )
+        if message:
+            self.sniffed.update(_sniff_run_metadata(encode_connect_proto_frame(message)))
+            await session.write_request(encode_connect_proto_frame(message), end_stream=False)
+
+    async def aclose(self) -> None:
+        self.closed = True
+        self.opened.set()
+        session = self.session
+        self.session = None
+        if session is not None:
+            await session.aclose()
+
+
+class _Http1LaneRegistry:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._lanes: Dict[str, _Http1AgentnLane] = {}
+
+    async def register(self, request_id: str) -> _Http1AgentnLane:
+        async with self._lock:
+            existing = self._lanes.get(request_id)
+            if existing is not None and not existing.closed:
+                return existing
+            if len(self._lanes) >= _MAX_HTTP1_LANE_SESSIONS:
+                raise CursorConnectError(
+                    "HTTP/1.1 Agent CLI lane registry is full.",
+                    status_code=503,
+                )
+            lane = _Http1AgentnLane(request_id)
+            self._lanes[request_id] = lane
+            return lane
+
+    async def get(self, request_id: str) -> Optional[_Http1AgentnLane]:
+        async with self._lock:
+            return self._lanes.get(request_id)
+
+    async def discard(self, request_id: str) -> None:
+        async with self._lock:
+            self._lanes.pop(request_id, None)
+
+
+_http1_lanes = _Http1LaneRegistry()
 
 
 def _sniff_run_metadata(buffer: bytes) -> Dict[str, str]:
@@ -433,6 +631,7 @@ async def _persist_inbound_cli_turn(
     status_code: int,
     start_time: datetime,
     error: Optional[str] = None,
+    connect_method: str = "Run",
 ) -> None:
     kwargs = build_inbound_cli_session_history_kwargs(
         call_id=call_id,
@@ -440,6 +639,7 @@ async def _persist_inbound_cli_turn(
         model_id=sniffed.get("model_id") or "",
         conversation_id=sniffed.get("conversation_id") or "",
         run_id=sniffed.get("run_id") or "",
+        connect_method=connect_method,
         http_version=http_version,
         client_host=client_host,
     )
@@ -809,7 +1009,7 @@ def _upstream_request_headers(
         if lowered in seen or lowered in _HOP_BY_HOP or lowered == "authorization":
             continue
         if lowered in _FORWARDED_REQUEST_HEADERS or lowered.startswith("x-cursor-"):
-            if lowered == "x-cursor-checksum":
+            if lowered in {"x-cursor-checksum", "x-cursor-streaming"}:
                 continue
             forwarded.append((lowered, str(value)))
             seen.add(lowered)
@@ -819,7 +1019,7 @@ def _upstream_request_headers(
     return forwarded
 
 
-async def proxy_inbound_cli_run(
+async def proxy_inbound_cli_run(  # noqa: PLR0915
     scope: Mapping[str, Any],
     receive: Callable[[], Awaitable[Mapping[str, Any]]],
     send: Callable[[Mapping[str, Any]], Awaitable[None]],
@@ -1006,17 +1206,309 @@ async def proxy_inbound_cli_run(
             status_code=status_code,
             start_time=start_time,
             error=error_message,
+            connect_method="Run",
         )
 
 
+async def _read_asgi_body(
+    receive: Callable[[], Awaitable[Mapping[str, Any]]],
+) -> bytes:
+    chunks: List[bytes] = []
+    total = 0
+    while True:
+        message = await receive()
+        message_type = message.get("type")
+        if message_type == "http.disconnect":
+            break
+        if message_type != "http.request":
+            continue
+        body = bytes(message.get("body") or b"")
+        total += len(body)
+        if total > _MAX_HTTP1_LANE_BODY_BYTES:
+            raise CursorConnectError(
+                "HTTP/1.1 Agent CLI body exceeds the maximum supported size.",
+                status_code=413,
+            )
+        if body:
+            chunks.append(body)
+        if not message.get("more_body", False):
+            break
+    return b"".join(chunks)
+
+
+async def proxy_inbound_cli_runsse(  # noqa: PLR0915
+    scope: Mapping[str, Any],
+    receive: Callable[[], Awaitable[Mapping[str, Any]]],
+    send: Callable[[Mapping[str, Any]], Awaitable[None]],
+    *,
+    session_factory: Optional[Callable[[], _AgentnH2Session]] = None,
+    turn_base: str = CURSOR_AGENT_TURN_HOST,
+    lanes: Optional[_Http1LaneRegistry] = None,
+) -> None:
+    """HTTP/1.1 Connect server-stream ``RunSSE`` compatibility lane.
+
+    The CLI remaps logical ``run`` here and sends later client frames as
+    unary ``BidiAppend``. Upstream egress stays HTTP/2 ``Run``.
+    """
+    start_time = datetime.now(timezone.utc)
+    call_id = str(uuid.uuid4())
+    headers = _asgi_headers(scope)
+    http_version = _http_version(scope)
+    client_host = _client_host(scope)
+    sniffed: Dict[str, str] = {}
+    status_code = 500
+    error_message: Optional[str] = None
+    session: Optional[_AgentnH2Session] = None
+    response_started = False
+    request_id = ""
+    registry = lanes if lanes is not None else _http1_lanes
+    lane: Optional[_Http1AgentnLane] = None
+
+    try:
+        if http_version == "2":
+            status_code = 505
+            error_message = "HTTP/1.1 required for AgentService/RunSSE"
+            await _send_json_error(
+                send,
+                status_code=505,
+                payload=inbound_cli_http1_error_payload(
+                    reason="http1_required",
+                    detail=error_message,
+                ),
+            )
+            return
+        try:
+            access_token = require_inbound_cli_bearer(headers)
+        except InboundCursorAgentCliAuthError as exc:
+            status_code = exc.status_code
+            error_message = exc.reason
+            await _send_json_error(
+                send,
+                status_code=exc.status_code,
+                payload=inbound_cli_auth_error_payload(exc),
+            )
+            return
+
+        body = await _read_asgi_body(receive)
+        content_type = _get_header(headers, "content-type") or CURSOR_AGENT_CONNECT_CONTENT_TYPE
+        request_id = parse_bidi_request_id(body, content_type) or _get_header(
+            headers, "x-request-id"
+        )
+        if not request_id:
+            status_code = 400
+            error_message = "missing_bidi_request_id"
+            await _send_json_error(
+                send,
+                status_code=400,
+                payload=inbound_cli_http1_error_payload(
+                    reason=error_message,
+                    detail="HTTP/1.1 RunSSE requires aiserver.v1.BidiRequestId.",
+                ),
+            )
+            return
+
+        verbose_proxy_logger.info(
+            "cursor_agent_cli_inbound RunSSE http_version=%s client=%s",
+            http_version,
+            client_host,
+        )
+        lane = await registry.register(request_id)
+        session = session_factory() if session_factory is not None else _AgentnH2Session(turn_base)
+        lane.session = session
+        await session.open(_upstream_request_headers(headers, access_token))
+        lane.opened.set()
+
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", CURSOR_AGENT_CONNECT_CONTENT_TYPE.encode("ascii")),
+                    (b"connect-protocol-version", b"1"),
+                ],
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": _connect_header_flush_frame(),
+                "more_body": True,
+            }
+        )
+        response_started = True
+        status_code = 200
+        async for chunk in session.iter_response_data():
+            if chunk:
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": chunk,
+                        "more_body": True,
+                    }
+                )
+            if session.response_status >= 400:
+                status_code = session.response_status
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+        if session.response_status >= 400:
+            status_code = session.response_status
+            error_message = f"upstream_http_{session.response_status}"
+        sniffed.update(lane.sniffed)
+    except InboundCursorAgentCliAuthError as exc:
+        status_code = exc.status_code
+        error_message = exc.reason
+        if not response_started:
+            await _send_json_error(
+                send,
+                status_code=exc.status_code,
+                payload=inbound_cli_auth_error_payload(exc),
+            )
+    except CursorConnectError as exc:
+        status_code = int(getattr(exc, "status_code", 502) or 502)
+        error_message = "upstream_connect_error"
+        verbose_proxy_logger.warning(
+            "cursor_agent_cli_inbound RunSSE connect error: %s",
+            exc.message,
+        )
+        if not response_started:
+            await _send_json_error(
+                send,
+                status_code=status_code,
+                payload={
+                    "error": "cursor_agent_cli_inbound_upstream",
+                    "reason": error_message,
+                    "detail": "Cursor Agent CLI inbound HTTP/1.1 RunSSE egress failed.",
+                },
+            )
+    except Exception as exc:
+        status_code = 502
+        error_message = "inbound_proxy_error"
+        verbose_proxy_logger.warning("cursor_agent_cli_inbound RunSSE proxy error: %s", exc)
+        if not response_started:
+            await _send_json_error(
+                send,
+                status_code=502,
+                payload={
+                    "error": "cursor_agent_cli_inbound_upstream",
+                    "reason": error_message,
+                    "detail": "Cursor Agent CLI inbound HTTP/1.1 RunSSE proxy failed.",
+                },
+            )
+    finally:
+        if lane is not None:
+            sniffed.update(lane.sniffed)
+            await lane.aclose()
+            await registry.discard(request_id)
+        elif session is not None:
+            await session.aclose()
+        await _persist_inbound_cli_turn(
+            call_id=call_id,
+            headers=headers,
+            sniffed=sniffed,
+            http_version=http_version,
+            client_host=client_host,
+            status_code=status_code,
+            start_time=start_time,
+            error=error_message,
+            connect_method="RunSSE",
+        )
+
+
+async def proxy_inbound_cli_bidi_append(
+    scope: Mapping[str, Any],
+    receive: Callable[[], Awaitable[Mapping[str, Any]]],
+    send: Callable[[Mapping[str, Any]], Awaitable[None]],
+    *,
+    lanes: Optional[_Http1LaneRegistry] = None,
+) -> None:
+    """Unary HTTP/1.1 ``BidiAppend`` that writes onto the matching RunSSE lane."""
+    headers = _asgi_headers(scope)
+    registry = lanes if lanes is not None else _http1_lanes
+    try:
+        try:
+            require_inbound_cli_bearer(headers)
+        except InboundCursorAgentCliAuthError as exc:
+            await _send_json_error(
+                send,
+                status_code=exc.status_code,
+                payload=inbound_cli_auth_error_payload(exc),
+            )
+            return
+
+        body = await _read_asgi_body(receive)
+        content_type = _get_header(headers, "content-type") or "application/proto"
+        parsed = parse_bidi_append_request(body, content_type)
+        request_id = parsed.get("request_id") or ""
+        if not request_id:
+            await _send_json_error(
+                send,
+                status_code=400,
+                payload=inbound_cli_http1_error_payload(
+                    reason="missing_bidi_request_id",
+                    detail="HTTP/1.1 BidiAppend requires aiserver.v1.BidiRequestId.",
+                ),
+            )
+            return
+        lane = await registry.get(request_id)
+        if lane is None or lane.closed:
+            await _send_json_error(
+                send,
+                status_code=404,
+                payload=inbound_cli_http1_error_payload(
+                    reason="unknown_bidi_request_id",
+                    detail="HTTP/1.1 BidiAppend has no matching RunSSE lane.",
+                ),
+            )
+            return
+        await lane.write_client_message(bytes(parsed.get("client_message") or b""))
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"application/proto"),
+                    (b"content-length", b"0"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+    except CursorConnectProtocolError as exc:
+        await _send_json_error(
+            send,
+            status_code=400,
+            payload=inbound_cli_http1_error_payload(
+                reason="invalid_bidi_append",
+                detail=str(exc.message),
+            ),
+        )
+    except CursorConnectError as exc:
+        await _send_json_error(
+            send,
+            status_code=int(getattr(exc, "status_code", 502) or 502),
+            payload=inbound_cli_http1_error_payload(
+                reason="bidi_append_upstream",
+                detail="HTTP/1.1 BidiAppend failed to write the Agent CLI lane.",
+            ),
+        )
+    except Exception as exc:
+        verbose_proxy_logger.warning("cursor_agent_cli_inbound BidiAppend proxy error: %s", exc)
+        await _send_json_error(
+            send,
+            status_code=502,
+            payload=inbound_cli_http1_error_payload(
+                reason="inbound_proxy_error",
+                detail="Cursor Agent CLI inbound HTTP/1.1 BidiAppend proxy failed.",
+            ),
+        )
+
 
 class CursorAgentCliInboundMiddleware:
-    """Outermost ASGI intercept for inbound HTTP/2 Connect ``Run``.
+    """Outermost ASGI intercept for inbound Agent CLI Connect.
 
     FastAPI ``request_response`` waits for the handler to return before the
-    custom Response ASGI cycle starts. Connect bidi does not EndBody until
-    response headers arrive, so the FastAPI route deadlocks. This middleware
-    bypasses FastAPI for ``POST /agent.v1.AgentService/Run``.
+    custom Response ASGI cycle starts. Connect streaming does not EndBody
+    until response headers arrive, so FastAPI routes deadlock. This
+    middleware bypasses FastAPI for HTTP/2 ``Run`` and HTTP/1.1
+    ``RunSSE`` / ``BidiAppend``.
     """
 
     def __init__(self, app: Any) -> None:
@@ -1030,6 +1522,12 @@ class CursorAgentCliInboundMiddleware:
     ) -> None:
         if is_cursor_agent_cli_run_scope(scope):
             await proxy_inbound_cli_run(scope, receive, send)
+            return
+        if is_cursor_agent_cli_runsse_scope(scope):
+            await proxy_inbound_cli_runsse(scope, receive, send)
+            return
+        if is_cursor_agent_cli_bidi_append_scope(scope):
+            await proxy_inbound_cli_bidi_append(scope, receive, send)
             return
         await self.app(scope, receive, send)
 
@@ -1066,3 +1564,39 @@ async def cursor_agent_cli_run_endpoint(request: Request) -> Response:
     token, not a LiteLLM virtual key.
     """
     return CursorAgentCliInboundResponse()
+
+
+class CursorAgentCliInboundRunSSEResponse(Response):
+    """Starlette response that takes over the ASGI cycle for HTTP/1.1 RunSSE."""
+
+    media_type = CURSOR_AGENT_CONNECT_CONTENT_TYPE
+
+    async def __call__(self, scope, receive, send) -> None:
+        await proxy_inbound_cli_runsse(scope, receive, send)
+
+
+class CursorAgentCliInboundBidiAppendResponse(Response):
+    """Starlette response that takes over the ASGI cycle for unary BidiAppend."""
+
+    media_type = "application/proto"
+
+    async def __call__(self, scope, receive, send) -> None:
+        await proxy_inbound_cli_bidi_append(scope, receive, send)
+
+
+async def cursor_agent_cli_runsse_endpoint(request: Request) -> Response:
+    """FastAPI entry for inbound HTTP/1.1 Connect ``RunSSE``.
+
+    Compatibility lane only. Does not change HTTP/2 ``Run``. ``RunPoll`` is
+    not the ``--print`` path.
+    """
+    return CursorAgentCliInboundRunSSEResponse()
+
+
+async def cursor_agent_cli_bidi_append_endpoint(request: Request) -> Response:
+    """FastAPI entry for inbound HTTP/1.1 unary ``BidiAppend``.
+
+    Subsequent client frames after ``RunSSE``. Does not change HTTP/2
+    ``Run``. ``RunPoll`` is not the ``--print`` path.
+    """
+    return CursorAgentCliInboundBidiAppendResponse()

@@ -25,12 +25,23 @@ from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
     CURSOR_AGENT_CLI_INBOUND_TRACE_NAME,
     CursorAgentCliInboundMiddleware,
     InboundCursorAgentCliAuthError,
+    _Http1LaneRegistry,
     _connect_header_flush_frame,
     _request_context_exec_replies,
     _summarize_connect_chunk,
+    _upstream_request_headers,
     build_inbound_cli_session_history_kwargs,
+    encode_bidi_append_request,
+    encode_bidi_request_id,
     inbound_cli_auth_error_payload,
+    is_cursor_agent_cli_bidi_append_scope,
+    is_cursor_agent_cli_run_scope,
+    is_cursor_agent_cli_runsse_scope,
+    parse_bidi_append_request,
+    parse_bidi_request_id,
+    proxy_inbound_cli_bidi_append,
     proxy_inbound_cli_run,
+    proxy_inbound_cli_runsse,
     require_inbound_cli_bearer,
 )
 
@@ -248,6 +259,7 @@ async def test_proxy_inbound_cli_run_forwards_bearer_and_body() -> None:
     assert persist_kwargs["sniffed"]["model_id"] == "composer-2.5"
     assert persist_kwargs["sniffed"]["conversation_id"] == "conv-1"
     assert persist_kwargs["http_version"] == "2"
+    assert persist_kwargs["connect_method"] == "Run"
     assert persist_kwargs["status_code"] == 200
 
 
@@ -625,3 +637,272 @@ def test_parse_cursor_cli_user_agent() -> None:
     )
     assert name == "cursor-cli"
     assert version == "2026.09.08-6caf4ff"
+
+
+def test_http2_run_scope_does_not_match_runsse_or_bidiappend() -> None:
+    run_scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/agent.v1.AgentService/Run",
+    }
+    runsse_scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/agent.v1.AgentService/RunSSE",
+    }
+    bidi_scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/aiserver.v1.BidiService/BidiAppend",
+    }
+    poll_scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/agent.v1.AgentService/RunPoll",
+    }
+    assert is_cursor_agent_cli_run_scope(run_scope) is True
+    assert is_cursor_agent_cli_run_scope(runsse_scope) is False
+    assert is_cursor_agent_cli_run_scope(bidi_scope) is False
+    assert is_cursor_agent_cli_run_scope(poll_scope) is False
+    assert is_cursor_agent_cli_runsse_scope(runsse_scope) is True
+    assert is_cursor_agent_cli_runsse_scope(run_scope) is False
+    assert is_cursor_agent_cli_bidi_append_scope(bidi_scope) is True
+    assert is_cursor_agent_cli_bidi_append_scope(run_scope) is False
+
+
+def test_upstream_http2_headers_omit_cursor_streaming() -> None:
+    forwarded = _upstream_request_headers(
+        {
+            "authorization": "Bearer cursor-access-token",
+            "content-type": "application/connect+proto",
+            "x-cursor-streaming": "true",
+            "x-request-id": "req-http2",
+        },
+        "cursor-access-token",
+    )
+    names = {name for name, _value in forwarded}
+    assert ("authorization", "Bearer cursor-access-token") in forwarded
+    assert "x-cursor-streaming" not in names
+    assert ("x-request-id", "req-http2") in forwarded
+
+
+def test_bidi_append_round_trip_binary_and_hex() -> None:
+    payload = decode_connect_proto_frames(_run_frame())[0].payload
+    encoded = encode_bidi_append_request("req-lane-1", 0, payload, binary=True)
+    parsed = parse_bidi_append_request(encoded, "application/proto")
+    assert parsed["request_id"] == "req-lane-1"
+    assert parsed["append_seqno"] == 0
+    assert parsed["binary"] is True
+    assert parsed["client_message"] == payload
+
+    hex_encoded = encode_bidi_append_request("req-lane-1", 1, payload, binary=False)
+    hex_parsed = parse_bidi_append_request(hex_encoded, "application/proto")
+    assert hex_parsed["request_id"] == "req-lane-1"
+    assert hex_parsed["append_seqno"] == 1
+    assert hex_parsed["binary"] is False
+    assert hex_parsed["client_message"] == payload
+
+
+def test_parse_bidi_request_id_from_connect_envelope() -> None:
+    body = encode_bidi_request_id("req-lane-1")
+    assert parse_bidi_request_id(body, "application/connect+proto") == "req-lane-1"
+
+
+@pytest.mark.asyncio
+async def test_proxy_inbound_cli_runsse_rejects_http2() -> None:
+    sent: List[Dict[str, Any]] = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    persist = AsyncMock()
+    with patch(
+        "litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound._persist_inbound_cli_turn",
+        persist,
+    ):
+        await proxy_inbound_cli_runsse(
+            {
+                "type": "http",
+                "http_version": "2",
+                "method": "POST",
+                "path": "/agent.v1.AgentService/RunSSE",
+                "headers": [(b"authorization", b"Bearer cursor-access-token")],
+            },
+            receive,
+            send,
+        )
+    start = next(message for message in sent if message.get("type") == "http.response.start")
+    assert start["status"] == 505
+    persist.assert_awaited()
+    assert persist.await_args.kwargs["connect_method"] == "RunSSE"
+
+
+@pytest.mark.asyncio
+async def test_proxy_inbound_cli_runsse_and_bidiappend_share_agentn_lane() -> None:
+    class _LaneSession(_FakeSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self._wrote = asyncio.Event()
+            self._closed = asyncio.Event()
+            self._chunks = [b"upstream-connect-bytes"]
+
+        async def write_request(self, data: bytes, *, end_stream: bool = False) -> None:
+            await super().write_request(data, end_stream=end_stream)
+            if data:
+                self._wrote.set()
+
+        async def iter_response_data(self):
+            await self._wrote.wait()
+            for chunk in list(self._chunks):
+                yield chunk
+
+        async def aclose(self) -> None:
+            self.closed = True
+            self._closed.set()
+
+    session = _LaneSession()
+    lanes = _Http1LaneRegistry()
+    persist = AsyncMock()
+    run_payload = decode_connect_proto_frames(_run_frame())[0].payload
+    request_id = "req-lane-1"
+    expected_agentn_frame = encode_connect_proto_frame(run_payload)
+
+    runsse_messages = [
+        {
+            "type": "http.request",
+            "body": encode_bidi_request_id(request_id),
+            "more_body": False,
+        }
+    ]
+    append_messages = [
+        {
+            "type": "http.request",
+            "body": encode_bidi_append_request(request_id, 0, run_payload, binary=True),
+            "more_body": False,
+        }
+    ]
+    sent_runsse: List[Dict[str, Any]] = []
+    sent_append: List[Dict[str, Any]] = []
+    response_started = asyncio.Event()
+
+    async def receive_runsse():
+        if runsse_messages:
+            return runsse_messages.pop(0)
+        await response_started.wait()
+        return {"type": "http.disconnect"}
+
+    async def send_runsse(message):
+        sent_runsse.append(message)
+        if message.get("type") == "http.response.start":
+            response_started.set()
+
+    async def receive_append():
+        return append_messages.pop(0)
+
+    async def send_append(message):
+        sent_append.append(message)
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound._persist_inbound_cli_turn",
+        persist,
+    ):
+        runsse_task = asyncio.create_task(
+            proxy_inbound_cli_runsse(
+                {
+                    "type": "http",
+                    "http_version": "1.1",
+                    "method": "POST",
+                    "path": "/agent.v1.AgentService/RunSSE",
+                    "headers": [
+                        (b"authorization", b"Bearer cursor-access-token"),
+                        (b"content-type", b"application/connect+proto"),
+                        (b"x-cursor-streaming", b"true"),
+                        (b"x-request-id", request_id.encode("ascii")),
+                    ],
+                    "client": ("127.0.0.1", 9),
+                },
+                receive_runsse,
+                send_runsse,
+                session_factory=lambda: session,
+                lanes=lanes,
+            )
+        )
+        await asyncio.wait_for(response_started.wait(), timeout=2)
+        await proxy_inbound_cli_bidi_append(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/aiserver.v1.BidiService/BidiAppend",
+                "headers": [
+                    (b"authorization", b"Bearer cursor-access-token"),
+                    (b"content-type", b"application/proto"),
+                    (b"x-cursor-streaming", b"true"),
+                    (b"x-request-id", request_id.encode("ascii")),
+                ],
+            },
+            receive_append,
+            send_append,
+            lanes=lanes,
+        )
+        await asyncio.wait_for(runsse_task, timeout=2)
+
+    assert session.opened_headers is not None
+    names = {name for name, _value in session.opened_headers}
+    assert ("authorization", "Bearer cursor-access-token") in session.opened_headers
+    assert "x-cursor-streaming" not in names
+    assert expected_agentn_frame in session.written
+    append_start = next(
+        message for message in sent_append if message.get("type") == "http.response.start"
+    )
+    assert append_start["status"] == 200
+    runsse_start = next(
+        message for message in sent_runsse if message.get("type") == "http.response.start"
+    )
+    assert runsse_start["status"] == 200
+    persist.assert_awaited()
+    persist_kwargs = persist.await_args.kwargs
+    assert persist_kwargs["connect_method"] == "RunSSE"
+    assert persist_kwargs["http_version"] == "1.1"
+    assert persist_kwargs["sniffed"]["model_id"] == "composer-2.5"
+
+
+@pytest.mark.asyncio
+async def test_inbound_middleware_dispatches_http1_without_fastapi() -> None:
+    inner_called = False
+
+    async def inner(scope, receive, send):
+        nonlocal inner_called
+        inner_called = True
+        await asyncio.sleep(3600)
+
+    middleware = CursorAgentCliInboundMiddleware(inner)
+    sent: List[Dict[str, Any]] = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    persist = AsyncMock()
+    with patch(
+        "litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound._persist_inbound_cli_turn",
+        persist,
+    ):
+        await middleware(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "path": "/agent.v1.AgentService/RunSSE",
+                "headers": [(b"authorization", b"Basic Y3Vyc29yLWtleTo=")],
+            },
+            receive,
+            send,
+        )
+    assert inner_called is False
+    start = next(message for message in sent if message.get("type") == "http.response.start")
+    assert start["status"] == 401

@@ -84,8 +84,10 @@ from litellm.llms.xai.oauth import (
 from litellm.llms.xai.route_descriptors import (
     GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
     GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+    XAI_NATIVE_RESPONSES_TOOL_HISTORY_CAPABILITY,
     XAI_OAUTH_CREDENTIAL_FAMILY,  # noqa: F401 - codex candidate host binding
     XAI_OAUTH_ROUTE_FAMILY,  # noqa: F401 - codex candidate host binding
+    has_grok_native_route_capability,
 )
 from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 from litellm.proxy._types import *
@@ -3270,6 +3272,34 @@ def _prepare_grok_logging_body_for_passthrough(
     )
 
 
+def _grok_cli_passthrough_history_model(prepared_body: dict[str, Any]) -> Any:
+    """Prefer the Grok CLI override, then the request model, for history policy."""
+
+    metadata = prepared_body.get("litellm_metadata")
+    if isinstance(metadata, dict):
+        override = metadata.get("grok_model_override")
+        if isinstance(override, str) and override.strip():
+            return override.strip()
+    return prepared_body.get("model")
+
+
+def _preserve_or_rewrite_grok_cli_input_history_in_place(
+    prepared_body: dict[str, Any],
+) -> None:
+    """Keep grok-4.6 typed tool history; flatten only models that still rewrite."""
+
+    model = _grok_cli_passthrough_history_model(prepared_body)
+    if has_grok_native_route_capability(
+        model, XAI_NATIVE_RESPONSES_TOOL_HISTORY_CAPABILITY
+    ):
+        _anthropic_grok_normalization.preserve_typed_function_history_in_place(
+            prepared_body
+        )
+        return
+    _sanitize_grok_native_function_call_arguments_in_place(prepared_body)
+    _rewrite_grok_native_unsupported_input_items_in_place(prepared_body)
+
+
 def _prepare_grok_request_body_for_passthrough(
     *,
     request: Request,
@@ -3287,8 +3317,7 @@ def _prepare_grok_request_body_for_passthrough(
         prepared_body,
         _grok_unsupported_input_items,
     ) = _drop_unsupported_codex_input_items_from_request_body(prepared_body)
-    _sanitize_grok_native_function_call_arguments_in_place(prepared_body)
-    _rewrite_grok_native_unsupported_input_items_in_place(prepared_body)
+    _preserve_or_rewrite_grok_cli_input_history_in_place(prepared_body)
     (
         prepared_body,
         _removed_tool_choice,
@@ -6760,6 +6789,44 @@ async def cursor_agent_cli_run_route(request: Request):
     )
 
     return await cursor_agent_cli_run_endpoint(request)
+
+
+@router.api_route(
+    "/agent.v1.AgentService/RunSSE",
+    methods=["POST"],
+    tags=["Cursor Agent CLI inbound", "pass-through"],
+)
+async def cursor_agent_cli_runsse_route(request: Request):
+    """Inbound Cursor Agent CLI HTTP/1.1 Connect ``RunSSE``.
+
+    Compatibility lane when the CLI remaps logical ``run`` under HTTP/1.1
+    (``useHttp1ForAgent`` or server force-disable). This does not change
+    HTTP/2 ``POST /agent.v1.AgentService/Run``. ``RunPoll`` is not the
+    ``--print`` path.
+    """
+    from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
+        cursor_agent_cli_runsse_endpoint,
+    )
+
+    return await cursor_agent_cli_runsse_endpoint(request)
+
+
+@router.api_route(
+    "/aiserver.v1.BidiService/BidiAppend",
+    methods=["POST"],
+    tags=["Cursor Agent CLI inbound", "pass-through"],
+)
+async def cursor_agent_cli_bidi_append_route(request: Request):
+    """Inbound Cursor Agent CLI HTTP/1.1 unary ``BidiAppend``.
+
+    Subsequent client frames after ``RunSSE``. Does not change HTTP/2
+    ``Run``. ``RunPoll`` is not the ``--print`` path.
+    """
+    from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
+        cursor_agent_cli_bidi_append_endpoint,
+    )
+
+    return await cursor_agent_cli_bidi_append_endpoint(request)
 
 
 async def vertex_ai_live_websocket_passthrough(

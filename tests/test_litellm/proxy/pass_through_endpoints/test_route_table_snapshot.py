@@ -37,6 +37,16 @@ _EXPECTED_ROUTES: frozenset[tuple[str, tuple[str, ...], str]] = frozenset(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints",
         ),
         (
+            "/agent.v1.AgentService/RunSSE",
+            ("POST",),
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints",
+        ),
+        (
+            "/aiserver.v1.BidiService/BidiAppend",
+            ("POST",),
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints",
+        ),
+        (
             "/anthropic",
             ("HEAD",),
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints",
