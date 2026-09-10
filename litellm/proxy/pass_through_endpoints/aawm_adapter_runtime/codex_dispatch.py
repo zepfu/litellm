@@ -473,10 +473,22 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
     import litellm
 
     codex_collaboration_identities = []
-    normalized_request_body = normalize_codex_collaboration_dispatch_body(
-        prepared_request_body,
-        identity_collector=codex_collaboration_identities,
-    )
+    try:
+        normalized_request_body = normalize_codex_collaboration_dispatch_body(
+            prepared_request_body,
+            identity_collector=codex_collaboration_identities,
+        )
+    except Exception as exc:
+        # Normalization is pre-egress and may fail before the route guard's
+        # normal exception finalizer runs. Release any inherited reservation.
+        _sa = _session_affinity_mod()
+        await _sa.finalize_request_session_owner_lease(
+            request=request,
+            exc=exc,
+            failure_phase="codex_collaboration_dispatch_preflight",
+            raise_on_promote_failure=False,
+        )
+        raise
     bind_codex_collaboration_tool_identities(
         request,
         codex_collaboration_identities,
