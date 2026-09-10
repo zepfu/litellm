@@ -422,6 +422,35 @@ label.
    value to `false` and redeploy. Remove the record from the explicit inventory
    before archiving its file. Unlisted files and backups are never enrolled.
 
+### Testing switch for a single egress path
+
+`load_codex_oauth_inventory()` resolves each record's effective `enabled`
+flag on every parse. Highest priority first:
+
+1. Overlay JSON at `AAWM_CODEX_OAUTH_ACCOUNT_ENABLE_FILE` (default
+   `/app/.analysis/runtime/codex_oauth_account_enable.json` in managed
+   Compose). Object of `label -> boolean`, for example
+   `{"account1": false, "account2": true}`. Missing file is a no-op.
+2. Process env `AAWM_CODEX_OAUTH_ACCOUNT1_ENABLED` /
+   `AAWM_CODEX_OAUTH_ACCOUNT2_ENABLED` (`1`/`true`/`yes`/`on` vs
+   `0`/`false`/`no`/`off`). Unset/empty means no env override.
+3. The inventory JSON `enabled` field from Compose interpolation.
+
+The overlay is for forcing one Codex OAuth egress path during testing. It
+contains no secrets and does not swap `account1` / `account2` files or
+hashes. Clear it to restore both accounts:
+
+```bash
+./.venv/bin/python scripts/set_codex_oauth_test_accounts.py --only account2
+./.venv/bin/python scripts/set_codex_oauth_test_accounts.py --only account1
+./.venv/bin/python scripts/set_codex_oauth_test_accounts.py --account1 on --account2 off
+./.venv/bin/python scripts/set_codex_oauth_test_accounts.py --show
+./.venv/bin/python scripts/set_codex_oauth_test_accounts.py --clear
+```
+
+A running proxy honors overlay/env changes on the next inventory load.
+Changing only the Compose JSON interpolation still requires a recreate.
+
 The managed proxy mounts `/home/zepfu/.codex` read-only. The provider-status
 sidecar mounts the same parent directory read-write so its lock and atomic
 `os.replace` publication remain visible to readers. Keep directory mounts

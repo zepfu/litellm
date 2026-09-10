@@ -28,6 +28,9 @@ CODEX_OAUTH_ACCOUNT_HASH_LENGTH = 12
 CODEX_OAUTH_AUTH_FILE_MODE = 0o600
 CODEX_OAUTH_AUTH_FILE_MAX_BYTES = 1_048_576
 CODEX_OAUTH_SNAPSHOT_CACHE_MAX_ENTRIES = 128
+CODEX_OAUTH_ACCOUNT_ENABLE_FILE_ENV = "AAWM_CODEX_OAUTH_ACCOUNT_ENABLE_FILE"
+_TRUE_ENABLE_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_ENABLE_VALUES = frozenset({"0", "false", "no", "off"})
 
 _SAFE_LABEL_RE = re.compile(r"\A[a-z][a-z0-9._-]{0,63}\Z")
 _ACCOUNT_HASH_RE = re.compile(
@@ -403,12 +406,17 @@ def parse_codex_oauth_inventory(payload: Any) -> CodexOAuthInventory:
         )
 
     routing = _parse_routing_policy(payload.get("routing"))
+    overlay = load_codex_oauth_account_enable_overlay()
     records: list[CodexOAuthCredentialRecord] = []
     seen_labels: set[str] = set()
     seen_paths: dict[str, str] = {}
     seen_account_hashes: dict[str, str] = {}
     for declaration_order, account in enumerate(accounts):
-        record = _parse_account_record(account, declaration_order=declaration_order)
+        record = _parse_account_record(
+            account,
+            declaration_order=declaration_order,
+            overlay=overlay,
+        )
         if record.label in seen_labels:
             raise CodexOAuthInventoryError(
                 f"Duplicate Codex OAuth account label '{record.label}'."
@@ -589,6 +597,7 @@ def _parse_account_record(
     payload: Any,
     *,
     declaration_order: int,
+    overlay: Optional[Mapping[str, bool]] = None,
 ) -> CodexOAuthCredentialRecord:
     if not isinstance(payload, dict):
         raise CodexOAuthInventoryError(
@@ -649,6 +658,11 @@ def _parse_account_record(
         raise CodexOAuthInventoryError(
             f"Codex OAuth account '{label}' enabled must be a boolean."
         )
+    enabled = resolve_codex_oauth_account_enabled(
+        label,
+        enabled,
+        overlay=overlay,
+    )
 
     models_value = payload.get("models")
     if not isinstance(models_value, list) or not models_value:
@@ -866,6 +880,91 @@ def _clean_string(value: Any) -> Optional[str]:
     return cleaned or None
 
 
+def _codex_oauth_account_enabled_env_name(label: str) -> str:
+    normalized = re.sub(r"[.\-]", "_", label.strip()).upper()
+    return f"AAWM_CODEX_OAUTH_{normalized}_ENABLED"
+
+
+def _parse_codex_oauth_account_enabled_flag(
+    value: Any,
+    *,
+    source: str,
+) -> bool:
+    if isinstance(value, bool):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        raise CodexOAuthInventoryError(
+            f"Codex OAuth account enable override from {source} must be a boolean."
+        )
+    normalized = value.strip().lower()
+    if normalized in _TRUE_ENABLE_VALUES:
+        return True
+    if normalized in _FALSE_ENABLE_VALUES:
+        return False
+    raise CodexOAuthInventoryError(
+        f"Codex OAuth account enable override from {source} is invalid."
+    )
+
+
+def load_codex_oauth_account_enable_overlay(
+    overlay_path: Optional[str] = None,
+) -> dict[str, bool]:
+    """Read the optional testing overlay of label -> enabled flags."""
+    raw_path = (
+        overlay_path
+        if overlay_path is not None
+        else os.getenv(CODEX_OAUTH_ACCOUNT_ENABLE_FILE_ENV)
+    )
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return {}
+    path = Path(raw_path.strip())
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, json.JSONDecodeError) as exc:
+        raise CodexOAuthInventoryError(
+            "Codex OAuth account enable overlay is not valid JSON."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise CodexOAuthInventoryError(
+            "Codex OAuth account enable overlay must be a JSON object."
+        )
+    overlay: dict[str, bool] = {}
+    for label, value in payload.items():
+        if not isinstance(label, str) or _SAFE_LABEL_RE.fullmatch(label) is None:
+            continue
+        overlay[label] = _parse_codex_oauth_account_enabled_flag(
+            value,
+            source=f"overlay:{label}",
+        )
+    return overlay
+
+
+def resolve_codex_oauth_account_enabled(
+    label: str,
+    configured_enabled: bool,
+    *,
+    overlay: Optional[Mapping[str, bool]] = None,
+) -> bool:
+    """Resolve effective account enablement: overlay, then env, then JSON."""
+    mapping = (
+        overlay
+        if overlay is not None
+        else load_codex_oauth_account_enable_overlay()
+    )
+    if label in mapping:
+        return bool(mapping[label])
+    env_name = _codex_oauth_account_enabled_env_name(label)
+    env_value = os.getenv(env_name)
+    if env_value is not None and str(env_value).strip():
+        return _parse_codex_oauth_account_enabled_flag(
+            env_value,
+            source=env_name,
+        )
+    return bool(configured_enabled)
+
+
 __all__ = [
     "CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY",
     "CODEX_OAUTH_ACCOUNT_HASH_LENGTH",
@@ -873,6 +972,7 @@ __all__ = [
     "CODEX_OAUTH_AUTH_FILE_MODE",
     "CODEX_OAUTH_INVENTORY_ENV",
     "CODEX_OAUTH_INVENTORY_SCHEMA_VERSION",
+    "CODEX_OAUTH_ACCOUNT_ENABLE_FILE_ENV",
     "CodexOAuthCredentialError",
     "CodexOAuthCredentialRecord",
     "CodexOAuthCredentialSnapshot",
@@ -889,6 +989,8 @@ __all__ = [
     "read_codex_oauth_snapshot",
     "read_codex_oauth_snapshot_sync",
     "load_codex_oauth_inventory",
+    "load_codex_oauth_account_enable_overlay",
     "parse_codex_oauth_inventory",
+    "resolve_codex_oauth_account_enabled",
     "validate_codex_oauth_account_identity",
 ]

@@ -819,6 +819,7 @@ _CODEX_AUTO_AGENT_OPENAI_ALPHA_CAPACITY_ERROR_TOKENS = frozenset(
     {
         "server_is_overloaded",
         "capacity_exhausted",
+        "MODEL_AT_CAPACITY",
     }
 )
 _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS = frozenset(

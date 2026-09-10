@@ -25,6 +25,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _classify_codex_auto_agent_retryable_exhaustion,
 )
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+    _classify_passthrough_raw_http_error,
     _execute_passthrough_pre_first_byte_with_hidden_retries,
     _is_openai_alpha_capacity_retry_target,
 )
@@ -2273,12 +2274,13 @@ class TestCoordinatorNoReplayBoundary:
         assert coordinator.retry_count == 0
 
 
-def test_central_capacity_retry_target_is_scoped_to_alpha_openai_responses(
+def test_central_capacity_retry_target_is_scoped_to_openai_responses(
     monkeypatch,
 ):
     request = _responses_request({"model": "gpt-5.4"})
     monkeypatch.delenv("AAWM_LITELLM_ENVIRONMENT", raising=False)
-    assert not _is_openai_alpha_capacity_retry_target(
+    monkeypatch.delenv("AAWM_OPENAI_CAPACITY_RETRY_ENABLED", raising=False)
+    assert _is_openai_alpha_capacity_retry_target(
         request=request,
         url=httpx.URL("https://api.openai.com/v1/responses"),
         endpoint_type=EndpointType.OPENAI,
@@ -2296,6 +2298,12 @@ def test_central_capacity_retry_target_is_scoped_to_alpha_openai_responses(
         endpoint_type=EndpointType.OPENAI,
     )
     monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-dev")
+    assert _is_openai_alpha_capacity_retry_target(
+        request=request,
+        url=httpx.URL("https://api.openai.com/v1/responses"),
+        endpoint_type=EndpointType.OPENAI,
+    )
+    monkeypatch.setenv("AAWM_OPENAI_CAPACITY_RETRY_ENABLED", "false")
     assert not _is_openai_alpha_capacity_retry_target(
         request=request,
         url=httpx.URL("https://api.openai.com/v1/responses"),
@@ -2303,12 +2311,13 @@ def test_central_capacity_retry_target_is_scoped_to_alpha_openai_responses(
     )
 
 
-def test_alpha_capacity_planner_gate_requires_codex_openai_route(monkeypatch):
+def test_alpha_capacity_planner_gate_requires_openai_responses_route(monkeypatch):
     request = _responses_request({"model": "gpt-5.4"})
     candidate = {
         "provider": "openai",
         "route_family": "codex_responses",
     }
+    monkeypatch.delenv("AAWM_OPENAI_CAPACITY_RETRY_ENABLED", raising=False)
     monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
     assert _is_openai_alpha_capacity_retry_enabled(
         request=request,
@@ -2320,21 +2329,106 @@ def test_alpha_capacity_planner_gate_requires_codex_openai_route(monkeypatch):
         candidate={**candidate, "provider": "openrouter"},
         is_codex_alias=True,
     )
-    assert not _is_openai_alpha_capacity_retry_enabled(
+    assert _is_openai_alpha_capacity_retry_enabled(
         request=request,
         candidate={**candidate, "route_family": "anthropic_openai_responses_adapter"},
         is_codex_alias=True,
     )
-    assert not _is_openai_alpha_capacity_retry_enabled(
+    assert _is_openai_alpha_capacity_retry_enabled(
         request=request,
         candidate=candidate,
         is_codex_alias=False,
     )
     monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-dev")
+    assert _is_openai_alpha_capacity_retry_enabled(
+        request=request,
+        candidate=candidate,
+        is_codex_alias=True,
+    )
+    monkeypatch.setenv("AAWM_OPENAI_CAPACITY_RETRY_ENABLED", "0")
     assert not _is_openai_alpha_capacity_retry_enabled(
         request=request,
         candidate=candidate,
         is_codex_alias=True,
+    )
+
+
+def test_selected_model_at_capacity_message_is_retryable_pre_commit():
+    error_class, classification, retryable = (
+        PassThroughStreamingHandler._classify_responses_pre_commit_error(
+            {
+                "message": (
+                    "Selected model is at capacity. Please try a different model."
+                )
+            }
+        )
+    )
+    assert error_class == "server_overloaded"
+    assert classification == "transient_capacity"
+    assert retryable is True
+
+
+def test_selected_model_at_capacity_http_error_is_transient_capacity():
+    exc = HTTPException(
+        status_code=503,
+        detail={
+            "error": {
+                "message": (
+                    "Selected model is at capacity. Please try a different model."
+                )
+            }
+        },
+    )
+    classified = _classify_passthrough_raw_http_error(exc, status_code=503)
+    assert classified is not None
+    error_class, classification, retryable = classified
+    assert error_class == "server_overloaded"
+    assert classification == "transient_capacity"
+    assert retryable is True
+
+
+@pytest.mark.asyncio
+async def test_selected_model_at_capacity_hidden_retry_recovers():
+    coordinator = MagicMock()
+    coordinator.deadline_seconds = 7200.0
+    coordinator.remaining_seconds = 7200.0
+    coordinator.within_deadline.return_value = True
+    coordinator.next_wait_seconds.return_value = 15.0
+    coordinator.sleep_with_wakeup = AsyncMock(return_value="timer")
+    coordinator.record_retry = MagicMock()
+    coordinator.record_terminal = MagicMock()
+    coordinator.signal_success = AsyncMock()
+    attempts = 0
+
+    async def operation():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ResponsesStreamPreCommitFailure(
+                error_class="server_overloaded",
+                classification="transient_capacity",
+                retryable=True,
+                message=(
+                    "Selected model is at capacity. Please try a different model."
+                ),
+            )
+        return "committed"
+
+    result = await _execute_passthrough_pre_first_byte_with_hidden_retries(
+        kwargs={},
+        operation_name="stream_pre_first_byte",
+        operation=operation,
+        caller_managed_hidden_retry=False,
+        openai_capacity_coordinator=coordinator,
+    )
+
+    assert result == "committed"
+    assert attempts == 2
+    coordinator.record_retry.assert_called_once()
+    coordinator.record_terminal.assert_called_once_with(
+        "success",
+        error_class="success",
+        status_code=200,
     )
 
 

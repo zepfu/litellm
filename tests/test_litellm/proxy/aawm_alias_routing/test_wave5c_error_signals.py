@@ -110,6 +110,7 @@ _OPENAI_ALPHA_CAPACITY_ERROR_TOKENS = frozenset(
     {
         "server_is_overloaded",
         "capacity_exhausted",
+        "MODEL_AT_CAPACITY",
     }
 )
 _RATE_LIMIT_ERROR_TOKENS = frozenset(
@@ -1114,6 +1115,63 @@ class TestClassification:
             _classify_codex_auto_agent_retryable_exhaustion(
                 exc,
                 candidate=_CODEX_RESPONSES_CANDIDATE,
+                attempted_provider_call=True,
+                openai_alpha_capacity_retry_enabled=True,
+            )
+            == expected
+        )
+
+    @pytest.mark.parametrize(
+        ("candidate", "status_code", "message", "expected"),
+        [
+            (
+                _CODEX_RESPONSES_CANDIDATE,
+                503,
+                "Selected model is at capacity. Please try a different model.",
+                "capacity_exhausted",
+            ),
+            (
+                {**_CODEX_RESPONSES_CANDIDATE, "route_family": "openai_responses"},
+                503,
+                "Selected model is at capacity. Please try a different model.",
+                "capacity_exhausted",
+            ),
+            (
+                _CODEX_RESPONSES_CANDIDATE,
+                429,
+                (
+                    "Selected model is at capacity. Please try a different "
+                    "model. Quota exhausted."
+                ),
+                "usage_limit_reached",
+            ),
+            (
+                _CODEX_RESPONSES_CANDIDATE,
+                401,
+                (
+                    "Selected model is at capacity. Please try a different "
+                    "model. Invalid API key."
+                ),
+                "provider_terminal_error",
+            ),
+        ],
+    )
+    def test_classify_selected_model_at_capacity_message(
+        self,
+        candidate: dict[str, str],
+        status_code: int,
+        message: str,
+        expected: str,
+    ):
+        exc = _FakeExc(
+            message=message,
+            status_code=status_code,
+            _aawm_provider_returned=True,
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=candidate,
                 attempted_provider_call=True,
                 openai_alpha_capacity_retry_enabled=True,
             )

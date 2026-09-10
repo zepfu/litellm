@@ -12,6 +12,7 @@ from starlette.requests import Request
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import codex_oauth
 from litellm.secret_managers.codex_oauth_inventory import (
+    CODEX_OAUTH_ACCOUNT_ENABLE_FILE_ENV,
     CODEX_OAUTH_INVENTORY_ENV,
     CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY,
     CodexOAuthCredentialError,
@@ -20,8 +21,13 @@ from litellm.secret_managers.codex_oauth_inventory import (
     codex_oauth_masked_account_display,
     load_codex_oauth_credential,
     load_codex_oauth_inventory,
+    resolve_codex_oauth_account_enabled,
 )
 from scripts import codex_oauth_refresh
+from scripts.set_codex_oauth_test_accounts import (
+    build_overlay_payload,
+    write_overlay,
+)
 
 
 def _jwt(
@@ -139,7 +145,10 @@ def _request(headers: dict[str, str] | None = None) -> Request:
 
 
 @pytest.fixture(autouse=True)
-def _configure_codex_oauth_runtime() -> None:
+def _configure_codex_oauth_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(CODEX_OAUTH_ACCOUNT_ENABLE_FILE_ENV, raising=False)
+    monkeypatch.delenv("AAWM_CODEX_OAUTH_ACCOUNT1_ENABLED", raising=False)
+    monkeypatch.delenv("AAWM_CODEX_OAUTH_ACCOUNT2_ENABLED", raising=False)
     codex_oauth.configure_codex_oauth_runtime(
         get_request_header_or_passthrough_alias=lambda request, name: (
             request.headers.get(name)
@@ -364,6 +373,177 @@ def test_inventory_is_explicit_ordered_and_model_eligible(tmp_path: Path) -> Non
     assert inventory.records[0].weight == 1.0
     assert str(inventory.records[0].auth_path) not in repr(inventory.records[0])
     assert inventory.routing.credential_affinity == "pinned"
+
+
+def test_inventory_env_disable_keeps_only_account1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(CODEX_OAUTH_ACCOUNT_ENABLE_FILE_ENV, raising=False)
+    monkeypatch.setenv("AAWM_CODEX_OAUTH_ACCOUNT2_ENABLED", "false")
+    inventory = load_codex_oauth_inventory(
+        _inventory_json(
+            [
+                _account(
+                    tmp_path,
+                    label="account1",
+                    account_id="acct-one",
+                    priority=10,
+                    models=["*"],
+                ),
+                _account(
+                    tmp_path,
+                    label="account2",
+                    account_id="acct-two",
+                    priority=20,
+                    models=["*"],
+                ),
+            ]
+        )
+    )
+    assert [
+        record.label for record in inventory.ordered_records(enabled_only=True)
+    ] == ["account1"]
+    assert inventory.select_record().label == "account1"
+
+
+def test_inventory_overlay_wins_over_env_and_selects_account2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    overlay = tmp_path / "enable.json"
+    overlay.write_text(
+        json.dumps({"account1": False, "account2": True}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(CODEX_OAUTH_ACCOUNT_ENABLE_FILE_ENV, str(overlay))
+    monkeypatch.setenv("AAWM_CODEX_OAUTH_ACCOUNT1_ENABLED", "true")
+    inventory = load_codex_oauth_inventory(
+        _inventory_json(
+            [
+                _account(
+                    tmp_path,
+                    label="account1",
+                    account_id="acct-one",
+                    priority=10,
+                    models=["*"],
+                ),
+                _account(
+                    tmp_path,
+                    label="account2",
+                    account_id="acct-two",
+                    priority=20,
+                    models=["*"],
+                ),
+            ]
+        )
+    )
+    assert resolve_codex_oauth_account_enabled("account1", True) is False
+    assert [
+        record.label for record in inventory.ordered_records(enabled_only=True)
+    ] == ["account2"]
+    assert inventory.select_record().label == "account2"
+
+
+def test_inventory_script_only_account1_overlay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    overlay = tmp_path / "enable.json"
+    write_overlay(overlay, build_overlay_payload(only="account1"))
+    monkeypatch.setenv(CODEX_OAUTH_ACCOUNT_ENABLE_FILE_ENV, str(overlay))
+    inventory = load_codex_oauth_inventory(
+        _inventory_json(
+            [
+                _account(
+                    tmp_path,
+                    label="account1",
+                    account_id="acct-one",
+                    priority=10,
+                    models=["*"],
+                ),
+                _account(
+                    tmp_path,
+                    label="account2",
+                    account_id="acct-two",
+                    priority=20,
+                    models=["*"],
+                ),
+            ]
+        )
+    )
+    assert json.loads(overlay.read_text(encoding="utf-8")) == {
+        "account1": True,
+        "account2": False,
+    }
+    assert [
+        record.label for record in inventory.ordered_records(enabled_only=True)
+    ] == ["account1"]
+
+
+def test_inventory_invalid_env_enable_flag_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(CODEX_OAUTH_ACCOUNT_ENABLE_FILE_ENV, raising=False)
+    monkeypatch.setenv("AAWM_CODEX_OAUTH_ACCOUNT1_ENABLED", "maybe")
+    with pytest.raises(CodexOAuthInventoryError, match="invalid"):
+        load_codex_oauth_inventory(
+            _inventory_json(
+                [
+                    _account(
+                        tmp_path,
+                        label="account1",
+                        account_id="acct-one",
+                        priority=10,
+                        models=["*"],
+                    )
+                ]
+            )
+        )
+
+
+def test_inventory_missing_overlay_file_uses_json_and_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        CODEX_OAUTH_ACCOUNT_ENABLE_FILE_ENV,
+        str(tmp_path / "missing.json"),
+    )
+    inventory = load_codex_oauth_inventory(
+        _inventory_json(
+            [
+                _account(
+                    tmp_path,
+                    label="account1",
+                    account_id="acct-one",
+                    priority=10,
+                    models=["*"],
+                ),
+                _account(
+                    tmp_path,
+                    label="account2",
+                    account_id="acct-two",
+                    priority=20,
+                    models=["*"],
+                    enabled=False,
+                ),
+            ]
+        )
+    )
+    assert [
+        record.label for record in inventory.ordered_records(enabled_only=True)
+    ] == ["account1"]
+
+
+def test_compose_exposes_codex_oauth_account_enable_env() -> None:
+    repo = Path(__file__).resolve().parents[4]
+    for name in ("docker-compose.alpha.yml", "docker-compose.dev.yml"):
+        text = (repo / name).read_text(encoding="utf-8")
+        assert "AAWM_CODEX_OAUTH_ACCOUNT1_ENABLED=${AAWM_CODEX_OAUTH_ACCOUNT1_ENABLED:-true}" in text
+        assert "AAWM_CODEX_OAUTH_ACCOUNT2_ENABLED=${AAWM_CODEX_OAUTH_ACCOUNT2_ENABLED:-true}" in text
+        assert "AAWM_CODEX_OAUTH_ACCOUNT_ENABLE_FILE=${AAWM_CODEX_OAUTH_ACCOUNT_ENABLE_FILE:-/app/.analysis/runtime/codex_oauth_account_enable.json}" in text
 
 
 def test_inventory_parses_interchangeable_priority_policy(

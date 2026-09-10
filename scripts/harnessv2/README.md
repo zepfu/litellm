@@ -125,6 +125,18 @@ python scripts/harnessv2/run.py \
   --dry-run
 ```
 
+Minimal Codex OpenAI-egress check (parent `gpt-5.6-luna` dispatches
+`readbasic`; overlay only, not the default Codex orch walk):
+
+```text
+python scripts/harnessv2/run.py \
+  --instance litellm-alpha \
+  --tui codex \
+  --test orchestration \
+  --overlay scripts/harnessv2/config/overlays/codex_luna_readbasic.yaml \
+  --dry-run
+```
+
 That plan must stay tools-on. Each child is a `provider-<id>` Ohmypi
 `agent=` profile except `provider-anthropic` and all `claude-*` aliases,
 which current closeout `provider_coverage` must not select or run.

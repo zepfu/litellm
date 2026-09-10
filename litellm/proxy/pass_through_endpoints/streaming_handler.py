@@ -925,6 +925,8 @@ class PassThroughStreamingHandler:
                 "upstream_overloaded",
                 "high demand",
                 "model_capacity_exhausted",
+                "selected model is at capacity",
+                "model is at capacity",
                 "model at capacity",
                 "upstream busy",
             )

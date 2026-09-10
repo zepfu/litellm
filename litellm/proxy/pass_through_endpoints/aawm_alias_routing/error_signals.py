@@ -2587,7 +2587,6 @@ def _classify_openai_alpha_capacity_error_code(
         or getattr(exc, "_aawm_provider_returned", False) is not True
         or not isinstance(candidate, dict)
         or candidate.get("provider") != _CODEX_AUTO_AGENT_NATIVE_PROVIDER
-        or candidate.get("route_family") != "codex_responses"
     ):
         return None
 
@@ -2616,6 +2615,14 @@ def _classify_openai_alpha_capacity_error_code(
     ):
         return "provider_terminal_error"
     if not exact_codes:
+        if "model_at_capacity" in normalized_tokens or (
+            "selected model is at capacity" in text_lower
+            or (
+                "model is at capacity" in text_lower
+                and "try a different model" in text_lower
+            )
+        ):
+            return "capacity_exhausted"
         return None
     if "server_is_overloaded" in exact_codes:
         return "server_overloaded"
