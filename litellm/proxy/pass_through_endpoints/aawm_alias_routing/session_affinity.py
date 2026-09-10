@@ -1848,6 +1848,55 @@ async def get_session_owner_record(
     return record, cache_key, None
 
 
+async def _cleanup_unpublished_session_owner_reservation(
+    *,
+    session_identity: str,
+    reservation_token: str,
+) -> Optional[SessionOwnerMutationResult]:
+    """Release an aborted reservation without replacing its primary failure."""
+
+    cleanup_task = asyncio.ensure_future(
+        release_session_owner_reservation(
+            session_identity=session_identity,
+            reservation_token=reservation_token,
+        )
+    )
+    try:
+        return await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        try:
+            return await asyncio.shield(cleanup_task)
+        except BaseException:  # noqa: BLE001
+            return None
+    except BaseException:  # noqa: BLE001
+        return None
+
+
+async def _acquire_session_owner_reservation(
+    *,
+    operation: Awaitable[Any],
+    session_identity: str,
+    reservation_token: str,
+) -> Any:
+    """Settle a cancellable NX write before cleaning up a claimed token."""
+
+    acquisition_task = asyncio.ensure_future(operation)
+    try:
+        return await asyncio.shield(acquisition_task)
+    except asyncio.CancelledError:
+        claimed = False
+        try:
+            claimed = bool(await asyncio.shield(acquisition_task))
+        except BaseException:  # noqa: BLE001
+            pass
+        if claimed:
+            await _cleanup_unpublished_session_owner_reservation(
+                session_identity=session_identity,
+                reservation_token=reservation_token,
+            )
+        raise
+
+
 async def guard_session_owner_before_egress(  # noqa: PLR0915
     *,
     session_identity: Optional[str] = None,
@@ -2173,12 +2222,16 @@ async def guard_session_owner_before_egress(  # noqa: PLR0915
         reservation_token=token,
     )
     try:
-        claimed = await redis_cache.async_set_cache(
-            key=cache_key,
-            value=reserved_record,
-            ttl=ttl,
-            nx=True,
-            raise_on_error=True,
+        claimed = await _acquire_session_owner_reservation(
+            operation=redis_cache.async_set_cache(
+                key=cache_key,
+                value=reserved_record,
+                ttl=ttl,
+                nx=True,
+                raise_on_error=True,
+            ),
+            session_identity=cleaned,
+            reservation_token=token,
         )
     except Exception as exc:  # noqa: BLE001
         reason = f"session_owner: redis reserve failed: {exc}"
@@ -2203,6 +2256,10 @@ async def guard_session_owner_before_egress(  # noqa: PLR0915
                 cache_key=cache_key,
             )
         except RuntimeError as exc:
+            await _cleanup_unpublished_session_owner_reservation(
+                session_identity=cleaned,
+                reservation_token=token,
+            )
             provenance = build_session_owner_provenance(
                 session_identity=cleaned,
                 decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,
@@ -2213,13 +2270,21 @@ async def guard_session_owner_before_egress(  # noqa: PLR0915
                 decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
                 session_identity=cleaned,
                 cache_key=cache_key,
-                reservation_token=token,
                 mismatch_reason=str(exc),
                 provenance=provenance,
-                held_reservation=True,
             )
+        except BaseException:  # noqa: BLE001
+            await _cleanup_unpublished_session_owner_reservation(
+                session_identity=cleaned,
+                reservation_token=token,
+            )
+            raise
         if durable_record is None:
             reason = "session_owner: reserve write not visible on read-back"
+            await _cleanup_unpublished_session_owner_reservation(
+                session_identity=cleaned,
+                reservation_token=token,
+            )
             provenance = build_session_owner_provenance(
                 session_identity=cleaned,
                 decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,
@@ -2230,16 +2295,18 @@ async def guard_session_owner_before_egress(  # noqa: PLR0915
                 decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
                 session_identity=cleaned,
                 cache_key=cache_key,
-                reservation_token=token,
                 mismatch_reason=reason,
                 provenance=provenance,
-                held_reservation=True,
             )
         durable_token = _clean_optional_str(durable_record.get(_RECORD_TOKEN_FIELD))
         if durable_token != token or _record_state(durable_record) != (
             SessionOwnerRecordState.RESERVED.value
         ):
             reason = "session_owner: reserve lost race on read-back"
+            await _cleanup_unpublished_session_owner_reservation(
+                session_identity=cleaned,
+                reservation_token=token,
+            )
             provenance = build_session_owner_provenance(
                 session_identity=cleaned,
                 decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,
@@ -2348,16 +2415,20 @@ async def guard_session_owner_before_egress(  # noqa: PLR0915
             # Retry the ordinary atomic reservation once with this request's
             # token; no token is shared with the other HTTP request.
             try:
-                claimed = await redis_cache.async_set_cache(
-                    key=cache_key,
-                    value=_build_reserved_record(
-                        owner_id=resolved_owner_id,
-                        attributes=attrs,
-                        reservation_token=token,
+                claimed = await _acquire_session_owner_reservation(
+                    operation=redis_cache.async_set_cache(
+                        key=cache_key,
+                        value=_build_reserved_record(
+                            owner_id=resolved_owner_id,
+                            attributes=attrs,
+                            reservation_token=token,
+                        ),
+                        ttl=ttl,
+                        nx=True,
+                        raise_on_error=True,
                     ),
-                    ttl=ttl,
-                    nx=True,
-                    raise_on_error=True,
+                    session_identity=cleaned,
+                    reservation_token=token,
                 )
             except Exception as exc:  # noqa: BLE001
                 reason = f"session_owner: redis reserve failed: {exc}"
@@ -2369,7 +2440,17 @@ async def guard_session_owner_before_egress(  # noqa: PLR0915
                             cache_key=cache_key,
                         )
                     except RuntimeError as exc:
+                        await _cleanup_unpublished_session_owner_reservation(
+                            session_identity=cleaned,
+                            reservation_token=token,
+                        )
                         reason = str(exc)
+                    except BaseException:  # noqa: BLE001
+                        await _cleanup_unpublished_session_owner_reservation(
+                            session_identity=cleaned,
+                            reservation_token=token,
+                        )
+                        raise
                     else:
                         if (
                             retry_record is not None
@@ -2398,6 +2479,10 @@ async def guard_session_owner_before_egress(  # noqa: PLR0915
                                 provenance=provenance,
                                 held_reservation=True,
                             )
+                        await _cleanup_unpublished_session_owner_reservation(
+                            session_identity=cleaned,
+                            reservation_token=token,
+                        )
                         reason = "session_owner: reserve lost race on read-back"
                 else:
                     reason = "session_owner: concurrent reservation won the race"
