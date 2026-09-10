@@ -24,6 +24,7 @@ def _parse_client_identity_from_user_agent(
         (re.compile(r"\bomp/(?P<version>[A-Za-z0-9.+_-]+)", re.IGNORECASE), "ohmypi"),
         (re.compile(r"\bOh My Pi/(?P<version>[A-Za-z0-9.+_-]+)", re.IGNORECASE), "ohmypi"),
         (re.compile(r"\bBun/(?P<version>[A-Za-z0-9.+_-]+)", re.IGNORECASE), "bun"),
+        (re.compile(r"\bCursor-CLI/(?P<version>[A-Za-z0-9.+_-]+)"), "cursor-cli"),
     )
     for pattern, client_name in known_patterns:
         match = pattern.search(user_agent)

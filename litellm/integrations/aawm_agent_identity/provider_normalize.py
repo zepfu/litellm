@@ -159,6 +159,8 @@ def _session_history_provider_from_route_family(route_family: Any) -> Optional[s
         return "openai"
     if "anthropic" in route_lower:
         return "anthropic"
+    if "cursor_agent_cli_inbound" in route_lower:
+        return "cursor_agent_cli_inbound"
     return None
 
 

@@ -6742,6 +6742,26 @@ async def cursor_proxy_route(
     return received_value
 
 
+@router.api_route(
+    "/agent.v1.AgentService/Run",
+    methods=["POST"],
+    tags=["Cursor Agent CLI inbound", "pass-through"],
+)
+async def cursor_agent_cli_run_route(request: Request):
+    """Inbound Cursor Agent CLI HTTP/2 Connect ``Run``.
+
+    Host ``cursoral`` / ``cursoralt`` / ``cursorala`` aim hidden
+    ``--agent-endpoint`` here. This is not Cloud Agents ``/cursor``.
+    Auth is the CLI Bearer access token, not a LiteLLM virtual key and not
+    Cloud Agents Basic. Dashboard login stays on ``api2``.
+    """
+    from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
+        cursor_agent_cli_run_endpoint,
+    )
+
+    return await cursor_agent_cli_run_endpoint(request)
+
+
 async def vertex_ai_live_websocket_passthrough(
     websocket: WebSocket,
     model: Optional[str] = None,

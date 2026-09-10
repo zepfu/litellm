@@ -27,6 +27,16 @@ _EXPECTED_ROUTES: frozenset[tuple[str, tuple[str, ...], str]] = frozenset(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints",
         ),
         (
+            "/aawm/alias-routing/cooldowns/acceptance",
+            ("POST",),
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints",
+        ),
+        (
+            "/agent.v1.AgentService/Run",
+            ("POST",),
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints",
+        ),
+        (
             "/anthropic",
             ("HEAD",),
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints",
