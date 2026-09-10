@@ -1,7 +1,10 @@
 import asyncio
 import codecs
+import inspect
 import json
 import os
+import struct
+import tempfile
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -92,7 +95,6 @@ _RESPONSES_SUBSTANTIVE_EVENT_PREFIXES = (
     "response.shell",
 )
 _RESPONSES_PRE_COMMIT_MAX_BUFFER_BYTES = 64 * 1024
-_RESPONSES_PRE_COMMIT_MAX_EVENTS = 16
 RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS = 10.0
 RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS = 2
 _RESPONSES_TRANSIENT_CAPACITY_CLASSES = frozenset(
@@ -190,7 +192,7 @@ class _PrefixedHttpxByteStream:
     def __init__(
         self,
         response: httpx.Response,
-        prefix: List[bytes],
+        prefix: Any,
         remainder: Any = None,
     ) -> None:
         self._response = response
@@ -200,14 +202,189 @@ class _PrefixedHttpxByteStream:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._response, name)
 
+    def _close_prefix(self) -> None:
+        close = getattr(self._prefix, "close", None)
+        if callable(close):
+            close()
+
     async def aiter_bytes(self):
-        for chunk in self._prefix:
+        try:
+            if hasattr(self._prefix, "iter_chunks"):
+                prefix_chunks = self._prefix.iter_chunks()
+            else:
+                prefix_chunks = iter(self._prefix)
+            for chunk in prefix_chunks:
+                if chunk:
+                    yield chunk
+            if self._remainder is None:
+                return
+            async for chunk in self._remainder:
+                yield chunk
+        except BaseException:
+            await self.aclose()
+            raise
+        finally:
+            self._close_prefix()
+
+    async def aclose(self) -> None:
+        self._close_prefix()
+        close = getattr(self._response, "aclose", None)
+        if not callable(close):
+            return
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+
+
+class _ResponsesPreCommitPrefixStore:
+    """Bounded-memory storage for an exact replayable response prefix."""
+
+    _CHUNK_LENGTH = struct.Struct("!Q")
+
+    def __init__(self, max_buffer_bytes: int) -> None:
+        memory_limit = max(0, int(max_buffer_bytes))
+        self._data = tempfile.SpooledTemporaryFile(
+            max_size=memory_limit,
+            mode="w+b",
+        )
+        self._lengths = tempfile.SpooledTemporaryFile(
+            max_size=memory_limit,
+            mode="w+b",
+        )
+        self._closed = False
+
+    def append(self, chunk: bytes) -> None:
+        if self._closed:
+            raise RuntimeError("Responses pre-commit prefix store is closed")
+        if not chunk:
+            return
+        self._data.seek(0, os.SEEK_END)
+        self._data.write(chunk)
+        self._lengths.seek(0, os.SEEK_END)
+        self._lengths.write(self._CHUNK_LENGTH.pack(len(chunk)))
+
+    def read_range(self, start: int, end: int) -> bytes:
+        if self._closed or end <= start:
+            return b""
+        self._data.seek(start)
+        return self._data.read(end - start)
+
+    def iter_chunks(self):
+        if self._closed:
+            return
+        self._data.seek(0)
+        self._lengths.seek(0)
+        while True:
+            encoded_length = self._lengths.read(self._CHUNK_LENGTH.size)
+            if not encoded_length:
+                return
+            if len(encoded_length) != self._CHUNK_LENGTH.size:
+                raise RuntimeError("Corrupt Responses pre-commit prefix metadata")
+            chunk_length = self._CHUNK_LENGTH.unpack(encoded_length)[0]
+            chunk = self._data.read(chunk_length)
+            if len(chunk) != chunk_length:
+                raise RuntimeError("Corrupt Responses pre-commit prefix data")
             if chunk:
                 yield chunk
-        if self._remainder is None:
+
+    def close(self) -> None:
+        if self._closed:
             return
-        async for chunk in self._remainder:
-            yield chunk
+        self._closed = True
+        try:
+            self._data.close()
+        finally:
+            self._lengths.close()
+
+
+class _ResponsesPreCommitSSEParser:
+    """Inspect complete SSE frames without retaining the whole prefix in RAM."""
+
+    def __init__(self, prefix: _ResponsesPreCommitPrefixStore) -> None:
+        self._prefix = prefix
+        self._frame_start = 0
+        self._position = 0
+        self._search_tail = b""
+        self._saw_lifecycle = False
+        self._first_error_payload: Optional[Dict[str, Any]] = None
+        self._first_error_event: Optional[str] = None
+        self._saw_substantive = False
+        self._substantive_event: Optional[str] = None
+
+    @staticmethod
+    def _find_boundary(
+        value: bytes,
+        start: int,
+    ) -> Optional[tuple[int, int]]:
+        lf_index = value.find(b"\n\n", start)
+        crlf_index = value.find(b"\r\n\r\n", start)
+        if lf_index < 0 and crlf_index < 0:
+            return None
+        if crlf_index < 0 or (lf_index >= 0 and lf_index < crlf_index):
+            return lf_index, 2
+        return crlf_index, 4
+
+    def _consume_frame(self, frame: bytes) -> None:
+        decision, error_payload, event_type = (
+            PassThroughStreamingHandler._inspect_responses_pre_commit_chunks([frame])
+        )
+        if decision == "substantive":
+            self._saw_substantive = True
+            self._substantive_event = event_type
+            return
+        if decision == "failed":
+            if self._first_error_payload is None:
+                self._first_error_payload = error_payload
+                self._first_error_event = event_type
+            return
+        if decision == "lifecycle":
+            self._saw_lifecycle = True
+
+    def feed(
+        self,
+        chunk: bytes,
+    ) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+        if not chunk:
+            return self.decision()
+
+        position_before = self._position
+        search = self._search_tail + chunk
+        search_base = position_before - len(self._search_tail)
+        self._position += len(chunk)
+        search_start = 0
+        while True:
+            boundary = self._find_boundary(search, search_start)
+            if boundary is None:
+                break
+            boundary_index, boundary_length = boundary
+            frame_end = search_base + boundary_index + boundary_length
+            self._consume_frame(
+                self._prefix.read_range(self._frame_start, frame_end)
+            )
+            self._frame_start = frame_end
+            search_start = boundary_index + boundary_length
+            if self._saw_substantive:
+                break
+        self._search_tail = search[search_start:][-3:]
+        return self.decision()
+
+    def decision(
+        self,
+    ) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+        if self._saw_substantive:
+            return "substantive", None, self._substantive_event
+        if (
+            self._first_error_payload is not None
+            or self._first_error_event is not None
+        ):
+            return (
+                "failed",
+                self._first_error_payload,
+                self._first_error_event,
+            )
+        if self._saw_lifecycle:
+            return "lifecycle", None, None
+        return "empty", None, None
 
 
 class _PassThroughStreamLineAccumulator:
@@ -767,8 +944,6 @@ class PassThroughStreamingHandler:
         events = PassThroughStreamingHandler._iter_responses_sse_events(lines)
         if not events:
             return "empty", None, None
-        if len(events) > _RESPONSES_PRE_COMMIT_MAX_EVENTS:
-            return "substantive", None, None
         first_error_payload: Optional[Dict[str, Any]] = None
         first_error_event: Optional[str] = None
         saw_lifecycle = False
@@ -932,64 +1107,89 @@ class PassThroughStreamingHandler:
         openai_alpha_capacity_retry_enabled: bool = False,
     ) -> tuple[httpx.Response, Optional[ResponsesStreamPreCommitFailure]]:
         """Hold lifecycle-only Responses bytes until a commit or pre-SSE failure."""
-        peeked: List[bytes] = []
-        buffered_bytes = 0
-        iterator = response.aiter_bytes()
-        while True:
-            try:
-                chunk = await iterator.__anext__()
-            except StopAsyncIteration:
-                iterator = None
-                break
-            if not chunk:
-                continue
-            peeked.append(chunk)
-            buffered_bytes += len(chunk)
-            if buffered_bytes > max_buffer_bytes:
-                return _PrefixedHttpxByteStream(response, peeked, iterator), None
-            decision, error_payload, event_type = (
-                PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(peeked)
-            )
+        prefix = _ResponsesPreCommitPrefixStore(max_buffer_bytes)
+        parser = _ResponsesPreCommitSSEParser(prefix)
+        iterator: Any = None
+        try:
+            iterator = response.aiter_bytes()
+            while True:
+                try:
+                    chunk = await iterator.__anext__()
+                except StopAsyncIteration:
+                    iterator = None
+                    break
+                if not chunk:
+                    continue
+                chunk = bytes(chunk)
+                prefix.append(chunk)
+                decision, error_payload, event_type = parser.feed(chunk)
+                if decision == "failed":
+                    return (
+                        _PrefixedHttpxByteStream(response, prefix, iterator),
+                        PassThroughStreamingHandler._build_responses_pre_commit_failure(
+                            error_payload=error_payload,
+                            event_type=event_type,
+                            openai_alpha_capacity_retry_enabled=(
+                                openai_alpha_capacity_retry_enabled
+                            ),
+                        ),
+                    )
+                if decision == "substantive":
+                    return (
+                        _PrefixedHttpxByteStream(response, prefix, iterator),
+                        None,
+                    )
+
+            decision, error_payload, event_type = parser.decision()
             if decision == "failed":
                 return (
-                    _PrefixedHttpxByteStream(response, peeked, iterator),
+                    _PrefixedHttpxByteStream(response, prefix, iterator),
                     PassThroughStreamingHandler._build_responses_pre_commit_failure(
                         error_payload=error_payload,
                         event_type=event_type,
-                        openai_alpha_capacity_retry_enabled=openai_alpha_capacity_retry_enabled,
+                        openai_alpha_capacity_retry_enabled=(
+                            openai_alpha_capacity_retry_enabled
+                        ),
                     ),
                 )
-            if decision == "substantive":
-                return _PrefixedHttpxByteStream(response, peeked, iterator), None
-        decision, error_payload, event_type = (
-            PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(peeked)
-        )
-        if decision == "failed":
-            return (
-                _PrefixedHttpxByteStream(response, peeked, iterator),
-                PassThroughStreamingHandler._build_responses_pre_commit_failure(
-                    error_payload=error_payload,
-                    event_type=event_type,
-                    openai_alpha_capacity_retry_enabled=openai_alpha_capacity_retry_enabled,
-                ),
-            )
-        if decision in {"empty", "lifecycle"}:
-            return (
-                _PrefixedHttpxByteStream(response, peeked, iterator),
-                PassThroughStreamingHandler._build_responses_pre_commit_failure(
-                    error_payload={
-                        "code": "openai_responses_stream_missing_terminal",
-                        "type": "invalid_response",
-                        "message": (
-                            "OpenAI Responses stream ended before a substantive "
-                            "or terminal event."
+            if decision in {"empty", "lifecycle"}:
+                return (
+                    _PrefixedHttpxByteStream(response, prefix, iterator),
+                    PassThroughStreamingHandler._build_responses_pre_commit_failure(
+                        error_payload={
+                            "code": "openai_responses_stream_missing_terminal",
+                            "type": "invalid_response",
+                            "message": (
+                                "OpenAI Responses stream ended before a substantive "
+                                "or terminal event."
+                            ),
+                        },
+                        event_type=decision,
+                        openai_alpha_capacity_retry_enabled=(
+                            openai_alpha_capacity_retry_enabled
                         ),
-                    },
-                    event_type=decision,
-                    openai_alpha_capacity_retry_enabled=openai_alpha_capacity_retry_enabled,
-                ),
-            )
-        return _PrefixedHttpxByteStream(response, peeked, iterator), None
+                    ),
+                )
+            return _PrefixedHttpxByteStream(response, prefix, iterator), None
+        except BaseException:
+            prefix.close()
+            close_iterator = getattr(iterator, "aclose", None)
+            if callable(close_iterator):
+                try:
+                    result = close_iterator()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    pass
+            close_response = getattr(response, "aclose", None)
+            if callable(close_response):
+                try:
+                    result = close_response()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    pass
+            raise
 
     @staticmethod
     def _dedupe_done_chunks(
