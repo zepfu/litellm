@@ -526,6 +526,26 @@ async def test_agentn_session_aclose_does_not_wait_for_peer() -> None:
     assert session.writer is None
 
 
+def test_agentn_session_dispatches_data_received_without_dropping() -> None:
+    from h2.events import DataReceived, ResponseReceived
+
+    from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
+        _AgentnH2Session,
+    )
+
+    session = _AgentnH2Session("https://agentn.global.api5.cursor.sh")
+    headers = object.__new__(ResponseReceived)
+    headers.headers = [(":status", "200")]
+    data = object.__new__(DataReceived)
+    data.data = b"upstream-connect-bytes"
+    data.flow_controlled_length = len(data.data)
+    data.stream_id = 1
+    chunks, ended = session._dispatch_h2_events([headers, data])
+    assert session.response_status == 200
+    assert chunks == [b"upstream-connect-bytes"]
+    assert ended is False
+
+
 def test_proxy_server_wraps_inbound_cli_run_as_raw_asgi() -> None:
     source = (
         Path(__file__).resolve().parents[4] / "litellm" / "proxy" / "proxy_server.py"
