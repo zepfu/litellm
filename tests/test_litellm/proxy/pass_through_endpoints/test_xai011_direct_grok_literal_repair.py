@@ -283,6 +283,55 @@ async def test_direct_grok_nonstream_malformed_literal_blocks_return_502_and_int
 
 
 @pytest.mark.asyncio
+async def test_direct_grok_nonstream_context_note_history_dialect_returns_502(
+    monkeypatch, tmp_path
+):
+    """Grok Build dumps that echo LiteLLM history rewrite text are fail-closed.
+
+    Repair skips Context-note prefixed Tool label blocks, then the detector
+    still classifies them as malformed literal tool text, so /grok/v1/responses
+    must 502 instead of launching the named tool.
+    """
+    from litellm.llms.anthropic.experimental_pass_through.providers.grok import (
+        normalization,
+    )
+
+    _enable_malformed_intake(monkeypatch, tmp_path)
+    history_block = normalization.format_function_call_input_message(
+        {
+            "name": "search_replace",
+            "call_id": "call-c9d1aa12-e8c4-4c32-8e16-e7e3c8c9d0e4-0",
+            "arguments": {
+                "file_path": "/tmp/xai011_a.py",
+                "old_string": "alpha",
+                "new_string": "alpha-fixed",
+            },
+        }
+    )
+    literal_text = (
+        "HEAD still has the dummy 5-byte Connect envelope. I'll inspect the file.\n"
+        + history_block
+    )
+    request_body = _search_replace_tool_request_body()
+    upstream = Response(
+        content=json.dumps(_literal_tool_response_payload(literal_text)),
+        media_type="application/json",
+    )
+
+    with pytest.raises(ProxyException) as vis:
+        await _invoke_direct_grok_responses(
+            request_body=request_body,
+            upstream_response=upstream,
+        )
+
+    _assert_malformed_reject(vis.value)
+    records = await _wait_for_intake_records(tmp_path)
+    assert records
+    assert records[0]["adapter"] == "direct_grok_responses"
+    assert records[0]["error_code"] == "aawm_auto_agent_malformed_tool_call_text"
+
+
+@pytest.mark.asyncio
 async def test_direct_grok_nonstream_quoted_tool_label_prose_without_payload_is_unchanged():
     prose = (
         'The docs may mention a "Tool label:" heading as an example, '
