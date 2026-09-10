@@ -173,6 +173,11 @@ class ProxyInitializationHelpers:
         )  # noqa
         config = Config()
         config.bind = [f"{host}:{port}"]
+        from litellm.proxy.pass_through_endpoints.cursor_agent_cli_hypercorn import (
+            configure_hypercorn_for_cursor_agent_cli,
+        )
+
+        configure_hypercorn_for_cursor_agent_cli(config)
 
         if ssl_certfile_path is not None and ssl_keyfile_path is not None:
             print(  # noqa

@@ -23,7 +23,7 @@ services:
       dockerfile: Dockerfile.dev
     container_name: litellm-dev
     restart: always
-    command: ["litellm", "--config", "/app/litellm-dev-config.yaml", "--port", "4001"]
+    command: ["litellm", "--config", "/app/litellm-dev-config.yaml", "--port", "4001", "--run_hypercorn"]
     logging:
       driver: json-file
       options:

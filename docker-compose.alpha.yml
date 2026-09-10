@@ -45,7 +45,7 @@ services:
       - /usr/bin/env
       - LITELLM_KIMI_NATIVE_CONTRACT_PATH=/run/aawm/kimi-descriptor/native-contract.json
       - watchfiles
-      - litellm --config /app/litellm-dev-config.yaml --port 4011
+      - litellm --config /app/litellm-dev-config.yaml --port 4011 --run_hypercorn
       - /app/litellm
       - /app/enterprise
       - /app/litellm-dev-config.yaml
