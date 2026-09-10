@@ -1120,6 +1120,28 @@ def test_should_plan_codex_luna_readbasic_overlay_orchestration(hv, config) -> N
     assert payload["orchestration_prompt"] == prompt
 
 
+def test_should_target_dotted_codex_tmux_session_exactly(hv, config) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+
+    driver = CodexDriver(config)
+    dotted = "hv2-codex-gpt-5.6-luna-1"
+    exact = f"={dotted}:"
+    assert driver._tmux_target(dotted) == exact
+    assert driver._tmux_target("%48") == "%48"
+    assert driver._tmux_target(f"={dotted}") == exact
+    assert driver._tmux_target(exact) == exact
+    assert driver._with_exact_tmux_targets(
+        ["capture-pane", "-pt", dotted, "-S", "-200"]
+    ) == ["capture-pane", "-pt", exact, "-S", "-200"]
+    assert driver._with_exact_tmux_targets(
+        ["send-keys", "-t", dotted, "Enter"]
+    ) == ["send-keys", "-t", exact, "Enter"]
+    assert driver._with_exact_tmux_targets(
+        ["new-session", "-d", "-s", dotted]
+    ) == ["new-session", "-d", "-s", dotted]
+
+
 def test_should_plan_explicit_codex_basic_without_compiled_all(hv, config) -> None:
     _skip_unless_codex_tui_shipped(config)
     plan = hv.build_plan(

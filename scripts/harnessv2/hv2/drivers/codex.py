@@ -347,6 +347,35 @@ class CodexDriver:
     def _session_name(self) -> str:
         return self._active_session or self._default_session_name()
 
+    def _tmux_target(self, name: str | None = None) -> str:
+        """Exact tmux session target. Dots in `gpt-5.6-luna` are pane paths.
+
+        ``=name`` is not enough: tmux still splits ``gpt-5.6-luna`` as
+        ``session:window.pane``. A trailing colon pins the session.
+        """
+        session = name or self._session_name()
+        if not session or session.startswith("%"):
+            return session
+        if session.startswith("="):
+            return session if session.endswith(":") else f"{session}:"
+        return f"={session}:"
+
+    def _with_exact_tmux_targets(self, args: Sequence[str]) -> list[str]:
+        rewritten: list[str] = []
+        pending_target = False
+        for item in args:
+            token = str(item)
+            if pending_target:
+                rewritten.append(
+                    token if token.startswith("-") else self._tmux_target(token)
+                )
+                pending_target = False
+                continue
+            if token in {"-t", "-pt"}:
+                pending_target = True
+            rewritten.append(token)
+        return rewritten
+
     def _run_tmux(
         self,
         args: Sequence[str],
@@ -355,7 +384,12 @@ class CodexDriver:
         stdin_text: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [self._tmux_bin(), "-L", self._tmux_socket(), *[str(item) for item in args]],
+            [
+                self._tmux_bin(),
+                "-L",
+                self._tmux_socket(),
+                *self._with_exact_tmux_targets(args),
+            ],
             input=stdin_text,
             capture_output=True,
             text=True,
