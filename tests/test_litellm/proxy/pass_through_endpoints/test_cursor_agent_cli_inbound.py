@@ -350,11 +350,18 @@ def test_summarize_connect_chunk_reports_field_numbers_not_payload() -> None:
 
 def test_request_context_exec_replies_answers_agentn_query() -> None:
     decoder = _ProtoConnectFrameDecoder()
-    replies = _request_context_exec_replies(_request_context_chunk(), decoder)
+    replies, forwarded = _request_context_exec_replies(_request_context_chunk(), decoder)
     assert len(replies) == 2
+    assert forwarded == b""
     payloads = [frame.payload for frame in decode_connect_proto_frames(b"".join(replies))]
     assert [_decode_top_fields(payload) for payload in payloads] == [[2], [5]]
-    assert _request_context_exec_replies(_heartbeat_chunk(), _ProtoConnectFrameDecoder()) == []
+    heartbeat = _heartbeat_chunk()
+    heartbeat_replies, heartbeat_forwarded = _request_context_exec_replies(
+        heartbeat,
+        _ProtoConnectFrameDecoder(),
+    )
+    assert heartbeat_replies == []
+    assert heartbeat_forwarded == heartbeat
 
 
 def _decode_top_fields(payload: bytes) -> List[int]:
@@ -597,7 +604,7 @@ def test_agentn_session_dispatches_data_received_without_dropping() -> None:
     data.stream_id = 1
     chunks, ended = session._dispatch_h2_events([headers, data])
     assert session.response_status == 200
-    assert chunks == [payload]
+    assert chunks == []
     assert ended is False
     assert len(session._auto_replies) == 2
 

@@ -133,40 +133,58 @@ def _summarize_connect_chunk(chunk: bytes) -> str:
     return " ".join(parts)
 
 
+def _is_request_context_exec_frame(payload: bytes) -> bool:
+    try:
+        fields = _decode_proto_fields(payload)
+    except Exception:
+        return False
+    exec_server = _proto_last_field(fields, 2, wire_type=2)
+    if not isinstance(exec_server, bytes):
+        return False
+    try:
+        exec_fields = _decode_proto_fields(exec_server)
+    except Exception:
+        return False
+    return isinstance(_proto_last_field(exec_fields, 10, wire_type=2), bytes)
+
+
 def _request_context_exec_replies(
     chunk: bytes,
     decoder: _ProtoConnectFrameDecoder,
-) -> List[bytes]:
-    """Answer agentn exec_server_message request-context queries.
+) -> Tuple[List[bytes], bytes]:
+    """Answer agentn request-context queries and drop those frames from the CLI.
 
     Native CLI answers these on a direct agentn stream. Through the inbound
-    proxy the CLI never emits that reply, so agentn waits on heartbeats.
+    proxy the CLI never emits that reply. Forwarding the query after we answer
+    it leaves the CLI waiting on a handshake agentn already considers done.
     """
     try:
         frames = decoder.feed(chunk)
     except Exception:
-        return []
+        return [], chunk
     replies: List[bytes] = []
+    forwarded: List[bytes] = []
     for frame in frames:
         if frame.is_end_stream:
+            forwarded.append(
+                bytes((frame.flags,))
+                + len(frame.payload).to_bytes(4, "big")
+                + frame.payload
+            )
             continue
-        try:
+        if _is_request_context_exec_frame(frame.payload):
             fields = _decode_proto_fields(frame.payload)
-        except Exception:
+            exec_fields = _decode_proto_fields(
+                _proto_last_field(fields, 2, wire_type=2)
+            )
+            for payload in _encode_request_context_exec_response(exec_fields):
+                replies.append(encode_connect_proto_frame(payload))
             continue
-        exec_server = _proto_last_field(fields, 2, wire_type=2)
-        if not isinstance(exec_server, bytes):
-            continue
-        try:
-            exec_fields = _decode_proto_fields(exec_server)
-        except Exception:
-            continue
-        request_context_args = _proto_last_field(exec_fields, 10, wire_type=2)
-        if not isinstance(request_context_args, bytes):
-            continue
-        for payload in _encode_request_context_exec_response(exec_fields):
-            replies.append(encode_connect_proto_frame(payload))
-    return replies
+        forwarded.append(encode_connect_proto_frame(frame.payload, flags=frame.flags))
+    leftover = bytes(decoder.buffer)
+    if leftover:
+        forwarded.append(leftover)
+    return replies, b"".join(forwarded)
 
 
 def is_cursor_agent_cli_run_scope(scope: Mapping[str, Any]) -> bool:
@@ -619,15 +637,20 @@ class _AgentnH2Session:
             elif isinstance(event, DataReceived):
                 if event.data:
                     payload = bytes(event.data)
-                    chunks.append(payload)
-                    self._auto_replies.extend(
-                        _request_context_exec_replies(payload, self._agentn_body_decoder)
+                    replies, forwarded = _request_context_exec_replies(
+                        payload,
+                        self._agentn_body_decoder,
                     )
+                    self._auto_replies.extend(replies)
+                    if forwarded:
+                        chunks.append(forwarded)
                     if self._logged_data_chunks < _MAX_LOGGED_AGENTN_DATA_CHUNKS:
                         self._logged_data_chunks += 1
                         verbose_proxy_logger.info(
-                            "cursor_agent_cli_inbound agentn data bytes=%s %s",
+                            "cursor_agent_cli_inbound agentn data bytes=%s forwarded=%s auto_replies=%s %s",
                             len(payload),
+                            len(forwarded),
+                            len(replies),
                             _summarize_connect_chunk(payload),
                         )
                     else:
