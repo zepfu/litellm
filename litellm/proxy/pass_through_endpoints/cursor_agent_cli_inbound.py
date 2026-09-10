@@ -38,7 +38,6 @@ from litellm.llms.cursor_agent.connect import (
     _decode_proto_string,
     _proto_last_field,
     decode_connect_proto_frames,
-    encode_connect_proto_frame,
     ensure_cursor_http2_available,
 )
 from litellm.llms.cursor_agent.dashboard import cursor_agent_user_agent
@@ -80,14 +79,13 @@ _FORWARDED_REQUEST_HEADERS = {
 }
 
 def _connect_header_flush_frame() -> bytes:
-    """Non-empty Connect envelope so Hypercorn emits HTTP/2 HEADERS.
+    """Empty ASGI body that still flushes Hypercorn HTTP/2 HEADERS.
 
-    Hypercorn's HTTP/2 ASGI adapter holds ``http.response.start`` until the
-    first non-empty ``http.response.body``. An empty body is dropped, which
-    leaves the Cursor Agent CLI waiting for Connect headers until it
-    reconnects.
+    Hypercorn sends HTTP/2 HEADERS on the first ``http.response.body`` event
+    even when that body is empty; empty DATA is not forwarded. A non-empty
+    dummy Connect envelope would poison the CLI stream.
     """
-    return encode_connect_proto_frame(b"")
+    return b""
 
 
 def is_cursor_agent_cli_run_scope(scope: Mapping[str, Any]) -> bool:
@@ -452,22 +450,29 @@ class _AgentnH2Session:
         await self.writer.drain()
 
     async def write_request(self, data: bytes, *, end_stream: bool = False) -> None:
-        if data:
-            self.pending.extend(data)
-        outbound = CursorAgentConnectClient._flush_h2_request_data(
-            self.connection,
-            self.stream_id,
-            self.pending,
-        )
-        if outbound:
-            self.writer.write(outbound)
-            await self.writer.drain()
-        if end_stream:
-            self.connection.end_stream(self.stream_id)
-            leftover = self.connection.data_to_send()
-            if leftover:
-                self.writer.write(leftover)
-                await self.writer.drain()
+        writer = self.writer
+        connection = self.connection
+        if writer is None or connection is None:
+            return
+        try:
+            if data:
+                self.pending.extend(data)
+            outbound = CursorAgentConnectClient._flush_h2_request_data(
+                connection,
+                self.stream_id,
+                self.pending,
+            )
+            if outbound:
+                writer.write(outbound)
+                await writer.drain()
+            if end_stream:
+                connection.end_stream(self.stream_id)
+                leftover = connection.data_to_send()
+                if leftover:
+                    writer.write(leftover)
+                    await writer.drain()
+        except Exception:
+            return
 
     async def iter_response_data(self):
         from h2.events import (
@@ -478,49 +483,57 @@ class _AgentnH2Session:
             WindowUpdated,
         )
 
-        while True:
-            incoming = await self.reader.read(64 * 1024)
-            if not incoming:
-                return
-            events = self.connection.receive_data(incoming)
-            for event in events:
-                if isinstance(event, ResponseReceived):
-                    status = "200"
-                    for name, value in event.headers:
-                        if name == ":status":
-                            status = value
-                            break
-                    try:
-                        self.response_status = int(status)
-                    except ValueError:
-                        self.response_status = 502
-                    self._headers_event.set()
-                elif isinstance(event, DataReceived):
-                    if event.data:
-                        yield event.data
-                    self.connection.acknowledge_received_data(
-                        event.flow_controlled_length,
-                        event.stream_id,
-                    )
-                elif isinstance(event, (StreamEnded, TrailersReceived)):
-                    leftover = self.connection.data_to_send()
-                    if leftover:
-                        self.writer.write(leftover)
-                        await self.writer.drain()
+        reader = self.reader
+        if reader is None:
+            return
+        try:
+            while True:
+                if self.writer is None:
                     return
-                elif isinstance(event, WindowUpdated):
-                    outbound = CursorAgentConnectClient._flush_h2_request_data(
-                        self.connection,
-                        self.stream_id,
-                        self.pending,
-                    )
-                    if outbound:
-                        self.writer.write(outbound)
-                        await self.writer.drain()
-            leftover = self.connection.data_to_send()
-            if leftover:
-                self.writer.write(leftover)
-                await self.writer.drain()
+                incoming = await reader.read(64 * 1024)
+                if not incoming:
+                    return
+                events = self.connection.receive_data(incoming)
+                for event in events:
+                    if isinstance(event, ResponseReceived):
+                        status = "200"
+                        for name, value in event.headers:
+                            if name == ":status":
+                                status = value
+                                break
+                        try:
+                            self.response_status = int(status)
+                        except ValueError:
+                            self.response_status = 502
+                        self._headers_event.set()
+                    elif isinstance(event, DataReceived):
+                        if event.data:
+                            yield event.data
+                        self.connection.acknowledge_received_data(
+                            event.flow_controlled_length,
+                            event.stream_id,
+                        )
+                    elif isinstance(event, (StreamEnded, TrailersReceived)):
+                        leftover = self.connection.data_to_send()
+                        if leftover and self.writer is not None:
+                            self.writer.write(leftover)
+                            await self.writer.drain()
+                        return
+                    elif isinstance(event, WindowUpdated):
+                        outbound = CursorAgentConnectClient._flush_h2_request_data(
+                            self.connection,
+                            self.stream_id,
+                            self.pending,
+                        )
+                        if outbound and self.writer is not None:
+                            self.writer.write(outbound)
+                            await self.writer.drain()
+                leftover = self.connection.data_to_send()
+                if leftover and self.writer is not None:
+                    self.writer.write(leftover)
+                    await self.writer.drain()
+        except Exception:
+            return
 
     async def aclose(self) -> None:
         writer = self.writer
@@ -627,6 +640,7 @@ async def proxy_inbound_cli_run(
                     message_type = message.get("type")
                     if message_type == "http.disconnect":
                         await to_agentn.put((b"", True))
+                        await session.aclose()
                         return
                     if message_type != "http.request":
                         continue
@@ -674,20 +688,27 @@ async def proxy_inbound_cli_run(
             )
             response_started = True
             status_code = 200
-            async for chunk in session.iter_response_data():
-                if chunk:
-                    await send(
-                        {
-                            "type": "http.response.body",
-                            "body": chunk,
-                            "more_body": True,
-                        }
-                    )
-                if session.response_status >= 400:
-                    status_code = session.response_status
-            await send({"type": "http.response.body", "body": b"", "more_body": False})
+            try:
+                async for chunk in session.iter_response_data():
+                    if chunk:
+                        await send(
+                            {
+                                "type": "http.response.body",
+                                "body": chunk,
+                                "more_body": True,
+                            }
+                        )
+                    if session.response_status >= 400:
+                        status_code = session.response_status
+            finally:
+                await send({"type": "http.response.body", "body": b"", "more_body": False})
 
-        await asyncio.gather(pump_client(), pump_to_agentn(), pump_upstream())
+        await asyncio.gather(
+            pump_client(),
+            pump_to_agentn(),
+            pump_upstream(),
+            return_exceptions=True,
+        )
         if session.response_status >= 400:
             status_code = session.response_status
             error_message = f"upstream_http_{session.response_status}"

@@ -309,11 +309,9 @@ async def test_proxy_inbound_cli_run_rejects_http1() -> None:
     assert start["status"] == 505
 
 
-def test_connect_header_flush_frame_is_non_empty_connect_envelope() -> None:
+def test_connect_header_flush_frame_is_empty_asgi_body() -> None:
     frame = _connect_header_flush_frame()
-    assert isinstance(frame, bytes)
-    assert len(frame) >= 5
-    assert frame != b""
+    assert frame == b""
 
 
 @pytest.mark.asyncio
@@ -367,12 +365,11 @@ async def test_proxy_inbound_cli_run_starts_response_before_client_end_body() ->
     assert client_ended.is_set()
     start = next(message for message in sent if message.get("type") == "http.response.start")
     assert start["status"] == 200
-    bodies = [
-        message.get("body")
-        for message in sent
-        if message.get("type") == "http.response.body" and message.get("body")
-    ]
-    assert _connect_header_flush_frame() in bodies
+    body_events = [message for message in sent if message.get("type") == "http.response.body"]
+    assert body_events[0]["body"] == b""
+    assert body_events[0]["more_body"] is True
+    bodies = [message.get("body") for message in body_events]
+    assert b"upstream-connect-bytes" in bodies
     persist.assert_awaited()
 
 
@@ -433,6 +430,70 @@ async def test_inbound_middleware_bypasses_fastapi_before_end_body() -> None:
 
     assert inner_called is False
     assert any(message.get("type") == "http.response.start" for message in sent)
+
+
+@pytest.mark.asyncio
+async def test_proxy_inbound_cli_run_persists_when_client_disconnects_before_upstream() -> None:
+    class _HangUntilClosedSession(_FakeSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self._closed = asyncio.Event()
+            self._chunks = []
+
+        async def iter_response_data(self):
+            await self._closed.wait()
+            if False:
+                yield b""
+
+        async def aclose(self) -> None:
+            self.closed = True
+            self._closed.set()
+
+    session = _HangUntilClosedSession()
+    sent: List[Dict[str, Any]] = []
+    response_started = asyncio.Event()
+    first_chunk = {"type": "http.request", "body": _run_frame(), "more_body": True}
+
+    async def receive():
+        if first_chunk:
+            message = dict(first_chunk)
+            first_chunk.clear()
+            return message
+        await response_started.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+        if message.get("type") == "http.response.start":
+            response_started.set()
+
+    persist = AsyncMock()
+    with patch(
+        "litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound._persist_inbound_cli_turn",
+        persist,
+    ):
+        await asyncio.wait_for(
+            proxy_inbound_cli_run(
+                {
+                    "type": "http",
+                    "http_version": "2",
+                    "method": "POST",
+                    "path": "/agent.v1.AgentService/Run",
+                    "headers": [
+                        (b"authorization", b"Bearer cursor-access-token"),
+                        (b"content-type", b"application/connect+proto"),
+                    ],
+                    "client": ("127.0.0.1", 9),
+                },
+                receive,
+                send,
+                session_factory=lambda: session,
+            ),
+            timeout=2,
+        )
+
+    assert session.closed is True
+    persist.assert_awaited()
 
 
 def test_proxy_server_wraps_inbound_cli_run_as_raw_asgi() -> None:
