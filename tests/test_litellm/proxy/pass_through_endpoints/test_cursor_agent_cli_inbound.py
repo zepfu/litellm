@@ -496,6 +496,36 @@ async def test_proxy_inbound_cli_run_persists_when_client_disconnects_before_ups
     persist.assert_awaited()
 
 
+@pytest.mark.asyncio
+async def test_agentn_session_aclose_does_not_wait_for_peer() -> None:
+    from litellm.proxy.pass_through_endpoints.cursor_agent_cli_inbound import (
+        _AgentnH2Session,
+    )
+
+    class _HangingWriter:
+        def __init__(self) -> None:
+            self.closed = False
+            self.aborted = False
+
+        def close(self) -> None:
+            self.closed = True
+
+        def abort(self) -> None:
+            self.aborted = True
+
+        async def wait_closed(self) -> None:
+            await asyncio.Event().wait()
+
+    session = _AgentnH2Session("https://agentn.global.api5.cursor.sh")
+    writer = _HangingWriter()
+    session.writer = writer
+    session.reader = object()
+    await asyncio.wait_for(session.aclose(), timeout=2)
+    assert writer.closed is True
+    assert writer.aborted is True
+    assert session.writer is None
+
+
 def test_proxy_server_wraps_inbound_cli_run_as_raw_asgi() -> None:
     source = (
         Path(__file__).resolve().parents[4] / "litellm" / "proxy" / "proxy_server.py"

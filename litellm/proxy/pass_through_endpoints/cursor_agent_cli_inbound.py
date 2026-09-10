@@ -409,6 +409,47 @@ class _AgentnH2Session:
         self.response_status = 200
         self._headers_event = asyncio.Event()
 
+    async def _flush_connection(self) -> None:
+        writer = self.writer
+        connection = self.connection
+        if writer is None or connection is None:
+            return
+        outbound = connection.data_to_send()
+        if outbound:
+            writer.write(outbound)
+            await writer.drain()
+
+    async def _acknowledge_remote_settings(self) -> None:
+        """Read agentn SETTINGS and ACK before sending request DATA."""
+        from h2.events import RemoteSettingsChanged, SettingsAcknowledged, WindowUpdated
+
+        reader = self.reader
+        if reader is None or self.connection is None:
+            raise CursorConnectError(
+                "Inbound Cursor Agent CLI egress lost the HTTP/2 socket during handshake.",
+                status_code=502,
+            )
+        deadline = asyncio.get_running_loop().time() + 10.0
+        while asyncio.get_running_loop().time() < deadline:
+            timeout = max(0.05, deadline - asyncio.get_running_loop().time())
+            incoming = await asyncio.wait_for(reader.read(64 * 1024), timeout=timeout)
+            if not incoming:
+                raise CursorConnectError(
+                    "Inbound Cursor Agent CLI egress closed during HTTP/2 handshake.",
+                    status_code=502,
+                )
+            events = self.connection.receive_data(incoming)
+            await self._flush_connection()
+            if any(
+                isinstance(event, (RemoteSettingsChanged, SettingsAcknowledged, WindowUpdated))
+                for event in events
+            ):
+                return
+        raise CursorConnectError(
+            "Inbound Cursor Agent CLI egress timed out waiting for HTTP/2 SETTINGS.",
+            status_code=504,
+        )
+
     async def open(self, request_headers: List[Tuple[str, str]]) -> None:
         from h2.config import H2Configuration
         from h2.connection import H2Connection
@@ -434,6 +475,8 @@ class _AgentnH2Session:
             config=H2Configuration(client_side=True, header_encoding="utf-8")
         )
         self.connection.initiate_connection()
+        await self._flush_connection()
+        await self._acknowledge_remote_settings()
         self.stream_id = self.connection.get_next_available_stream_id()
         self.connection.send_headers(
             self.stream_id,
@@ -446,39 +489,47 @@ class _AgentnH2Session:
             ],
             end_stream=False,
         )
-        self.writer.write(self.connection.data_to_send())
-        await self.writer.drain()
+        await self._flush_connection()
+        verbose_proxy_logger.info(
+            "cursor_agent_cli_inbound opened agentn stream_id=%s",
+            self.stream_id,
+        )
 
     async def write_request(self, data: bytes, *, end_stream: bool = False) -> None:
         writer = self.writer
         connection = self.connection
         if writer is None or connection is None:
             return
-        try:
-            if data:
-                self.pending.extend(data)
-            outbound = CursorAgentConnectClient._flush_h2_request_data(
-                connection,
-                self.stream_id,
-                self.pending,
-            )
-            if outbound:
-                writer.write(outbound)
+        if data:
+            self.pending.extend(data)
+        outbound = CursorAgentConnectClient._flush_h2_request_data(
+            connection,
+            self.stream_id,
+            self.pending,
+        )
+        if outbound:
+            writer.write(outbound)
+            await writer.drain()
+        if end_stream:
+            connection.end_stream(self.stream_id)
+            leftover = connection.data_to_send()
+            if leftover:
+                writer.write(leftover)
                 await writer.drain()
-            if end_stream:
-                connection.end_stream(self.stream_id)
-                leftover = connection.data_to_send()
-                if leftover:
-                    writer.write(leftover)
-                    await writer.drain()
-        except Exception:
-            return
+        verbose_proxy_logger.info(
+            "cursor_agent_cli_inbound wrote agentn bytes=%s end_stream=%s pending=%s",
+            len(data),
+            end_stream,
+            len(self.pending),
+        )
 
     async def iter_response_data(self):
         from h2.events import (
+            ConnectionTerminated,
             DataReceived,
             ResponseReceived,
             StreamEnded,
+            StreamReset,
             TrailersReceived,
             WindowUpdated,
         )
@@ -486,65 +537,80 @@ class _AgentnH2Session:
         reader = self.reader
         if reader is None:
             return
-        try:
-            while True:
-                if self.writer is None:
+        while True:
+            if self.writer is None or self.connection is None:
+                return
+            incoming = await reader.read(64 * 1024)
+            if not incoming:
+                verbose_proxy_logger.info(
+                    "cursor_agent_cli_inbound agentn read EOF status=%s",
+                    self.response_status,
+                )
+                return
+            events = self.connection.receive_data(incoming)
+            for event in events:
+                if isinstance(event, ResponseReceived):
+                    status = "200"
+                    for name, value in event.headers:
+                        if name == ":status":
+                            status = value
+                            break
+                    try:
+                        self.response_status = int(status)
+                    except ValueError:
+                        self.response_status = 502
+                    self._headers_event.set()
+                    verbose_proxy_logger.info(
+                        "cursor_agent_cli_inbound agentn response status=%s",
+                        self.response_status,
+                    )
+                elif isinstance(event, DataReceived):
+                    if event.data:
+                        yield event.data
+                    self.connection.acknowledge_received_data(
+                        event.flow_controlled_length,
+                        event.stream_id,
+                    )
+                elif isinstance(event, (StreamEnded, TrailersReceived)):
+                    leftover = self.connection.data_to_send()
+                    if leftover and self.writer is not None:
+                        self.writer.write(leftover)
+                        await self.writer.drain()
                     return
-                incoming = await reader.read(64 * 1024)
-                if not incoming:
+                elif isinstance(event, (StreamReset, ConnectionTerminated)):
+                    verbose_proxy_logger.warning(
+                        "cursor_agent_cli_inbound agentn stream closed: %s",
+                        type(event).__name__,
+                    )
                     return
-                events = self.connection.receive_data(incoming)
-                for event in events:
-                    if isinstance(event, ResponseReceived):
-                        status = "200"
-                        for name, value in event.headers:
-                            if name == ":status":
-                                status = value
-                                break
-                        try:
-                            self.response_status = int(status)
-                        except ValueError:
-                            self.response_status = 502
-                        self._headers_event.set()
-                    elif isinstance(event, DataReceived):
-                        if event.data:
-                            yield event.data
-                        self.connection.acknowledge_received_data(
-                            event.flow_controlled_length,
-                            event.stream_id,
-                        )
-                    elif isinstance(event, (StreamEnded, TrailersReceived)):
-                        leftover = self.connection.data_to_send()
-                        if leftover and self.writer is not None:
-                            self.writer.write(leftover)
-                            await self.writer.drain()
-                        return
-                    elif isinstance(event, WindowUpdated):
-                        outbound = CursorAgentConnectClient._flush_h2_request_data(
-                            self.connection,
-                            self.stream_id,
-                            self.pending,
-                        )
-                        if outbound and self.writer is not None:
-                            self.writer.write(outbound)
-                            await self.writer.drain()
-                leftover = self.connection.data_to_send()
-                if leftover and self.writer is not None:
-                    self.writer.write(leftover)
-                    await self.writer.drain()
-        except Exception:
-            return
+                elif isinstance(event, WindowUpdated):
+                    outbound = CursorAgentConnectClient._flush_h2_request_data(
+                        self.connection,
+                        self.stream_id,
+                        self.pending,
+                    )
+                    if outbound and self.writer is not None:
+                        self.writer.write(outbound)
+                        await self.writer.drain()
+            leftover = self.connection.data_to_send()
+            if leftover and self.writer is not None:
+                self.writer.write(leftover)
+                await self.writer.drain()
 
     async def aclose(self) -> None:
         writer = self.writer
         self.writer = None
+        self.reader = None
         if writer is None:
             return
         try:
             writer.close()
+            abort_fn = getattr(writer, "abort", None)
+            if callable(abort_fn):
+                abort_fn()
             wait_closed = getattr(writer, "wait_closed", None)
             if callable(wait_closed):
-                await wait_closed()
+                await asyncio.wait_for(wait_closed(), timeout=1.0)
         except Exception:
             pass
 
