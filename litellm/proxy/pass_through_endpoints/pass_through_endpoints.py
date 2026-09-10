@@ -4432,6 +4432,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         url: Union[str, httpx.URL],
         credential_family: Optional[str],
         expected_target_family: Optional[str],
+        custom_llm_provider: Optional[str] = None,
     ) -> None:
         """Reject 3xx responses before any credential-bearing follow-up."""
         is_managed_xai = HttpPassThroughEndpointHelpers._is_managed_xai_oauth_egress(
@@ -4440,7 +4441,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         is_openai_redirect = (
             not is_managed_xai
             and HttpPassThroughEndpointHelpers._is_openai_bound_egress(
-                custom_llm_provider=None,
+                custom_llm_provider=custom_llm_provider,
                 egress_credential_family=credential_family,
                 expected_target_family=expected_target_family,
                 url=url,
