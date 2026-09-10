@@ -189,9 +189,10 @@ def _request_context_exec_replies(
                 replies.append(encode_connect_proto_frame(payload))
             continue
         forwarded.append(encode_connect_proto_frame(frame.payload, flags=frame.flags))
-    leftover = bytes(decoder.buffer)
-    if leftover:
-        forwarded.append(leftover)
+    # Incomplete Connect envelopes stay in the decoder until the next DATA
+    # chunk completes them. Forwarding leftover bytes here duplicates the
+    # envelope when the completed frame is later re-encoded (a 9-byte
+    # heartbeat split at 6 bytes became 15 bytes on the CLI).
     return replies, b"".join(forwarded)
 
 

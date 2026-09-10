@@ -376,6 +376,23 @@ def test_request_context_exec_replies_answers_agentn_query() -> None:
     assert heartbeat_forwarded == heartbeat
 
 
+def test_request_context_exec_replies_does_not_duplicate_split_heartbeat() -> None:
+    """A 9-byte heartbeat split at 6 bytes must reassemble to 9, not 15."""
+    heartbeat = _heartbeat_chunk()
+    assert len(heartbeat) == 9
+    decoder = _ProtoConnectFrameDecoder()
+    first, second = heartbeat[:6], heartbeat[6:]
+    replies1, forwarded1 = _request_context_exec_replies(first, decoder)
+    assert replies1 == []
+    assert forwarded1 == b""
+    assert bytes(decoder.buffer) == first
+    replies2, forwarded2 = _request_context_exec_replies(second, decoder)
+    assert replies2 == []
+    assert forwarded2 == heartbeat
+    assert len(forwarded1) + len(forwarded2) == 9
+    assert bytes(decoder.buffer) == b""
+
+
 def _decode_top_fields(payload: bytes) -> List[int]:
     from litellm.llms.cursor_agent.connect import _decode_proto_fields
 
