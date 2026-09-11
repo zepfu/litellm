@@ -17474,6 +17474,10 @@ def _collect_bound_chatgpt_conversation_init_account(  # noqa: PLR0915 - bounded
                         record,
                         history_binding,
                         coverage,
+                        auth_headers={
+                            "Authorization": f"Bearer {credential.access_token}",
+                            "ChatGPT-Account-Id": credential.account_id,
+                        },
                     )
             except OracleBrowserCleanupError as exc:
                 history_usage = coverage.setdefault(
@@ -18929,6 +18933,8 @@ def _capture_chatgpt_native_history_usage(
     record: CodexOAuthCredentialRecord,
     resolved_binding: ChatGPTConversationInitResolvedBinding,
     coverage: Dict[str, Any],
+    *,
+    auth_headers: Optional[Mapping[str, str]] = None,
 ) -> None:
     """Persist reconstructed Chat history attempts for one bound account."""
 
@@ -18954,6 +18960,7 @@ def _capture_chatgpt_native_history_usage(
             lifecycle_capability=resolved_binding.lifecycle_capability,
             expected_account_hash=record.expected_account_hash,
             timeout_seconds=DEFAULT_CHATGPT_NATIVE_HISTORY_PROBE_TIMEOUT_SECONDS,
+            auth_headers=auth_headers,
         )
     except Exception as exc:
         history_usage["capture_status"] = "capture_failed"
@@ -18969,6 +18976,12 @@ def _capture_chatgpt_native_history_usage(
     history_usage["account_identity_verified"] = observation.get(
         "account_identity_verified"
     )
+    for field_name in (
+        "credential_headers_configured",
+        "credential_headers_applied",
+        "credential_headers_observed",
+    ):
+        history_usage[field_name] = bool(observation.get(field_name))
     history_usage["observation_state"] = observation.get("observation_state")
     if observation.get("cleanup_unproven"):
         history_usage["cleanup_unproven"] = True
@@ -19179,6 +19192,16 @@ def _run_chatgpt_native_history_probe(  # noqa: PLR0915 - bounded one-shot probe
     record = matches[0]
     event["account_label"] = record.label
     event["account_hash"] = record.expected_account_hash
+    try:
+        credential = load_codex_oauth_credential(record)
+    except Exception as exc:
+        _set_chatgpt_native_history_probe_failure(
+            event,
+            error_class="ChatGPTNativeHistoryProbeAuthUnavailable",
+            telemetry_class="auth",
+        )
+        event["error_message"] = _redacted_failure_message(str(exc))
+        return event
 
     binding = (config.chatgpt_conversation_init_account_bindings or {}).get(label)
     if binding is None:
@@ -19257,6 +19280,10 @@ def _run_chatgpt_native_history_probe(  # noqa: PLR0915 - bounded one-shot probe
                     DEFAULT_CHATGPT_NATIVE_HISTORY_PROBE_TIMEOUT_SECONDS,
                     remaining,
                 ),
+                auth_headers={
+                    "Authorization": f"Bearer {credential.access_token}",
+                    "ChatGPT-Account-Id": credential.account_id,
+                },
             )
         observation = _sanitize_chatgpt_native_history_probe_observation(result)
         if observation is None:

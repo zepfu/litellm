@@ -126,8 +126,10 @@ _CHATGPT_BROWSER_HISTORY_FETCH_MUTATION_PATTERNS = tuple(
     for path in (
         "/backend-api/conversation",
         "/backend-api/conversation/*",
+        "/backend-api/conversations*",
         "/backend-api/f/conversation",
         "/backend-api/f/conversation/*",
+        "/backend-api/f/conversations*",
     )
 )
 _CHATGPT_BROWSER_INIT_FETCH_PATTERNS = tuple(
@@ -4725,6 +4727,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
     expected_account_hash: str,
     deadline: float,
     max_response_bytes: int,
+    auth_headers: Optional[Mapping[str, str]] = None,
     abort_event: Optional[Any] = None,
 ) -> Mapping[str, Any]:
     capture: Dict[str, Any] = {}
@@ -4748,6 +4751,12 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
     held_history_requests: List[Mapping[str, Any]] = []
     held_history_network_ids: List[str] = []
     capture_deadline = deadline - min(2.0, _remaining_browser_timeout(deadline) / 5)
+    request_header_overrides = {
+        str(name).lower(): str(value)
+        for name, value in (auth_headers or {}).items()
+        if str(name).lower() in {"authorization", "chatgpt-account-id"}
+        and str(value).strip()
+    }
 
     def set_boundary(reason: str) -> None:
         nonlocal boundary_reason
@@ -4879,7 +4888,13 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             if not observer_closed:
                 set_boundary("fetch_control_failed")
 
-    def continue_fetch(request_id: Any, *, pause_stage: str = "request") -> None:
+    def continue_fetch(
+        request_id: Any,
+        *,
+        pause_stage: str = "request",
+        override_auth: bool = False,
+        original_headers: Optional[Mapping[str, Any]] = None,
+    ) -> None:
         if observer_closed or is_stopped():
             return
         if not isinstance(request_id, str) or not request_id:
@@ -4890,7 +4905,27 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             return
         fetch_actions[action_key] = "continue"
         try:
-            session.send("Fetch.continueRequest", {"requestId": request_id})
+            params: Dict[str, Any] = {"requestId": request_id}
+            if override_auth and request_header_overrides:
+                headers: List[Dict[str, str]] = []
+                if isinstance(original_headers, Mapping):
+                    for original_name, original_value in original_headers.items():
+                        if str(original_name).lower() in request_header_overrides:
+                            continue
+                        headers.append(
+                            {
+                                "name": str(original_name),
+                                "value": str(original_value),
+                            }
+                        )
+                headers.extend(
+                    {"name": name, "value": value}
+                    for name, value in request_header_overrides.items()
+                )
+                params["headers"] = headers
+            session.send("Fetch.continueRequest", params)
+            if override_auth and request_header_overrides:
+                capture["credential_headers_applied"] = True
         except Exception:
             set_boundary("fetch_control_failed")
 
@@ -4953,6 +4988,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
         )
         capture.pop("body_failure_reason", None)
         capture.pop("structural", None)
+        capture.pop("fetch_request_id", None)
         apply_network_record(record)
 
     def admit_next_held_history() -> None:
@@ -5078,6 +5114,11 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
         if record is None:
             return None
         record["extra_seen"] = True
+        if request_header_overrides and isinstance(headers, Mapping):
+            record["credential_headers_observed"] = all(
+                _native_init_header(headers, name) == value
+                for name, value in request_header_overrides.items()
+            )
         account_hash = (
             _native_init_account_hash(headers)
             if isinstance(headers, Mapping)
@@ -5590,6 +5631,7 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
                 if (
                     history_admitted
                     and network_request_id == capture.get("network_request_id")
+                    and capture.get("fetch_request_id") is not None
                 ):
                     set_boundary("history_request_replayed")
                 elif len(history_network_ids) > _NATIVE_HISTORY_MAX_COUNT:
@@ -5723,7 +5765,15 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
         if blocked:
             fail_fetch(request_id, pause_stage="request")
         elif not is_stopped():
-            continue_fetch(request_id)
+            continue_fetch(
+                request_id,
+                override_auth=history,
+                original_headers=(
+                    request.get("headers")
+                    if isinstance(request.get("headers"), Mapping)
+                    else None
+                ),
+            )
 
     def request_seen(event: Mapping[str, Any]) -> None:
         nonlocal request_count, history_admitted
@@ -5867,6 +5917,14 @@ def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
             )
         if "blocked_request" in capture:
             result["blocked_request"] = capture["blocked_request"]
+        result["credential_headers_configured"] = bool(request_header_overrides)
+        result["credential_headers_applied"] = bool(
+            capture.get("credential_headers_applied")
+        )
+        result["credential_headers_observed"] = any(
+            record.get("history") and record.get("credential_headers_observed")
+            for record in pending_network.values()
+        )
         return result
     try:
         session.on("Fetch.requestPaused", guard_request)
@@ -6071,6 +6129,7 @@ def observe_native_chatgpt_history_from_oracle_browser(
     expected_account_hash: str = CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH,
     timeout_seconds: float = CHATGPT_NATIVE_HISTORY_DEFAULT_TIMEOUT_SECONDS,
     max_response_bytes: int = CHATGPT_NATIVE_HISTORY_MAX_RESPONSE_BYTES,
+    auth_headers: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     """Observe native ChatGPT history index/detail/message GETs through Oracle CDP.
 
@@ -6109,6 +6168,13 @@ def observe_native_chatgpt_history_from_oracle_browser(
         raise OracleBrowserBoundaryUnavailable(
             "Native ChatGPT history requires a canonical inventory account hash."
         )
+    if auth_headers:
+        supplied_account_hash = _native_init_account_hash(auth_headers)
+        if supplied_account_hash != expected_account_hash:
+            raise OracleBrowserBoundaryUnavailable(
+                "Native ChatGPT history credential identity does not match "
+                "the selected account."
+            )
     if not isinstance(timeout_seconds, (int, float)) or isinstance(
         timeout_seconds,
         bool,
@@ -6169,6 +6235,7 @@ def observe_native_chatgpt_history_from_oracle_browser(
                 operation_start=operation_start,
                 target_close_budget=target_close_budget,
                 max_response_bytes=max_response_bytes,
+                auth_headers=auth_headers,
                 lifecycle_capability=lifecycle_capability,
             )
         )
@@ -6496,6 +6563,7 @@ def _run_oracle_browser_history_observation_in_worker(  # noqa: PLR0915 - bounde
     operation_start: float,
     target_close_budget: float,
     max_response_bytes: int,
+    auth_headers: Optional[Mapping[str, str]],
     lifecycle_capability: NativeHistoryLifecycleCapability,
 ) -> Mapping[str, Any]:
     context = _oracle_browser_process_context(None)
@@ -6535,6 +6603,7 @@ def _run_oracle_browser_history_observation_in_worker(  # noqa: PLR0915 - bounde
             deadline,
             expected_account_hash,
             max_response_bytes,
+            auth_headers,
             private_process_group,
             private_process_start_time,
             role_marker,
@@ -7396,6 +7465,7 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
     cleanup_deadline: float,
     expected_account_hash: str,
     max_response_bytes: int,
+    auth_headers: Optional[Mapping[str, str]],
     private_process_group: Any,
     private_process_start_time: Any,
     role_marker: str,
@@ -7500,6 +7570,7 @@ def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded clean
             expected_account_hash=expected_account_hash,
             deadline=capture_deadline,
             max_response_bytes=max_response_bytes,
+            auth_headers=auth_headers,
             abort_event=abort_event,
         )
         # Observation may spend the capture deadline. Keep reconstructed

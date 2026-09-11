@@ -1007,8 +1007,11 @@ owned page in that browser context and performs one ordinary
 with reserved phase budgets for target close, termination, reaping, and scratch
 removal.
 
-The observer never calls history endpoints directly, supplies guessed headers,
-reads cookies or storage, or submits a model message. Unknown same-origin
+The observer never calls history endpoints directly. When the selected
+inventory account has a validated OAuth snapshot, its bearer and
+`ChatGPT-Account-Id` headers are applied only to admitted history GETs; these
+headers are never retained in output. The observer never reads cookies or
+storage, or submits a model message. Unknown same-origin
 `GET` backend/API bootstrap routes continue observation without storing their
 payloads. Unknown `POST`, mutation, and model-unsafe routes are aborted.
 Authenticated `GET /backend-api/conversations` index traffic plus
