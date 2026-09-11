@@ -3726,6 +3726,7 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
     request_url: str,
     expected_account_hash: str,
     deadline: float,
+    auth_headers: Optional[Mapping[str, str]] = None,
 ) -> Mapping[str, Any]:
     """Capture one native request without retaining its body or credentials."""
     import base64
@@ -3742,6 +3743,17 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
     home_retry_issued = False
     # Leave the existing worker deadline some room to close its owned target.
     capture_deadline = deadline - min(2.0, _remaining_browser_timeout(deadline) / 5)
+    request_header_overrides = [
+        {"name": str(name), "value": str(value)}
+        for name, value in (auth_headers or {}).items()
+        if str(name).strip() and str(value).strip()
+    ]
+
+    def continue_request(request_id: Any, *, override_auth: bool = False) -> None:
+        params: Dict[str, Any] = {"requestId": request_id}
+        if override_auth and request_header_overrides:
+            params["headers"] = request_header_overrides
+        session.send("Fetch.continueRequest", params)
 
     def is_init(url: str) -> bool:
         parsed = urlsplit(url)
@@ -3762,9 +3774,7 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
         if _is_admitted_browser_document_request(
             method, event.get("resourceType")
         ):
-            session.send(
-                "Fetch.continueRequest", {"requestId": event["requestId"]}
-            )
+            continue_request(event["requestId"])
             return
         init_redirect = redirected is not None and (
             is_init(request.get("url", "")) or redirected == init_fetch_id
@@ -3780,9 +3790,7 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
             capture.setdefault("init_observed", True)
         if extra_init:
             # Extra same-origin conversation-init POSTs are SPA bootstrap.
-            session.send(
-                "Fetch.continueRequest", {"requestId": event["requestId"]}
-            )
+            continue_request(event["requestId"], override_auth=True)
             return
         if forbidden:
             # Fail only this request. A third-party Document must not poison
@@ -3799,7 +3807,10 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
                 {"requestId": event["requestId"], "errorReason": "BlockedByClient"},
             )
             return
-        session.send("Fetch.continueRequest", {"requestId": event["requestId"]})
+        continue_request(
+            event["requestId"],
+            override_auth=is_init(request.get("url", "")),
+        )
 
     def request_seen(event: Mapping[str, Any]) -> None:
         nonlocal boundary_error
@@ -3820,13 +3831,14 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
                 not request.get("hasPostData", False) and "postData" not in request
             ),
         )
-        if (
-            capture["method"] != "POST"
-            or capture["account_hash"] != expected_account_hash
+        if capture["method"] != "POST" or (
+            capture["account_hash"] is not None
+            and capture["account_hash"] != expected_account_hash
         ):
             boundary_error = True
 
     def extra_seen(event: Mapping[str, Any]) -> None:
+        nonlocal boundary_error
         request_id = event.get("requestId")
         if not isinstance(request_id, str):
             return
@@ -3834,6 +3846,10 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
         captured_id = capture.get("request_id")
         if account_hash is None and request_id != captured_id:
             return
+        if request_id == captured_id and capture.get("account_hash") is None:
+            capture["account_hash"] = account_hash
+            if account_hash is not None and account_hash != expected_account_hash:
+                boundary_error = True
         if request_id not in extra_hashes and len(extra_hashes) >= 256:
             oldest = next(
                 (key for key in extra_hashes if key != captured_id), None
@@ -6181,6 +6197,7 @@ class OracleBrowserConversationInitTransport:
         page_target_id: str,
         expected_account_hash: str,
         timeout_seconds: float = 30.0,
+        auth_headers: Optional[Mapping[str, str]] = None,
         playwright_factory: Optional[Callable[[], Any]] = None,
     ) -> None:
         endpoint = cdp_endpoint
@@ -6206,6 +6223,11 @@ class OracleBrowserConversationInitTransport:
             )
         self.expected_account_hash = expected_account_hash
         self.timeout_seconds = timeout_seconds
+        self._auth_headers = {
+            str(name): str(value)
+            for name, value in (auth_headers or {}).items()
+            if str(name).strip() and str(value).strip()
+        }
         self._playwright_factory = playwright_factory
 
     def fetch(self, request: urllib_request.Request) -> Mapping[str, Any]:
@@ -6218,6 +6240,7 @@ class OracleBrowserConversationInitTransport:
                 expected_account_hash=self.expected_account_hash,
                 request_url=request.full_url,
                 deadline=deadline,
+                auth_headers=self._auth_headers,
                 playwright_factory=self._playwright_factory,
             )
         except OracleBrowserBoundaryUnavailable:
@@ -6240,6 +6263,7 @@ def _run_oracle_browser_capture_in_worker(
     expected_account_hash: str,
     request_url: str,
     deadline: float,
+    auth_headers: Optional[Mapping[str, str]],
     playwright_factory: Optional[Callable[[], Any]],
 ) -> Mapping[str, Any]:
     context = _oracle_browser_process_context(playwright_factory)
@@ -6265,6 +6289,7 @@ def _run_oracle_browser_capture_in_worker(
             private_process_group,
             private_process_start_time,
             expected_account_hash,
+            auth_headers,
             owned_target,
             creation_state,
             creation_url,
@@ -6333,6 +6358,7 @@ def _oracle_browser_capture_worker(  # noqa: PLR0915 - bounded browser worker
     private_process_group: Any,
     private_process_start_time: Any,
     expected_account_hash: str,
+    auth_headers: Optional[Mapping[str, str]],
     owned_target: Any,
     creation_state: Any,
     creation_url: str,
@@ -6405,6 +6431,7 @@ def _oracle_browser_capture_worker(  # noqa: PLR0915 - bounded browser worker
             request_url=request_url,
             expected_account_hash=expected_account_hash,
             deadline=deadline,
+            auth_headers=auth_headers,
         )
         _raise_if_browser_deadline_expired(deadline)
         successful = True
@@ -8213,6 +8240,7 @@ def build_oracle_browser_conversation_init_transport(
     page_target_id: str,
     expected_account_hash: str,
     timeout_seconds: float = 30.0,
+    auth_headers: Optional[Mapping[str, str]] = None,
 ) -> OracleBrowserConversationInitTransport:
     """Build native capture in an owned page of the pinned target's context."""
 
@@ -8221,6 +8249,7 @@ def build_oracle_browser_conversation_init_transport(
         page_target_id=page_target_id,
         expected_account_hash=expected_account_hash,
         timeout_seconds=timeout_seconds,
+        auth_headers=auth_headers,
     )
 
 
@@ -8558,6 +8587,7 @@ def collect_conversation_init_snapshot_from_oracle_browser(
     page_target_id: str,
     expected_account_hash: str,
     timeout_seconds: float = 30.0,
+    auth_headers: Optional[Mapping[str, str]] = None,
     request_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Collect one verified, account-bound snapshot through Oracle's browser.
@@ -8592,6 +8622,7 @@ def collect_conversation_init_snapshot_from_oracle_browser(
             page_target_id=page_target_id,
             expected_account_hash=expected,
             timeout_seconds=timeout_seconds,
+            auth_headers=auth_headers,
         )
     except (ChatGPTConversationInitError, ValueError) as exc:
         return _bound_capture_failure(

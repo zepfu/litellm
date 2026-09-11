@@ -29,7 +29,7 @@ import urllib.request
 import uuid
 from contextlib import contextmanager
 from concurrent.futures import Future, ThreadPoolExecutor, wait as futures_wait
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import dataclass, field as dataclass_field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import (
@@ -1528,12 +1528,13 @@ FROM ranked
 
 @dataclass(frozen=True)
 class ChatGPTConversationInitAccountBinding:
-    """Nonsecret browser binding for one Codex OAuth inventory label."""
+    """Browser and credential binding for one Codex OAuth inventory label."""
 
     cdp_endpoint: Optional[str] = None
     page_target_id: Optional[str] = None
     oracle_profile_path: Optional[str] = None
     oracle_profile_directory: Optional[str] = None
+    auth_file_path: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -2245,6 +2246,7 @@ def _parse_chatgpt_conversation_init_account_bindings(
         "page_target_id",
         "oracle_profile_path",
         "oracle_profile_directory",
+        "auth_file_path",
     }
     for raw_label, raw_binding in parsed.items():
         if not isinstance(raw_label, str) or not raw_label.strip():
@@ -2268,6 +2270,16 @@ def _parse_chatgpt_conversation_init_account_bindings(
         page_target_id = raw_binding.get("page_target_id")
         oracle_profile_path = raw_binding.get("oracle_profile_path")
         oracle_profile_directory = raw_binding.get("oracle_profile_directory")
+        auth_file_path = raw_binding.get("auth_file_path")
+        if auth_file_path is not None and (
+            not isinstance(auth_file_path, str)
+            or not auth_file_path.strip()
+            or not Path(auth_file_path.strip()).is_absolute()
+        ):
+            raise SystemExit(
+                f"{CHATGPT_CONVERSATION_INIT_ACCOUNT_BINDINGS_ENV} entry "
+                f"'{label}' auth_file_path must be an absolute path."
+            )
         has_cdp_binding = cdp_endpoint is not None or page_target_id is not None
         has_oracle_binding = (
             oracle_profile_path is not None or oracle_profile_directory is not None
@@ -2292,6 +2304,9 @@ def _parse_chatgpt_conversation_init_account_bindings(
             bindings[label] = ChatGPTConversationInitAccountBinding(
                 cdp_endpoint=cdp_endpoint.strip(),
                 page_target_id=page_target_id.strip(),
+                auth_file_path=(
+                    auth_file_path.strip() if auth_file_path is not None else None
+                ),
             )
             continue
         if (
@@ -2316,6 +2331,9 @@ def _parse_chatgpt_conversation_init_account_bindings(
                 oracle_profile_directory.strip()
                 if oracle_profile_directory is not None
                 else None
+            ),
+            auth_file_path=(
+                auth_file_path.strip() if auth_file_path is not None else None
             ),
         )
     return bindings
@@ -17396,7 +17414,15 @@ def _collect_bound_chatgpt_conversation_init_account(  # noqa: PLR0915 - bounded
     )
 
     try:
-        credential = load_codex_oauth_credential(record)
+        auth_record = record
+        if binding.auth_file_path is not None:
+            auth_path = Path(binding.auth_file_path).expanduser()
+            auth_record = replace(
+                record,
+                auth_path=auth_path,
+                lock_path=Path(f"{auth_path}.lock"),
+            )
+        credential = load_codex_oauth_credential(auth_record)
         if credential.account_hash != record.expected_account_hash:
             _set_chatgpt_account_failure(
                 coverage,
@@ -17491,6 +17517,10 @@ def _collect_bound_chatgpt_conversation_init_account(  # noqa: PLR0915 - bounded
                         cdp_endpoint=resolved_binding.cdp_endpoint,
                         page_target_id=resolved_binding.page_target_id,
                         expected_account_hash=record.expected_account_hash,
+                        auth_headers={
+                            "Authorization": f"Bearer {credential.access_token}",
+                            "ChatGPT-Account-Id": credential.account_id,
+                        },
                         timeout_seconds=(
                             DEFAULT_CHATGPT_CONVERSATION_INIT_BROWSER_TIMEOUT_SECONDS
                         ),
