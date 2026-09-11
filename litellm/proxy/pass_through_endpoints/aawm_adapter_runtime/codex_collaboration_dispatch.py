@@ -321,11 +321,21 @@ def parse_codex_collaboration_text_frame(value: Any) -> str:
 
 
 def _parse_codex_collaboration_payload(value: Any) -> str:
-    """Accept the current plaintext payload and the CFG-047 frame form."""
+    """Accept plaintext and materialize CFG-047 without rejecting opaque text.
+
+    Codex has shipped more than one assignment representation.  A payload
+    that starts like JSON may be a client-owned serialized assignment rather
+    than a complete CFG-047 frame, so an unknown frame shape must be preserved
+    byte-for-byte for the child route instead of becoming a pre-egress 409.
+    """
     if not isinstance(value, str) or not value or len(value) > _MAX_FRAME_CHARS:
         raise CodexCollaborationDispatchError("invalid_envelope")
     if _FRAME_PREFIX_PATTERN.match(value):
-        return parse_codex_collaboration_text_frame(value)
+        try:
+            return parse_codex_collaboration_text_frame(value)
+        except CodexCollaborationDispatchError as exc:
+            if exc.reason != "unknown_representation":
+                raise
     return value
 
 
