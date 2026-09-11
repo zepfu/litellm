@@ -23,6 +23,7 @@ from hv2.checks.orch_evidence import (
     child_spawn_evidence,
     grok_spawn_tool_evidence,
     grok_workspace_session_root,
+    muse_spawn_tool_evidence,
 )
 from hv2.checks.redis_scan import snapshot_redis
 from hv2.checks.session_history import session_history_result
@@ -448,7 +449,7 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
     for model in plan.models:
         argv = driver.launch_argv(model)
         driver.assert_no_print_flags(argv)
-        if plan.tui != "grok" and ("-p" in argv or "--print" in argv):
+        if plan.tui not in {"grok", "muse"} and ("-p" in argv or "--print" in argv):
             failures.append(f"refusing print-mode argv for {model}")
             continue
         launched = driver.ensure_session(model, tools=tools)
@@ -560,6 +561,8 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
         raise PlanError("orchestration kind requires --tui")
     driver = _driver_for_plan(plan)
     grok_orch = plan.tui == "grok"
+    muse_orch = plan.tui == "muse"
+    spawn_tool_orch = grok_orch or muse_orch
     template = str(plan.extra.get("orchestration_prompt_template") or "")
     if not plan.orchestration_parents:
         raise PlanError("orchestration kind has no parent")
@@ -573,7 +576,7 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
         )
         argv = driver.launch_argv(parent)
         driver.assert_no_print_flags(argv)
-        if plan.tui != "grok" and ("-p" in argv or "--print" in argv):
+        if plan.tui not in {"grok", "muse"} and ("-p" in argv or "--print" in argv):
             raise PlanError(f"refusing print-mode argv for {parent}")
         rows.append(
             {
@@ -635,6 +638,33 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
             session_dir = str(driver.alias_session_dir(first))
         elif hasattr(driver, "spec"):
             session_dir = str((driver.spec or {}).get("session_dir") or "") or None
+
+        def _spawn_evidence(current_pane: str) -> dict[str, Any]:
+            if grok_orch:
+                return grok_spawn_tool_evidence(
+                    pane=current_pane,
+                    prompt=sent_prompt,
+                    after_echo_index=pre_echo,
+                    session_dir=session_dir,
+                    since_mtime=session_started,
+                )
+            if muse_orch:
+                return muse_spawn_tool_evidence(
+                    pane=current_pane,
+                    prompt=sent_prompt,
+                    after_echo_index=pre_echo,
+                    session_dir=session_dir,
+                    since_mtime=session_started,
+                )
+            return child_spawn_evidence(
+                children=list(plan.orchestration_children),
+                pane=current_pane,
+                session_dir=session_dir,
+                since_mtime=session_started,
+                prompt=sent_prompt,
+                after_echo_index=pre_echo,
+            )
+
         wait_seconds = 420.0
         poll_seconds = 1.0
         if hasattr(driver, "_tmux_float"):
@@ -642,23 +672,7 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
             poll_seconds = driver._tmux_float("poll_interval_seconds", 1)
         deadline = time.time() + wait_seconds
         pane = driver.capture_pane() if hasattr(driver, "capture_pane") else ""
-        if grok_orch:
-            evidence = grok_spawn_tool_evidence(
-                pane=pane,
-                prompt=sent_prompt,
-                after_echo_index=pre_echo,
-                session_dir=session_dir,
-                since_mtime=session_started,
-            )
-        else:
-            evidence = child_spawn_evidence(
-                children=list(plan.orchestration_children),
-                pane=pane,
-                session_dir=session_dir,
-                since_mtime=session_started,
-                prompt=sent_prompt,
-                after_echo_index=pre_echo,
-            )
+        evidence = _spawn_evidence(pane)
         recap_present = bool(
             orch_needles
             and _pane_tool_command_pass(
@@ -668,7 +682,7 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
                 after_echo_index=pre_echo,
             )
         )
-        if grok_orch:
+        if spawn_tool_orch:
             # Wrap-token recap is not wait-complete. Spawn/tool JSONL is the gate.
             wait_complete = bool(evidence.get("ok"))
         else:
@@ -676,28 +690,12 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
                 recap_present if pass_mode == "tool_command" else evidence.get("ok")
             )
         # Recap/tool-token is wait-complete only for Ohmypi/Codex. Keep polling
-        # Grok until spawn/tool evidence is complete even if the pane already
-        # shows the wrap token.
+        # Grok/Muse until spawn/tool evidence is complete even if the pane
+        # already shows the wrap token.
         while time.time() < deadline and not wait_complete:
             time.sleep(max(poll_seconds, 0.2))
             pane = driver.capture_pane() if hasattr(driver, "capture_pane") else pane
-            if grok_orch:
-                evidence = grok_spawn_tool_evidence(
-                    pane=pane,
-                    prompt=sent_prompt,
-                    after_echo_index=pre_echo,
-                    session_dir=session_dir,
-                    since_mtime=session_started,
-                )
-            else:
-                evidence = child_spawn_evidence(
-                    children=list(plan.orchestration_children),
-                    pane=pane,
-                    session_dir=session_dir,
-                    since_mtime=session_started,
-                    prompt=sent_prompt,
-                    after_echo_index=pre_echo,
-                )
+            evidence = _spawn_evidence(pane)
             recap_present = bool(
                 orch_needles
                 and _pane_tool_command_pass(
@@ -707,20 +705,14 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
                     after_echo_index=pre_echo,
                 )
             )
-            if grok_orch:
+            if spawn_tool_orch:
                 wait_complete = bool(evidence.get("ok"))
             else:
                 wait_complete = (
                     recap_present if pass_mode == "tool_command" else evidence.get("ok")
                 )
-        if grok_orch:
-            evidence = grok_spawn_tool_evidence(
-                pane=pane,
-                prompt=sent_prompt,
-                after_echo_index=pre_echo,
-                session_dir=session_dir,
-                since_mtime=session_started,
-            )
+        if spawn_tool_orch:
+            evidence = _spawn_evidence(pane)
         rows[0]["idle"] = False
         rows[0]["replied"] = bool(evidence.get("ok") or recap_present)
         rows[0]["pane_preview"] = pane[-4000:]
@@ -732,7 +724,7 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
             )
         rows[0]["child_evidence"] = evidence
         rows[0]["recap_present"] = recap_present
-        if grok_orch:
+        if spawn_tool_orch:
             # Wrap-token recap is wait-complete only. Spawn/tool chrome is the gate.
             failures.extend(list(evidence.get("failures") or []))
             rows[0]["tool_pass"] = bool(evidence.get("ok"))

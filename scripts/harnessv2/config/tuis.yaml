@@ -1,4 +1,4 @@
-# TUI drivers. Ohmypi and Codex are implemented. Claude is not a stub.
+# TUI drivers. Ohmypi, Codex, Grok, and Muse are implemented. Claude is not a stub.
 tuis:
   out_of_scope:
     - claude
@@ -6,6 +6,7 @@ tuis:
     - ohmypi
     - codex
     - grok
+    - muse
   stubs:
     - opencode
   ohmypi:
@@ -388,6 +389,130 @@ tuis:
         - GROK_SANDBOX
         - GROK_SUBAGENTS
         - AAWM_GROK_REAL_BIN
+  # Interactive Muse TUI. Never exec operator musela/muselt/musel.
+  # --base-url is inspect-derived origin only (today 127.0.0.1:4011).
+  # Muse joins GET /muse-code/models and POST /responses itself.
+  # MUSE-007 owns rollup identity; do not guess a Muse client stamp here.
+  muse:
+    enabled: true
+    stub: false
+    binary: muse
+    wrapper: musela
+    cwd: /tmp/hv2-muse-workspace
+    session_dir: /tmp/hv2-muse-sessions
+    default_models:
+      - muse-spark-1.3-contributor
+    default_orchestration_parent: muse-spark-1.3-contributor
+    default_orchestration_children:
+      - muse-spark-1.3-contributor
+    model_prompt: muse_model
+    orchestration_prompt: muse_orchestration
+    tmux:
+      socket: tmux37
+      session: muse
+      harness_session_prefix: hv2-muse
+      wait_ready_seconds: 25
+      wait_idle_seconds: 180
+      wait_reply_seconds: 600
+      wait_mcp_seconds: 30
+      poll_interval_seconds: 1
+    forbid_flags:
+      - "--yolo"
+      - exec
+    forbid_tokens:
+      - muselt
+      - musel
+    submit_keys:
+      - C-m
+    submit_delay_seconds: 1.0
+    argv_interactive:
+      - muse
+      - --base-url
+      - "{base_url}"
+      - --workspace
+      - "{cwd}"
+      - --approval-mode
+      - never
+      - --trust-workspace
+    argv_launch_model:
+      - muse
+      - --base-url
+      - "{base_url}"
+      - --workspace
+      - "{cwd}"
+      - --model
+      - "{model}"
+      - --approval-mode
+      - never
+      - --trust-workspace
+    argv_no_tools: []
+    lanes:
+      alias: litellm-alpha
+    model_id_template: "{model}"
+    select_model:
+      strategy: launch_session
+      reuse_operator_session: false
+      tools_for_model: false
+      tools_for_orchestration: true
+      pass_mode: exact_pong
+      standalone_pass_tokens:
+        - hv2-muse-child
+      # Conservative unique strings from muse --help / binary chrome.
+      # Live pane needles still need operator-approved capture.
+      ready_needles:
+        - Muse Code
+        - muse-spark
+      mcp_ready_needles: []
+      idle_needles:
+        - Muse Code
+        - muse-spark
+      busy_needles:
+        - Working
+        - Calling tools
+        - Compacting
+        - Interrupting
+        - "Waiting for"
+        - "Spawn accepted"
+        - "Child running"
+      selected_needles:
+        - "{selector}"
+        - "{model}"
+      reply_needles:
+        - PONG
+        - hv2-muse-child
+        - "No endpoints found for"
+        - "404 Not Found"
+        - "status code 404"
+        - "Error: 404"
+      provider_404_needles:
+        - "No endpoints found for"
+        - "404 Not Found"
+        - "status code 404"
+        - "Error: 404"
+        - "model_not_found"
+      orchestration_pass_needles:
+        - hv2-muse-child
+      reject_needles:
+        - "Unknown model"
+        - "model_not_found"
+        - muselt
+        - musel
+      env_keys:
+        - PATH
+        - HOME
+        - USER
+        - LOGNAME
+        - TERM
+        - COLORTERM
+        - TMPDIR
+        - LANG
+        - LC_ALL
+        - LC_CTYPE
+        - AAWM_HARNESS_USER_ID
+        - XDG_CONFIG_HOME
+        - XDG_DATA_HOME
+        - AAWM_MUSE_REAL_BIN
+        - MUSE_DISABLE_ULTRA_ANIMATIONS
   opencode:
     enabled: false
     stub: true

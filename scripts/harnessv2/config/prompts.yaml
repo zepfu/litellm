@@ -11,3 +11,7 @@ prompts:
     file: prompts/grok_model.txt
   grok_orchestration:
     file: prompts/grok_orchestration.txt
+  muse_model:
+    file: prompts/muse_model.txt
+  muse_orchestration:
+    file: prompts/muse_orchestration.txt

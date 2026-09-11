@@ -30,6 +30,7 @@ _TUI_ROLLUP_IDENTITY = {
     "ohmypi": (_OHMYPI_ROLLUP_IDENTITY, "Ohmypi"),
     "codex": (_CODEX_ROLLUP_IDENTITY, "Codex"),
     "grok": (_GROK_ROLLUP_IDENTITY, "Grok"),
+    # muse: skip until MUSE-007 stamps a stable client identity.
 }
 # Repo token is the \S+ immediately before @ after the rollup timestamp.
 _ROLLUP_REPO_BEFORE_AT = re.compile(
