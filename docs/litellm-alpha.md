@@ -43,7 +43,10 @@ does not share candidate cooldown or affinity keys with `litellm-dev`.
 - Compose file: `docker-compose.alpha.yml` (alpha only)
 - Local endpoint: `http://127.0.0.1:4011`
 - Tailscale endpoint: `http://100.109.19.233:4011`
-- Config: `/app/litellm-dev-config.yaml`, bind-mounted from this repository
+- Config: `/app/litellm-alpha-config.yaml`, bind-mounted from this
+  repository (`litellm-alpha-config.yaml`). Do not load
+  `litellm-dev-config.yaml` in the alpha process; that file remains the
+  `:4001` config.
 - Source: `/app`, bind-mounted read-only from this repository
 - Cursor GUI auth directory: `/home/zepfu/.config/cursor`, bind-mounted
   read-only at the same path; the directory mount keeps sidecar atomic
@@ -84,7 +87,7 @@ claim, replay, quarantine, or delete `litellm-dev` spool records.
 
 - `litellm/`
 - `enterprise/`
-- `litellm-dev-config.yaml`
+- `litellm-alpha-config.yaml`
 - `model_prices_and_context_window.json`
 - `context-replacement/`
 
@@ -215,3 +218,108 @@ namespace, but it is not a sandbox for destructive database or provider tests.
 The Cursor auth-file wiring is testing-only. Alpha results remain confined to
 the alpha service and current checkout; they do not promote candidates or
 configuration to `litellm-dev` or production.
+
+## Muse Code (alpha only)
+
+Muse Code may use alpha as `--base-url`. Production (`:4000`) and
+development (`:4001`) are out of scope for this work. Do not point Muse
+at `musel` or `muselt` to exercise the alpha route.
+
+### `musela`
+
+Host launchers (Fish and Bash, not this repository) resolve:
+
+```bash
+musela
+# muse --base-url http://litellm-dev.tailf1878c.ts.net:4011
+```
+
+Override with `AAWM_MUSE_LITELLM_ALPHA_URL`. The value must be an origin
+only (`http://host:4011`), not `.../v1` and not `.../muse-code`. Muse
+then calls `GET /muse-code/models` and `POST /responses` on that origin.
+
+Confirm the function in a fresh shell:
+
+```bash
+bash -lc 'type musela'
+fish -c 'type musela'
+```
+
+Default client model: `muse-spark-1.3-contributor` (host
+`~/.config/muse/settings.json`). Catalog ids the facade may advertise:
+`muse-spark-1.3-contributor`, `muse-spark-1.3`,
+`muse-spark-1.2-contributor`, `muse-spark-1.2`. Override the advertised
+list with `AAWM_MUSE_CODE_MODEL_IDS` (comma-separated) on alpha Compose
+only.
+
+### Credentials
+
+Muse sends `Authorization: Bearer …` plus `x-client-id` and, on model
+calls, `x-tbh-session-id` / `x-meta-ai-gateway-session-id`. LiteLLM
+virtual-key auth is the inbound gate once the facade is enabled. Do not
+put Meta OAuth tokens or API keys in Compose, Langfuse, or
+`session_history`. Host Muse login stays in `~/.config/muse/auth.json`
+and is not an alpha bind-mount.
+
+Enable the facade only on alpha:
+
+```yaml
+# docker-compose.alpha.yml environment (alpha only)
+AAWM_MUSE_CODE_FACADE_ENABLED: "1"
+```
+
+Leave that variable unset on `litellm-dev` and production. When unset,
+`GET /muse-code/models` remains FastAPI `{"detail":"Not Found"}`.
+
+### Known limitations
+
+- Alpha-only. `musel` / `muselt` are not this route.
+- Muse `--base-url` is origin-only. A base that already ends in `/v1`
+  is a different join and is not the `musela` contract.
+- Tool execution (shell, filesystem, MCP) stays in the Muse client.
+  LiteLLM must not run those tools.
+- Approvals are local Muse/MSP, not Meta HTTP.
+- Harness v2 Muse TUI source may exist under `scripts/harnessv2/`;
+  running it still needs an explicit operator request.
+- Upstream alias mapping, body limits, and stream timeouts remain
+  alpha-config knobs and must not be added to `litellm-dev-config.yaml`.
+
+### Logs
+
+- Container:
+  `docker compose -f docker-compose.alpha.yml logs litellm-alpha`
+- Error JSONL: repository `.analysis/alpha-error.jsonl`
+  (`LITELLM_AAWM_ERROR_LOG_ENV=alpha`)
+- Langfuse: `LITELLM_LANGFUSE_TRACE_ENVIRONMENT=alpha`
+- Session-history spool:
+  `/app/.analysis/runtime/litellm-alpha/session_history`
+- Route family for Muse catalog/call attribution: `muse_code` (no
+  credentials in tags)
+
+### Rollback / removal
+
+Do not use `docker-compose.dev.yml` or production Compose for this
+rollback. Alpha-only:
+
+1. Remove `AAWM_MUSE_CODE_FACADE_ENABLED` (and any later
+   `AAWM_MUSE_*` / `LITELLM_MUSE_*` keys) from
+   `docker-compose.alpha.yml`.
+2. Remove Muse `model_list` rows, timeouts, and body limits from
+   `litellm-alpha-config.yaml` only. Do not edit
+   `litellm-dev-config.yaml` to “undo” Muse.
+3. Recreate **only** `litellm-alpha`:
+
+   ```bash
+   docker compose -f docker-compose.alpha.yml up -d --force-recreate litellm-alpha
+   ```
+
+4. Confirm `curl -sS http://127.0.0.1:4011/muse-code/models` is 404
+   `{"detail":"Not Found"}` and that `:4000` / `:4001` were not
+   restarted.
+5. Source rollback is the reverse of the Muse facade commit (router
+   include + `muse_code_gateway` module). Alias YAML under
+   `litellm/proxy/aawm_alias_config/` must not have received Muse
+   entries; if it did, revert that as a defect.
+
+Host `musela` can remain; it only sets `--base-url`. Removing the
+launcher is optional and is not required to disable the alpha route.
