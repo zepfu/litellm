@@ -1,0 +1,15 @@
+You are the parent on model {parent}.
+
+Call spawn_subagent now with subagent_type=general-purpose and a non-empty
+message that tells the child to execute a harmless local shell command
+(`pwd`) in this workspace and return only that command's stdout. Do not
+guess the result. Do not skip the child spawn. Do not run the command
+yourself.
+
+After the child returns stdout, in a single assistant response run these
+two tools in parallel (not sequential turns): `pwd` and `uname -s`.
+Return the two stdout strings. No other tools.
+
+Then print the child's stdout on its own line, then reply with the exact
+token hv2-grok-child on its own line. Do not print the token until the
+child's stdout is visible.

@@ -16,7 +16,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="harnessv2",
         description=(
             "YAML/JSON-first LiteLLM acceptance harness. "
-            "Ohmypi and Codex are implemented TUIs. Claude is out of scope. "
+            "Ohmypi, Codex, and Grok (grokla) are implemented TUIs. "
+            "Claude is out of scope. "
             "--instance is a Docker container name; host port comes from "
             "docker inspect. Never targets aawm-litellm (:4000) or "
             "litellm-dev (:4001)."

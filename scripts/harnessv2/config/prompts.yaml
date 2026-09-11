@@ -7,3 +7,7 @@ prompts:
     file: prompts/codex_model.txt
   codex_orchestration:
     file: prompts/codex_orchestration.txt
+  grok_model:
+    file: prompts/grok_model.txt
+  grok_orchestration:
+    file: prompts/grok_orchestration.txt

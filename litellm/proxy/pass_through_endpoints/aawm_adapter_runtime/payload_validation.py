@@ -23,6 +23,9 @@ from litellm.integrations.aawm_agent_quality_rules import (
     is_malformed_composer_call_literal_text,
     is_malformed_grok_literal_tool_label_transcript_text,
 )
+from litellm.llms.anthropic.experimental_pass_through.providers.grok import (
+    composer_repair as _anthropic_grok_composer_repair,
+)
 from litellm.proxy._types import ProxyException
 from litellm.proxy.aawm_runtime_error_logging import (
     schedule_persist_malformed_tool_call_detection,
@@ -2459,7 +2462,11 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
         if restored_namespace_tool_count:
             response_body = restored_body
             response_changed = True
-        if _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
+        if _is_codex_auto_agent_malformed_tool_call_text_output(
+            response_body
+        ) and not _anthropic_grok_composer_repair.response_body_has_structured_tool_calls(
+            response_body
+        ):
             _raise_codex_auto_agent_malformed_tool_call_text_payload(
                 response_body=response_body,
                 adapter_model=adapter_model,
@@ -2617,7 +2624,11 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             )
             if restored_namespace_tool_count:
                 response_body = restored_body
-            if _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
+            if _is_codex_auto_agent_malformed_tool_call_text_output(
+                response_body
+            ) and not _anthropic_grok_composer_repair.response_body_has_structured_tool_calls(
+                response_body
+            ):
                 _raise_codex_auto_agent_malformed_tool_call_text_payload(
                     response_body=response_body,
                     adapter_model=adapter_model,

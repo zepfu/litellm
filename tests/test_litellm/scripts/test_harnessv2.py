@@ -18,6 +18,7 @@ _HV2 = _REPO / "scripts" / "harnessv2"
 _FIXTURES = _HV2 / "fixtures" / "logs"
 _ORCH_FIXTURES = _HV2 / "fixtures" / "orch"
 _CODEX_DRIVER = _HV2 / "hv2" / "drivers" / "codex.py"
+_GROK_DRIVER = _HV2 / "hv2" / "drivers" / "grok.py"
 _ORCH_BASELINE_CHILDREN = (
     "basic",
     "basic-other",
@@ -156,7 +157,13 @@ def test_should_load_yaml_includes_and_compiled_aliases(hv, config) -> None:
     assert 4001 in config["protected_ports"]
     assert config["tuis"]["out_of_scope"] == ["claude"]
     assert "ohmypi" in config["tuis"]["implemented"]
-    assert "grok" in config["tuis"]["stubs"]
+    if _GROK_DRIVER.is_file() and "grok" in set(config["tuis"].get("implemented") or []):
+        assert "grok" not in config["tuis"]["stubs"]
+        assert config["tuis"]["grok"]["enabled"] is True
+        assert config["tuis"]["grok"]["wrapper"] == "grokla"
+        assert "groklt" in config["tuis"]["grok"]["forbid_tokens"]
+    else:
+        assert "grok" in config["tuis"]["stubs"]
     assert "opencode" in config["tuis"]["stubs"]
     assert "-p" in config["tuis"]["ohmypi"]["forbid_flags"]
     assert "--print" in config["tuis"]["ohmypi"]["forbid_flags"]
@@ -245,7 +252,11 @@ def test_should_refuse_claude_tui(hv, config) -> None:
 
 
 def test_should_refuse_stub_tui(hv, config) -> None:
-    stubs = ["grok", "opencode"]
+    stubs = ["opencode"]
+    if "grok" in set(config["tuis"].get("stubs") or []) and "grok" not in set(
+        config["tuis"].get("implemented") or []
+    ):
+        stubs.append("grok")
     if not _codex_tui_implemented(config):
         stubs.append("codex")
     for stub in stubs:
@@ -907,6 +918,391 @@ def test_should_still_fail_unrelated_traceback_after_expected_work_miss(
     joined = " ".join(scan["failures"])
     assert "Traceback (most recent call last)" in joined
     assert "Exception in ASGI application" in joined
+
+
+def _alpha_inspect_payload() -> dict[str, Any]:
+    return {
+        "State": {"Running": True},
+        "Config": {
+            "Cmd": ["litellm", "--port", "4011"],
+            "Env": ["AAWM_LITELLM_ENVIRONMENT=litellm-alpha"],
+        },
+        "NetworkSettings": {
+            "Ports": {"4011/tcp": [{"HostIp": "127.0.0.1", "HostPort": "4011"}]}
+        },
+    }
+
+
+def test_should_plan_grok_tui_against_alpha_not_as_stub(hv, config) -> None:
+    if not _GROK_DRIVER.is_file():
+        pytest.skip("Grok driver is not shipped")
+    plan = hv.build_plan(
+        config=config,
+        kind="orchestration",
+        instance_token="alpha",
+        tui="grok",
+        models=None,
+        orchestration_parent=None,
+        orchestration_children=None,
+        dry_run=True,
+        write_artifact=None,
+    )
+    assert plan.tui == "grok"
+    assert plan.container == "litellm-alpha"
+    assert plan.orchestration_parents == ("grok-4.6",)
+    artifact = hv.run_plan(plan)
+    assert artifact["ok"] is True
+    assert artifact["dry_run"] is True
+
+
+def test_should_refuse_grok_plan_on_protected_targets(hv, config) -> None:
+    if not _GROK_DRIVER.is_file():
+        pytest.skip("Grok driver is not shipped")
+    for name in ("aawm-litellm", "litellm-dev"):
+        with pytest.raises((hv.PlanError, hv.ProtectedTargetError)):
+            hv.build_plan(
+                config=config,
+                kind="orchestration",
+                instance_token=name,
+                tui="grok",
+                models=None,
+                orchestration_parent=None,
+                orchestration_children=None,
+                dry_run=True,
+                write_artifact=None,
+            )
+
+
+def test_should_resolve_grokla_proxy_url_from_alpha_inspect(hv, config) -> None:
+    from hv2.grokla import resolve_grokla_proxy_url
+
+    url = resolve_grokla_proxy_url(
+        config,
+        inspect_payload=_alpha_inspect_payload(),
+    )
+    assert url == "http://127.0.0.1:4011/grok/v1"
+
+
+def test_should_refuse_grokla_proxy_url_on_protected_ports_and_groklt(hv, config) -> None:
+    from hv2.grokla import assert_grokla_proxy_url
+
+    for url in (
+        "http://127.0.0.1:4000/grok/v1",
+        "http://127.0.0.1:4001/grok/v1",
+        "http://aawm-litellm:4011/grok/v1",
+        "http://litellm-dev:4011/grok/v1",
+        "http://127.0.0.1:4011/groklt",
+    ):
+        with pytest.raises((hv.PlanError, hv.ProtectedTargetError)):
+            assert_grokla_proxy_url(url, config)
+
+
+def test_should_bind_grok_driver_child_env_to_alpha_grok_v1(hv, config) -> None:
+    from hv2.drivers.grok import GrokDriver
+    from hv2.instance import inspect_instance
+
+    if not _GROK_DRIVER.is_file():
+        pytest.skip("Grok driver is not shipped")
+    driver = GrokDriver(config)
+    resolved = inspect_instance(
+        "litellm-alpha", config, inspect_payload=_alpha_inspect_payload()
+    )
+    assert driver.bind_resolved(resolved) == "http://127.0.0.1:4011/grok/v1"
+    env = driver.child_env()
+    assert env["GROK_CLI_CHAT_PROXY_BASE_URL"] == "http://127.0.0.1:4011/grok/v1"
+    argv = driver.launch_argv("grok-4.6")
+    joined = " ".join(argv)
+    assert "groklt" not in joined
+    assert ":4000" not in joined
+    assert ":4001" not in joined
+
+
+def test_should_refuse_grok_driver_groklt_tokens(hv, config) -> None:
+    from hv2.drivers.grok import GrokDriver
+
+    if not _GROK_DRIVER.is_file():
+        pytest.skip("Grok driver is not shipped")
+    driver = GrokDriver(config)
+    with pytest.raises(hv.PlanError, match="groklt"):
+        driver.assert_no_print_flags(["groklt", "--cwd", "/tmp"])
+
+
+def test_should_pin_grok_tmux_session_target_when_model_contains_a_dot(hv, config) -> None:
+    from hv2.drivers.grok import GrokDriver
+
+    if not _GROK_DRIVER.is_file():
+        pytest.skip("Grok driver is not shipped")
+    driver = GrokDriver(config)
+    driver._active_session = "hv2-grok-grok-4-6-123"
+    assert driver._tmux_target() == "=hv2-grok-grok-4-6-123:"
+    rewritten = driver._with_exact_tmux_targets(
+        ["capture-pane", "-pt", "hv2-grok-grok-4-6-123", "-S", "-200"]
+    )
+    assert rewritten[2] == "=hv2-grok-grok-4-6-123:"
+    session_create = driver._with_exact_tmux_targets(
+        ["new-session", "-d", "-s", "hv2-grok-grok-4-6-123"]
+    )
+    assert session_create[-1] == "hv2-grok-grok-4-6-123"
+    assert not any(token.startswith("=") for token in session_create)
+
+
+def test_should_match_wrapped_grok_pass_token_after_prompt_echo() -> None:
+    from hv2.pane import _pane_tool_command_pass
+
+    prompt = (
+        "You are the parent on model grok-4.6.\n\n"
+        "Then print the child's stdout on its own line, then reply with the exact\n"
+        "token hv2-grok-child on its own line.\n"
+    )
+    pane = (
+        "     ❯ You are the parent on model grok-4.6.                         9:59 PM\n"
+        "       Call spawn_subagent now with subagent_type=general- …\n"
+        "     /tmp/hv2-grok-workspace Linux /tmp/hv2-grok-workspace hv2-     10:00 PM\n"
+        "     grok-child\n"
+        "  │ ❯                                                                        │\n"
+    )
+    assert _pane_tool_command_pass(pane, prompt, ["hv2-grok-child"]) is True
+
+
+def test_should_reject_wrap_token_theater_as_grok_spawn_tool_evidence() -> None:
+    from hv2.checks.orch_evidence import grok_spawn_tool_evidence
+
+    prompt = (
+        "You are the parent on model grok-4.6.\n\n"
+        "Call spawn_subagent now with subagent_type=general-purpose and a non-empty\n"
+        "message that tells the child to execute a harmless local shell command\n"
+        "(`pwd`) in this workspace and return only that command's stdout.\n"
+        "Then print the child's stdout on its own line, then reply with the exact\n"
+        "token hv2-grok-child on its own line.\n"
+    )
+    pane = (
+        "  sandbox:workspace /tmp/hv2-grok-workspace                         18K / 500K\n"
+        "\n"
+        "     ❯ You are the parent on model grok-4.6.                        11:29 PM\n"
+        "\n"
+        "       Call spawn_subagent now with subagent_type=general- …\n"
+        "\n"
+        "     ◆ Run Print kernel operating system name\n"
+        "     ◆ Thought for 2.5s                                                        █\n"
+        "                                                                               █\n"
+        "     /tmp/hv2-grok-workspace Linux /tmp/hv2-grok-workspace hv2-     11:30 PM   █\n"
+        "     grok-child                                                                █\n"
+        "                                                                               █\n"
+        "     Worked for 44s                                                            █\n"
+    )
+    evidence = grok_spawn_tool_evidence(
+        pane=pane,
+        prompt=prompt,
+        after_echo_index=-1,
+    )
+    assert evidence["ok"] is False
+    joined = " ".join(evidence["failures"])
+    assert "spawn chrome" in joined
+    assert "pwd and uname" in joined
+    assert evidence["kind"] == "grok_spawn_tool"
+    assert evidence["session_tool_calls"] == 0
+
+
+def test_should_read_grok_sessionupdate_tool_call_from_workspace_jsonl(tmp_path) -> None:
+    from hv2.checks.orch_evidence import grok_spawn_tool_evidence
+
+    session = tmp_path / "grok-session"
+    session.mkdir()
+    (session / "updates.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "method": "session/update",
+                        "params": {
+                            "update": {
+                                "sessionUpdate": "tool_call",
+                                "title": "spawn_subagent",
+                                "rawInput": {
+                                    "prompt": "Execute pwd",
+                                    "subagent_type": "general-purpose",
+                                },
+                                "_meta": {"x.ai/tool": {"name": "spawn_subagent"}},
+                            }
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "method": "_x.ai/session/update",
+                        "params": {
+                            "update": {
+                                "sessionUpdate": "subagent_spawned",
+                                "subagent_id": "child-1",
+                                "subagent_type": "general-purpose",
+                            }
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "method": "session/update",
+                        "params": {
+                            "update": {
+                                "sessionUpdate": "tool_call",
+                                "title": "run_terminal_command",
+                                "rawInput": {
+                                    "command": "pwd",
+                                    "description": "Print workspace",
+                                },
+                                "_meta": {
+                                    "x.ai/tool": {"name": "run_terminal_command"}
+                                },
+                            }
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "method": "session/update",
+                        "params": {
+                            "update": {
+                                "sessionUpdate": "tool_call",
+                                "title": "run_terminal_command",
+                                "rawInput": {
+                                    "command": "uname -s",
+                                    "description": "Print kernel name",
+                                },
+                                "_meta": {
+                                    "x.ai/tool": {"name": "run_terminal_command"}
+                                },
+                            }
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    evidence = grok_spawn_tool_evidence(
+        pane="wrap token only /tmp/hv2-grok-workspace hv2-grok-child",
+        prompt="Call spawn_subagent now",
+        after_echo_index=-1,
+        session_dir=str(session),
+    )
+    assert evidence["ok"] is True
+    assert evidence["spawn_chrome"] is True
+    assert evidence["pwd_row"] is True
+    assert evidence["uname_row"] is True
+    assert evidence["session_tool_calls"] > 0
+
+
+def test_should_fail_grok_orchestration_on_wrap_token_without_session_jsonl(
+    hv, config, tmp_path, monkeypatch
+) -> None:
+    from hv2.drivers.grok import GrokDriver
+    from hv2.kinds.runner import _step_tui_orchestration
+
+    if not _GROK_DRIVER.is_file():
+        pytest.skip("Grok driver is not shipped")
+    cfg = _clone_config(config)
+    cfg["tuis"]["grok"]["cwd"] = str(tmp_path)
+    driver = GrokDriver(cfg)
+    prompt = (
+        "You are the parent on model grok-4.6.\n\n"
+        "Call spawn_subagent now with subagent_type=general-purpose\n"
+        "token hv2-grok-child on its own line.\n"
+    )
+    pane = (
+        "     ❯ You are the parent on model grok-4.6.                         9:59 PM\n"
+        "       Call spawn_subagent now with subagent_type=general- …\n"
+        "     ◆ Run Print kernel operating system name\n"
+        "     /tmp/hv2-grok-workspace Linux /tmp/hv2-grok-workspace hv2-\n"
+        "     grok-child\n"
+    )
+    monkeypatch.setattr("hv2.kinds.runner.driver_for", lambda tui, _config: driver)
+    monkeypatch.setattr(driver, "launch_argv", lambda model, **k: ["grok", "--model", model])
+    monkeypatch.setattr(driver, "assert_no_print_flags", lambda argv: None)
+    monkeypatch.setattr(
+        driver,
+        "ensure_session",
+        lambda model, tools=True, **_kwargs: {
+            "ok": True,
+            "session": "hv2-grok-grok-4-6-test",
+            "selector": driver.model_selector(model),
+            "selected": True,
+        },
+    )
+    monkeypatch.setattr(
+        driver, "send_keys", lambda text: {"ok": True, "method": "paste-buffer"}
+    )
+    monkeypatch.setattr(driver, "capture_pane", lambda: pane)
+    monkeypatch.setattr(driver, "pane_has_selector", lambda model, pane=None: True)
+    monkeypatch.setattr(driver, "_tmux_float", _fast_ohmypi_tmux_float)
+    plan = hv.build_plan(
+        config=config,
+        kind="orchestration",
+        instance_token="alpha",
+        tui="grok",
+        models=None,
+        orchestration_parent=None,
+        orchestration_children=None,
+        dry_run=True,
+        write_artifact=None,
+    )
+    object.__setattr__(
+        plan,
+        "extra",
+        {**plan.extra, "orchestration_prompt_template": prompt},
+    )
+    payload = _step_tui_orchestration(plan)
+    assert payload.get("ok") is False
+    row = payload["parents"][0]
+    assert row["child_evidence"]["kind"] == "grok_spawn_tool"
+    assert row["child_evidence"]["ok"] is False
+    assert row["tool_pass"] is False
+    joined = " ".join(payload.get("failures") or [])
+    assert "spawn chrome" in joined
+
+
+def test_should_accept_grok_spawn_chrome_and_parallel_run_rows() -> None:
+    from hv2.checks.orch_evidence import grok_spawn_tool_evidence
+
+    prompt = (
+        "You are the parent on model grok-4.6.\n\n"
+        "Call spawn_subagent now with subagent_type=general-purpose\n"
+        "token hv2-grok-child on its own line.\n"
+    )
+    pane = (
+        "     ❯ You are the parent on model grok-4.6.                         9:59 PM\n"
+        "       Call spawn_subagent now with subagent_type=general- …\n"
+        "     ◆ Subagent completed in 5.5s: “Run pwd in workspace”\n"
+        "     ◆ Run pwd in this workspace\n"
+        "     ◆ Run Print kernel name via uname\n"
+        "     /tmp/hv2-grok-workspace Linux /tmp/hv2-grok-workspace hv2-\n"
+        "     grok-child\n"
+    )
+    evidence = grok_spawn_tool_evidence(pane=pane, prompt=prompt, after_echo_index=-1)
+    assert evidence["ok"] is True
+    assert evidence["spawn_chrome"] is True
+    assert evidence["pwd_row"] is True
+    assert evidence["uname_row"] is True
+    assert evidence["failures"] == []
+
+
+def test_should_report_grokla_inspect_error_without_nameerror(capsys) -> None:
+    import runpy
+    from unittest.mock import patch
+
+    from hv2.errors import InstanceError
+
+    grokla = _HV2 / "grokla"
+    with patch(
+        "hv2.grokla.resolve_grokla_proxy_url",
+        side_effect=InstanceError("docker inspect litellm-alpha failed"),
+    ):
+        with pytest.raises(SystemExit) as vis:
+            runpy.run_path(str(grokla), run_name="__main__")
+    assert vis.value.code == 2
+    err = capsys.readouterr().err
+    assert "NameError" not in err
+    assert "grokla: docker inspect litellm-alpha failed" in err
 
 
 def test_should_scrub_langfuse_and_db_secrets_from_child_env(hv, config, monkeypatch) -> None:

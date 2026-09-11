@@ -246,6 +246,7 @@ child_env:
     - CODEX_
     - OPENAI_
     - XAI_
+    - GROK_
     - PI_
     - OMP_
   deny_keys:

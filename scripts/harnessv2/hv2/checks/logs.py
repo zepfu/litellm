@@ -23,9 +23,13 @@ _OHMYPI_ROLLUP_IDENTITY = re.compile(
 _CODEX_ROLLUP_IDENTITY = re.compile(
     r"\S+#Codex\[[^\]\s]+\]@\S+",
 )
+_GROK_ROLLUP_IDENTITY = re.compile(
+    r"(?:^|\s)(?:Grok|grok-shell)\[[^\]\s]+\]@\S+",
+)
 _TUI_ROLLUP_IDENTITY = {
     "ohmypi": (_OHMYPI_ROLLUP_IDENTITY, "Ohmypi"),
     "codex": (_CODEX_ROLLUP_IDENTITY, "Codex"),
+    "grok": (_GROK_ROLLUP_IDENTITY, "Grok"),
 }
 # Repo token is the \S+ immediately before @ after the rollup timestamp.
 _ROLLUP_REPO_BEFORE_AT = re.compile(
@@ -221,6 +225,8 @@ def scan_log_text(
         if str(tui or "") == "codex":
             other_tui_re = _OHMYPI_ROLLUP_IDENTITY
         elif str(tui or "") == "ohmypi":
+            other_tui_re = _CODEX_ROLLUP_IDENTITY
+        elif str(tui or "") == "grok":
             other_tui_re = _CODEX_ROLLUP_IDENTITY
         unidentified = [
             hit

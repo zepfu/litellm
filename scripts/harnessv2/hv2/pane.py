@@ -7,7 +7,8 @@ import re
 _EXACT_PONG = "PONG"
 # Codex TUI prefixes assistant lines with a list bullet. Standalone pass
 # tokens such as `hv2-codex-child` still count when the line is `• token`.
-_LEADING_LIST_MARKER = re.compile(r"^(?:[•●▪▸›*]|\d+[.)]|-)\s+")
+_LEADING_LIST_MARKER = re.compile(r"^(?:[•●▪▸›❯*]|\d+[.)]|-)\s+")
+_TRAILING_BLOCK_CHAR_RE = re.compile(r"[█▌]+$")
 _TREE_PREFIX = re.compile(r"^[└├│]\s*")
 _DATE_STDOUT_LINE = re.compile(
     r"^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
@@ -26,6 +27,29 @@ _CODEX_IDLE_COMPOSER_LINE = re.compile(
     r"^(?:[›>]\s*Ask Codex to do anything|>)\s*$"
 )
 _CODEX_TOOL_PASS_TOKEN = "hv2-codex-child"
+_GROK_TOOL_PASS_TOKEN = "hv2-grok-child"
+_HYPHEN_WRAP_RE = re.compile(r"(\S)-\s+(\S)")
+_TUI_CLOCK_SUFFIX_RE = re.compile(
+    r"\s+\d{1,2}:\d{2}(?:\s*[AP]M)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _pane_echo_line_text(raw_line: str) -> tuple[str, bool]:
+    """Return display text for prompt-echo matching, plus whether it was truncated."""
+
+    text = " ".join(_line_token_text(raw_line).split())
+    text = _TRAILING_BLOCK_CHAR_RE.sub("", text).strip()
+    text = _TUI_CLOCK_SUFFIX_RE.sub("", text).strip()
+    text = _TRAILING_BLOCK_CHAR_RE.sub("", text).strip()
+    truncated = False
+    if text.endswith("…"):
+        truncated = True
+        text = text[:-1].rstrip()
+    elif text.endswith("..."):
+        truncated = True
+        text = text[:-3].rstrip()
+    return text, truncated
 
 
 def _latest_prompt_echo_index(pane: str, prompt: str) -> int:
@@ -33,7 +57,8 @@ def _latest_prompt_echo_index(pane: str, prompt: str) -> int:
 
     Codex may paint the sent prompt across visually wrapped lines. Current-turn
     scanning starts after that wrapped echo so a missing exact one-line match
-    never falls back to line 0.
+    never falls back to line 0. Grok may truncate the painted prompt with
+    ``…`` and a clock; a truncated prefix still counts as the current echo.
     """
 
     prompt_line = prompt.strip()
@@ -44,19 +69,25 @@ def _latest_prompt_echo_index(pane: str, prompt: str) -> int:
     lines = pane.splitlines()
     for start, raw_start in enumerate(lines):
         raw_stripped = raw_start.strip()
-        start_text = " ".join(_line_token_text(raw_start).split())
+        start_text, start_truncated = _pane_echo_line_text(raw_start)
         if raw_stripped == prompt_line or start_text == sent:
             last = start
             continue
         if not start_text or not sent.startswith(start_text):
             continue
+        if start_truncated:
+            last = start
+            continue
         acc = start_text
         for end, raw_line in enumerate(lines[start + 1 :], start=start + 1):
-            piece = " ".join(_line_token_text(raw_line).split())
+            piece, truncated = _pane_echo_line_text(raw_line)
             if not piece:
-                break
+                continue
             joined = f"{acc} {piece}"
             if joined == sent:
+                last = end
+                break
+            if truncated and sent.startswith(joined):
                 last = end
                 break
             if not sent.startswith(joined):
@@ -238,6 +269,22 @@ def _pane_has_child_command_stdout(
     return False
 
 
+def _collapse_wrapped_scan_text(lines: list[str]) -> str:
+    """Join current-turn pane lines, gluing wraps such as ``hv2-`` / ``grok-child``."""
+
+    pieces: list[str] = []
+    for raw_line in lines:
+        text, _truncated = _pane_echo_line_text(raw_line)
+        if text:
+            pieces.append(text)
+    collapsed = " ".join(pieces)
+    while True:
+        glued = _HYPHEN_WRAP_RE.sub(r"\1-\2", collapsed)
+        if glued == collapsed:
+            return collapsed
+        collapsed = glued
+
+
 def _pane_has_current_turn_pass_token(
     pane: str,
     prompt: str | None,
@@ -251,8 +298,13 @@ def _pane_has_current_turn_pass_token(
         return False
     sent = (prompt or "").strip()
     start = _pane_scan_start(pane, prompt, after_echo_index=after_echo_index)
-    for raw_line in pane.splitlines()[start:]:
+    scan_lines = pane.splitlines()[start:]
+    for raw_line in scan_lines:
         if _line_equals_token(raw_line, token) and token != sent:
+            return True
+    if token == _GROK_TOOL_PASS_TOKEN:
+        collapsed = _collapse_wrapped_scan_text(scan_lines)
+        if token in collapsed:
             return True
     return False
 
@@ -299,6 +351,21 @@ def _pane_tool_command_pass(
         if not _pane_has_child_command_stdout(
             pane, prompt, after_echo_index=after_echo_index
         ):
+            return False
+        return True
+    if _GROK_TOOL_PASS_TOKEN in tokens:
+        if not _pane_has_current_turn_pass_token(
+            pane,
+            prompt,
+            _GROK_TOOL_PASS_TOKEN,
+            after_echo_index=after_echo_index,
+        ):
+            return False
+        start = _pane_scan_start(
+            pane, prompt, after_echo_index=after_echo_index
+        )
+        collapsed = _collapse_wrapped_scan_text(pane.splitlines()[start:])
+        if not re.search(r"(^|\s)/\S+", collapsed):
             return False
         return True
     return _pane_has_any(

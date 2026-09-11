@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""grokla: groklt analogue aimed at litellm-alpha /grok/v1.
+
+Sets GROK_CLI_CHAT_PROXY_BASE_URL from docker inspect of litellm-alpha
+(today 127.0.0.1:4011/grok/v1). Never targets :4000 / aawm-litellm or
+:4001 / litellm-dev / groklt.
+
+Usage:
+  python scripts/harnessv2/grokla --print-url
+  python scripts/harnessv2/grokla [--] [grok args...]
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+HARNESS_DIR = Path(__file__).resolve().parent
+if str(HARNESS_DIR) not in sys.path:
+    sys.path.insert(0, str(HARNESS_DIR))
+
+from hv2.errors import HarnessError  # noqa: E402
+from hv2.grokla import grok_binary, grokla_argv, resolve_grokla_proxy_url  # noqa: E402
+from hv2.load_config import load_config  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    try:
+        config = load_config()
+        proxy_url = resolve_grokla_proxy_url(config)
+        if args[:1] == ["--print-url"]:
+            sys.stdout.write(f"{proxy_url}\n")
+            return 0
+        if args[:1] == ["--"]:
+            args = args[1:]
+        grok = grok_binary()
+        env = os.environ.copy()
+        env["GROK_CLI_CHAT_PROXY_BASE_URL"] = proxy_url
+        env.setdefault("GROK_DISABLE_UPDATE_CHECK", "1")
+        env.setdefault("GROK_SANDBOX", "workspace")
+        env.setdefault("GROK_SUBAGENTS", "1")
+        os.execvpe(grok, grokla_argv(args, binary=grok), env)
+    except HarnessError as vis:
+        sys.stderr.write(f"grokla: {vis}\n")
+        return int(getattr(vis, "exit_code", 2) or 2)
+    except FileNotFoundError as vis:
+        sys.stderr.write(f"grokla: Grok executable is unavailable: {vis}\n")
+        return 127
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -5,8 +5,8 @@ tuis:
   implemented:
     - ohmypi
     - codex
-  stubs:
     - grok
+  stubs:
     - opencode
   ohmypi:
     enabled: true
@@ -285,8 +285,109 @@ tuis:
         - LC_CTYPE
         - AAWM_HARNESS_USER_ID
   grok:
-    enabled: false
-    stub: true
+    enabled: true
+    stub: false
+    binary: grok
+    wrapper: grokla
+    cwd: /tmp/hv2-grok-workspace
+    session_dir: /tmp/hv2-grok-sessions
+    default_models:
+      - grok-4.6
+    default_orchestration_parent: grok-4.6
+    default_orchestration_children:
+      - grok-4.6
+    model_prompt: grok_model
+    orchestration_prompt: grok_orchestration
+    tmux:
+      socket: tmux37
+      session: grok
+      harness_session_prefix: hv2-grok
+      wait_ready_seconds: 25
+      wait_idle_seconds: 180
+      wait_reply_seconds: 600
+      wait_mcp_seconds: 30
+      poll_interval_seconds: 1
+    forbid_flags: []
+    forbid_tokens:
+      - groklt
+      - grokl
+    submit_keys:
+      - C-m
+    submit_delay_seconds: 1.0
+    argv_interactive:
+      - grok
+      - --cwd
+      - "{cwd}"
+      - --always-approve
+    argv_launch_model:
+      - grok
+      - --cwd
+      - "{cwd}"
+      - --model
+      - "{model}"
+      - --always-approve
+      - --leader-socket
+      - "{session_dir}/leader.sock"
+    argv_no_tools: []
+    lanes:
+      alias: litellm-alpha
+    model_id_template: "{model}"
+    select_model:
+      strategy: launch_session
+      reuse_operator_session: false
+      tools_for_model: true
+      tools_for_orchestration: true
+      pass_mode: tool_command
+      standalone_pass_tokens:
+        - hv2-grok-child
+      ready_needles:
+        - grok
+        - Grok
+        - always-approve
+      mcp_ready_needles: []
+      idle_needles:
+        - ">"
+        - "❯"
+      busy_needles:
+        - Thinking
+        - Working
+        - Streaming
+        - Responding
+        - Subagent
+      selected_needles:
+        - "{selector}"
+        - "{model}"
+        - "Grok 4.6"
+        - always-approve
+      reply_needles:
+        - hv2-grok-child
+        - PONG
+      provider_404_needles:
+        - "No endpoints found for"
+        - "404 Not Found"
+        - "status code 404"
+        - "Error: 404"
+      orchestration_pass_needles:
+        - hv2-grok-child
+      reject_needles:
+        - "Unknown model"
+      env_keys:
+        - PATH
+        - HOME
+        - USER
+        - LOGNAME
+        - TERM
+        - COLORTERM
+        - TMPDIR
+        - LANG
+        - LC_ALL
+        - LC_CTYPE
+        - AAWM_HARNESS_USER_ID
+        - GROK_CLI_CHAT_PROXY_BASE_URL
+        - GROK_DISABLE_UPDATE_CHECK
+        - GROK_SANDBOX
+        - GROK_SUBAGENTS
+        - AAWM_GROK_REAL_BIN
   opencode:
     enabled: false
     stub: true

@@ -580,3 +580,308 @@ def child_spawn_evidence(
         "project_agents_dir": project_agents_dir,
         "saw_task_result": saw_task_result,
     }
+
+
+_GROK_SPAWN_CHROME_RE = re.compile(
+    r"(?:◆\s*)?(?:Subagent|spawn_subagent)\b",
+    re.IGNORECASE,
+)
+_GROK_RUN_ROW_RE = re.compile(r"◆\s+Run\b")
+_GROK_PWD_ROW_RE = re.compile(
+    r"◆\s+Run\b.*\bpwd\b",
+    re.IGNORECASE,
+)
+_GROK_UNAME_ROW_RE = re.compile(
+    r"◆\s+Run\b.*\buname\b",
+    re.IGNORECASE,
+)
+_GROK_TOOL_LABEL_DUMP_RE = re.compile(r"(?im)^Tool label:\s*\S")
+_GROK_SESSION_UPDATE_KEYS = frozenset(
+    {"sessionUpdate", "session_update", "type", "customType"}
+)
+
+
+def _grok_current_turn_text(
+    pane: str,
+    prompt: str | None,
+    after_echo_index: int | None,
+) -> str:
+    pane_text = pane or ""
+    if prompt is not None:
+        scan_start = _pane_scan_start(
+            pane_text, prompt, after_echo_index=after_echo_index
+        )
+        pane_text = "\n".join(pane_text.splitlines()[scan_start:])
+    return pane_text
+
+
+def grok_workspace_session_root(cwd: str | None = None) -> Path:
+    """Return ``~/.grok/sessions/<urlencoded cwd>`` for Grok Build JSONL."""
+
+    workspace = Path(cwd or "/tmp/hv2-grok-workspace")
+    encoded = "".join(
+        ch if ch.isalnum() or ch in "._-" else f"%{ord(ch):02X}"
+        for ch in str(workspace)
+    )
+    return Path.home() / ".grok" / "sessions" / encoded
+
+
+def _grok_workspace_session_roots(session_dir: str | None) -> list[Path]:
+    """Scan only the provided session directory and its child session dirs."""
+
+    roots: list[Path] = []
+    if not session_dir:
+        return roots
+    root = Path(session_dir)
+    roots.append(root)
+    if root.is_dir():
+        newest = sorted(
+            (path for path in root.iterdir() if path.is_dir()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        roots.extend(newest[:8])
+    return roots
+
+
+def _grok_session_tool_records(
+    session_dir: str | None,
+    *,
+    since_mtime: float | None = None,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for root in _grok_workspace_session_roots(session_dir):
+        for path in _session_jsonl_paths(root, since_mtime=since_mtime)[
+            :_JSONL_SCAN_CAP
+        ]:
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            for obj in _iter_jsonl_objects(path):
+                records.append(obj)
+    return records
+
+
+def _grok_nested_update(obj: Mapping[str, Any]) -> Mapping[str, Any]:
+    params = obj.get("params")
+    if isinstance(params, Mapping):
+        update = params.get("update")
+        if isinstance(update, Mapping):
+            return update
+    update = obj.get("update")
+    if isinstance(update, Mapping):
+        return update
+    return {}
+
+
+def _grok_xai_tool_name(source: Mapping[str, Any]) -> str:
+    meta = source.get("_meta")
+    if not isinstance(meta, Mapping):
+        return ""
+    xai_tool = meta.get("x.ai/tool")
+    if not isinstance(xai_tool, Mapping):
+        return ""
+    name = xai_tool.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return ""
+
+
+def _grok_record_tool_name(obj: Mapping[str, Any]) -> str:
+    """Prefer structured xAI tool name over TUI display titles."""
+
+    update = _grok_nested_update(obj)
+    for source in (update, obj):
+        named = _grok_xai_tool_name(source)
+        if named:
+            return named
+        for key in ("tool_name", "name", "toolName"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    for source in (update, obj):
+        title = source.get("title")
+        if isinstance(title, str) and title.strip():
+            return title.strip()
+    calls = obj.get("tool_calls")
+    if isinstance(calls, list):
+        for item in calls:
+            if isinstance(item, Mapping):
+                name = item.get("name")
+                if isinstance(name, str) and name.strip():
+                    return name.strip()
+    return ""
+
+
+def _grok_command_from_mapping(source: Mapping[str, Any]) -> str:
+    for key in ("rawInput", "rawOutput"):
+        raw = source.get(key)
+        if not isinstance(raw, Mapping):
+            continue
+        command = raw.get("command")
+        if isinstance(command, str) and command.strip():
+            return command.strip()
+        nested = raw.get("input")
+        if isinstance(nested, Mapping):
+            command = nested.get("command")
+            if isinstance(command, str) and command.strip():
+                return command.strip()
+    meta = source.get("_meta")
+    if isinstance(meta, Mapping):
+        xai_tool = meta.get("x.ai/tool")
+        if isinstance(xai_tool, Mapping):
+            nested = xai_tool.get("input")
+            if isinstance(nested, Mapping):
+                command = nested.get("command")
+                if isinstance(command, str) and command.strip():
+                    return command.strip()
+    return ""
+
+
+def _grok_record_command(obj: Mapping[str, Any]) -> str:
+    update = _grok_nested_update(obj)
+    for source in (update, obj):
+        command = _grok_command_from_mapping(source)
+        if command:
+            return command
+    return ""
+
+
+def _grok_record_is_tool_call(obj: Mapping[str, Any]) -> bool:
+    update = _grok_nested_update(obj)
+    session_update = str(update.get("sessionUpdate") or obj.get("sessionUpdate") or "")
+    obj_type = str(obj.get("type") or "")
+    if session_update in {
+        "tool_call",
+        "tool_call_update",
+        "subagent_spawned",
+        "subagent_finished",
+    }:
+        return True
+    if obj_type in {"tool_started", "tool_completed"}:
+        return True
+    if obj.get("tool_calls"):
+        return True
+    name = _grok_record_tool_name(obj).lower()
+    return name in {
+        "spawn_subagent",
+        "run_terminal_command",
+        "pwd",
+        "uname",
+        "get_command_or_subagent_output",
+    }
+
+
+def grok_spawn_tool_evidence(
+    *,
+    pane: str = "",
+    prompt: str | None = None,
+    after_echo_index: int | None = None,
+    session_dir: str | None = None,
+    since_mtime: float | None = None,
+) -> dict[str, Any]:
+    """Grok Build spawn + parallel tool evidence. Not Ohmypi recap.
+
+    After the current-turn prompt echo, require spawn chrome that is not the
+    sent prompt, plus two distinct tool rows for parallel ``pwd`` and
+    ``uname``. Fail closed on prompt-echo-only spawn, ``Tool label:`` dumps,
+    or a wrap-token / ``/tmp`` recap with no spawn chrome.
+    """
+
+    failures: list[str] = []
+    sent = (prompt or "").strip()
+    current = _grok_current_turn_text(pane, prompt, after_echo_index)
+    session_records = _grok_session_tool_records(
+        session_dir, since_mtime=since_mtime
+    )
+    session_tool_calls = [
+        obj for obj in session_records if _grok_record_is_tool_call(obj)
+    ]
+    session_blob = json.dumps(session_tool_calls, default=str).lower()
+    tool_names = {
+        _grok_record_tool_name(obj).lower() for obj in session_tool_calls
+    }
+
+    dump = bool(_GROK_TOOL_LABEL_DUMP_RE.search(current))
+    spawn_in_prompt = "spawn_subagent" in sent.lower()
+    spawn_chrome = False
+    for match in _GROK_SPAWN_CHROME_RE.finditer(current):
+        line = current[max(0, match.start() - 80) : match.end() + 80]
+        if spawn_in_prompt and "Call spawn_subagent" in line:
+            continue
+        spawn_chrome = True
+        break
+    if not spawn_chrome:
+        spawn_chrome = (
+            "spawn_subagent" in tool_names or "subagent_spawned" in session_blob
+        )
+
+    run_rows = list(_GROK_RUN_ROW_RE.findall(current))
+    pwd_row = bool(_GROK_PWD_ROW_RE.search(current))
+    uname_row = bool(_GROK_UNAME_ROW_RE.search(current))
+    session_run_commands: list[str] = []
+    seen_commands: set[str] = set()
+    for obj in session_tool_calls:
+        name = _grok_record_tool_name(obj).lower()
+        command = _grok_record_command(obj).lower()
+        if not command and name in {"pwd", "uname"}:
+            command = name
+        if not command:
+            continue
+        is_run = name in {"run_terminal_command", "pwd", "uname"} or command in {
+            "pwd",
+            "uname",
+        } or command.startswith("pwd ") or command.startswith("uname")
+        if not is_run:
+            continue
+        if command in seen_commands:
+            continue
+        seen_commands.add(command)
+        session_run_commands.append(command)
+    if session_run_commands:
+        pwd_row = pwd_row or any(
+            command == "pwd" or command.startswith("pwd ")
+            for command in session_run_commands
+        )
+        uname_row = uname_row or any(
+            command == "uname" or command.startswith("uname")
+            for command in session_run_commands
+        )
+        if len(session_run_commands) >= 2:
+            run_rows = run_rows or ["session"] * len(session_run_commands)
+
+    if dump:
+        failures.append(
+            "Grok orchestration dumped native-text Tool label: output; "
+            "structured spawn/tool launch is required"
+        )
+    if not spawn_chrome:
+        failures.append(
+            "Grok orchestration is missing current-turn spawn chrome "
+            "(Subagent / spawn_subagent tool row, or sessionUpdate=tool_call); "
+            "prompt-echo-only spawn is not evidence"
+        )
+    if len(run_rows) < 2 and not (pwd_row and uname_row):
+        failures.append(
+            "Grok orchestration is missing two distinct current-turn tool rows "
+            "for parallel pwd and uname; a single parent uname/recap is not "
+            "parallel tool evidence"
+        )
+    elif not (pwd_row and uname_row):
+        failures.append(
+            "Grok orchestration tool rows do not show both pwd and uname"
+        )
+
+    return {
+        "ok": not failures,
+        "failures": failures,
+        "spawn_chrome": spawn_chrome,
+        "pwd_row": pwd_row,
+        "uname_row": uname_row,
+        "run_rows": len(run_rows),
+        "tool_label_dump": dump,
+        "session_tool_calls": len(session_tool_calls),
+        "kind": "grok_spawn_tool",
+    }

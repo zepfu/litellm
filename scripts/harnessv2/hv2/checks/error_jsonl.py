@@ -78,6 +78,17 @@ def scan_new_rows(
                 warnings.append(f"soft-fail ({match.get('name')}): {label}")
             continue
         if not traceback_empty:
+            traceback_text = str(traceback)
+            label_text = str(label or "")
+            if (
+                "client_connected_cb" in label_text
+                and "closed fd=" in traceback_text
+            ):
+                warnings.append(
+                    "ignored Hypercorn client disconnect: "
+                    f"{label_text}"
+                )
+                continue
             failures.append(f"new error JSONL row has traceback: {label}")
         elif spec.get("traceback_null_is_warning", True):
             warnings.append(f"structured terminal JSONL (traceback null): {label}")
