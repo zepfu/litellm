@@ -1266,8 +1266,10 @@ class _AgentnH2Session:
                 if outbound:
                     writer.write(outbound)
                     await writer.drain()
-            if not pending and not self._request_end_stream_requested:
-                break
+                if self._request_end_stream_sent:
+                    break
+                if not pending and not self._request_end_stream_requested:
+                    break
             if not self._request_end_stream_requested:
                 self._pending_wakeup.set()
                 break
@@ -1676,6 +1678,16 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
                         candidate_reason = "normal_response"
                 except (asyncio.CancelledError, Exception):
                     pass
+            if candidate_reason == "client_disconnect":
+                for task, role in (
+                    (response_task, "response"),
+                    (reader_termination_task, "upstream"),
+                    (upload_task, "upload"),
+                    (open_task, "upstream"),
+                ):
+                    if task in done_tasks and _task_failure_reason(task, role) != "unknown":
+                        candidate_reason = _task_failure_reason(task, role)
+                        break
             if candidate_reason is not None:
                 termination_reason = _sanitize_termination_reason(candidate_reason)
                 break
@@ -2062,6 +2074,15 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
                         candidate_reason = "normal_response"
                 except (asyncio.CancelledError, Exception):
                     pass
+            if candidate_reason == "client_disconnect":
+                for task, role in (
+                    (response_task, "response"),
+                    (reader_termination_task, "upstream"),
+                    (open_task, "upstream"),
+                ):
+                    if task in done and _task_failure_reason(task, role) != "unknown":
+                        candidate_reason = _task_failure_reason(task, role)
+                        break
             if candidate_reason is not None:
                 termination_reason = _sanitize_termination_reason(candidate_reason)
                 break
