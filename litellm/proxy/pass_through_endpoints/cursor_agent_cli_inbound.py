@@ -99,6 +99,123 @@ _STRIP_UPSTREAM_COMPRESSION_HEADERS = {
     "grpc-accept-encoding",
 }
 _MAX_LOGGED_AGENTN_DATA_CHUNKS = 8
+_SAFE_INBOUND_TELEMETRY_HEADER_NAMES = frozenset(
+    {
+        "accept",
+        "connect-protocol-version",
+        "content-type",
+        "user-agent",
+        "x-cursor-client-type",
+        "x-cursor-client-version",
+        "x-cursor-streaming",
+        "x-ghost-mode",
+        "x-request-id",
+    }
+)
+_TERMINATION_REASONS = frozenset(
+    {
+        "unknown",
+        "client_disconnect",
+        "request_body_complete",
+        "receive_failed",
+        "upload_failed",
+        "send_failed",
+        "upstream_failure",
+        "upstream_reset",
+        "upstream_eof",
+        "normal_response",
+        "cancelled",
+        "append_write_failed",
+        "append_cancelled",
+        "http2_required",
+        "http1_required",
+        "auth_failure",
+        "invalid_request",
+    }
+)
+
+
+class _InboundCliClientDisconnected(Exception):
+    """ASGI delivered a terminal client disconnect while reading a request."""
+
+    reason = "client_disconnect"
+
+
+def _sanitize_termination_reason(reason: Any) -> str:
+    """Keep lifecycle telemetry to a small, payload-free reason vocabulary."""
+    candidate = str(reason or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if candidate in _TERMINATION_REASONS:
+        return candidate
+    return "unknown"
+
+
+def _log_inbound_cli_lifecycle(
+    *,
+    call_id: str,
+    event: str,
+    reason: Optional[str] = None,
+    http_version: Optional[str] = None,
+) -> None:
+    safe_reason = _sanitize_termination_reason(reason) if reason else None
+    fields = [
+        f"call_id={call_id}",
+        f"event={event}",
+    ]
+    if safe_reason is not None:
+        fields.append(f"reason={safe_reason}")
+    if http_version:
+        fields.append(f"http_version={http_version}")
+    verbose_proxy_logger.info(
+        "cursor_agent_cli_inbound lifecycle %s",
+        " ".join(fields),
+    )
+
+
+async def _await_bounded_task(
+    task: "asyncio.Task[Any]",
+    *,
+    timeout: float = _INBOUND_CLI_CLEANUP_TIMEOUT_SECONDS,
+) -> None:
+    """Join an owned cleanup task without allowing transport teardown to hang."""
+    cancelled = False
+    try:
+        await asyncio.wait({task}, timeout=timeout)
+    except asyncio.CancelledError:
+        cancelled = True
+        try:
+            await asyncio.wait({task}, timeout=timeout)
+        except asyncio.CancelledError:
+            cancelled = True
+    if not task.done():
+        task.cancel()
+        try:
+            await asyncio.wait({task}, timeout=timeout)
+        except asyncio.CancelledError:
+            cancelled = True
+    if task.done():
+        _consume_task_exception(task)
+    else:
+        task.add_done_callback(_consume_task_exception)
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+def _consume_task_exception(task: "asyncio.Task[Any]") -> None:
+    try:
+        task.exception()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+async def _bounded_session_close(session: Any, reason: str) -> None:
+    async def _close() -> None:
+        try:
+            close_result = session.aclose(reason=reason)
+        except TypeError:
+            close_result = session.aclose()
+        await close_result
+
+    await _await_bounded_task(asyncio.create_task(_close()))
 
 
 def _connect_header_flush_frame() -> bytes:
@@ -594,7 +711,7 @@ def build_inbound_cli_session_history_kwargs(
     safe_headers = {
         key: value
         for key, value in headers.items()
-        if str(key).lower() != "authorization"
+        if str(key).lower() in _SAFE_INBOUND_TELEMETRY_HEADER_NAMES
     }
     tags = list(CURSOR_AGENT_CLI_INBOUND_TAGS)
     metadata = {
