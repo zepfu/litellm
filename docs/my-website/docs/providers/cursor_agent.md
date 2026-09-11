@@ -115,6 +115,24 @@ sidecar does not execute or depend on the Cursor CLI. If no exchangeable
 or unusable access token. Optional usage polling remains disabled and is not
 auth-refresh evidence.
 
+## Inbound CLI sessions
+
+The inbound Agent CLI route is request-owned. HTTP/2 `Run` keeps receiving
+after the request body half-closes, because request `END_STREAM` does not mean
+that the client can no longer receive response data. A later client
+disconnect, upstream reset, send failure, or request cancellation terminates
+the owned `agentn` session and cancels sibling work.
+
+The HTTP/1.1 `RunSSE` and `BidiAppend` compatibility lanes use the same
+ownership rule. A lane is removed only when the closing request still owns
+that lane. Cleanup aborts the upstream transport before bounded task joins,
+drains flow-controlled request bytes before sending one upstream `END_STREAM`,
+and does not impose a turn-age or heartbeat deadline on valid long turns.
+
+Lifecycle records use sanitized termination reasons and an explicit
+non-sensitive header allowlist. Request payloads, access credentials, cookies,
+and arbitrary custom headers are excluded from persisted telemetry.
+
 ## Stock Codex child agents
 
 The Codex adapter advertises configured `collaboration` namespace tools as child
