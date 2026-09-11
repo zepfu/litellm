@@ -104,24 +104,21 @@ def account_evidence(
     A newer invalid row must shadow older usable comparison evidence.
     Historical weekly quota can rank accounts without extending hard blocks.
     Local response observations can retain hard exclusions, but only the shared
-    poll scope supplies cross-runtime weekly ranking.
+    poll source supplies cross-runtime weekly ranking. ``environment`` and
+    ``runtime_environment`` are retained as compatibility inputs and are not
+    part of the observation identity.
     """
-    latest: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    latest: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in observations:
         if family is not None and row.get("quota_family") != family:
             continue
-        scope = str(row.get("environment") or "")
         source = str(row.get("source") or "")
-        if not scope or scope not in {environment, runtime_environment}:
-            continue
-        if source == POLL_SOURCE and scope != (environment or runtime_environment):
-            continue
         if not source:
             continue
         period = _period(row)
         if period is None:
             continue
-        key = (scope, source, str(row.get("quota_family") or ""), period)
+        key = (source, str(row.get("quota_family") or ""), period)
         window = _window(row, now=now, horizon=horizon)
         previous = latest.get(key)
         observed_at = window["observed_at"]
@@ -147,17 +144,18 @@ def account_evidence(
                 previous = window
             previous["unusable_reason"] = "conflicting_current_windows"
     windows = list(latest.values())
-    weekly = latest.get((environment or "", POLL_SOURCE, family or "", "seven_day"))
+    weekly = latest.get((POLL_SOURCE, family or "", "seven_day"))
     missing_reason = (
         "unknown_quota_family"
         if family is None
-        else "missing_observation_scope"
-        if environment is None
         else "missing_weekly_observation"
     )
     return {
         "evaluated_at": now,
-        "environment": environment,
+        # Account quota is shared across runtime deployments. Keep the
+        # configured scope out of comparison identity; each window still
+        # retains its source environment for provenance.
+        "environment": "shared",
         "quota_family": family,
         "validity_horizon_seconds": horizon,
         "weekly": weekly,
