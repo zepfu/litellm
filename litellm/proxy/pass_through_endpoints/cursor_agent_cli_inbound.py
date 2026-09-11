@@ -1432,6 +1432,40 @@ def _lifecycle_reason_priority(reason: Optional[str]) -> int:
     }.get(reason or "unknown", 3)
 
 
+def _reduce_lifecycle_reasons(
+    done: set,
+    task_roles: Mapping[asyncio.Task[Any], str],
+    *,
+    session: _AgentnH2Session,
+    lane: Optional[_Http1AgentnLane] = None,
+) -> Optional[str]:
+    reasons: List[str] = []
+    for task, role in task_roles.items():
+        if task not in done:
+            continue
+        if role == "reader":
+            reason = session.upstream_termination_reason
+        elif role == "lane":
+            reason = lane.termination_reason if lane is not None else None
+        else:
+            reason = _task_failure_reason(task, role)
+        if reason in {
+            "send_failed",
+            "receive_failed",
+            "upload_failed",
+            "upstream_failure",
+            "upstream_reset",
+            "upstream_eof",
+            "cancelled",
+            "client_disconnect",
+            "normal_response",
+        }:
+            reasons.append(reason)
+    if not reasons:
+        return None
+    return max(reasons, key=_lifecycle_reason_priority)
+
+
 async def proxy_inbound_cli_run(  # noqa: PLR0915
     scope: Mapping[str, Any],
     receive: Callable[[], Awaitable[Mapping[str, Any]]],
@@ -1704,6 +1738,19 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
                     if task in done_tasks and _task_failure_reason(task, role) != "unknown":
                         candidate_reason = _task_failure_reason(task, role)
                         break
+            reduced_reason = _reduce_lifecycle_reasons(
+                set(done_tasks),
+                {
+                    receive_task: "receive",
+                    open_task: "upstream",
+                    upload_task: "upload",
+                    response_task: "response",
+                    reader_termination_task: "reader",
+                },
+                session=session,
+            )
+            if reduced_reason is not None:
+                candidate_reason = reduced_reason
             if candidate_reason is not None:
                 termination_reason = _sanitize_termination_reason(candidate_reason)
                 break
@@ -2100,6 +2147,20 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
                     if task in done and _task_failure_reason(task, role) != "unknown":
                         candidate_reason = _task_failure_reason(task, role)
                         break
+            reduced_reason = _reduce_lifecycle_reasons(
+                set(done),
+                {
+                    disconnect_task: "receive",
+                    open_task: "upstream",
+                    response_task: "response",
+                    reader_termination_task: "reader",
+                    lane_task: "lane",
+                },
+                session=session,
+                lane=lane,
+            )
+            if reduced_reason is not None:
+                candidate_reason = reduced_reason
             if candidate_reason is not None:
                 termination_reason = _sanitize_termination_reason(candidate_reason)
                 break
