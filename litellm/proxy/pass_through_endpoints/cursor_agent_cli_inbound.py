@@ -1402,7 +1402,7 @@ def _task_failure_reason(task: "asyncio.Task[Any]", role: str) -> str:
     if task.cancelled():
         return "cancelled"
     try:
-        task.result()
+        result = task.result()
     except asyncio.CancelledError:
         return "cancelled"
     except Exception:
@@ -1413,7 +1413,23 @@ def _task_failure_reason(task: "asyncio.Task[Any]", role: str) -> str:
         if role == "upload":
             return "upload_failed"
         return "upstream_failure"
+    if isinstance(result, str) and result != "unknown":
+        return result
     return "unknown"
+
+
+def _lifecycle_reason_priority(reason: Optional[str]) -> int:
+    return {
+        "normal_response": 1,
+        "client_disconnect": 0,
+        "receive_failed": 4,
+        "upload_failed": 4,
+        "send_failed": 5,
+        "upstream_failure": 5,
+        "upstream_reset": 5,
+        "upstream_eof": 5,
+        "cancelled": 6,
+    }.get(reason or "unknown", 3)
 
 
 async def proxy_inbound_cli_run(  # noqa: PLR0915
@@ -2078,6 +2094,7 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
                 for task, role in (
                     (response_task, "response"),
                     (reader_termination_task, "upstream"),
+                    (lane_task, "upstream"),
                     (open_task, "upstream"),
                 ):
                     if task in done and _task_failure_reason(task, role) != "unknown":
