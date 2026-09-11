@@ -972,6 +972,9 @@ class _AgentnH2Session:
         self._closed = False
         self._close_task: Optional[asyncio.Task[None]] = None
         self._pending_wakeup = asyncio.Event()
+        self._request_end_stream_event = asyncio.Event()
+        self._flush_termination_event = asyncio.Event()
+        self._flush_termination_reason: Optional[str] = None
         self._request_end_stream_requested = False
         self._request_end_stream_sent = False
         self._upstream_termination_reason: Optional[str] = None
@@ -983,6 +986,10 @@ class _AgentnH2Session:
     @property
     def upstream_termination_reason(self) -> Optional[str]:
         return self._upstream_termination_reason
+
+    @property
+    def flush_termination_reason(self) -> Optional[str]:
+        return self._flush_termination_reason
 
     def _mark_upstream_termination(self, reason: str) -> None:
         if self._upstream_termination_reason is None:
@@ -1221,63 +1228,71 @@ class _AgentnH2Session:
             await self._incoming.put(None)
 
     async def _flush_loop(self) -> None:
-        while not self._closed:
-            await self._pending_wakeup.wait()
-            self._pending_wakeup.clear()
-            if self._closed:
-                return
-            async with self._lock:
-                writer = self.writer
-                connection = self.connection
-                if writer is None or connection is None:
+        try:
+            while not self._closed:
+                await self._pending_wakeup.wait()
+                if self._closed:
                     return
-                outbound = self._flush_pending_locked()
-                if outbound:
-                    writer.write(outbound)
-                    await writer.drain()
-            if not self.pending and self._request_end_stream_sent:
-                return
+                async with self._lock:
+                    self._pending_wakeup.clear()
+                    writer = self.writer
+                    connection = self.connection
+                    if writer is None or connection is None:
+                        raise CursorConnectError(
+                            "Inbound Cursor Agent CLI upstream session is closed.",
+                            status_code=499,
+                        )
+                    outbound = self._flush_pending_locked()
+                    if outbound:
+                        writer.write(outbound)
+                        await writer.drain()
+                    if self._request_end_stream_sent:
+                        self._request_end_stream_event.set()
+                        return
+        except asyncio.CancelledError:
+            if not self._closed:
+                self._flush_termination_reason = "cancelled"
+            raise
+        except Exception:
+            self._flush_termination_reason = "upstream_failure"
+            self._mark_upstream_termination("upstream_failure")
+        finally:
+            self._flush_termination_event.set()
+            if self._flush_termination_reason is not None:
+                self._request_end_stream_event.set()
 
     async def write_request(self, data: bytes, *, end_stream: bool = False) -> None:
-        if self._closed:
-            raise CursorConnectError(
-                "Inbound Cursor Agent CLI upstream session is closed.",
-                status_code=499,
-            )
-        if self._request_end_stream_sent and (data or end_stream):
-            raise CursorConnectError(
-                "Inbound Cursor Agent CLI request stream is already closed.",
-                status_code=409,
-            )
-        if end_stream:
-            self._request_end_stream_requested = True
-        if data:
+        async with self._lock:
+            if self._closed or self.writer is None or self.connection is None:
+                raise CursorConnectError(
+                    "Inbound Cursor Agent CLI upstream session is closed.",
+                    status_code=499,
+                )
+            if self._request_end_stream_sent and (data or end_stream):
+                raise CursorConnectError(
+                    "Inbound Cursor Agent CLI request stream is already closed.",
+                    status_code=409,
+                )
+            if self._flush_termination_reason is not None:
+                raise CursorConnectError(
+                    "Inbound Cursor Agent CLI upstream flush failed.",
+                    status_code=502,
+                )
             self.pending.extend(data)
-        if self._flush_task is None or self._flush_task.done():
-            self._flush_task = asyncio.create_task(self._flush_loop())
-        while True:
-            async with self._lock:
-                writer = self.writer
-                connection = self.connection
-                if writer is None or connection is None or self._closed:
-                    raise CursorConnectError(
-                        "Inbound Cursor Agent CLI upstream session is closed.",
-                        status_code=499,
-                    )
-                outbound = self._flush_pending_locked()
-                pending = bool(self.pending)
-                if outbound:
-                    writer.write(outbound)
-                    await writer.drain()
-                if self._request_end_stream_sent:
-                    break
-                if not pending and not self._request_end_stream_requested:
-                    break
-            if not self._request_end_stream_requested:
-                self._pending_wakeup.set()
-                break
-                self._pending_wakeup.clear()
-            await self._pending_wakeup.wait()
+            if end_stream:
+                self._request_end_stream_requested = True
+            if self._flush_task is None:
+                self._flush_task = asyncio.create_task(self._flush_loop())
+            self._pending_wakeup.set()
+        # Only the upload owner waits for half-close. The sole reader must
+        # remain free to receive credit while automatic replies are queued.
+        if end_stream:
+            await self._request_end_stream_event.wait()
+            if self._flush_termination_reason is not None or self._closed:
+                raise CursorConnectError(
+                    "Inbound Cursor Agent CLI request half-close failed.",
+                    status_code=502,
+                )
         verbose_proxy_logger.info(
             "cursor_agent_cli_inbound wrote agentn bytes=%s end_stream=%s pending=%s",
             len(data),
@@ -1306,6 +1321,7 @@ class _AgentnH2Session:
         self._closed = True
         self._mark_upstream_termination(reason)
         self._pending_wakeup.set()
+        self._request_end_stream_event.set()
         current_task = asyncio.current_task()
         read_task = self._read_task
         flush_task = self._flush_task
@@ -1448,8 +1464,12 @@ def _reduce_lifecycle_reasons(
     for task, role in task_roles.items():
         if task not in done:
             continue
-        if role == "reader":
-            reason = session.upstream_termination_reason
+        if role in {"reader", "flush"}:
+            reason = (
+                session.flush_termination_reason
+                if role == "flush"
+                else session.upstream_termination_reason
+            )
             if reason == "normal_response":
                 continue
         elif role == "lane":
@@ -1664,6 +1684,7 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
         upload_task: Optional[asyncio.Task[Any]] = None
         response_task: Optional[asyncio.Task[Any]] = None
         reader_termination_task: Optional[asyncio.Task[Any]] = None
+        flush_termination_task: Optional[asyncio.Task[Any]] = None
         open_complete = False
 
         while active_tasks:
@@ -1757,6 +1778,7 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
                     upload_task: "upload",
                     response_task: "response",
                     reader_termination_task: "reader",
+                    flush_termination_task: "flush",
                 },
                 session=session,
             )
@@ -1771,11 +1793,14 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
                 reader_termination_task = asyncio.create_task(
                     session.reader_termination_event.wait()
                 )
+                flush_termination_task = asyncio.create_task(
+                    session._flush_termination_event.wait()
+                )
                 active_tasks.extend(
-                    (upload_task, response_task, reader_termination_task)
+                    (upload_task, response_task, reader_termination_task, flush_termination_task)
                 )
                 all_tasks.extend(
-                    (upload_task, response_task, reader_termination_task)
+                    (upload_task, response_task, reader_termination_task, flush_termination_task)
                 )
                 _log_inbound_cli_lifecycle(
                     call_id=call_id,
@@ -1854,6 +1879,7 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
             http_version=http_version,
         )
         cleanup_cancelled = False
+        cleanup_complete = True
         try:
             current_task = asyncio.current_task()
             for task in all_tasks:
@@ -1864,22 +1890,32 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
         finally:
             try:
                 if session is not None:
-                    await asyncio.shield(
+                    close_task = asyncio.create_task(
                         _bounded_session_close(session, cleanup_reason)
                     )
+                    try:
+                        await _await_bounded_task(close_task)
+                    finally:
+                        cleanup_complete = close_task.done() and not close_task.cancelled()
             except asyncio.CancelledError:
                 cleanup_cancelled = True
             except Exception:
                 pass
             try:
-                await asyncio.shield(_cancel_and_join_tasks(all_tasks))
+                join_task = asyncio.create_task(_cancel_and_join_tasks(all_tasks))
+                try:
+                    await _await_bounded_task(join_task)
+                finally:
+                    cleanup_complete = (
+                        cleanup_complete and join_task.done() and not join_task.cancelled()
+                    )
             except asyncio.CancelledError:
                 cleanup_cancelled = True
             except Exception:
                 pass
         _log_inbound_cli_lifecycle(
             call_id=call_id,
-            event="cleanup_finished",
+            event="cleanup_finished" if cleanup_complete else "cleanup_incomplete",
             reason=cleanup_reason,
             http_version=http_version,
         )
@@ -2086,6 +2122,7 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
         all_tasks.extend((disconnect_task, lane_task, open_task))
         response_task: Optional[asyncio.Task[Any]] = None
         reader_termination_task: Optional[asyncio.Task[Any]] = None
+        flush_termination_task: Optional[asyncio.Task[Any]] = None
         active_tasks: List[asyncio.Task[Any]] = [
             disconnect_task,
             lane_task,
@@ -2165,6 +2202,7 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
                     open_task: "upstream",
                     response_task: "response",
                     reader_termination_task: "reader",
+                    flush_termination_task: "flush",
                     lane_task: "lane",
                 },
                 session=session,
@@ -2181,8 +2219,11 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
                 reader_termination_task = asyncio.create_task(
                     session.reader_termination_event.wait()
                 )
-                all_tasks.extend((response_task, reader_termination_task))
-                active_tasks.extend((response_task, reader_termination_task))
+                flush_termination_task = asyncio.create_task(
+                    session._flush_termination_event.wait()
+                )
+                all_tasks.extend((response_task, reader_termination_task, flush_termination_task))
+                active_tasks.extend((response_task, reader_termination_task, flush_termination_task))
                 _log_inbound_cli_lifecycle(
                     call_id=call_id,
                     event="upstream_started",
@@ -2249,6 +2290,7 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
                 }
     finally:
         cleanup_cancelled = False
+        cleanup_complete = True
         cleanup_reason = _sanitize_termination_reason(termination_reason or "unknown")
         _log_inbound_cli_lifecycle(
             call_id=call_id,
@@ -2262,36 +2304,38 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
                 task.cancel()
         if lane is not None:
             sniffed.update(lane.sniffed)
+            close_task = asyncio.create_task(lane.aclose(reason=cleanup_reason))
             try:
-                await asyncio.shield(lane.aclose(reason=cleanup_reason))
+                await _await_bounded_task(close_task)
             except asyncio.CancelledError:
                 cleanup_cancelled = True
-                try:
-                    await asyncio.shield(lane.aclose(reason=cleanup_reason))
-                except asyncio.CancelledError:
-                    pass
             finally:
+                cleanup_complete = close_task.done() and not close_task.cancelled()
                 await registry.discard(request_id, lane)
         elif session is not None:
+            close_task = asyncio.create_task(
+                _bounded_session_close(session, cleanup_reason)
+            )
             try:
-                await asyncio.shield(
-                    _bounded_session_close(
-                        session,
-                        _sanitize_termination_reason(
-                            termination_reason or "unknown"
-                        ),
-                    )
-                )
+                await _await_bounded_task(close_task)
             except asyncio.CancelledError:
                 cleanup_cancelled = True
+            finally:
+                cleanup_complete = close_task.done() and not close_task.cancelled()
         try:
             if all_tasks:
-                await asyncio.shield(_cancel_and_join_tasks(all_tasks))
+                join_task = asyncio.create_task(_cancel_and_join_tasks(all_tasks))
+                try:
+                    await _await_bounded_task(join_task)
+                finally:
+                    cleanup_complete = (
+                        cleanup_complete and join_task.done() and not join_task.cancelled()
+                    )
         except asyncio.CancelledError:
             cleanup_cancelled = True
         _log_inbound_cli_lifecycle(
             call_id=call_id,
-            event="cleanup_finished",
+            event="cleanup_finished" if cleanup_complete else "cleanup_incomplete",
             reason=cleanup_reason,
             http_version=http_version,
         )
