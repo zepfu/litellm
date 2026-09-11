@@ -937,6 +937,20 @@ class PassThroughStreamingHandler:
             )
         ):
             return "server_overloaded", "transient_capacity", True
+        if (
+            {
+                "server_error",
+                "internal_server_error",
+                "internal_error",
+                "api_error",
+                "upstream_error",
+                "service_unavailable",
+            }
+            & tokens
+            or "server error" in joined
+            or "internal server error" in joined
+        ):
+            return "upstream_transient_internal", "transient_upstream", True
         return "provider_terminal_error", "provider_terminal_error", False
 
     @staticmethod
