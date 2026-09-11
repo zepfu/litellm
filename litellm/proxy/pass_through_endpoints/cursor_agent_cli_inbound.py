@@ -1436,6 +1436,7 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
     response_started = False
     active_tasks: List[asyncio.Task[Any]] = []
     all_tasks: List[asyncio.Task[Any]] = []
+    deferred_error_payload: Optional[Mapping[str, str]] = None
 
     try:
         if http_version != "2":
@@ -1707,18 +1708,13 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
             termination_reason != "normal_response"
             and not response_started
         ):
-            response_started = True
-            await _send_json_error(
-                send,
-                status_code=status_code,
-                payload={
+            deferred_error_payload = {
                     "error": "cursor_agent_cli_inbound_upstream",
                     "reason": _sanitize_termination_reason(
                         termination_reason or "upstream_failure"
                     ),
                     "detail": "Cursor Agent CLI inbound request failed.",
-                },
-            )
+                }
     except InboundCursorAgentCliAuthError as exc:
         status_code = exc.status_code
         error_message = exc.reason
@@ -1745,30 +1741,22 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
         termination_reason = termination_reason or "upstream_failure"
         verbose_proxy_logger.warning("cursor_agent_cli_inbound connect error: %s", exc.message)
         if not response_started:
-            await _send_json_error(
-                send,
-                status_code=status_code,
-                payload={
+            deferred_error_payload = {
                     "error": "cursor_agent_cli_inbound_upstream",
                     "reason": error_message,
                     "detail": "Cursor Agent CLI inbound egress failed.",
-                },
-            )
+                }
     except Exception as exc:
         status_code = 502
         error_message = "inbound_proxy_error"
         termination_reason = termination_reason or "upstream_failure"
         verbose_proxy_logger.warning("cursor_agent_cli_inbound proxy error: %s", exc)
         if not response_started:
-            await _send_json_error(
-                send,
-                status_code=502,
-                payload={
+            deferred_error_payload = {
                     "error": "cursor_agent_cli_inbound_upstream",
                     "reason": error_message,
                     "detail": "Cursor Agent CLI inbound proxy failed.",
-                },
-            )
+                }
     finally:
         cleanup_reason = _sanitize_termination_reason(
             termination_reason or "unknown"
@@ -1812,6 +1800,13 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
         if error_message is None and cleanup_reason != "normal_response":
             error_message = cleanup_reason
         try:
+            if deferred_error_payload is not None and not response_started:
+                response_started = True
+                await _send_json_error(
+                    send,
+                    status_code=status_code,
+                    payload=deferred_error_payload,
+                )
             await _persist_inbound_cli_turn(
                 call_id=call_id,
                 headers=headers,
