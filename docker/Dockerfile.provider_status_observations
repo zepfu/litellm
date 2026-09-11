@@ -64,8 +64,18 @@ COPY litellm/llms/cursor_agent/connect.py /app/litellm/llms/cursor_agent/connect
 COPY litellm/llms/cursor_agent/usage.py /app/litellm/llms/cursor_agent/usage.py
 # Stdlib ChatGPT conversation-init observer (pure-stdlib).
 COPY litellm/llms/chatgpt/conversation_init.py /app/litellm/llms/chatgpt/conversation_init.py
+# History-backed usage ledger (stdlib persist/count; not the SQLite product).
+COPY scripts/apply_chatgpt_usage_ledger_2026_09_08.sql /app/scripts/apply_chatgpt_usage_ledger_2026_09_08.sql
+COPY scripts/chatgpt_chat_usage_capture/__init__.py /app/scripts/chatgpt_chat_usage_capture/__init__.py
+COPY scripts/chatgpt_chat_usage_capture/models.py /app/scripts/chatgpt_chat_usage_capture/models.py
+COPY scripts/chatgpt_chat_usage_capture/privacy.py /app/scripts/chatgpt_chat_usage_capture/privacy.py
+COPY scripts/chatgpt_chat_usage_capture/timeutil.py /app/scripts/chatgpt_chat_usage_capture/timeutil.py
+COPY scripts/chatgpt_chat_usage_capture/reconstruct.py /app/scripts/chatgpt_chat_usage_capture/reconstruct.py
+COPY scripts/chatgpt_chat_usage_capture/pg_ledger.py /app/scripts/chatgpt_chat_usage_capture/pg_ledger.py
+COPY scripts/chatgpt_chat_usage_capture/native_history_ingest.py /app/scripts/chatgpt_chat_usage_capture/native_history_ingest.py
 RUN touch \
     /app/scripts/__init__.py \
+    /app/scripts/chatgpt_chat_usage_capture/__init__.py \
     /app/litellm/__init__.py \
     /app/litellm/secret_managers/__init__.py \
     /app/litellm/llms/__init__.py \
