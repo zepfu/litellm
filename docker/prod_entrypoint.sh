@@ -1,5 +1,9 @@
 #!/bin/sh
 
+# Git-archive /app is the inbound Connect + leftover-dup source of truth.
+# Wheel-overlay site-packages can lag sql.py and crash Hypercorn on import.
+export PYTHONPATH="${PYTHONPATH:-/app}"
+
 if [ "$SEPARATE_HEALTH_APP" = "1" ]; then
     export LITELLM_ARGS="$@"
     export SUPERVISORD_STOPWAITSECS="${SUPERVISORD_STOPWAITSECS:-3600}"

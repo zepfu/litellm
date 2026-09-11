@@ -81,6 +81,8 @@ RUN apk add --no-cache bash openssl tzdata nodejs npm python3 py3-pip libsndfile
     { apk del --no-cache npm 2>/dev/null || true; }
 
 WORKDIR /app
+# Prefer git-archive /app over a lagging wheel overlay in site-packages.
+ENV PYTHONPATH=/app
 # Copy the current directory contents into the container at /app
 COPY . .
 RUN ls -la /app
