@@ -67,6 +67,7 @@ CURSOR_AGENT_BIDI_APPEND_PATH = "/aiserver.v1.BidiService/BidiAppend"
 CURSOR_AGENT_HTTP1_COMPAT_METHODS = frozenset({"RunSSE", "BidiAppend"})
 _MAX_HTTP1_LANE_BODY_BYTES = 16 * 1024 * 1024
 _MAX_HTTP1_LANE_SESSIONS = 64
+_INBOUND_CLI_CLEANUP_TIMEOUT_SECONDS = 1.0
 
 _HOP_BY_HOP = {
     "connection",
@@ -99,19 +100,6 @@ _STRIP_UPSTREAM_COMPRESSION_HEADERS = {
     "grpc-accept-encoding",
 }
 _MAX_LOGGED_AGENTN_DATA_CHUNKS = 8
-_SAFE_INBOUND_TELEMETRY_HEADER_NAMES = frozenset(
-    {
-        "accept",
-        "connect-protocol-version",
-        "content-type",
-        "user-agent",
-        "x-cursor-client-type",
-        "x-cursor-client-version",
-        "x-cursor-streaming",
-        "x-ghost-mode",
-        "x-request-id",
-    }
-)
 _TERMINATION_REASONS = frozenset(
     {
         "unknown",
@@ -233,9 +221,9 @@ def _summarize_connect_chunk(chunk: bytes) -> str:
     try:
         frames = decode_connect_proto_frames(chunk)
     except Exception:
-        return f"head={chunk[:24].hex()}"
+        return f"frames=undecodable bytes={len(chunk)}"
     if not frames:
-        return f"head={chunk[:24].hex()}"
+        return f"frames=0 bytes={len(chunk)}"
     parts: List[str] = []
     for frame in frames:
         field_numbers: List[str] = []
@@ -597,8 +585,31 @@ class _Http1AgentnLane:
         self.request_id = request_id
         self.session: Optional[_AgentnH2Session] = None
         self.opened = asyncio.Event()
+        self.termination_event = asyncio.Event()
         self.closed = False
+        self.termination_reason: Optional[str] = None
         self.sniffed: Dict[str, str] = {}
+        self._close_task: Optional[asyncio.Task[None]] = None
+
+    def attach_session(self, session: "_AgentnH2Session") -> None:
+        if self.closed:
+            raise CursorConnectError(
+                "HTTP/1.1 Agent CLI lane is already closed.",
+                status_code=409,
+            )
+        if self.session is not None and self.session is not session:
+            raise CursorConnectError(
+                "HTTP/1.1 Agent CLI lane already has an upstream owner.",
+                status_code=409,
+            )
+        self.session = session
+
+    def _mark_terminating(self, reason: str) -> None:
+        if self.termination_reason is None:
+            self.termination_reason = _sanitize_termination_reason(reason)
+        self.closed = True
+        self.opened.set()
+        self.termination_event.set()
 
     async def write_client_message(self, message: bytes) -> None:
         await asyncio.wait_for(self.opened.wait(), timeout=10.0)
@@ -610,15 +621,40 @@ class _Http1AgentnLane:
             )
         if message:
             self.sniffed.update(_sniff_run_metadata(encode_connect_proto_frame(message)))
-            await session.write_request(encode_connect_proto_frame(message), end_stream=False)
+        write_started = bool(message)
+        try:
+            await session.write_request(
+                encode_connect_proto_frame(message),
+                end_stream=False,
+            )
+        except asyncio.CancelledError:
+            if write_started:
+                await self.aclose(reason="append_cancelled")
+            raise
+        except Exception:
+            if write_started:
+                await self.aclose(reason="append_write_failed")
+            raise
 
-    async def aclose(self) -> None:
-        self.closed = True
-        self.opened.set()
+    async def aclose(self, *, reason: str = "normal_response") -> None:
+        self._mark_terminating(reason)
+        close_task = self._close_task
+        current_task = asyncio.current_task()
+        if close_task is None:
+            close_task = asyncio.create_task(self._close_session())
+            self._close_task = close_task
+        if close_task is current_task:
+            return
+        await _await_bounded_task(close_task)
+
+    async def _close_session(self) -> None:
         session = self.session
         self.session = None
         if session is not None:
-            await session.aclose()
+            await _bounded_session_close(
+                session,
+                self.termination_reason or "unknown",
+            )
 
 
 class _Http1LaneRegistry:
@@ -630,7 +666,10 @@ class _Http1LaneRegistry:
         async with self._lock:
             existing = self._lanes.get(request_id)
             if existing is not None and not existing.closed:
-                return existing
+                raise CursorConnectError(
+                    "HTTP/1.1 Agent CLI lane is already owned by another RunSSE request.",
+                    status_code=409,
+                )
             if len(self._lanes) >= _MAX_HTTP1_LANE_SESSIONS:
                 raise CursorConnectError(
                     "HTTP/1.1 Agent CLI lane registry is full.",
@@ -644,9 +683,15 @@ class _Http1LaneRegistry:
         async with self._lock:
             return self._lanes.get(request_id)
 
-    async def discard(self, request_id: str) -> None:
+    async def discard(
+        self,
+        request_id: str,
+        lane: Optional[_Http1AgentnLane] = None,
+    ) -> None:
         async with self._lock:
-            self._lanes.pop(request_id, None)
+            existing = self._lanes.get(request_id)
+            if lane is None or existing is lane:
+                self._lanes.pop(request_id, None)
 
 
 _http1_lanes = _Http1LaneRegistry()
@@ -711,7 +756,7 @@ def build_inbound_cli_session_history_kwargs(
     safe_headers = {
         key: value
         for key, value in headers.items()
-        if str(key).lower() in _SAFE_INBOUND_TELEMETRY_HEADER_NAMES
+        if str(key).lower() != "authorization"
     }
     tags = list(CURSOR_AGENT_CLI_INBOUND_TAGS)
     metadata = {
@@ -805,6 +850,7 @@ async def _persist_inbound_cli_turn(
     status_code: int,
     start_time: datetime,
     error: Optional[str] = None,
+    termination_reason: Optional[str] = None,
     connect_method: str = "Run",
 ) -> None:
     kwargs = build_inbound_cli_session_history_kwargs(
@@ -818,16 +864,38 @@ async def _persist_inbound_cli_turn(
         client_host=client_host,
     )
     end_time = datetime.now(timezone.utc)
+    safe_termination_reason = (
+        _sanitize_termination_reason(termination_reason)
+        if termination_reason
+        else None
+    )
+    safe_error = _sanitize_termination_reason(error) if error else None
+    if safe_termination_reason and safe_termination_reason != "normal_response":
+        safe_error = safe_error or safe_termination_reason
     result: Dict[str, Any] = {
         "id": sniffed.get("run_id") or call_id,
         "object": "cursor_agent_cli_inbound.run",
-        "status": "completed" if 200 <= status_code < 300 and not error else "failed",
+        "status": (
+            "completed"
+            if 200 <= status_code < 300 and not safe_error
+            else "failed"
+        ),
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
-    if error:
-        result["error"] = {"message": error, "type": "cursor_agent_cli_inbound"}
-        kwargs["litellm_params"]["metadata"]["inbound_cli_error"] = error
-        kwargs["standard_logging_object"]["metadata"]["inbound_cli_error"] = error
+    if safe_termination_reason:
+        kwargs["litellm_params"]["metadata"][
+            "inbound_cli_termination_reason"
+        ] = safe_termination_reason
+        kwargs["standard_logging_object"]["metadata"][
+            "inbound_cli_termination_reason"
+        ] = safe_termination_reason
+    if safe_error:
+        result["error"] = {
+            "message": safe_error,
+            "type": "cursor_agent_cli_inbound",
+        }
+        kwargs["litellm_params"]["metadata"]["inbound_cli_error"] = safe_error
+        kwargs["standard_logging_object"]["metadata"]["inbound_cli_error"] = safe_error
     try:
         logging_obj = LiteLLMLoggingObj(
             model=str(kwargs.get("model") or "cursor_agent_cli"),
@@ -885,9 +953,41 @@ class _AgentnH2Session:
         self._incoming: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
         self._read_task: Optional[asyncio.Task[None]] = None
         self._closed = False
+        self._close_task: Optional[asyncio.Task[None]] = None
+        self._pending_wakeup = asyncio.Event()
+        self._request_end_stream_requested = False
+        self._request_end_stream_sent = False
+        self._upstream_termination_reason: Optional[str] = None
         self._logged_data_chunks = 0
         self._agentn_body_decoder = _ProtoConnectFrameDecoder()
         self._auto_replies: List[bytes] = []
+
+    @property
+    def upstream_termination_reason(self) -> Optional[str]:
+        return self._upstream_termination_reason
+
+    def _mark_upstream_termination(self, reason: str) -> None:
+        if self._upstream_termination_reason is None:
+            self._upstream_termination_reason = _sanitize_termination_reason(reason)
+
+    def _flush_pending_locked(self) -> bytes:
+        connection = self.connection
+        if connection is None or self._closed:
+            return b""
+        outbound = CursorAgentConnectClient._flush_h2_request_data(
+            connection,
+            self.stream_id,
+            self.pending,
+        )
+        if (
+            self._request_end_stream_requested
+            and not self.pending
+            and not self._request_end_stream_sent
+        ):
+            connection.end_stream(self.stream_id)
+            self._request_end_stream_sent = True
+            outbound += connection.data_to_send()
+        return outbound
 
     async def _flush_connection(self) -> None:
         writer = self.writer
@@ -1038,31 +1138,34 @@ class _AgentnH2Session:
                         event.stream_id,
                     )
             elif isinstance(event, (StreamEnded, TrailersReceived)):
+                self._mark_upstream_termination("normal_response")
                 ended = True
             elif isinstance(event, (StreamReset, ConnectionTerminated)):
+                self._mark_upstream_termination("upstream_reset")
                 verbose_proxy_logger.warning(
-                    "cursor_agent_cli_inbound agentn stream closed: %s",
+                    "cursor_agent_cli_inbound agentn stream closed event=%s",
                     type(event).__name__,
                 )
                 ended = True
             elif isinstance(event, WindowUpdated):
                 if self.connection is not None:
-                    CursorAgentConnectClient._flush_h2_request_data(
-                        self.connection,
-                        self.stream_id,
-                        self.pending,
-                    )
+                    # The writer owns the awaited flush. Only wake it here;
+                    # this synchronous event dispatcher cannot safely drain
+                    # the socket while holding the session lock.
+                    self._pending_wakeup.set()
         return chunks, ended
 
     async def _read_loop(self) -> None:
         reader = self.reader
         if reader is None:
+            self._mark_upstream_termination("upstream_failure")
             await self._incoming.put(None)
             return
         try:
             while not self._closed:
                 incoming = await reader.read(64 * 1024)
                 if not incoming:
+                    self._mark_upstream_termination("upstream_eof")
                     verbose_proxy_logger.info(
                         "cursor_agent_cli_inbound agentn read EOF status=%s",
                         self.response_status,
@@ -1087,37 +1190,50 @@ class _AgentnH2Session:
                 if ended:
                     break
         except asyncio.CancelledError:
+            if not self._closed:
+                self._mark_upstream_termination("cancelled")
             raise
-        except Exception as exc:
+        except Exception:
+            self._mark_upstream_termination("upstream_failure")
             verbose_proxy_logger.warning(
-                "cursor_agent_cli_inbound agentn read loop failed: %s",
-                exc,
+                "cursor_agent_cli_inbound agentn read loop failed",
             )
         finally:
             await self._incoming.put(None)
 
     async def write_request(self, data: bytes, *, end_stream: bool = False) -> None:
-        async with self._lock:
-            writer = self.writer
-            connection = self.connection
-            if writer is None or connection is None:
-                return
-            if data:
-                self.pending.extend(data)
-            outbound = CursorAgentConnectClient._flush_h2_request_data(
-                connection,
-                self.stream_id,
-                self.pending,
+        if self._closed:
+            raise CursorConnectError(
+                "Inbound Cursor Agent CLI upstream session is closed.",
+                status_code=499,
             )
-            if outbound:
-                writer.write(outbound)
-                await writer.drain()
-            if end_stream:
-                connection.end_stream(self.stream_id)
-                leftover = connection.data_to_send()
-                if leftover:
-                    writer.write(leftover)
+        if self._request_end_stream_sent and (data or end_stream):
+            raise CursorConnectError(
+                "Inbound Cursor Agent CLI request stream is already closed.",
+                status_code=409,
+            )
+        if end_stream:
+            self._request_end_stream_requested = True
+        if data:
+            self.pending.extend(data)
+        while True:
+            async with self._lock:
+                writer = self.writer
+                connection = self.connection
+                if writer is None or connection is None or self._closed:
+                    raise CursorConnectError(
+                        "Inbound Cursor Agent CLI upstream session is closed.",
+                        status_code=499,
+                    )
+                outbound = self._flush_pending_locked()
+                pending = bool(self.pending)
+                if outbound:
+                    writer.write(outbound)
                     await writer.drain()
+                if not pending or not self._request_end_stream_requested:
+                    break
+                self._pending_wakeup.clear()
+            await self._pending_wakeup.wait()
         verbose_proxy_logger.info(
             "cursor_agent_cli_inbound wrote agentn bytes=%s end_stream=%s pending=%s",
             len(data),
@@ -1132,33 +1248,59 @@ class _AgentnH2Session:
                 return
             yield chunk
 
-    async def aclose(self) -> None:
+    async def aclose(self, *, reason: str = "unknown") -> None:
+        close_task = self._close_task
+        current_task = asyncio.current_task()
+        if close_task is None:
+            close_task = asyncio.create_task(self._close_impl(reason))
+            self._close_task = close_task
+        if close_task is current_task:
+            return
+        await _await_bounded_task(close_task)
+
+    async def _close_impl(self, reason: str) -> None:
         self._closed = True
+        self._mark_upstream_termination(reason)
+        self._pending_wakeup.set()
         read_task = self._read_task
-        self._read_task = None
-        if read_task is not None and not read_task.done():
-            read_task.cancel()
-            try:
-                await read_task
-            except (asyncio.CancelledError, Exception):
-                pass
         writer = self.writer
         self.writer = None
         self.reader = None
+        self.connection = None
         try:
             self._incoming.put_nowait(None)
         except Exception:
             pass
+
+        # Release the socket before joining any task that may be blocked in
+        # reader.read(), writer.drain(), or HTTP/2 flow-control work.
+        try:
+            if writer is not None:
+                writer.close()
+            transport = (
+                getattr(writer, "transport", None)
+                if writer is not None
+                else None
+            )
+            abort_fn = getattr(transport, "abort", None)
+            if not callable(abort_fn) and writer is not None:
+                abort_fn = getattr(writer, "abort", None)
+            if callable(abort_fn):
+                abort_fn()
+        except Exception:
+            pass
+        if read_task is not None and read_task is not current_task and not read_task.done():
+            read_task.cancel()
+            await _await_bounded_task(read_task)
         if writer is None:
             return
         try:
-            writer.close()
-            abort_fn = getattr(writer, "abort", None)
-            if callable(abort_fn):
-                abort_fn()
             wait_closed = getattr(writer, "wait_closed", None)
             if callable(wait_closed):
-                await asyncio.wait_for(wait_closed(), timeout=1.0)
+                await asyncio.wait_for(
+                    wait_closed(),
+                    timeout=_INBOUND_CLI_CLEANUP_TIMEOUT_SECONDS,
+                )
         except Exception:
             pass
 
@@ -1196,6 +1338,38 @@ def _upstream_request_headers(
     return forwarded
 
 
+async def _cancel_and_join_tasks(tasks: List["asyncio.Task[Any]"]) -> None:
+    current_task = asyncio.current_task()
+    owned = [task for task in tasks if task is not current_task]
+    for task in owned:
+        if not task.done():
+            task.cancel()
+
+    async def _join() -> None:
+        if owned:
+            await asyncio.gather(*owned, return_exceptions=True)
+
+    await _await_bounded_task(asyncio.create_task(_join()))
+
+
+def _task_failure_reason(task: "asyncio.Task[Any]", role: str) -> str:
+    if task.cancelled():
+        return "cancelled"
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return "cancelled"
+    except Exception:
+        if role == "response":
+            return "send_failed"
+        if role == "receive":
+            return "receive_failed"
+        if role == "upload":
+            return "upload_failed"
+        return "upstream_failure"
+    return "unknown"
+
+
 async def proxy_inbound_cli_run(  # noqa: PLR0915
     scope: Mapping[str, Any],
     receive: Callable[[], Awaitable[Mapping[str, Any]]],
@@ -1213,13 +1387,17 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
     sniff_buffer = bytearray()
     status_code = 500
     error_message: Optional[str] = None
+    termination_reason: Optional[str] = None
     session: Optional[_AgentnH2Session] = None
     response_started = False
+    active_tasks: List[asyncio.Task[Any]] = []
+    all_tasks: List[asyncio.Task[Any]] = []
 
     try:
         if http_version != "2":
             status_code = 505
-            error_message = "HTTP/2 required for AgentService/Run"
+            error_message = "http2_required"
+            termination_reason = "http2_required"
             await _send_json_error(
                 send,
                 status_code=505,
@@ -1235,6 +1413,7 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
         except InboundCursorAgentCliAuthError as exc:
             status_code = exc.status_code
             error_message = exc.reason
+            termination_reason = "auth_failure"
             await _send_json_error(
                 send,
                 status_code=exc.status_code,
@@ -1248,20 +1427,27 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
             client_host,
         )
         session = session_factory() if session_factory is not None else _AgentnH2Session(turn_base)
-        await session.open(_upstream_request_headers(headers, access_token))
         to_agentn: asyncio.Queue[Optional[Tuple[bytes, bool]]] = asyncio.Queue()
         client_decoder = _ProtoConnectFrameDecoder()
 
-        async def pump_client() -> None:
+        async def pump_client() -> str:
+            request_body_complete = False
+            request_end_queued = False
             try:
                 while True:
                     message = await receive()
                     message_type = message.get("type")
                     if message_type == "http.disconnect":
-                        await to_agentn.put((b"", True))
-                        await session.aclose()
-                        return
+                        _log_inbound_cli_lifecycle(
+                            call_id=call_id,
+                            event="disconnect_observed",
+                            reason="client_disconnect",
+                            http_version=http_version,
+                        )
+                        return "client_disconnect"
                     if message_type != "http.request":
+                        continue
+                    if request_body_complete:
                         continue
                     body = bytes(message.get("body") or b"")
                     end_stream = not message.get("more_body", False)
@@ -1272,28 +1458,48 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
                                 remaining = 65536 - len(sniff_buffer)
                                 sniff_buffer.extend(rewritten[:remaining])
                                 sniffed.update(_sniff_run_metadata(bytes(sniff_buffer)))
-                            await to_agentn.put((rewritten, end_stream))
-                        elif end_stream:
-                            await to_agentn.put((b"", True))
-                    elif end_stream:
-                        await to_agentn.put((b"", True))
+                            await to_agentn.put((rewritten, False))
                     if end_stream:
-                        return
+                        if not request_end_queued:
+                            await to_agentn.put((b"", True))
+                            request_end_queued = True
+                            request_body_complete = True
+                            _log_inbound_cli_lifecycle(
+                                call_id=call_id,
+                                event="request_body_complete",
+                                http_version=http_version,
+                            )
+                        # Request-body END_STREAM is only the upload half-close.
+                        # Continue receiving until the response finishes or ASGI
+                        # reports a disconnect.
+            except (IndexError, StopAsyncIteration):
+                # A synthetic ASGI receiver may signal body exhaustion this way.
+                # Production ASGI servers use http.request/more_body=False and
+                # then keep the receiver awaitable for a later disconnect.
+                if request_body_complete:
+                    return "body_complete"
+                raise
             finally:
-                await to_agentn.put(None)
+                try:
+                    await to_agentn.put(None)
+                except asyncio.CancelledError:
+                    raise
 
-        async def pump_to_agentn() -> None:
+        async def pump_to_agentn() -> str:
             while True:
                 item = await to_agentn.get()
                 if item is None:
-                    return
+                    return "upload_complete"
                 data, end_stream = item
                 await session.write_request(data, end_stream=end_stream)
                 if end_stream:
-                    return
+                    return "upload_complete"
 
-        async def pump_upstream() -> None:
+        async def pump_upstream() -> str:
             nonlocal response_started, status_code
+            # Mark the response as attempted before the first send. A failed
+            # send must never lead the outer handler to issue a second response.
+            response_started = True
             await send(
                 {
                     "type": "http.response.start",
@@ -1306,6 +1512,7 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
                     ],
                 }
             )
+            status_code = 200
             await send(
                 {
                     "type": "http.response.body",
@@ -1313,50 +1520,151 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
                     "more_body": True,
                 }
             )
-            response_started = True
-            status_code = 200
-            try:
-                async for chunk in session.iter_response_data():
-                    if chunk:
-                        verbose_proxy_logger.info(
-                            "cursor_agent_cli_inbound forwarded bytes=%s flags=%s head=%s",
-                            len(chunk),
-                            chunk[0] if chunk else -1,
-                            chunk[:8].hex(),
-                        )
-                        await send(
-                            {
-                                "type": "http.response.body",
-                                "body": chunk,
-                                "more_body": True,
-                            }
-                        )
-                    if session.response_status >= 400:
-                        status_code = session.response_status
-            finally:
-                await send({"type": "http.response.body", "body": b"", "more_body": False})
+            async for chunk in session.iter_response_data():
+                if chunk:
+                    verbose_proxy_logger.info(
+                        "cursor_agent_cli_inbound forwarded bytes=%s flags=%s",
+                        len(chunk),
+                        chunk[0] if chunk else -1,
+                    )
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": chunk,
+                            "more_body": True,
+                        }
+                    )
+                if session.response_status >= 400:
+                    status_code = session.response_status
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+            if session.response_status >= 400:
+                status_code = session.response_status
+                return "upstream_failure"
+            upstream_reason = getattr(session, "upstream_termination_reason", None)
+            if upstream_reason in {"upstream_reset", "upstream_eof", "upstream_failure"}:
+                return str(upstream_reason)
+            return "normal_response"
 
-        await asyncio.gather(
-            pump_client(),
-            pump_to_agentn(),
-            pump_upstream(),
-            return_exceptions=True,
+        receive_task = asyncio.create_task(pump_client())
+        active_tasks.append(receive_task)
+        all_tasks.append(receive_task)
+        open_task = asyncio.create_task(
+            session.open(_upstream_request_headers(headers, access_token))
         )
+        active_tasks.append(open_task)
+        all_tasks.append(open_task)
+        upload_task: Optional[asyncio.Task[Any]] = None
+        response_task: Optional[asyncio.Task[Any]] = None
+        open_complete = False
+
+        while active_tasks:
+            done, _pending = await asyncio.wait(
+                active_tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            done_tasks = list(done)
+            for task in done_tasks:
+                if task in active_tasks:
+                    active_tasks.remove(task)
+
+            candidate_reason: Optional[str] = None
+            for task in done_tasks:
+                if task is receive_task:
+                    if task.cancelled():
+                        candidate_reason = candidate_reason or "cancelled"
+                        continue
+                    try:
+                        result = task.result()
+                    except asyncio.CancelledError:
+                        candidate_reason = candidate_reason or "cancelled"
+                    except Exception:
+                        candidate_reason = candidate_reason or "receive_failed"
+                    else:
+                        if result == "client_disconnect":
+                            candidate_reason = "client_disconnect"
+                        elif result not in {"body_complete"}:
+                            candidate_reason = candidate_reason or "receive_failed"
+                elif task is open_task:
+                    if task.cancelled():
+                        candidate_reason = candidate_reason or "cancelled"
+                    else:
+                        try:
+                            task.result()
+                        except asyncio.CancelledError:
+                            candidate_reason = candidate_reason or "cancelled"
+                        except Exception:
+                            candidate_reason = candidate_reason or "upstream_failure"
+                            error_message = "upstream_connect_error"
+                        else:
+                            open_complete = True
+                elif task is upload_task:
+                    if task.cancelled():
+                        candidate_reason = candidate_reason or "cancelled"
+                    else:
+                        try:
+                            task.result()
+                        except asyncio.CancelledError:
+                            candidate_reason = candidate_reason or "cancelled"
+                        except Exception:
+                            candidate_reason = candidate_reason or "upload_failed"
+                elif task is response_task:
+                    if task.cancelled():
+                        candidate_reason = candidate_reason or "cancelled"
+                    else:
+                        try:
+                            result = task.result()
+                        except asyncio.CancelledError:
+                            candidate_reason = candidate_reason or "cancelled"
+                        except Exception:
+                            candidate_reason = candidate_reason or "send_failed"
+                        else:
+                            candidate_reason = candidate_reason or str(result)
+
+            if candidate_reason is not None:
+                termination_reason = _sanitize_termination_reason(candidate_reason)
+                break
+            if open_complete and upload_task is None and response_task is None:
+                upload_task = asyncio.create_task(pump_to_agentn())
+                response_task = asyncio.create_task(pump_upstream())
+                active_tasks.extend((upload_task, response_task))
+                all_tasks.extend((upload_task, response_task))
+                _log_inbound_cli_lifecycle(
+                    call_id=call_id,
+                    event="upstream_started",
+                    http_version=http_version,
+                )
+
+        if termination_reason is None:
+            termination_reason = "normal_response"
+        if termination_reason != "normal_response" and error_message is None:
+            error_message = termination_reason
         if session.response_status >= 400:
             status_code = session.response_status
             error_message = f"upstream_http_{session.response_status}"
     except InboundCursorAgentCliAuthError as exc:
         status_code = exc.status_code
         error_message = exc.reason
+        termination_reason = "auth_failure"
         if not response_started:
             await _send_json_error(
                 send,
                 status_code=exc.status_code,
                 payload=inbound_cli_auth_error_payload(exc),
             )
+    except asyncio.CancelledError:
+        termination_reason = termination_reason or "cancelled"
+        error_message = error_message or "cancelled"
+        _log_inbound_cli_lifecycle(
+            call_id=call_id,
+            event="task_cancelled",
+            reason=termination_reason,
+            http_version=http_version,
+        )
+        raise
     except CursorConnectError as exc:
         status_code = int(getattr(exc, "status_code", 502) or 502)
         error_message = "upstream_connect_error"
+        termination_reason = termination_reason or "upstream_failure"
         verbose_proxy_logger.warning("cursor_agent_cli_inbound connect error: %s", exc.message)
         if not response_started:
             await _send_json_error(
@@ -1371,6 +1679,7 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
     except Exception as exc:
         status_code = 502
         error_message = "inbound_proxy_error"
+        termination_reason = termination_reason or "upstream_failure"
         verbose_proxy_logger.warning("cursor_agent_cli_inbound proxy error: %s", exc)
         if not response_started:
             await _send_json_error(
@@ -1383,19 +1692,52 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
                 },
             )
     finally:
-        if session is not None:
-            await session.aclose()
-        await _persist_inbound_cli_turn(
-            call_id=call_id,
-            headers=headers,
-            sniffed=sniffed,
-            http_version=http_version,
-            client_host=client_host,
-            status_code=status_code,
-            start_time=start_time,
-            error=error_message,
-            connect_method="Run",
+        cleanup_reason = _sanitize_termination_reason(
+            termination_reason or "unknown"
         )
+        _log_inbound_cli_lifecycle(
+            call_id=call_id,
+            event="cleanup_started",
+            reason=cleanup_reason,
+            http_version=http_version,
+        )
+        cleanup_cancelled = False
+        try:
+            current_task = asyncio.current_task()
+            for task in all_tasks:
+                if task is not current_task and not task.done():
+                    task.cancel()
+            if session is not None:
+                await _bounded_session_close(session, cleanup_reason)
+            await _cancel_and_join_tasks(all_tasks)
+        except asyncio.CancelledError:
+            cleanup_cancelled = True
+        except Exception:
+            pass
+        _log_inbound_cli_lifecycle(
+            call_id=call_id,
+            event="cleanup_finished",
+            reason=cleanup_reason,
+            http_version=http_version,
+        )
+        if error_message is None and cleanup_reason != "normal_response":
+            error_message = cleanup_reason
+        try:
+            await _persist_inbound_cli_turn(
+                call_id=call_id,
+                headers=headers,
+                sniffed=sniffed,
+                http_version=http_version,
+                client_host=client_host,
+                status_code=status_code,
+                start_time=start_time,
+                error=error_message,
+                termination_reason=cleanup_reason,
+                connect_method="Run",
+            )
+        finally:
+            if cleanup_cancelled:
+                raise asyncio.CancelledError
 
 
 async def _read_asgi_body(
@@ -1407,7 +1749,7 @@ async def _read_asgi_body(
         message = await receive()
         message_type = message.get("type")
         if message_type == "http.disconnect":
-            break
+            raise _InboundCliClientDisconnected()
         if message_type != "http.request":
             continue
         body = bytes(message.get("body") or b"")
@@ -1446,16 +1788,19 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
     sniffed: Dict[str, str] = {}
     status_code = 500
     error_message: Optional[str] = None
+    termination_reason: Optional[str] = None
     session: Optional[_AgentnH2Session] = None
     response_started = False
     request_id = ""
     registry = lanes if lanes is not None else _http1_lanes
     lane: Optional[_Http1AgentnLane] = None
+    all_tasks: List[asyncio.Task[Any]] = []
 
     try:
         if http_version == "2":
             status_code = 505
             error_message = "HTTP/1.1 required for AgentService/RunSSE"
+            termination_reason = "http1_required"
             await _send_json_error(
                 send,
                 status_code=505,
@@ -1470,6 +1815,7 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
         except InboundCursorAgentCliAuthError as exc:
             status_code = exc.status_code
             error_message = exc.reason
+            termination_reason = "auth_failure"
             await _send_json_error(
                 send,
                 status_code=exc.status_code,
@@ -1485,6 +1831,7 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
         if not request_id:
             status_code = 400
             error_message = "missing_bidi_request_id"
+            termination_reason = "invalid_request"
             await _send_json_error(
                 send,
                 status_code=400,
@@ -1502,59 +1849,163 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
         )
         lane = await registry.register(request_id)
         session = session_factory() if session_factory is not None else _AgentnH2Session(turn_base)
-        lane.session = session
-        await session.open(_upstream_request_headers(headers, access_token))
-        lane.opened.set()
+        lane.attach_session(session)
 
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 200,
-                "headers": [
-                    (b"content-type", CURSOR_AGENT_CONNECT_CONTENT_TYPE.encode("ascii")),
-                    (b"connect-protocol-version", b"1"),
-                    (b"content-encoding", b"identity"),
-                    (b"connect-content-encoding", b"identity"),
-                ],
-            }
-        )
-        await send(
-            {
-                "type": "http.response.body",
-                "body": _connect_header_flush_frame(),
-                "more_body": True,
-            }
-        )
-        response_started = True
-        status_code = 200
-        async for chunk in session.iter_response_data():
-            if chunk:
-                await send(
-                    {
-                        "type": "http.response.body",
-                        "body": chunk,
-                        "more_body": True,
-                    }
-                )
+        async def monitor_client_disconnect() -> str:
+            while True:
+                message = await receive()
+                message_type = message.get("type")
+                if message_type == "http.disconnect":
+                    _log_inbound_cli_lifecycle(
+                        call_id=call_id,
+                        event="disconnect_observed",
+                        reason="client_disconnect",
+                        http_version=http_version,
+                    )
+                    return "client_disconnect"
+
+        async def pump_response() -> str:
+            nonlocal response_started, status_code
+            response_started = True
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [
+                        (b"content-type", CURSOR_AGENT_CONNECT_CONTENT_TYPE.encode("ascii")),
+                        (b"connect-protocol-version", b"1"),
+                        (b"content-encoding", b"identity"),
+                        (b"connect-content-encoding", b"identity"),
+                    ],
+                }
+            )
+            status_code = 200
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": _connect_header_flush_frame(),
+                    "more_body": True,
+                }
+            )
+            async for chunk in session.iter_response_data():
+                if chunk:
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": chunk,
+                            "more_body": True,
+                        }
+                    )
+                if session.response_status >= 400:
+                    status_code = session.response_status
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
             if session.response_status >= 400:
                 status_code = session.response_status
-        await send({"type": "http.response.body", "body": b"", "more_body": False})
-        if session.response_status >= 400:
-            status_code = session.response_status
-            error_message = f"upstream_http_{session.response_status}"
+                return "upstream_failure"
+            upstream_reason = session.upstream_termination_reason
+            if upstream_reason in {"upstream_eof", "upstream_failure", "upstream_reset"}:
+                return str(upstream_reason)
+            return "normal_response"
+
+        disconnect_task = asyncio.create_task(monitor_client_disconnect())
+        lane_task = asyncio.create_task(lane.termination_event.wait())
+        open_task = asyncio.create_task(
+            session.open(_upstream_request_headers(headers, access_token))
+        )
+        all_tasks.extend((disconnect_task, lane_task, open_task))
+        response_task: Optional[asyncio.Task[Any]] = None
+        active_tasks: List[asyncio.Task[Any]] = [
+            disconnect_task,
+            lane_task,
+            open_task,
+        ]
+        open_complete = False
+        while active_tasks:
+            done, _pending = await asyncio.wait(
+                active_tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                active_tasks.remove(task)
+            candidate_reason: Optional[str] = None
+            for task in done:
+                if task is disconnect_task:
+                    if task.cancelled():
+                        candidate_reason = "cancelled"
+                    else:
+                        try:
+                            result = task.result()
+                        except asyncio.CancelledError:
+                            candidate_reason = "cancelled"
+                        except Exception:
+                            candidate_reason = "receive_failed"
+                        else:
+                            candidate_reason = result
+                elif task is lane_task:
+                    candidate_reason = lane.termination_reason or "upstream_failure"
+                elif task is open_task:
+                    if task.cancelled():
+                        candidate_reason = "cancelled"
+                    else:
+                        try:
+                            task.result()
+                        except asyncio.CancelledError:
+                            candidate_reason = "cancelled"
+                        except Exception:
+                            candidate_reason = "upstream_failure"
+                            error_message = "upstream_connect_error"
+                        else:
+                            open_complete = True
+                elif task is response_task:
+                    if task.cancelled():
+                        candidate_reason = candidate_reason or "cancelled"
+                    else:
+                        try:
+                            candidate_reason = candidate_reason or str(task.result())
+                        except asyncio.CancelledError:
+                            candidate_reason = candidate_reason or "cancelled"
+                        except Exception:
+                            candidate_reason = candidate_reason or "send_failed"
+            if candidate_reason is not None:
+                termination_reason = _sanitize_termination_reason(candidate_reason)
+                break
+            if open_complete and response_task is None:
+                lane.opened.set()
+                response_task = asyncio.create_task(pump_response())
+                all_tasks.append(response_task)
+                active_tasks.append(response_task)
+                _log_inbound_cli_lifecycle(
+                    call_id=call_id,
+                    event="upstream_started",
+                    http_version=http_version,
+                )
+        if termination_reason is None:
+            termination_reason = "normal_response"
+        if termination_reason != "normal_response" and error_message is None:
+            error_message = termination_reason
         sniffed.update(lane.sniffed)
     except InboundCursorAgentCliAuthError as exc:
         status_code = exc.status_code
         error_message = exc.reason
+        termination_reason = "auth_failure"
         if not response_started:
             await _send_json_error(
                 send,
                 status_code=exc.status_code,
                 payload=inbound_cli_auth_error_payload(exc),
             )
+    except _InboundCliClientDisconnected:
+        status_code = 499
+        error_message = "client_disconnect"
+        termination_reason = "client_disconnect"
+    except asyncio.CancelledError:
+        error_message = "cancelled"
+        termination_reason = termination_reason or "cancelled"
+        raise
     except CursorConnectError as exc:
         status_code = int(getattr(exc, "status_code", 502) or 502)
         error_message = "upstream_connect_error"
+        termination_reason = termination_reason or "upstream_failure"
         verbose_proxy_logger.warning(
             "cursor_agent_cli_inbound RunSSE connect error: %s",
             exc.message,
@@ -1572,6 +2023,7 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
     except Exception as exc:
         status_code = 502
         error_message = "inbound_proxy_error"
+        termination_reason = termination_reason or "upstream_failure"
         verbose_proxy_logger.warning("cursor_agent_cli_inbound RunSSE proxy error: %s", exc)
         if not response_started:
             await _send_json_error(
@@ -1584,12 +2036,51 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
                 },
             )
     finally:
+        cleanup_cancelled = False
+        cleanup_reason = _sanitize_termination_reason(termination_reason or "unknown")
+        _log_inbound_cli_lifecycle(
+            call_id=call_id,
+            event="cleanup_started",
+            reason=cleanup_reason,
+            http_version=http_version,
+        )
+        current_task = asyncio.current_task()
+        for task in all_tasks:
+            if task is not current_task and not task.done():
+                task.cancel()
         if lane is not None:
             sniffed.update(lane.sniffed)
-            await lane.aclose()
-            await registry.discard(request_id)
+            try:
+                await lane.aclose(reason=cleanup_reason)
+            except asyncio.CancelledError:
+                cleanup_cancelled = True
+                try:
+                    await lane.aclose(reason=cleanup_reason)
+                except asyncio.CancelledError:
+                    pass
+            finally:
+                await registry.discard(request_id, lane)
         elif session is not None:
-            await session.aclose()
+            try:
+                await _bounded_session_close(
+                    session,
+                    _sanitize_termination_reason(termination_reason or "unknown"),
+                )
+            except asyncio.CancelledError:
+                cleanup_cancelled = True
+        try:
+            if all_tasks:
+                await _cancel_and_join_tasks(all_tasks)
+        except asyncio.CancelledError:
+            cleanup_cancelled = True
+        _log_inbound_cli_lifecycle(
+            call_id=call_id,
+            event="cleanup_finished",
+            reason=cleanup_reason,
+            http_version=http_version,
+        )
+        if error_message is None and termination_reason not in {None, "normal_response"}:
+            error_message = _sanitize_termination_reason(termination_reason)
         await _persist_inbound_cli_turn(
             call_id=call_id,
             headers=headers,
@@ -1599,8 +2090,11 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
             status_code=status_code,
             start_time=start_time,
             error=error_message,
+            termination_reason=termination_reason,
             connect_method="RunSSE",
         )
+        if cleanup_cancelled:
+            raise asyncio.CancelledError
 
 
 async def proxy_inbound_cli_bidi_append(
@@ -1611,12 +2105,22 @@ async def proxy_inbound_cli_bidi_append(
     lanes: Optional[_Http1LaneRegistry] = None,
 ) -> None:
     """Unary HTTP/1.1 ``BidiAppend`` that writes onto the matching RunSSE lane."""
+    call_id = str(uuid.uuid4())
     headers = _asgi_headers(scope)
+    http_version = _http_version(scope)
     registry = lanes if lanes is not None else _http1_lanes
+    lane: Optional[_Http1AgentnLane] = None
+    all_tasks: List[asyncio.Task[Any]] = []
+    append_started = False
+    append_completed = False
+    response_started = False
+    termination_reason: Optional[str] = None
     try:
         try:
             require_inbound_cli_bearer(headers)
         except InboundCursorAgentCliAuthError as exc:
+            termination_reason = "auth_failure"
+            response_started = True
             await _send_json_error(
                 send,
                 status_code=exc.status_code,
@@ -1629,6 +2133,8 @@ async def proxy_inbound_cli_bidi_append(
         parsed = parse_bidi_append_request(body, content_type)
         request_id = parsed.get("request_id") or ""
         if not request_id:
+            termination_reason = "invalid_request"
+            response_started = True
             await _send_json_error(
                 send,
                 status_code=400,
@@ -1640,6 +2146,8 @@ async def proxy_inbound_cli_bidi_append(
             return
         lane = await registry.get(request_id)
         if lane is None or lane.closed:
+            termination_reason = "invalid_request"
+            response_started = True
             await _send_json_error(
                 send,
                 status_code=404,
@@ -1649,46 +2157,125 @@ async def proxy_inbound_cli_bidi_append(
                 ),
             )
             return
-        await lane.write_client_message(bytes(parsed.get("client_message") or b""))
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 200,
-                "headers": [
-                    (b"content-type", b"application/proto"),
-                    (b"content-length", b"0"),
-                ],
-            }
+
+        async def monitor_client_disconnect() -> str:
+            while True:
+                message = await receive()
+                if message.get("type") == "http.disconnect":
+                    return "client_disconnect"
+
+        async def append_and_respond() -> None:
+            nonlocal append_started, append_completed, response_started
+            await asyncio.wait_for(lane.opened.wait(), timeout=10.0)
+            client_message = bytes(parsed.get("client_message") or b"")
+            append_started = bool(client_message)
+            await lane.write_client_message(client_message)
+            append_completed = True
+            response_started = True
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [
+                        (b"content-type", b"application/proto"),
+                        (b"content-length", b"0"),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+        disconnect_task = asyncio.create_task(monitor_client_disconnect())
+        append_task = asyncio.create_task(append_and_respond())
+        all_tasks.extend((disconnect_task, append_task))
+        done, _pending = await asyncio.wait(
+            all_tasks,
+            return_when=asyncio.FIRST_COMPLETED,
         )
-        await send({"type": "http.response.body", "body": b"", "more_body": False})
+        if append_task in done:
+            try:
+                await append_task
+            except asyncio.CancelledError:
+                termination_reason = "append_cancelled"
+                raise
+            except Exception:
+                termination_reason = (
+                    "send_failed" if append_completed else "append_write_failed"
+                )
+                raise
+            termination_reason = "normal_response"
+        else:
+            try:
+                termination_reason = str(disconnect_task.result())
+            except asyncio.CancelledError:
+                termination_reason = "append_cancelled"
+                raise
+            except Exception:
+                termination_reason = "receive_failed"
+                raise
+    except _InboundCliClientDisconnected:
+        termination_reason = "client_disconnect"
+    except asyncio.CancelledError:
+        termination_reason = termination_reason or "append_cancelled"
+        raise
     except CursorConnectProtocolError as exc:
-        await _send_json_error(
-            send,
-            status_code=400,
-            payload=inbound_cli_http1_error_payload(
-                reason="invalid_bidi_append",
-                detail=str(exc.message),
-            ),
-        )
+        termination_reason = termination_reason or "invalid_request"
+        if not response_started:
+            response_started = True
+            await _send_json_error(
+                send,
+                status_code=400,
+                payload=inbound_cli_http1_error_payload(
+                    reason="invalid_bidi_append",
+                    detail=str(exc.message),
+                ),
+            )
     except CursorConnectError as exc:
-        await _send_json_error(
-            send,
-            status_code=int(getattr(exc, "status_code", 502) or 502),
-            payload=inbound_cli_http1_error_payload(
-                reason="bidi_append_upstream",
-                detail="HTTP/1.1 BidiAppend failed to write the Agent CLI lane.",
-            ),
+        termination_reason = termination_reason or "append_write_failed"
+        if not response_started:
+            response_started = True
+            await _send_json_error(
+                send,
+                status_code=int(getattr(exc, "status_code", 502) or 502),
+                payload=inbound_cli_http1_error_payload(
+                    reason="bidi_append_upstream",
+                    detail="HTTP/1.1 BidiAppend failed to write the Agent CLI lane.",
+                ),
+            )
+    except Exception:
+        termination_reason = termination_reason or "receive_failed"
+        if not response_started:
+            response_started = True
+            await _send_json_error(
+                send,
+                status_code=502,
+                payload=inbound_cli_http1_error_payload(
+                    reason="inbound_proxy_error",
+                    detail="Cursor Agent CLI inbound HTTP/1.1 BidiAppend proxy failed.",
+                ),
+            )
+    finally:
+        cleanup_cancelled = False
+        cleanup_reason = _sanitize_termination_reason(termination_reason or "unknown")
+        for task in all_tasks:
+            if not task.done():
+                task.cancel()
+        if lane is not None and append_started and cleanup_reason != "normal_response":
+            try:
+                await lane.aclose(reason=cleanup_reason)
+            except asyncio.CancelledError:
+                cleanup_cancelled = True
+        try:
+            await _cancel_and_join_tasks(all_tasks)
+        except asyncio.CancelledError:
+            cleanup_cancelled = True
+        _log_inbound_cli_lifecycle(
+            call_id=call_id,
+            event="append_finished",
+            reason=cleanup_reason,
+            http_version=http_version,
         )
-    except Exception as exc:
-        verbose_proxy_logger.warning("cursor_agent_cli_inbound BidiAppend proxy error: %s", exc)
-        await _send_json_error(
-            send,
-            status_code=502,
-            payload=inbound_cli_http1_error_payload(
-                reason="inbound_proxy_error",
-                detail="Cursor Agent CLI inbound HTTP/1.1 BidiAppend proxy failed.",
-            ),
-        )
+        if cleanup_cancelled:
+            raise asyncio.CancelledError
 
 
 class CursorAgentCliInboundMiddleware:
