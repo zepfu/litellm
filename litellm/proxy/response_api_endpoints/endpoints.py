@@ -11,16 +11,160 @@ from starlette.websockets import WebSocket
 from litellm._logging import verbose_proxy_logger
 from litellm.integrations.custom_guardrail import ModifyResponseException
 from litellm.proxy._types import *
+from litellm.proxy.aawm_route_logging import record_aawm_route_rollup_turn
 from litellm.proxy.auth.user_api_key_auth import (
     UserAPIKeyAuth,
     user_api_key_auth,
     user_api_key_auth_websocket,
 )
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+from litellm.proxy.pass_through_endpoints.muse_code_gateway import (
+    apply_muse_code_responses_ingress,
+    log_muse_code_responses_failure,
+    muse_code_responses_data_generator,
+    muse_code_session_id_from_request,
+)
 from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
 from litellm.types.responses.main import DeleteResponseResult
 
 router = APIRouter()
+
+
+def _log_muse_code_provider_exception(
+    *,
+    request: Request,
+    data: dict,
+    requested_model: str,
+    session_id: str,
+    exc: Exception,
+) -> None:
+    status_code = getattr(exc, "status_code", None) or getattr(exc, "code", 500)
+    try:
+        status_code = int(status_code)
+    except (TypeError, ValueError):
+        status_code = 500
+    log_muse_code_responses_failure(
+        request=request,
+        model_id=requested_model or str(data.get("model") or ""),
+        session_id=session_id,
+        status_code=status_code,
+        detail=getattr(exc, "message", str(exc)),
+        failure_kind="muse_code_responses_provider_error",
+    )
+
+
+def _drop_codex_unsupported_hosted_tools_if_configured(data: dict) -> dict:
+    from litellm.proxy.pass_through_endpoints.aawm_request_policy.codex_tool_policy import (
+        is_codex_tool_policy_runtime_configured,
+    )
+
+    if not is_codex_tool_policy_runtime_configured():
+        return data
+    from litellm.proxy.pass_through_endpoints.aawm_request_policy.codex_tool_policy import (
+        _drop_unsupported_codex_hosted_tools_from_request_body,
+    )
+
+    updated, _removed = _drop_unsupported_codex_hosted_tools_from_request_body(data)
+    return updated
+
+
+def _muse_code_select_data_generator(inner_generator):
+    def muse_code_select_data_generator(response, user_api_key_dict, request_data):
+        return muse_code_responses_data_generator(
+            response=response,
+            user_api_key_dict=user_api_key_dict,
+            request_data=request_data,
+            inner_generator=inner_generator,
+        )
+
+    return muse_code_select_data_generator
+
+
+def _maybe_start_responses_polling(
+    *,
+    data: dict,
+    llm_router,
+    redis_usage_cache,
+    polling_cache_ttl,
+    polling_via_cache_enabled,
+    native_background_mode,
+):
+    from litellm.proxy.response_polling.polling_handler import (
+        should_use_polling_for_request,
+    )
+
+    if not should_use_polling_for_request(
+        background_mode=data.get("background", False),
+        polling_via_cache_enabled=polling_via_cache_enabled,
+        redis_cache=redis_usage_cache,
+        model=data.get("model", ""),
+        llm_router=llm_router,
+        native_background_mode=native_background_mode,
+    ):
+        return None
+
+    from litellm.proxy.response_polling.background_streaming import (
+        background_streaming_task,
+    )
+    from litellm.proxy.response_polling.polling_handler import ResponsePollingHandler
+
+    verbose_proxy_logger.info(
+        f"Starting background response with polling for model={data.get('model')}"
+    )
+    polling_handler = ResponsePollingHandler(
+        redis_cache=redis_usage_cache,
+        ttl=polling_cache_ttl,
+    )
+    polling_id = ResponsePollingHandler.generate_polling_id()
+    return polling_handler, polling_id, background_streaming_task
+
+
+async def _start_responses_polling_task(
+    *,
+    polling_plan,
+    data: dict,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    general_settings,
+    llm_router,
+    proxy_config,
+    proxy_logging_obj,
+    select_data_generator,
+    user_model,
+    user_temperature,
+    user_request_timeout,
+    user_max_tokens,
+    user_api_base,
+    version,
+):
+    polling_handler, polling_id, background_streaming_task = polling_plan
+    initial_state = await polling_handler.create_initial_state(
+        polling_id=polling_id,
+        request_data=data,
+    )
+    asyncio.create_task(
+        background_streaming_task(
+            polling_id=polling_id,
+            data=data.copy(),
+            polling_handler=polling_handler,
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            general_settings=general_settings,
+            llm_router=llm_router,
+            proxy_config=proxy_config,
+            proxy_logging_obj=proxy_logging_obj,
+            select_data_generator=select_data_generator,
+            user_model=user_model,
+            user_temperature=user_temperature,
+            user_request_timeout=user_request_timeout,
+            user_max_tokens=user_max_tokens,
+            user_api_base=user_api_base,
+            version=version,
+        )
+    )
+    return initial_state
 
 
 @router.post(
@@ -91,89 +235,55 @@ async def responses_api(
     )
 
     data = await _read_request_body(request=request)
-    from litellm.proxy.pass_through_endpoints.aawm_request_policy.codex_tool_policy import (
-        is_codex_tool_policy_runtime_configured,
+    muse_code_context = apply_muse_code_responses_ingress(request, data)
+    muse_code_request, data, muse_code_route_kwargs, muse_code_early_response = (
+        muse_code_context
+    )
+    if muse_code_early_response is not None:
+        return muse_code_early_response
+    muse_code_requested_model = (
+        data.get("model") if isinstance(data.get("model"), str) else ""
+    )
+    muse_code_session_id = muse_code_session_id_from_request(request)
+
+    data = _drop_codex_unsupported_hosted_tools_if_configured(data)
+
+    polling_plan = None
+    if not muse_code_request:
+        polling_plan = _maybe_start_responses_polling(
+            data=data,
+            llm_router=llm_router,
+            redis_usage_cache=redis_usage_cache,
+            polling_cache_ttl=polling_cache_ttl,
+            polling_via_cache_enabled=polling_via_cache_enabled,
+            native_background_mode=native_background_mode,
+        )
+    if polling_plan is not None:
+        return await _start_responses_polling_task(
+            polling_plan=polling_plan,
+            data=data,
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            general_settings=general_settings,
+            llm_router=llm_router,
+            proxy_config=proxy_config,
+            proxy_logging_obj=proxy_logging_obj,
+            select_data_generator=select_data_generator,
+            user_model=user_model,
+            user_temperature=user_temperature,
+            user_request_timeout=user_request_timeout,
+            user_max_tokens=user_max_tokens,
+            user_api_base=user_api_base,
+            version=version,
+        )
+
+    selected_data_generator = (
+        _muse_code_select_data_generator(select_data_generator)
+        if muse_code_request
+        else select_data_generator
     )
 
-    if is_codex_tool_policy_runtime_configured():
-        from litellm.proxy.pass_through_endpoints.aawm_request_policy.codex_tool_policy import (
-            _drop_unsupported_codex_hosted_tools_from_request_body,
-        )
-
-        data, _codex_unsupported_hosted_tools = (
-            _drop_unsupported_codex_hosted_tools_from_request_body(data)
-        )
-
-    # Check if polling via cache should be used for this request
-    from litellm.proxy.response_polling.polling_handler import (
-        should_use_polling_for_request,
-    )
-
-    should_use_polling = should_use_polling_for_request(
-        background_mode=data.get("background", False),
-        polling_via_cache_enabled=polling_via_cache_enabled,
-        redis_cache=redis_usage_cache,
-        model=data.get("model", ""),
-        llm_router=llm_router,
-        native_background_mode=native_background_mode,
-    )
-
-    # If polling is enabled, use polling mode
-    if should_use_polling:
-        from litellm.proxy.response_polling.background_streaming import (
-            background_streaming_task,
-        )
-        from litellm.proxy.response_polling.polling_handler import (
-            ResponsePollingHandler,
-        )
-
-        verbose_proxy_logger.info(
-            f"Starting background response with polling for model={data.get('model')}"
-        )
-
-        # Initialize polling handler with configured TTL (from global config)
-        polling_handler = ResponsePollingHandler(
-            redis_cache=redis_usage_cache,
-            ttl=polling_cache_ttl,  # Global var set at startup
-        )
-
-        # Generate polling ID
-        polling_id = ResponsePollingHandler.generate_polling_id()
-
-        # Create initial state in Redis
-        initial_state = await polling_handler.create_initial_state(
-            polling_id=polling_id,
-            request_data=data,
-        )
-
-        # Start background task to stream and update cache
-        asyncio.create_task(
-            background_streaming_task(
-                polling_id=polling_id,
-                data=data.copy(),
-                polling_handler=polling_handler,
-                request=request,
-                fastapi_response=fastapi_response,
-                user_api_key_dict=user_api_key_dict,
-                general_settings=general_settings,
-                llm_router=llm_router,
-                proxy_config=proxy_config,
-                proxy_logging_obj=proxy_logging_obj,
-                select_data_generator=select_data_generator,
-                user_model=user_model,
-                user_temperature=user_temperature,
-                user_request_timeout=user_request_timeout,
-                user_max_tokens=user_max_tokens,
-                user_api_base=user_api_base,
-                version=version,
-            )
-        )
-
-        # Return OpenAI Response object format (initial state)
-        # https://platform.openai.com/docs/api-reference/responses/object
-        return initial_state
-
-    # Normal response flow
     processor = ProxyBaseLLMRequestProcessing(data=data)
     try:
         response = await processor.base_process_llm_request(
@@ -185,7 +295,7 @@ async def responses_api(
             llm_router=llm_router,
             general_settings=general_settings,
             proxy_config=proxy_config,
-            select_data_generator=select_data_generator,
+            select_data_generator=selected_data_generator,
             model=None,
             user_model=user_model,
             user_temperature=user_temperature,
@@ -238,6 +348,8 @@ async def responses_api(
                             f"Failed to store background response in managed objects table: {str(e)}"
                         )
 
+        if muse_code_route_kwargs is not None:
+            record_aawm_route_rollup_turn(muse_code_route_kwargs)
         return response
     except ModifyResponseException as e:
         # Guardrail passthrough: return violation message in Responses API format (200)
@@ -260,6 +372,14 @@ async def responses_api(
         )
         return response_obj
     except Exception as e:
+        if muse_code_request:
+            _log_muse_code_provider_exception(
+                request=request,
+                data=data,
+                requested_model=muse_code_requested_model,
+                session_id=muse_code_session_id,
+                exc=e,
+            )
         raise await processor._handle_llm_api_exception(
             e=e,
             user_api_key_dict=user_api_key_dict,
