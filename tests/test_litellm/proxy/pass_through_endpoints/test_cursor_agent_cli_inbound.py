@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from litellm.llms.cursor_agent.connect import (
+    CONNECT_COMPRESSED_FLAG,
     _ProtoConnectFrameDecoder,
     _encode_proto_message_field,
     _encode_proto_varint_field,
@@ -393,6 +394,46 @@ def test_request_context_exec_replies_does_not_duplicate_split_heartbeat() -> No
     assert bytes(decoder.buffer) == b""
 
 
+def test_request_context_exec_replies_forwards_gzip_uncompressed() -> None:
+    """Agentn gzip Connect frames must reach the CLI without compression bit 0.
+
+    The stock CLI errors with ``received compressed envelope, but do not know
+    how to decompress`` when inbound forwards gzip envelopes. The shipped
+    helper must decode then re-encode uncompressed.
+    """
+    heartbeat = _heartbeat_chunk()
+    payload = decode_connect_proto_frames(heartbeat)[0].payload
+    compressed = encode_connect_proto_frame(payload, compress=True)
+    assert compressed[0] & CONNECT_COMPRESSED_FLAG
+    assert compressed != heartbeat
+    replies, forwarded = _request_context_exec_replies(
+        compressed,
+        _ProtoConnectFrameDecoder(),
+    )
+    assert replies == []
+    assert forwarded[0] & CONNECT_COMPRESSED_FLAG == 0
+    frames = decode_connect_proto_frames(forwarded)
+    assert len(frames) == 1
+    assert frames[0].payload == payload
+    assert frames[0].flags & CONNECT_COMPRESSED_FLAG == 0
+    assert forwarded == heartbeat
+
+
+def test_request_context_exec_replies_answers_gzip_query_without_forward() -> None:
+    query = _request_context_chunk()
+    payload = decode_connect_proto_frames(query)[0].payload
+    compressed = encode_connect_proto_frame(payload, compress=True)
+    assert compressed[0] & CONNECT_COMPRESSED_FLAG
+    replies, forwarded = _request_context_exec_replies(
+        compressed,
+        _ProtoConnectFrameDecoder(),
+    )
+    assert forwarded == b""
+    assert len(replies) == 2
+    for reply in replies:
+        assert reply[0] & CONNECT_COMPRESSED_FLAG == 0
+
+
 def _decode_top_fields(payload: bytes) -> List[int]:
     from litellm.llms.cursor_agent.connect import _decode_proto_fields
 
@@ -701,6 +742,26 @@ def test_upstream_http2_headers_omit_cursor_streaming() -> None:
     assert ("authorization", "Bearer cursor-access-token") in forwarded
     assert "x-cursor-streaming" not in names
     assert ("x-request-id", "req-http2") in forwarded
+
+
+def test_upstream_http2_headers_force_identity_encoding() -> None:
+    forwarded = _upstream_request_headers(
+        {
+            "authorization": "Bearer cursor-access-token",
+            "content-type": "application/connect+proto",
+            "accept-encoding": "gzip, deflate, br",
+            "connect-accept-encoding": "gzip",
+            "grpc-accept-encoding": "gzip",
+        },
+        "cursor-access-token",
+    )
+    names = {name for name, _value in forwarded}
+    assert ("accept-encoding", "identity") in forwarded
+    assert "connect-accept-encoding" not in names
+    assert "grpc-accept-encoding" not in names
+    assert "grpc-encoding" not in names
+    encodings = [value for name, value in forwarded if name == "accept-encoding"]
+    assert encodings == ["identity"]
 
 
 def test_bidi_append_round_trip_binary_and_hex() -> None:

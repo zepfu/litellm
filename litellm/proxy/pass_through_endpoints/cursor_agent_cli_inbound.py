@@ -32,9 +32,11 @@ from litellm.llms.cursor_agent.constants import (
     CURSOR_CLI_KEY_ENV,
 )
 from litellm.llms.cursor_agent.connect import (
+    CONNECT_COMPRESSED_FLAG,
     CursorAgentConnectClient,
     CursorConnectError,
     CursorConnectProtocolError,
+    CursorConnectProtoFrame,
     _ProtoConnectFrameDecoder,
     _decode_proto_fields,
     _decode_proto_string,
@@ -87,6 +89,13 @@ _FORWARDED_REQUEST_HEADERS = {
     "x-cursor-streaming",
     "x-ghost-mode",
     "x-request-id",
+}
+_STRIP_UPSTREAM_COMPRESSION_HEADERS = {
+    "accept-encoding",
+    "connect-accept-encoding",
+    "content-encoding",
+    "grpc-encoding",
+    "grpc-accept-encoding",
 }
 _MAX_LOGGED_AGENTN_DATA_CHUNKS = 8
 
@@ -156,6 +165,20 @@ def _is_request_context_exec_frame(payload: bytes) -> bool:
     return isinstance(_proto_last_field(exec_fields, 10, wire_type=2), bytes)
 
 
+def _cli_connect_envelope(frame: CursorConnectProtoFrame) -> bytes:
+    """Re-encode one agentn envelope the way the CLI can consume it.
+
+    Agentn may set Connect compression bit 0. The stock CLI errors with
+    ``received compressed envelope, but do not know how to decompress``
+    unless gzip was negotiated. The decoder already gunzips ``payload``;
+    never forward the compressed flag or the raw gzip bytes.
+    """
+    flags = frame.flags & ~CONNECT_COMPRESSED_FLAG
+    if frame.is_end_stream:
+        return bytes((flags,)) + len(frame.payload).to_bytes(4, "big") + frame.payload
+    return encode_connect_proto_frame(frame.payload, flags=flags)
+
+
 def _request_context_exec_replies(
     chunk: bytes,
     decoder: _ProtoConnectFrameDecoder,
@@ -169,16 +192,19 @@ def _request_context_exec_replies(
     try:
         frames = decoder.feed(chunk)
     except Exception:
-        return [], chunk
+        # Raw DATA may include compressed Connect envelopes. Forwarding them
+        # poisons the CLI (``received compressed envelope``). Incomplete
+        # envelopes stay in the decoder; drop only this undecodable chunk.
+        verbose_proxy_logger.warning(
+            "cursor_agent_cli_inbound dropping undecodable agentn chunk bytes=%s",
+            len(chunk),
+        )
+        return [], b""
     replies: List[bytes] = []
     forwarded: List[bytes] = []
     for frame in frames:
         if frame.is_end_stream:
-            forwarded.append(
-                bytes((frame.flags,))
-                + len(frame.payload).to_bytes(4, "big")
-                + frame.payload
-            )
+            forwarded.append(_cli_connect_envelope(frame))
             continue
         if _is_request_context_exec_frame(frame.payload):
             fields = _decode_proto_fields(frame.payload)
@@ -188,7 +214,7 @@ def _request_context_exec_replies(
             for payload in _encode_request_context_exec_response(exec_fields):
                 replies.append(encode_connect_proto_frame(payload))
             continue
-        forwarded.append(encode_connect_proto_frame(frame.payload, flags=frame.flags))
+        forwarded.append(_cli_connect_envelope(frame))
     # Incomplete Connect envelopes stay in the decoder until the next DATA
     # chunk completes them. Forwarding leftover bytes here duplicates the
     # envelope when the completed frame is later re-encoded (a 9-byte
@@ -1003,11 +1029,14 @@ def _upstream_request_headers(
             _get_header(headers, "connect-protocol-version") or "1",
         ),
         ("user-agent", _get_header(headers, "user-agent") or cursor_agent_user_agent()),
+        ("accept-encoding", "identity"),
     ]
     seen = {name for name, _value in forwarded}
     for key, value in headers.items():
         lowered = str(key).lower()
         if lowered in seen or lowered in _HOP_BY_HOP or lowered == "authorization":
+            continue
+        if lowered in _STRIP_UPSTREAM_COMPRESSION_HEADERS:
             continue
         if lowered in _FORWARDED_REQUEST_HEADERS or lowered.startswith("x-cursor-"):
             if lowered in {"x-cursor-checksum", "x-cursor-streaming"}:
