@@ -6085,9 +6085,11 @@ def observe_native_chatgpt_history_from_oracle_browser(
         raise OracleBrowserBoundaryUnavailable(
             "Native ChatGPT history requires private browser lifecycle ownership."
         )
-    if expected_account_hash != CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH:
+    if not isinstance(expected_account_hash, str) or not re.fullmatch(
+        r"[0-9a-f]{12}", expected_account_hash
+    ):
         raise OracleBrowserBoundaryUnavailable(
-            "Native ChatGPT history requires the pinned inventory account hash."
+            "Native ChatGPT history requires a canonical inventory account hash."
         )
     if not isinstance(timeout_seconds, (int, float)) or isinstance(
         timeout_seconds,
