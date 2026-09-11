@@ -301,7 +301,12 @@ def wrap_encrypted_content_with_provenance(
 
 
 _LITELLM_ENC_PREFIX = "litellm_enc:"
-_FUNCTION_CALL_OUTPUT_ITEM_TYPE = "function_call_output"
+_FUNCTION_CALL_OUTPUT_ITEM_TYPES = {
+    "function_call_output",
+    # Codex/tool adapters may use this wire spelling before the canonical
+    # Responses body compiler normalizes it.
+    "custom_tool_call_output",
+}
 _NESTED_ENCRYPTED_CONTENT_PART_TYPE = "encrypted_content"
 
 
@@ -390,7 +395,7 @@ def _encrypted_function_output_blob_present(value: Any) -> bool:
 
 def _item_has_encrypted_function_output(item: Any) -> bool:
     if isinstance(item, MutableMapping) or isinstance(item, Mapping):
-        if item.get("type") != _FUNCTION_CALL_OUTPUT_ITEM_TYPE:
+        if item.get("type") not in _FUNCTION_CALL_OUTPUT_ITEM_TYPES:
             return False
         if _encrypted_function_output_blob_present(item.get("encrypted_content")):
             return True
@@ -399,7 +404,7 @@ def _item_has_encrypted_function_output(item: Any) -> bool:
         if isinstance(output, str):
             return False
         return _encrypted_function_output_blob_present(output)
-    if getattr(item, "type", None) != _FUNCTION_CALL_OUTPUT_ITEM_TYPE:
+    if getattr(item, "type", None) not in _FUNCTION_CALL_OUTPUT_ITEM_TYPES:
         return False
     if _encrypted_function_output_blob_present(
         getattr(item, "encrypted_content", None)
