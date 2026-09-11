@@ -216,12 +216,13 @@ def _consume_task_exception(task: "asyncio.Task[Any]") -> None:
 
 
 async def _bounded_session_close(session: Any, reason: str) -> bool:
-    async def _close() -> None:
+    async def _close() -> bool:
         try:
             close_result = session.aclose(reason=reason)
         except TypeError:
             close_result = session.aclose()
-        await close_result
+        result = await close_result
+        return result is not False
 
     return await _await_bounded_task(asyncio.create_task(_close()))
 
@@ -1363,10 +1364,12 @@ class _AgentnH2Session:
             pass
         if read_task is not None and read_task is not current_task and not read_task.done():
             read_task.cancel()
-            cleanup_ok = await _await_bounded_task(read_task) and cleanup_ok
+            read_ok = await _await_bounded_task(read_task)
+            cleanup_ok = (read_ok or read_task.cancelled()) and cleanup_ok
         if flush_task is not None and flush_task is not current_task and not flush_task.done():
             flush_task.cancel()
-            cleanup_ok = await _await_bounded_task(flush_task) and cleanup_ok
+            flush_ok = await _await_bounded_task(flush_task)
+            cleanup_ok = (flush_ok or flush_task.cancelled()) and cleanup_ok
         if writer is None:
             return cleanup_ok
         try:
@@ -1524,6 +1527,7 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
     sniffed: Dict[str, str] = {}
     sniff_buffer = bytearray()
     status_code = 500
+    error_message: Optional[str] = None
     termination_reason: Optional[str] = None
     session: Optional[_AgentnH2Session] = None
     response_started = False
