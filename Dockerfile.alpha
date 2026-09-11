@@ -23,4 +23,4 @@ ENV PYTHONPATH=/app \
 
 EXPOSE 4011
 
-CMD ["watchfiles", "litellm --config /app/litellm-dev-config.yaml --port 4011 --run_hypercorn", "/app/litellm", "/app/enterprise", "/app/litellm-dev-config.yaml", "/app/model_prices_and_context_window.json", "/app/context-replacement"]
+CMD ["watchfiles", "litellm --config /app/litellm-alpha-config.yaml --port 4011 --run_hypercorn", "/app/litellm", "/app/enterprise", "/app/litellm-alpha-config.yaml", "/app/model_prices_and_context_window.json", "/app/context-replacement"]
