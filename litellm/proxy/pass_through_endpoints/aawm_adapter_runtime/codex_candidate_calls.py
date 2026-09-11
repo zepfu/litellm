@@ -1899,7 +1899,7 @@ def _cursor_message_input_item(
             or any(
                 not isinstance(part, dict)
                 or set(part) != {"type", "text"}
-                or part.get("type") not in {"input_text", "text"}
+                or part.get("type") not in ("input_text", "text")
                 or not isinstance(part.get("text"), str)
                 for part in content
             )
