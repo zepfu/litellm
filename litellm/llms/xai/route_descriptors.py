@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from functools import lru_cache
+from importlib.resources import files
 from types import MappingProxyType
-from typing import Any, Literal, Mapping, Optional
+from typing import Any, Iterable, Literal, Mapping, Optional
 from urllib.parse import urlsplit
 
 import httpx
@@ -156,19 +159,37 @@ def _native_descriptor(
     )
 
 
-def _get_xai_model_capabilities(model: str) -> frozenset[str]:
-    """Read xAI model capabilities from the current canonical model metadata."""
+@lru_cache(maxsize=1)
+def _load_bundled_xai_model_cost_map() -> Mapping[str, Any]:
+    """Load packaged model metadata when the live cost map is a stripped subset."""
 
     try:
-        from litellm.utils import get_model_info
-
-        model_info = get_model_info(
-            model=model,
-            custom_llm_provider="xai",
+        loaded = json.loads(
+            files("litellm")
+            .joinpath("bundled_model_prices_and_context_window_fallback.json")
+            .read_text(encoding="utf-8")
         )
     except Exception:
-        return frozenset()
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
 
+
+def _xai_model_info_candidate_keys(model: str) -> tuple[str, ...]:
+    name = model.strip()
+    if not name:
+        return ()
+    split_name = name.split("/", 1)[1] if "/" in name else name
+    candidates = (name, f"xai/{split_name}", split_name)
+    unique: list[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in unique:
+            unique.append(candidate)
+    return tuple(unique)
+
+
+def _capabilities_from_model_info(model_info: Any) -> frozenset[str]:
+    if not isinstance(model_info, Mapping):
+        return frozenset()
     provider_specific_entry = model_info.get("provider_specific_entry")
     if not isinstance(provider_specific_entry, Mapping):
         return frozenset()
@@ -183,6 +204,52 @@ def _get_xai_model_capabilities(model: str) -> frozenset[str]:
         for capability in raw_capabilities
         if str(capability).strip()
     )
+
+
+def _iter_xai_model_info_sources(model: str) -> Iterable[Any]:
+    try:
+        from litellm.utils import get_model_info
+
+        yield get_model_info(
+            model=model,
+            custom_llm_provider="xai",
+        )
+    except Exception:
+        pass
+
+    sources: list[Any] = []
+    try:
+        import litellm
+
+        live_cost = getattr(litellm, "model_cost", None)
+        if isinstance(live_cost, Mapping):
+            sources.append(live_cost)
+    except Exception:
+        pass
+    sources.append(_load_bundled_xai_model_cost_map())
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for key in _xai_model_info_candidate_keys(model):
+            yield source.get(key)
+
+
+def _get_xai_model_capabilities(model: str) -> frozenset[str]:
+    """Read xAI capabilities from live metadata, then the bundled catalog.
+
+    The fetched GitHub cost map is a stripped subset and often omits
+    ``provider_specific_entry``. Rewrite-type policy already falls back to
+    the packaged catalog; history preservation must do the same or grok-4.6
+    flattens ``function_call`` items on `/grok/v1`.
+    """
+
+    if not isinstance(model, str) or not model.strip():
+        return frozenset()
+    for model_info in _iter_xai_model_info_sources(model):
+        capabilities = _capabilities_from_model_info(model_info)
+        if capabilities:
+            return capabilities
+    return frozenset()
 
 
 OA_XAI_ROUTE_DESCRIPTORS: Mapping[str, XAIRouteDescriptor] = MappingProxyType(

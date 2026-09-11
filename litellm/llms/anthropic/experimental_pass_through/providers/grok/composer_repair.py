@@ -231,8 +231,6 @@ def repair_literal_tool_calls_in_text(
     *,
     advertised_tools: AdvertisedTools,
 ) -> tuple[Optional[str], list[Payload]]:
-    if _LITERAL_CONTEXT_NOTE_LINE_RE.search(text):
-        return None, []
     blocks = parse_literal_tool_label_blocks(runtime, text)
     if not blocks:
         return None, []
@@ -325,6 +323,23 @@ def response_body_has_literal_tool_label_blocks(
     return False
 
 
+def response_body_has_structured_tool_calls(response_body: Payload) -> bool:
+    """True when the response already has structured function/tool calls."""
+
+    output = response_body.get("output")
+    if not isinstance(output, list):
+        return False
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type in {"function_call", "custom_tool_call", "mcp_call"}:
+            return True
+        if item.get("tool_calls") or item.get("function_call"):
+            return True
+    return False
+
+
 def repair_literal_tool_calls_in_message_item(
     runtime: Runtime,
     item: Payload,
@@ -346,9 +361,6 @@ def repair_literal_tool_calls_in_message_item(
         and part.get("type") in {"text", "output_text"}
         and isinstance(part.get("text"), str)
     )
-    if _LITERAL_CONTEXT_NOTE_LINE_RE.search(message_text):
-        return None
-
     message_items: list[Payload] = []
     leftover_text_parts: list[str] = []
     message_has_literal_blocks = False
@@ -402,6 +414,8 @@ def try_repair_literal_tool_call_response_body(
     *,
     request_body: Optional[Payload],
 ) -> Optional[Payload]:
+    if response_body_has_structured_tool_calls(response_body):
+        return None
     if not (
         runtime.is_malformed_tool_call_text_output(response_body)
         or response_body_has_literal_tool_label_blocks(runtime, response_body)
@@ -459,6 +473,7 @@ __all__ = [
     "repair_literal_tool_calls_in_message_item",
     "repair_literal_tool_calls_in_text",
     "response_body_has_literal_tool_label_blocks",
+    "response_body_has_structured_tool_calls",
     "sanitize_literal_tool_arguments",
     "try_repair_literal_tool_call_response_body",
 ]

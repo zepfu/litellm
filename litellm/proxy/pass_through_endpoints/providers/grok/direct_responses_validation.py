@@ -283,6 +283,8 @@ def _repair_or_reject_response_body(
     )
     if isinstance(repaired_body, dict):
         return repaired_body
+    if composer_repair.response_body_has_structured_tool_calls(response_body):
+        return None
     if host._is_codex_auto_agent_malformed_tool_call_text_output(
         response_body
     ) or composer_repair.response_body_has_literal_tool_label_blocks(

@@ -151,114 +151,125 @@ def test_should_preserve_unsupported_input_rewrite_delegate_parity(
         assert rewritten_items[0]["call_id"] == "call_1"
 
 
-def test_grok_history_rewrite_dialect_is_detected_but_not_repaired() -> None:
-    """LiteLLM flattens native function_call history into Tool label text.
+def _direct_grok_passthrough_request(*, model: str) -> Any:
+    from unittest.mock import MagicMock
 
-    Today's Grok Build dumps used that same dialect as assistant output.
-    Repair refuses any block that still has the Context note prefix, so the
-    text stays native instead of becoming a structured function_call.
-    """
-    from litellm.integrations.aawm_agent_quality_rules import (
-        is_malformed_grok_literal_tool_label_transcript_text,
-    )
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.request_build import (
-        _repair_grok_composer_literal_tool_calls_in_text,
-    )
-    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
-        _is_codex_auto_agent_malformed_tool_call_text_output,
-        _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body,
-    )
+    from fastapi import Request
 
-    rewritten = normalization.format_function_call_input_message(
-        {
-            "name": "read_file",
-            "call_id": "call-c9d1aa12-e8c4-4c32-8e16-e7e3c8c9d0e4-0",
-            "arguments": {"target_file": "/tmp/x.py", "limit": 20},
-        }
-    )
-    assert rewritten.splitlines()[0] == (
-        "[Context note - prior assistant step; not an executable tool invocation]"
-    )
-    assert "Tool label: read_file" in rewritten
-    assert "Correlation ref: call-c9d1aa12-e8c4-4c32-8e16-e7e3c8c9d0e4-0" in rewritten
-    assert "Input payload:" in rewritten
-
-    echoed = (
-        "HEAD still has the dummy 5-byte Connect envelope. I'll inspect the file.\n"
-        + rewritten
-    )
-    advertised = {
-        "read_file": {
-            "type": "object",
-            "properties": {
-                "target_file": {"type": "string"},
-                "limit": {"type": "integer"},
-            },
-            "additionalProperties": True,
-        }
+    request = MagicMock(spec=Request)
+    request.headers = {
+        "content-type": "application/json",
+        "x-grok-model-override": model,
+        "x-grok-session-id": "session_xai046",
     }
-    leftover, items = _repair_grok_composer_literal_tool_calls_in_text(
-        echoed,
-        advertised_tools=advertised,
-    )
-    assert leftover is None
-    assert items == []
-    assert is_malformed_grok_literal_tool_label_transcript_text(echoed) is True
+    request.query_params = {}
+    request.scope = {}
+    return request
 
-    without_note = "\n".join(
-        line
-        for line in echoed.splitlines()
-        if "Context note" not in line
-    )
-    leftover_ok, items_ok = _repair_grok_composer_literal_tool_calls_in_text(
-        without_note,
-        advertised_tools=advertised,
-    )
-    assert items_ok and items_ok[0]["name"] == "read_file"
-    assert leftover_ok is not None
-    assert "Tool label:" not in leftover_ok
 
-    response_body = {
-        "id": "resp_today_dump",
-        "object": "response",
-        "status": "completed",
-        "model": "grok-4.6",
-        "output": [
+def _typed_tool_history_request_body(*, model: str) -> dict[str, Any]:
+    return {
+        "model": model,
+        "input": [
+            {"type": "message", "role": "user", "content": "continue"},
             {
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": echoed}],
-            }
-        ],
-    }
-    request_body = {
-        "model": "grok-4.6",
-        "tools": [
-            {
-                "type": "function",
+                "type": "function_call",
                 "name": "read_file",
-                "parameters": advertised["read_file"],
-            }
+                "call_id": "call-c9d1aa12-e8c4-4c32-8e16-e7e3c8c9d0e4-0",
+                "arguments": {"target_file": "/tmp/x.py", "limit": 20},
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-c9d1aa12-e8c4-4c32-8e16-e7e3c8c9d0e4-0",
+                "output": {"status": "ok"},
+            },
         ],
     }
-    assert _is_codex_auto_agent_malformed_tool_call_text_output(response_body) is True
-    assert (
-        _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body(
-            response_body,
-            request_body=request_body,
-        )
-        is None
+
+
+def test_grok_history_preserves_typed_tool_items_for_grok_46() -> None:
+    """Direct /grok/v1 request-prep keeps grok-4.6 typed tool history.
+
+    Commit 79b0abb0c3 asserted flattening into Context-note / Tool label
+    messages. That characterization is inverted: the shipped Grok CLI
+    chat-proxy path must leave function_call / function_call_output items
+    as those types and must not synthesize the rewrite dialect into input.
+    Residual model-authored Context-note dumps are XAI-047.
+    """
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _prepare_grok_request_body_for_passthrough,
     )
 
+    prepared = _prepare_grok_request_body_for_passthrough(
+        request=_direct_grok_passthrough_request(model="grok-4.6"),
+        request_body=_typed_tool_history_request_body(model="grok-4.6"),
+    )
+    input_items = prepared["input"]
+    assert [item.get("type") for item in input_items] == [
+        "message",
+        "function_call",
+        "function_call_output",
+    ]
+    assert input_items[1]["name"] == "read_file"
+    assert input_items[1]["call_id"] == (
+        "call-c9d1aa12-e8c4-4c32-8e16-e7e3c8c9d0e4-0"
+    )
+    assert input_items[2]["call_id"] == (
+        "call-c9d1aa12-e8c4-4c32-8e16-e7e3c8c9d0e4-0"
+    )
+    rendered = json.dumps(prepared["input"])
+    assert (
+        "[Context note - prior assistant step; not an executable tool invocation]"
+        not in rendered
+    )
+    assert "Tool label:" not in rendered
+    assert "Correlation ref:" not in rendered
+    assert "Input payload:" not in rendered
 
-def test_grok_4_6_model_info_rewrites_function_call_history() -> None:
+
+def test_grok_model_capability_preserves_grok_46_and_flattens_composer_history() -> None:
+    """grok-4.6 CLI passthrough preserves history; composer still flattens.
+
+    Commit 79b0abb0c3 treated rewrite_input_item_types as the product
+    contract. Invert: native_responses_tool_history on the Grok CLI
+    chat-proxy path must not flatten grok-4.6 history even while the
+    catalog still lists rewrite types for composer models.
+    """
     from pathlib import Path
 
-    prices_path = Path(__file__).resolve().parents[4] / "model_prices_and_context_window.json"
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _prepare_grok_request_body_for_passthrough,
+    )
+
+    prices_path = (
+        Path(__file__).resolve().parents[4] / "model_prices_and_context_window.json"
+    )
     prices = json.loads(prices_path.read_text(encoding="utf-8"))
     grok_46 = prices["xai/grok-4.6"]
-    assert "function_call" in grok_46["rewrite_input_item_types"]
-    assert "function_call_output" in grok_46["rewrite_input_item_types"]
     assert "native_responses_tool_history" in grok_46["provider_specific_entry"]["xai"][
         "capabilities"
     ]
+
+    preserved = _prepare_grok_request_body_for_passthrough(
+        request=_direct_grok_passthrough_request(model="grok-4.6"),
+        request_body=_typed_tool_history_request_body(model="grok-4.6"),
+    )
+    assert [item.get("type") for item in preserved["input"]] == [
+        "message",
+        "function_call",
+        "function_call_output",
+    ]
+    assert "Tool label:" not in json.dumps(preserved["input"])
+
+    flattened = _prepare_grok_request_body_for_passthrough(
+        request=_direct_grok_passthrough_request(model="grok-composer-2.5-fast"),
+        request_body=_typed_tool_history_request_body(model="grok-composer-2.5-fast"),
+    )
+    assert [item.get("type") for item in flattened["input"]] == [
+        "message",
+        "message",
+        "message",
+    ]
+    assert flattened["input"][1]["role"] == "assistant"
+    assert "Tool label: read_file" in flattened["input"][1]["content"]
+    assert flattened["input"][2]["role"] == "user"

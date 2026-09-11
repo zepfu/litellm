@@ -13,6 +13,9 @@ from litellm.llms.xai.reference_cost import (
 from litellm.llms.xai.route_descriptors import (
     GROK_NATIVE_ROUTE_DESCRIPTORS,
     OA_XAI_ROUTE_DESCRIPTORS,
+    XAI_NATIVE_RESPONSES_TOOL_HISTORY_CAPABILITY,
+    _get_xai_model_capabilities,
+    has_grok_native_route_capability,
 )
 from litellm.integrations.aawm_agent_identity import (
     _build_session_history_db_payload,
@@ -141,6 +144,44 @@ def test_should_report_grok_46_xhigh_support_through_capability_lookup() -> None
         )
         is True
     )
+
+
+def test_should_read_grok_46_tool_history_capability_when_live_cost_map_is_stripped() -> None:
+    """Bundled catalog still advertises native_responses_tool_history.
+
+    The fetched GitHub cost map is a stripped subset and omits
+    ``provider_specific_entry``. History preservation on `/grok/v1` must
+    still see the capability through the packaged fallback.
+    """
+
+    previous = litellm.model_cost
+    live_entry = previous.get("xai/grok-4.6")
+    if isinstance(live_entry, dict):
+        stripped_entry = {
+            key: value
+            for key, value in live_entry.items()
+            if key != "provider_specific_entry"
+        }
+    else:
+        stripped_entry = {"litellm_provider": "xai", "mode": "responses"}
+    litellm.model_cost = {"xai/grok-4.6": stripped_entry}
+    litellm.get_model_info.cache_clear()
+    try:
+        capabilities = _get_xai_model_capabilities("grok-4.6")
+        assert XAI_NATIVE_RESPONSES_TOOL_HISTORY_CAPABILITY in capabilities
+        assert has_grok_native_route_capability(
+            "grok-4.6", XAI_NATIVE_RESPONSES_TOOL_HISTORY_CAPABILITY
+        )
+        assert has_grok_native_route_capability(
+            "xai/grok-4.6", XAI_NATIVE_RESPONSES_TOOL_HISTORY_CAPABILITY
+        )
+        assert not has_grok_native_route_capability(
+            "grok-composer-2.5-fast",
+            XAI_NATIVE_RESPONSES_TOOL_HISTORY_CAPABILITY,
+        )
+    finally:
+        litellm.model_cost = previous
+        litellm.get_model_info.cache_clear()
 
 
 def test_should_register_native_and_managed_grok_46_descriptors() -> None:

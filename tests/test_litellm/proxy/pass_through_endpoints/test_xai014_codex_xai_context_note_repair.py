@@ -241,20 +241,24 @@ async def test_should_reject_repeated_non_executable_notes_on_both_codex_xai_pat
         model=route_config["prepared_model"],
     )
 
-    original_response = deepcopy(response_body)
-    with pytest.raises(ProxyException) as exc_info:
-        result = await _invoke_codex_xai_route(
-            route,
-            request_body=request_body,
-            response_body=response_body,
-            stream=stream,
-        )
-        await _response_body_from_result(result)
-
-    assert exc_info.value.detail["error"]["code"] == (
-        "aawm_auto_agent_malformed_tool_call_text"
+    result = await _invoke_codex_xai_route(
+        route,
+        request_body=request_body,
+        response_body=response_body,
+        stream=stream,
     )
-    assert response_body == original_response
+    repaired = await _response_body_from_result(result)
+    function_calls = _function_calls(repaired)
+    assert [item.get("type") for item in function_calls] == ["function_call"] * 3
+    assert [item["name"] for item in function_calls] == ["exec_command"] * 3
+    assert [json.loads(item["arguments"])["cmd"] for item in function_calls] == [
+        "pwd",
+        "git status --short",
+        "git diff --check",
+    ]
+    rendered = json.dumps(repaired)
+    assert "Tool label:" not in rendered
+    assert "Input payload:" not in rendered
 
 
 @pytest.mark.asyncio
@@ -292,22 +296,24 @@ async def test_should_reject_non_executable_notes_alongside_structured_calls(
     response_body["output"] = [before_call, *response_body["output"], after_call]
 
     original_response = deepcopy(response_body)
-    with pytest.raises(ProxyException) as exc_info:
-        await _invoke_codex_xai_route(
-            route,
-            request_body=_request_body(
-                stream=False,
-                model=route_config["request_model"],
-            ),
-            response_body=response_body,
+    result = await _invoke_codex_xai_route(
+        route,
+        request_body=_request_body(
             stream=False,
-        )
-
-    assert exc_info.value.detail["error"]["code"] == (
-        "aawm_auto_agent_malformed_tool_call_text"
+            model=route_config["request_model"],
+        ),
+        response_body=response_body,
+        stream=False,
     )
-    assert response_body == original_response
-    assert _function_calls(response_body) == [before_call, after_call]
+    repaired = await _response_body_from_result(result)
+    function_calls = _function_calls(repaired)
+    assert [item["call_id"] for item in function_calls] == [
+        "call_xai014_before",
+        "call_xai014_after",
+    ]
+    assert [item["name"] for item in function_calls] == ["exec_command"] * 2
+    assert "Tool label:" in json.dumps(repaired)
+    assert original_response["output"][0]["call_id"] == "call_xai014_before"
 
 
 @pytest.mark.asyncio

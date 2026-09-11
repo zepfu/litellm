@@ -33,6 +33,7 @@ OWNER_FUNCTIONS = {
     "dedupe_repaired_call_id",
     "repair_literal_tool_calls_in_text",
     "response_body_has_literal_tool_label_blocks",
+    "response_body_has_structured_tool_calls",
     "repair_literal_tool_calls_in_message_item",
     "try_repair_literal_tool_call_response_body",
 }
@@ -155,6 +156,7 @@ def test_rr054_grok_composer_module_owns_substantive_parsing_and_repair() -> Non
         "runtime.is_malformed_tool_call_text_output",
         "repair_literal_tool_calls_in_message_item",
         "response_body_has_literal_tool_label_blocks",
+        "response_body_has_structured_tool_calls",
     } <= _calls(repair_response)
     assert any(isinstance(node, ast.For) for node in ast.walk(repair_response))
 

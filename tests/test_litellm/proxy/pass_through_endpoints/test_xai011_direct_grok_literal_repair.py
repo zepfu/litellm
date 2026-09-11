@@ -283,20 +283,18 @@ async def test_direct_grok_nonstream_malformed_literal_blocks_return_502_and_int
 
 
 @pytest.mark.asyncio
-async def test_direct_grok_nonstream_context_note_history_dialect_returns_502(
-    monkeypatch, tmp_path
-):
-    """Grok Build dumps that echo LiteLLM history rewrite text are fail-closed.
+async def test_direct_grok_nonstream_context_note_history_dialect_repairs_advertised_tool():
+    """Advertised Context-note dumps become launchable function_call items.
 
-    Repair skips Context-note prefixed Tool label blocks, then the detector
-    still classifies them as malformed literal tool text, so /grok/v1/responses
-    must 502 instead of launching the named tool.
+    Commit-era characterization expected 502 because repair skipped any
+    Context-note line. Invert: /grok/v1/responses must repair an advertised
+    tool dump into output[].type == function_call. Unknown-tool and
+    invalid-JSON dumps stay 502.
     """
     from litellm.llms.anthropic.experimental_pass_through.providers.grok import (
         normalization,
     )
 
-    _enable_malformed_intake(monkeypatch, tmp_path)
     history_block = normalization.format_function_call_input_message(
         {
             "name": "search_replace",
@@ -318,9 +316,61 @@ async def test_direct_grok_nonstream_context_note_history_dialect_returns_502(
         media_type="application/json",
     )
 
+    response = await _invoke_direct_grok_responses(
+        request_body=request_body,
+        upstream_response=upstream,
+    )
+
+    assert isinstance(response, Response)
+    repaired = json.loads(response.body)
+    rendered = json.dumps(repaired)
+    assert "Tool label:" not in rendered
+    assert "Input payload:" not in rendered
+    function_calls = _function_calls(repaired)
+    assert [item.get("type") for item in function_calls] == ["function_call"]
+    assert function_calls[0]["name"] == "search_replace"
+    assert function_calls[0]["call_id"] == (
+        "call-c9d1aa12-e8c4-4c32-8e16-e7e3c8c9d0e4-0"
+    )
+    assert json.loads(function_calls[0]["arguments"]) == {
+        "file_path": "/tmp/xai011_a.py",
+        "old_string": "alpha",
+        "new_string": "alpha-fixed",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "literal_text",
+    [
+        (
+            "[Context note - prior assistant step; not an executable tool invocation]\n"
+            "Tool label: not_advertised_tool\n"
+            "Correlation ref: call-xai047-unknown\n"
+            'Input payload: {"file_path": "/tmp/x.py", "old_string": "a", "new_string": "b"}'
+        ),
+        (
+            "[Context note - prior assistant step; not an executable tool invocation]\n"
+            "Tool label: search_replace\n"
+            "Correlation ref: call-xai047-invalid-json\n"
+            'Input payload: {"file_path": "/tmp/x.py"'
+        ),
+    ],
+)
+async def test_direct_grok_nonstream_context_note_unknown_or_invalid_dumps_return_502(
+    monkeypatch,
+    tmp_path,
+    literal_text,
+):
+    _enable_malformed_intake(monkeypatch, tmp_path)
+    upstream = Response(
+        content=json.dumps(_literal_tool_response_payload(literal_text)),
+        media_type="application/json",
+    )
+
     with pytest.raises(ProxyException) as vis:
         await _invoke_direct_grok_responses(
-            request_body=request_body,
+            request_body=_search_replace_tool_request_body(),
             upstream_response=upstream,
         )
 
