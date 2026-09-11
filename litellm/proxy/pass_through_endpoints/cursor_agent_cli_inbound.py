@@ -1737,13 +1737,24 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
             for task in all_tasks:
                 if task is not current_task and not task.done():
                     task.cancel()
-            if session is not None:
-                await _bounded_session_close(session, cleanup_reason)
-            await _cancel_and_join_tasks(all_tasks)
         except asyncio.CancelledError:
             cleanup_cancelled = True
-        except Exception:
-            pass
+        finally:
+            try:
+                if session is not None:
+                    await asyncio.shield(
+                        _bounded_session_close(session, cleanup_reason)
+                    )
+            except asyncio.CancelledError:
+                cleanup_cancelled = True
+            except Exception:
+                pass
+            try:
+                await asyncio.shield(_cancel_and_join_tasks(all_tasks))
+            except asyncio.CancelledError:
+                cleanup_cancelled = True
+            except Exception:
+                pass
         _log_inbound_cli_lifecycle(
             call_id=call_id,
             event="cleanup_finished",
@@ -2097,26 +2108,30 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
         if lane is not None:
             sniffed.update(lane.sniffed)
             try:
-                await lane.aclose(reason=cleanup_reason)
+                await asyncio.shield(lane.aclose(reason=cleanup_reason))
             except asyncio.CancelledError:
                 cleanup_cancelled = True
                 try:
-                    await lane.aclose(reason=cleanup_reason)
+                    await asyncio.shield(lane.aclose(reason=cleanup_reason))
                 except asyncio.CancelledError:
                     pass
             finally:
                 await registry.discard(request_id, lane)
         elif session is not None:
             try:
-                await _bounded_session_close(
-                    session,
-                    _sanitize_termination_reason(termination_reason or "unknown"),
+                await asyncio.shield(
+                    _bounded_session_close(
+                        session,
+                        _sanitize_termination_reason(
+                            termination_reason or "unknown"
+                        ),
+                    )
                 )
             except asyncio.CancelledError:
                 cleanup_cancelled = True
         try:
             if all_tasks:
-                await _cancel_and_join_tasks(all_tasks)
+                await asyncio.shield(_cancel_and_join_tasks(all_tasks))
         except asyncio.CancelledError:
             cleanup_cancelled = True
         _log_inbound_cli_lifecycle(
@@ -2305,7 +2320,7 @@ async def proxy_inbound_cli_bidi_append(
         for task in all_tasks:
             if not task.done():
                 task.cancel()
-        if lane is not None and append_started and cleanup_reason != "normal_response":
+        if lane is not None and append_started and not append_completed:
             try:
                 await lane.aclose(reason=cleanup_reason)
             except asyncio.CancelledError:
