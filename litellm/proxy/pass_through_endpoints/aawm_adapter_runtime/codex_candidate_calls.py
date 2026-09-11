@@ -1874,21 +1874,32 @@ def _cursor_message_input_item(
     item_type = str(item.get("type") or "")
     if item_type == "agent_message":
         content = item.get("content")
+        author = item.get("author")
+        recipient = item.get("recipient")
+        identity_invalid = (
+            (author is None) != (recipient is None)
+            or (
+                author is not None
+                and (
+                    not isinstance(author, str)
+                    or not author.strip()
+                    or not isinstance(recipient, str)
+                    or not recipient.strip()
+                )
+            )
+        )
         if (
             set(item) - {
                 "type", "id", "author", "recipient", "content",
                 "internal_chat_message_metadata_passthrough",
             }
-            or any(
-                not isinstance(item.get(key), str) or not item[key].strip()
-                for key in ("author", "recipient")
-            )
+            or identity_invalid
             or not isinstance(content, list)
             or not content
             or any(
                 not isinstance(part, dict)
                 or set(part) != {"type", "text"}
-                or part.get("type") != "input_text"
+                or part.get("type") not in {"input_text", "text"}
                 or not isinstance(part.get("text"), str)
                 for part in content
             )
