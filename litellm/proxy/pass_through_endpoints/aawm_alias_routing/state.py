@@ -1976,12 +1976,13 @@ class AliasRoutingStateManager:
                 or ""
             ).strip()
             environment = str(observation.get("environment") or "").strip()
+            cache_environment = "shared" if codex_poll else environment
             expected_reset_at = self._quota_observation_timestamp(
                 observation.get("expected_reset_at")
                 or observation.get("provider_resets_at")
                 or observation.get("billing_period_end_at")
             )
-            key = (provider, model, account_hash, quota_key, environment)
+            key = (provider, model, account_hash, quota_key, cache_environment)
             prepared.append(
                 (
                     key,

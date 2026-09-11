@@ -131,6 +131,7 @@ _CODEX_OAUTH_WEEKLY_BALANCE_THRESHOLD_ENV = (
 )
 _CODEX_OAUTH_QUOTA_CLIENT = "codex"
 _CODEX_OAUTH_QUOTA_SOURCE = "codex_quota_poll"
+_CODEX_OAUTH_QUOTA_SHARED_SCOPE = "shared"
 _CODEX_OAUTH_QUOTA_FAMILY_OVERALL = "overall"
 _CODEX_OAUTH_QUOTA_FAMILY_SPARK = "spark"
 _SHARED_ACCOUNT_QUOTA_CACHE_TTL_SECONDS = 30.0
@@ -154,8 +155,8 @@ _ZAI_CODING_PLAN_QUOTA_WINDOWS = frozenset({"5h", "7d"})
 _ZAI_CODING_PLAN_QUOTA_MAX_AGE_SECONDS = 900.0
 _ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE = "customerId_sha256"
 _CODEX_OAUTH_QUOTA_CURRENT_ROWS_SQL = """
+-- Codex OAuth quota is account-global; runtime environment is provenance only.
 SELECT DISTINCT ON (
-    NULLIF(BTRIM(evidence->>'environment'), ''),
     account_hash,
     COALESCE(model, ''),
     quota_key
@@ -177,10 +178,8 @@ FROM public.rate_limit_observations
 WHERE provider = $1
   AND client = $2
   AND source = $3
-  AND NULLIF(BTRIM(evidence->>'environment'), '') = $4
-  AND account_hash = ANY($5::text[])
+  AND account_hash = ANY($4::text[])
 ORDER BY
-    NULLIF(BTRIM(evidence->>'environment'), ''),
     account_hash,
     COALESCE(model, ''),
     quota_key,
@@ -2748,15 +2747,13 @@ def _codex_oauth_quota_int(value: Any) -> Optional[int]:
 def _codex_oauth_quota_observation_from_row(
     row: Any,
     *,
-    expected_environment: str,
+    expected_environment: Optional[str] = None,
 ) -> dict[str, Any]:
     try:
         values = dict(row)
     except Exception:
         return {}
     environment = str(values.get("environment") or "").strip()
-    if environment != expected_environment:
-        return {}
     raw_provider_fields = _codex_oauth_quota_json_mapping(
         values.get("raw_provider_fields")
     )
@@ -2852,22 +2849,9 @@ def _capture_codex_oauth_quota_evidence(
 async def _refresh_codex_oauth_quota_observations(
     contexts: Sequence[dict[str, Any]],
 ) -> None:
-    if (
-        _get_codex_quota_observation_pool is None
-        or _get_codex_quota_observation_environment is None
-    ):
+    if _get_codex_quota_observation_pool is None:
         return
-    try:
-        environment = _codex_oauth_expected_quota_environment() or ""
-    except Exception as exc:
-        verbose_proxy_logger.debug(
-            "Codex OAuth durable quota environment resolution failed open "
-            "(error_class=%s)",
-            exc.__class__.__name__,
-        )
-        return
-    if not environment:
-        return
+    environment = _CODEX_OAUTH_QUOTA_SHARED_SCOPE
     account_hashes = tuple(
         dict.fromkeys(
             str(context.get("candidate", {}).get("codex_oauth_account_hash") or "")
@@ -2906,7 +2890,6 @@ async def _refresh_codex_oauth_quota_observations(
                     _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
                     _CODEX_OAUTH_QUOTA_CLIENT,
                     _CODEX_OAUTH_QUOTA_SOURCE,
-                    environment,
                     list(account_hashes),
                 )
 
@@ -4038,9 +4021,6 @@ def _attach_normalized_quota_state(
     )
     request_model = str(candidate.get("model") or "")
     quota_family = _codex_oauth_quota_family_for_model(request_model)
-    expected_environment = _codex_oauth_expected_quota_environment(
-        use_shared_scope=_candidate_uses_codex_oauth(candidate)
-    )
     evidence = state.get("codex_oauth_quota_evidence")
     if isinstance(evidence, dict):
         family_windows = evidence["valid_windows"]
@@ -4064,12 +4044,6 @@ def _attach_normalized_quota_state(
     )
     if observation is None:
         return state
-    if (
-        expected_environment is not None
-        and str(observation.get("environment") or "").strip()
-        != expected_environment
-    ):
-        return state
 
     raw_windows = observation.get("windows")
     family_windows = (
@@ -4083,10 +4057,7 @@ def _attach_normalized_quota_state(
     family_windows = [
         window
         for window in family_windows
-        if _codex_oauth_window_matches_environment(
-            window,
-            expected_environment=expected_environment,
-        )
+        if isinstance(window, dict)
     ]
     if not family_windows:
         # Do not let the other quota family hide or invent exhaustion/remaining.
