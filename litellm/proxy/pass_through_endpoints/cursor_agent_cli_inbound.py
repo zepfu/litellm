@@ -100,19 +100,17 @@ _STRIP_UPSTREAM_COMPRESSION_HEADERS = {
     "grpc-accept-encoding",
 }
 _MAX_LOGGED_AGENTN_DATA_CHUNKS = 8
-_SENSITIVE_INBOUND_HEADER_NAMES = frozenset(
+_SAFE_INBOUND_TELEMETRY_HEADER_NAMES = frozenset(
     {
-        "authorization",
-        "cookie",
-        "proxy-authorization",
-        "proxy-authenticate",
-        "x-api-key",
-        "x-auth-token",
-        "x-cursor-api-key",
-        "x-forwarded-authorization",
-        "x-goog-api-key",
-        "x-openai-api-key",
-        "x-api-token",
+        "accept",
+        "connect-protocol-version",
+        "content-type",
+        "user-agent",
+        "x-cursor-client-type",
+        "x-cursor-client-version",
+        "x-cursor-streaming",
+        "x-ghost-mode",
+        "x-request-id",
     }
 )
 _TERMINATION_REASONS = frozenset(
@@ -771,7 +769,7 @@ def build_inbound_cli_session_history_kwargs(
     safe_headers = {
         key: value
         for key, value in headers.items()
-        if str(key).lower() not in _SENSITIVE_INBOUND_HEADER_NAMES
+        if str(key).lower() in _SAFE_INBOUND_TELEMETRY_HEADER_NAMES
     }
     tags = list(CURSOR_AGENT_CLI_INBOUND_TAGS)
     metadata = {
