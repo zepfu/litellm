@@ -1001,10 +1001,11 @@ prior rows or establish account coverage.
 attach-only observer for ordinary Chat history. It requires the nonserialized
 lifecycle capability supplied by the private profile owner, the owner's
 persistent supervised registry, the exact CDP endpoint and anchor target, and
-the pinned canonical-12 account hash `8e92854835c4`. It creates one owned page
-in that browser context and performs one ordinary `https://chatgpt.com/`
-navigation. Cleanup uses one absolute operation deadline with reserved phase
-budgets for target close, termination, reaping, and scratch removal.
+the selected account's configured canonical-12 inventory hash. It creates one
+owned page in that browser context and performs one ordinary
+`https://chatgpt.com/` navigation. Cleanup uses one absolute operation deadline
+with reserved phase budgets for target close, termination, reaping, and scratch
+removal.
 
 The observer never calls history endpoints directly, supplies guessed headers,
 reads cookies or storage, or submits a model message. Unknown same-origin
@@ -1046,8 +1047,9 @@ An account without a usable Oracle browser binding is recorded as
 `missing_binding` on both the conversation-init coverage row and
 `history_usage`; it is never omitted or mixed with another account's balances.
 The one-shot `--chatgpt-native-history-probe-account-label` entry remains
-available for a supervised account1 observation after the parent confirms that
-the bound browser session has no active conversation-history cooldown.
+available for a supervised inventory-account observation after the parent
+confirms that the bound browser session has no active conversation-history
+cooldown.
 
 Relevant additional environment variables:
 
