@@ -150,7 +150,6 @@ from litellm.llms.cursor_agent.usage import (
 from litellm.llms.chatgpt.conversation_init import (
     CHATGPT_CONVERSATION_INIT_DEFAULT_URL,
     CHATGPT_NATIVE_HISTORY_CLOSER_FAILURE_SUBREASONS,
-    CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH,
     CHATGPT_NATIVE_HISTORY_ROLE_ENV,
     _NATIVE_HISTORY_CLEANUP_RESERVE_SECONDS,
     _NATIVE_HISTORY_TARGET_BROWSER_TERMINATED,
@@ -19148,13 +19147,6 @@ def _run_chatgpt_native_history_probe(  # noqa: PLR0915 - bounded one-shot probe
         return event
 
     record = matches[0]
-    if record.expected_account_hash != CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH:
-        _set_chatgpt_native_history_probe_failure(
-            event,
-            error_class="ChatGPTNativeHistoryProbeAccountHashMismatch",
-            telemetry_class="configuration",
-        )
-        return event
     event["account_label"] = record.label
     event["account_hash"] = record.expected_account_hash
 
