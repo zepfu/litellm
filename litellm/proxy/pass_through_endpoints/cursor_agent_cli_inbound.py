@@ -46,6 +46,7 @@ from litellm.llms.cursor_agent.connect import (
     _encode_proto_varint_field,
     _encode_request_context_exec_response,
     _proto_last_field,
+    _bounded_gzip_decompress,
     decode_connect_proto_frames,
     encode_connect_proto_frame,
     ensure_cursor_http2_available,
@@ -172,11 +173,40 @@ def _cli_connect_envelope(frame: CursorConnectProtoFrame) -> bytes:
     ``received compressed envelope, but do not know how to decompress``
     unless gzip was negotiated. The decoder already gunzips ``payload``;
     never forward the compressed flag or the raw gzip bytes.
+
+    EndStream JSON is also never compressed: Connect-ES still inspects
+    bit 0 on that envelope. If agentn sends gzip bytes under flags=2,
+    gunzip the payload before wrapping.
     """
-    flags = frame.flags & ~CONNECT_COMPRESSED_FLAG
+    flags = int(frame.flags) & ~CONNECT_COMPRESSED_FLAG
+    payload = bytes(frame.payload)
+    if frame.is_end_stream and payload.startswith(b"\x1f\x8b"):
+        payload = _bounded_gzip_decompress(payload)
     if frame.is_end_stream:
-        return bytes((flags,)) + len(frame.payload).to_bytes(4, "big") + frame.payload
-    return encode_connect_proto_frame(frame.payload, flags=flags)
+        return bytes((flags,)) + len(payload).to_bytes(4, "big") + payload
+    return encode_connect_proto_frame(payload, flags=flags)
+
+
+def _rewrite_cli_connect_bytes(
+    chunk: bytes,
+    decoder: _ProtoConnectFrameDecoder,
+) -> bytes:
+    """Re-encode CLI→agentn envelopes without Connect compression bit 0.
+
+    Interactive TUI payloads are large enough for Connect-ES to gzip.
+    Agentn then EndStreams with the same ``received compressed envelope``
+    error the CLI surfaces. ``--print`` stays uncompressed because it is
+    small. Incomplete envelopes stay in the decoder.
+    """
+    try:
+        frames = decoder.feed(chunk)
+    except Exception:
+        verbose_proxy_logger.warning(
+            "cursor_agent_cli_inbound dropping undecodable client chunk bytes=%s",
+            len(chunk),
+        )
+        return b""
+    return b"".join(_cli_connect_envelope(frame) for frame in frames)
 
 
 def _request_context_exec_replies(
@@ -1103,6 +1133,7 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
         session = session_factory() if session_factory is not None else _AgentnH2Session(turn_base)
         await session.open(_upstream_request_headers(headers, access_token))
         to_agentn: asyncio.Queue[Optional[Tuple[bytes, bool]]] = asyncio.Queue()
+        client_decoder = _ProtoConnectFrameDecoder()
 
         async def pump_client() -> None:
             try:
@@ -1115,14 +1146,20 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
                         return
                     if message_type != "http.request":
                         continue
-                    body = message.get("body") or b""
+                    body = bytes(message.get("body") or b"")
                     end_stream = not message.get("more_body", False)
                     if body:
-                        if len(sniff_buffer) < 65536:
-                            remaining = 65536 - len(sniff_buffer)
-                            sniff_buffer.extend(body[:remaining])
-                            sniffed.update(_sniff_run_metadata(bytes(sniff_buffer)))
-                    await to_agentn.put((bytes(body), end_stream))
+                        rewritten = _rewrite_cli_connect_bytes(body, client_decoder)
+                        if rewritten:
+                            if len(sniff_buffer) < 65536:
+                                remaining = 65536 - len(sniff_buffer)
+                                sniff_buffer.extend(rewritten[:remaining])
+                                sniffed.update(_sniff_run_metadata(bytes(sniff_buffer)))
+                            await to_agentn.put((rewritten, end_stream))
+                        elif end_stream:
+                            await to_agentn.put((b"", True))
+                    elif end_stream:
+                        await to_agentn.put((b"", True))
                     if end_stream:
                         return
             finally:
@@ -1147,6 +1184,8 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
                     "headers": [
                         (b"content-type", CURSOR_AGENT_CONNECT_CONTENT_TYPE.encode("ascii")),
                         (b"connect-protocol-version", b"1"),
+                        (b"content-encoding", b"identity"),
+                        (b"connect-content-encoding", b"identity"),
                     ],
                 }
             )
@@ -1163,8 +1202,10 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
                 async for chunk in session.iter_response_data():
                     if chunk:
                         verbose_proxy_logger.info(
-                            "cursor_agent_cli_inbound forwarded bytes=%s",
+                            "cursor_agent_cli_inbound forwarded bytes=%s flags=%s head=%s",
                             len(chunk),
+                            chunk[0] if chunk else -1,
+                            chunk[:8].hex(),
                         )
                         await send(
                             {
@@ -1355,6 +1396,8 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
                 "headers": [
                     (b"content-type", CURSOR_AGENT_CONNECT_CONTENT_TYPE.encode("ascii")),
                     (b"connect-protocol-version", b"1"),
+                    (b"content-encoding", b"identity"),
+                    (b"connect-content-encoding", b"identity"),
                 ],
             }
         )

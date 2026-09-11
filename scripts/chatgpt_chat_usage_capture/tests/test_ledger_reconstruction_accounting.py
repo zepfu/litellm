@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -331,3 +334,193 @@ def test_rebuild_reclassifies_retained_raw_evidence_and_preserves_history(
         (new_config.account().id,),
     ).fetchall()
     assert [row["mapping_version"] for row in revisions] == ["mapping-v1", "mapping-v2"]
+
+
+def test_pg_ledger_persists_reconstructed_attempts_and_counts_by_account_model() -> None:
+    psycopg = pytest.importorskip("psycopg")
+    dsn_candidates = [
+        os.getenv("AAWM_TEST_POSTGRES_DSN"),
+        os.getenv("AAWM_CODEX_QUOTA_DSN"),
+        "postgresql://postgres:aawm_dev_postgres@127.0.0.1:55432/aawm_tristore",
+        "postgresql://postgres:postgres@127.0.0.1:55432/postgres",
+        "postgresql://postgres@127.0.0.1:55432/postgres",
+    ]
+    dsn = None
+    last_error: Exception | None = None
+    for candidate in dsn_candidates:
+        if not candidate:
+            continue
+        try:
+            with psycopg.connect(candidate, connect_timeout=3) as conn:
+                conn.execute("SELECT 1")
+            dsn = candidate
+            break
+        except Exception as exc:  # pragma: no cover - connection probe
+            last_error = exc
+    if dsn is None:
+        pytest.skip(f"PostgreSQL is unavailable for usage-ledger tests: {last_error}")
+
+    from litellm.llms.chatgpt.conversation_init import (
+        project_native_history_reconstruction_page,
+    )
+    from scripts.chatgpt_chat_usage_capture.native_history_ingest import (
+        persist_coverage_gap,
+        persist_reconstructed_attempts,
+        reconstruct_attempts_from_history_pages,
+    )
+    from scripts.chatgpt_chat_usage_capture.pg_ledger import PgLedger
+
+    mapping_rules = (
+        {"slug": "gpt-5.6-astra-pro", "family": "astra_pro"},
+        {"slug": "gpt-6-sol-pro", "family": "sol_pro"},
+    )
+    ledger = PgLedger(dsn, application_name="chatgpt-usage-ledger-test")
+    ledger.ensure_schema()
+    fixture_root = Path(__file__).parent / "fixtures"
+    detail = json.loads(
+        (fixture_root / "conversation-conv-001.json").read_text(encoding="utf-8")
+    )
+    regenerated = json.loads(json.dumps(detail))
+    regenerated["mapping"]["node-002b"] = {
+        "id": "node-002b",
+        "message": {
+            "id": "msg-002b",
+            "author": {"role": "assistant"},
+            "create_time": "2026-09-05T10:00:08Z",
+            "metadata": {
+                "model_slug": "gpt-5.6-astra-pro",
+                "generation_id": "gen-abc-001-retry",
+                "request_id": "req-abc-001",
+                "surface": "chat",
+            },
+            "end_turn": True,
+            "status": "finished_successfully",
+        },
+        "parent": "node-001",
+        "children": ["node-003"],
+    }
+    regenerated["mapping"]["node-001"]["children"] = ["node-002", "node-002b"]
+    regenerated["mapping"]["node-tool"] = {
+        "id": "node-tool",
+        "message": {
+            "id": "msg-tool",
+            "author": {"role": "assistant"},
+            "create_time": "2026-09-05T10:00:06Z",
+            "channel": "tool",
+            "metadata": {
+                "generation_id": "gen-abc-001",
+                "request_id": "req-abc-001",
+                "surface": "chat",
+            },
+            "end_turn": False,
+            "status": "finished_successfully",
+        },
+        "parent": "node-001",
+        "children": [],
+    }
+    projected = project_native_history_reconstruction_page(
+        regenerated,
+        path="/backend-api/conversations/conv-001",
+        method="GET",
+        http_status=200,
+    )
+    pages = [
+        {
+            "route_class": "modern_history_index",
+            "conversation_id": None,
+            "items": [{"conversation_id": "conv-001", "surface": SURFACE_CHAT}],
+            "messages": [],
+            "coverage": "validated_page",
+        },
+        projected,
+    ]
+    attempts = reconstruct_attempts_from_history_pages(
+        pages,
+        mapping_version="mapping-v1",
+        mapping_rules=mapping_rules,
+    )
+    generation_ids = {
+        alias[1]
+        for attempt in attempts
+        for alias in attempt.aliases
+        if alias[0] == "generation"
+    }
+    assert generation_ids == {
+        "gen-abc-001",
+        "gen-abc-001-retry",
+        "gen-def-002",
+    }
+    assert len(attempts) == 3
+    requested = {attempt.requested_model_raw for attempt in attempts}
+    recorded = {attempt.recorded_final_model_raw for attempt in attempts}
+    assert "gpt-5.6-astra-pro" in requested
+    assert "gpt-6-sol-pro" in requested
+    assert "gpt-5.6-astra-pro" in recorded
+    assert "gpt-6-sol-pro" in recorded
+    assert all(attempt.surface == SURFACE_CHAT for attempt in attempts)
+
+    account_id = f"account-ledger-{uuid4().hex[:12]}"
+    first = persist_reconstructed_attempts(
+        ledger,
+        collector_account_id=account_id,
+        pages=pages,
+        mapping_version="mapping-v1",
+        mapping_rules=mapping_rules,
+    )
+    second = persist_reconstructed_attempts(
+        ledger,
+        collector_account_id=account_id,
+        pages=pages,
+        mapping_version="mapping-v1",
+        mapping_rules=mapping_rules,
+    )
+    assert first["attempt_count"] == 3
+    assert first["inserted"] == 3
+    assert second["attempt_count"] == 3
+    assert second["inserted"] == 0
+    assert second["deduplicated"] == 3
+    counts = first["counts"]
+    assert counts.total == 3
+    assert counts.by_requested_family.get("astra_pro", 0) >= 1
+    assert counts.by_recorded_final_family.get("sol_pro", 0) >= 1
+    assert counts.by_requested_model_raw.get("gpt-5.6-astra-pro")
+    assert counts.by_recorded_final_model_raw.get("gpt-6-sol-pro")
+    windowed = ledger.count_attempts(
+        account_id,
+        window_start=datetime(2026, 9, 5, tzinfo=timezone.utc),
+        window_end=datetime(2026, 9, 6, tzinfo=timezone.utc),
+    )
+    assert windowed.total == 3
+    family_window = ledger.count_attempts(
+        account_id,
+        model_family="sol_pro",
+        window_start=datetime(2026, 9, 5, tzinfo=timezone.utc),
+        window_end=datetime(2026, 9, 6, tzinfo=timezone.utc),
+    )
+    assert family_window.total >= 1
+
+    missing_account = "6efba95eb187"
+    gap = persist_coverage_gap(
+        ledger,
+        collector_account_id=missing_account,
+        reason="missing_binding",
+        source_id=missing_account,
+        details={"cause": "missing_binding"},
+    )
+    assert gap["reason"] == "missing_binding"
+    assert gap["quota_charge"] is False
+    with ledger.connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT reason, state, collector_account_id
+                FROM public.chatgpt_usage_coverage_gaps
+                WHERE collector_account_id = %s
+                  AND reason = %s
+                """,
+                (missing_account, "missing_binding"),
+            )
+            rows = cur.fetchall()
+    assert rows
+    assert rows[0][0] == "missing_binding"
+    assert rows[0][1] == "open"
