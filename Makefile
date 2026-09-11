@@ -64,6 +64,10 @@ BLACK := $(VENV_BIN)/black
 MYPY := $(VENV_BIN)/mypy
 PIP_RUNTIME := $(PYTHON) -m pip
 DEV_COMPOSE := docker compose -f docker-compose.dev.yml
+CODEX_ACCOUNT1_AUTH ?= /home/zepfu/.codex/account1.auth.json
+CODEX_ACCOUNT2_AUTH ?= /home/zepfu/.codex/account2.auth.json
+CODEX_ACCOUNT_HASH = $(PYTHON) -c 'import hashlib,json,sys; print(hashlib.sha256(json.load(open(sys.argv[1]))["tokens"]["account_id"].encode()).hexdigest()[:12])'
+DEV_COMPOSE_ENV = AAWM_CODEX_OAUTH_ACCOUNT1_EXPECTED_HASH=$$( $(CODEX_ACCOUNT_HASH) "$(CODEX_ACCOUNT1_AUTH)" ) AAWM_CODEX_OAUTH_ACCOUNT2_EXPECTED_HASH=$$( $(CODEX_ACCOUNT_HASH) "$(CODEX_ACCOUNT2_AUTH)" )
 DEV_PROXY_SERVICE := litellm-dev
 TAIL ?= 200
 
@@ -273,7 +277,7 @@ dev-proxy-build:
 	$(DEV_COMPOSE) build $(DEV_PROXY_SERVICE)
 
 dev-proxy-rebuild:
-	$(DEV_COMPOSE) up -d --build $(DEV_PROXY_SERVICE)
+	$(DEV_COMPOSE_ENV) $(DEV_COMPOSE) up -d --build $(DEV_PROXY_SERVICE)
 
 dev-proxy-down:
 	$(DEV_COMPOSE) rm -f -s $(DEV_PROXY_SERVICE)
