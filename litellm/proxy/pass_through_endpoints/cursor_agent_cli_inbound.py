@@ -635,7 +635,9 @@ class _Http1AgentnLane:
             )
         if message:
             self.sniffed.update(_sniff_run_metadata(encode_connect_proto_frame(message)))
-        write_started = bool(message)
+        # An empty append is still an upstream write operation whose
+        # cancellation/failure must close this request-owned lane.
+        write_started = True
         try:
             await session.write_request(
                 encode_connect_proto_frame(message),
@@ -966,6 +968,7 @@ class _AgentnH2Session:
         self._lock = asyncio.Lock()
         self._incoming: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
         self._read_task: Optional[asyncio.Task[None]] = None
+        self._flush_task: Optional[asyncio.Task[None]] = None
         self._closed = False
         self._close_task: Optional[asyncio.Task[None]] = None
         self._pending_wakeup = asyncio.Event()
@@ -1428,6 +1431,8 @@ def _lifecycle_reason_priority(reason: Optional[str]) -> int:
         "upstream_failure": 5,
         "upstream_reset": 5,
         "upstream_eof": 5,
+        "append_write_failed": 5,
+        "append_cancelled": 6,
         "cancelled": 6,
     }.get(reason or "unknown", 3)
 
@@ -1445,8 +1450,12 @@ def _reduce_lifecycle_reasons(
             continue
         if role == "reader":
             reason = session.upstream_termination_reason
+            if reason == "normal_response":
+                continue
         elif role == "lane":
             reason = lane.termination_reason if lane is not None else None
+            if reason == "normal_response":
+                continue
         else:
             reason = _task_failure_reason(task, role)
         if reason in {
@@ -1456,6 +1465,8 @@ def _reduce_lifecycle_reasons(
             "upstream_failure",
             "upstream_reset",
             "upstream_eof",
+            "append_write_failed",
+            "append_cancelled",
             "cancelled",
             "client_disconnect",
             "normal_response",
