@@ -100,6 +100,21 @@ _STRIP_UPSTREAM_COMPRESSION_HEADERS = {
     "grpc-accept-encoding",
 }
 _MAX_LOGGED_AGENTN_DATA_CHUNKS = 8
+_SENSITIVE_INBOUND_HEADER_NAMES = frozenset(
+    {
+        "authorization",
+        "cookie",
+        "proxy-authorization",
+        "proxy-authenticate",
+        "x-api-key",
+        "x-auth-token",
+        "x-cursor-api-key",
+        "x-forwarded-authorization",
+        "x-goog-api-key",
+        "x-openai-api-key",
+        "x-api-token",
+    }
+)
 _TERMINATION_REASONS = frozenset(
     {
         "unknown",
@@ -756,7 +771,7 @@ def build_inbound_cli_session_history_kwargs(
     safe_headers = {
         key: value
         for key, value in headers.items()
-        if str(key).lower() != "authorization"
+        if str(key).lower() not in _SENSITIVE_INBOUND_HEADER_NAMES
     }
     tags = list(CURSOR_AGENT_CLI_INBOUND_TAGS)
     metadata = {
@@ -1641,6 +1656,22 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
         if session.response_status >= 400:
             status_code = session.response_status
             error_message = f"upstream_http_{session.response_status}"
+        if (
+            termination_reason != "normal_response"
+            and not response_started
+        ):
+            response_started = True
+            await _send_json_error(
+                send,
+                status_code=status_code,
+                payload={
+                    "error": "cursor_agent_cli_inbound_upstream",
+                    "reason": _sanitize_termination_reason(
+                        termination_reason or "upstream_failure"
+                    ),
+                    "detail": "Cursor Agent CLI inbound request failed.",
+                },
+            )
     except InboundCursorAgentCliAuthError as exc:
         status_code = exc.status_code
         error_message = exc.reason
@@ -1984,6 +2015,22 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
         if termination_reason != "normal_response" and error_message is None:
             error_message = termination_reason
         sniffed.update(lane.sniffed)
+        if (
+            termination_reason != "normal_response"
+            and not response_started
+        ):
+            response_started = True
+            await _send_json_error(
+                send,
+                status_code=status_code,
+                payload={
+                    "error": "cursor_agent_cli_inbound_upstream",
+                    "reason": _sanitize_termination_reason(
+                        termination_reason or "upstream_failure"
+                    ),
+                    "detail": "Cursor Agent CLI inbound HTTP/1.1 RunSSE failed.",
+                },
+            )
     except InboundCursorAgentCliAuthError as exc:
         status_code = exc.status_code
         error_message = exc.reason
@@ -2168,7 +2215,7 @@ async def proxy_inbound_cli_bidi_append(
             nonlocal append_started, append_completed, response_started
             await asyncio.wait_for(lane.opened.wait(), timeout=10.0)
             client_message = bytes(parsed.get("client_message") or b"")
-            append_started = bool(client_message)
+            append_started = True
             await lane.write_client_message(client_message)
             append_completed = True
             response_started = True
