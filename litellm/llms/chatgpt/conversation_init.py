@@ -21,15 +21,6 @@ canonical account hash. The bound path only verifies an authoritative
 fails closed because this module has no established same-context metadata
 contract to substitute. Live authenticated Oracle-browser proof remains a
 separate acceptance gate.
-
-The native history observer is a separate attach-only, read-only path. It
-performs one ordinary ChatGPT home navigation and observes authenticated
-``GET`` index, conversation-detail, and message-pagination traffic. Unknown
-same-origin GET bootstrap requests continue observation. Unknown POST,
-mutation, and model-unsafe routes are aborted. It never submits a model
-message or conversation content, never copies cookies, tokens, titles,
-prompts, or raw headers, and returns metadata sufficient to reconstruct
-generation attempts.
 """
 
 from __future__ import annotations
@@ -45,9 +36,7 @@ import select
 import signal
 import tempfile
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from enum import IntEnum
 from pathlib import Path
 from typing import (
     Any,
@@ -71,12 +60,6 @@ CHATGPT_CONVERSATION_INIT_PARSER_VERSION = "chatgpt_conversation_init_v1"
 CHATGPT_CONVERSATION_INIT_CLIENT = "chatgpt-web"
 CHATGPT_CONVERSATION_INIT_METHOD = "POST"
 CHATGPT_CONVERSATION_INIT_PATH = "/backend-api/conversation/init"
-CHATGPT_CONVERSATION_INIT_PATHS = frozenset(
-    {
-        "/backend-api/conversation/init",
-        "/backend-api/f/conversation/init",
-    }
-)
 CHATGPT_CONVERSATION_INIT_DEFAULT_URL = (
     "https://chatgpt.com/backend-api/conversation/init"
 )
@@ -107,66 +90,6 @@ CHATGPT_CONVERSATION_INIT_BROWSER_CDP_ENDPOINT_ENV = (
 ORACLE_BROWSER_CDP_ENDPOINT_ENV = "ORACLE_BROWSER_CDP_ENDPOINT"
 DEFAULT_ORACLE_BROWSER_CDP_ENDPOINT = "http://127.0.0.1:9222"
 ORACLE_BROWSER_BOUNDARY_NAME = "oracle_browser_cdp_attach"
-CHATGPT_NATIVE_HISTORY_HOME_URL = "https://chatgpt.com/"
-CHATGPT_BROWSER_DOCUMENT_HOSTS = frozenset(
-    {"chatgpt.com", "www.chatgpt.com", "chat.openai.com"}
-)
-# Pause only ChatGPT backend-api traffic. A wildcard Fetch.enable, even without
-# Document, still stalls or aborts Playwright ``page.goto`` when a paused
-# bootstrap XHR is not continued. Conversation-init and history live on
-# ``/backend-api/``; Cloudflare challenge Documents must not be intercepted.
-_CHATGPT_BROWSER_FETCH_REQUEST_STAGES = ("Request",)
-_CHATGPT_BROWSER_CDP_CONNECT_TIMEOUT_SECONDS = 8.0
-_CHATGPT_BROWSER_HISTORY_FETCH_MUTATION_PATTERNS = tuple(
-    {
-        "urlPattern": "*://%s%s" % (host, path),
-        "requestStage": "Request",
-    }
-    for host in sorted({"chatgpt.com", "www.chatgpt.com", "chat.openai.com"})
-    for path in (
-        "/backend-api/conversation",
-        "/backend-api/conversation/*",
-        "/backend-api/f/conversation",
-        "/backend-api/f/conversation/*",
-    )
-)
-_CHATGPT_BROWSER_INIT_FETCH_PATTERNS = tuple(
-    {
-        "urlPattern": "*://%s%s" % (host, path),
-        "requestStage": "Request",
-    }
-    for host in sorted({"chatgpt.com", "www.chatgpt.com", "chat.openai.com"})
-    for path in (
-        "/backend-api/conversation/init",
-        "/backend-api/f/conversation/init",
-        "/backend-api/conversation",
-        "/backend-api/conversation/*",
-        "/backend-api/f/conversation",
-        "/backend-api/f/conversation/*",
-    )
-)
-CHATGPT_NATIVE_HISTORY_INDEX_PATH = "/backend-api/conversations"
-CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH = "8e92854835c4"
-CHATGPT_NATIVE_HISTORY_OBSERVER = "chatgpt_native_history"
-CHATGPT_NATIVE_HISTORY_ROLE_ENV = "AAWM_CHATGPT_NATIVE_HISTORY_ROLE"
-CHATGPT_NATIVE_HISTORY_DEFAULT_TIMEOUT_SECONDS = 150.0
-CHATGPT_NATIVE_HISTORY_MAX_RESPONSE_BYTES = 1_048_576
-# Shared across the history worker and its parent.  A target stays owned until
-# the close acknowledgement is published; the parent must not reap the worker
-# while the state is still pending.
-_NATIVE_HISTORY_TARGET_NONE = 0
-_NATIVE_HISTORY_TARGET_CREATING = 1
-_NATIVE_HISTORY_TARGET_ATTACHED = 2
-_NATIVE_HISTORY_TARGET_CLEANUP_PENDING = 3
-_NATIVE_HISTORY_TARGET_CLOSED = 4
-_NATIVE_HISTORY_TARGET_CLEANUP_HANDOFF = 5
-_NATIVE_HISTORY_TARGET_NO_CREATE = 6
-_NATIVE_HISTORY_TARGET_BROWSER_TERMINATED = 7
-_NATIVE_HISTORY_CLEANUP_RESERVE_SECONDS = 10.0
-_NATIVE_HISTORY_TERM_GRACE_SECONDS = 1.0
-_NATIVE_HISTORY_KILL_GRACE_SECONDS = 1.0
-_NATIVE_HISTORY_REAP_GRACE_SECONDS = 1.0
-_NATIVE_HISTORY_MAX_PROCESS_INVENTORY_ENTRIES = 4096
 
 
 # Truncation does not silently claim completeness.
@@ -180,701 +103,6 @@ MAX_PROJECTION_DEPTH = 5
 MAX_PROJECTION_LIST_ITEMS = 200
 MAX_PROJECTION_OBJECT_KEYS = 200
 MAX_SAFE_STRING_LENGTH = 256
-_NATIVE_HISTORY_MAX_INSPECTED_NODES = 512
-_NATIVE_HISTORY_MAX_COUNT = 200
-_NATIVE_HISTORY_MAX_PENDING_NETWORKS = 256
-_NATIVE_HISTORY_FIELD_NAMES = (
-    "conversations",
-    "items",
-    "total",
-    "offset",
-    "limit",
-    "has_missing_conversations",
-    "updated_at",
-    "updatedAt",
-    "update_time",
-    "updateTime",
-)
-_NATIVE_HISTORY_MODEL_FIELD_NAMES = (
-    "model_slug",
-    "requested_model",
-    "default_model_slug",
-    "model",
-    "recorded_model",
-    "recorded_final_model",
-)
-_NATIVE_HISTORY_FIELD_COUNTER_SPECS = {
-    "model": (
-        ("model_slug", ("model_slug", "modelSlug")),
-        (
-            "requested_model",
-            (
-                "requested_model",
-                "requestedModel",
-                "requested_model_slug",
-                "requestedModelSlug",
-            ),
-        ),
-        ("default_model_slug", ("default_model_slug", "defaultModelSlug")),
-        ("model", ("model",)),
-        ("recorded_model", ("recorded_model", "recordedModel")),
-        (
-            "recorded_final_model",
-            ("recorded_final_model", "recordedFinalModel"),
-        ),
-    ),
-    "updated_time": (
-        ("updated_at", ("updated_at", "updatedAt")),
-        ("update_time", ("update_time", "updateTime")),
-        (
-            "last_updated_at",
-            ("last_updated_at", "lastUpdatedAt"),
-        ),
-    ),
-    "pagination": (
-        ("total", ("total",)),
-        ("offset", ("offset",)),
-        ("limit", ("limit",)),
-        ("page", ("page",)),
-        ("page_size", ("page_size", "pageSize")),
-        ("has_more", ("has_more", "hasMore")),
-        (
-            "has_missing_conversations",
-            ("has_missing_conversations", "hasMissingConversations"),
-        ),
-        ("next_cursor", ("next_cursor", "nextCursor")),
-        ("cursor", ("cursor",)),
-    ),
-}
-_NATIVE_HISTORY_VALUE_TYPES = (
-    "null",
-    "boolean",
-    "number",
-    "string",
-    "object",
-    "array",
-    "unsupported",
-)
-_NATIVE_HISTORY_MODEL_FIELD_ALIASES = {
-    "model_slug": ("model_slug", "modelSlug"),
-    "requested_model": (
-        "requested_model",
-        "requestedModel",
-        "requested_model_slug",
-        "requestedModelSlug",
-    ),
-    "default_model_slug": ("default_model_slug", "defaultModelSlug"),
-    "model": ("model",),
-    "recorded_model": ("recorded_model", "recordedModel"),
-    "recorded_final_model": (
-        "recorded_final_model",
-        "recordedFinalModel",
-    ),
-}
-_NATIVE_HISTORY_STREAM_CHUNK_BYTES = 64 * 1024
-_NATIVE_HISTORY_BOOTSTRAP_READ_PATHS = frozenset(
-    {
-        "/api/auth/session",
-        "/backend-api/me",
-        "/backend-api/models",
-        *CHATGPT_CONVERSATION_INIT_PATHS,
-        CHATGPT_NATIVE_HISTORY_INDEX_PATH,
-    }
-)
-
-_NATIVE_HISTORY_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
-_NATIVE_HISTORY_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
-_NATIVE_HISTORY_KNOWN_METHODS = frozenset(
-    {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}
-)
-_NATIVE_HISTORY_KNOWN_RESOURCES = frozenset(
-    {"Document", "XHR", "Fetch", "Ping", "Script"}
-)
-
-
-def _native_history_path_segments(path: str) -> list[str]:
-    return [part for part in str(path or "").split("/") if part]
-
-
-def _native_history_safe_id(value: Any) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-    token = value.strip()
-    if not token or token.lower() == "init":
-        return None
-    if not _NATIVE_HISTORY_SAFE_ID_RE.fullmatch(token):
-        return None
-    return token
-
-
-def is_native_history_index_path(path: str) -> bool:
-    return path in {
-        CHATGPT_NATIVE_HISTORY_INDEX_PATH,
-        "/backend-api/f/conversations",
-    }
-
-
-def is_native_history_messages_path(path: str) -> bool:
-    segments = _native_history_path_segments(path)
-    if (
-        len(segments) == 4
-        and segments[0] == "backend-api"
-        and segments[1] == "conversations"
-        and segments[3] == "messages"
-        and _native_history_safe_id(segments[2]) is not None
-    ):
-        return True
-    if (
-        len(segments) == 5
-        and segments[0] == "backend-api"
-        and segments[1] == "f"
-        and segments[2] == "conversations"
-        and segments[4] == "messages"
-        and _native_history_safe_id(segments[3]) is not None
-    ):
-        return True
-    return False
-
-
-def is_native_history_detail_path(path: str) -> bool:
-    if is_native_history_messages_path(path) or is_native_history_index_path(path):
-        return False
-    segments = _native_history_path_segments(path)
-    if (
-        len(segments) == 3
-        and segments[0] == "backend-api"
-        and segments[1] in {"conversations", "conversation"}
-        and _native_history_safe_id(segments[2]) is not None
-    ):
-        return True
-    if (
-        len(segments) == 4
-        and segments[0] == "backend-api"
-        and segments[1] == "f"
-        and segments[2] in {"conversations", "conversation"}
-        and _native_history_safe_id(segments[3]) is not None
-    ):
-        return True
-    return False
-
-
-def is_native_history_read_path(path: str) -> bool:
-    return (
-        is_native_history_index_path(path)
-        or is_native_history_detail_path(path)
-        or is_native_history_messages_path(path)
-    )
-
-
-def native_history_route_class(path: str) -> Optional[str]:
-    if is_native_history_index_path(path):
-        return "modern_history_index"
-    if is_native_history_messages_path(path):
-        return "modern_conversation_messages"
-    if is_native_history_detail_path(path):
-        segments = _native_history_path_segments(path)
-        if "conversation" in segments and "conversations" not in segments:
-            return "legacy_conversation_detail"
-        return "modern_conversation_detail"
-    return None
-
-
-def is_native_history_mutation_path(path: str) -> bool:
-    if path in {"/backend-api/conversation", "/backend-api/f/conversation"}:
-        return True
-    if path in CHATGPT_CONVERSATION_INIT_PATHS:
-        return False
-    if is_native_history_read_path(path):
-        return False
-    prefixes = (
-        "/backend-api/conversation/",
-        "/backend-api/conversations/",
-        "/backend-api/f/conversation/",
-        "/backend-api/f/conversations/",
-    )
-    return any(path.startswith(prefix) for prefix in prefixes)
-
-
-def classify_native_history_request(
-    *,
-    method: Any,
-    url: Any,
-    resource_type: Any = None,
-    redirected: Any = None,
-) -> Dict[str, Any]:
-    """Classify one native-history Fetch request without storing payloads."""
-
-    parsed = urlsplit(url if isinstance(url, str) else "")
-    normalized_method = str(method or "").upper()
-    path = parsed.path
-    chatgpt_origin = parsed.scheme == "https" and parsed.netloc == "chatgpt.com"
-    history = chatgpt_origin and is_native_history_read_path(path)
-    init_url = chatgpt_origin and path in CHATGPT_CONVERSATION_INIT_PATHS
-    if chatgpt_origin:
-        origin_category = "chatgpt"
-    elif parsed.scheme == "https":
-        origin_category = "other_https"
-    else:
-        origin_category = "other"
-    if is_native_history_mutation_path(path):
-        route_family = "model_or_mutation"
-    elif path in _NATIVE_HISTORY_BOOTSTRAP_READ_PATHS or init_url:
-        route_family = "bootstrap_read"
-    elif path.startswith("/backend-api/"):
-        route_family = "other_backend_api"
-    elif path.startswith("/api/"):
-        route_family = "other_api"
-    else:
-        route_family = "other"
-    decision: Dict[str, Any] = {
-        "action": "continue",
-        "stops_observation": False,
-        "history": history,
-        "route_class": native_history_route_class(path) if history else None,
-        "route_family": route_family,
-        "origin_category": origin_category,
-        "method": (
-            normalized_method
-            if normalized_method in _NATIVE_HISTORY_KNOWN_METHODS
-            else "other"
-        ),
-        "resource_type": (
-            resource_type
-            if resource_type in _NATIVE_HISTORY_KNOWN_RESOURCES
-            else "other"
-        ),
-        "boundary_reason": None,
-        "mutation_block_branch": None,
-        "blocked_request": None,
-    }
-    if history:
-        if normalized_method != "GET":
-            # OPTIONS/HEAD preflights and POST-to-index creates must not abort
-            # later GET index/detail observation. Model-message POSTs live on
-            # /backend-api/conversation, not these read paths.
-            decision.update(
-                action="fail",
-                stops_observation=False,
-                mutation_block_branch="mutating_method",
-            )
-        elif redirected is not None:
-            decision.update(
-                action="fail",
-                stops_observation=True,
-                boundary_reason="history_request_redirected",
-            )
-        return decision
-    if init_url:
-        if normalized_method != "POST":
-            decision.update(
-                action="fail",
-                stops_observation=True,
-                boundary_reason="init_request_invalid_method",
-            )
-        elif redirected is not None:
-            decision.update(
-                action="fail",
-                stops_observation=True,
-                boundary_reason="init_request_redirected",
-            )
-        return decision
-    if is_native_history_mutation_path(path):
-        decision.update(
-            action="fail",
-            stops_observation=True,
-            mutation_block_branch="model_or_mutation_path",
-            boundary_reason="model_or_mutation_blocked",
-        )
-    elif resource_type == "Document":
-        # GET/HEAD Documents, including Cloudflare challenge frames, must not
-        # stop observation. Document mutations are rejected without aborting
-        # later history reads.
-        if normalized_method not in {"", "GET", "HEAD"}:
-            decision.update(
-                action="fail",
-                stops_observation=False,
-                mutation_block_branch="mutating_method",
-            )
-        return decision
-    elif normalized_method in _NATIVE_HISTORY_MUTATING_METHODS:
-        decision.update(
-            action="fail",
-            stops_observation=False,
-            mutation_block_branch="mutating_method",
-        )
-    elif (
-        chatgpt_origin
-        and normalized_method == "GET"
-        and (
-            path.startswith("/backend-api/")
-            or path.startswith("/api/")
-        )
-    ):
-        return decision
-    if decision["mutation_block_branch"] is not None:
-        decision["blocked_request"] = {
-            "branch": decision["mutation_block_branch"],
-            "method": decision["method"],
-            "resource_type": decision["resource_type"],
-            "origin_category": origin_category,
-            "route_family": route_family,
-        }
-    return decision
-
-
-def _native_history_optional_iso(value: Any) -> Optional[str]:
-    if isinstance(value, datetime):
-        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        try:
-            return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat().replace(
-                "+00:00", "Z"
-            )
-        except (OverflowError, OSError, ValueError):
-            return None
-    if not isinstance(value, str):
-        return None
-    token = value.strip()
-    return token or None
-
-
-def _native_history_message_projection(
-    node: Mapping[str, Any],
-    *,
-    conversation_id: str,
-    node_id: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    message_raw = node.get("message")
-    message = message_raw if isinstance(message_raw, Mapping) else node
-    message_id = _native_history_safe_id(
-        message.get("id") or node.get("id") or node_id
-    )
-    if message_id is None:
-        return None
-    author_raw = message.get("author")
-    author = author_raw if isinstance(author_raw, Mapping) else {}
-    metadata_raw = message.get("metadata")
-    metadata = metadata_raw if isinstance(metadata_raw, Mapping) else {}
-    children_raw = (
-        node.get("children")
-        if isinstance(node.get("children"), list)
-        else message.get("children")
-    )
-    children = tuple(
-        child
-        for child in (
-            _native_history_safe_id(item) for item in (children_raw or [])
-        )
-        if child is not None
-    )
-    role = _native_history_safe_id(author.get("role"))
-    requested = None
-    recorded = None
-    if role == "user":
-        requested = _native_history_safe_id(
-            metadata.get("requested_model")
-            or metadata.get("requested_model_slug")
-            or metadata.get("model_slug")
-        )
-    elif role == "assistant":
-        recorded = _native_history_safe_id(
-            metadata.get("model_slug") or message.get("model_slug")
-        )
-        requested = _native_history_safe_id(metadata.get("requested_model"))
-    return {
-        "conversation_id": conversation_id,
-        "message_id": message_id,
-        "node_id": _native_history_safe_id(node.get("id") or node_id) or message_id,
-        "parent_id": _native_history_safe_id(
-            node.get("parent") or message.get("parent") or metadata.get("parent_id")
-        ),
-        "children": children,
-        "role": role,
-        "channel": _native_history_safe_id(
-            message.get("channel") or metadata.get("channel")
-        ),
-        "created_at": _native_history_optional_iso(
-            message.get("create_time") or node.get("create_time")
-        ),
-        "status": _native_history_safe_id(
-            message.get("status") or metadata.get("status")
-        ),
-        "end_turn": message.get("end_turn")
-        if isinstance(message.get("end_turn"), bool)
-        else None,
-        "requested_model_raw": requested,
-        "requested_mode_raw": _native_history_safe_id(metadata.get("requested_mode")),
-        "requested_reasoning_effort_raw": _native_history_safe_id(
-            metadata.get("reasoning_effort")
-        ),
-        "recorded_final_model_raw": recorded,
-        "generation_id": _native_history_safe_id(
-            metadata.get("generation_id") or metadata.get("message_request_id")
-        ),
-        "request_id": _native_history_safe_id(metadata.get("request_id")),
-        "surface": _native_history_safe_id(
-            metadata.get("surface") or message.get("surface")
-        )
-        or "unknown",
-        "origin": _native_history_safe_id(metadata.get("origin")),
-    }
-
-
-def project_native_history_reconstruction_page(
-    payload: Any,
-    *,
-    path: str,
-    method: str = "GET",
-    http_status: Optional[int] = None,
-) -> Dict[str, Any]:
-    """Project authenticated index/detail/message metadata without content."""
-
-    route_class = native_history_route_class(path)
-    page: Dict[str, Any] = {
-        "route_class": route_class or "unknown",
-        "request_method": "GET" if str(method).upper() == "GET" else "other",
-        "http_status": http_status,
-        "request_body_omitted": True,
-        "conversation_id": None,
-        "items": [],
-        "messages": [],
-        "pagination": {
-            "has_more": None,
-            "exhausted": None,
-            "cursor_present": False,
-        },
-        "coverage": "unrecognized",
-        "warnings": [],
-    }
-    if not isinstance(payload, Mapping) or route_class is None:
-        page["warnings"].append("unrecognized_payload")
-        return page
-    if route_class == "modern_history_index":
-        items_raw = payload.get("items")
-        if items_raw is None:
-            items_raw = payload.get("conversations")
-        warnings: List[str] = []
-        summaries: List[Dict[str, Any]] = []
-        if isinstance(items_raw, list):
-            for item in items_raw:
-                if not isinstance(item, Mapping):
-                    warnings.append("non_object_conversation_item")
-                    continue
-                conversation_id = _native_history_safe_id(
-                    item.get("id") or item.get("conversation_id")
-                )
-                if conversation_id is None:
-                    warnings.append("conversation_missing_id")
-                    continue
-                summaries.append(
-                    {
-                        "conversation_id": conversation_id,
-                        "created_at": _native_history_optional_iso(
-                            item.get("create_time") or item.get("created_at")
-                        ),
-                        "updated_at": _native_history_optional_iso(
-                            item.get("update_time")
-                            or item.get("updated_at")
-                            or item.get("create_time")
-                        ),
-                        "is_archived": bool(item.get("is_archived", False)),
-                        "surface": _native_history_safe_id(item.get("surface"))
-                        or "unknown",
-                        "origin": _native_history_safe_id(item.get("origin")),
-                    }
-                )
-        else:
-            warnings.append("missing_items_array")
-        total = payload.get("total")
-        exhausted = False
-        if isinstance(total, int) and isinstance(items_raw, list) and len(items_raw) >= total:
-            exhausted = True
-        elif (
-            isinstance(items_raw, list)
-            and isinstance(payload.get("limit"), int)
-            and len(items_raw) < payload["limit"]
-        ):
-            exhausted = True
-        page.update(
-            items=summaries,
-            pagination={
-                "has_more": (not exhausted) if isinstance(items_raw, list) else None,
-                "exhausted": exhausted if isinstance(items_raw, list) else None,
-                "cursor_present": False,
-                "offset": payload.get("offset")
-                if isinstance(payload.get("offset"), int)
-                else None,
-                "limit": payload.get("limit")
-                if isinstance(payload.get("limit"), int)
-                else None,
-                "total": total if isinstance(total, int) else None,
-            },
-            coverage="partial" if warnings else "validated_page",
-            warnings=warnings,
-        )
-        return page
-    segments = _native_history_path_segments(path)
-    conversation_id = _native_history_safe_id(
-        payload.get("conversation_id")
-        or payload.get("id")
-        or (
-            segments[-2]
-            if is_native_history_messages_path(path) and len(segments) >= 2
-            else (segments[-1] if segments else None)
-        )
-    )
-    page["conversation_id"] = conversation_id
-    messages: List[Dict[str, Any]] = []
-    warnings = []
-    mapping = payload.get("mapping")
-    if isinstance(mapping, Mapping) and conversation_id is not None:
-        for node_id, node in mapping.items():
-            if not isinstance(node, Mapping):
-                warnings.append("non_object_mapping_node")
-                continue
-            projected = _native_history_message_projection(
-                node,
-                conversation_id=conversation_id,
-                node_id=str(node_id),
-            )
-            if projected is None:
-                warnings.append("message_missing_id")
-                continue
-            messages.append(projected)
-    elif isinstance(payload.get("messages"), list) and conversation_id is not None:
-        for item in payload["messages"]:
-            if not isinstance(item, Mapping):
-                warnings.append("non_object_message_item")
-                continue
-            projected = _native_history_message_projection(
-                item,
-                conversation_id=conversation_id,
-            )
-            if projected is None:
-                warnings.append("message_missing_id")
-                continue
-            messages.append(projected)
-    else:
-        warnings.append("unrecognized_detail_shape")
-    page_info = payload.get("page_info")
-    exhausted = isinstance(mapping, Mapping) and "page_info" not in payload
-    cursor_present = False
-    has_more = False
-    if isinstance(page_info, Mapping):
-        cursor = page_info.get("start_cursor")
-        has_previous = page_info.get("has_previous_page")
-        cursor_present = isinstance(cursor, str) and bool(cursor.strip())
-        if has_previous is True:
-            exhausted = False
-            has_more = True
-        elif has_previous is False:
-            exhausted = True
-            has_more = False
-    page.update(
-        messages=messages,
-        pagination={
-            "has_more": has_more,
-            "exhausted": exhausted,
-            "cursor_present": cursor_present,
-        },
-        coverage="partial" if warnings else "validated_page",
-        warnings=warnings,
-    )
-    return page
-
-
-def observe_native_history_from_injected_events(
-    events: Sequence[Mapping[str, Any]],
-    *,
-    expected_account_hash: str,
-) -> Dict[str, Any]:
-    """Drive the shipped native-history guard/projection path without CDP."""
-
-    request_count = 0
-    history_request_count = 0
-    pages: List[Dict[str, Any]] = []
-    blocked_request = None
-    failure_reason = None
-    identity_match = False
-    account_identity_source = None
-    for raw_event in events:
-        if not isinstance(raw_event, Mapping):
-            continue
-        request_count += 1
-        decision = classify_native_history_request(
-            method=raw_event.get("method"),
-            url=raw_event.get("url"),
-            resource_type=raw_event.get("resourceType")
-            or raw_event.get("resource_type"),
-            redirected=raw_event.get("redirectedRequestId")
-            or raw_event.get("redirected"),
-        )
-        headers = raw_event.get("headers")
-        if isinstance(headers, Mapping):
-            account_hash = _native_init_account_hash(headers)
-            if account_hash is not None:
-                account_identity_source = (
-                    CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
-                )
-                identity_match = account_hash == expected_account_hash
-                if not identity_match:
-                    failure_reason = "account_identity_mismatch"
-        elif raw_event.get("account_hash") == expected_account_hash:
-            identity_match = True
-            account_identity_source = (
-                CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
-            )
-        if decision["blocked_request"] is not None and blocked_request is None:
-            blocked_request = decision["blocked_request"]
-        if decision["action"] == "fail":
-            if decision["stops_observation"]:
-                failure_reason = (
-                    decision["boundary_reason"] or "model_or_mutation_blocked"
-                )
-                break
-            continue
-        if not decision["history"]:
-            continue
-        history_request_count += 1
-        parsed = urlsplit(str(raw_event.get("url") or ""))
-        payload = raw_event.get("payload")
-        if payload is None:
-            payload = raw_event.get("body")
-        pages.append(
-            project_native_history_reconstruction_page(
-                payload,
-                path=parsed.path,
-                method=str(raw_event.get("method") or "GET"),
-                http_status=_native_history_status(
-                    raw_event.get("status") or raw_event.get("http_status")
-                ),
-            )
-        )
-    observation_state = "history_observed" if pages else "no_history_observed"
-    if failure_reason and not pages:
-        observation_state = "history_observation_failed"
-    result = _native_history_base_observation(
-        page_target_id_matched=True,
-        request_count=request_count,
-        history_request_count=history_request_count,
-    )
-    result.update(
-        {
-            "observation_state": observation_state,
-            "route_class": pages[0]["route_class"] if pages else "none",
-            "account_identity_verified": identity_match,
-            "account_identity_source": account_identity_source,
-            "identity_match": identity_match,
-            "request_method": "GET",
-            "request_body_omitted": True,
-            "failure_reason": failure_reason,
-            "history_pages": pages,
-        }
-    )
-    if blocked_request is not None:
-        result["blocked_request"] = blocked_request
-    return result
-
 
 _FORBIDDEN_REQUEST_CONTENT_FIELDS = (
     "messages",
@@ -3302,324 +2530,6 @@ class OracleBrowserBoundaryUnavailable(ChatGPTConversationInitError):
         super().__init__(message, telemetry_class="auth")
 
 
-class OracleBrowserCleanupError(OracleBrowserBoundaryUnavailable):
-    """Native-history cleanup could not be proven within its deadline."""
-
-
-_ORACLE_BROWSER_SAFE_ERROR_CLASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
-_ORACLE_BROWSER_SAFE_ERROR_STAGE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
-_ORACLE_BROWSER_SAFE_NET_ERROR_RE = re.compile(r"\bnet::ERR_[A-Z0-9_]{1,64}\b")
-_ORACLE_BROWSER_SAFE_ERR_ABORTED_RE = re.compile(r"\bERR_ABORTED\b")
-
-
-def _oracle_browser_safe_error_class(exc: BaseException) -> str:
-    name = type(exc).__name__
-    message = str(exc)
-    if not _ORACLE_BROWSER_SAFE_ERROR_CLASS_RE.fullmatch(name):
-        return "Error"
-    match = _ORACLE_BROWSER_SAFE_NET_ERROR_RE.search(message)
-    if match is not None:
-        return (
-            match.group(0)
-            .replace("::", "_")
-            .replace("ERR_", "err_")
-            .lower()
-        )
-    if _ORACLE_BROWSER_SAFE_ERR_ABORTED_RE.search(message):
-        return "net_err_aborted"
-    if name in {"TimeoutError", "Timeout"} or (
-        name == "Error"
-        and "timeout" in message.lower()
-        and "exceeded" in message.lower()
-    ):
-        return "timeout"
-    if name == "TargetClosedError":
-        return "target_closed"
-    if name == "OracleBrowserBoundaryUnavailable":
-        lowered = message.lower()
-        if "timed out" in lowered:
-            return "timeout"
-        if "identity, method, or redirect" in lowered:
-            return "native_init_rejected"
-        if "extrainfo" in lowered:
-            return "account_mismatch"
-        if "size limit" in lowered:
-            return "response_too_large"
-        return "oracle_boundary_unavailable"
-    lowered = message.lower()
-    if "execution context was destroyed" in lowered:
-        return "execution_context_destroyed"
-    if "navigation interrupted" in lowered:
-        return "navigation_interrupted"
-    if "frame was detached" in lowered or "frame has been detached" in lowered:
-        return "frame_detached"
-    if "no resource with given identifier" in lowered:
-        return "response_body_unavailable"
-    if "protocol error" in lowered:
-        return "protocol_error"
-    return name
-
-
-def _is_retryable_browser_navigation_error(exc: BaseException) -> bool:
-    error_class = _oracle_browser_safe_error_class(exc)
-    return error_class in {
-        "net_err_aborted",
-        "execution_context_destroyed",
-        "navigation_interrupted",
-        "frame_detached",
-        "target_closed",
-        "response_body_unavailable",
-        "protocol_error",
-        "Error",
-    }
-
-
-def _is_nonfatal_browser_runtime_error(exc: BaseException) -> bool:
-    error_class = _oracle_browser_safe_error_class(exc)
-    return error_class != "timeout" and (
-        error_class == "Error" or _is_retryable_browser_navigation_error(exc)
-    )
-
-
-def _wait_for_browser_timeout(page: Any, milliseconds: int) -> None:
-    try:
-        page.wait_for_timeout(milliseconds)
-    except Exception as exc:
-        if not _is_nonfatal_browser_runtime_error(exc):
-            raise
-
-
-def _chatgpt_browser_navigate(session: Any, url: str) -> None:
-    """Start ChatGPT home navigation without aborting it on Playwright timeout."""
-
-    try:
-        session.send("Page.enable")
-    except Exception as exc:
-        if not _is_nonfatal_browser_runtime_error(exc):
-            raise
-    session.send("Page.navigate", {"url": url})
-
-
-def _oracle_browser_safe_error_stage(stage: Optional[str]) -> Optional[str]:
-    if not isinstance(stage, str):
-        return None
-    cleaned = stage.strip()
-    if _ORACLE_BROWSER_SAFE_ERROR_STAGE_RE.fullmatch(cleaned):
-        return cleaned
-    return None
-
-
-def _oracle_browser_worker_error_suffix(message: Mapping[str, Any]) -> str:
-    """Attach a privacy-safe worker error class/stage, never cookies or headers."""
-
-    error_class = message.get("error_class")
-    error_stage = message.get("error_stage")
-    if not isinstance(error_class, str) or not _ORACLE_BROWSER_SAFE_ERROR_CLASS_RE.fullmatch(
-        error_class
-    ):
-        return ""
-    suffix = f" ({error_class}"
-    if isinstance(error_stage, str) and _ORACLE_BROWSER_SAFE_ERROR_STAGE_RE.fullmatch(
-        error_stage
-    ):
-        suffix += f" at {error_stage}"
-    suffix += ")"
-    return suffix
-
-
-class _OracleTargetCloserStage(IntEnum):
-    UNKNOWN = 0
-    PROCESS_GROUP_SETUP = 1
-    ROLE_MARKER_SETUP = 2
-    DEADLINE_CHECK = 3
-    PLAYWRIGHT_START = 4
-    CDP_CONNECT = 5
-    CDP_SESSION = 6
-    INITIAL_LISTING = 7
-    INITIAL_LISTING_INVALID = 8
-    INITIAL_TARGETS_INVALID = 9
-    TARGET_MATCH = 10
-    TARGET_MATCH_NOT_UNIQUE = 11
-    TARGET_LOOKUP = 12
-    TARGET_MISSING = 13
-    CLOSE_REQUEST = 14
-    CLOSE_NOT_ACKNOWLEDGED = 15
-    ABSENCE_LISTING = 16
-    ABSENCE_LISTING_INVALID = 17
-    ABSENCE_TARGETS_INVALID = 18
-    TARGET_ABSENCE_CHECK = 19
-    TARGET_STILL_PRESENT = 20
-
-
-_ORACLE_TARGET_CLOSER_FAILURE_MESSAGES = {
-    stage: f"Oracle browser owned-target cleanup failed at {stage.name.lower()}."
-    for stage in _OracleTargetCloserStage
-}
-CHATGPT_NATIVE_HISTORY_CLOSER_FAILURE_SUBREASONS = {
-    message: f"target_closer_{stage.name.lower()}"
-    for stage, message in _ORACLE_TARGET_CLOSER_FAILURE_MESSAGES.items()
-}
-
-
-@dataclass(frozen=True)
-class NativeHistoryTargetProof:
-    """Authoritative proof that one owned target is absent after close."""
-
-    target_id: Optional[str]
-    anchor_target_id: str
-    creation_url: str
-
-
-@dataclass(frozen=True)
-class NativeHistoryReleaseProof:
-    """Owner-derived authorization to release one history interception worker."""
-
-    registration_id: str
-    kind: str
-    target_id: Optional[str]
-    anchor_target_id: str
-    creation_url: str
-
-
-@dataclass
-class NativeHistoryCloseRegistration:
-    """Process registration for the independent exact-target closer."""
-
-    process: Any
-    private_process_group: Any
-    private_process_start_time: Any
-    target_proof: Any
-    driver_done: Any
-    reap_ack: Any
-    target_id: Optional[str]
-    creation_url: str
-    start_state: str = "not_started"
-    started: bool = False
-    reaped: bool = False
-    scope_reaped_proven: bool = False
-    failure_stage: Any = None
-
-
-@dataclass
-class NativeHistoryLifecycleRegistration:
-    """Nonserialized native-history ownership state held by its browser owner."""
-
-    process: Any
-    private_process_group: Any
-    private_process_start_time: Any
-    creation_state: Any
-    owned_target: Any
-    creation_url: str
-    abort_event: Any
-    release_event: Any
-    release_control_state: Any
-    creation_gate: Any
-    creation_settled: Any
-    creation_issued: Any
-    cdp_endpoint: str
-    anchor_target_id: str
-    deadline: float
-    operation_start: float
-    target_close_budget: float
-    finalization_gate: Any = None
-    finalizing: bool = False
-    cleanup_callback: Optional[Callable[..., Any]] = None
-    close_registration: Optional[NativeHistoryCloseRegistration] = None
-    start_state: str = "not_started"
-    released: bool = False
-    release_authorized: bool = False
-    release_control_failed: bool = False
-    retired: bool = False
-    worker_retirement_proven: bool = False
-    release_proof: Optional[NativeHistoryReleaseProof] = None
-    target_resolution: Optional[NativeHistoryTargetProof] = None
-    cleanup_plan: Optional[Dict[str, float]] = None
-    cleanup_failure: Optional[str] = None
-    shutdown_deadline: Optional[float] = None
-    worker_scope_reaped_proven: bool = False
-    registration_id: str = ""
-
-    def __post_init__(self) -> None:
-        if not self.registration_id:
-            self.registration_id = "native-history-" + os.urandom(16).hex()
-
-
-class NativeHistoryLifecycleCapability(Protocol):
-    """Owner-side operations supplied only by a private browser owner."""
-
-    def register_native_history(
-        self, registration: NativeHistoryLifecycleRegistration
-    ) -> None:
-        ...
-
-    def register_native_history_closer(
-        self,
-        registration: NativeHistoryLifecycleRegistration,
-        closer: NativeHistoryCloseRegistration,
-    ) -> None:
-        ...
-
-    def retain_native_history(
-        self,
-        registration: NativeHistoryLifecycleRegistration,
-        reason: str,
-    ) -> None:
-        ...
-
-    def release_native_history(
-        self,
-        registration: NativeHistoryLifecycleRegistration,
-        *,
-        proof: NativeHistoryReleaseProof,
-    ) -> None:
-        ...
-
-    def retire_native_history(
-        self,
-        registration: NativeHistoryLifecycleRegistration,
-    ) -> None:
-        ...
-
-    def prepare_native_history_cleanup_plan(
-        self,
-        registration: NativeHistoryLifecycleRegistration,
-        *,
-        cleanup_deadline: float,
-        operation_deadline: float,
-    ) -> Mapping[str, float]:
-        ...
-
-    def terminate_native_history_process_scope(
-        self,
-        *,
-        registration_id: str,
-        term_deadline: float,
-        kill_deadline: float,
-        reap_deadline: float,
-        poll_only: bool = False,
-    ) -> bool:
-        ...
-
-    def terminate_owned_browser(
-        self,
-        *,
-        term_deadline: float,
-        kill_deadline: float,
-        reap_deadline: float,
-        final_deadline: float,
-        poll_only: bool = False,
-    ) -> bool:
-        ...
-
-    def bind_native_history_endpoint(
-        self,
-        *,
-        cdp_endpoint: str,
-        anchor_target_id: str,
-    ) -> None:
-        ...
-
-
 def _native_init_header(headers: Mapping[str, Any], name: str) -> Any:
     for key in headers:
         if key.lower() == name:
@@ -3632,34 +2542,6 @@ def _native_init_account_hash(headers: Mapping[str, Any]) -> Optional[str]:
     if not isinstance(value, str) or value.strip() == "default":
         return None
     return hash_chatgpt_conversation_init_canonical_account_id(value)
-
-
-def _chatgpt_browser_fetch_enable_params(
-    *,
-    extra_patterns: Optional[Sequence[Mapping[str, Any]]] = None,
-) -> Dict[str, Any]:
-    """Enable Fetch interception for ChatGPT init/mutation POSTs only."""
-
-    if extra_patterns:
-        return {"patterns": [dict(pattern) for pattern in extra_patterns]}
-    return {
-        "patterns": [dict(pattern) for pattern in _CHATGPT_BROWSER_INIT_FETCH_PATTERNS]
-    }
-
-
-def _chatgpt_browser_cdp_connect_timeout_seconds(deadline: float) -> float:
-    remaining = _remaining_browser_timeout(deadline)
-    if remaining <= 0:
-        return 0.0
-    return min(_CHATGPT_BROWSER_CDP_CONNECT_TIMEOUT_SECONDS, remaining)
-
-
-def _is_admitted_browser_document_request(method: Any, resource_type: Any) -> bool:
-    return resource_type == "Document" and str(method or "").upper() in {
-        "",
-        "GET",
-        "HEAD",
-    }
 
 
 def _native_init_retry_after(headers: Mapping[str, Any]) -> Optional[float]:
@@ -3710,7 +2592,7 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
         return (
             parsed.scheme == "https"
             and parsed.netloc == target.netloc
-            and parsed.path in CHATGPT_CONVERSATION_INIT_PATHS
+            and parsed.path == CHATGPT_CONVERSATION_INIT_PATH
         )
 
     def guard_request(event: Mapping[str, Any]) -> None:
@@ -3718,43 +2600,38 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
         request = event.get("request", {})
         parsed = urlsplit(request.get("url", ""))
         redirected = event.get("redirectedRequestId")
-        method = str(request.get("method") or "").upper()
-        # GET Documents, including Cloudflare challenge frames, must continue.
-        # failRequest on those aborts Playwright page.goto.
-        if _is_admitted_browser_document_request(
-            method, event.get("resourceType")
-        ):
-            session.send(
-                "Fetch.continueRequest", {"requestId": event["requestId"]}
+        forbidden = (
+            event.get("resourceType") == "Document"
+            and (
+                parsed.scheme != "https"
+                or parsed.netloc != target.netloc
+                or parsed.path not in {"", "/"}
+                or redirected is not None
             )
-            return
-        init_redirect = redirected is not None and (
-            is_init(request.get("url", "")) or redirected == init_fetch_id
+        ) or (
+            redirected is not None
+            and (
+                is_init(request.get("url", ""))
+                or redirected == init_fetch_id
+            )
         )
-        model_message_post = (
+        # No model-message route is needed to render an empty page.
+        forbidden = forbidden or (
             parsed.path in {"/backend-api/conversation", "/backend-api/f/conversation"}
             and request.get("method") == "POST"
         )
-        extra_init = is_init(request.get("url", "")) and init_fetch_id is not None
-        forbidden = init_redirect or model_message_post or extra_init
         if is_init(request.get("url", "")):
+            forbidden = forbidden or init_fetch_id is not None
             init_fetch_id = event["requestId"]
         if forbidden:
-            # Fail only this request. A third-party Document must not poison
-            # later chatgpt.com navigation or conversation-init capture.
             boundary_error = True
+        if forbidden or boundary_error or failure is not None:
             session.send(
                 "Fetch.failRequest",
                 {"requestId": event["requestId"], "errorReason": "BlockedByClient"},
             )
-            return
-        if boundary_error or failure is not None:
-            session.send(
-                "Fetch.failRequest",
-                {"requestId": event["requestId"], "errorReason": "BlockedByClient"},
-            )
-            return
-        session.send("Fetch.continueRequest", {"requestId": event["requestId"]})
+        else:
+            session.send("Fetch.continueRequest", {"requestId": event["requestId"]})
 
     def request_seen(event: Mapping[str, Any]) -> None:
         nonlocal boundary_error
@@ -3855,11 +2732,10 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
     def envelope(payload: Any, failed: bool = False) -> Mapping[str, Any]:
         state = failure if failed and failure is not None else capture
         request_id = capture.get("request_id")
-        extra_hash = extra_hashes.get(request_id)
         verified = (
             isinstance(request_id, str)
             and capture.get("account_hash") == expected_account_hash
-            and extra_hash in {None, expected_account_hash}
+            and extra_hashes.get(request_id) == expected_account_hash
         )
         native: Dict[str, Any] = {
             "account_hash": expected_account_hash if verified else None,
@@ -3890,39 +2766,29 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
         session.on("Network.responseReceived", response_seen)
         session.on("Network.loadingFinished", loading_finished)
         session.on("Network.loadingFailed", loading_failed)
-        def enable_network() -> None:
-            session.send(
-                "Network.enable",
-                {
-                    "maxTotalBufferSize": MAX_CONVERSATION_INIT_SOURCE_BYTES * 2,
-                    "maxResourceBufferSize": MAX_CONVERSATION_INIT_SOURCE_BYTES,
-                    "maxPostDataSize": 0,
-                },
+        session.send(
+            "Network.enable",
+            {
+                "maxTotalBufferSize": MAX_CONVERSATION_INIT_SOURCE_BYTES * 2,
+                "maxResourceBufferSize": MAX_CONVERSATION_INIT_SOURCE_BYTES,
+                "maxPostDataSize": 0,
+            },
+        )
+        session.send("Network.setBypassServiceWorker", {"bypass": True})
+        session.send(
+            "Fetch.enable",
+            {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]},
+        )
+        try:
+            page.goto(
+                origin + "/",
+                wait_until="commit",
+                timeout=_browser_timeout_milliseconds(
+                    _remaining_browser_timeout(capture_deadline)
+                ),
             )
-            session.send("Network.setBypassServiceWorker", {"bypass": True})
-
-        try:
-            enable_network()
-        except Exception as exc:
-            if not _is_nonfatal_browser_runtime_error(exc):
-                raise
-        fetch_enabled = False
-        try:
-            session.send("Fetch.enable", _chatgpt_browser_fetch_enable_params())
-            fetch_enabled = True
-        except Exception as exc:
-            if not _is_nonfatal_browser_runtime_error(exc):
-                raise
-        # Playwright page.goto aborts the Document when its wait times out.
-        # CDP Page.navigate is fire-and-forget so Cloudflare/SPA can finish.
-        try:
-            _chatgpt_browser_navigate(session, origin + "/")
-        except Exception as exc:
-            if failure is not None:
-                pass
-            elif not _is_nonfatal_browser_runtime_error(exc) and (
-                _oracle_browser_safe_error_class(exc) != "timeout"
-            ):
+        except Exception:
+            if failure is None:
                 raise
         while True:
             if failure is not None:
@@ -3933,9 +2799,8 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
                 )
             _raise_if_browser_deadline_expired(capture_deadline)
             request_id = capture.get("request_id")
-            if capture.get("finished") and capture.get("account_hash") == expected_account_hash:
-                extra_hash = extra_hashes.get(request_id)
-                if extra_hash not in {None, expected_account_hash}:
+            if capture.get("finished") and request_id in extra_hashes:
+                if extra_hashes[request_id] != expected_account_hash:
                     raise OracleBrowserBoundaryUnavailable(
                         "Native Oracle init ExtraInfo account did not match inventory."
                     )
@@ -3943,12 +2808,9 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
                     body = session.send(
                         "Network.getResponseBody", {"requestId": request_id}
                     )
-                except Exception as exc:
+                except Exception:
                     if failure is not None:
                         return envelope(None, failed=True)
-                    if _is_nonfatal_browser_runtime_error(exc):
-                        _wait_for_browser_timeout(page, 50)
-                        continue
                     raise
                 # Synchronous CDP calls can dispatch queued network callbacks.
                 if failure is not None:
@@ -3970,2025 +2832,24 @@ def _observe_native_oracle_init(  # noqa: PLR0915 - callbacks share one capture 
                 except ValueError:
                     payload = None
                 return envelope(payload)
-            if not fetch_enabled:
-                try:
-                    session.send(
-                        "Fetch.enable", _chatgpt_browser_fetch_enable_params()
-                    )
-                    fetch_enabled = True
-                except Exception as exc:
-                    if not _is_nonfatal_browser_runtime_error(exc):
-                        raise
-            try:
-                challenged = page.evaluate(
-                    "() => [...document.querySelectorAll("
-                    "'form#challenge-form[action*=\"__cf_chl\"],"
-                    "form#challenge-form[action^=\"/cdn-cgi/challenge-platform/\"],"
-                    "#challenge-running')].some(node => {"
-                    "const rect = node.getBoundingClientRect();"
-                    "return rect.width > 0 && rect.height > 0 &&"
-                    "getComputedStyle(node).visibility !== 'hidden';})"
-                )
-            except Exception as extra:
-                if (
-                    _is_nonfatal_browser_runtime_error(extra)
-                    or _oracle_browser_safe_error_class(extra) == "timeout"
-                ):
-                    _wait_for_browser_timeout(page, 50)
-                    continue
-                raise
-            if challenged:
+            if page.evaluate(
+                "() => [...document.querySelectorAll("
+                "'form#challenge-form[action*=\"__cf_chl\"],"
+                "form#challenge-form[action^=\"/cdn-cgi/challenge-platform/\"],"
+                "#challenge-running')].some(node => {"
+                "const rect = node.getBoundingClientRect();"
+                "return rect.width > 0 && rect.height > 0 &&"
+                "getComputedStyle(node).visibility !== 'hidden';})"
+            ):
                 browser_challenge = True
                 if failure is None:
-                    failure = {**(page_response or {}), "correlated": False}
+                    failure = {**page_response, "correlated": False}
                 return envelope(None, failed=True)
-            _wait_for_browser_timeout(page, 50)
+            page.wait_for_timeout(50)
     finally:
         # Keep Fetch interception installed until the caller closes the target.
         # Closing that target tears down the session; do not detach it here.
         boundary_error = True
-
-
-def _native_history_type_name(value: Any) -> str:
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "boolean"
-    if isinstance(value, (int, float)):
-        return "number"
-    if isinstance(value, str):
-        return "string"
-    if isinstance(value, Mapping):
-        return "object"
-    if isinstance(value, list):
-        return "array"
-    return "unsupported"
-
-
-def _native_history_metadata(value: Any, *, present: bool = True) -> Dict[str, Any]:
-    if not present:
-        return {
-            "present": False,
-            "container": "missing",
-            "type": "missing",
-            "count": None,
-            "count_truncated": False,
-            "count_is_lower_bound": False,
-        }
-    if isinstance(value, list):
-        truncated = len(value) > _NATIVE_HISTORY_MAX_COUNT
-        return {
-            "present": True,
-            "container": "array",
-            "type": "array",
-            "count": min(len(value), _NATIVE_HISTORY_MAX_COUNT),
-            "count_truncated": truncated,
-            "count_is_lower_bound": truncated,
-        }
-    if isinstance(value, Mapping):
-        truncated = len(value) > _NATIVE_HISTORY_MAX_COUNT
-        return {
-            "present": True,
-            "container": "object",
-            "type": "object",
-            "count": min(len(value), _NATIVE_HISTORY_MAX_COUNT),
-            "count_truncated": truncated,
-            "count_is_lower_bound": truncated,
-        }
-    return {
-        "present": True,
-        "container": "scalar",
-        "type": _native_history_type_name(value),
-        "count": None,
-        "count_truncated": False,
-        "count_is_lower_bound": False,
-    }
-
-
-def _native_history_fixed_field_value(
-    payload: Any,
-    field_name: str,
-) -> Tuple[bool, Any]:
-    if not isinstance(payload, Mapping):
-        return False, None
-    aliases = {
-        "has_missing_conversations": ("has_missing_conversations", "hasMissingConversations"),
-    }.get(field_name, (field_name,))
-    candidates: List[Mapping[str, Any]] = [payload]
-    for wrapper_name in ("data", "result"):
-        wrapped = payload.get(wrapper_name)
-        if isinstance(wrapped, Mapping):
-            candidates.append(wrapped)
-    for candidate in candidates:
-        for alias in aliases:
-            if alias in candidate:
-                return True, candidate[alias]
-    return False, None
-
-
-def _native_history_model_presence(payload: Any) -> Dict[str, Optional[bool]]:
-    counters, traversal = _native_history_field_presence_type_counts(payload)
-    fields: Dict[str, Optional[bool]] = {}
-    for field_name in _NATIVE_HISTORY_MODEL_FIELD_NAMES:
-        field = counters["model"][field_name]
-        if field["presence_count"]:
-            fields[field_name] = True
-        elif traversal["absence_is_known"]:
-            fields[field_name] = False
-        else:
-            fields[field_name] = None
-    return fields
-
-
-def _native_history_empty_field_counters() -> Dict[str, Dict[str, Dict[str, Any]]]:
-    return {
-        group_name: {
-            field_name: {
-                "presence_count": 0,
-                "count_is_lower_bound": False,
-                "type_counts": {
-                    type_name: 0 for type_name in _NATIVE_HISTORY_VALUE_TYPES
-                },
-            }
-            for field_name, _aliases in field_specs
-        }
-        for group_name, field_specs in _NATIVE_HISTORY_FIELD_COUNTER_SPECS.items()
-    }
-
-
-def _native_history_field_presence_type_counts(
-    payload: Any,
-) -> Tuple[Dict[str, Dict[str, Dict[str, Any]]], Dict[str, Any]]:
-    counters = _native_history_empty_field_counters()
-    if payload is None or not isinstance(payload, (Mapping, list)):
-        return counters, {
-            "visited_nodes": 0,
-            "max_nodes": _NATIVE_HISTORY_MAX_INSPECTED_NODES,
-            "truncated": False,
-            "absence_is_known": False,
-        }
-
-    pending: List[Any] = [payload]
-    visited = 0
-    truncated = False
-    while pending:
-        if visited >= _NATIVE_HISTORY_MAX_INSPECTED_NODES:
-            truncated = True
-            break
-        value = pending.pop()
-        if isinstance(value, Mapping):
-            visited += 1
-            for group_name, field_specs in _NATIVE_HISTORY_FIELD_COUNTER_SPECS.items():
-                for field_name, aliases in field_specs:
-                    present_alias = next(
-                        (alias for alias in aliases if alias in value),
-                        None,
-                    )
-                    if present_alias is None:
-                        continue
-                    field_counter = counters[group_name][field_name]
-                    field_counter["presence_count"] += 1
-                    type_name = _native_history_type_name(
-                        value[present_alias]
-                    )
-                    field_counter["type_counts"][type_name] += 1
-            children = list(value.values())
-            if len(children) > MAX_PROJECTION_OBJECT_KEYS:
-                truncated = True
-                children = children[:MAX_PROJECTION_OBJECT_KEYS]
-            pending.extend(children)
-        elif isinstance(value, list):
-            visited += 1
-            children = value
-            if len(children) > MAX_PROJECTION_LIST_ITEMS:
-                truncated = True
-                children = children[:MAX_PROJECTION_LIST_ITEMS]
-            pending.extend(children)
-
-    if truncated:
-        for group_counters in counters.values():
-            for field_counter in group_counters.values():
-                field_counter["count_is_lower_bound"] = True
-    return counters, {
-        "visited_nodes": visited,
-        "max_nodes": _NATIVE_HISTORY_MAX_INSPECTED_NODES,
-        "truncated": truncated,
-        "absence_is_known": not truncated,
-    }
-
-
-def _native_history_structural_projection(payload: Any) -> Dict[str, Any]:
-    root = _native_history_metadata(payload)
-    field_metadata: Dict[str, Dict[str, Any]] = {}
-    present_count = 0
-    for field_name in _NATIVE_HISTORY_FIELD_NAMES:
-        present, value = _native_history_fixed_field_value(payload, field_name)
-        field_metadata[field_name] = _native_history_metadata(
-            value,
-            present=present,
-        )
-        present_count += int(present)
-    if not isinstance(payload, (Mapping, list)):
-        schema_state = "malformed"
-    elif present_count:
-        schema_state = "recognized"
-    else:
-        schema_state = "unrecognized"
-    field_counters, traversal = _native_history_field_presence_type_counts(
-        payload
-    )
-    return {
-        "root": root,
-        "fields": field_metadata,
-        "schema_state": schema_state,
-        "field_presence_type_counts": field_counters,
-        "traversal": traversal,
-    }
-
-
-def _native_history_base_observation(
-    *,
-    page_target_id_matched: bool,
-    request_count: int = 0,
-    history_request_count: int = 0,
-) -> Dict[str, Any]:
-    bounded_request_count = min(
-        max(int(request_count), 0),
-        _NATIVE_HISTORY_MAX_COUNT,
-    )
-    bounded_history_request_count = min(
-        max(int(history_request_count), 0),
-        _NATIVE_HISTORY_MAX_COUNT,
-    )
-    request_count_truncated = request_count > _NATIVE_HISTORY_MAX_COUNT
-    history_request_count_truncated = (
-        history_request_count > _NATIVE_HISTORY_MAX_COUNT
-    )
-    return {
-        "observer": CHATGPT_NATIVE_HISTORY_OBSERVER,
-        "observation_state": "no_history_observed",
-        "route_class": "none",
-        "http_status": None,
-        "account_identity_verified": False,
-        "account_identity_source": None,
-        "identity_match": False,
-        "request_response_correlated": False,
-        "request_method": None,
-        "request_body_omitted": None,
-        "page_target_id_matched": bool(page_target_id_matched),
-        "request_count": bounded_request_count,
-        "request_count_truncated": request_count_truncated,
-        "request_count_is_lower_bound": request_count_truncated,
-        "history_request_count": bounded_history_request_count,
-        "history_request_count_truncated": history_request_count_truncated,
-        "history_request_count_is_lower_bound": history_request_count_truncated,
-        "response_bytes": None,
-        "response_content_type": "missing",
-        "retry_after_seconds": None,
-        "browser_challenge": False,
-        "structural_metadata": {
-            "root": _native_history_metadata(None, present=False),
-            "fields": {
-                field_name: _native_history_metadata(None, present=False)
-                for field_name in _NATIVE_HISTORY_FIELD_NAMES
-            },
-            "schema_state": "absent",
-        },
-        "model_field_presence": {
-            field_name: None for field_name in _NATIVE_HISTORY_MODEL_FIELD_NAMES
-        },
-        "failure_reason": "no_history_observed",
-        "warnings": [],
-    }
-
-
-def _native_history_content_type(headers: Any) -> str:
-    if not isinstance(headers, Mapping):
-        return "missing"
-    value = _native_init_header(headers, "content-type")
-    if not isinstance(value, str):
-        return "missing"
-    normalized = value.split(";", 1)[0].strip().lower()
-    if normalized in {"application/json", "application/problem+json"}:
-        return "json"
-    if normalized in {"text/html", "text/plain"}:
-        return "text"
-    return "other"
-
-
-def _native_history_content_length(headers: Any) -> Optional[int]:
-    if not isinstance(headers, Mapping):
-        return None
-    value = _native_init_header(headers, "content-length")
-    if not isinstance(value, str):
-        return None
-    try:
-        length = int(value.strip())
-    except (TypeError, ValueError):
-        return None
-    return length if length >= 0 else None
-
-
-def _native_history_status(value: Any) -> Optional[int]:
-    if isinstance(value, bool):
-        return None
-    try:
-        status = int(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return status if 100 <= status <= 999 else None
-
-
-def _native_history_request_method(value: Any) -> Optional[str]:
-    if value == "GET":
-        return "GET"
-    if isinstance(value, str):
-        return "other"
-    return None
-
-
-def _native_history_failure_for_status(status: Optional[int]) -> Optional[str]:
-    if status is None:
-        return "invalid_status"
-    if 200 <= status < 300 and status not in {204, 206}:
-        return None
-    if status in {401, 403}:
-        return "http_auth"
-    if status == 429:
-        return "http_rate_limited"
-    return "http_error"
-
-
-def _native_history_finalize_observation(
-    capture: Mapping[str, Any],
-    *,
-    expected_account_hash: str,
-    page_target_id_matched: bool,
-    request_count: int,
-    history_request_count: int,
-    max_response_bytes: int,
-    structural: Optional[Mapping[str, Any]] = None,
-    failure_reason: Optional[str] = None,
-) -> Dict[str, Any]:
-    request_id = capture.get("request_id")
-    if not isinstance(request_id, str) or not request_id:
-        return _native_history_no_route_observation(
-            page_target_id_matched=page_target_id_matched,
-            request_count=request_count,
-            history_request_count=history_request_count,
-            failure_reason=(
-                failure_reason
-                or capture.get("boundary_reason")
-                or "no_history_observed"
-            ),
-            browser_challenge=bool(capture.get("browser_challenge")),
-            retry_after_seconds=capture.get("retry_after_seconds"),
-        )
-    result = _native_history_base_observation(
-        page_target_id_matched=page_target_id_matched,
-        request_count=request_count,
-        history_request_count=history_request_count,
-    )
-    request_hash = capture.get("request_account_hash")
-    extra_hash = capture.get("extra_account_hash")
-    identity_match = (
-        not capture.get("identity_conflict")
-        and expected_account_hash in {request_hash, extra_hash}
-        and extra_hash in {None, expected_account_hash}
-        and request_hash in {None, expected_account_hash}
-    )
-    status = _native_history_status(capture.get("status_code"))
-    response_bytes = capture.get("response_bytes")
-    if isinstance(response_bytes, bool) or not isinstance(response_bytes, int):
-        response_bytes = None
-    if response_bytes is not None:
-        response_bytes = min(max(response_bytes, 0), max_response_bytes)
-    history_pages = capture.get("history_pages")
-    if not isinstance(history_pages, list):
-        history_pages = []
-    result["history_pages"] = history_pages
-    route_class = "modern_history_index"
-    if history_pages and isinstance(history_pages[0], Mapping):
-        route_class = str(history_pages[0].get("route_class") or route_class)
-    result.update(
-        {
-            "observation_state": "history_observed",
-            "route_class": route_class,
-            "http_status": status,
-            "account_identity_verified": identity_match,
-            "account_identity_source": (
-                CHATGPT_CONVERSATION_INIT_NATIVE_REQUEST_IDENTITY_SOURCE
-                if (
-                    request_hash is not None
-                    or extra_hash is not None
-                    or capture.get("identity_conflict")
-                )
-                else None
-            ),
-            "identity_match": identity_match,
-            "request_response_correlated": bool(
-                capture.get("response_received")
-                and capture.get("response_request_id")
-                == capture.get("request_id")
-            ),
-            "request_method": _native_history_request_method(
-                capture.get("method")
-            ),
-            "request_body_omitted": capture.get("body_omitted"),
-            "response_bytes": response_bytes,
-            "response_content_type": capture.get(
-                "content_type",
-                "missing",
-            ),
-            "retry_after_seconds": capture.get("retry_after_seconds"),
-            "browser_challenge": bool(capture.get("browser_challenge")),
-        }
-    )
-    if structural is not None:
-        result["structural_metadata"] = dict(structural)
-        result["model_field_presence"] = _native_history_model_presence(
-            capture.get("payload")
-        )
-        result["field_presence_type_counts"] = dict(
-            structural.get("field_presence_type_counts", {})
-        )
-        result["traversal"] = dict(structural.get("traversal", {}))
-    else:
-        result["structural_metadata"] = {
-            "root": _native_history_metadata(None, present=False),
-            "fields": {
-                field_name: _native_history_metadata(None, present=False)
-                for field_name in _NATIVE_HISTORY_FIELD_NAMES
-            },
-            "schema_state": "absent",
-        }
-        result["field_presence_type_counts"] = (
-            _native_history_empty_field_counters()
-        )
-        result["traversal"] = {
-            "visited_nodes": 0,
-            "max_nodes": _NATIVE_HISTORY_MAX_INSPECTED_NODES,
-            "truncated": False,
-            "absence_is_known": False,
-        }
-    intentional_disposal = (
-        capture.get("intentional_disposal_request_id")
-        == capture.get("fetch_request_id")
-        and capture.get("response_stream_complete") is True
-    )
-    terminal_reason = capture.get("terminal_reason")
-    if isinstance(terminal_reason, str) and terminal_reason:
-        failure_reason = terminal_reason
-    elif capture.get("boundary_reason"):
-        failure_reason = str(capture["boundary_reason"])
-    elif failure_reason is None and capture.get("body_failure_reason"):
-        failure_reason = str(capture["body_failure_reason"])
-    if failure_reason is None and capture.get("loading_failed") and not intentional_disposal:
-        failure_reason = "history_response_failed"
-    if failure_reason is None and not capture.get("response_received"):
-        failure_reason = "history_response_missing"
-    if failure_reason is None and not identity_match:
-        failure_reason = (
-            "account_identity_mismatch"
-            if (
-                request_hash is not None
-                or extra_hash is not None
-                or capture.get("identity_conflict")
-            )
-            else "identity_evidence_missing"
-        )
-    if failure_reason is None and capture.get("browser_challenge"):
-        failure_reason = "browser_challenge"
-    if failure_reason is None:
-        status_failure = _native_history_failure_for_status(status)
-        if status_failure is not None:
-            failure_reason = status_failure
-    if failure_reason is None and capture.get("content_type") != "json":
-        failure_reason = "non_json_response"
-    if failure_reason is None and capture.get("response_stream_complete") is not True:
-        failure_reason = "history_response_missing"
-    if failure_reason is not None:
-        result["observation_state"] = "history_observation_failed"
-    result["failure_reason"] = failure_reason
-    return result
-
-
-def _native_history_no_route_observation(
-    *,
-    page_target_id_matched: bool,
-    request_count: int,
-    history_request_count: int,
-    failure_reason: Optional[str],
-    browser_challenge: bool,
-    retry_after_seconds: Optional[float] = None,
-) -> Dict[str, Any]:
-    result = _native_history_base_observation(
-        page_target_id_matched=page_target_id_matched,
-        request_count=request_count,
-        history_request_count=history_request_count,
-    )
-    result["browser_challenge"] = bool(browser_challenge)
-    result["retry_after_seconds"] = retry_after_seconds
-    result["failure_reason"] = failure_reason or "no_history_observed"
-    if result["failure_reason"] != "no_history_observed":
-        result["observation_state"] = "history_observation_failed"
-    if failure_reason == "no_history_observed" or failure_reason is None:
-        result["warnings"] = ["no_native_history_index_request"]
-    return result
-
-
-def _native_history_response_headers(headers: Any) -> Mapping[str, Any]:
-    if isinstance(headers, Mapping):
-        return headers
-    if not isinstance(headers, list):
-        return {}
-    allowed = {
-        "content-type",
-        "content-length",
-        "retry-after",
-        "cf-mitigated",
-    }
-    normalized: Dict[str, str] = {}
-    for header in headers:
-        if not isinstance(header, Mapping):
-            continue
-        name = header.get("name")
-        value = header.get("value")
-        if (
-            isinstance(name, str)
-            and name.strip().lower() in allowed
-            and isinstance(value, str)
-        ):
-            normalized[name.strip().lower()] = value
-    return normalized
-
-
-def _capture_native_history_body_stream(  # noqa: PLR0915 - bounded response stream
-    session: Any,
-    capture: Dict[str, Any],
-    *,
-    fetch_request_id: str,
-    response_headers: Any,
-    deadline: float,
-    max_response_bytes: int,
-    should_stop: Optional[Callable[[], bool]] = None,
-) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[int]]:
-    import binascii
-    import base64
-
-    headers = _native_history_response_headers(response_headers)
-    content_length = _native_history_content_length(headers)
-    if content_length is not None and content_length > max_response_bytes:
-        return None, "response_too_large", content_length
-    if should_stop is not None and should_stop():
-        return None, "capture_interrupted", 0
-    try:
-        stream_result = session.send(
-            "Fetch.takeResponseBodyAsStream",
-            {"requestId": fetch_request_id},
-        )
-    except Exception:
-        return None, "response_body_unavailable", None
-    if not isinstance(stream_result, Mapping):
-        return None, "response_body_unavailable", None
-    stream_handle = stream_result.get("stream")
-    if not isinstance(stream_handle, str) or not stream_handle:
-        return None, "response_body_unavailable", None
-    if should_stop is not None and should_stop():
-        try:
-            session.send("IO.close", {"handle": stream_handle})
-        except Exception:
-            pass
-        return None, "capture_interrupted", 0
-
-    raw_bytes = bytearray()
-    try:
-        while True:
-            _raise_if_browser_deadline_expired(deadline)
-            if should_stop is not None and should_stop():
-                return None, "capture_interrupted", len(raw_bytes)
-            remaining = max_response_bytes - len(raw_bytes)
-            read_size = min(
-                _NATIVE_HISTORY_STREAM_CHUNK_BYTES,
-                remaining + 1,
-            )
-            if read_size <= 0:
-                return None, "response_too_large", len(raw_bytes) + 1
-            chunk_result = session.send(
-                "IO.read",
-                {"handle": stream_handle, "size": read_size},
-            )
-            if should_stop is not None and should_stop():
-                return None, "capture_interrupted", len(raw_bytes)
-            if not isinstance(chunk_result, Mapping):
-                return None, "invalid_response_body", len(raw_bytes)
-            chunk = chunk_result.get("data")
-            if not isinstance(chunk, str):
-                return None, "invalid_response_body", len(raw_bytes)
-            try:
-                chunk_bytes = (
-                    base64.b64decode(chunk, validate=True)
-                    if chunk_result.get("base64Encoded")
-                    else chunk.encode("utf-8")
-                )
-            except (UnicodeDecodeError, ValueError, binascii.Error):
-                return None, "invalid_response_body", len(raw_bytes)
-            if len(raw_bytes) + len(chunk_bytes) > max_response_bytes:
-                return (
-                    None,
-                    "response_too_large",
-                    len(raw_bytes) + len(chunk_bytes),
-                )
-            raw_bytes.extend(chunk_bytes)
-            if should_stop is not None and should_stop():
-                return None, "capture_interrupted", len(raw_bytes)
-            if chunk_result.get("eof") is True:
-                break
-            if not chunk_bytes:
-                return None, "invalid_response_body", len(raw_bytes)
-    finally:
-        try:
-            session.send("IO.close", {"handle": stream_handle})
-        except Exception:
-            pass
-
-    response_bytes = len(raw_bytes)
-    if content_length is not None:
-        response_bytes = max(response_bytes, content_length)
-    if should_stop is not None and should_stop():
-        return None, "capture_interrupted", response_bytes
-    try:
-        payload = json.loads(bytes(raw_bytes).decode("utf-8"))
-    except (UnicodeDecodeError, TypeError, ValueError):
-        return None, "invalid_json", response_bytes
-    if should_stop is not None and should_stop():
-        return None, "capture_interrupted", response_bytes
-    # Keep the parsed value only for this bounded in-process projection.
-    capture["payload"] = payload
-    capture["response_stream_complete"] = True
-    response_path = capture.get("history_path")
-    if isinstance(response_path, str):
-        pages = capture.setdefault("history_pages", [])
-        if isinstance(pages, list) and len(pages) < _NATIVE_HISTORY_MAX_COUNT:
-            pages.append(
-                project_native_history_reconstruction_page(
-                    payload,
-                    path=response_path,
-                    method=str(capture.get("method") or "GET"),
-                    http_status=_native_history_status(capture.get("status_code")),
-                )
-            )
-    return _native_history_structural_projection(payload), None, response_bytes
-
-
-def _observe_native_history_oracle_page(  # noqa: PLR0915 - bounded CDP lifetime
-    page: Any,
-    *,
-    session: Any,
-    expected_account_hash: str,
-    deadline: float,
-    max_response_bytes: int,
-    abort_event: Optional[Any] = None,
-) -> Mapping[str, Any]:
-    capture: Dict[str, Any] = {}
-    boundary_reason: Optional[str] = None
-    terminal_failure: Optional[Dict[str, Any]] = None
-    pending_response: Optional[Dict[str, Any]] = None
-    pending_network: Dict[str, Dict[str, Any]] = {}
-    pending_network_order: List[str] = []
-    history_network_ids: set[str] = set()
-    seen_fetch_request_ids: set[str] = set()
-    fetch_actions: Dict[Tuple[str, str], str] = {}
-    init_fetch_id: Optional[str] = None
-    observer_closed = False
-    response_read_in_progress = False
-    browser_challenge = False
-    request_count = 0
-    history_request_count = 0
-    history_admitted = False
-    retry_after_max: Optional[float] = None
-    held_history_requests: List[Mapping[str, Any]] = []
-    capture_deadline = deadline - min(2.0, _remaining_browser_timeout(deadline) / 5)
-
-    def set_boundary(reason: str) -> None:
-        nonlocal boundary_reason
-        if boundary_reason is None:
-            boundary_reason = reason
-        capture.setdefault("boundary_reason", boundary_reason)
-
-    def is_stopped() -> bool:
-        return (
-            observer_closed
-            or boundary_reason is not None
-            or terminal_failure is not None
-            or (abort_event is not None and abort_event.is_set())
-        )
-
-    def is_history_url(url: Any) -> bool:
-        if not isinstance(url, str):
-            return False
-        parsed = urlsplit(url)
-        return (
-            parsed.scheme == "https"
-            and parsed.netloc in CHATGPT_BROWSER_DOCUMENT_HOSTS
-            and is_native_history_read_path(parsed.path)
-        )
-
-    def is_init_url(url: Any) -> bool:
-        if not isinstance(url, str):
-            return False
-        parsed = urlsplit(url)
-        return (
-            parsed.scheme == "https"
-            and parsed.netloc in CHATGPT_BROWSER_DOCUMENT_HOSTS
-            and parsed.path in CHATGPT_CONVERSATION_INIT_PATHS
-        )
-
-    def is_conversation_detail_path(path: str) -> bool:
-        return is_native_history_detail_path(path) or is_native_history_messages_path(
-            path
-        )
-
-    def is_model_or_mutation_path(path: str) -> bool:
-        return is_native_history_mutation_path(path)
-
-    def terminal_priority(reason: str) -> int:
-        if "rate_limited" in reason:
-            return 4
-        if "auth" in reason:
-            return 3
-        if "challenge" in reason:
-            return 2
-        return 1
-
-    def latch_terminal(
-        reason: str,
-        *,
-        retry_after_seconds: Optional[float] = None,
-        challenged: bool = False,
-    ) -> None:
-        nonlocal browser_challenge, retry_after_max, terminal_failure
-        browser_challenge = browser_challenge or challenged
-        if (
-            isinstance(retry_after_seconds, (int, float))
-            and not isinstance(retry_after_seconds, bool)
-            and isfinite(float(retry_after_seconds))
-            and retry_after_seconds >= 0
-        ):
-            retry_after_max = max(
-                retry_after_max or 0.0,
-                float(retry_after_seconds),
-            )
-        candidate = {
-            "reason": reason,
-            "retry_after_seconds": retry_after_max,
-            "browser_challenge": browser_challenge,
-        }
-        if terminal_failure is None or terminal_priority(reason) > terminal_priority(
-            str(terminal_failure.get("reason") or "")
-        ):
-            terminal_failure = candidate
-        elif terminal_failure is not None:
-            terminal_failure["retry_after_seconds"] = retry_after_max
-            terminal_failure["browser_challenge"] = bool(
-                terminal_failure.get("browser_challenge") or browser_challenge
-            )
-        capture["browser_challenge"] = browser_challenge
-        capture["terminal_reason"] = terminal_failure["reason"]
-        capture["retry_after_seconds"] = retry_after_max
-
-    def terminal_reason() -> Optional[str]:
-        if terminal_failure is None:
-            return None
-        reason = terminal_failure.get("reason")
-        return reason if isinstance(reason, str) else "terminal_failure"
-
-    def terminal_retry_after() -> Optional[float]:
-        if isinstance(retry_after_max, (int, float)):
-            return retry_after_max
-        return None
-
-    def fail_fetch(
-        request_id: Any,
-        *,
-        pause_stage: str,
-        intentional_disposal: bool = False,
-    ) -> None:
-        if observer_closed:
-            return
-        if not isinstance(request_id, str) or not request_id:
-            return
-        action_key = (request_id, pause_stage)
-        if action_key in fetch_actions:
-            return
-        fetch_actions[action_key] = "fail"
-        if request_id == capture.get("fetch_request_id"):
-            # Network.loadingFailed can be caused by this observer's own
-            # rejection; keep it separate from an upstream transport failure.
-            capture["observer_rejected_fetch_request_id"] = request_id
-        if intentional_disposal:
-            capture["intentional_disposal_request_id"] = request_id
-        try:
-            session.send(
-                "Fetch.failRequest",
-                {
-                    "requestId": request_id,
-                    "errorReason": "BlockedByClient",
-                },
-            )
-        except Exception:
-            if not observer_closed:
-                set_boundary("fetch_control_failed")
-
-    def continue_fetch(request_id: Any, *, pause_stage: str = "request") -> None:
-        if observer_closed or is_stopped():
-            return
-        if not isinstance(request_id, str) or not request_id:
-            set_boundary("fetch_control_failed")
-            return
-        action_key = (request_id, pause_stage)
-        if action_key in fetch_actions:
-            return
-        fetch_actions[action_key] = "continue"
-        try:
-            session.send("Fetch.continueRequest", {"requestId": request_id})
-        except Exception:
-            set_boundary("fetch_control_failed")
-
-    def remember_network(network_id: Any) -> Optional[Dict[str, Any]]:
-        if not isinstance(network_id, str) or not network_id:
-            return None
-        if network_id not in pending_network:
-            if len(pending_network_order) >= _NATIVE_HISTORY_MAX_PENDING_NETWORKS:
-                evict_index = next(
-                    (
-                        index
-                        for index, candidate in enumerate(pending_network_order)
-                        if candidate != capture.get("network_request_id")
-                    ),
-                    None,
-                )
-                if evict_index is None:
-                    capture["pending_network_truncated"] = True
-                    return None
-                oldest = pending_network_order.pop(evict_index)
-                pending_network.pop(oldest, None)
-            pending_network[network_id] = {
-                "network_id": network_id,
-                "request_hash": None,
-                "extra_hash": None,
-                "identity_conflict": False,
-            }
-            pending_network_order.append(network_id)
-        return pending_network[network_id]
-
-    def note_history_request(network_id: Any) -> None:
-        nonlocal history_request_count
-        if not isinstance(network_id, str) or not network_id:
-            return
-        if network_id in history_network_ids:
-            return
-        if len(history_network_ids) < _NATIVE_HISTORY_MAX_COUNT + 1:
-            history_network_ids.add(network_id)
-        history_request_count = min(
-            history_request_count + 1,
-            _NATIVE_HISTORY_MAX_COUNT + 1,
-        )
-
-    def record_identity(
-        record: Dict[str, Any],
-        field_name: str,
-        account_hash: Optional[str],
-    ) -> None:
-        if account_hash is None:
-            return
-        prior = record.get(field_name)
-        if prior is not None and prior != account_hash:
-            record["identity_conflict"] = True
-        if account_hash != expected_account_hash:
-            record["identity_conflict"] = True
-            latch_terminal("account_identity_mismatch")
-        if prior is None:
-            record[field_name] = account_hash
-        if record.get("identity_conflict"):
-            capture["identity_conflict"] = True
-
-    def apply_network_record(record: Optional[Mapping[str, Any]]) -> None:
-        if not isinstance(record, Mapping):
-            return
-        if record.get("request_seen"):
-            capture["network_request_seen"] = True
-        if record.get("extra_seen"):
-            capture["extra_seen"] = True
-        for field_name in (
-            "request_hash",
-            "extra_hash",
-            "response_received",
-            "response_request_id",
-            "status_code",
-            "content_type",
-            "content_length",
-            "response_url_valid",
-            "response_retry_after_seconds",
-            "network_loading_finished",
-            "loading_failed",
-        ):
-            if field_name in record:
-                if field_name == "response_retry_after_seconds":
-                    response_retry = record[field_name]
-                    if isinstance(response_retry, (int, float)) and (
-                        capture.get("retry_after_seconds") is None
-                        or response_retry > capture["retry_after_seconds"]
-                    ):
-                        capture["retry_after_seconds"] = response_retry
-                    continue
-                target_name = {
-                    "request_hash": "request_account_hash",
-                    "extra_hash": "extra_account_hash",
-                }.get(field_name, field_name)
-                capture[target_name] = record[field_name]
-        if record.get("identity_conflict"):
-            capture["identity_conflict"] = True
-        if record.get("response_error_reason"):
-            capture["response_error_observed"] = True
-
-    def record_network_request(
-        network_id: Any,
-        *,
-        request: Mapping[str, Any],
-        redirected: Any = None,
-    ) -> Optional[Dict[str, Any]]:
-        record = remember_network(network_id)
-        if record is None:
-            return None
-        url = request.get("url")
-        method = str(request.get("method") or "").upper()
-        record["request_seen"] = True
-        record["method"] = method
-        record["body_omitted"] = (
-            not request.get("hasPostData", False)
-            and "postData" not in request
-        )
-        record["redirected"] = redirected is not None or bool(
-            request.get("redirectResponse")
-        )
-        record["history"] = is_history_url(url)
-        headers = request.get("headers")
-        account_hash = (
-            _native_init_account_hash(headers)
-            if isinstance(headers, Mapping)
-            else None
-        )
-        record_identity(record, "request_hash", account_hash)
-        if record.get("history"):
-            note_history_request(network_id)
-        if network_id == capture.get("network_request_id"):
-            apply_network_record(record)
-        return record
-
-    def record_network_extra(
-        network_id: Any,
-        *,
-        headers: Any,
-    ) -> Optional[Dict[str, Any]]:
-        record = remember_network(network_id)
-        if record is None:
-            return None
-        record["extra_seen"] = True
-        account_hash = (
-            _native_init_account_hash(headers)
-            if isinstance(headers, Mapping)
-            else None
-        )
-        record_identity(record, "extra_hash", account_hash)
-        if network_id == capture.get("network_request_id"):
-            apply_network_record(record)
-        return record
-
-    def record_relevant_response(
-        *,
-        response_url: Any,
-        status: Optional[int],
-        headers: Any,
-    ) -> None:
-        nonlocal browser_challenge
-        normalized_headers = _native_history_response_headers(headers)
-        challenged = (
-            _native_init_header(normalized_headers, "cf-mitigated") == "challenge"
-        )
-        browser_challenge = browser_challenge or challenged
-        retry_after = _native_init_retry_after(normalized_headers)
-        if challenged:
-            latch_terminal(
-                "browser_challenge",
-                retry_after_seconds=retry_after,
-                challenged=True,
-            )
-        parsed_url = urlsplit(response_url) if isinstance(response_url, str) else None
-        if parsed_url is None or parsed_url.netloc != "chatgpt.com":
-            return
-        if parsed_url.path == "/":
-            route_name = "home"
-        elif parsed_url.path == CHATGPT_NATIVE_HISTORY_INDEX_PATH:
-            route_name = "history"
-        elif parsed_url.path in CHATGPT_CONVERSATION_INIT_PATHS:
-            route_name = "init"
-        elif parsed_url.path == "/api/auth/session":
-            route_name = "auth_session"
-        elif parsed_url.path in _NATIVE_HISTORY_BOOTSTRAP_READ_PATHS:
-            route_name = "bootstrap"
-        else:
-            return
-        if status in {401, 403}:
-            latch_terminal(
-                f"{route_name}_auth",
-                retry_after_seconds=retry_after,
-            )
-        elif status == 429:
-            latch_terminal(
-                f"{route_name}_rate_limited",
-                retry_after_seconds=retry_after,
-            )
-
-    def store_response(
-        *,
-        request_id: Any,
-        response_url: Any,
-        status: Optional[int],
-        headers: Any,
-        classify_boundary: bool = True,
-    ) -> None:
-        record = remember_network(request_id)
-        if record is None:
-            return
-        normalized_headers = _native_history_response_headers(headers)
-        record.update(
-            response_received=True,
-            response_request_id=request_id,
-            status_code=status,
-            content_type=_native_history_content_type(normalized_headers),
-            content_length=_native_history_content_length(normalized_headers),
-            response_retry_after_seconds=_native_init_retry_after(
-                normalized_headers
-            ),
-            response_url_valid=is_history_url(response_url),
-        )
-        record_relevant_response(
-            response_url=response_url,
-            status=status,
-            headers=normalized_headers,
-        )
-        if classify_boundary and is_history_url(response_url):
-            if not record["response_url_valid"]:
-                set_boundary("history_response_mismatch")
-            elif status is None:
-                set_boundary("invalid_status")
-            elif 300 <= status < 400:
-                set_boundary("history_response_redirected")
-        if request_id == capture.get("network_request_id"):
-            apply_network_record(record)
-
-    def store_loading_finished(request_id: Any, event: Mapping[str, Any]) -> None:
-        record = remember_network(request_id)
-        if record is None:
-            return
-        record["network_loading_finished"] = True
-        encoded = event.get("encodedDataLength")
-        if (
-            isinstance(encoded, (int, float))
-            and not isinstance(encoded, bool)
-            and encoded >= 0
-        ):
-            record["encoded_data_length"] = int(encoded)
-        if request_id == capture.get("network_request_id"):
-            apply_network_record(record)
-
-    def store_loading_failed(request_id: Any) -> None:
-        record = remember_network(request_id)
-        if record is None:
-            return
-        record["loading_failed"] = True
-        if request_id != capture.get("network_request_id"):
-            return
-        fetch_request_id = capture.get("fetch_request_id")
-        observer_rejected = (
-            isinstance(fetch_request_id, str)
-            and capture.get("observer_rejected_fetch_request_id")
-            == fetch_request_id
-        )
-        if observer_rejected:
-            intentional_disposal = (
-                capture.get("intentional_disposal_request_id")
-                == fetch_request_id
-                and capture.get("response_stream_complete") is True
-            )
-            if (
-                intentional_disposal
-                or capture.get("body_failure_reason") is not None
-            ):
-                capture["loading_failed_ignored"] = True
-                return
-        capture["loading_failed"] = True
-        if capture.get("body_failure_reason") is None:
-            capture["body_failure_reason"] = "history_response_failed"
-        capture["network_loading_finished"] = True
-
-    def response_read_should_stop() -> bool:
-        return (
-            observer_closed
-            or boundary_reason is not None
-            or terminal_failure is not None
-            or (abort_event is not None and abort_event.is_set())
-            or capture.get("identity_conflict") is True
-            or (
-                capture.get("loading_failed") is True
-                and capture.get("intentional_disposal_request_id")
-                != capture.get("fetch_request_id")
-            )
-            or _remaining_browser_timeout(capture_deadline) <= 0
-        )
-
-    def process_pending_response() -> None:
-        nonlocal pending_response, response_read_in_progress
-        if pending_response is None or response_read_in_progress:
-            return
-        owned_response = pending_response
-        pending_response = None
-        if is_stopped():
-            fail_fetch(
-                owned_response.get("fetch_request_id"),
-                pause_stage="response",
-            )
-            capture["finished"] = True
-            return
-        if capture.get("identity_conflict"):
-            pending_response = owned_response
-            return
-        if (
-            capture.get("request_account_hash") != expected_account_hash
-            and capture.get("extra_account_hash") != expected_account_hash
-        ):
-            pending_response = owned_response
-            return
-        response_read_in_progress = True
-        try:
-            structural, body_error, response_bytes = (
-                _capture_native_history_body_stream(
-                    session,
-                    capture,
-                    fetch_request_id=str(owned_response["fetch_request_id"]),
-                    response_headers=owned_response.get("response_headers"),
-                    deadline=capture_deadline,
-                    max_response_bytes=max_response_bytes,
-                    should_stop=response_read_should_stop,
-                )
-            )
-        except Exception:
-            structural, body_error, response_bytes = (
-                None,
-                "response_body_unavailable",
-                None,
-            )
-        finally:
-            response_read_in_progress = False
-        if response_bytes is not None:
-            capture["response_bytes"] = response_bytes
-        if structural is not None:
-            capture["structural"] = structural
-        if body_error is not None and capture.get("body_failure_reason") is None:
-            capture["body_failure_reason"] = body_error
-        capture["finished"] = True
-        if (
-            body_error is None
-            and not is_stopped()
-            and capture.get("response_stream_complete") is True
-            and not capture.get("loading_failed")
-        ):
-            fail_fetch(
-                owned_response.get("fetch_request_id"),
-                pause_stage="response",
-                intentional_disposal=True,
-            )
-        else:
-            fail_fetch(
-                owned_response.get("fetch_request_id"),
-                pause_stage="response",
-            )
-        if held_history_requests and not is_stopped():
-            queued = held_history_requests.pop(0)
-            guard_request(queued, from_hold=True)
-
-    def process_network_history_body() -> None:
-        """Read an admitted history GET via Network.getResponseBody.
-
-        Fetch Response pauses are not required. Live ChatGPT often never
-        re-pauses the same Fetch id after continueRequest.
-        """
-
-        nonlocal response_read_in_progress
-        if (
-            response_read_in_progress
-            or pending_response is not None
-            or is_stopped()
-            or capture.get("finished") is True
-            or not history_admitted
-        ):
-            return
-        network_request_id = capture.get("network_request_id")
-        if not isinstance(network_request_id, str):
-            return
-        record = pending_network.get(network_request_id)
-        if not isinstance(record, Mapping):
-            return
-        if record.get("loading_failed"):
-            return
-        if (
-            record.get("network_loading_finished") is not True
-            and record.get("response_received") is not True
-        ):
-            return
-        if capture.get("identity_conflict"):
-            return
-        request_hash = capture.get("request_account_hash")
-        extra_hash = capture.get("extra_account_hash")
-        if (
-            request_hash != expected_account_hash
-            and extra_hash != expected_account_hash
-        ):
-            return
-        import base64
-
-        response_read_in_progress = True
-        try:
-            body = session.send(
-                "Network.getResponseBody",
-                {"requestId": network_request_id},
-            )
-            if not isinstance(body, Mapping):
-                capture["body_failure_reason"] = "response_body_unavailable"
-                capture["finished"] = True
-                return
-            content = body.get("body", "")
-            if not isinstance(content, str):
-                capture["body_failure_reason"] = "invalid_response_body"
-                capture["finished"] = True
-                return
-            if len(content) > max_response_bytes:
-                capture["body_failure_reason"] = "response_too_large"
-                capture["finished"] = True
-                return
-            if body.get("base64Encoded"):
-                content = base64.b64decode(content, validate=True).decode("utf-8")
-            payload = json.loads(content)
-            capture["payload"] = payload
-            capture["response_stream_complete"] = True
-            capture["finished"] = True
-            capture["response_bytes"] = min(len(content), max_response_bytes)
-            response_path = capture.get("history_path")
-            if isinstance(response_path, str):
-                pages = capture.setdefault("history_pages", [])
-                if isinstance(pages, list) and len(pages) < _NATIVE_HISTORY_MAX_COUNT:
-                    pages.append(
-                        project_native_history_reconstruction_page(
-                            payload,
-                            path=response_path,
-                            method=str(capture.get("method") or "GET"),
-                            http_status=_native_history_status(
-                                capture.get("status_code")
-                            ),
-                        )
-                    )
-            if held_history_requests and not is_stopped():
-                queued = held_history_requests.pop(0)
-                guard_request(queued, from_hold=True)
-        except Exception as exc:
-            if _is_nonfatal_browser_runtime_error(exc):
-                return
-            capture["body_failure_reason"] = "response_body_unavailable"
-            capture["finished"] = True
-        finally:
-            response_read_in_progress = False
-
-    def guard_response(event: Mapping[str, Any]) -> None:
-        nonlocal pending_response
-        if is_stopped():
-            fail_fetch(event.get("requestId"), pause_stage="response")
-            return
-        request = event.get("request")
-        response_url = (
-            request.get("url") if isinstance(request, Mapping) else None
-        )
-        fetch_request_id = event.get("requestId")
-        network_request_id = event.get("networkId")
-        method = str(request.get("method") or "").upper() if isinstance(request, Mapping) else ""
-        if not is_history_url(response_url):
-            # Conversation-init/model POSTs share the conversation* pattern.
-            # Fail only this pause; do not stop later GET index/detail.
-            fail_fetch(fetch_request_id, pause_stage="response")
-            return
-        if method != "GET":
-            fail_fetch(fetch_request_id, pause_stage="response")
-            return
-        if isinstance(fetch_request_id, str) and (
-            fetch_request_id == capture.get("fetch_request_id")
-            or network_request_id == capture.get("network_request_id")
-        ):
-            capture["fetch_request_id"] = fetch_request_id
-        store_response(
-            request_id=network_request_id,
-            response_url=response_url,
-            status=_native_history_status(event.get("responseStatusCode")),
-            headers=event.get("responseHeaders"),
-            classify_boundary=False,
-        )
-        continue_fetch(fetch_request_id, pause_stage="response")
-        return
-        if not history_admitted:
-            continue_fetch(fetch_request_id, pause_stage="response")
-            return
-        owned_fetch = capture.get("fetch_request_id")
-        owned_network = capture.get("network_request_id")
-        if fetch_request_id != owned_fetch and network_request_id != owned_network:
-            # Same GET often re-pauses with a new Fetch id. Continue it so
-            # Network.getResponseBody can still read the admitted history GET.
-            continue_fetch(fetch_request_id, pause_stage="response")
-            return
-        if isinstance(fetch_request_id, str):
-            capture["fetch_request_id"] = fetch_request_id
-        status = _native_history_status(event.get("responseStatusCode"))
-        headers = event.get("responseHeaders")
-        if "responseErrorReason" in event:
-            store_response(
-                request_id=network_request_id,
-                response_url=response_url,
-                status=status,
-                headers=headers,
-                classify_boundary=False,
-            )
-            capture["response_error_observed"] = True
-            capture["body_failure_reason"] = "history_response_transport_failed"
-            capture["finished"] = True
-            set_boundary("history_response_transport_failed")
-            fail_fetch(fetch_request_id, pause_stage="response")
-            return
-        store_response(
-            request_id=network_request_id,
-            response_url=response_url,
-            status=status,
-            headers=headers,
-        )
-        status_failure = _native_history_failure_for_status(status)
-        if terminal_failure is not None or boundary_reason is not None:
-            fail_fetch(fetch_request_id, pause_stage="response")
-            capture["finished"] = True
-            return
-        if status_failure is not None:
-            capture["body_failure_reason"] = status_failure
-            fail_fetch(fetch_request_id, pause_stage="response")
-            capture["finished"] = True
-            return
-        if capture.get("content_type") != "json":
-            capture["body_failure_reason"] = "non_json_response"
-            fail_fetch(fetch_request_id, pause_stage="response")
-            capture["finished"] = True
-            return
-        pending_response = {
-            "fetch_request_id": fetch_request_id,
-            "network_request_id": network_request_id,
-            "response_headers": headers,
-        }
-        process_pending_response()
-
-    def guard_request(  # noqa: PLR0915 - admission branches share one boundary
-        event: Mapping[str, Any],
-        *,
-        from_hold: bool = False,
-    ) -> None:
-        nonlocal history_admitted, init_fetch_id
-        if (
-            "responseStatusCode" in event
-            or "responseHeaders" in event
-            or "responseErrorReason" in event
-        ):
-            guard_response(event)
-            return
-        if observer_closed:
-            fail_fetch(event.get("requestId"), pause_stage="request")
-            return
-        if is_stopped():
-            fail_fetch(event.get("requestId"), pause_stage="request")
-            return
-        request = event.get("request")
-        request_id = event.get("requestId")
-        if not isinstance(request, Mapping):
-            set_boundary("malformed_request_event")
-            fail_fetch(request_id, pause_stage="request")
-            return
-        url = request.get("url", "")
-        parsed = urlsplit(url if isinstance(url, str) else "")
-        method = str(request.get("method") or "").upper()
-        redirected = event.get("redirectedRequestId")
-        history = is_history_url(url)
-        blocked = False
-        mutation_block_branch: Optional[str] = None
-        decision = classify_native_history_request(
-            method=method,
-            url=url,
-            resource_type=event.get("resourceType"),
-            redirected=redirected,
-        )
-        if isinstance(init_fetch_id, str) and redirected == init_fetch_id:
-            set_boundary("init_request_redirected")
-            blocked = True
-        if isinstance(request_id, str):
-            if request_id in seen_fetch_request_ids and not from_hold:
-                set_boundary("fetch_request_replayed")
-                blocked = True
-            elif request_id not in seen_fetch_request_ids:
-                seen_fetch_request_ids.add(request_id)
-        if history:
-            if method != "GET":
-                blocked = True
-                mutation_block_branch = "mutating_method"
-            else:
-                network_request_id = event.get("networkId")
-                record = record_network_request(
-                    network_request_id,
-                    request=request,
-                    redirected=redirected,
-                )
-                if (
-                    history_admitted
-                    and network_request_id == capture.get("network_request_id")
-                ):
-                    set_boundary("history_request_replayed")
-                elif len(history_network_ids) > _NATIVE_HISTORY_MAX_COUNT:
-                    set_boundary("history_request_limit_exceeded")
-                elif not isinstance(request_id, str):
-                    set_boundary("history_request_identity_missing")
-                elif not isinstance(network_request_id, str):
-                    set_boundary("history_request_identity_missing")
-                elif redirected is not None or (
-                    isinstance(record, Mapping) and record.get("redirected")
-                ):
-                    set_boundary("history_request_redirected")
-                elif isinstance(record, Mapping) and record.get("identity_conflict"):
-                    set_boundary("account_identity_mismatch")
-                elif terminal_failure is not None:
-                    set_boundary("terminal_failure")
-                elif boundary_reason is not None:
-                    pass
-                elif (
-                    history_admitted
-                    and network_request_id != capture.get("network_request_id")
-                    and (
-                        pending_response is not None
-                        or response_read_in_progress
-                        or capture.get("finished") is not True
-                    )
-                ):
-                    held_history_requests.append(event)
-                    return
-                else:
-                    history_admitted = True
-                    capture.update(
-                        request_id=network_request_id,
-                        network_request_id=network_request_id,
-                        fetch_request_id=request_id,
-                        method=method,
-                        history_path=parsed.path,
-                        body_omitted=(
-                            not request.get("hasPostData", False)
-                            and "postData" not in request
-                        ),
-                        finished=False,
-                        response_stream_complete=False,
-                        loading_failed=False,
-                    )
-                    capture.pop("body_failure_reason", None)
-                    capture.pop("structural", None)
-                    apply_network_record(record)
-                    if (
-                        capture.get("loading_failed")
-                        and capture.get("body_failure_reason") is None
-                    ):
-                        capture["body_failure_reason"] = "history_response_failed"
-        elif is_init_url(url):
-            if method != "POST":
-                set_boundary("init_request_invalid_method")
-            elif redirected is not None or request.get("redirectResponse"):
-                set_boundary("init_request_redirected")
-            elif not isinstance(request_id, str):
-                set_boundary("init_request_identity_missing")
-            elif init_fetch_id is None:
-                init_fetch_id = request_id
-            # Extra same-origin conversation-init POSTs are SPA bootstrap.
-            # Continue them so later history GETs can still reconstruct.
-        elif decision["action"] == "fail" and decision["history"]:
-            blocked = True
-            if decision["boundary_reason"]:
-                set_boundary(str(decision["boundary_reason"]))
-        elif event.get("resourceType") == "Document":
-            if not _is_admitted_browser_document_request(
-                method, event.get("resourceType")
-            ):
-                # Fail only this mutating Document. GET challenge frames must
-                # not stop later chatgpt.com history observation.
-                blocked = True
-        elif decision["mutation_block_branch"] == "mutating_method":
-            # Reject this request without stopping unrelated permitted reads.
-            blocked = True
-            mutation_block_branch = "mutating_method"
-        elif parsed.path == CHATGPT_NATIVE_HISTORY_INDEX_PATH and method != "GET":
-            blocked = True
-            mutation_block_branch = "mutating_method"
-        if (
-            decision["mutation_block_branch"] == "model_or_mutation_path"
-            and not history
-            and not is_init_url(url)
-        ):
-            blocked = True
-            mutation_block_branch = mutation_block_branch or "model_or_mutation_path"
-            # Fail this model/mutation POST without aborting reconstructed
-            # history pages already observed on this navigation.
-            if not capture.get("history_pages"):
-                set_boundary("model_or_mutation_blocked")
-        if decision["blocked_request"] is not None and "blocked_request" not in capture:
-            capture["blocked_request"] = decision["blocked_request"]
-        if mutation_block_branch is not None and "blocked_request" not in capture:
-            if parsed.scheme == "https" and parsed.netloc == "chatgpt.com":
-                origin_category = "chatgpt"
-            elif parsed.scheme == "https":
-                origin_category = "other_https"
-            else:
-                origin_category = "other"
-            if is_model_or_mutation_path(parsed.path):
-                route_family = "model_or_mutation"
-            elif parsed.path in _NATIVE_HISTORY_BOOTSTRAP_READ_PATHS:
-                route_family = "bootstrap_read"
-            elif parsed.path.startswith("/backend-api/"):
-                route_family = "other_backend_api"
-            elif parsed.path.startswith("/api/"):
-                route_family = "other_api"
-            else:
-                route_family = "other"
-            resource_type = event.get("resourceType")
-            capture["blocked_request"] = {
-                "branch": mutation_block_branch,
-                "method": (
-                    method
-                    if method in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}
-                    else "other"
-                ),
-                "resource_type": (
-                    resource_type
-                    if resource_type in ("Document", "XHR", "Fetch", "Ping", "Script")
-                    else "other"
-                ),
-                "origin_category": origin_category,
-                "route_family": route_family,
-            }
-        if is_stopped():
-            blocked = True
-        if blocked:
-            fail_fetch(request_id, pause_stage="request")
-        elif not is_stopped():
-            continue_fetch(request_id)
-
-    def request_seen(event: Mapping[str, Any]) -> None:
-        nonlocal request_count, history_admitted
-        request_count = min(
-            request_count + 1,
-            _NATIVE_HISTORY_MAX_COUNT + 1,
-        )
-        request = event.get("request")
-        if not isinstance(request, Mapping):
-            set_boundary("malformed_request_event")
-            return
-        network_id = event.get("requestId")
-        if not isinstance(network_id, str):
-            return
-        url = request.get("url", "")
-        record = record_network_request(
-            network_id,
-            request=request,
-            redirected=event.get("redirectedRequestId"),
-        )
-        if is_history_url(url):
-            if len(history_network_ids) > _NATIVE_HISTORY_MAX_COUNT:
-                set_boundary("history_request_limit_exceeded")
-            elif (
-                str(request.get("method") or "").upper() == "GET"
-                and event.get("redirectedRequestId") is None
-                and not is_stopped()
-            ):
-                if not history_admitted or (
-                    capture.get("finished") is True
-                    and network_id != capture.get("network_request_id")
-                ):
-                    history_admitted = True
-                    parsed = urlsplit(url if isinstance(url, str) else "")
-                    capture.update(
-                        request_id=network_id,
-                        network_request_id=network_id,
-                        method="GET",
-                        history_path=parsed.path,
-                        body_omitted=(
-                            not request.get("hasPostData", False)
-                            and "postData" not in request
-                        ),
-                        finished=False,
-                        response_stream_complete=False,
-                        loading_failed=False,
-                    )
-                    capture.pop("body_failure_reason", None)
-                    capture.pop("structural", None)
-                    apply_network_record(record)
-        elif is_init_url(url) and (
-            event.get("redirectResponse")
-            or event.get("redirectedRequestId") is not None
-        ):
-            set_boundary("init_request_redirected")
-        if (
-            isinstance(init_fetch_id, str)
-            and event.get("redirectedRequestId") == init_fetch_id
-        ):
-            set_boundary("init_request_redirected")
-        if network_id == capture.get("network_request_id"):
-            apply_network_record(record)
-
-    def extra_seen(event: Mapping[str, Any]) -> None:
-        request_id = event.get("requestId")
-        record = record_network_extra(
-            request_id,
-            headers=event.get("headers"),
-        )
-        if record is None:
-            return
-        if request_id == capture.get("network_request_id"):
-            apply_network_record(record)
-        if not response_read_in_progress and not is_stopped():
-            process_pending_response()
-            process_network_history_body()
-
-    def response_seen(event: Mapping[str, Any]) -> None:
-        response = event.get("response")
-        if not isinstance(response, Mapping):
-            set_boundary("malformed_response_event")
-            return
-        request_id = event.get("requestId")
-        response_url = response.get("url")
-        headers = response.get("headers")
-        status = _native_history_status(response.get("status"))
-        record_relevant_response(
-            response_url=response_url,
-            status=status,
-            headers=headers,
-        )
-        store_response(
-            request_id=request_id,
-            response_url=response_url,
-            status=status,
-            headers=headers,
-        )
-
-    def loading_finished(event: Mapping[str, Any]) -> None:
-        request_id = event.get("requestId")
-        store_loading_finished(request_id, event)
-        if not is_stopped():
-            process_network_history_body()
-
-    def loading_failed(event: Mapping[str, Any]) -> None:
-        request_id = event.get("requestId")
-        store_loading_failed(request_id)
-
-    def finalize_capture(failure_reason: Optional[str] = None) -> Mapping[str, Any]:
-        if pending_response is not None:
-            fail_fetch(
-                pending_response.get("fetch_request_id"),
-                pause_stage="response",
-            )
-        if boundary_reason is not None:
-            capture["boundary_reason"] = boundary_reason
-        if terminal_failure is not None:
-            capture["terminal_reason"] = terminal_reason()
-        capture["retry_after_seconds"] = retry_after_max
-        if isinstance(capture.get("request_id"), str):
-            result = _native_history_finalize_observation(
-                capture,
-                expected_account_hash=expected_account_hash,
-                page_target_id_matched=True,
-                request_count=request_count,
-                history_request_count=history_request_count,
-                max_response_bytes=max_response_bytes,
-                structural=capture.get("structural"),
-                failure_reason=failure_reason,
-            )
-        else:
-            result = _native_history_no_route_observation(
-                page_target_id_matched=True,
-                request_count=request_count,
-                history_request_count=history_request_count,
-                failure_reason=(
-                    terminal_reason()
-                    or boundary_reason
-                    or failure_reason
-                    or "no_history_observed"
-                ),
-                browser_challenge=browser_challenge,
-                retry_after_seconds=terminal_retry_after(),
-            )
-        if "blocked_request" in capture:
-            result["blocked_request"] = capture["blocked_request"]
-        return result
-    try:
-        session.on("Fetch.requestPaused", guard_request)
-        session.on("Network.requestWillBeSent", request_seen)
-        session.on("Network.requestWillBeSentExtraInfo", extra_seen)
-        session.on("Network.responseReceived", response_seen)
-        session.on("Network.loadingFinished", loading_finished)
-        session.on("Network.loadingFailed", loading_failed)
-        session.send(
-            "Network.enable",
-            {
-                "maxTotalBufferSize": max_response_bytes * 2,
-                "maxResourceBufferSize": max_response_bytes,
-                "maxPostDataSize": 0,
-            },
-        )
-        session.send("Network.setBypassServiceWorker", {"bypass": True})
-        try:
-            session.send(
-                "Fetch.enable",
-                _chatgpt_browser_fetch_enable_params(
-                    extra_patterns=_CHATGPT_BROWSER_HISTORY_FETCH_MUTATION_PATTERNS,
-                ),
-            )
-        except Exception as exc:
-            if not _is_nonfatal_browser_runtime_error(exc):
-                raise
-        if is_stopped():
-            set_boundary("history_capture_aborted")
-        else:
-            try:
-                _chatgpt_browser_navigate(session, CHATGPT_NATIVE_HISTORY_HOME_URL)
-            except Exception as exc:
-                if (
-                    not _is_nonfatal_browser_runtime_error(exc)
-                    and _oracle_browser_safe_error_class(exc) != "timeout"
-                ):
-                    set_boundary("home_navigation_failed")
-        while True:
-            process_pending_response()
-            process_network_history_body()
-            if terminal_failure is not None or boundary_reason is not None:
-                history_pages = capture.get("history_pages")
-                if (
-                    isinstance(history_pages, list)
-                    and history_pages
-                    and boundary_reason
-                    in {
-                        "init_request_limit_exceeded",
-                        "init_request_invalid_method",
-                        "model_or_mutation_blocked",
-                    }
-                    and terminal_failure is None
-                ):
-                    return finalize_capture()
-                return finalize_capture(terminal_reason() or boundary_reason)
-            if capture.get("body_failure_reason"):
-                return finalize_capture(capture.get("body_failure_reason"))
-            history_pages = capture.get("history_pages")
-            if (
-                isinstance(history_pages, list)
-                and history_pages
-                and pending_response is None
-                and not response_read_in_progress
-            ):
-                has_index = any(
-                    isinstance(history_page, Mapping)
-                    and history_page.get("route_class") == "modern_history_index"
-                    for history_page in history_pages
-                )
-                has_detail = any(
-                    isinstance(history_page, Mapping)
-                    and history_page.get("route_class")
-                    in {
-                        "modern_conversation_detail",
-                        "modern_conversation_messages",
-                        "legacy_conversation_detail",
-                    }
-                    for history_page in history_pages
-                )
-                if has_index and not has_detail and not capture.get("detail_requested"):
-                    conversation_id = None
-                    for history_page in history_pages:
-                        if not isinstance(history_page, Mapping):
-                            continue
-                        items = history_page.get("items")
-                        if not isinstance(items, list):
-                            continue
-                        for item in items:
-                            if not isinstance(item, Mapping):
-                                continue
-                            candidate = item.get("conversation_id")
-                            if isinstance(candidate, str) and candidate:
-                                conversation_id = candidate
-                                break
-                        if conversation_id:
-                            break
-                    if conversation_id:
-                        capture["detail_requested"] = True
-                        try:
-                            _chatgpt_browser_navigate(
-                                session,
-                                "https://chatgpt.com/c/" + conversation_id,
-                            )
-                        except Exception as exc:
-                            if (
-                                not _is_nonfatal_browser_runtime_error(exc)
-                                and _oracle_browser_safe_error_class(exc) != "timeout"
-                            ):
-                                set_boundary("home_navigation_failed")
-                if has_index and has_detail:
-                    return finalize_capture()
-            if _remaining_browser_timeout(capture_deadline) <= 0:
-                history_pages = capture.get("history_pages")
-                if (
-                    isinstance(history_pages, list)
-                    and any(
-                        isinstance(history_page, Mapping)
-                        and history_page.get("route_class") == "modern_history_index"
-                        for history_page in history_pages
-                    )
-                    and any(
-                        isinstance(history_page, Mapping)
-                        and history_page.get("route_class")
-                        in {
-                            "modern_conversation_detail",
-                            "modern_conversation_messages",
-                            "legacy_conversation_detail",
-                        }
-                        for history_page in history_pages
-                    )
-                ):
-                    return finalize_capture()
-                if history_request_count > 0:
-                    set_boundary("history_response_timeout")
-                    return finalize_capture()
-                return finalize_capture("no_history_observed")
-            try:
-                if is_stopped():
-                    continue
-                challenge_visible = bool(
-                    page.evaluate(
-                        "() => [...document.querySelectorAll("
-                        "'form#challenge-form[action*=\"__cf_chl\"],"
-                        "form#challenge-form[action^=\"/cdn-cgi/challenge-platform/\"],"
-                        "#challenge-running')].some(node => {"
-                        "const rect = node.getBoundingClientRect();"
-                        "return rect.width > 0 && rect.height > 0 &&"
-                        "getComputedStyle(node).visibility !== 'hidden';})"
-                    )
-                )
-            except Exception:
-                challenge_visible = False
-            if challenge_visible:
-                latch_terminal("browser_challenge", challenged=True)
-                continue
-            if is_stopped():
-                continue
-            try:
-                page.wait_for_timeout(
-                    min(
-                        50,
-                        _browser_timeout_milliseconds(
-                            _remaining_browser_timeout(capture_deadline)
-                        ),
-                    )
-                )
-            except Exception as extra:
-                if not _is_nonfatal_browser_runtime_error(extra):
-                    if capture.get("history_pages"):
-                        return finalize_capture()
-                    raise
-    finally:
-        # Fetch interception remains installed until the owned target closes.
-        observer_closed = True
-        capture["observer_closed"] = True
-
-
-def observe_native_chatgpt_history_from_oracle_browser(
-    *,
-    page_target_id: str,
-    cdp_endpoint: Optional[str] = None,
-    lifecycle_capability: Optional[NativeHistoryLifecycleCapability] = None,
-    expected_account_hash: str = CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH,
-    timeout_seconds: float = CHATGPT_NATIVE_HISTORY_DEFAULT_TIMEOUT_SECONDS,
-    max_response_bytes: int = CHATGPT_NATIVE_HISTORY_MAX_RESPONSE_BYTES,
-) -> Dict[str, Any]:
-    """Observe native ChatGPT history index/detail/message GETs through Oracle CDP.
-
-    The caller supplies an exact existing CDP page target as a context anchor
-    and the canonical account hash pin. The observer creates one owned page in
-    that context, performs one ordinary ChatGPT home navigation, and returns
-    metadata-only index, detail, and message pages. It never issues a direct
-    history request, reads browser storage, exports headers, or submits a
-    model message. Native history requires a lifecycle capability from the
-    owner that actually launched the private browser; a bare CDP endpoint is
-    intentionally insufficient.
-    """
-
-    if lifecycle_capability is None or not all(
-        callable(getattr(lifecycle_capability, method_name, None))
-        for method_name in (
-            "register_native_history",
-            "register_native_history_closer",
-            "retain_native_history",
-            "release_native_history",
-            "retire_native_history",
-            "prepare_native_history_cleanup_plan",
-            "terminate_native_history_process_scope",
-            "terminate_owned_browser",
-            "bind_native_history_endpoint",
-        )
-    ):
-        raise OracleBrowserBoundaryUnavailable(
-            "Native ChatGPT history requires private browser lifecycle ownership."
-        )
-    if expected_account_hash != CHATGPT_NATIVE_HISTORY_EXPECTED_ACCOUNT_HASH:
-        raise OracleBrowserBoundaryUnavailable(
-            "Native ChatGPT history requires the pinned inventory account hash."
-        )
-    if not isinstance(timeout_seconds, (int, float)) or isinstance(
-        timeout_seconds,
-        bool,
-    ):
-        raise OracleBrowserBoundaryUnavailable(
-            "Native ChatGPT history timeout is invalid."
-        )
-    if (
-        not isfinite(float(timeout_seconds))
-        or timeout_seconds <= 0
-        or timeout_seconds > CHATGPT_NATIVE_HISTORY_DEFAULT_TIMEOUT_SECONDS
-    ):
-        raise OracleBrowserBoundaryUnavailable(
-            "Native ChatGPT history timeout exceeds the 150-second limit."
-        )
-    if (
-        isinstance(max_response_bytes, bool)
-        or not isinstance(max_response_bytes, int)
-        or max_response_bytes <= 0
-        or max_response_bytes > CHATGPT_NATIVE_HISTORY_MAX_RESPONSE_BYTES
-    ):
-        raise OracleBrowserBoundaryUnavailable(
-            "Native ChatGPT history response budget exceeds the 1 MiB limit."
-        )
-    target_id = _validate_page_target_id(page_target_id)
-    endpoint = cdp_endpoint
-    if endpoint is None:
-        endpoint = os.getenv(CHATGPT_CONVERSATION_INIT_BROWSER_CDP_ENDPOINT_ENV)
-    if endpoint is None:
-        endpoint = os.getenv(ORACLE_BROWSER_CDP_ENDPOINT_ENV)
-    endpoint = str(endpoint or DEFAULT_ORACLE_BROWSER_CDP_ENDPOINT).strip()
-    if not endpoint:
-        raise OracleBrowserBoundaryUnavailable(
-            "Oracle browser CDP endpoint is not configured."
-        )
-    deadline = time.monotonic() + float(timeout_seconds)
-    operation_start = time.monotonic()
-    target_close_budget = min(
-        10.0,
-        max(0.0, deadline - operation_start) / 4,
-    )
-    try:
-        lifecycle_capability.bind_native_history_endpoint(
-            cdp_endpoint=endpoint,
-            anchor_target_id=target_id,
-        )
-    except Exception as exc:
-        raise OracleBrowserBoundaryUnavailable(
-            "Native ChatGPT history lifecycle endpoint binding failed."
-        ) from exc
-    try:
-        return dict(
-            _run_oracle_browser_history_observation_in_worker(
-                cdp_endpoint=endpoint,
-                page_target_id=target_id,
-                expected_account_hash=expected_account_hash,
-                deadline=deadline,
-                operation_start=operation_start,
-                target_close_budget=target_close_budget,
-                max_response_bytes=max_response_bytes,
-                lifecycle_capability=lifecycle_capability,
-            )
-        )
-    except OracleBrowserBoundaryUnavailable:
-        raise
-    except Exception as exc:
-        raise OracleBrowserBoundaryUnavailable(
-            "Oracle browser boundary is unavailable for native ChatGPT history."
-        ) from exc
 
 
 class OracleBrowserConversationInitTransport:
@@ -6072,7 +2933,6 @@ def _run_oracle_browser_capture_in_worker(
     context = _oracle_browser_process_context(playwright_factory)
     receiver, sender = context.Pipe(duplex=False)
     private_process_group = context.RawValue("q", 0)
-    private_process_start_time = context.RawValue("q", 0)
     owned_target = context.RawArray("c", 256)
     # Publish the state last so a kill cannot expose a partially copied ID.
     creation_state = context.RawValue("b", 0)
@@ -6090,7 +2950,6 @@ def _run_oracle_browser_capture_in_worker(
             capture_deadline,
             playwright_factory,
             private_process_group,
-            private_process_start_time,
             expected_account_hash,
             owned_target,
             creation_state,
@@ -6119,24 +2978,13 @@ def _run_oracle_browser_capture_in_worker(
                 "Oracle browser conversation-init cleanup timed out."
             )
         if not isinstance(message, Mapping) or message.get("ok") is not True:
-            suffix = (
-                _oracle_browser_worker_error_suffix(message)
-                if isinstance(message, Mapping)
-                else ""
-            )
             raise OracleBrowserBoundaryUnavailable(
-                "Oracle browser boundary is unavailable for conversation-init"
-                + suffix
-                + "."
+                "Oracle browser boundary is unavailable for conversation-init."
             )
         return _coerce_browser_response(message.get("result"))
     finally:
         receiver.close()
-        _terminate_oracle_browser_worker(
-            process,
-            private_process_group.value,
-            private_process_start_time,
-        )
+        _terminate_oracle_browser_worker(process, private_process_group.value)
         process.join(timeout=min(0.1, max(0.0, _remaining_browser_timeout(deadline))))
         target_id = owned_target.value if creation_state.value == 2 else b""
         if creation_state.value:
@@ -6158,39 +3006,29 @@ def _oracle_browser_capture_worker(
     deadline: float,
     playwright_factory: Optional[Callable[[], Any]],
     private_process_group: Any,
-    private_process_start_time: Any,
     expected_account_hash: str,
     owned_target: Any,
     creation_state: Any,
     creation_url: str,
 ) -> None:
-    _enter_oracle_browser_worker_process_group(
-        private_process_group,
-        private_process_start_time,
-    )
+    _enter_oracle_browser_worker_process_group(private_process_group)
     playwright = None
     browser = None
     owned_page = None
     target_session = None
     result = None
     successful = False
-    error_class: Optional[str] = None
-    error_stage: Optional[str] = None
     try:
-        error_stage = "deadline"
         _raise_if_browser_deadline_expired(deadline)
-        error_stage = "playwright"
         playwright = _start_playwright_from_factory(playwright_factory)
         _raise_if_browser_deadline_expired(deadline)
-        error_stage = "cdp_connect"
         browser = playwright.chromium.connect_over_cdp(
             cdp_endpoint,
             timeout=_browser_timeout_milliseconds(
-                _chatgpt_browser_cdp_connect_timeout_seconds(deadline)
+                _remaining_browser_timeout(deadline)
             ),
         )
         _raise_if_browser_deadline_expired(deadline)
-        error_stage = "find_anchor"
         source_page = _find_existing_chatgpt_page(
             browser,
             page_target_id,
@@ -6203,9 +3041,7 @@ def _oracle_browser_capture_worker(
                 "context anchor for the conversation-init request."
             )
         _raise_if_browser_deadline_expired(deadline)
-        error_stage = "browser_cdp_session"
         target_session = browser.new_browser_cdp_session()
-        error_stage = "create_owned_page"
         owned_page = _create_owned_oracle_page(
             target_session,
             source_page,
@@ -6215,32 +3051,17 @@ def _oracle_browser_capture_worker(
             creation_url,
             deadline,
         )
-        error_stage = "owned_cdp_session"
-        owned_session = None
-        while owned_session is None:
-            _raise_if_browser_deadline_expired(deadline)
-            try:
-                owned_session = owned_page.context.new_cdp_session(owned_page)
-            except Exception as exc:
-                if not _is_nonfatal_browser_runtime_error(exc):
-                    raise
-                time.sleep(0.05)
-        error_stage = "observe_native_init"
         result = _observe_native_oracle_init(
             owned_page,
-            session=owned_session,
+            session=owned_page.context.new_cdp_session(owned_page),
             request_url=request_url,
             expected_account_hash=expected_account_hash,
             deadline=deadline,
         )
         _raise_if_browser_deadline_expired(deadline)
         successful = True
-        error_class = None
-        error_stage = None
-    except Exception as exc:
+    except Exception:
         successful = False
-        error_class = _oracle_browser_safe_error_class(exc)
-        error_stage = _oracle_browser_safe_error_stage(error_stage)
     finally:
         if owned_target.value and target_session is not None:
             try:
@@ -6254,27 +3075,20 @@ def _oracle_browser_capture_worker(
                     )
                 creation_state.value = 0
                 owned_target.value = b""
-            except Exception as exc:
+            except Exception:
                 successful = False
-                error_class = error_class or _oracle_browser_safe_error_class(exc)
-                error_stage = error_stage or "close_owned_target"
         try:
             _disconnect_attached_browser(playwright, browser)
-        except Exception as exc:
+        except Exception:
             successful = False
-            error_class = error_class or _oracle_browser_safe_error_class(exc)
-            error_stage = error_stage or "disconnect"
-        payload: Dict[str, Any] = {
-            "ok": successful,
-            "result": result if successful else None,
-        }
-        if not successful:
-            if error_class is not None:
-                payload["error_class"] = error_class
-            if error_stage is not None:
-                payload["error_stage"] = error_stage
         try:
-            _send_oracle_browser_worker_message(sender, payload)
+            _send_oracle_browser_worker_message(
+                sender,
+                {
+                    "ok": successful,
+                    "result": result if successful else None,
+                },
+            )
         except Exception:
             try:
                 _send_oracle_browser_worker_message(
@@ -6285,1168 +3099,6 @@ def _oracle_browser_capture_worker(
                 pass
         finally:
             sender.close()
-
-
-def _run_oracle_browser_history_observation_in_worker(  # noqa: PLR0915 - bounded lifecycle supervisor
-    *,
-    cdp_endpoint: str,
-    page_target_id: str,
-    expected_account_hash: str,
-    deadline: float,
-    operation_start: float,
-    target_close_budget: float,
-    max_response_bytes: int,
-    lifecycle_capability: NativeHistoryLifecycleCapability,
-) -> Mapping[str, Any]:
-    context = _oracle_browser_process_context(None)
-    receiver, sender = context.Pipe(duplex=False)
-    private_process_group = context.RawValue("q", 0)
-    private_process_start_time = context.RawValue("q", 0)
-    owned_target = context.RawArray("c", 256)
-    creation_state = context.RawValue("b", 0)
-    creation_issued = context.RawValue("b", False)
-    creation_gate = context.Lock()
-    creation_settled = context.Event()
-    abort_event = context.Event()
-    release_event = context.Event()
-    release_control_failed = context.RawValue("b", False)
-    creation_url = "about:blank#oracle-native-history-" + os.urandom(16).hex()
-    registration_id = "native-history-" + os.urandom(16).hex()
-    role_marker = "history-observer:" + registration_id
-    target_close_budget = min(
-        _NATIVE_HISTORY_CLEANUP_RESERVE_SECONDS,
-        max(0.0, target_close_budget),
-    )
-    target_close_reserve = min(
-        target_close_budget,
-        max(0.0, deadline - operation_start),
-    )
-    capture_deadline = max(
-        operation_start,
-        deadline - target_close_reserve,
-    )
-    process = context.Process(
-        target=_oracle_browser_history_observation_worker,
-        args=(
-            sender,
-            cdp_endpoint,
-            page_target_id,
-            capture_deadline,
-            deadline,
-            expected_account_hash,
-            max_response_bytes,
-            private_process_group,
-            private_process_start_time,
-            role_marker,
-            owned_target,
-            creation_state,
-            creation_url,
-            creation_issued,
-            creation_gate,
-            creation_settled,
-            abort_event,
-            release_event,
-            release_control_failed,
-        ),
-    )
-    registration = NativeHistoryLifecycleRegistration(
-        process=process,
-        private_process_group=private_process_group,
-        private_process_start_time=private_process_start_time,
-        creation_state=creation_state,
-        owned_target=owned_target,
-        creation_url=creation_url,
-        abort_event=abort_event,
-        release_event=release_event,
-        release_control_state=release_control_failed,
-        creation_gate=creation_gate,
-        creation_settled=creation_settled,
-        creation_issued=creation_issued,
-        cdp_endpoint=cdp_endpoint,
-        anchor_target_id=page_target_id,
-        deadline=deadline,
-        operation_start=operation_start,
-        target_close_budget=target_close_budget,
-        finalization_gate=context.Lock(),
-        registration_id=registration_id,
-    )
-    registration.cleanup_callback = lambda cleanup_deadline, poll_only=False: (
-        _finalize_native_history_registration(
-            registration,
-            lifecycle_capability,
-            cleanup_deadline=cleanup_deadline,
-            operation_deadline=deadline,
-            poll_only=poll_only,
-        )
-    )
-    try:
-        # The owner must know every shared handle before a child can publish
-        # browser or target state.
-        lifecycle_capability.register_native_history(registration)
-    except Exception as exc:
-        sender.close()
-        receiver.close()
-        raise OracleBrowserCleanupError(
-            "Native ChatGPT history lifecycle registration failed."
-        ) from exc
-    operation_error: Optional[Exception] = None
-    result: Optional[Mapping[str, Any]] = None
-    try:
-        registration.start_state = "starting"
-        process.start()
-        registration.start_state = "started"
-    except Exception as exc:
-        registration.start_state = "failed"
-        operation_error = OracleBrowserBoundaryUnavailable(
-            "Oracle browser history observer worker could not start."
-        )
-        operation_error.__cause__ = exc
-    sender.close()
-    try:
-        if operation_error is None:
-            try:
-                message = _receive_oracle_browser_worker_message(
-                    receiver,
-                    capture_deadline,
-                    should_stop=registration.abort_event.is_set,
-                )
-                if not isinstance(message, Mapping):
-                    raise OracleBrowserBoundaryUnavailable(
-                        "Oracle browser history observer is unavailable."
-                    )
-                candidate = message.get("result")
-                if isinstance(candidate, Mapping):
-                    result = dict(candidate)
-                elif message.get("ok") is True:
-                    raise OracleBrowserBoundaryUnavailable(
-                        "Oracle browser history observer returned an invalid result."
-                    )
-                else:
-                    raise OracleBrowserBoundaryUnavailable(
-                        "Oracle browser history observer is unavailable"
-                        + _oracle_browser_worker_error_suffix(message)
-                        + "."
-                    )
-            except Exception as exc:
-                operation_error = exc
-    finally:
-        receiver.close()
-
-    cleanup_error: Optional[Exception] = None
-    try:
-        if not _finalize_native_history_registration(
-            registration,
-            lifecycle_capability,
-            cleanup_deadline=deadline,
-            operation_deadline=deadline,
-        ):
-            cleanup_error = OracleBrowserCleanupError(
-                registration.cleanup_failure
-                or "Native ChatGPT history cleanup could not be proven."
-            )
-        elif registration.cleanup_failure is not None:
-            cleanup_error = OracleBrowserCleanupError(
-                registration.cleanup_failure
-            )
-    except Exception as exc:
-        cleanup_error = (
-            exc
-            if isinstance(exc, OracleBrowserCleanupError)
-            else OracleBrowserCleanupError(
-                "Native ChatGPT history cleanup failed."
-            )
-        )
-        if cleanup_error is not exc:
-            cleanup_error.__cause__ = exc
-    if result is not None:
-        observed = dict(result)
-        if cleanup_error is not None:
-            observed["cleanup_error_class"] = cleanup_error.__class__.__name__
-            observed["cleanup_unproven"] = True
-        return observed
-    if operation_error is not None:
-        raise operation_error
-    if cleanup_error is not None:
-        raise cleanup_error
-    raise OracleBrowserBoundaryUnavailable(
-        "Oracle browser history observer returned no result."
-    )
-
-
-def _native_history_mark_no_create(
-    *,
-    creation_state: Any,
-    creation_issued: Any,
-    creation_settled: Any,
-) -> bool:
-    """Publish an explicit no-create acknowledgement, never infer it from NONE."""
-
-    if bool(creation_issued.value):
-        return False
-    creation_state.value = _NATIVE_HISTORY_TARGET_NO_CREATE
-    creation_settled.set()
-    return True
-
-
-def _native_history_wait_for_release(
-    release_event: Any,
-) -> bool:
-    while True:
-        try:
-            if release_event.wait(timeout=0.05):
-                return True
-        except (OSError, ValueError):
-            return False
-
-
-def _native_history_cleanup_phase_plan(
-    registration: NativeHistoryLifecycleRegistration,
-    cleanup_deadline: float,
-    operation_deadline: float,
-) -> Dict[str, float]:
-    """Allocate one immutable cleanup plan and only clamp it earlier."""
-
-    ceiling = min(
-        float(registration.deadline),
-        float(operation_deadline),
-        float(cleanup_deadline),
-    )
-    if registration.shutdown_deadline is not None:
-        ceiling = min(ceiling, float(registration.shutdown_deadline))
-    now = time.monotonic()
-    if registration.cleanup_plan is None:
-        start = min(now, ceiling)
-        reserve = min(
-            _NATIVE_HISTORY_CLEANUP_RESERVE_SECONDS,
-            max(0.0, registration.target_close_budget),
-            max(0.0, ceiling - start),
-        )
-        end = start + reserve
-        registration.cleanup_plan = {
-            "target_close_deadline": start + reserve / 3,
-            "term_deadline": start + reserve / 2,
-            "kill_deadline": start + reserve * 2 / 3,
-            "reap_deadline": start + reserve * 5 / 6,
-            "final_deadline": end,
-        }
-    else:
-        for phase_name, phase_deadline in list(registration.cleanup_plan.items()):
-            registration.cleanup_plan[phase_name] = min(
-                phase_deadline,
-                ceiling,
-            )
-    return registration.cleanup_plan
-
-
-def _native_history_process_start_time(pid: Any) -> Optional[int]:
-    try:
-        process_id = int(pid)
-    except (TypeError, ValueError):
-        return None
-    if os.name != "posix" or process_id <= 0:
-        return None
-    try:
-        fields = Path(f"/proc/{process_id}/stat").read_text().rsplit(
-            ")",
-            1,
-        )[1].split()
-        return int(fields[19])
-    except (OSError, ValueError, IndexError):
-        return None
-
-
-def _native_history_process_identity_matches(
-    pid: Any,
-    start_time: Any,
-) -> bool:
-    try:
-        expected = int(getattr(start_time, "value", start_time) or 0)
-    except (TypeError, ValueError):
-        return False
-    return expected > 0 and _native_history_process_start_time(pid) == expected
-
-
-def _native_history_process_group_member_count(
-    group_id: int,
-    *,
-    deadline: Optional[float] = None,
-) -> Optional[int]:
-    if os.name != "posix" or group_id <= 0:
-        return 0
-    count = 0
-    inspected = 0
-    inspection_failed = False
-    if deadline is not None and time.monotonic() >= deadline:
-        return None
-    try:
-        entries = Path("/proc").iterdir()
-        for entry in entries:
-            if not entry.name.isdigit():
-                continue
-            if deadline is not None and time.monotonic() >= deadline:
-                return None
-            inspected += 1
-            if inspected > _NATIVE_HISTORY_MAX_PROCESS_INVENTORY_ENTRIES:
-                return None
-            try:
-                fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
-                if int(fields[2]) == group_id:
-                    count += 1
-            except (OSError, ValueError, IndexError):
-                inspection_failed = True
-    except OSError:
-        return None
-    if inspection_failed:
-        return None
-    return count
-
-
-def _native_history_process_group_alive(
-    group: Any,
-    process: Any,
-    private_process_start_time: Any,
-    *,
-    deadline: Optional[float] = None,
-) -> Optional[bool]:
-    try:
-        group_id = int(getattr(group, "value", group) or 0)
-    except (TypeError, ValueError):
-        return False
-    process_id = getattr(process, "pid", None)
-    if os.name != "posix" or group_id <= 0:
-        return False
-    identity_matches = (
-        group_id == process_id
-        and _native_history_process_identity_matches(
-            group_id,
-            private_process_start_time,
-        )
-    )
-    if not identity_matches:
-        member_count = _native_history_process_group_member_count(
-            group_id,
-            deadline=deadline,
-        )
-        if member_count == 0:
-            return False
-        return None
-    try:
-        os.killpg(group_id, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return None
-    return True
-
-
-def _signal_native_history_worker(
-    process: Any,
-    private_process_group: Any,
-    private_process_start_time: Any,
-    signal_number: int,
-) -> None:
-    try:
-        group_id = int(getattr(private_process_group, "value", private_process_group) or 0)
-    except (TypeError, ValueError):
-        group_id = 0
-    if (
-        os.name == "posix"
-        and group_id > 0
-        and group_id != os.getpgrp()
-        and _native_history_process_identity_matches(
-            getattr(process, "pid", None),
-            private_process_start_time,
-        )
-    ):
-        try:
-            os.killpg(group_id, signal_number)
-        except OSError:
-            pass
-    try:
-        if _native_history_process_alive(process):
-            process.send_signal(signal_number)
-    except AttributeError:
-        try:
-            if signal_number == signal.SIGKILL:
-                process.kill()
-            else:
-                process.terminate()
-        except (AttributeError, OSError):
-            pass
-    except OSError:
-        pass
-
-
-def _native_history_process_alive(process: Any) -> bool:
-    try:
-        return bool(process.is_alive())
-    except (AssertionError, OSError, ValueError):
-        return False
-
-
-def _native_history_process_reaped(
-    process: Any,
-    private_process_group: Any,
-    private_process_start_time: Any,
-    *,
-    term_deadline: float,
-    kill_deadline: float,
-    reap_deadline: float,
-    poll_only: bool = False,
-    scope_reaped_state: Optional[Dict[str, bool]] = None,
-) -> bool:
-    """Retire a worker tree without borrowing a later phase."""
-
-    def direct_child_reaped() -> bool:
-        if getattr(process, "pid", None) is None:
-            return True
-        try:
-            process.join(timeout=0)
-        except (AssertionError, OSError):
-            return False
-        return (
-            not _native_history_process_alive(process)
-            and getattr(process, "exitcode", None) is not None
-        )
-
-    def scope_reaped() -> bool:
-        # A capability-level scope proof covers descendants, but never
-        # substitutes for reaping this directly owned multiprocessing child.
-        if not direct_child_reaped():
-            return False
-        if (
-            scope_reaped_state is not None
-            and scope_reaped_state.get("proven") is True
-        ):
-            return True
-        try:
-            group_id = int(
-                getattr(private_process_group, "value", private_process_group)
-                or 0
-            )
-        except (TypeError, ValueError):
-            group_id = 0
-        if getattr(process, "pid", None) is None:
-            if group_id <= 0:
-                if scope_reaped_state is not None:
-                    scope_reaped_state["proven"] = True
-                return True
-            if poll_only:
-                return False
-            scope_alive = _native_history_process_group_alive(
-                private_process_group,
-                process,
-                private_process_start_time,
-                deadline=(
-                    time.monotonic()
-                    if poll_only
-                    else reap_deadline
-                ),
-            )
-            if scope_alive is False and scope_reaped_state is not None:
-                scope_reaped_state["proven"] = True
-            return scope_alive is False
-        if poll_only and group_id > 0:
-            # A post-leader group scan is a blocking inventory operation. In
-            # poll-only servicing, rely on prior sealed scope evidence or the
-            # sidecar's retained role pidfds instead of inventing proof.
-            return False
-        scope_alive = _native_history_process_group_alive(
-            private_process_group,
-            process,
-            private_process_start_time,
-            deadline=(
-                time.monotonic()
-                if poll_only
-                else reap_deadline
-            ),
-        )
-        if scope_alive is False and scope_reaped_state is not None:
-            scope_reaped_state["proven"] = True
-        return scope_alive is False
-
-    if scope_reaped():
-        return True
-    now = time.monotonic()
-    if now < term_deadline:
-        _signal_native_history_worker(
-            process,
-            private_process_group,
-            private_process_start_time,
-            signal.SIGTERM,
-        )
-        if poll_only:
-            return scope_reaped()
-        try:
-            process.join(timeout=max(0.0, term_deadline - time.monotonic()))
-        except (AssertionError, OSError):
-            return False
-        if scope_reaped():
-            return True
-    if poll_only:
-        # Poll-only servicing may not restart the TERM grace window. Once its
-        # cutoff passes, escalate immediately and only observe retirement.
-        _signal_native_history_worker(
-            process,
-            private_process_group,
-            private_process_start_time,
-            signal.SIGKILL,
-        )
-        return scope_reaped()
-    _signal_native_history_worker(
-        process,
-        private_process_group,
-        private_process_start_time,
-        signal.SIGKILL,
-    )
-    if not poll_only and time.monotonic() < kill_deadline:
-        try:
-            process.join(timeout=max(0.0, kill_deadline - time.monotonic()))
-        except (AssertionError, OSError):
-            return False
-    if scope_reaped():
-        return True
-    if not poll_only and time.monotonic() < reap_deadline:
-        try:
-            process.join(timeout=max(0.0, reap_deadline - time.monotonic()))
-        except (AssertionError, OSError):
-            return False
-    return scope_reaped()
-
-
-def _finalize_native_history_registration(  # noqa: PLR0915 - bounded lifecycle finalizer
-    registration: NativeHistoryLifecycleRegistration,
-    lifecycle_capability: NativeHistoryLifecycleCapability,
-    *,
-    cleanup_deadline: float,
-    operation_deadline: float,
-    poll_only: bool = False,
-) -> bool:
-    """Close, authorize release, and retire one history operation."""
-
-    try:
-        registration.abort_event.set()
-    except (OSError, ValueError):
-        registration.cleanup_failure = (
-            "Native ChatGPT history abort control failed."
-        )
-    gate = registration.finalization_gate
-    gate_acquired = False
-    if gate is not None:
-        try:
-            gate_acquired = bool(gate.acquire(False))
-            if not gate_acquired:
-                return False
-        except (TypeError, OSError, ValueError):
-            registration.cleanup_failure = (
-                "Native ChatGPT history finalization control failed."
-            )
-            try:
-                lifecycle_capability.retain_native_history(
-                    registration,
-                    registration.cleanup_failure,
-                )
-            except Exception:
-                pass
-            return False
-    try:
-        if registration.start_state == "starting":
-            registration.cleanup_failure = (
-                "Native ChatGPT history worker start is still in progress."
-            )
-            lifecycle_capability.retain_native_history(
-                registration,
-                registration.cleanup_failure,
-            )
-            return False
-
-        lifecycle_capability.prepare_native_history_cleanup_plan(
-            registration,
-            cleanup_deadline=cleanup_deadline,
-            operation_deadline=operation_deadline,
-        )
-        plan = _native_history_cleanup_phase_plan(
-            registration,
-            cleanup_deadline,
-            operation_deadline,
-        )
-        state = int(registration.creation_state.value)
-        close_registration = registration.close_registration
-
-        def promote_closer_proof() -> None:
-            nonlocal state
-            closer = registration.close_registration
-            if closer is None or not bool(closer.target_proof.value):
-                return
-            registration.target_resolution = NativeHistoryTargetProof(
-                target_id=closer.target_id,
-                anchor_target_id=registration.anchor_target_id,
-                creation_url=registration.creation_url,
-            )
-            registration.creation_state.value = _NATIVE_HISTORY_TARGET_CLOSED
-            state = _NATIVE_HISTORY_TARGET_CLOSED
-
-        # A closer may have published target safety before its own driver was
-        # reaped. Promote that proof once and never create a second closer for
-        # the same target.
-        promote_closer_proof()
-
-        if registration.target_resolution is None:
-            plan = _native_history_cleanup_phase_plan(
-                registration,
-                cleanup_deadline,
-                operation_deadline,
-            )
-            if (
-                state == _NATIVE_HISTORY_TARGET_NONE
-                and registration.start_state in {"not_started", "failed"}
-                and not bool(registration.creation_issued.value)
-            ):
-                _native_history_mark_no_create(
-                    creation_state=registration.creation_state,
-                    creation_issued=registration.creation_issued,
-                    creation_settled=registration.creation_settled,
-                )
-                state = _NATIVE_HISTORY_TARGET_NO_CREATE
-                registration.target_resolution = NativeHistoryTargetProof(
-                    target_id=None,
-                    anchor_target_id=registration.anchor_target_id,
-                    creation_url=registration.creation_url,
-                )
-            elif state == _NATIVE_HISTORY_TARGET_NO_CREATE:
-                registration.target_resolution = NativeHistoryTargetProof(
-                    target_id=None,
-                    anchor_target_id=registration.anchor_target_id,
-                    creation_url=registration.creation_url,
-                )
-            else:
-                if not poll_only and time.monotonic() < plan["target_close_deadline"]:
-                    target_bytes = registration.owned_target.value
-                    target_id = None
-                    if target_bytes:
-                        try:
-                            target_id = target_bytes.decode("ascii")
-                        except (UnicodeDecodeError, AttributeError):
-                            target_id = None
-                    try:
-                        proof = _close_owned_oracle_target(
-                            cdp_endpoint=registration.cdp_endpoint,
-                            target_id=target_id,
-                            anchor_target_id=registration.anchor_target_id,
-                            creation_url=registration.creation_url,
-                            deadline=plan["target_close_deadline"],
-                            playwright_factory=None,
-                            lifecycle_capability=lifecycle_capability,
-                            lifecycle_registration=registration,
-                        )
-                        registration.target_resolution = proof
-                        registration.creation_state.value = (
-                            _NATIVE_HISTORY_TARGET_CLOSED
-                        )
-                        state = _NATIVE_HISTORY_TARGET_CLOSED
-                    except Exception as exc:
-                        registration.cleanup_failure = str(exc)
-                    promote_closer_proof()
-                    close_registration = registration.close_registration
-
-        close_registration = registration.close_registration
-
-        if registration.target_resolution is None:
-            plan = _native_history_cleanup_phase_plan(
-                registration,
-                cleanup_deadline,
-                operation_deadline,
-            )
-            try:
-                if lifecycle_capability.terminate_owned_browser(
-                    term_deadline=plan["term_deadline"],
-                    kill_deadline=plan["kill_deadline"],
-                    reap_deadline=plan["reap_deadline"],
-                    final_deadline=plan["final_deadline"],
-                    poll_only=poll_only,
-                ):
-                    registration.creation_state.value = (
-                        _NATIVE_HISTORY_TARGET_BROWSER_TERMINATED
-                    )
-                    state = _NATIVE_HISTORY_TARGET_BROWSER_TERMINATED
-            except Exception as exc:
-                registration.cleanup_failure = str(exc)
-
-        if registration.target_resolution is None and state != (
-            _NATIVE_HISTORY_TARGET_BROWSER_TERMINATED
-        ):
-            registration.cleanup_failure = (
-                registration.cleanup_failure
-                or "Native ChatGPT history target ownership could not be closed."
-            )
-            lifecycle_capability.retain_native_history(
-                registration,
-                registration.cleanup_failure,
-            )
-            return False
-
-        if not registration.release_authorized:
-            if state == _NATIVE_HISTORY_TARGET_BROWSER_TERMINATED:
-                proof_kind = "owned_browser_termination_proven"
-                target_id = None
-            elif state == _NATIVE_HISTORY_TARGET_NO_CREATE:
-                proof_kind = "no_create_acknowledged"
-                target_id = None
-            else:
-                proof_kind = "target_close_and_absence_proven"
-                target_id = (
-                    registration.target_resolution.target_id
-                    if registration.target_resolution is not None
-                    else None
-                )
-            release_proof = NativeHistoryReleaseProof(
-                registration_id=registration.registration_id,
-                kind=proof_kind,
-                target_id=target_id,
-                anchor_target_id=registration.anchor_target_id,
-                creation_url=registration.creation_url,
-            )
-            lifecycle_capability.release_native_history(
-                registration,
-                proof=release_proof,
-            )
-            registration.release_authorized = True
-            registration.released = True
-            registration.release_proof = release_proof
-
-        def worker_tree_reaped(
-            process: Any,
-            private_process_group: Any,
-            private_process_start_time: Any,
-            *,
-            phase_poll_only: bool,
-        ) -> bool:
-            close_scope = registration.close_registration
-            is_closer = (
-                close_scope is not None
-                and process is close_scope.process
-            )
-            scope_reaped_state = {
-                "proven": (
-                    close_scope.scope_reaped_proven
-                    if is_closer and close_scope is not None
-                    else registration.worker_scope_reaped_proven
-                ),
-            }
-            try:
-                scope_proof = bool(
-                    lifecycle_capability.terminate_native_history_process_scope(
-                        registration_id=registration.registration_id,
-                        term_deadline=plan["term_deadline"],
-                        kill_deadline=plan["kill_deadline"],
-                        reap_deadline=plan["reap_deadline"],
-                        poll_only=phase_poll_only,
-                    )
-                )
-            except Exception as exc:
-                registration.cleanup_failure = str(exc)
-                return False
-            if scope_proof:
-                # Retain the actual owner result even when the directly owned
-                # multiprocessing child still needs a later join.
-                scope_reaped_state["proven"] = True
-                if is_closer and close_scope is not None:
-                    close_scope.scope_reaped_proven = True
-                else:
-                    registration.worker_scope_reaped_proven = True
-            if _native_history_process_reaped(
-                process,
-                private_process_group,
-                private_process_start_time,
-                term_deadline=plan["term_deadline"],
-                kill_deadline=plan["kill_deadline"],
-                reap_deadline=plan["reap_deadline"],
-                poll_only=phase_poll_only,
-                scope_reaped_state=scope_reaped_state,
-            ):
-                if is_closer and close_scope is not None:
-                    close_scope.scope_reaped_proven = bool(
-                        scope_reaped_state["proven"]
-                    )
-                else:
-                    registration.worker_scope_reaped_proven = bool(
-                        scope_reaped_state["proven"]
-                    )
-                return True
-            # The browser driver can outlive its multiprocessing leader. Give
-            # the owning sidecar a chance to signal its retained role-marked
-            # pidfds before declaring the worker tree unreaped.
-            try:
-                lifecycle_capability.terminate_owned_browser(
-                    term_deadline=plan["term_deadline"],
-                    kill_deadline=plan["kill_deadline"],
-                    reap_deadline=plan["reap_deadline"],
-                    final_deadline=plan["final_deadline"],
-                    poll_only=phase_poll_only,
-                )
-            except Exception as exc:
-                registration.cleanup_failure = str(exc)
-                return False
-            reaped = _native_history_process_reaped(
-                process,
-                private_process_group,
-                private_process_start_time,
-                term_deadline=plan["term_deadline"],
-                kill_deadline=plan["kill_deadline"],
-                reap_deadline=plan["reap_deadline"],
-                poll_only=True,
-                scope_reaped_state=scope_reaped_state,
-            )
-            if is_closer and close_scope is not None:
-                close_scope.scope_reaped_proven = bool(
-                    scope_reaped_state["proven"]
-                )
-            else:
-                registration.worker_scope_reaped_proven = bool(
-                    scope_reaped_state["proven"]
-                )
-            return reaped
-
-        close_registration = registration.close_registration
-        if close_registration is not None and not close_registration.reaped:
-            plan = _native_history_cleanup_phase_plan(
-                registration,
-                cleanup_deadline,
-                operation_deadline,
-            )
-            if not worker_tree_reaped(
-                close_registration.process,
-                close_registration.private_process_group,
-                close_registration.private_process_start_time,
-                phase_poll_only=poll_only,
-            ):
-                registration.cleanup_failure = (
-                    "Native ChatGPT history closer was not reaped."
-                )
-                lifecycle_capability.retain_native_history(
-                    registration,
-                    registration.cleanup_failure,
-                )
-                return False
-            close_registration.reaped = True
-            close_registration.reap_ack.set()
-
-        plan = _native_history_cleanup_phase_plan(
-            registration,
-            cleanup_deadline,
-            operation_deadline,
-        )
-        if not worker_tree_reaped(
-            registration.process,
-            registration.private_process_group,
-            registration.private_process_start_time,
-            phase_poll_only=poll_only,
-        ):
-            registration.cleanup_failure = (
-                "Native ChatGPT history interception worker was not reaped."
-            )
-            lifecycle_capability.retain_native_history(
-                registration,
-                registration.cleanup_failure,
-            )
-            return False
-        registration.worker_retirement_proven = True
-        release_control_state = registration.release_control_state
-        registration.release_control_failed = bool(
-            registration.release_control_failed
-            or (
-                release_control_state is not None
-                and bool(release_control_state.value)
-            )
-        )
-        if registration.release_control_failed:
-            registration.cleanup_failure = (
-                "Native ChatGPT history release control failed."
-            )
-            lifecycle_capability.retain_native_history(
-                registration,
-                registration.cleanup_failure,
-            )
-        registration.owned_target.value = b""
-        lifecycle_capability.retire_native_history(registration)
-        registration.retired = True
-        return True
-    except Exception as exc:
-        registration.cleanup_failure = str(exc)
-        lifecycle_capability.retain_native_history(
-            registration,
-            registration.cleanup_failure,
-        )
-        return False
-    finally:
-        if gate is not None and gate_acquired:
-            try:
-                gate.release()
-            except (RuntimeError, OSError, ValueError):
-                pass
-
-
-def _oracle_browser_history_observation_worker(  # noqa: PLR0915 - bounded cleanup handshake
-    sender: Any,
-    cdp_endpoint: str,
-    page_target_id: str,
-    capture_deadline: float,
-    cleanup_deadline: float,
-    expected_account_hash: str,
-    max_response_bytes: int,
-    private_process_group: Any,
-    private_process_start_time: Any,
-    role_marker: str,
-    owned_target: Any,
-    creation_state: Any,
-    creation_url: str,
-    creation_issued: Any,
-    creation_gate: Any,
-    creation_settled: Any,
-    abort_event: Any,
-    release_event: Any,
-    release_control_failed: Any,
-) -> None:
-    _enter_oracle_browser_worker_process_group(
-        private_process_group,
-        private_process_start_time,
-    )
-    # Install the role marker before Playwright launches any driver process.
-    # The marker is inherited by the actual browser driver and lets the owner
-    # retain its pidfd after this worker exits.
-    os.environ[CHATGPT_NATIVE_HISTORY_ROLE_ENV] = role_marker
-    playwright = None
-    browser = None
-    target_session = None
-    result = None
-    successful = False
-    error_class: Optional[str] = None
-    error_stage: Optional[str] = None
-    try:
-        error_stage = "deadline"
-        _raise_if_browser_deadline_expired(capture_deadline)
-        if abort_event.is_set():
-            raise OracleBrowserBoundaryUnavailable(
-                "Native ChatGPT history was aborted before browser attachment."
-            )
-        error_stage = "playwright"
-        playwright = _start_playwright_from_factory(None)
-        _raise_if_browser_deadline_expired(capture_deadline)
-        error_stage = "cdp_connect"
-        browser = playwright.chromium.connect_over_cdp(
-            cdp_endpoint,
-            timeout=_browser_timeout_milliseconds(
-                _chatgpt_browser_cdp_connect_timeout_seconds(capture_deadline)
-            ),
-        )
-        _raise_if_browser_deadline_expired(capture_deadline)
-        error_stage = "find_anchor"
-        source_page = _find_existing_chatgpt_page(
-            browser,
-            page_target_id,
-            CHATGPT_NATIVE_HISTORY_HOME_URL,
-            deadline=capture_deadline,
-        )
-        if source_page is None:
-            raise OracleBrowserBoundaryUnavailable(
-                "Oracle browser has no exact bound ChatGPT context anchor "
-                "for native history."
-            )
-        error_stage = "browser_cdp_session"
-        target_session = browser.new_browser_cdp_session()
-        error_stage = "create_owned_page"
-        owned_page = _create_native_history_owned_page(
-            target_session,
-            source_page,
-            page_target_id,
-            owned_target,
-            creation_state,
-            creation_url,
-            capture_deadline,
-            creation_issued,
-            creation_gate,
-            creation_settled,
-            abort_event,
-        )
-        if abort_event.is_set():
-            raise OracleBrowserBoundaryUnavailable(
-                "Native ChatGPT history was aborted before navigation."
-            )
-        error_stage = "owned_cdp_session"
-        owned_session = None
-        while owned_session is None:
-            _raise_if_browser_deadline_expired(capture_deadline)
-            if abort_event.is_set():
-                raise OracleBrowserBoundaryUnavailable(
-                    "Native ChatGPT history was aborted before observation."
-                )
-            try:
-                context = getattr(owned_page, "context", None)
-                if context is None:
-                    raise OracleBrowserBoundaryUnavailable(
-                        "Oracle browser owned page has no context for native history."
-                    )
-                owned_session = context.new_cdp_session(owned_page)
-            except Exception as exc:
-                if not _is_nonfatal_browser_runtime_error(exc):
-                    raise
-                time.sleep(0.05)
-        error_stage = "observe_native_history"
-        result = _observe_native_history_oracle_page(
-            owned_page,
-            session=owned_session,
-            expected_account_hash=expected_account_hash,
-            deadline=capture_deadline,
-            max_response_bytes=max_response_bytes,
-            abort_event=abort_event,
-        )
-        # Observation may spend the capture deadline. Keep reconstructed
-        # pages even when that deadline is already expired; cleanup still
-        # runs after the result is sent.
-        successful = isinstance(result, Mapping) and not abort_event.is_set()
-        if successful:
-            error_class = None
-            error_stage = None
-    except Exception as exc:
-        successful = False
-        error_class = _oracle_browser_safe_error_class(exc)
-        error_stage = _oracle_browser_safe_error_stage(error_stage)
-        if isinstance(result, Mapping) and result.get("history_pages"):
-            successful = True
-    finally:
-        if (
-            not bool(creation_issued.value)
-            and creation_state.value == _NATIVE_HISTORY_TARGET_NONE
-        ):
-            _native_history_mark_no_create(
-                creation_state=creation_state,
-                creation_issued=creation_issued,
-                creation_settled=creation_settled,
-            )
-        elif (
-            creation_state.value == _NATIVE_HISTORY_TARGET_CREATING
-            and creation_settled.is_set()
-        ):
-            creation_state.value = _NATIVE_HISTORY_TARGET_CLEANUP_PENDING
-        if abort_event.is_set():
-            successful = False
-        if (
-            not bool(creation_issued.value)
-            and creation_state.value == _NATIVE_HISTORY_TARGET_NONE
-        ):
-            _native_history_mark_no_create(
-                creation_state=creation_state,
-                creation_issued=creation_issued,
-                creation_settled=creation_settled,
-            )
-        payload: Dict[str, Any] = {
-            "ok": successful
-            or (
-                isinstance(result, Mapping)
-                and bool(result.get("history_pages"))
-            ),
-            "result": result if isinstance(result, Mapping) else None,
-        }
-        if not successful:
-            if error_class is not None:
-                payload["error_class"] = error_class
-            if error_stage is not None:
-                payload["error_stage"] = error_stage
-        try:
-            _send_oracle_browser_worker_message(sender, payload)
-        except Exception:
-            try:
-                _send_oracle_browser_worker_message(
-                    sender,
-                    {"ok": False, "result": None},
-                )
-            except Exception:
-                pass
-        finally:
-            sender.close()
-        # Keep Fetch interception and the attached browser alive until the
-        # owner proves target closure or terminates its private browser.
-        if _native_history_wait_for_release(release_event):
-            try:
-                _disconnect_attached_browser(playwright, browser)
-            except Exception:
-                pass
-        else:
-            # A broken release channel cannot authorize detachment. Keep the
-            # interception session and browser references parked until the
-            # owner proves target safety and retires this worker directly.
-            release_control_failed.value = True
-            while True:
-                time.sleep(0.05)
-
-
-def _create_native_history_owned_page(
-    target_session: Any,
-    source_page: Any,
-    anchor_target_id: str,
-    owned_target: Any,
-    creation_state: Any,
-    creation_url: str,
-    deadline: float,
-    creation_issued: Any,
-    creation_gate: Any,
-    creation_settled: Any,
-    abort_event: Any,
-) -> Any:
-    anchor = target_session.send(
-        "Target.getTargetInfo", {"targetId": anchor_target_id}
-    )["targetInfo"]
-    create_options = {"url": creation_url}
-    if anchor.get("browserContextId"):
-        create_options["browserContextId"] = anchor["browserContextId"]
-    gate_timeout = max(0.0, _remaining_browser_timeout(deadline))
-    acquired = creation_gate.acquire(timeout=gate_timeout)
-    if not acquired:
-        raise OracleBrowserBoundaryUnavailable(
-            "Native ChatGPT history target-creation gate timed out."
-        )
-    try:
-        if abort_event.is_set():
-            _native_history_mark_no_create(
-                creation_state=creation_state,
-                creation_issued=creation_issued,
-                creation_settled=creation_settled,
-            )
-            raise OracleBrowserBoundaryUnavailable(
-                "Native ChatGPT history was aborted before target creation."
-            )
-        creation_state.value = _NATIVE_HISTORY_TARGET_CREATING
-        creation_issued.value = True
-        try:
-            with source_page.context.expect_page(
-                predicate=lambda page: page.url == creation_url,
-                timeout=_browser_timeout_milliseconds(
-                    _remaining_browser_timeout(deadline)
-                ),
-            ) as page_event:
-                created = target_session.send(
-                    "Target.createTarget",
-                    create_options,
-                )
-                target_id = _validate_page_target_id(created["targetId"])
-                if target_id == anchor_target_id:
-                    raise OracleBrowserBoundaryUnavailable(
-                        "Oracle browser returned the context anchor as an owned target."
-                    )
-                owned_target.value = target_id.encode("ascii")
-                creation_state.value = _NATIVE_HISTORY_TARGET_ATTACHED
-        finally:
-            creation_settled.set()
-    finally:
-        creation_gate.release()
-    candidate = page_event.value
-    if _page_target_id(source_page.context, candidate) != target_id:
-        raise OracleBrowserBoundaryUnavailable(
-            "Oracle browser owned page did not match its created target."
-        )
-    return candidate
 
 
 def _create_owned_oracle_page(
@@ -7469,7 +3121,7 @@ def _create_owned_oracle_page(
         predicate=lambda page: page.url == creation_url,
         timeout=_browser_timeout_milliseconds(_remaining_browser_timeout(deadline))
     ) as page_event:
-        creation_state.value = _NATIVE_HISTORY_TARGET_CREATING
+        creation_state.value = 1
         created = target_session.send("Target.createTarget", create_options)
         target_id = _validate_page_target_id(created["targetId"])
         if target_id == anchor_target_id:
@@ -7477,7 +3129,7 @@ def _create_owned_oracle_page(
                 "Oracle browser returned the context anchor as an owned target."
             )
         owned_target.value = target_id.encode("ascii")
-        creation_state.value = _NATIVE_HISTORY_TARGET_ATTACHED
+        creation_state.value = 2
     candidate = page_event.value
     if _page_target_id(source_page.context, candidate) != target_id:
         raise OracleBrowserBoundaryUnavailable(
@@ -7486,7 +3138,7 @@ def _create_owned_oracle_page(
     return candidate
 
 
-def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
+def _close_owned_oracle_target(
     *,
     cdp_endpoint: str,
     target_id: Optional[str],
@@ -7494,23 +3146,8 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
     creation_url: str,
     deadline: float,
     playwright_factory: Optional[Callable[[], Any]],
-    lifecycle_capability: Optional[NativeHistoryLifecycleCapability] = None,
-    lifecycle_registration: Optional[NativeHistoryLifecycleRegistration] = None,
-) -> NativeHistoryTargetProof:
+) -> None:
     """Give exact-target cleanup its own bounded, killable driver."""
-    if lifecycle_registration is not None:
-        existing = lifecycle_registration.close_registration
-        if existing is not None:
-            if bool(existing.target_proof.value):
-                return NativeHistoryTargetProof(
-                    target_id=existing.target_id,
-                    anchor_target_id=anchor_target_id,
-                    creation_url=creation_url,
-                )
-            raise OracleBrowserCleanupError(
-                "Oracle browser owned-target closer is already registered."
-            )
-    _raise_if_browser_deadline_expired(deadline)
     if target_id == anchor_target_id:
         raise OracleBrowserBoundaryUnavailable(
             "Oracle browser cleanup cannot close the context anchor."
@@ -7520,19 +3157,7 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
     _raise_if_browser_deadline_expired(deadline)
     context = _oracle_browser_process_context(playwright_factory)
     private_process_group = context.RawValue("q", 0)
-    private_process_start_time = context.RawValue("q", 0)
-    target_proof = context.RawValue("b", False)
-    failure_stage = context.RawValue("i", _OracleTargetCloserStage.UNKNOWN)
-    driver_done = context.Event()
-    reap_ack = context.Event()
-    role_marker = (
-        "history-closer:"
-        + (
-            lifecycle_registration.registration_id
-            if lifecycle_registration is not None
-            else os.urandom(16).hex()
-        )
-    )
+    closed = context.RawValue("b", False)
     process = context.Process(
         target=_oracle_browser_close_target_worker,
         args=(
@@ -7543,132 +3168,22 @@ def _close_owned_oracle_target(  # noqa: PLR0915 - bounded target cleanup
             deadline,
             playwright_factory,
             private_process_group,
-            private_process_start_time,
-            role_marker,
-            target_proof,
-            driver_done,
-            lifecycle_registration is not None,
-            lifecycle_registration is not None,
-            failure_stage,
+            closed,
         ),
     )
-    close_registration: Optional[NativeHistoryCloseRegistration] = None
-    if lifecycle_capability is not None and lifecycle_registration is not None:
-        close_registration = NativeHistoryCloseRegistration(
-            process=process,
-            private_process_group=private_process_group,
-            private_process_start_time=private_process_start_time,
-            target_proof=target_proof,
-            driver_done=driver_done,
-            reap_ack=reap_ack,
-            target_id=target_id,
-            creation_url=creation_url,
-            failure_stage=failure_stage,
-        )
-        lifecycle_capability.register_native_history_closer(
-            lifecycle_registration,
-            close_registration,
-        )
-    try:
-        if close_registration is not None:
-            close_registration.start_state = "starting"
-        process.start()
-        if close_registration is not None:
-            close_registration.start_state = "started"
-            close_registration.started = True
-    except Exception as exc:
-        if close_registration is not None:
-            close_registration.start_state = "failed"
-        raise OracleBrowserCleanupError(
-            "Oracle browser owned-target closer could not start."
-        ) from exc
-    scope_reaped_proven = False
-
-    def closer_scope_reaped() -> bool:
-        nonlocal scope_reaped_proven
-        if scope_reaped_proven:
-            return True
-        if (
-            _native_history_process_alive(process)
-            or getattr(process, "exitcode", None) is None
-        ):
-            return False
-        scope_alive = _native_history_process_group_alive(
-            private_process_group,
-            process,
-            private_process_start_time,
-            deadline=deadline,
-        )
-        if scope_alive is False:
-            scope_reaped_proven = True
-            if close_registration is not None:
-                close_registration.scope_reaped_proven = True
-            return True
-        return False
-
+    process.start()
     try:
         process.join(timeout=max(0.0, _remaining_browser_timeout(deadline)))
-        if (
-            not closer_scope_reaped()
-        ):
-            _terminate_oracle_browser_worker(
-                process,
-                private_process_group.value,
-                private_process_start_time,
-            )
-            process.join(timeout=max(0.0, _remaining_browser_timeout(deadline)))
-        if (
-            not closer_scope_reaped()
-        ):
-            if (
-                close_registration is not None
-                and bool(close_registration.target_proof.value)
-            ):
-                raise OracleBrowserCleanupError(
-                    "Oracle browser target was closed but its closer remains active."
-                )
+        if not closed.value:
             raise OracleBrowserBoundaryUnavailable(
-                "Oracle browser owned-target closer was not reaped."
+                "Oracle browser owned-target cleanup was not confirmed."
             )
-        if close_registration is not None:
-            close_registration.reaped = True
-            reap_ack.set()
-        if not target_proof.value:
-            raise OracleBrowserBoundaryUnavailable(
-                _ORACLE_TARGET_CLOSER_FAILURE_MESSAGES.get(
-                    failure_stage.value,
-                    _ORACLE_TARGET_CLOSER_FAILURE_MESSAGES[
-                        _OracleTargetCloserStage.UNKNOWN
-                    ],
-                )
-            )
-        return NativeHistoryTargetProof(
-            target_id=target_id,
-            anchor_target_id=anchor_target_id,
-            creation_url=creation_url,
-        )
     finally:
-        if not closer_scope_reaped():
-            _terminate_oracle_browser_worker(
-                process,
-                private_process_group.value,
-                private_process_start_time,
-            )
-            try:
-                process.join(
-                    timeout=max(0.0, _remaining_browser_timeout(deadline))
-                )
-            except (AssertionError, OSError):
-                pass
-        if (
-            closer_scope_reaped()
-            and close_registration is not None
-        ):
-            close_registration.reaped = True
-            reap_ack.set()
+        _terminate_oracle_browser_worker(process, private_process_group.value)
+        process.join(timeout=0)
 
 
-def _oracle_browser_close_target_worker(  # noqa: PLR0915 - fixed closer phase diagnostics
+def _oracle_browser_close_target_worker(
     cdp_endpoint: str,
     target_id: Optional[str],
     anchor_target_id: str,
@@ -7676,139 +3191,50 @@ def _oracle_browser_close_target_worker(  # noqa: PLR0915 - fixed closer phase d
     deadline: float,
     playwright_factory: Optional[Callable[[], Any]],
     private_process_group: Any,
-    private_process_start_time: Any,
-    role_marker: str,
-    target_proof: Any,
-    driver_done: Any,
-    require_target_present: bool,
-    require_target_absence: bool,
-    failure_stage: Any = None,
+    closed: Any,
 ) -> None:
-    def record_stage(stage: _OracleTargetCloserStage) -> None:
-        if failure_stage is not None:
-            failure_stage.value = stage
-
-    record_stage(_OracleTargetCloserStage.PROCESS_GROUP_SETUP)
-    _enter_oracle_browser_worker_process_group(
-        private_process_group,
-        private_process_start_time,
-    )
-    # Install the role marker before Playwright launches its driver. The
-    # sidecar uses this marker plus pidfds, never a stale parent PID.
-    record_stage(_OracleTargetCloserStage.ROLE_MARKER_SETUP)
-    os.environ[CHATGPT_NATIVE_HISTORY_ROLE_ENV] = role_marker
+    _enter_oracle_browser_worker_process_group(private_process_group)
     playwright = None
     browser = None
     try:
-        record_stage(_OracleTargetCloserStage.DEADLINE_CHECK)
         _raise_if_browser_deadline_expired(deadline)
-        record_stage(_OracleTargetCloserStage.PLAYWRIGHT_START)
         playwright = _start_playwright_from_factory(playwright_factory)
-        record_stage(_OracleTargetCloserStage.CDP_CONNECT)
         browser = playwright.chromium.connect_over_cdp(
             cdp_endpoint,
             timeout=_browser_timeout_milliseconds(
                 _remaining_browser_timeout(deadline)
             ),
         )
-        record_stage(_OracleTargetCloserStage.CDP_SESSION)
         session = browser.new_browser_cdp_session()
         # Only this published target may be closed; never close the browser.
-        record_stage(_OracleTargetCloserStage.INITIAL_LISTING)
-        target_listing = session.send("Target.getTargets")
-        record_stage(_OracleTargetCloserStage.INITIAL_LISTING_INVALID)
-        if not isinstance(target_listing, Mapping):
-            return
-        targets = target_listing.get("targetInfos")
-        record_stage(_OracleTargetCloserStage.INITIAL_TARGETS_INVALID)
-        if not isinstance(targets, (list, tuple)):
-            return
-        if any(
-            not isinstance(info, Mapping)
-            or not isinstance(info.get("targetId"), str)
-            or not info.get("targetId")
-            for info in targets
-        ):
-            return
+        targets = session.send("Target.getTargets").get("targetInfos", ())
         if target_id is None:
             # A lost createTarget reply is recoverable only by the unique URL
             # assigned before creation, never by host, page title, or account.
-            record_stage(_OracleTargetCloserStage.TARGET_MATCH)
             matches = [
                 info.get("targetId")
                 for info in targets
-                if isinstance(info, Mapping)
-                and info.get("url") == creation_url
+                if info.get("url") == creation_url
                 and info.get("type") == "page"
                 and info.get("targetId") != anchor_target_id
             ]
             if len(matches) != 1 or not isinstance(matches[0], str):
-                record_stage(_OracleTargetCloserStage.TARGET_MATCH_NOT_UNIQUE)
                 return
             target_id = matches[0]
-        record_stage(_OracleTargetCloserStage.TARGET_LOOKUP)
-        if not any(
-            isinstance(info, Mapping) and info.get("targetId") == target_id
-            for info in targets
-        ):
-            record_stage(_OracleTargetCloserStage.TARGET_MISSING)
-            target_proof.value = not require_target_present
-            return
-        record_stage(_OracleTargetCloserStage.CLOSE_REQUEST)
-        result = session.send("Target.closeTarget", {"targetId": target_id})
-        if not isinstance(result, Mapping) or result.get("success") is not True:
-            record_stage(_OracleTargetCloserStage.CLOSE_NOT_ACKNOWLEDGED)
-            return
-        if not require_target_absence:
-            target_proof.value = True
-            return
-        record_stage(_OracleTargetCloserStage.DEADLINE_CHECK)
-        # Close acknowledgment can precede removal from the target listing.
-        while True:
-            _raise_if_browser_deadline_expired(deadline)
-            record_stage(_OracleTargetCloserStage.ABSENCE_LISTING)
-            post_close_listing = session.send("Target.getTargets")
-            record_stage(_OracleTargetCloserStage.ABSENCE_LISTING_INVALID)
-            if not isinstance(post_close_listing, Mapping):
-                return
-            if "targetInfos" not in post_close_listing:
-                return
-            post_close_targets = post_close_listing["targetInfos"]
-            record_stage(_OracleTargetCloserStage.ABSENCE_TARGETS_INVALID)
-            if not isinstance(post_close_targets, (list, tuple)):
-                return
-            if any(
-                not isinstance(info, Mapping)
-                or not isinstance(info.get("targetId"), str)
-                or not info.get("targetId")
-                for info in post_close_targets
-            ):
-                return
-            record_stage(_OracleTargetCloserStage.TARGET_ABSENCE_CHECK)
-            target_proof.value = not any(
-                isinstance(info, Mapping) and info.get("targetId") == target_id
-                for info in post_close_targets
-            )
-            if target_proof.value:
-                return
-            record_stage(_OracleTargetCloserStage.TARGET_STILL_PRESENT)
-            remaining_seconds = _remaining_browser_timeout(deadline)
-            if remaining_seconds <= 0:
-                return
-            time.sleep(min(remaining_seconds, 0.05))
+        if not any(info.get("targetId") == target_id for info in targets):
+            closed.value = True
+        else:
+            result = session.send("Target.closeTarget", {"targetId": target_id})
+            closed.value = result.get("success") is True
     except Exception:
-        target_proof.value = False
+        closed.value = False
     finally:
-        try:
-            _disconnect_attached_browser(playwright, browser)
-        finally:
-            driver_done.set()
+        _disconnect_attached_browser(playwright, browser)
 
 
 def _receive_oracle_browser_worker_message(
     receiver: Any,
     deadline: float,
-    should_stop: Optional[Callable[[], bool]] = None,
 ) -> Mapping[str, Any]:
     pipe_buffer = bytearray()
     payload = bytearray()
@@ -7817,7 +3243,6 @@ def _receive_oracle_browser_worker_message(
             receiver,
             pipe_buffer,
             deadline,
-            should_stop=should_stop,
         )
         if not frame:
             break
@@ -7843,7 +3268,6 @@ def _read_oracle_browser_worker_frame(
     receiver: Any,
     pipe_buffer: bytearray,
     deadline: float,
-    should_stop: Optional[Callable[[], bool]] = None,
 ) -> bytes:
     try:
         pipe_fd = receiver.fileno()
@@ -7857,7 +3281,6 @@ def _read_oracle_browser_worker_frame(
         pipe_buffer,
         4,
         deadline,
-        should_stop=should_stop,
     )
     frame_length = int.from_bytes(pipe_buffer[:4], byteorder="big", signed=True)
     del pipe_buffer[:4]
@@ -7870,7 +3293,6 @@ def _read_oracle_browser_worker_frame(
         pipe_buffer,
         frame_length,
         deadline,
-        should_stop=should_stop,
     )
     frame = bytes(pipe_buffer[:frame_length])
     del pipe_buffer[:frame_length]
@@ -7882,13 +3304,8 @@ def _fill_oracle_browser_pipe_buffer(
     pipe_buffer: bytearray,
     required_bytes: int,
     deadline: float,
-    should_stop: Optional[Callable[[], bool]] = None,
 ) -> None:
     while len(pipe_buffer) < required_bytes:
-        if should_stop is not None and should_stop():
-            raise OracleBrowserBoundaryUnavailable(
-                "Oracle browser conversation-init capture was aborted."
-            )
         remaining_seconds = _remaining_browser_timeout(deadline)
         if remaining_seconds <= 0:
             raise OracleBrowserBoundaryUnavailable(
@@ -7899,14 +3316,16 @@ def _fill_oracle_browser_pipe_buffer(
                 [pipe_fd],
                 [],
                 [],
-                min(remaining_seconds, 0.1),
+                remaining_seconds,
             )
         except (OSError, ValueError) as exc:
             raise OracleBrowserBoundaryUnavailable(
                 "Oracle browser boundary worker pipe is unavailable."
             ) from exc
         if not readable:
-            continue
+            raise OracleBrowserBoundaryUnavailable(
+                "Oracle browser conversation-init capture timed out."
+            )
         try:
             chunk = os.read(pipe_fd, 65536)
         except BlockingIOError:
@@ -7945,28 +3364,14 @@ def _oracle_browser_process_context(
     return multiprocessing.get_context("spawn")
 
 
-def _enter_oracle_browser_worker_process_group(
-    private_process_group: Any,
-    private_process_start_time: Optional[Any] = None,
-) -> None:
+def _enter_oracle_browser_worker_process_group(private_process_group: Any) -> None:
     if os.name == "posix":
         # Fail before starting the driver unless cleanup owns an isolated group.
         os.setsid()
         private_process_group.value = os.getpgrp()
-        if private_process_start_time is not None:
-            start_time = _native_history_process_start_time(os.getpid())
-            if start_time is None:
-                raise RuntimeError(
-                    "Oracle browser worker identity could not be established."
-                )
-            private_process_start_time.value = start_time
 
 
-def _terminate_oracle_browser_worker(
-    process: Any,
-    private_process_group: int,
-    private_process_start_time: Optional[Any] = None,
-) -> None:
+def _terminate_oracle_browser_worker(process: Any, private_process_group: int) -> None:
     process_id = getattr(process, "pid", None)
     if (
         os.name == "posix"
@@ -7974,35 +3379,26 @@ def _terminate_oracle_browser_worker(
         and private_process_group == process_id
         and private_process_group > 0
         and private_process_group != os.getpgrp()
-        and private_process_start_time is not None
-        and _native_history_process_identity_matches(
-            process_id,
-            private_process_start_time,
-        )
     ):
         try:
             # The driver can survive its leader; group cleanup is unconditional.
             os.killpg(private_process_group, signal.SIGKILL)
         except OSError:
             pass
-    try:
-        process_alive = process.is_alive()
-    except (AssertionError, OSError, ValueError):
-        process_alive = False
-    if not process_alive:
+    if not process.is_alive():
         return
     kill = getattr(process, "kill", None)
     if callable(kill):
         try:
             kill()
             return
-        except (AssertionError, OSError, ValueError):
+        except OSError:
             pass
     terminate = getattr(process, "terminate", None)
     if callable(terminate):
         try:
             terminate()
-        except (AssertionError, OSError, ValueError):
+        except OSError:
             pass
 
 
@@ -8065,7 +3461,7 @@ def _validate_oracle_browser_request(request: urllib_request.Request) -> None:
         raise OracleBrowserBoundaryUnavailable(
             "Oracle conversation-init transport only permits ChatGPT HTTPS."
         )
-    if parsed.path not in CHATGPT_CONVERSATION_INIT_PATHS:
+    if parsed.path != CHATGPT_CONVERSATION_INIT_PATH:
         raise OracleBrowserBoundaryUnavailable(
             "Oracle conversation-init transport only permits the "
             "conversation-init path."
@@ -8461,17 +3857,11 @@ def _collect_bound_conversation_init_snapshot(  # noqa: PLR0915 - bound state
     try:
         raw = transport.fetch(request)
     except ChatGPTConversationInitError as exc:
-        error = "browser_boundary_unavailable"
-        detail = str(exc).strip()
-        if detail.startswith(
-            "Oracle browser boundary is unavailable for conversation-init"
-        ) and "(" in detail:
-            error = detail.rstrip(".")
         return _bound_capture_failure(
             summary,
             source_path=source_path,
             expected_account_hash=expected_account_hash,
-            error=error,
+            error="browser_boundary_unavailable",
             telemetry_status="auth",
             telemetry_class=exc.telemetry_class,
             reusable=reusable,

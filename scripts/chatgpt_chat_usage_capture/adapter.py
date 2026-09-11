@@ -616,10 +616,6 @@ def _raise_if_authentication_required(payload: Mapping[str, Any], path: str) -> 
 
 
 def _is_allowed_path(path: str) -> bool:
-    if "?" in path or "#" in path:
-        return False
-    if path.endswith("/delete") or "/delete/" in path:
-        return False
     return any(path == prefix or path.startswith(f"{prefix}/") for prefix in ALLOWED_PATH_PREFIXES)
 
 

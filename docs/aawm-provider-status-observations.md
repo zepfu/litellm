@@ -995,67 +995,6 @@ the shared browser session, preserving other sessions and prior observation
 rows. A deferred or failed capture is not fresh evidence and does not replace
 prior rows or establish account coverage.
 
-### Native ChatGPT history observation
-
-`observe_native_chatgpt_history_from_oracle_browser(...)` is a separate
-attach-only observer for ordinary Chat history. It requires the nonserialized
-lifecycle capability supplied by the private profile owner, the owner's
-persistent supervised registry, the exact CDP endpoint and anchor target, and
-the pinned canonical-12 account hash `8e92854835c4`. It creates one owned page
-in that browser context and performs one ordinary `https://chatgpt.com/`
-navigation. Cleanup uses one absolute operation deadline with reserved phase
-budgets for target close, termination, reaping, and scratch removal.
-
-The observer never calls history endpoints directly, supplies guessed headers,
-reads cookies or storage, or submits a model message. Unknown same-origin
-`GET` backend/API bootstrap routes continue observation without storing their
-payloads. Unknown `POST`, mutation, and model-unsafe routes are aborted.
-Authenticated `GET /backend-api/conversations` index traffic plus
-conversation-detail and message-pagination GETs are projected into
-metadata-only pages. Those pages carry conversation IDs, generation/request
-identities, requested vs recorded-final model slugs, timestamps, surface, and
-pagination flags. Titles, prompts, answers, cookies, tokens, authorization
-headers, and raw browser storage never leave the observer.
-
-`classify_native_history_request(...)` and
-`observe_native_history_from_injected_events(...)` are the same guard and
-projection path with an injected transport, so tests can drive the shipped
-classifier without a live browser.
-
-### History-backed usage ledger
-
-Conversation-init capacity remains on `public.rate_limit_observations` with
-`source=chatgpt_conversation_init`. History-backed generation attempts use the
-dedicated PostgreSQL usage-ledger tables created by
-`scripts/apply_chatgpt_usage_ledger_2026_09_08.sql` and written through
-`scripts/chatgpt_chat_usage_capture/pg_ledger.py`. The sidecar persist adapter
-is `scripts/chatgpt_chat_usage_capture/native_history_ingest.py`. That schema
-grants the sidecar database role `aawm` SELECT/INSERT/UPDATE on the usage-ledger
-tables so host and container persist paths can write coverage gaps and reconstructed
-attempts. Reconstructed attempts are not provider quota charges.
-
-The ledger keeps requested-model, recorded-final-model, and raw-slug evidence
-separate. Attempt identity plus revision/alias idempotency prevent rescans and
-48-hour overlap from inflating counts. Chat stays separate from Work, Codex,
-API, Deep Research, image, voice, and Agent Mode. `PgLedger.count_attempts`
-returns per-account/per-model counts by calendar window. A second identical
-ingest is a deduplicated no-op.
-
-Bound sidecar capture iterates every enabled Codex OAuth inventory account.
-An account without a usable Oracle browser binding is recorded as
-`missing_binding` on both the conversation-init coverage row and
-`history_usage`; it is never omitted or mixed with another account's balances.
-The one-shot `--chatgpt-native-history-probe-account-label` entry remains
-available for a supervised account1 observation after the parent confirms that
-the bound browser session has no active conversation-history cooldown.
-
-Relevant additional environment variables:
-
-- `AAWM_CHATGPT_NATIVE_HISTORY_PROBE_ACCOUNT_LABEL`: one-shot probe inventory
-  label; skips other sidecar work.
-- `AAWM_CHATGPT_NATIVE_HISTORY_PROBE_COOLDOWN_CLEARED`: required parent
-  confirmation that the bound session is not in a history cooldown.
-
 ## Alibaba Token Plan quota polling
 
 The provider-status sidecar can poll the authenticated ModelStudio Token Plan

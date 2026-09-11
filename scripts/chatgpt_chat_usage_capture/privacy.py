@@ -90,8 +90,6 @@ METADATA_ALLOWLIST = {
     "model_slug",
     "requested_model",
     "requested_model_slug",
-    "resolved_model",
-    "resolved_model_slug",
     "requested_mode",
     "reasoning_effort",
     "default_model_slug",
@@ -139,8 +137,6 @@ _METADATA_IDENTIFIER_KEYS = {
     "model_slug",
     "requested_model",
     "requested_model_slug",
-    "resolved_model",
-    "resolved_model_slug",
     "default_model_slug",
     "generation_id",
     "request_id",
@@ -365,32 +361,24 @@ def observation_projection(
 
 
 def assert_no_secrets(value: Any, *, path: str = "root") -> None:
-    """Walk mapping keys and values looking for secret-like patterns."""
-    _assert_no_secrets_walk(value, path="root")
+    """Walk values only (not keys) looking for secret-like patterns."""
+    _assert_no_secrets_walk(value, path=path)
 
 
 def _assert_no_secrets_walk(value: Any, *, path: str) -> None:
     if isinstance(value, str):
-        if _contains_secret_value(value):
-            raise PrivacyError(f"secret-like value survived sanitization at {path}")
+        lowered = value.lower()
+        for needle in ("bearer ", "set-cookie", "authorization", "eyj"):
+            if needle in lowered:
+                raise PrivacyError(f"secret-like value survived sanitization at {path}")
+        if EMAIL_RE.search(value):
+            raise PrivacyError(f"email survived sanitization at {path}")
     elif isinstance(value, dict):
-        for index, (key, child) in enumerate(value.items()):
-            key_text = str(key)
-            if SENSITIVE_KEY_RE.search(key_text) or _contains_secret_value(key_text):
-                # Rejected keys and caller-supplied paths can themselves be secrets.
-                raise PrivacyError(f"secret-like mapping key survived sanitization at {path}.field[{index}]")
-            _assert_no_secrets_walk(child, path=f"{path}.field[{index}]")
+        for key, child in value.items():
+            _assert_no_secrets_walk(child, path=f"{path}.{key}")
     elif isinstance(value, list):
         for idx, child in enumerate(value):
             _assert_no_secrets_walk(child, path=f"{path}[{idx}]")
-
-
-def _contains_secret_value(value: str) -> bool:
-    lowered = value.lower()
-    return bool(
-        any(needle in lowered for needle in ("bearer ", "set-cookie", "authorization", "eyj"))
-        or EMAIL_RE.search(value)
-    )
 
 
 def evidence_identity(source_kind: str, source_id: str, revision: str) -> str:
