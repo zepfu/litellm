@@ -880,79 +880,103 @@ class BaseOpenAIPassThroughHandler:
                             ),
                             request=request,
                         )
-                guard = await _sa.ensure_session_owner_guard_for_request(
-                    request=request,
-                    request_body=direct_body,
-                    session_identity=canonical_session_identity,
-                    requested_attributes=requested_attributes,
-                    alias_model=str(requested_model)
-                    if requested_model is not None
-                    else None,
-                    require_exact_attributes=True,
-                    failure_phase="session_owner_direct_openai_pre_egress",
-                    raise_on_redispatch=False,
-                )
-                if (
-                    guard.decision
-                    is _sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
-                ):
-                    # OPENAI-020: same hosted_provider model/account switches
-                    # are COMPATIBLE_OWNER on the canonical identity and must
-                    # not activate aawm-session-owner-redispatch-v1:*. Keep
-                    # activate_session_owner_redispatch_effective_identity for
-                    # remaining replay-safe mismatches.
-                    same_hosted_provider = _sa._hosted_providers_match(
-                        requested_attributes,
-                        _sa._owner_attributes(guard.owner_record),
+                session_owner_identity = canonical_session_identity
+                session_owner_reservation_retry_attempts = 0
+                while True:
+                    guard = await _sa.ensure_session_owner_guard_for_request(
+                        request=request,
+                        request_body=direct_body,
+                        session_identity=session_owner_identity,
+                        requested_attributes=requested_attributes,
+                        alias_model=str(requested_model)
+                        if requested_model is not None
+                        else None,
+                        require_exact_attributes=True,
+                        failure_phase="session_owner_direct_openai_pre_egress",
+                        raise_on_redispatch=False,
                     )
-                    can_retry_with_effective_identity = (
-                        not same_hosted_provider
-                        and _sa.is_exact_owned_session_owner_route_mismatch(
-                            guard=guard,
-                            requested_attributes=requested_attributes,
-                        )
-                        and _sa.is_replay_safe_session_owner_redispatch_body(
-                            direct_body
-                        )
-                        and not _sa.request_has_effective_session_identity(
-                            request
-                        )
-                    )
-                    if can_retry_with_effective_identity and _sa.clear_non_held_request_session_owner_lease(
-                        request
-                    ):
-                        effective_identity = _sa.activate_session_owner_redispatch_effective_identity(
-                            request=request,
-                            base_session_identity=canonical_session_identity,
-                        )
-                        if effective_identity is not None:
-                            guard = await _sa.ensure_session_owner_guard_for_request(
-                                request=request,
-                                request_body=direct_body,
-                                session_identity=effective_identity,
-                                requested_attributes=requested_attributes,
-                                alias_model=str(requested_model)
-                                if requested_model is not None
-                                else None,
-                                require_exact_attributes=True,
-                                failure_phase="session_owner_direct_openai_pre_egress",
-                                raise_on_redispatch=False,
-                            )
                     if (
                         guard.decision
                         is _sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
                     ):
-                        _sa.raise_session_owner_redispatch_required(
-                            session_identity=guard.session_identity
-                            or canonical_session_identity,
-                            guard=guard,
-                            alias_model=str(requested_model)
-                            if requested_model is not None
-                            else None,
-                            candidate=requested_attributes,
-                            failure_phase="session_owner_direct_openai_pre_egress",
-                            request=request,
+                        # OPENAI-020: same hosted_provider model/account switches
+                        # are COMPATIBLE_OWNER on the canonical identity and must
+                        # not activate aawm-session-owner-redispatch-v1:*. Keep
+                        # activate_session_owner_redispatch_effective_identity for
+                        # remaining replay-safe mismatches.
+                        same_hosted_provider = _sa._hosted_providers_match(
+                            requested_attributes,
+                            _sa._owner_attributes(guard.owner_record),
                         )
+                        can_retry_with_effective_identity = (
+                            not same_hosted_provider
+                            and _sa.is_exact_owned_session_owner_route_mismatch(
+                                guard=guard,
+                                requested_attributes=requested_attributes,
+                            )
+                            and _sa.is_replay_safe_session_owner_redispatch_body(
+                                direct_body
+                            )
+                            and not _sa.request_has_effective_session_identity(
+                                request
+                            )
+                        )
+                        if can_retry_with_effective_identity and _sa.clear_non_held_request_session_owner_lease(
+                            request
+                        ):
+                            effective_identity = _sa.activate_session_owner_redispatch_effective_identity(
+                                request=request,
+                                base_session_identity=canonical_session_identity,
+                            )
+                            if effective_identity is not None:
+                                session_owner_identity = effective_identity
+                                guard = await _sa.ensure_session_owner_guard_for_request(
+                                    request=request,
+                                    request_body=direct_body,
+                                    session_identity=effective_identity,
+                                    requested_attributes=requested_attributes,
+                                    alias_model=str(requested_model)
+                                    if requested_model is not None
+                                    else None,
+                                    require_exact_attributes=True,
+                                    failure_phase="session_owner_direct_openai_pre_egress",
+                                    raise_on_redispatch=False,
+                                )
+                        can_retry_competing_reservation = (
+                            guard.decision
+                            is _sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
+                            and _sa._record_state(guard.owner_record)
+                            == _sa.SessionOwnerRecordState.RESERVED.value
+                            and session_owner_reservation_retry_attempts < 3
+                            and _sa.is_replay_safe_session_owner_redispatch_body(
+                                direct_body
+                            )
+                        )
+                        if (
+                            can_retry_competing_reservation
+                            and _sa.clear_non_held_request_session_owner_lease(
+                                request
+                            )
+                        ):
+                            session_owner_reservation_retry_attempts += 1
+                            await asyncio.sleep(1.0)
+                            continue
+                        if (
+                            guard.decision
+                            is _sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
+                        ):
+                            _sa.raise_session_owner_redispatch_required(
+                                session_identity=guard.session_identity
+                                or session_owner_identity,
+                                guard=guard,
+                                alias_model=str(requested_model)
+                                if requested_model is not None
+                                else None,
+                                candidate=requested_attributes,
+                                failure_phase="session_owner_direct_openai_pre_egress",
+                                request=request,
+                            )
+                    break
         session_owner_lease = _sa.get_request_session_owner_lease(request)
         defer_managed_xai_promotion = (
             managed_xai_oauth_request
