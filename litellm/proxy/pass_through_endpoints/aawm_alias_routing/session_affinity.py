@@ -1690,6 +1690,31 @@ async def _read_session_owner_record(
 _REQUEST_STATE_RESERVATION_WAIT_DEADLINE_ATTR = (
     "_aawm_session_owner_reservation_wait_deadline"
 )
+_REQUEST_STATE_DEFER_COMPETING_RESERVATION_LOG_ATTR = (
+    "_aawm_session_owner_defer_competing_reservation_log"
+)
+
+
+def set_competing_reservation_log_deferred(
+    request: Any,
+    deferred: bool,
+) -> None:
+    if request is None:
+        return
+    state = getattr(request, "state", None)
+    if state is not None:
+        setattr(state, _REQUEST_STATE_DEFER_COMPETING_RESERVATION_LOG_ATTR, deferred)
+
+
+def _competing_reservation_log_is_deferred(request: Any) -> bool:
+    if request is None:
+        return False
+    state = getattr(request, "state", None)
+    return bool(
+        getattr(state, _REQUEST_STATE_DEFER_COMPETING_RESERVATION_LOG_ATTR, False)
+        if state is not None
+        else False
+    )
 
 
 def _get_reservation_wait_deadline(request: Any) -> Optional[float]:
@@ -1768,10 +1793,9 @@ async def _wait_for_foreign_reserved_session_owner(
         return record, None
 
     deadline = _get_reservation_wait_deadline(request)
-    if deadline is None:
-        deadline = time.monotonic() + _normalize_reservation_wait_timeout(
-            timeout_seconds
-        )
+    now = time.monotonic()
+    if deadline is None or deadline <= now:
+        deadline = now + _normalize_reservation_wait_timeout(timeout_seconds)
         _set_reservation_wait_deadline(request, deadline)
     poll = _normalize_reservation_wait_poll(poll_seconds)
     current = record
@@ -4463,23 +4487,30 @@ def raise_session_owner_redispatch_required(
     # Keep the legacy attribution argument for callers; reopened D1-614 intentionally
     # does not emit its values.
     _ = attribution
-    _emit_session_owner_redispatch_observability(
-        session_identity=session_identity,
-        failure_phase=failure_phase,
-        mismatch_reason=mismatch_reason,
-        alias_model=alias_model,
-        shaped_candidate=shaped_candidate,
-        candidate_endpoint=candidate_endpoint,
-        owner_attrs=owner_attrs,
-        request=request,
-        attempted_provider_call=attempted_provider_call,
-        terminal_marker=(
-            terminal_marker
-            if terminal_marker is not None
-            else getattr(request, "state", None)
-        ),
-        replay_safety=replay_safety,
-    )
+    # A competing reservation is a bounded, pre-egress coordination race.
+    # The alias selector may retry it internally; emit terminal observability
+    # only if the bounded retry ultimately surfaces the conflict.
+    if not (
+        failure_phase == "session_owner_competing_reservation"
+        and _competing_reservation_log_is_deferred(request)
+    ):
+        _emit_session_owner_redispatch_observability(
+            session_identity=session_identity,
+            failure_phase=failure_phase,
+            mismatch_reason=mismatch_reason,
+            alias_model=alias_model,
+            shaped_candidate=shaped_candidate,
+            candidate_endpoint=candidate_endpoint,
+            owner_attrs=owner_attrs,
+            request=request,
+            attempted_provider_call=attempted_provider_call,
+            terminal_marker=(
+                terminal_marker
+                if terminal_marker is not None
+                else getattr(request, "state", None)
+            ),
+            replay_safety=replay_safety,
+        )
     # Direct OpenAI / nested Codex guards raise 409 before
     # pass_through_request registers ACCESS replacement. Register once so
     # the leftover uvicorn ACCESS for this exact POST

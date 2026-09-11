@@ -1121,6 +1121,7 @@ async def handle_alias_route(  # noqa: PLR0915
     request_retry_started_at = time.monotonic()
     request_retry_budget = OpenAIAlphaCapacityRetryBudget()
     token_invalidated_reload_attempts: set[str] = set()
+    session_owner_reservation_retry_attempts = 0
     account_failover_replay_safe = (
         replay_safety.safe
         if replay_safety is not None
@@ -1949,6 +1950,16 @@ async def handle_alias_route(  # noqa: PLR0915
         )
 
     while provider_candidate_attempts < max_candidate_attempts:
+        can_retry_competing_reservation = (
+            session_owner_reservation_retry_attempts < 3
+            and _session_affinity_mod().is_replay_safe_session_owner_redispatch_body(
+                prepared_request_body
+            )
+        )
+        _session_affinity_mod().set_competing_reservation_log_deferred(
+            request,
+            can_retry_competing_reservation,
+        )
         try:
             selection_kwargs: dict[str, Any] = {
                 "request": request,
@@ -1962,17 +1973,34 @@ async def handle_alias_route(  # noqa: PLR0915
                 )
             selection = await select_candidate_fn(**selection_kwargs)
         except HTTPException as exc:
-            if attempts:
-                _mark_auto_agent_alias_request_terminal_failure(
-                    request,
-                    attempts[-1],
-                )
             selection_detail = exc.detail if isinstance(exc.detail, dict) else {}
             selection_error = selection_detail.get("error")
             selection_error_code = (
                 selection_error.get("code")
                 if isinstance(selection_error, dict)
                 else None
+            )
+            if (
+                exc.status_code == status.HTTP_409_CONFLICT
+                and selection_error_code
+                == "aawm_session_owner_redispatch_required"
+                and selection_detail.get("failure_phase")
+                == "session_owner_competing_reservation"
+                and selection_detail.get("attempted_provider_call") is False
+                and can_retry_competing_reservation
+                and session_owner_reservation_retry_attempts < 3
+            ):
+                session_owner_reservation_retry_attempts += 1
+                await asyncio.sleep(1.0)
+                continue
+            if attempts:
+                _mark_auto_agent_alias_request_terminal_failure(
+                    request,
+                    attempts[-1],
+                )
+            _session_affinity_mod().set_competing_reservation_log_deferred(
+                request,
+                False,
             )
             selection_error_codes = _redispatch_error_codes(exc, selection_detail)
             if (
@@ -2048,6 +2076,10 @@ async def handle_alias_route(  # noqa: PLR0915
             )
             raise
         candidate = selection["candidate"]
+        _session_affinity_mod().set_competing_reservation_log_deferred(
+            request,
+            False,
+        )
         bind_openai_candidate_context(request, candidate)
         cooldown_key = str(selection["cooldown_key"])
         capacity_retry_coordinator = (
