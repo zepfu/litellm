@@ -603,6 +603,7 @@ class _Http1AgentnLane:
         self.termination_reason: Optional[str] = None
         self.sniffed: Dict[str, str] = {}
         self._close_task: Optional[asyncio.Task[None]] = None
+        self._flush_task: Optional[asyncio.Task[None]] = None
 
     def attach_session(self, session: "_AgentnH2Session") -> None:
         if self.closed:
@@ -1216,6 +1217,24 @@ class _AgentnH2Session:
             self.reader_termination_event.set()
             await self._incoming.put(None)
 
+    async def _flush_loop(self) -> None:
+        while not self._closed:
+            await self._pending_wakeup.wait()
+            self._pending_wakeup.clear()
+            if self._closed:
+                return
+            async with self._lock:
+                writer = self.writer
+                connection = self.connection
+                if writer is None or connection is None:
+                    return
+                outbound = self._flush_pending_locked()
+                if outbound:
+                    writer.write(outbound)
+                    await writer.drain()
+            if not self.pending and self._request_end_stream_sent:
+                return
+
     async def write_request(self, data: bytes, *, end_stream: bool = False) -> None:
         if self._closed:
             raise CursorConnectError(
@@ -1231,6 +1250,8 @@ class _AgentnH2Session:
             self._request_end_stream_requested = True
         if data:
             self.pending.extend(data)
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_task = asyncio.create_task(self._flush_loop())
         while True:
             async with self._lock:
                 writer = self.writer
@@ -1245,8 +1266,11 @@ class _AgentnH2Session:
                 if outbound:
                     writer.write(outbound)
                     await writer.drain()
-                if not pending or not self._request_end_stream_requested:
-                    break
+            if not pending and not self._request_end_stream_requested:
+                break
+            if not self._request_end_stream_requested:
+                self._pending_wakeup.set()
+                break
                 self._pending_wakeup.clear()
             await self._pending_wakeup.wait()
         verbose_proxy_logger.info(
@@ -1279,6 +1303,7 @@ class _AgentnH2Session:
         self._pending_wakeup.set()
         current_task = asyncio.current_task()
         read_task = self._read_task
+        flush_task = self._flush_task
         writer = self.writer
         self.writer = None
         self.reader = None
@@ -1308,6 +1333,9 @@ class _AgentnH2Session:
         if read_task is not None and read_task is not current_task and not read_task.done():
             read_task.cancel()
             await _await_bounded_task(read_task)
+        if flush_task is not None and flush_task is not current_task and not flush_task.done():
+            flush_task.cancel()
+            await _await_bounded_task(flush_task)
         if writer is None:
             return
         try:
@@ -1641,6 +1669,12 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
                     if reason not in {"normal_response", None}:
                         candidate_reason = candidate_reason or str(reason)
 
+            if response_task in done_tasks and candidate_reason == "client_disconnect":
+                try:
+                    if response_task.result() == "normal_response":
+                        candidate_reason = "normal_response"
+                except (asyncio.CancelledError, Exception):
+                    pass
             if candidate_reason is not None:
                 termination_reason = _sanitize_termination_reason(candidate_reason)
                 break
@@ -2026,6 +2060,12 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
                     reason = session.upstream_termination_reason
                     if reason not in {"normal_response", None}:
                         candidate_reason = candidate_reason or str(reason)
+            if response_task in done and candidate_reason == "client_disconnect":
+                try:
+                    if response_task.result() == "normal_response":
+                        candidate_reason = "normal_response"
+                except (asyncio.CancelledError, Exception):
+                    pass
             if candidate_reason is not None:
                 termination_reason = _sanitize_termination_reason(candidate_reason)
                 break
