@@ -1277,6 +1277,7 @@ class _AgentnH2Session:
         self._closed = True
         self._mark_upstream_termination(reason)
         self._pending_wakeup.set()
+        current_task = asyncio.current_task()
         read_task = self._read_task
         writer = self.writer
         self.writer = None
