@@ -191,6 +191,7 @@ from .streaming_handler import (
     PassThroughStreamingHandler,
     ResponsesStreamPreCommitFailure,
     _RESPONSES_TRANSIENT_CAPACITY_CLASSES,
+    _RESPONSES_TRANSIENT_STREAM_CLASSES,
 )
 from .aawm_alias_routing.pre_commit_retry import (
     ClientDisconnectedCancellation,
@@ -1930,7 +1931,11 @@ def _is_passthrough_pre_first_byte_hidden_retryable(
     if isinstance(exc, ResponsesStreamPreCommitFailure):
         return bool(
             exc.retryable
-            and exc.error_class in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
+            and exc.error_class
+            in (
+                _RESPONSES_TRANSIENT_CAPACITY_CLASSES
+                | _RESPONSES_TRANSIENT_STREAM_CLASSES
+            )
             and not exc.pre_commit_retry_exhausted
         )
     if status_code == 429:
@@ -2440,7 +2445,10 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 (
                     isinstance(exc, ResponsesStreamPreCommitFailure)
                     and exc.error_class
-                    in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
+                    in (
+                        _RESPONSES_TRANSIENT_CAPACITY_CLASSES
+                        | _RESPONSES_TRANSIENT_STREAM_CLASSES
+                    )
                     and exc.retryable
                 )
                 or raw_http_capacity_overload

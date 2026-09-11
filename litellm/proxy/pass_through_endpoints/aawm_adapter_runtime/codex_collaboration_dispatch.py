@@ -87,7 +87,6 @@ _CODEX_ENVELOPE_PATTERN = re.compile(
 )
 _FRAME_PREFIX_PATTERN = re.compile(r'\A\{\s*"cfg047"\s*:')
 _OPAQUE_PREFIXES = (
-    "gAAAA",
     "aawm_erp:",
     "litellm_enc:",
 )
@@ -319,6 +318,15 @@ def parse_codex_collaboration_text_frame(value: Any) -> str:
     if not isinstance(text, str) or not text:
         raise CodexCollaborationDispatchError("invalid_envelope")
     return text
+
+
+def _parse_codex_collaboration_payload(value: Any) -> str:
+    """Accept the current plaintext payload and the CFG-047 frame form."""
+    if not isinstance(value, str) or not value or len(value) > _MAX_FRAME_CHARS:
+        raise CodexCollaborationDispatchError("invalid_envelope")
+    if _FRAME_PREFIX_PATTERN.match(value):
+        return parse_codex_collaboration_text_frame(value)
+    return value
 
 
 def _is_opaque_representation(value: str) -> bool:
@@ -786,6 +794,8 @@ def _validate_envelope_identity(
 ) -> None:
     author = item.get("author")
     recipient = item.get("recipient")
+    if author is None and recipient is None:
+        return
     if (
         not isinstance(author, str)
         or not author
@@ -811,16 +821,14 @@ def _validate_visible_agent_message(
     message_type, task_name, sender, payload_offset = envelope
     _validate_envelope_identity(item, task_name=task_name, sender=sender)
     remainder = visible_text[payload_offset:]
-    if message_type == "FINAL_ANSWER":
+    if message_type != "NEW_TASK":
         # A child result is content, even when its text happens to begin with
         # a representation-looking prefix. Never reinterpret it as a task.
         return None
     if not remainder:
         raise CodexCollaborationDispatchError("invalid_envelope")
-    if _is_opaque_representation(remainder):
-        raise CodexCollaborationDispatchError("opaque")
-    if _FRAME_PREFIX_PATTERN.match(remainder):
-        assignment = parse_codex_collaboration_text_frame(remainder)
+    if remainder:
+        assignment = _parse_codex_collaboration_payload(remainder)
         normalized_item = _NormalizedCodexAgentMessage(item)
         normalized_item["content"] = [
             {
@@ -868,14 +876,12 @@ def _normalize_agent_message_item(item: dict[str, Any]) -> tuple[dict[str, Any],
         if payload_offset != len(visible_text):
             raise CodexCollaborationDispatchError("invalid_envelope")
         _validate_envelope_identity(item, task_name=task_name, sender=sender)
-        if message_type == "FINAL_ANSWER":
-            raise CodexCollaborationDispatchError("invalid_envelope")
+        if message_type != "NEW_TASK":
+            return item, False
         payload = payload_part.get("encrypted_content")
         if not isinstance(payload, str) or not payload:
             raise CodexCollaborationDispatchError("invalid_envelope")
-        if _is_opaque_representation(payload):
-            raise CodexCollaborationDispatchError("opaque")
-        assignment = parse_codex_collaboration_text_frame(payload)
+        assignment = _parse_codex_collaboration_payload(payload)
         normalized_item = _NormalizedCodexAgentMessage(item)
         normalized_item["content"] = [
             {

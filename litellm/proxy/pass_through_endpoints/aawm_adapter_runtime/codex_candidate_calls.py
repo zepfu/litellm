@@ -5261,9 +5261,26 @@ async def _perform_codex_auto_agent_native_openai_request(
     request_body: dict[str, Any],
     custom_headers: Optional[dict[str, str]] = None,
 ) -> Response:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+        guard_openai_encrypted_reasoning_egress,
+    )
+
     # Managed Codex Responses egress is always streamed and unpersisted,
     # including nested alias candidates that bypass direct-route shaping.
-    request_body = dict(request_body)
+    request_body = normalize_codex_collaboration_dispatch_body(
+        dict(request_body)
+    )
+    request_body, _encrypted_reasoning_disposition = (
+        guard_openai_encrypted_reasoning_egress(
+            request_body,
+            url=target_url,
+            egress_credential_family=(
+                "openai" if custom_headers is not None or forward_headers else None
+            ),
+            custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+            model=request_body.get("model"),
+        )
+    )
     request_body["stream"] = True
     request_body["store"] = False
     is_streaming_request = True

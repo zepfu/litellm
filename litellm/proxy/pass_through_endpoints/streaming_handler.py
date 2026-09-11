@@ -105,6 +105,11 @@ _RESPONSES_TRANSIENT_CAPACITY_CLASSES = frozenset(
         "upstream_transient_internal",
     }
 )
+_RESPONSES_TRANSIENT_STREAM_CLASSES = frozenset(
+    {
+        "stream_interrupted",
+    }
+)
 _RESPONSES_ACCOUNT_EXHAUSTION_CLASSES = frozenset(
     {
         "usage_limit_reached",
@@ -3705,11 +3710,25 @@ class PassThroughStreamingHandler:
                 or "output_policy_failure"
             )
             retryable = False
-        elif delivered_disposition and delivered_disposition != "completed":
+        elif (
+            delivered_disposition
+            and delivered_disposition != "completed"
+            and not (
+                delivered_disposition == "cancelled"
+                and terminal_event_type is None
+                and not policy_failure_kind
+                and not policy_failure_code
+                and not policy_failure_class
+            )
+        ):
             if error_payload is None:
                 error_class = f"delivered_{delivered_disposition}"
                 classification = error_class
                 retryable = False
+        elif delivered_disposition == "cancelled" and terminal_event_type is None:
+            error_class = "stream_interrupted"
+            classification = "transient_stream_interruption"
+            retryable = True
         sanitized_message = None
         if isinstance(error_payload, dict):
             sanitized_message = (
@@ -3748,7 +3767,15 @@ class PassThroughStreamingHandler:
             setattr(failure_exc, "policy_failure_code", policy_failure_code)
         if policy_failure_class:
             setattr(failure_exc, "policy_failure_class", policy_failure_class)
-        if delivered_disposition is not None and delivered_disposition != "completed":
+        if (
+            delivered_disposition is not None
+            and delivered_disposition != "completed"
+            and not (
+                delivered_disposition == "cancelled"
+                and terminal_event_type is None
+                and retryable
+            )
+        ):
             failure_exc.retryable = False
             failure_exc.pre_commit_retry_exhausted = True
         failure_context = {
