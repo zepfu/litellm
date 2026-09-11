@@ -4430,6 +4430,7 @@ def raise_session_owner_redispatch_required(
         ),
         "type": "invalid_request_error",
         "code": _SESSION_OWNER_REDISPATCH_ERROR_CODE,
+        "retryable": True,
     }
     replay_safety_detail = _bounded_replay_safety_detail(replay_safety)
     detail = _build_minimized_replay_unsafe_detail(
@@ -4485,7 +4486,11 @@ def raise_session_owner_redispatch_required(
     # /openai_passthrough/responses 409 is consumed.
     _register_session_owner_inbound_access_log_replacement(request)
 
-    raise HTTPException(status_code=409, detail=detail)
+    raise HTTPException(
+        status_code=409,
+        detail=detail,
+        headers={"Retry-After": "1"},
+    )
 
 
 

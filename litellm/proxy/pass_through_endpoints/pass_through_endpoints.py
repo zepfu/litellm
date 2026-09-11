@@ -132,7 +132,7 @@ PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS: Tuple[int, ...] = (
     120,
 )
 PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES = frozenset(
-    {500, 502, 503, 504, 529}
+    {500, 502, 503, 504, 520, 529}
 )
 # Wall-clock ceiling for shared pre-first-byte hidden retries (RR-056 / B2).
 # Bounds total elapsed time across attempts + backoff, independent of per-attempt
@@ -1006,6 +1006,18 @@ def _mark_passthrough_capacity_exception_terminal(
         exc = _build_http_exception_from_upstream_status_error(
             exc, exc.response.text
         )
+    elif isinstance(exc, HTTPException) and getattr(exc, "status_code", None) in (
+        PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES
+    ):
+        # Preserve provider detail while exposing the standard retryable 503
+        # contract after the coordinator's capacity budget is exhausted.
+        headers = dict(getattr(exc, "headers", None) or {})
+        headers.setdefault("Retry-After", "10")
+        exc = HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=getattr(exc, "detail", None),
+            headers=headers,
+        )
     setattr(exc, "_aawm_openai_capacity_expired", True)
     return exc
 
@@ -1857,6 +1869,8 @@ def _classify_passthrough_raw_http_error(
         and status_code not in PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES
     ):
         return None
+    if status_code == 520:
+        return "upstream_transient_internal", "transient_upstream", True
 
     detail: Any = getattr(exc, "detail", None)
     if detail is None and isinstance(exc, httpx.HTTPStatusError):

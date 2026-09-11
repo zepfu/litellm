@@ -3759,6 +3759,9 @@ class PassThroughStreamingHandler:
         metadata["aawm_responses_stream_failure_class"] = error_class
         metadata["aawm_responses_stream_failure_classification"] = classification
         metadata["aawm_responses_stream_failure_retryable"] = retryable
+        if retryable and isinstance(error_payload, dict):
+            # Preserve the retry contract in the wire error for orchestrators.
+            error_payload.setdefault("retryable", True)
         if delivered_disposition:
             metadata["aawm_delivered_disposition"] = delivered_disposition
             metadata["aawm_route_rollup_turn_suppressed"] = True
