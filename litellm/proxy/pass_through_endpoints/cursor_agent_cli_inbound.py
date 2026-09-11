@@ -176,7 +176,7 @@ async def _await_bounded_task(
     task: "asyncio.Task[Any]",
     *,
     timeout: float = _INBOUND_CLI_CLEANUP_TIMEOUT_SECONDS,
-) -> None:
+) -> bool:
     """Join an owned cleanup task without allowing transport teardown to hang."""
     cancelled = False
     try:
@@ -193,12 +193,19 @@ async def _await_bounded_task(
             await asyncio.wait({task}, timeout=timeout)
         except asyncio.CancelledError:
             cancelled = True
+    success = False
     if task.done():
+        try:
+            result = task.result()
+            success = result is not False
+        except (asyncio.CancelledError, Exception):
+            success = False
         _consume_task_exception(task)
     else:
         task.add_done_callback(_consume_task_exception)
     if cancelled:
         raise asyncio.CancelledError
+    return success
 
 
 def _consume_task_exception(task: "asyncio.Task[Any]") -> None:
@@ -208,7 +215,7 @@ def _consume_task_exception(task: "asyncio.Task[Any]") -> None:
         pass
 
 
-async def _bounded_session_close(session: Any, reason: str) -> None:
+async def _bounded_session_close(session: Any, reason: str) -> bool:
     async def _close() -> None:
         try:
             close_result = session.aclose(reason=reason)
@@ -216,7 +223,7 @@ async def _bounded_session_close(session: Any, reason: str) -> None:
             close_result = session.aclose()
         await close_result
 
-    await _await_bounded_task(asyncio.create_task(_close()))
+    return await _await_bounded_task(asyncio.create_task(_close()))
 
 
 def _connect_header_flush_frame() -> bytes:
@@ -652,7 +659,7 @@ class _Http1AgentnLane:
                 await self.aclose(reason="append_write_failed")
             raise
 
-    async def aclose(self, *, reason: str = "normal_response") -> None:
+    async def aclose(self, *, reason: str = "normal_response") -> bool:
         self._mark_terminating(reason)
         close_task = self._close_task
         current_task = asyncio.current_task()
@@ -660,17 +667,18 @@ class _Http1AgentnLane:
             close_task = asyncio.create_task(self._close_session())
             self._close_task = close_task
         if close_task is current_task:
-            return
-        await _await_bounded_task(close_task)
+            return True
+        return await _await_bounded_task(close_task)
 
-    async def _close_session(self) -> None:
+    async def _close_session(self) -> bool:
         session = self.session
         self.session = None
         if session is not None:
-            await _bounded_session_close(
+            return await _bounded_session_close(
                 session,
                 self.termination_reason or "unknown",
             )
+        return True
 
 
 class _Http1LaneRegistry:
@@ -1105,6 +1113,7 @@ class _AgentnH2Session:
         from h2.events import (
             ConnectionTerminated,
             DataReceived,
+            RemoteSettingsChanged,
             ResponseReceived,
             StreamEnded,
             StreamReset,
@@ -1163,7 +1172,6 @@ class _AgentnH2Session:
                         event.stream_id,
                     )
             elif isinstance(event, (StreamEnded, TrailersReceived)):
-                self._mark_upstream_termination("normal_response")
                 ended = True
             elif isinstance(event, (StreamReset, ConnectionTerminated)):
                 self._mark_upstream_termination("upstream_reset")
@@ -1172,7 +1180,7 @@ class _AgentnH2Session:
                     type(event).__name__,
                 )
                 ended = True
-            elif isinstance(event, WindowUpdated):
+            elif isinstance(event, (WindowUpdated, RemoteSettingsChanged)):
                 if self.connection is not None:
                     # The writer owns the awaited flush. Only wake it here;
                     # this synchronous event dispatcher cannot safely drain
@@ -1213,6 +1221,7 @@ class _AgentnH2Session:
                 for chunk in chunks:
                     await self._incoming.put(chunk)
                 if ended:
+                    self._mark_upstream_termination("normal_response")
                     break
         except asyncio.CancelledError:
             if not self._closed:
@@ -1307,17 +1316,17 @@ class _AgentnH2Session:
                 return
             yield chunk
 
-    async def aclose(self, *, reason: str = "unknown") -> None:
+    async def aclose(self, *, reason: str = "unknown") -> bool:
         close_task = self._close_task
         current_task = asyncio.current_task()
         if close_task is None:
             close_task = asyncio.create_task(self._close_impl(reason))
             self._close_task = close_task
         if close_task is current_task:
-            return
-        await _await_bounded_task(close_task)
+            return True
+        return await _await_bounded_task(close_task)
 
-    async def _close_impl(self, reason: str) -> None:
+    async def _close_impl(self, reason: str) -> bool:
         self._closed = True
         self._mark_upstream_termination(reason)
         self._pending_wakeup.set()
@@ -1325,6 +1334,7 @@ class _AgentnH2Session:
         current_task = asyncio.current_task()
         read_task = self._read_task
         flush_task = self._flush_task
+        cleanup_ok = True
         writer = self.writer
         self.writer = None
         self.reader = None
@@ -1353,12 +1363,12 @@ class _AgentnH2Session:
             pass
         if read_task is not None and read_task is not current_task and not read_task.done():
             read_task.cancel()
-            await _await_bounded_task(read_task)
+            cleanup_ok = await _await_bounded_task(read_task) and cleanup_ok
         if flush_task is not None and flush_task is not current_task and not flush_task.done():
             flush_task.cancel()
-            await _await_bounded_task(flush_task)
+            cleanup_ok = await _await_bounded_task(flush_task) and cleanup_ok
         if writer is None:
-            return
+            return cleanup_ok
         try:
             wait_closed = getattr(writer, "wait_closed", None)
             if callable(wait_closed):
@@ -1367,7 +1377,8 @@ class _AgentnH2Session:
                     timeout=_INBOUND_CLI_CLEANUP_TIMEOUT_SECONDS,
                 )
         except Exception:
-            pass
+            cleanup_ok = False
+        return cleanup_ok
 
 
 
@@ -1403,7 +1414,7 @@ def _upstream_request_headers(
     return forwarded
 
 
-async def _cancel_and_join_tasks(tasks: List["asyncio.Task[Any]"]) -> None:
+async def _cancel_and_join_tasks(tasks: List["asyncio.Task[Any]"]) -> bool:
     current_task = asyncio.current_task()
     owned = [task for task in tasks if task is not current_task]
     for task in owned:
@@ -1414,7 +1425,7 @@ async def _cancel_and_join_tasks(tasks: List["asyncio.Task[Any]"]) -> None:
         if owned:
             await asyncio.gather(*owned, return_exceptions=True)
 
-    await _await_bounded_task(asyncio.create_task(_join()))
+    return await _await_bounded_task(asyncio.create_task(_join()))
 
 
 def _task_failure_reason(task: "asyncio.Task[Any]", role: str) -> str:
@@ -1513,7 +1524,6 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
     sniffed: Dict[str, str] = {}
     sniff_buffer = bytearray()
     status_code = 500
-    error_message: Optional[str] = None
     termination_reason: Optional[str] = None
     session: Optional[_AgentnH2Session] = None
     response_started = False
@@ -1896,7 +1906,12 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
                     try:
                         await _await_bounded_task(close_task)
                     finally:
-                        cleanup_complete = close_task.done() and not close_task.cancelled()
+                        cleanup_complete = (
+                            close_task.done()
+                            and not close_task.cancelled()
+                            and close_task.exception() is None
+                            and close_task.result() is not False
+                        )
             except asyncio.CancelledError:
                 cleanup_cancelled = True
             except Exception:
@@ -1906,9 +1921,13 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
                 try:
                     await _await_bounded_task(join_task)
                 finally:
-                    cleanup_complete = (
-                        cleanup_complete and join_task.done() and not join_task.cancelled()
-                    )
+                        cleanup_complete = (
+                            cleanup_complete
+                            and join_task.done()
+                            and not join_task.cancelled()
+                            and join_task.exception() is None
+                            and join_task.result() is not False
+                        )
             except asyncio.CancelledError:
                 cleanup_cancelled = True
             except Exception:
@@ -2310,7 +2329,12 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
             except asyncio.CancelledError:
                 cleanup_cancelled = True
             finally:
-                cleanup_complete = close_task.done() and not close_task.cancelled()
+                cleanup_complete = (
+                    close_task.done()
+                    and not close_task.cancelled()
+                    and close_task.exception() is None
+                    and close_task.result() is not False
+                )
                 await registry.discard(request_id, lane)
         elif session is not None:
             close_task = asyncio.create_task(
@@ -2321,7 +2345,12 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
             except asyncio.CancelledError:
                 cleanup_cancelled = True
             finally:
-                cleanup_complete = close_task.done() and not close_task.cancelled()
+                cleanup_complete = (
+                    close_task.done()
+                    and not close_task.cancelled()
+                    and close_task.exception() is None
+                    and close_task.result() is not False
+                )
         try:
             if all_tasks:
                 join_task = asyncio.create_task(_cancel_and_join_tasks(all_tasks))
@@ -2329,7 +2358,11 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
                     await _await_bounded_task(join_task)
                 finally:
                     cleanup_complete = (
-                        cleanup_complete and join_task.done() and not join_task.cancelled()
+                        cleanup_complete
+                        and join_task.done()
+                        and not join_task.cancelled()
+                        and join_task.exception() is None
+                        and join_task.result() is not False
                     )
         except asyncio.CancelledError:
             cleanup_cancelled = True
@@ -2382,6 +2415,8 @@ async def proxy_inbound_cli_bidi_append(
     append_completed = False
     response_started = False
     termination_reason: Optional[str] = None
+    status_code = 200
+    deferred_error_payload: Optional[Mapping[str, str]] = None
     try:
         try:
             require_inbound_cli_bearer(headers)
@@ -2479,6 +2514,13 @@ async def proxy_inbound_cli_bidi_append(
             except Exception:
                 termination_reason = "receive_failed"
                 raise
+            if termination_reason != "client_disconnect":
+                status_code = 502
+                deferred_error_payload = {
+                    "error": "cursor_agent_cli_inbound_upstream",
+                    "reason": _sanitize_termination_reason(termination_reason),
+                    "detail": "Cursor Agent CLI inbound BidiAppend failed.",
+                }
     except _InboundCliClientDisconnected:
         termination_reason = "client_disconnect"
     except asyncio.CancelledError:
@@ -2486,40 +2528,28 @@ async def proxy_inbound_cli_bidi_append(
         raise
     except CursorConnectProtocolError as exc:
         termination_reason = termination_reason or "invalid_request"
+        status_code = 400
         if not response_started:
-            response_started = True
-            await _send_json_error(
-                send,
-                status_code=400,
-                payload=inbound_cli_http1_error_payload(
+            deferred_error_payload = inbound_cli_http1_error_payload(
                     reason="invalid_bidi_append",
                     detail=str(exc.message),
-                ),
-            )
+                )
     except CursorConnectError as exc:
         termination_reason = termination_reason or "append_write_failed"
+        status_code = int(getattr(exc, "status_code", 502) or 502)
         if not response_started:
-            response_started = True
-            await _send_json_error(
-                send,
-                status_code=int(getattr(exc, "status_code", 502) or 502),
-                payload=inbound_cli_http1_error_payload(
+            deferred_error_payload = inbound_cli_http1_error_payload(
                     reason="bidi_append_upstream",
                     detail="HTTP/1.1 BidiAppend failed to write the Agent CLI lane.",
-                ),
-            )
+                )
     except Exception:
         termination_reason = termination_reason or "receive_failed"
+        status_code = 502
         if not response_started:
-            response_started = True
-            await _send_json_error(
-                send,
-                status_code=502,
-                payload=inbound_cli_http1_error_payload(
+            deferred_error_payload = inbound_cli_http1_error_payload(
                     reason="inbound_proxy_error",
                     detail="Cursor Agent CLI inbound HTTP/1.1 BidiAppend proxy failed.",
-                ),
-            )
+                )
     finally:
         cleanup_cancelled = False
         cleanup_reason = _sanitize_termination_reason(termination_reason or "unknown")
@@ -2543,6 +2573,13 @@ async def proxy_inbound_cli_bidi_append(
         )
         if cleanup_cancelled:
             raise asyncio.CancelledError
+        if deferred_error_payload is not None and not response_started:
+            response_started = True
+            await _send_json_error(
+                send,
+                status_code=status_code,
+                payload=deferred_error_payload,
+            )
 
 
 class CursorAgentCliInboundMiddleware:
