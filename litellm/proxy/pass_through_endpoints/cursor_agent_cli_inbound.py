@@ -971,6 +971,7 @@ class _AgentnH2Session:
         self._request_end_stream_requested = False
         self._request_end_stream_sent = False
         self._upstream_termination_reason: Optional[str] = None
+        self.reader_termination_event = asyncio.Event()
         self._logged_data_chunks = 0
         self._agentn_body_decoder = _ProtoConnectFrameDecoder()
         self._auto_replies: List[bytes] = []
@@ -1212,6 +1213,7 @@ class _AgentnH2Session:
                 "cursor_agent_cli_inbound agentn read loop failed",
             )
         finally:
+            self.reader_termination_event.set()
             await self._incoming.put(None)
 
     async def write_request(self, data: bytes, *, end_stream: bool = False) -> None:
@@ -1569,6 +1571,7 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
         all_tasks.append(open_task)
         upload_task: Optional[asyncio.Task[Any]] = None
         response_task: Optional[asyncio.Task[Any]] = None
+        reader_termination_task: Optional[asyncio.Task[Any]] = None
         open_complete = False
 
         while active_tasks:
@@ -1633,6 +1636,10 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
                             candidate_reason = candidate_reason or "send_failed"
                         else:
                             candidate_reason = candidate_reason or str(result)
+                elif task is reader_termination_task:
+                    reason = session.upstream_termination_reason
+                    if reason not in {"normal_response", None}:
+                        candidate_reason = candidate_reason or str(reason)
 
             if candidate_reason is not None:
                 termination_reason = _sanitize_termination_reason(candidate_reason)
@@ -1640,8 +1647,15 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
             if open_complete and upload_task is None and response_task is None:
                 upload_task = asyncio.create_task(pump_to_agentn())
                 response_task = asyncio.create_task(pump_upstream())
-                active_tasks.extend((upload_task, response_task))
-                all_tasks.extend((upload_task, response_task))
+                reader_termination_task = asyncio.create_task(
+                    session.reader_termination_event.wait()
+                )
+                active_tasks.extend(
+                    (upload_task, response_task, reader_termination_task)
+                )
+                all_tasks.extend(
+                    (upload_task, response_task, reader_termination_task)
+                )
                 _log_inbound_cli_lifecycle(
                     call_id=call_id,
                     event="upstream_started",
@@ -1955,6 +1969,7 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
         )
         all_tasks.extend((disconnect_task, lane_task, open_task))
         response_task: Optional[asyncio.Task[Any]] = None
+        reader_termination_task: Optional[asyncio.Task[Any]] = None
         active_tasks: List[asyncio.Task[Any]] = [
             disconnect_task,
             lane_task,
@@ -2007,14 +2022,21 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
                             candidate_reason = candidate_reason or "cancelled"
                         except Exception:
                             candidate_reason = candidate_reason or "send_failed"
+                elif task is reader_termination_task:
+                    reason = session.upstream_termination_reason
+                    if reason not in {"normal_response", None}:
+                        candidate_reason = candidate_reason or str(reason)
             if candidate_reason is not None:
                 termination_reason = _sanitize_termination_reason(candidate_reason)
                 break
             if open_complete and response_task is None:
                 lane.opened.set()
                 response_task = asyncio.create_task(pump_response())
-                all_tasks.append(response_task)
-                active_tasks.append(response_task)
+                reader_termination_task = asyncio.create_task(
+                    session.reader_termination_event.wait()
+                )
+                all_tasks.extend((response_task, reader_termination_task))
+                active_tasks.extend((response_task, reader_termination_task))
                 _log_inbound_cli_lifecycle(
                     call_id=call_id,
                     event="upstream_started",
