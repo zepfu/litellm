@@ -3510,7 +3510,6 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         skip_reason = "candidate_ineligible"
     if (
         excluded_candidate
-        and (cooldown_seconds <= 0 or _candidate_uses_codex_oauth(candidate))
         and skip_reason is None
     ):
         skip_reason = "candidate_ineligible"
