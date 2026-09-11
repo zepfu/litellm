@@ -301,12 +301,12 @@ def wrap_encrypted_content_with_provenance(
 
 
 _LITELLM_ENC_PREFIX = "litellm_enc:"
-_FUNCTION_CALL_OUTPUT_ITEM_TYPES = {
+_FUNCTION_CALL_OUTPUT_ITEM_TYPES = (
     "function_call_output",
     # Codex/tool adapters may use this wire spelling before the canonical
     # Responses body compiler normalizes it.
     "custom_tool_call_output",
-}
+)
 _NESTED_ENCRYPTED_CONTENT_PART_TYPE = "encrypted_content"
 
 
