@@ -5828,7 +5828,7 @@ def _build_parser(  # noqa: PLR0915
         help=(
             "Run one supervised native-history observation for the exact Codex "
             "OAuth inventory label and skip all other sidecar work. Requires a "
-            "profile binding for pinned account 8e92854835c4."
+            "profile binding for the selected enabled inventory account."
         ),
     )
     parser.add_argument(
