@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
-import base64
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -1179,10 +1179,6 @@ def _codex_child_contract(
         if not isinstance(payload, Mapping):
             continue
         for source in (obj, payload):
-            for key in ("alias_model", "effective_alias_model", "model_alias"):
-                value = source.get(key)
-                if isinstance(value, str) and value.strip():
-                    effective_aliases.add(value.strip())
             for key in ("alias_model", "effective_alias_model", "model_alias"):
                 value = source.get(key)
                 if isinstance(value, str) and value.strip():
