@@ -4433,6 +4433,10 @@ async def handle_alias_route(  # noqa: PLR0915
                 if (
                     failover_ordinal > 0
                     and xai_no_io_selection_skip_reason is None
+                    and (
+                        attempted_provider_call
+                        or selection_provider_egress_reached
+                    )
                 ):
                     provider_candidate_attempts += 1
                 _record_auto_agent_alias_attempt_failure(
