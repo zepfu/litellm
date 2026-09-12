@@ -1171,6 +1171,7 @@ def _codex_child_contract(
     providers: set[str] = set()
     selected_models: set[str] = set()
     route_families: set[str] = set()
+    provenance_tuples: set[tuple[str, str, str, str]] = set()
     task_complete = False
     final_answer = False
 
@@ -1179,7 +1180,28 @@ def _codex_child_contract(
         if not isinstance(payload, Mapping):
             continue
         for source in (obj, payload):
-            for key in ("alias_model", "effective_alias_model", "model_alias"):
+            alias_value = next(
+                (
+                    str(source.get(key)).strip()
+                    for key in (
+                        "alias_model",
+                        "effective_alias_model",
+                        "model_alias",
+                        "requested_model_alias",
+                        "codex_auto_agent_alias",
+                    )
+                    if isinstance(source.get(key), str)
+                    and source.get(key).strip()
+                ),
+                "",
+            )
+            for key in (
+                "alias_model",
+                "effective_alias_model",
+                "model_alias",
+                "requested_model_alias",
+                "codex_auto_agent_alias",
+            ):
                 value = source.get(key)
                 if isinstance(value, str) and value.strip():
                     effective_aliases.add(value.strip())
@@ -1210,6 +1232,52 @@ def _codex_child_contract(
                 value = source.get(key)
                 if isinstance(value, str) and value.strip():
                     route_families.add(value.strip())
+            provider_value = next(
+                (
+                    str(source.get(key)).strip()
+                    for key in (
+                        "selected_provider",
+                        "producer_provider",
+                        "codex_auto_agent_selected_provider",
+                        "anthropic_auto_agent_selected_provider",
+                    )
+                    if isinstance(source.get(key), str)
+                    and source.get(key).strip()
+                ),
+                "",
+            )
+            model_value = next(
+                (
+                    str(source.get(key)).strip()
+                    for key in (
+                        "selected_model",
+                        "producer_model",
+                        "codex_auto_agent_selected_model",
+                        "anthropic_auto_agent_selected_model",
+                    )
+                    if isinstance(source.get(key), str)
+                    and source.get(key).strip()
+                ),
+                "",
+            )
+            route_value = next(
+                (
+                    str(source.get(key)).strip()
+                    for key in (
+                        "selected_route_family",
+                        "producer_route_family",
+                        "codex_auto_agent_selected_route_family",
+                        "anthropic_auto_agent_selected_route_family",
+                    )
+                    if isinstance(source.get(key), str)
+                    and source.get(key).strip()
+                ),
+                "",
+            )
+            if alias_value and provider_value and model_value and route_value:
+                provenance_tuples.add(
+                    (alias_value, provider_value, model_value, route_value)
+                )
             encrypted = source.get("encrypted_content")
             if isinstance(encrypted, str) and encrypted.startswith("aawm_erp:"):
                 encoded = encrypted[len("aawm_erp:") :].split(";", 1)[0]
@@ -1221,10 +1289,53 @@ def _codex_child_contract(
                 except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
                     envelope = {}
                 if isinstance(envelope, Mapping):
+                    alias_value = next(
+                        (
+                            str(envelope.get(key)).strip()
+                            for key in (
+                                "alias_model",
+                                "effective_alias_model",
+                                "alias_family",
+                            )
+                            if isinstance(envelope.get(key), str)
+                            and envelope.get(key).strip()
+                        ),
+                        "",
+                    )
                     for key in ("alias_model", "effective_alias_model", "alias_family"):
                         value = envelope.get(key)
                         if isinstance(value, str) and value.strip():
                             effective_aliases.add(value.strip())
+                    envelope_provider = next(
+                        (
+                            str(envelope.get(key)).strip()
+                            for key in ("producer_provider", "selected_provider")
+                            if isinstance(envelope.get(key), str)
+                            and envelope.get(key).strip()
+                        ),
+                        "",
+                    )
+                    envelope_model = next(
+                        (
+                            str(envelope.get(key)).strip()
+                            for key in ("producer_model", "selected_model")
+                            if isinstance(envelope.get(key), str)
+                            and envelope.get(key).strip()
+                        ),
+                        "",
+                    )
+                    envelope_route = next(
+                        (
+                            str(envelope.get(key)).strip()
+                            for key in (
+                                "producer_route_family",
+                                "selected_route_family",
+                            )
+                            if isinstance(envelope.get(key), str)
+                            and envelope.get(key).strip()
+                        ),
+                        "",
+                    )
                     for key in ("producer_provider", "selected_provider"):
                         value = envelope.get(key)
                         if isinstance(value, str) and value.strip():
@@ -1240,6 +1351,15 @@ def _codex_child_contract(
                         value = envelope.get(key)
                         if isinstance(value, str) and value.strip():
                             route_families.add(value.strip())
+                    if alias_value and envelope_provider and envelope_model and envelope_route:
+                        provenance_tuples.add(
+                            (
+                                alias_value,
+                                envelope_provider,
+                                envelope_model,
+                                envelope_route,
+                            )
+                        )
         kind = str(payload.get("type") or "")
         if kind == "function_call":
             name = _codex_function_call_name(payload)
@@ -1334,16 +1454,23 @@ def _codex_child_contract(
         failures.append("child has no final_answer record")
     if not task_complete:
         failures.append("child has no task_complete record")
+    expected_identity = {
+        "basic": ("openai", "gpt-5.6-luna", "codex_responses"),
+        "work": ("openai", "gpt-5.6-luna", "codex_responses"),
+        "expert": ("openai", "gpt-6-astra", "codex_responses"),
+    }.get(expected_alias)
     if expected_alias not in effective_aliases:
         failures.append(
             f"child effective alias does not include requested `{expected_alias}`"
         )
-    if not providers:
-        failures.append("child has no selected producer-provider evidence")
-    if not selected_models:
-        failures.append("child has no selected producer-model evidence")
-    if not route_families:
-        failures.append("child has no selected producer-route evidence")
+    if expected_identity is None or (
+        expected_alias,
+        *expected_identity,
+    ) not in provenance_tuples:
+        failures.append(
+            "child has no correlated expected producer identity "
+            f"for alias `{expected_alias}`"
+        )
 
     return {
         "ok": not failures,
@@ -1357,6 +1484,7 @@ def _codex_child_contract(
         "providers": sorted(providers),
         "selected_models": sorted(selected_models),
         "route_families": sorted(route_families),
+        "provenance_tuples": [list(item) for item in sorted(provenance_tuples)],
     }
 
 
