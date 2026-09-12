@@ -910,6 +910,22 @@ class PassThroughStreamingHandler:
             )
         ):
             return "usage_limit_reached", "usage_limit_reached", False
+        if error_code in {
+            "authentication_error",
+            "authorization_error",
+            "permission_error",
+            "invalid_request_error",
+            "insufficient_quota",
+            "usage_limit_reached",
+        } or error_type in {
+            "authentication_error",
+            "authorization_error",
+            "permission_error",
+            "invalid_request_error",
+            "insufficient_quota",
+            "usage_limit_reached",
+        }:
+            return "provider_terminal_error", "provider_terminal_error", False
         if openai_alpha_capacity_retry_enabled and (
             error_code in {
                 "rate_limit_exceeded",
