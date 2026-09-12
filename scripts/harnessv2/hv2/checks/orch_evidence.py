@@ -1165,6 +1165,8 @@ def _codex_child_contract(
     calls: list[dict[str, Any]] = []
     outputs: dict[str, Mapping[str, Any]] = {}
     command_events: dict[str, Mapping[str, Any]] = {}
+    effective_aliases: set[str] = set()
+    providers: set[str] = set()
     task_complete = False
     final_answer = False
 
@@ -1172,6 +1174,15 @@ def _codex_child_contract(
         payload = obj.get("payload")
         if not isinstance(payload, Mapping):
             continue
+        for source in (obj, payload):
+            for key in ("alias_model", "effective_alias_model", "model_alias"):
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    effective_aliases.add(value.strip())
+            for key in ("model_provider", "provider"):
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    providers.add(value.strip())
         kind = str(payload.get("type") or "")
         if kind == "function_call":
             name = _codex_function_call_name(payload)
@@ -1266,6 +1277,10 @@ def _codex_child_contract(
         failures.append("child has no final_answer record")
     if not task_complete:
         failures.append("child has no task_complete record")
+    if not effective_aliases:
+        failures.append("child has no effective alias evidence")
+    if not providers:
+        failures.append("child has no provider evidence")
 
     return {
         "ok": not failures,
@@ -1275,6 +1290,8 @@ def _codex_child_contract(
         "parallel_streak": 2 if len(calls) == 2 and not failures else 0,
         "final_answer": final_answer,
         "task_complete": task_complete,
+        "effective_aliases": sorted(effective_aliases),
+        "providers": sorted(providers),
     }
 
 
