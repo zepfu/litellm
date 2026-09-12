@@ -1898,7 +1898,7 @@ def _classify_passthrough_raw_http_error(
         payload = {**payload, "message": error_text}
     classified = PassThroughStreamingHandler._classify_responses_pre_commit_error(
         payload,
-        openai_alpha_capacity_retry_enabled=True,
+        openai_alpha_capacity_retry_enabled=provider_returned_429,
     )
     code, error_type, message = (
         PassThroughStreamingHandler._extract_responses_stream_error_fields(payload)
@@ -1927,9 +1927,13 @@ def _classify_passthrough_raw_http_error(
         for value in (code, error_type, message)
     ):
         return "server_overloaded", "transient_capacity", True
-    if code in {"capacity_exhausted", "server_is_overloaded"} or error_type in {
-        "capacity_exhausted", "server_is_overloaded"
-    }:
+    if provider_returned_429 and (
+        code in {"capacity_exhausted", "server_is_overloaded"}
+        or error_type in {
+            "capacity_exhausted",
+            "server_is_overloaded",
+        }
+    ):
         return "server_overloaded", "transient_capacity", True
     return classified
 
