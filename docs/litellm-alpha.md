@@ -246,21 +246,23 @@ fish -c 'type musela'
 ```
 
 Default client model: `muse-spark-1.3-contributor` (host
-`~/.config/muse/settings.json`). Catalog ids the facade may advertise:
-`muse-spark-1.3-contributor`, `muse-spark-1.3`,
-`muse-spark-1.2-contributor`, `muse-spark-1.2`. Override the advertised
-list with `AAWM_MUSE_CODE_MODEL_IDS` (comma-separated) on alpha Compose
-only. Those inbound ids are Muse catalog names. Do not map them onto
-Z.AI, OpenRouter, TAP, or any other unrelated provider.
+`~/.config/muse/settings.json`). Alpha does not synthesize a catalog or
+remap those ids. `GET /muse-code/models` is
+`GET https://api.meta.ai/muse-code/models`; Muse-shaped
+`POST /responses` is `POST https://api.meta.ai/v1/responses`. Meta
+keeps `muse-spark-*` ids. Do not map them onto Z.AI, OpenRouter, TAP,
+or any other unrelated provider.
 
 ### Credentials
 
-Muse sends `Authorization: Bearer …` plus `x-client-id` and, on model
-calls, `x-tbh-session-id` / `x-meta-ai-gateway-session-id`. LiteLLM
-virtual-key auth is the inbound gate once the facade is enabled. Do not
-put Meta OAuth tokens or API keys in Compose, Langfuse, or
-`session_history`. Host Muse login stays in `~/.config/muse/auth.json`
-and is not an alpha bind-mount.
+`musela` is Meta OAuth pass-through. Muse already authenticates with
+Meta; alpha forwards the inbound `Authorization: Bearer` plus
+`x-client-id` and, on model calls, `x-tbh-session-id` /
+`x-meta-ai-gateway-session-id` / `traceparent`. Missing or malformed
+Bearer fails closed. Do not treat the Meta token as a LiteLLM virtual
+key, and do not put Meta OAuth tokens or API keys in Compose,
+Langfuse, or `session_history`. Host Muse login stays in
+`~/.config/muse/auth.json` and is not an alpha bind-mount.
 
 Enable the facade only on alpha:
 
@@ -278,12 +280,14 @@ Leave that variable unset on `litellm-dev` and production. When unset,
 - Muse `--base-url` is origin-only. A base that already ends in `/v1`
   is a different join and is not the `musela` contract.
 - Tool execution (shell, filesystem, MCP) stays in the Muse client.
-  LiteLLM must not run those tools.
+  LiteLLM must not run those tools. Namespace tool bodies are forwarded
+  unmodified.
 - Approvals are local Muse/MSP, not Meta HTTP.
 - Harness v2 Muse TUI source may exist under `scripts/harnessv2/`;
   running it still needs an explicit operator request.
-- Upstream alias mapping, body limits, and stream timeouts remain
-  alpha-config knobs and must not be added to `litellm-dev-config.yaml`.
+- Body limits and stream timeouts remain alpha-config knobs and must
+  not be added to `litellm-dev-config.yaml`. Do not add Muse spark
+  aliases to `litellm-alpha-config.yaml`.
 
 ### Logs
 
@@ -305,9 +309,9 @@ rollback. Alpha-only:
 1. Remove `AAWM_MUSE_CODE_FACADE_ENABLED` (and any later
    `AAWM_MUSE_*` / `LITELLM_MUSE_*` keys) from
    `docker-compose.alpha.yml`.
-2. Remove Muse `model_list` rows, timeouts, and body limits from
-   `litellm-alpha-config.yaml` only. Do not edit
-   `litellm-dev-config.yaml` to “undo” Muse.
+2. Do not add Muse spark `model_list` rows to undo this route. If any
+   were added to `litellm-alpha-config.yaml`, remove them there only.
+   Do not edit `litellm-dev-config.yaml` to “undo” Muse.
 3. Recreate **only** `litellm-alpha`:
 
    ```bash
