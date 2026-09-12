@@ -1231,6 +1231,29 @@ async def handle_alias_route(  # noqa: PLR0915
             return "credential_readiness"
         return None
 
+    def _refund_selection_budget_if_no_provider_egress(
+        *,
+        attempt_record: dict[str, Any],
+        budget_was_counted: bool,
+        selection_provider_egress_reached: bool,
+    ) -> None:
+        """Refund one counted selection only when it never reached egress."""
+        nonlocal provider_candidate_attempts
+        if attempt_record.get("provider_attempt_budget_refunded") is True:
+            return
+        if (
+            budget_was_counted
+            and attempt_record.get("attempted_provider_call") is not True
+            and not selection_provider_egress_reached
+        ):
+            provider_candidate_attempts = max(
+                0,
+                provider_candidate_attempts - 1,
+            )
+            attempt_record["provider_attempt_budget_refunded"] = True
+        else:
+            attempt_record["provider_attempt_budget_refunded"] = False
+
     def _account_xai_no_io_selection(
         *,
         attempt_record: dict[str, Any],
@@ -1239,28 +1262,17 @@ async def handle_alias_route(  # noqa: PLR0915
         selection_provider_egress_reached: bool,
     ) -> None:
         """Refund one counted xAI selection and mark its bounded skip outcome."""
-        nonlocal provider_candidate_attempts
         if attempt_record.get("attempted_provider_call") is True:
             return
         already_skipped = (
             attempt_record.get("terminal_disposition") == "skipped"
             and attempt_record.get("skip_reason") == reason
         )
-        budget_refunded = (
-            attempt_record.get("provider_attempt_budget_refunded") is True
+        _refund_selection_budget_if_no_provider_egress(
+            attempt_record=attempt_record,
+            budget_was_counted=budget_was_counted,
+            selection_provider_egress_reached=selection_provider_egress_reached,
         )
-        if (
-            budget_was_counted
-            and not selection_provider_egress_reached
-            and not budget_refunded
-        ):
-            provider_candidate_attempts = max(
-                0,
-                provider_candidate_attempts - 1,
-            )
-            attempt_record["provider_attempt_budget_refunded"] = True
-        elif "provider_attempt_budget_refunded" not in attempt_record:
-            attempt_record["provider_attempt_budget_refunded"] = False
         if already_skipped:
             return
         if reason == "credential_readiness":
@@ -2162,9 +2174,12 @@ async def handle_alias_route(  # noqa: PLR0915
                 provider_status_code=attempt_record.get("error_status_code"),
             )
             if account_failover_planned:
-                provider_candidate_attempts = max(
-                    0,
-                    provider_candidate_attempts - 1,
+                _refund_selection_budget_if_no_provider_egress(
+                    attempt_record=attempt_record,
+                    budget_was_counted=selection_budget_counted,
+                    selection_provider_egress_reached=(
+                        selection_provider_egress_reached
+                    ),
                 )
                 _mark_auto_agent_alias_request_failover_pending(
                     request,
@@ -2290,12 +2305,26 @@ async def handle_alias_route(  # noqa: PLR0915
                     assert _claim.clear_reservation is not None
                     await _claim.clear_reservation.done.wait()
                     skip_after_probe_wait = True
+                    _refund_selection_budget_if_no_provider_egress(
+                        attempt_record=attempt_record,
+                        budget_was_counted=selection_budget_counted,
+                        selection_provider_egress_reached=(
+                            selection_provider_egress_reached
+                        ),
+                    )
                     break
                 if _claim.outcome is ClaimOutcome.FOLLOWER:
                     probe_lock.release()
                     assert _claim.intent is not None
                     await _claim.intent.done.wait()
                     skip_after_probe_wait = True
+                    _refund_selection_budget_if_no_provider_egress(
+                        attempt_record=attempt_record,
+                        budget_was_counted=selection_budget_counted,
+                        selection_provider_egress_reached=(
+                            selection_provider_egress_reached
+                        ),
+                    )
                     break
                 assert _claim.intent is not None
                 intent = _claim.intent
@@ -2339,6 +2368,13 @@ async def handle_alias_route(  # noqa: PLR0915
                         ):
                             raise probe_failure_exc
                         raise probe_failure_exc
+                    _refund_selection_budget_if_no_provider_egress(
+                        attempt_record=attempt_record,
+                        budget_was_counted=selection_budget_counted,
+                        selection_provider_egress_reached=(
+                            selection_provider_egress_reached
+                        ),
+                    )
                     break
 
                 # BaseException-safe: intent is ALWAYS completed and removed,
@@ -3629,9 +3665,12 @@ async def handle_alias_route(  # noqa: PLR0915
                             else True
                         )
                         if not attempted_provider_call:
-                            provider_candidate_attempts = max(
-                                0,
-                                provider_candidate_attempts - 1,
+                            _refund_selection_budget_if_no_provider_egress(
+                                attempt_record=attempt_record,
+                                budget_was_counted=selection_budget_counted,
+                                selection_provider_egress_reached=(
+                                    selection_provider_egress_reached
+                                ),
                             )
                         deterministically_ineligible_candidate_keys.add(cooldown_key)
                         last_retryable_exc = failure_exc
@@ -3794,9 +3833,12 @@ async def handle_alias_route(  # noqa: PLR0915
                 ):
                     if deterministic_exclusion_eligible:
                         if xai_no_io_selection_skip_reason is None:
-                            provider_candidate_attempts = max(
-                                0,
-                                provider_candidate_attempts - 1,
+                            _refund_selection_budget_if_no_provider_egress(
+                                attempt_record=attempt_record,
+                                budget_was_counted=selection_budget_counted,
+                                selection_provider_egress_reached=(
+                                    selection_provider_egress_reached
+                                ),
                             )
                     deterministically_ineligible_candidate_keys.add(cooldown_key)
                 last_retryable_exc = failure_exc
@@ -4347,10 +4389,23 @@ async def handle_alias_route(  # noqa: PLR0915
                         )
                         raise
                 if account_failover_planned:
-                    provider_candidate_attempts = max(
-                        0,
-                        provider_candidate_attempts - 1,
-                    )
+                    if (
+                        selection_budget_counted
+                        and attempt_record.get(
+                            "provider_attempt_budget_refunded"
+                        )
+                        is not True
+                    ):
+                        provider_candidate_attempts = max(
+                            0,
+                            provider_candidate_attempts - 1,
+                        )
+                        attempt_record["provider_attempt_budget_refunded"] = True
+                    else:
+                        attempt_record.setdefault(
+                            "provider_attempt_budget_refunded",
+                            False,
+                        )
                     _mark_auto_agent_alias_request_failover_pending(
                         request,
                         attempt_record,
