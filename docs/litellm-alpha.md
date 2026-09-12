@@ -227,16 +227,25 @@ at `musel` or `muselt` to exercise the alpha route.
 
 ### `musela`
 
-Host launchers (Fish and Bash, not this repository) resolve:
+Host launchers (Fish, Bash, and `~/.local/bin/musela`) pin Muse
+`endpoint_transport` to alpha and do **not** pass `--base-url`. Muse
+1.1.1 withholds the Meta bearer on a `--base-url` flag unless the same
+origin is pinned in settings with `auth = "bearer"`; a settings pin
+does not vouch for `--base-url`.
 
 ```bash
 musela
-# muse --base-url http://litellm-dev.tailf1878c.ts.net:4011
+# XDG_CONFIG_HOME=~/.config/aawm-musela muse
+# settings.endpoint_transport.base_url =
+#   http://litellm-dev.tailf1878c.ts.net:4011
+# settings.endpoint_transport.auth = bearer
 ```
 
 Override with `AAWM_MUSE_LITELLM_ALPHA_URL`. The value must be an origin
 only (`http://host:4011`), not `.../v1` and not `.../muse-code`. Muse
 then calls `GET /muse-code/models` and `POST /responses` on that origin.
+Native `muse` (no overlay) stays on Meta's front door. `musel` /
+`muselt` still pass `--base-url` and are not this route.
 
 Confirm the function in a fresh shell:
 
@@ -326,5 +335,6 @@ rollback. Alpha-only:
    `litellm/proxy/aawm_alias_config/` must not have received Muse
    entries; if it did, revert that as a defect.
 
-Host `musela` can remain; it only sets `--base-url`. Removing the
-launcher is optional and is not required to disable the alpha route.
+Host `musela` can remain; it only pins alpha `endpoint_transport` in
+`~/.config/aawm-musela/`. Removing the launcher is optional and is not
+required to disable the alpha route.
