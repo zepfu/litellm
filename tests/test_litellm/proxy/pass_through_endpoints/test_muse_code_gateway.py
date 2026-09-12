@@ -568,6 +568,35 @@ def test_muse_responses_failure_stamps_route_family_without_authorization(
     assert "meta-oauth-secret-token" not in rendered_rollup
 
 
+def test_muse_responses_rollup_shows_request_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _muse_responses_payload(stream=False)
+    payload["reasoning"] = {"effort": "high"}
+    _set_upstream(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={"id": "resp_meta", "model": "muse-spark-1.3-contributor"},
+            headers={"content-type": "application/json"},
+            request=request,
+        ),
+    )
+
+    response = _request(
+        _app(),
+        "POST",
+        "/responses",
+        content=json.dumps(payload).encode("utf-8"),
+        headers=_muse_identity_headers(),
+    )
+
+    assert response.status_code == 200
+    rendered_rollup = "\n".join(flush_aawm_route_rollups(force=True))
+    assert "muse-spark-1.3-contributor:high" in rendered_rollup
+    assert "muse-spark-1.3-contributor:none" not in rendered_rollup
+
+
 def test_disabled_facade_catalog_handler_is_not_found(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
