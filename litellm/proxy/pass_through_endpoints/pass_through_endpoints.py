@@ -8303,6 +8303,36 @@ async def pass_through_request(  # noqa: PLR0915
                 **error_log_context,
                 "status_code": status_code,
             }
+        # Preserve safe provider/account attribution on terminal errors. The
+        # selected candidate is already bound to request state by alias
+        # routing; copy only non-secret identity fields into the error context.
+        candidate_context = current_candidate_context(request)
+        if isinstance(candidate_context, dict):
+            for context_key, candidate_key in (
+                ("provider", "provider"),
+                ("model", "model"),
+                ("route_family", "route_family"),
+                ("account_hash", "account_hash"),
+                ("account_lane", "lane_key"),
+            ):
+                value = candidate_context.get(candidate_key)
+                if value not in (None, ""):
+                    error_log_context[context_key] = value
+        error_log_context["provider_returned"] = bool(
+            getattr(e, "_aawm_provider_returned", False)
+            or getattr(e, "provider_returned", False)
+        )
+        error_log_context["attempted_provider_call"] = bool(
+            getattr(
+                e,
+                "attempted_provider_call",
+                error_log_context["provider_returned"],
+            )
+        )
+        failure_phase = getattr(e, "failure_phase", None)
+        if isinstance(failure_phase, str) and failure_phase:
+            error_log_context["failure_phase"] = failure_phase
+        error_log_context["upstream_status_code"] = status_code
         error_log_context = _enrich_passthrough_error_log_context_for_request_shape_422(
             error_log_context=error_log_context,
             exc=e,

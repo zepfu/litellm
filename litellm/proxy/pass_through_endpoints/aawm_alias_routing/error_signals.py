@@ -2581,6 +2581,7 @@ def _classify_openai_alpha_capacity_error_code(
 ) -> Optional[str]:
     """Classify exact OpenAI alpha capacity codes without widening shared policy."""
     assert _CODEX_AUTO_AGENT_OPENAI_ALPHA_CAPACITY_ERROR_TOKENS is not None
+    assert _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS is not None
     if (
         not openai_alpha_capacity_retry_enabled
         or not attempted_provider_call
@@ -2614,6 +2615,15 @@ def _classify_openai_alpha_capacity_error_code(
         or any(marker in text_lower for marker in _OPENAI_ALPHA_CAPACITY_AUTH_TEXT_MARKERS)
     ):
         return "provider_terminal_error"
+    # OpenAI commonly reports model-busy/high-demand responses as HTTP 429
+    # with a rate-limit token rather than a capacity-specific code. Once the
+    # provider has returned the response, treat that shape as transient
+    # capacity so the alpha coordinator owns the progressive retry budget.
+    if (
+        _extract_adapter_exception_status_code(exc) == 429
+        and normalized_tokens & _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS
+    ):
+        return "capacity_exhausted"
     if not exact_codes:
         if "model_at_capacity" in normalized_tokens or (
             "selected model is at capacity" in text_lower
