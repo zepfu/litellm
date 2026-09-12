@@ -268,6 +268,8 @@ def _build_terminal_error_log_fields(
                 "route",
             ),
         ),
+        ("account_hash", ("account_hash", "selected_account_hash")),
+        ("account_lane", ("account_lane", "selected_account_lane")),
         ("error_code", ("error_code", "code")),
         (
             "failure_class",
@@ -303,6 +305,12 @@ def _build_terminal_error_log_fields(
     )
     if status_code is not None:
         fields["status_code"] = status_code
+    upstream_status_code = _terminal_error_safe_integer(
+        context.get("upstream_status_code"),
+        maximum=999,
+    )
+    if upstream_status_code is not None:
+        fields["upstream_status_code"] = upstream_status_code
 
     attempt_count = _terminal_error_safe_integer(
         context.get("attempt_count"),
@@ -311,7 +319,11 @@ def _build_terminal_error_log_fields(
     if attempt_count is not None:
         fields["attempt_count"] = attempt_count
 
-    for key in ("attempted_provider_call", "redispatch_required"):
+    for key in (
+        "attempted_provider_call",
+        "provider_returned",
+        "redispatch_required",
+    ):
         value = context.get(key)
         if isinstance(value, bool):
             fields[key] = value

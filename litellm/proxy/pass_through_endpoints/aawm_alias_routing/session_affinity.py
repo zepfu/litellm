@@ -4173,11 +4173,24 @@ def _emit_session_owner_redispatch_observability(
                     or shaped_candidate.get("route_family")
                     or candidate_endpoint
                 ),
+                "account_hash": (
+                    owner_attrs.get("account_hash")
+                    or shaped_candidate.get("account_hash")
+                    or shaped_candidate.get("codex_oauth_account_hash")
+                    or shaped_candidate.get("xai_oauth_account_hash")
+                ),
+                "account_lane": (
+                    owner_attrs.get("account_lane")
+                    or shaped_candidate.get("account_lane")
+                    or shaped_candidate.get("codex_oauth_lane_key")
+                    or shaped_candidate.get("xai_oauth_lane_key")
+                ),
                 "status_code": _SESSION_OWNER_LOG_STATUS_CODE,
                 "error_code": _SESSION_OWNER_REDISPATCH_ERROR_CODE,
                 "failure_class": "session_owner_redispatch",
                 "failure_phase": failure_phase,
                 "attempted_provider_call": bool(attempted_provider_call),
+                "provider_returned": bool(attempted_provider_call),
                 "redispatch_required": True,
                 "terminal_outcome": "redispatch_required",
                 "fallback_result": "none",
