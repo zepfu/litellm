@@ -283,6 +283,12 @@ _DEFAULT_RESERVATION_WAIT_TIMEOUT_SECONDS = 0.25
 _DEFAULT_RESERVATION_WAIT_POLL_SECONDS = 0.025
 _MAX_RESERVATION_WAIT_TIMEOUT_SECONDS = 1.0
 _MAX_RESERVATION_WAIT_POLL_SECONDS = 0.1
+# A replay-safe competing request may legitimately overlap a long upstream
+# turn. Keep retrying until the normal reservation TTL has elapsed so clients
+# do not spin on repeated 409 responses while the original request settles.
+DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS = int(
+    _DEFAULT_RESERVATION_TTL_SECONDS
+)
 
 # Account-scoped route families require credential/account identity on promote.
 _ACCOUNT_SCOPED_ROUTE_MARKERS = (

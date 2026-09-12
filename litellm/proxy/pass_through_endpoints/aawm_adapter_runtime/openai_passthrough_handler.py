@@ -947,7 +947,8 @@ class BaseOpenAIPassThroughHandler:
                             is _sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
                             and _sa._record_state(guard.owner_record)
                             == _sa.SessionOwnerRecordState.RESERVED.value
-                            and session_owner_reservation_retry_attempts < 3
+                            and session_owner_reservation_retry_attempts
+                            < _sa.DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS
                             and _sa.is_replay_safe_session_owner_redispatch_body(
                                 direct_body
                             )

@@ -1963,7 +1963,8 @@ async def handle_alias_route(  # noqa: PLR0915
 
     while provider_candidate_attempts < max_candidate_attempts:
         can_retry_competing_reservation = (
-            session_owner_reservation_retry_attempts < 3
+            session_owner_reservation_retry_attempts
+            < _session_affinity_mod().DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS
             and _session_affinity_mod().is_replay_safe_session_owner_redispatch_body(
                 prepared_request_body
             )
@@ -2000,7 +2001,8 @@ async def handle_alias_route(  # noqa: PLR0915
                 == "session_owner_competing_reservation"
                 and selection_detail.get("attempted_provider_call") is False
                 and can_retry_competing_reservation
-                and session_owner_reservation_retry_attempts < 3
+                and session_owner_reservation_retry_attempts
+                < _session_affinity_mod().DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS
             ):
                 session_owner_reservation_retry_attempts += 1
                 await asyncio.sleep(1.0)
