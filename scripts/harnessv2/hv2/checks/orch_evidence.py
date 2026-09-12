@@ -963,7 +963,8 @@ def _muse_session_jsonl_paths(
     root = Path(session_dir) if session_dir else None
     if root is None or not root.is_dir():
         return []
-    rows: list[tuple[float, str, Path]] = []
+    rows: list[Path] = []
+    mtimes: dict[Path, float] = {}
     for path in root.rglob("session.jsonl"):
         try:
             mtime = path.stat().st_mtime
@@ -972,9 +973,9 @@ def _muse_session_jsonl_paths(
         if since_mtime is not None and mtime < (since_mtime - 2):
             continue
         rows.append(path)
-    return sorted(rows, key=lambda item: item.stat().st_mtime, reverse=True)[
-        :_JSONL_SCAN_CAP
-    ]
+        mtimes[path] = mtime
+    rows.sort(key=lambda item: (mtimes[item], str(item)), reverse=True)
+    return rows[:_JSONL_SCAN_CAP]
 
 
 def _muse_event_kind(obj: Mapping[str, Any]) -> str:
