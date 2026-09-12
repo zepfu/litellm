@@ -1872,6 +1872,10 @@ def _classify_passthrough_raw_http_error(
     if status_code == 520:
         return "upstream_transient_internal", "transient_upstream", True
 
+    provider_returned_429 = (
+        status_code == status.HTTP_429_TOO_MANY_REQUESTS
+        and getattr(exc, "_aawm_provider_returned", False) is True
+    )
     detail: Any = getattr(exc, "detail", None)
     if detail is None and isinstance(exc, httpx.HTTPStatusError):
         try:
@@ -1886,6 +1890,8 @@ def _classify_passthrough_raw_http_error(
     if payload is None and error_text.strip():
         payload = {"message": error_text}
     if payload is None:
+        if provider_returned_429:
+            return "server_overloaded", "transient_capacity", True
         return None
 
     if not payload.get("message") and error_text.strip():
@@ -1909,6 +1915,12 @@ def _classify_passthrough_raw_http_error(
         return classified if not classified[2] else (
             "provider_terminal_error", "provider_terminal_error", False
         )
+    # Some OpenAI capacity responses contain no body, or a provider-specific
+    # shape that the shared Responses classifier cannot recognize. The
+    # provider-returned marker is required so local/pre-egress 429s remain
+    # terminal instead of entering the long capacity retry budget.
+    if provider_returned_429:
+        return "server_overloaded", "transient_capacity", True
     if code in {"capacity_exhausted", "server_is_overloaded"} or error_type in {
         "capacity_exhausted", "server_is_overloaded"
     }:
