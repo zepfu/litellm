@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import heapq
 import json
 import re
 from pathlib import Path
@@ -50,7 +51,7 @@ _OPERATIONAL_FALLBACK_ALIASES = frozenset(
 def _session_jsonl_paths(session_dir: Path, *, since_mtime: float | None) -> list[Path]:
     if not session_dir.is_dir():
         return []
-    rows: list[Path] = []
+    rows: list[tuple[float, str, Path]] = []
     for path in (*session_dir.glob("*.jsonl"), *session_dir.glob("*/*.jsonl")):
         try:
             mtime = path.stat().st_mtime
@@ -58,8 +59,9 @@ def _session_jsonl_paths(session_dir: Path, *, since_mtime: float | None) -> lis
             continue
         if since_mtime is not None and mtime < (since_mtime - 2):
             continue
-        rows.append(path)
-    return sorted(rows, key=lambda item: item.stat().st_mtime, reverse=True)
+        rows.append((mtime, str(path), path))
+    newest = heapq.nlargest(_JSONL_SCAN_CAP, rows, key=lambda item: (item[0], item[1]))
+    return [item[2] for item in newest]
 
 
 def _iter_jsonl_objects(path: Path) -> Iterable[dict[str, Any]]:
