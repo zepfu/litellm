@@ -1109,7 +1109,7 @@ def _codex_jsonl_paths(
     root = Path(session_dir) if session_dir else None
     if root is None or not root.is_dir():
         return []
-    rows: list[Path] = []
+    rows: list[tuple[float, str, Path]] = []
     for path in root.rglob("*.jsonl"):
         try:
             mtime = path.stat().st_mtime
