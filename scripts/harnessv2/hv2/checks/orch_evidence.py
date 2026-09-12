@@ -1090,3 +1090,189 @@ def muse_spawn_tool_evidence(
         "session_jsonl": [str(path) for path in session_paths[:4]],
         "kind": "muse_spawn_tool",
     }
+
+
+def codex_workspace_session_root() -> Path:
+    """Return ``~/.codex/sessions`` for Codex rollout JSONL."""
+
+    return Path.home() / ".codex" / "sessions"
+
+
+def _codex_jsonl_paths(
+    session_dir: str | None,
+    *,
+    since_mtime: float | None = None,
+) -> list[Path]:
+    root = Path(session_dir) if session_dir else None
+    if root is None or not root.is_dir():
+        return []
+    rows: list[Path] = []
+    for path in root.rglob("*.jsonl"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if since_mtime is not None and mtime < (since_mtime - 2):
+            continue
+        rows.append(path)
+    return sorted(rows, key=lambda item: item.stat().st_mtime, reverse=True)
+
+
+def _codex_session_meta(path: Path) -> dict[str, Any]:
+    for obj in _iter_jsonl_objects(path):
+        if obj.get("type") == "session_meta" and isinstance(obj.get("payload"), dict):
+            return dict(obj["payload"])
+    return {}
+
+
+def _codex_function_call_name(payload: Mapping[str, Any]) -> str:
+    name = payload.get("name")
+    return str(name).strip() if isinstance(name, str) else ""
+
+
+def _codex_function_call_args(payload: Mapping[str, Any]) -> dict[str, Any]:
+    raw = payload.get("arguments")
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(parsed, dict):
+            return dict(parsed)
+    return {}
+
+
+def _codex_spawn_targets(payload: Mapping[str, Any]) -> set[str]:
+    args = _codex_function_call_args(payload)
+    targets: set[str] = set()
+    for key in ("model", "agent_type", "agent", "task_name"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            targets.add(value.strip())
+    return targets
+
+
+def _codex_record_is_child_tool(obj: Mapping[str, Any]) -> bool:
+    payload = obj.get("payload")
+    if isinstance(payload, Mapping):
+        kind = str(payload.get("type") or "")
+        if kind == "function_call":
+            return True
+        item = payload.get("item")
+        if (
+            isinstance(item, Mapping)
+            and str(item.get("type") or "") == "CommandExecution"
+        ):
+            return True
+    return False
+
+
+def _codex_parallel_function_call_streak(path: Path) -> int:
+    """Longest run of consecutive child tool records in one JSONL file."""
+
+    streak = 0
+    longest = 0
+    for obj in _iter_jsonl_objects(path):
+        payload = obj.get("payload") if isinstance(obj.get("payload"), Mapping) else {}
+        kind = str(payload.get("type") or "") if isinstance(payload, Mapping) else ""
+        if _codex_record_is_child_tool(obj):
+            streak += 1
+            if streak > longest:
+                longest = streak
+            continue
+        if kind == "function_call_output":
+            continue
+        streak = 0
+    return longest
+
+
+def codex_spawn_tool_evidence(
+    *,
+    children: Sequence[str],
+    pane: str = "",
+    session_dir: str | None = None,
+    since_mtime: float | None = None,
+    prompt: str | None = None,
+    after_echo_index: int | None = None,
+    workspace: str | None = None,
+) -> dict[str, Any]:
+    """Codex parent spawn plus child consecutive parallel tool calls.
+
+    Recap-only ``hv2-codex-child`` is not a pass. The child JSONL must show
+    at least two consecutive ``function_call`` records before its final
+    response.
+    """
+
+    wanted = [str(item) for item in children if str(item).strip()]
+    wanted_set = set(wanted)
+    failures: list[str] = []
+    current = _muse_current_turn_text(pane, prompt, after_echo_index)
+    paths = _codex_jsonl_paths(session_dir, since_mtime=since_mtime)
+    workspace_cwd = str(workspace or "").rstrip("/")
+    session_paths: list[str] = []
+    spawned_targets: set[str] = set()
+    child_thread_ids: set[str] = set()
+    child_paths: list[Path] = []
+    parallel_streak = 0
+
+    for path in paths:
+        meta = _codex_session_meta(path)
+        cwd = str(meta.get("cwd") or "").rstrip("/")
+        if workspace_cwd and cwd and cwd != workspace_cwd:
+            continue
+        session_paths.append(str(path))
+        for obj in _iter_jsonl_objects(path):
+            payload = obj.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            kind = str(payload.get("type") or "")
+            if (
+                kind == "function_call"
+                and _codex_function_call_name(payload) == "spawn_agent"
+            ):
+                spawned_targets.update(_codex_spawn_targets(payload))
+            item = payload.get("item")
+            if (
+                isinstance(item, Mapping)
+                and str(item.get("type") or "") == "SubAgentActivity"
+            ):
+                thread_id = item.get("agent_thread_id")
+                if isinstance(thread_id, str) and thread_id.strip():
+                    child_thread_ids.add(thread_id.strip())
+
+    for path in paths:
+        if not any(thread_id and thread_id in path.name for thread_id in child_thread_ids):
+            continue
+        child_paths.append(path)
+        streak = _codex_parallel_function_call_streak(path)
+        if streak > parallel_streak:
+            parallel_streak = streak
+
+    if "meta" in spawned_targets:
+        spawned_targets.add("muse-spark-1.3-contributor")
+    spawned_wanted = bool(spawned_targets & wanted_set)
+    pane_spawn = any(child in current for child in wanted)
+    if not spawned_wanted and not pane_spawn:
+        failures.append(
+            "Codex orchestration is missing spawn of "
+            f"{wanted} (spawn_agent model/agent_type, or pane child id)"
+        )
+    if wanted and parallel_streak < 2:
+        failures.append(
+            "Codex child did not execute at least two consecutive parallel "
+            f"tool calls before returning (streak={parallel_streak})"
+        )
+
+    return {
+        "ok": not failures,
+        "failures": failures,
+        "children": wanted,
+        "spawned_targets": sorted(spawned_targets),
+        "child_thread_ids": sorted(child_thread_ids),
+        "parallel_streak": parallel_streak,
+        "session_jsonl": session_paths[:4],
+        "child_jsonl": [str(path) for path in child_paths[:4]],
+        "kind": "codex_parallel_child_tools",
+    }

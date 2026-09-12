@@ -21,6 +21,8 @@ from hv2.checks.http import check_catalog_http, check_health, check_http_suite
 from hv2.checks.logs import scan_log_text
 from hv2.checks.orch_evidence import (
     child_spawn_evidence,
+    codex_spawn_tool_evidence,
+    codex_workspace_session_root,
     grok_spawn_tool_evidence,
     grok_workspace_session_root,
     muse_spawn_tool_evidence,
@@ -562,7 +564,11 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
     driver = _driver_for_plan(plan)
     grok_orch = plan.tui == "grok"
     muse_orch = plan.tui == "muse"
-    spawn_tool_orch = grok_orch or muse_orch
+    select = _ohmypi_select_spec(driver)
+    codex_parallel_orch = plan.tui == "codex" and str(
+        select.get("spawn_evidence") or ""
+    ) == "codex_parallel_child_tools"
+    spawn_tool_orch = grok_orch or muse_orch or codex_parallel_orch
     template = str(plan.extra.get("orchestration_prompt_template") or "")
     if not plan.orchestration_parents:
         raise PlanError("orchestration kind has no parent")
@@ -588,7 +594,6 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
             }
         )
     send_text = ""
-    select = _ohmypi_select_spec(driver)
     tools = bool(select.get("tools_for_orchestration", True))
     pass_mode = str(select.get("pass_mode") or "exact_pong")
     session_started = time.time()
@@ -634,6 +639,8 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
             if hasattr(driver, "spec"):
                 cwd = str((driver.spec or {}).get("cwd") or "") or None
             session_dir = str(grok_workspace_session_root(cwd))
+        elif codex_parallel_orch:
+            session_dir = str(codex_workspace_session_root())
         elif hasattr(driver, "alias_session_dir"):
             session_dir = str(driver.alias_session_dir(first))
         elif hasattr(driver, "spec"):
@@ -647,6 +654,21 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
                     after_echo_index=pre_echo,
                     session_dir=session_dir,
                     since_mtime=session_started,
+                )
+            if codex_parallel_orch:
+                workspace = None
+                if getattr(driver, "_active_cwd", None):
+                    workspace = str(driver._active_cwd)
+                elif hasattr(driver, "spec"):
+                    workspace = str((driver.spec or {}).get("cwd") or "") or None
+                return codex_spawn_tool_evidence(
+                    children=list(plan.orchestration_children),
+                    pane=current_pane,
+                    prompt=sent_prompt,
+                    after_echo_index=pre_echo,
+                    session_dir=session_dir,
+                    since_mtime=session_started,
+                    workspace=workspace,
                 )
             if muse_orch:
                 return muse_spawn_tool_evidence(
