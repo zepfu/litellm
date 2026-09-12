@@ -282,6 +282,8 @@ def _gateway_reasoning_effort(body: Optional[dict[str, Any]]) -> Optional[object
     reasoning = body.get("reasoning")
     if isinstance(reasoning, dict) and "effort" in reasoning:
         return reasoning.get("effort")
+    if isinstance(reasoning, str) and reasoning.strip():
+        return reasoning
     if "reasoning_effort" in body:
         return body.get("reasoning_effort")
     return None

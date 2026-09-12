@@ -309,9 +309,10 @@ Leave that variable unset on `litellm-dev` and production. When unset,
   `/app/.analysis/runtime/litellm-alpha/session_history`
 - Route family for Muse catalog/call attribution: `muse_code` (no
   credentials in tags)
-- Rollup effort is the request `reasoning.effort` (or top-level
-  `reasoning_effort`). Catalog rows stay `:none`. A Muse call that
-  sent `high` renders `muse-spark-1.3-contributor:high`, not `:none`.
+- Rollup effort is the request `reasoning.effort` token as sent (or
+  top-level `reasoning_effort`). Catalog rows stay `:none`. Muse TUI
+  default `high` renders `:high`. Muse TUI `max` is `ultra` on the
+  wire and renders `:ultra`, not `:none`.
 
 ### Rollback / removal
 

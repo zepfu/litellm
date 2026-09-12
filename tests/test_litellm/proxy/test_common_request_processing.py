@@ -3714,8 +3714,10 @@ class TestAawmRouteRollup:
             ),
             (None, {}, "none"),
             ({"reasoning_effort": "none"}, {}, "none"),
-            ({"reasoning_effort": "invalid"}, {}, "none"),
-            ({"reasoning": {"effort": "invalid"}}, {}, "none"),
+            ({"reasoning_effort": "invalid"}, {}, "invalid"),
+            ({"reasoning": {"effort": "invalid"}}, {}, "invalid"),
+            ({"reasoning": {"effort": "ultra"}}, {}, "ultra"),
+            ({"reasoning": {"effort": "max"}}, {}, "max"),
         ],
     )
     def test_route_rollup_reasoning_effort_precedence_and_fallback(

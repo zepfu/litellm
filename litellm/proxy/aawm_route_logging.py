@@ -50,15 +50,7 @@ _AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY = (
     "_aawm_parsed_codex_review_decisions"
 )
 _AAWM_ROUTE_LOG_REASONING_EFFORT_METADATA_KEY = "reasoning_effort_native_value"
-_AAWM_ROUTE_ROLLUP_REASONING_EFFORT_VALUES = (
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max",
-)
+_AAWM_ROUTE_ROLLUP_REASONING_EFFORT_MAX_CHARS = 32
 _AAWM_ROUTE_ROLLUP_RED = "\033[91m"
 _AAWM_ROUTE_ROLLUP_BLUE = "\033[94m"
 _AAWM_ROUTE_ROLLUP_YELLOW = "\033[93m"
@@ -1601,14 +1593,25 @@ def _normalize_aawm_route_rollup_status(status: Optional[str]) -> Optional[str]:
 def _normalize_aawm_route_log_reasoning_effort(
     value: Any,
 ) -> str:
+    """Return the request's effort token for rollup ``model:effort``.
+
+    Absent/empty effort stays ``none``. A populated value is logged as sent
+    after log-safe sanitizing; it is not clamped to a fixed allowlist.
+    """
+
     if value is None:
         return "none"
-    normalized = " ".join(str(value).strip().lower().split())
-    if not normalized:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
         return "none"
-    if normalized in _AAWM_ROUTE_ROLLUP_REASONING_EFFORT_VALUES:
-        return normalized
-    return "none"
+    cleaned = _clean_aawm_route_log_field(value)
+    if not cleaned:
+        return "none"
+    token = cleaned.casefold()
+    if token.startswith(("bearer ", "sk-", "pk-", "xai-", "ya29.")):
+        return "none"
+    if len(token) > _AAWM_ROUTE_ROLLUP_REASONING_EFFORT_MAX_CHARS:
+        token = token[: _AAWM_ROUTE_ROLLUP_REASONING_EFFORT_MAX_CHARS]
+    return token
 
 
 def _extract_aawm_route_log_provider_bound_reasoning_effort(
@@ -1620,6 +1623,8 @@ def _extract_aawm_route_log_provider_bound_reasoning_effort(
     reasoning = provider_bound_body.get("reasoning")
     if isinstance(reasoning, dict) and "effort" in reasoning:
         return True, _normalize_aawm_route_log_reasoning_effort(reasoning.get("effort"))
+    if isinstance(reasoning, str) and reasoning.strip():
+        return True, _normalize_aawm_route_log_reasoning_effort(reasoning)
 
     if "reasoning_effort" in provider_bound_body:
         return (

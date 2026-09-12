@@ -2157,11 +2157,15 @@ the final provider-bound request body first, in this precedence order:
 
 Use same-request `reasoning_effort_native_value` only as a fallback when that
 final body lacks an effort field (or as a same-request cross-check). Absent
-effort and explicit `none` both render as `:none`. Never infer effort from
-static TOML/YAML alias values, configured defaults, model capabilities, product
-modes, or model-name heuristics. Accumulator keys include the normalized effort,
-so the same destination and model at different efforts (for example `low` and
-`xhigh`) create separate rollup sublines and turn counts within one interval.
+effort and explicit `none` both render as `:none`. A populated request
+effort token is logged as sent (log-safe sanitizing only); it is not
+clamped to a fixed allowlist. Muse TUI `max` is `ultra` on the wire and
+renders `:ultra`. Never infer effort from static TOML/YAML alias values,
+configured defaults, model capabilities, product modes, or model-name
+heuristics. Accumulator keys include the request effort token, so the
+same destination and model at different efforts (for example `low` and
+`ultra`) create separate rollup sublines and turn counts within one
+interval.
 Completed turns, streaming failures, and zero-turn route-status rollups preserve
 that request-specific effort when available and otherwise use `none`.
 
