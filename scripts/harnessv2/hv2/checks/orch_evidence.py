@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import base64
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -1158,6 +1159,7 @@ def _codex_child_contract(
     path: Path,
     *,
     workspace: str,
+    expected_alias: str,
 ) -> dict[str, Any]:
     """Validate one child transcript against the two-command acceptance contract."""
 
@@ -1167,6 +1169,8 @@ def _codex_child_contract(
     command_events: dict[str, Mapping[str, Any]] = {}
     effective_aliases: set[str] = set()
     providers: set[str] = set()
+    selected_models: set[str] = set()
+    route_families: set[str] = set()
     task_complete = False
     final_answer = False
 
@@ -1179,10 +1183,67 @@ def _codex_child_contract(
                 value = source.get(key)
                 if isinstance(value, str) and value.strip():
                     effective_aliases.add(value.strip())
-            for key in ("model_provider", "provider"):
+            for key in ("alias_model", "effective_alias_model", "model_alias"):
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    effective_aliases.add(value.strip())
+            for key in (
+                "selected_provider",
+                "producer_provider",
+                "codex_auto_agent_selected_provider",
+                "anthropic_auto_agent_selected_provider",
+            ):
                 value = source.get(key)
                 if isinstance(value, str) and value.strip():
                     providers.add(value.strip())
+            for key in (
+                "selected_model",
+                "producer_model",
+                "codex_auto_agent_selected_model",
+                "anthropic_auto_agent_selected_model",
+            ):
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    selected_models.add(value.strip())
+            for key in (
+                "selected_route_family",
+                "producer_route_family",
+                "codex_auto_agent_selected_route_family",
+                "anthropic_auto_agent_selected_route_family",
+            ):
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    route_families.add(value.strip())
+            encrypted = source.get("encrypted_content")
+            if isinstance(encrypted, str) and encrypted.startswith("aawm_erp:"):
+                encoded = encrypted[len("aawm_erp:") :].split(";", 1)[0]
+                try:
+                    decoded = base64.urlsafe_b64decode(
+                        encoded + "=" * (-len(encoded) % 4)
+                    )
+                    envelope = json.loads(decoded.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                    envelope = {}
+                if isinstance(envelope, Mapping):
+                    for key in ("alias_model", "effective_alias_model", "alias_family"):
+                        value = envelope.get(key)
+                        if isinstance(value, str) and value.strip():
+                            effective_aliases.add(value.strip())
+                    for key in ("producer_provider", "selected_provider"):
+                        value = envelope.get(key)
+                        if isinstance(value, str) and value.strip():
+                            providers.add(value.strip())
+                    for key in ("producer_model", "selected_model"):
+                        value = envelope.get(key)
+                        if isinstance(value, str) and value.strip():
+                            selected_models.add(value.strip())
+                    for key in (
+                        "producer_route_family",
+                        "selected_route_family",
+                    ):
+                        value = envelope.get(key)
+                        if isinstance(value, str) and value.strip():
+                            route_families.add(value.strip())
         kind = str(payload.get("type") or "")
         if kind == "function_call":
             name = _codex_function_call_name(payload)
@@ -1277,10 +1338,16 @@ def _codex_child_contract(
         failures.append("child has no final_answer record")
     if not task_complete:
         failures.append("child has no task_complete record")
-    if not effective_aliases:
-        failures.append("child has no effective alias evidence")
+    if expected_alias not in effective_aliases:
+        failures.append(
+            f"child effective alias does not include requested `{expected_alias}`"
+        )
     if not providers:
-        failures.append("child has no provider evidence")
+        failures.append("child has no selected producer-provider evidence")
+    if not selected_models:
+        failures.append("child has no selected producer-model evidence")
+    if not route_families:
+        failures.append("child has no selected producer-route evidence")
 
     return {
         "ok": not failures,
@@ -1292,6 +1359,8 @@ def _codex_child_contract(
         "task_complete": task_complete,
         "effective_aliases": sorted(effective_aliases),
         "providers": sorted(providers),
+        "selected_models": sorted(selected_models),
+        "route_families": sorted(route_families),
     }
 
 
@@ -1392,7 +1461,11 @@ def codex_spawn_tool_evidence(
                 }
             )
             continue
-        contract = _codex_child_contract(path, workspace=workspace_cwd)
+        contract = _codex_child_contract(
+            path,
+            workspace=workspace_cwd,
+            expected_alias=target,
+        )
         evidence = {
             "target": target,
             "thread_id": thread_id,
