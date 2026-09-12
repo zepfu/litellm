@@ -1919,7 +1919,13 @@ def _classify_passthrough_raw_http_error(
     # shape that the shared Responses classifier cannot recognize. The
     # provider-returned marker is required so local/pre-egress 429s remain
     # terminal instead of entering the long capacity retry budget.
-    if provider_returned_429:
+    # Preserve terminal classifications for provider 429s with any
+    # recognizable error fields. Only an otherwise unrecognized body can use
+    # the provider-attributed status as capacity evidence.
+    if provider_returned_429 and not any(
+        value is not None and str(value).strip()
+        for value in (code, error_type, message)
+    ):
         return "server_overloaded", "transient_capacity", True
     if code in {"capacity_exhausted", "server_is_overloaded"} or error_type in {
         "capacity_exhausted", "server_is_overloaded"
