@@ -28,6 +28,8 @@ _HUB_IDLE_PEER = re.compile(
 )
 _COMPLETION_TOOLS = {"task", "hub", "bash", "yield"}
 _JSONL_SCAN_CAP = 64
+_JSONL_MAX_BYTES = 2 * 1024 * 1024
+_JSONL_MAX_LINES = 20000
 _OPERATIONAL_FALLBACK_ALIASES = frozenset(
     {
         "basic",
@@ -70,19 +72,26 @@ def _session_jsonl_paths(session_dir: Path, *, since_mtime: float | None) -> lis
 
 def _iter_jsonl_objects(path: Path) -> Iterable[dict[str, Any]]:
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        handle = path.open("r", encoding="utf-8", errors="replace")
     except OSError:
         return
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict):
-            yield obj
+    with handle:
+        consumed = 0
+        for index, line in enumerate(handle):
+            if index >= _JSONL_MAX_LINES:
+                break
+            consumed += len(line.encode("utf-8", errors="replace"))
+            if consumed > _JSONL_MAX_BYTES:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                yield obj
 
 
 def _message_payload(obj: Mapping[str, Any]) -> dict[str, Any]:
