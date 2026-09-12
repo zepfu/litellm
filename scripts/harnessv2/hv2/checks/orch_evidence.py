@@ -1155,6 +1155,16 @@ def _codex_spawn_targets(payload: Mapping[str, Any]) -> set[str]:
     return targets
 
 
+def _codex_nested_sources(value: Any) -> Iterable[Mapping[str, Any]]:
+    if isinstance(value, Mapping):
+        yield value
+        for child in value.values():
+            yield from _codex_nested_sources(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _codex_nested_sources(child)
+
+
 def _codex_child_contract(
     path: Path,
     *,
@@ -1179,7 +1189,7 @@ def _codex_child_contract(
         payload = obj.get("payload")
         if not isinstance(payload, Mapping):
             continue
-        for source in (obj, payload):
+        for source in _codex_nested_sources(obj):
             alias_value = next(
                 (
                     str(source.get(key)).strip()
@@ -1236,8 +1246,8 @@ def _codex_child_contract(
                 (
                     str(source.get(key)).strip()
                     for key in (
-                        "selected_provider",
                         "producer_provider",
+                        "selected_provider",
                         "codex_auto_agent_selected_provider",
                         "anthropic_auto_agent_selected_provider",
                     )
@@ -1250,8 +1260,8 @@ def _codex_child_contract(
                 (
                     str(source.get(key)).strip()
                     for key in (
-                        "selected_model",
                         "producer_model",
+                        "selected_model",
                         "codex_auto_agent_selected_model",
                         "anthropic_auto_agent_selected_model",
                     )
@@ -1264,8 +1274,8 @@ def _codex_child_contract(
                 (
                     str(source.get(key)).strip()
                     for key in (
-                        "selected_route_family",
                         "producer_route_family",
+                        "selected_route_family",
                         "codex_auto_agent_selected_route_family",
                         "anthropic_auto_agent_selected_route_family",
                     )
@@ -1463,10 +1473,14 @@ def _codex_child_contract(
         failures.append(
             f"child effective alias does not include requested `{expected_alias}`"
         )
-    if expected_identity is None or (
-        expected_alias,
-        *expected_identity,
-    ) not in provenance_tuples:
+    matching_tuples = {
+        item for item in provenance_tuples if item[0] == expected_alias
+    }
+    if expected_identity is not None:
+        matching_tuples = {
+            item for item in matching_tuples if item[1:] == expected_identity
+        }
+    if not matching_tuples:
         failures.append(
             "child has no correlated expected producer identity "
             f"for alias `{expected_alias}`"
