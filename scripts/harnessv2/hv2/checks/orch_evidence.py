@@ -961,7 +961,7 @@ def _muse_session_jsonl_paths(
     root = Path(session_dir) if session_dir else None
     if root is None or not root.is_dir():
         return []
-    rows: list[Path] = []
+    rows: list[tuple[float, str, Path]] = []
     for path in root.rglob("session.jsonl"):
         try:
             mtime = path.stat().st_mtime
@@ -1117,8 +1117,13 @@ def _codex_jsonl_paths(
             continue
         if since_mtime is not None and mtime < (since_mtime - 2):
             continue
-        rows.append(path)
-    return sorted(rows, key=lambda item: item.stat().st_mtime, reverse=True)
+        rows.append((mtime, str(path), path))
+    newest = heapq.nlargest(
+        _JSONL_SCAN_CAP,
+        rows,
+        key=lambda item: (item[0], item[1]),
+    )
+    return [item[2] for item in newest]
 
 
 def _codex_session_meta(path: Path) -> dict[str, Any]:
