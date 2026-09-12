@@ -229,6 +229,7 @@ tuis:
       tools_for_model: true
       tools_for_orchestration: true
       pass_mode: tool_command
+      spawn_evidence: codex_parallel_child_tools
       standalone_pass_tokens:
         - hv2-codex-child
       ready_needles:

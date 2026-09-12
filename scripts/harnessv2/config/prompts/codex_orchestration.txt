@@ -1,8 +1,9 @@
 You are the parent on alias {parent}.
 
 Call spawn_agent now with model={child} and a non-empty message that tells
-the child to execute a harmless local shell command (`date` or `pwd`) in
-this workspace and return only stdout. Do not run the command yourself.
+the child to execute two independent harmless local shell commands in
+parallel, not sequentially: `pwd` and `uname -s`. The child must return only
+those two stdout strings. Do not run the commands yourself.
 Do not spawn any other children.
 
 After the child returns, print that exact stdout on its own line, list the
