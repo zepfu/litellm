@@ -4,27 +4,11 @@ defaults: {}
 aliases:
   - name: work
     candidates:
-      - alias_reference: work-other
-        priority: 110
-
-      - provider: anthropic
-        model: claude-sonnet-5[1m]
-        route_family: anthropic_messages
-        anthropic_route_family: anthropic_messages
-        priority: 80
-        reasoning_effort: max
-        tui_attached: Claude
-
-      - provider: anthropic
-        model: claude-sonnet-5
-        route_family: anthropic_messages
-        anthropic_route_family: anthropic_messages
-        priority: 70
-        reasoning_effort: max
-        tui_attached: Claude
-
       - provider: openai
         model: gpt-5.6-luna
         route_family: codex_responses
-        priority: 0
+        priority: 110
         reasoning_effort: high
+
+      - alias_reference: work-other
+        priority: 0

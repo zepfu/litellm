@@ -4,11 +4,11 @@ defaults: {}
 aliases:
   - name: expert
     candidates:
-      - alias_reference: expert-other
-        priority: 100
-
       - provider: openai
         model: gpt-6-astra
         route_family: codex_responses
-        priority: 0
+        priority: 110
         reasoning_effort: low
+
+      - alias_reference: expert-other
+        priority: 0

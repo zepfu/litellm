@@ -4,11 +4,11 @@ defaults: {}
 aliases:
   - name: basic
     candidates:
-      - provider: opencode_zen
-        model: big-pickle
-        route_family: codex_opencode_zen_adapter
-        anthropic_route_family: anthropic_opencode_zen_completion_adapter
-        priority: 50
+      - provider: openai
+        model: gpt-5.6-luna
+        route_family: codex_responses
+        priority: 110
+        reasoning_effort: low
 
       - alias_reference: basic-other
         priority: 0
