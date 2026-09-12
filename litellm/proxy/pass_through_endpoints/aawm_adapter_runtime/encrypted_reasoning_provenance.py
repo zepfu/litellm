@@ -1607,7 +1607,13 @@ def build_producer_provenance_from_egress_context(
     if not isinstance(metadata, Mapping) and isinstance(body, Mapping):
         fallback_meta = body.get("metadata")
         metadata = fallback_meta if isinstance(fallback_meta, Mapping) else None
+    alias_model = None
     if isinstance(metadata, Mapping):
+        alias_model = (
+            metadata.get("requested_model_alias")
+            or metadata.get("codex_auto_agent_alias")
+            or metadata.get("alias_model")
+        )
         account_label = account_label or metadata.get(
             "codex_auto_agent_selected_account_label"
         ) or metadata.get("account_label")
@@ -1635,11 +1641,7 @@ def build_producer_provenance_from_egress_context(
                 or provider
             )
     return build_encrypted_reasoning_provenance(
-        alias_model=(
-            metadata.get("requested_model_alias")
-            or metadata.get("codex_auto_agent_alias")
-            or metadata.get("alias_model")
-        ),
+        alias_model=alias_model,
         producer_provider=provider,
         producer_model=model,
         producer_route_family=resolved_route,
