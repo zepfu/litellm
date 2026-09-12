@@ -313,6 +313,11 @@ Leave that variable unset on `litellm-dev` and production. When unset,
   top-level `reasoning_effort`). Catalog rows stay `:none`. Muse TUI
   default `high` renders `:high`. Muse TUI `max` is `ultra` on the
   wire and renders `:ultra`, not `:none`.
+- Meta `429` / `5xx` are retried inside the alpha gateway for a short
+  budget (`AAWM_MUSE_CODE_HIDDEN_RETRY_BUDGET_SECONDS`, default 12s).
+  Recovered attempts log an INFO retry line, not a WARNING, and do not
+  stamp rollup `[Failed]` / `Request: [Failed]`. Exhausted retries still
+  fail closed to Muse.
 
 ### Rollback / removal
 

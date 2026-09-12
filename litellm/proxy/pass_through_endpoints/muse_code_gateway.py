@@ -16,6 +16,7 @@ When the facade is disabled, ``GET /muse-code/models`` is unregistered and
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from collections.abc import AsyncIterator
@@ -54,6 +55,11 @@ MUSE_CODE_MODEL_ID_PREFIX = "muse-"
 MUSE_CODE_CATALOG_UPSTREAM_URL = "https://api.meta.ai/muse-code/models"
 MUSE_CODE_RESPONSES_UPSTREAM_URL = "https://api.meta.ai/v1/responses"
 MUSE_CODE_GATEWAY_TIMEOUT_SECONDS = 120.0
+AAWM_MUSE_CODE_HIDDEN_RETRY_BUDGET_SECONDS_ENV = (
+    "AAWM_MUSE_CODE_HIDDEN_RETRY_BUDGET_SECONDS"
+)
+MUSE_CODE_HIDDEN_RETRY_BUDGET_SECONDS_DEFAULT = 12.0
+_MUSE_CODE_TRANSIENT_UPSTREAM_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 _MUSE_CODE_GATEWAY_ERROR_SUMMARY_MAX_CHARS = 500
 _MUSE_CODE_TRUTHY_VALUES = frozenset({"1", "true", "yes", "on"})
 _MUSE_CODE_SESSION_HEADER_NAMES: tuple[str, ...] = (
@@ -248,6 +254,67 @@ def _get_response_headers(headers: httpx.Headers) -> dict[str, str]:
         if name.lower() in _MUSE_CODE_RESPONSE_HEADERS
         or name.lower().startswith("x-ratelimit-")
     }
+
+
+def _hidden_retry_budget_seconds() -> float:
+    raw = os.getenv(AAWM_MUSE_CODE_HIDDEN_RETRY_BUDGET_SECONDS_ENV)
+    if raw is None or not raw.strip():
+        return MUSE_CODE_HIDDEN_RETRY_BUDGET_SECONDS_DEFAULT
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return MUSE_CODE_HIDDEN_RETRY_BUDGET_SECONDS_DEFAULT
+
+
+def _retry_after_seconds(headers: httpx.Headers, *, attempt: int) -> float:
+    raw = headers.get("retry-after")
+    if raw:
+        try:
+            parsed = float(raw)
+            if parsed >= 0:
+                return min(parsed, 10.0)
+        except ValueError:
+            pass
+    return min(0.5 * (2 ** max(attempt, 0)), 4.0)
+
+
+def _is_transient_upstream_status(status_code: int) -> bool:
+    return status_code in _MUSE_CODE_TRANSIENT_UPSTREAM_STATUS_CODES
+
+
+def _log_gateway_retry(
+    *,
+    request: Request,
+    target: str,
+    request_payload: _GatewayRequestPayload,
+    status_code: int,
+    attempt: int,
+    wait_seconds: float,
+    session_id: str,
+) -> None:
+    extra = {
+        "source": "muse_code_gateway",
+        "container": os.getenv("HOSTNAME"),
+        "endpoint": request.url.path,
+        "upstream_url": target,
+        "provider": "muse_code",
+        "model": request_payload["model"],
+        "model_alias": None,
+        "route_family": MUSE_CODE_ROUTE_FAMILY,
+        "status_code": status_code,
+        "failure_kind": "gateway_upstream_transient_retry",
+        "retry_attempt": attempt,
+        "retry_wait_seconds": wait_seconds,
+    }
+    if session_id:
+        extra["session_id"] = session_id
+    verbose_proxy_logger.info(
+        "Muse Code gateway retrying Meta upstream status=%s attempt=%s wait=%.2fs",
+        status_code,
+        attempt,
+        wait_seconds,
+        extra=extra,
+    )
 
 
 def _request_requires_streaming_response(request_body: bytes) -> bool:
@@ -484,6 +551,97 @@ async def _stream_response(
         await client.aclose()
 
 
+async def _send_upstream(
+    *,
+    request: Request,
+    upstream_url: str,
+    request_body: bytes,
+) -> tuple[httpx.AsyncClient, httpx.Response]:
+    client = httpx.AsyncClient(
+        timeout=MUSE_CODE_GATEWAY_TIMEOUT_SECONDS,
+        transport=_get_upstream_transport(),
+    )
+    try:
+        upstream_request = client.build_request(
+            method=request.method,
+            url=upstream_url,
+            headers=_get_upstream_headers(request),
+            content=request_body,
+        )
+        return client, await client.send(upstream_request, stream=True)
+    except Exception:
+        await client.aclose()
+        raise
+
+
+async def _send_upstream_with_transient_retry(
+    *,
+    request: Request,
+    upstream_url: str,
+    request_body: bytes,
+    request_payload: _GatewayRequestPayload,
+    session_id: str,
+) -> tuple[httpx.AsyncClient, httpx.Response]:
+    retry_budget_seconds = _hidden_retry_budget_seconds()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + retry_budget_seconds
+    attempt = 0
+    client: Optional[httpx.AsyncClient] = None
+    while True:
+        if client is not None:
+            await client.aclose()
+            client = None
+        try:
+            client, upstream_response = await _send_upstream(
+                request=request,
+                upstream_url=upstream_url,
+                request_body=request_body,
+            )
+        except httpx.HTTPError:
+            remaining = deadline - loop.time()
+            if remaining > 0:
+                wait_seconds = min(
+                    _retry_after_seconds(httpx.Headers(), attempt=attempt),
+                    remaining,
+                )
+                _log_gateway_retry(
+                    request=request,
+                    target=upstream_url,
+                    request_payload=request_payload,
+                    status_code=502,
+                    attempt=attempt + 1,
+                    wait_seconds=wait_seconds,
+                    session_id=session_id,
+                )
+                await asyncio.sleep(wait_seconds)
+                attempt += 1
+                continue
+            raise
+
+        if (
+            _is_transient_upstream_status(upstream_response.status_code)
+            and (deadline - loop.time()) > 0
+        ):
+            wait_seconds = min(
+                _retry_after_seconds(upstream_response.headers, attempt=attempt),
+                deadline - loop.time(),
+            )
+            _log_gateway_retry(
+                request=request,
+                target=upstream_url,
+                request_payload=request_payload,
+                status_code=upstream_response.status_code,
+                attempt=attempt + 1,
+                wait_seconds=wait_seconds,
+                session_id=session_id,
+            )
+            await upstream_response.aclose()
+            await asyncio.sleep(wait_seconds)
+            attempt += 1
+            continue
+        return client, upstream_response
+
+
 async def _proxy_muse_code_request(
     request: Request,
     *,
@@ -501,14 +659,14 @@ async def _proxy_muse_code_request(
 
     try:
         _require_inbound_bearer(request)
-    except HTTPException as exc:
+    except HTTPException as copilot_exc:
         _log_gateway_failure(
             request=request,
             target=upstream_url,
             request_payload=request_payload,
             kwargs=route_kwargs,
-            status_code=exc.status_code,
-            detail=exc.detail,
+            status_code=copilot_exc.status_code,
+            detail=copilot_exc.detail,
             failure_kind="gateway_authentication_rejected",
             session_id=session_id,
             provider_bound_body=provider_bound_body,
@@ -522,20 +680,15 @@ async def _proxy_muse_code_request(
         kwargs=route_kwargs,
         provider_bound_body=provider_bound_body,
     )
-    client = httpx.AsyncClient(
-        timeout=MUSE_CODE_GATEWAY_TIMEOUT_SECONDS,
-        transport=_get_upstream_transport(),
-    )
     try:
-        upstream_request = client.build_request(
-            method=request.method,
-            url=upstream_url,
-            headers=_get_upstream_headers(request),
-            content=request_body,
+        client, upstream_response = await _send_upstream_with_transient_retry(
+            request=request,
+            upstream_url=upstream_url,
+            request_body=request_body,
+            request_payload=request_payload,
+            session_id=session_id,
         )
-        upstream_response = await client.send(upstream_request, stream=True)
-    except httpx.HTTPError as exc:
-        await client.aclose()
+    except httpx.HTTPError as copilot_exc:
         detail = "Muse Code gateway upstream request failed."
         _log_gateway_failure(
             request=request,
@@ -551,7 +704,7 @@ async def _proxy_muse_code_request(
         raise HTTPException(
             status_code=502,
             detail=detail,
-        ) from exc
+        ) from copilot_exc
 
     response_headers = _get_response_headers(upstream_response.headers)
     is_sse_response = "text/event-stream" in upstream_response.headers.get(
@@ -578,7 +731,7 @@ async def _proxy_muse_code_request(
 
     try:
         response_body = await upstream_response.aread()
-    except httpx.HTTPError as exc:
+    except httpx.HTTPError as copilot_exc:
         detail = "Muse Code gateway upstream response read failed."
         _log_gateway_failure(
             request=request,
@@ -594,7 +747,7 @@ async def _proxy_muse_code_request(
             or upstream_response.headers.get("x-request-id")
             or upstream_response.headers.get("x-fb-trace-id"),
         )
-        raise HTTPException(status_code=502, detail=detail) from exc
+        raise HTTPException(status_code=502, detail=detail) from copilot_exc
     finally:
         await upstream_response.aclose()
         await client.aclose()

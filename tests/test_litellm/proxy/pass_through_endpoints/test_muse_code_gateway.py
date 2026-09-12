@@ -175,6 +175,12 @@ def _muse_responses_body(*, stream: bool = True) -> bytes:
 def enable_muse_facade(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AAWM_MUSE_CODE_FACADE_ENABLED", "1")
     monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+    monkeypatch.setenv("AAWM_MUSE_CODE_HIDDEN_RETRY_BUDGET_SECONDS", "5")
+
+    async def _instant_sleep(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(muse_code_gateway.asyncio, "sleep", _instant_sleep)
 
 
 @pytest.fixture(autouse=True)
@@ -624,6 +630,69 @@ def test_muse_responses_rollup_shows_muse_tui_max_as_request_ultra(
     rendered_rollup = "\n".join(flush_aawm_route_rollups(force=True))
     assert "muse-spark-1.3-contributor:ultra" in rendered_rollup
     assert "muse-spark-1.3-contributor:none" not in rendered_rollup
+
+
+def test_muse_responses_retries_transient_429_without_failed_rollup(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caplog.set_level(logging.INFO, logger=verbose_proxy_logger.name)
+    payload = _muse_responses_payload(stream=False)
+    payload["reasoning"] = {"effort": "high"}
+    calls = {"n": 0}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(
+                429,
+                json={
+                    "error": {
+                        "message": "Service temporarily unavailable. Please retry."
+                    }
+                },
+                headers={"retry-after": "0"},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={"id": "resp_meta", "model": "muse-spark-1.3-contributor"},
+            headers={"content-type": "application/json"},
+            request=request,
+        )
+
+    _set_upstream(monkeypatch, _handler)
+
+    response = _request(
+        _app(),
+        "POST",
+        "/responses",
+        content=json.dumps(payload).encode("utf-8"),
+        headers=_muse_identity_headers(),
+    )
+
+    assert response.status_code == 200
+    assert calls["n"] == 2
+    warning_records = [
+        record
+        for record in caplog.records
+        if record.name == verbose_proxy_logger.name
+        and "surfaced handled client/provider error" in record.getMessage()
+    ]
+    assert warning_records == []
+    retry_records = [
+        record
+        for record in caplog.records
+        if record.name == verbose_proxy_logger.name
+        and getattr(record, "failure_kind", None)
+        == "gateway_upstream_transient_retry"
+    ]
+    assert len(retry_records) == 1
+    rendered_rollup = "\n".join(flush_aawm_route_rollups(force=True))
+    assert "muse-spark-1.3-contributor:high" in rendered_rollup
+    assert "[Failed]" not in rendered_rollup
+    assert "Request: [Failed]" not in rendered_rollup
+    assert "Service temporarily unavailable" not in rendered_rollup
 
 
 def test_disabled_facade_catalog_handler_is_not_found(
