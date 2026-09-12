@@ -8316,23 +8316,44 @@ async def pass_through_request(  # noqa: PLR0915
                 ("account_lane", "lane_key"),
             ):
                 value = candidate_context.get(candidate_key)
-                if value not in (None, ""):
+                if (
+                    value not in (None, "")
+                    and error_log_context.get(context_key) in (None, "")
+                ):
                     error_log_context[context_key] = value
-        error_log_context["provider_returned"] = bool(
-            getattr(e, "_aawm_provider_returned", False)
-            or getattr(e, "provider_returned", False)
-        )
-        error_log_context["attempted_provider_call"] = bool(
-            getattr(
-                e,
-                "attempted_provider_call",
-                error_log_context["provider_returned"],
-            )
-        )
+        detail = getattr(e, "detail", None)
+        detail_mapping = detail if isinstance(detail, Mapping) else {}
+        provider_returned = getattr(e, "_aawm_provider_returned", None)
+        if not isinstance(provider_returned, bool):
+            provider_returned = getattr(e, "provider_returned", None)
+        if not isinstance(provider_returned, bool):
+            provider_returned = detail_mapping.get("provider_returned")
+        if isinstance(provider_returned, bool):
+            error_log_context["provider_returned"] = provider_returned
+        attempted_provider_call = getattr(e, "attempted_provider_call", None)
+        if not isinstance(attempted_provider_call, bool):
+            attempted_provider_call = detail_mapping.get("attempted_provider_call")
+        if isinstance(attempted_provider_call, bool):
+            error_log_context["attempted_provider_call"] = attempted_provider_call
         failure_phase = getattr(e, "failure_phase", None)
         if isinstance(failure_phase, str) and failure_phase:
             error_log_context["failure_phase"] = failure_phase
-        error_log_context["upstream_status_code"] = status_code
+        if error_log_context.get("upstream_status_code") is None:
+            upstream_status_code = getattr(e, "upstream_status_code", None)
+            if upstream_status_code is None:
+                upstream_status_code = getattr(
+                    getattr(e, "response", None),
+                    "status_code",
+                    None,
+                )
+            if upstream_status_code is None:
+                error_detail = detail_mapping.get("error")
+                if isinstance(error_detail, Mapping):
+                    upstream_status_code = error_detail.get("upstream_status_code")
+            if upstream_status_code is None:
+                upstream_status_code = detail_mapping.get("upstream_status_code")
+            if upstream_status_code is not None:
+                error_log_context["upstream_status_code"] = upstream_status_code
         error_log_context = _enrich_passthrough_error_log_context_for_request_shape_422(
             error_log_context=error_log_context,
             exc=e,

@@ -4190,7 +4190,6 @@ def _emit_session_owner_redispatch_observability(
                 "failure_class": "session_owner_redispatch",
                 "failure_phase": failure_phase,
                 "attempted_provider_call": bool(attempted_provider_call),
-                "provider_returned": bool(attempted_provider_call),
                 "redispatch_required": True,
                 "terminal_outcome": "redispatch_required",
                 "fallback_result": "none",
