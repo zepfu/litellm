@@ -4391,6 +4391,7 @@ async def handle_alias_route(  # noqa: PLR0915
                 if account_failover_planned:
                     if (
                         selection_budget_counted
+                        and not selection_provider_egress_reached
                         and attempt_record.get(
                             "provider_attempt_budget_refunded"
                         )
