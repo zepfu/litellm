@@ -250,7 +250,9 @@ Default client model: `muse-spark-1.3-contributor` (host
 `muse-spark-1.3-contributor`, `muse-spark-1.3`,
 `muse-spark-1.2-contributor`, `muse-spark-1.2`. Override the advertised
 list with `AAWM_MUSE_CODE_MODEL_IDS` (comma-separated) on alpha Compose
-only.
+only. Alpha `model_list` currently maps those inbound ids onto
+`zai_coding_plan/glm-5.3-flash` using the existing `ZAI_KEY` on alpha.
+That mapping is alpha-only and is not a dedicated Muse/Meta upstream.
 
 ### Credentials
 
