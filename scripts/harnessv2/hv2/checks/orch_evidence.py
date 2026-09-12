@@ -1154,38 +1154,128 @@ def _codex_spawn_targets(payload: Mapping[str, Any]) -> set[str]:
     return targets
 
 
-def _codex_record_is_child_tool(obj: Mapping[str, Any]) -> bool:
-    payload = obj.get("payload")
-    if isinstance(payload, Mapping):
+def _codex_child_contract(
+    path: Path,
+    *,
+    workspace: str,
+) -> dict[str, Any]:
+    """Validate one child transcript against the two-command acceptance contract."""
+
+    records = list(_iter_jsonl_objects(path))
+    calls: list[dict[str, Any]] = []
+    outputs: dict[str, Mapping[str, Any]] = {}
+    command_events: dict[str, Mapping[str, Any]] = {}
+    task_complete = False
+    final_answer = False
+
+    for index, obj in enumerate(records):
+        payload = obj.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
         kind = str(payload.get("type") or "")
         if kind == "function_call":
-            return True
+            name = _codex_function_call_name(payload)
+            if name == "exec_command":
+                args = _codex_function_call_args(payload)
+                call_id = payload.get("call_id") or payload.get("id")
+                calls.append(
+                    {
+                        "index": index,
+                        "call_id": str(call_id or ""),
+                        "cmd": str(args.get("cmd") or "").strip(),
+                    }
+                )
+        elif kind == "function_call_output":
+            call_id = payload.get("call_id")
+            if isinstance(call_id, str) and call_id:
+                outputs[call_id] = payload
+
         item = payload.get("item")
+        if isinstance(item, Mapping) and str(item.get("type") or "") == "CommandExecution":
+            event_id = item.get("id")
+            if isinstance(event_id, str) and event_id:
+                command_events[event_id] = item
+            continue
+
+        if kind == "task_complete":
+            task_complete = True
         if (
             isinstance(item, Mapping)
-            and str(item.get("type") or "") == "CommandExecution"
+            and str(item.get("type") or "") == "AgentMessage"
+            and str(item.get("phase") or "") == "final_answer"
         ):
-            return True
-    return False
+            final_answer = True
+        if (
+            kind == "message"
+            and str(payload.get("phase") or "") == "final_answer"
+        ):
+            final_answer = True
 
+    failures: list[str] = []
+    expected = {"pwd": f"{workspace}\n", "uname -s": "Linux\n"}
+    call_indices = [call["index"] for call in calls]
+    if len(calls) != 2:
+        failures.append(
+            f"child must issue exactly two exec_command calls (found={len(calls)})"
+        )
+    elif call_indices[1] != call_indices[0] + 1:
+        failures.append("child exec_command calls were not emitted concurrently")
 
-def _codex_parallel_function_call_streak(path: Path) -> int:
-    """Longest run of consecutive child tool records in one JSONL file."""
+    commands = [call["cmd"] for call in calls]
+    if sorted(commands) != sorted(expected):
+        failures.append(
+            "child commands must be exactly `pwd` and `uname -s` "
+            f"(found={commands!r})"
+        )
 
-    streak = 0
-    longest = 0
-    for obj in _iter_jsonl_objects(path):
-        payload = obj.get("payload") if isinstance(obj.get("payload"), Mapping) else {}
-        kind = str(payload.get("type") or "") if isinstance(payload, Mapping) else ""
-        if _codex_record_is_child_tool(obj):
-            streak += 1
-            if streak > longest:
-                longest = streak
+    for call in calls:
+        cmd = call["cmd"]
+        call_id = call["call_id"]
+        expected_stdout = expected.get(cmd)
+        event = command_events.get(call_id)
+        output = outputs.get(call_id)
+        if not call_id:
+            failures.append(f"child {cmd or 'exec_command'} record has no call_id")
             continue
-        if kind == "function_call_output":
+        if event is None:
+            failures.append(f"child {cmd} has no matching CommandExecution record")
             continue
-        streak = 0
-    return longest
+        if str(event.get("status") or "") != "completed" or event.get("exit_code") != 0:
+            failures.append(f"child {cmd} did not complete successfully")
+        stdout = event.get("stdout")
+        if expected_stdout is not None and stdout != expected_stdout:
+            failures.append(
+                f"child {cmd} stdout mismatch "
+                f"(expected={expected_stdout!r}, found={stdout!r})"
+            )
+        if output is None:
+            failures.append(f"child {cmd} has no matching function_call_output")
+        elif expected_stdout is not None:
+            rendered = str(output.get("output") or "")
+            marker = "Output:\n"
+            if (
+                marker not in rendered
+                or rendered.split(marker, 1)[1].strip()
+                != expected_stdout.strip()
+            ):
+                failures.append(
+                    f"child {cmd} function_call_output lacks exact stdout"
+                )
+
+    if not final_answer:
+        failures.append("child has no final_answer record")
+    if not task_complete:
+        failures.append("child has no task_complete record")
+
+    return {
+        "ok": not failures,
+        "failures": failures,
+        "commands": commands,
+        "call_count": len(calls),
+        "parallel_streak": 2 if len(calls) == 2 and not failures else 0,
+        "final_answer": final_answer,
+        "task_complete": task_complete,
+    }
 
 
 def codex_spawn_tool_evidence(
@@ -1198,24 +1288,16 @@ def codex_spawn_tool_evidence(
     after_echo_index: int | None = None,
     workspace: str | None = None,
 ) -> dict[str, Any]:
-    """Codex parent spawn plus child consecutive parallel tool calls.
-
-    Recap-only ``hv2-codex-child`` is not a pass. The child JSONL must show
-    at least two consecutive ``function_call`` records before its final
-    response.
-    """
+    """Require each planned Codex child to complete the two-command contract."""
 
     wanted = [str(item) for item in children if str(item).strip()]
-    wanted_set = set(wanted)
     failures: list[str] = []
-    current = _muse_current_turn_text(pane, prompt, after_echo_index)
     paths = _codex_jsonl_paths(session_dir, since_mtime=since_mtime)
     workspace_cwd = str(workspace or "").rstrip("/")
     session_paths: list[str] = []
-    spawned_targets: set[str] = set()
-    child_thread_ids: set[str] = set()
-    child_paths: list[Path] = []
-    parallel_streak = 0
+    spawn_requests: list[dict[str, Any]] = []
+    activity_by_call_id: dict[str, str] = {}
+    child_paths_by_id: dict[str, Path] = {}
 
     for path in paths:
         meta = _codex_session_meta(path)
@@ -1223,56 +1305,108 @@ def codex_spawn_tool_evidence(
         if workspace_cwd and cwd and cwd != workspace_cwd:
             continue
         session_paths.append(str(path))
+        session_id = str(meta.get("id") or meta.get("session_id") or "").strip()
+        if session_id:
+            child_paths_by_id[session_id] = path
         for obj in _iter_jsonl_objects(path):
             payload = obj.get("payload")
             if not isinstance(payload, Mapping):
                 continue
             kind = str(payload.get("type") or "")
-            if (
-                kind == "function_call"
-                and _codex_function_call_name(payload) == "spawn_agent"
-            ):
-                spawned_targets.update(_codex_spawn_targets(payload))
+            if kind == "function_call" and _codex_function_call_name(payload) == "spawn_agent":
+                call_id = payload.get("call_id") or payload.get("id")
+                spawn_requests.append(
+                    {
+                        "call_id": str(call_id or ""),
+                        "targets": _codex_spawn_targets(payload),
+                    }
+                )
             item = payload.get("item")
             if (
                 isinstance(item, Mapping)
                 and str(item.get("type") or "") == "SubAgentActivity"
             ):
                 thread_id = item.get("agent_thread_id")
-                if isinstance(thread_id, str) and thread_id.strip():
-                    child_thread_ids.add(thread_id.strip())
+                if (
+                    str(item.get("kind") or "") == "started"
+                    and isinstance(thread_id, str)
+                    and thread_id.strip()
+                ):
+                    activity_id = item.get("id")
+                    if isinstance(activity_id, str) and activity_id.strip():
+                        activity_by_call_id[activity_id] = thread_id.strip()
 
-    for path in paths:
-        if not any(thread_id and thread_id in path.name for thread_id in child_thread_ids):
+    remaining_requests = list(spawn_requests)
+    child_evidence: list[dict[str, Any]] = []
+    spawned_targets: list[str] = []
+    for target in wanted:
+        match_index = next(
+            (
+                index
+                for index, request in enumerate(remaining_requests)
+                if target in request["targets"]
+            ),
+            None,
+        )
+        if match_index is None:
+            failures.append(f"Codex orchestration is missing spawn_agent target {target}")
+            child_evidence.append(
+                {"target": target, "ok": False, "failures": ["spawn_agent missing"]}
+            )
             continue
-        child_paths.append(path)
-        streak = _codex_parallel_function_call_streak(path)
-        if streak > parallel_streak:
-            parallel_streak = streak
+        request = remaining_requests.pop(match_index)
+        spawned_targets.append(target)
+        thread_id = activity_by_call_id.get(request["call_id"])
+        if not thread_id:
+            message = f"spawn_agent target {target} has no started SubAgentActivity"
+            failures.append(message)
+            child_evidence.append({"target": target, "ok": False, "failures": [message]})
+            continue
+        path = child_paths_by_id.get(thread_id)
+        if path is None:
+            message = f"spawn_agent target {target} has no child rollout JSONL"
+            failures.append(message)
+            child_evidence.append(
+                {
+                    "target": target,
+                    "thread_id": thread_id,
+                    "ok": False,
+                    "failures": [message],
+                }
+            )
+            continue
+        contract = _codex_child_contract(path, workspace=workspace_cwd)
+        evidence = {
+            "target": target,
+            "thread_id": thread_id,
+            "jsonl": str(path),
+            **contract,
+        }
+        child_evidence.append(evidence)
+        failures.extend(f"{target}: {failure}" for failure in contract["failures"])
 
-    if "meta" in spawned_targets:
-        spawned_targets.add("muse-spark-1.3-contributor")
-    spawned_wanted = bool(spawned_targets & wanted_set)
-    pane_spawn = any(child in current for child in wanted)
-    if not spawned_wanted and not pane_spawn:
-        failures.append(
-            "Codex orchestration is missing spawn of "
-            f"{wanted} (spawn_agent model/agent_type, or pane child id)"
-        )
-    if wanted and parallel_streak < 2:
-        failures.append(
-            "Codex child did not execute at least two consecutive parallel "
-            f"tool calls before returning (streak={parallel_streak})"
-        )
+    parallel_streak = min(
+        (
+            int(evidence.get("parallel_streak") or 0)
+            for evidence in child_evidence
+            if evidence.get("target") in wanted
+        ),
+        default=0,
+    )
 
     return {
         "ok": not failures,
         "failures": failures,
         "children": wanted,
         "spawned_targets": sorted(spawned_targets),
-        "child_thread_ids": sorted(child_thread_ids),
+        "child_thread_ids": sorted(activity_by_call_id.values()),
         "parallel_streak": parallel_streak,
+        "child_evidence": child_evidence,
         "session_jsonl": session_paths[:4],
-        "child_jsonl": [str(path) for path in child_paths[:4]],
+        "child_jsonl": [
+            str(evidence["jsonl"])
+            for evidence in child_evidence
+            if evidence.get("jsonl")
+        ][:4],
         "kind": "codex_parallel_child_tools",
     }
