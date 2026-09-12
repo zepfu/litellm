@@ -203,8 +203,8 @@ services:
       - AAWM_OPENAI_FAULT_PLAN_ENABLED=${AAWM_OPENAI_FAULT_PLAN_ENABLED:-0}
       - AAWM_CFG004_ACCEPTANCE_ENABLED=${AAWM_CFG004_ACCEPTANCE_ENABLED:-0}
       - AAWM_CFG004_ACCEPTANCE_RUN_ID=${AAWM_CFG004_ACCEPTANCE_RUN_ID:-}
-      # MUSE-008: enable the Muse code facade on alpha only. Model aliases,
-      # credentials, timeouts, and body limits remain deferred.
+      # MUSE-008: enable the Muse Meta pass-through on alpha only.
+      # Catalog and calls forward the client's Meta Bearer to api.meta.ai.
       - AAWM_MUSE_CODE_FACADE_ENABLED=1
       - AAWM_MUSE_CODE_MODEL_IDS=muse-spark-1.3-contributor,muse-spark-1.3,muse-spark-1.2-contributor,muse-spark-1.2
     healthcheck:
