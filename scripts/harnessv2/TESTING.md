@@ -754,6 +754,13 @@ the dedicated parent session open after `_step_tui_orchestration`.
 Baseline leftover is that one orch parent session. `child_evidence.ok`
 without green post-TUI `docker_logs` is not a full orch pass.
 
+For Codex orchestration, `codex_parallel_child_tools` requires every selected
+child to be tied to a current-turn `spawn_agent` record and a started
+`SubAgentActivity`. Each child transcript must contain exactly adjacent
+`exec_command` calls for `pwd` and `uname -s`, matching successful
+`CommandExecution` and `function_call_output` records, followed by both
+`final_answer` and `task_complete`.
+
 ```text
 python scripts/harnessv2/run.py \
   --instance litellm-alpha \
