@@ -3393,6 +3393,9 @@ def _log_grok_forward_header_compare(
     endpoint: str,
     request: Request,
 ) -> None:
+    if os.getenv("AAWM_GROK_ROUTE_DEBUG") != "1":
+        return
+
     incoming_headers = {str(header_name).lower() for header_name in _safe_get_request_headers(request).keys()}
     allowed_headers = {header.lower() for header in _GROK_CLI_FORWARD_HEADER_ALLOWLIST}
     forwarded_headers = sorted(incoming_headers & allowed_headers)
@@ -3401,9 +3404,6 @@ def _log_grok_forward_header_compare(
         for header in incoming_headers - allowed_headers
         if header not in _GROK_CLI_FORWARD_HEADER_COMPARE_IGNORE and not header.startswith("x-pass-")
     )
-
-    if not stripped_headers and os.getenv("AAWM_GROK_ROUTE_DEBUG") != "1":
-        return
 
     verbose_proxy_logger.warning(
         "Grok passthrough header compare: endpoint=%s forwarded=%s stripped=%s",
@@ -6521,6 +6521,18 @@ async def openai_proxy_route(  # noqa: PLR0915
                 direct_account_error_class = "usage_limit_reached"
             elif _aawm_codex_oauth.is_direct_codex_token_invalidated_error(exc):
                 direct_account_error_class = "token_invalidated"
+            elif (
+                use_direct_codex_oauth_inventory
+                and attempted_provider_call
+                and provider_returned
+                and _aawm_error_signals._extract_adapter_exception_status_code(exc)
+                == status.HTTP_429_TOO_MANY_REQUESTS
+            ):
+                # A provider 429 without the structured Codex usage-limit
+                # payload is model/account capacity, not exhausted quota.
+                # Let the direct inventory retry path move to the next OAuth
+                # account for fresh, unbound agent requests.
+                direct_account_error_class = "rate_limited"
             elif (
                 use_direct_codex_oauth_inventory
                 and attempted_provider_call

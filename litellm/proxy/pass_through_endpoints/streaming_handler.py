@@ -904,10 +904,30 @@ class PassThroughStreamingHandler:
                 "usage limit",
                 "quota exceeded",
                 "quota exhausted",
+                "insufficient_quota",
+                "quota_limit",
                 "weekly limit",
             )
         ):
             return "usage_limit_reached", "usage_limit_reached", False
+        if openai_alpha_capacity_retry_enabled and (
+            error_code in {
+                "rate_limit_exceeded",
+                "rate_limited",
+                "too_many_requests",
+            }
+            or error_type in {"rate_limit_error", "rate_limited"}
+            or any(
+                marker in joined
+                for marker in (
+                    "rate_limit",
+                    "rate limit",
+                    "too many requests",
+                    "429",
+                )
+            )
+        ):
+            return "server_overloaded", "transient_capacity", True
         if (
             error_code in {"server_is_overloaded", "capacity_exhausted"}
             and error_type not in {
@@ -1051,6 +1071,23 @@ class PassThroughStreamingHandler:
             status_code = 400
             error_type = "invalid_request_error"
             error_code = error_code or "invalid_request_error"
+        elif error_class == "server_overloaded" and (
+            error_code in {
+                "rate_limit_exceeded",
+                "rate_limited",
+                "too_many_requests",
+            }
+            or error_type in {"rate_limit_error", "rate_limited"}
+            or any(
+                marker in " ".join(
+                    value.lower()
+                    for value in (error_code, error_type, extracted_message)
+                    if isinstance(value, str)
+                )
+                for marker in ("rate_limit", "rate limit", "429", "too many requests")
+            )
+        ):
+            status_code = 429
         if not sanitized_message:
             sanitized_message = classification
         if pre_commit_retry_exhausted and retryable:
@@ -3694,6 +3731,41 @@ class PassThroughStreamingHandler:
                 ),
             )
         )
+        # Keep canonical, non-secret provider identity on the persisted marker.
+        # The terminal emitter also carries these fields, but audit consumers
+        # read the marker context when a client cancels a failed stream.
+        route_context = metadata.get("aawm_route_rollup_context")
+        if not isinstance(route_context, dict):
+            route_context = {}
+        selected_provider = (
+            metadata.get("codex_auto_agent_selected_provider")
+            or metadata.get("provider")
+            or route_context.get("provider")
+            or "openai"
+        )
+        selected_model = (
+            metadata.get("codex_auto_agent_selected_model")
+            or metadata.get("model")
+            or request_body.get("model")
+            if isinstance(request_body, dict)
+            else metadata.get("model")
+        )
+        selected_route = (
+            metadata.get("codex_auto_agent_selected_route_family")
+            or metadata.get("route_family")
+            or route_context.get("outgoing_target")
+            or "codex_responses"
+        )
+        metadata.setdefault("provider", selected_provider)
+        if selected_model not in (None, ""):
+            metadata.setdefault("model", selected_model)
+        metadata.setdefault("route_family", selected_route)
+        metadata.setdefault("provider_returned", True)
+        metadata.setdefault("attempted_provider_call", True)
+        if isinstance(error_payload, dict):
+            payload_status = error_payload.get("status_code")
+            if isinstance(payload_status, int):
+                metadata.setdefault("upstream_status_code", payload_status)
         if policy_failure_kind or policy_failure_code or policy_failure_class:
             if isinstance(error_payload, dict):
                 metadata["aawm_provider_terminal_error_payload"] = dict(

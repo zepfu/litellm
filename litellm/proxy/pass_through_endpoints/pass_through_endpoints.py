@@ -1891,7 +1891,8 @@ def _classify_passthrough_raw_http_error(
     if not payload.get("message") and error_text.strip():
         payload = {**payload, "message": error_text}
     classified = PassThroughStreamingHandler._classify_responses_pre_commit_error(
-        payload
+        payload,
+        openai_alpha_capacity_retry_enabled=True,
     )
     code, error_type, message = (
         PassThroughStreamingHandler._extract_responses_stream_error_fields(payload)
