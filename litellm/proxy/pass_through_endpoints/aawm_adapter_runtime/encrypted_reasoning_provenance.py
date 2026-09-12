@@ -68,6 +68,7 @@ ROUTE_IDENTITY_FIELD = "aawm_route_identity"
 _WRAP_PREFIX = "aawm_erp:"
 _PROVENANCE_VERSION = 1
 _ROUTE_IDENTITY_KEYS = (
+    "alias_model",
     "producer_provider",
     "producer_model",
     "producer_route_family",
@@ -124,6 +125,7 @@ _SAFE_PROVENANCE_KEYS = (
     "account_lane",
     # account_hash is a one-way safe digest already used elsewhere; never raw id.
     "account_hash",
+    "alias_model",
 )
 
 
@@ -180,6 +182,7 @@ def infer_encrypted_state_format(
 
 def build_encrypted_reasoning_provenance(
     *,
+    alias_model: Any = None,
     producer_provider: Any = None,
     producer_model: Any = None,
     producer_route_family: Any = None,
@@ -202,6 +205,8 @@ def build_encrypted_reasoning_provenance(
         "encrypted_state_format": encrypted_state_format,
         "compatibility_source": ENCRYPTED_REASONING_COMPATIBILITY_SOURCE,
     }
+    if alias_model is not None and str(alias_model).strip():
+        provenance["alias_model"] = str(alias_model).strip()
     if producer_provider is not None and str(producer_provider).strip():
         provenance["producer_provider"] = str(producer_provider).strip()
     if producer_model is not None and str(producer_model).strip():
@@ -663,6 +668,11 @@ def build_route_identity_from_provenance(
     ):
         return None
     return {
+        **(
+            {"alias_model": str(provenance.get("alias_model")).strip()}
+            if str(provenance.get("alias_model") or "").strip()
+            else {}
+        ),
         "producer_provider": provider,
         "producer_model": model,
         "producer_route_family": route,
@@ -1625,6 +1635,11 @@ def build_producer_provenance_from_egress_context(
                 or provider
             )
     return build_encrypted_reasoning_provenance(
+        alias_model=(
+            metadata.get("requested_model_alias")
+            or metadata.get("codex_auto_agent_alias")
+            or metadata.get("alias_model")
+        ),
         producer_provider=provider,
         producer_model=model,
         producer_route_family=resolved_route,
