@@ -885,3 +885,208 @@ def grok_spawn_tool_evidence(
         "session_tool_calls": len(session_tool_calls),
         "kind": "grok_spawn_tool",
     }
+
+
+_MUSE_SPAWN_TOOLS = frozenset(
+    {
+        "subagent_spawn",
+        "muse.subagent_spawn",
+    }
+)
+_MUSE_RESULT_TOOLS = frozenset(
+    {
+        "subagent_read_result",
+        "muse.subagent_read_result",
+        "subagent_wait",
+        "muse.subagent_wait",
+    }
+)
+_MUSE_SPAWN_EVENTS = frozenset(
+    {
+        "subagent.control.spawn_accepted",
+        "subagent.control.child_session_bound",
+        "subagent.control.start_attested",
+        "spawn_accepted",
+        "child_session_bound",
+        "start_attested",
+    }
+)
+_MUSE_RESULT_EVENTS = frozenset(
+    {
+        "subagent.control.result_ready",
+        "subagent.control.closed",
+        "result_ready",
+        "closed",
+    }
+)
+_MUSE_SPAWN_CHROME_RE = re.compile(
+    r"(?:subagent_spawn|Spawn accepted|Child starting|Child running)\b",
+    re.IGNORECASE,
+)
+_MUSE_RESULT_CHROME_RE = re.compile(
+    r"(?:Result envelope ready|Reading result for|Child closed)\b",
+    re.IGNORECASE,
+)
+_MUSE_PROMPT_SPAWN_RE = re.compile(r"Call subagent_spawn", re.IGNORECASE)
+
+
+def muse_workspace_session_root(session_dir: str | None = None) -> Path:
+    """Return the harness Muse session root (XDG_DATA_HOME overlay)."""
+
+    return Path(session_dir or "/tmp/hv2-muse-sessions")
+
+
+def _muse_current_turn_text(
+    pane: str,
+    prompt: str | None,
+    after_echo_index: int | None,
+) -> str:
+    pane_text = pane or ""
+    if prompt is not None:
+        scan_start = _pane_scan_start(
+            pane_text, prompt, after_echo_index=after_echo_index
+        )
+        pane_text = "\n".join(pane_text.splitlines()[scan_start:])
+    return pane_text
+
+
+def _muse_session_jsonl_paths(
+    session_dir: str | None,
+    *,
+    since_mtime: float | None = None,
+) -> list[Path]:
+    root = Path(session_dir) if session_dir else None
+    if root is None or not root.is_dir():
+        return []
+    rows: list[Path] = []
+    for path in root.rglob("session.jsonl"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if since_mtime is not None and mtime < (since_mtime - 2):
+            continue
+        rows.append(path)
+    return sorted(rows, key=lambda item: item.stat().st_mtime, reverse=True)[
+        :_JSONL_SCAN_CAP
+    ]
+
+
+def _muse_event_kind(obj: Mapping[str, Any]) -> str:
+    payload = obj.get("payload")
+    if isinstance(payload, Mapping):
+        event = payload.get("event")
+        if isinstance(event, Mapping):
+            for key in ("kind", "action", "operation", "event"):
+                value = event.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        payload_type = obj.get("payload_type")
+        if isinstance(payload_type, str) and payload_type.strip():
+            return payload_type.strip()
+    for key in ("kind", "type", "payload_type"):
+        value = obj.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _muse_tool_names(obj: Mapping[str, Any]) -> set[str]:
+    names: set[str] = set()
+    blob_sources: list[Any] = [obj]
+    payload = obj.get("payload")
+    if isinstance(payload, Mapping):
+        blob_sources.append(payload)
+        event = payload.get("event")
+        if isinstance(event, Mapping):
+            blob_sources.append(event)
+            calls = event.get("tool_calls")
+            if isinstance(calls, list):
+                for item in calls:
+                    if isinstance(item, Mapping):
+                        name = item.get("name")
+                        if isinstance(name, str) and name.strip():
+                            names.add(name.strip())
+            task_kind = event.get("task_kind")
+            if isinstance(task_kind, str) and task_kind.startswith("tool."):
+                names.add(task_kind[len("tool.") :])
+    for source in blob_sources:
+        if not isinstance(source, Mapping):
+            continue
+        for key in ("tool", "tool_name", "toolName", "name"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                names.add(value.strip())
+    return names
+
+
+def muse_spawn_tool_evidence(
+    *,
+    pane: str = "",
+    prompt: str | None = None,
+    after_echo_index: int | None = None,
+    session_dir: str | None = None,
+    since_mtime: float | None = None,
+) -> dict[str, Any]:
+    """Muse-owned spawn + child completion. Wrap-token recap is not a pass.
+
+    After the current-turn prompt echo, require ``subagent_spawn`` chrome that
+    is not the sent prompt, plus session JSONL spawn/result events when the
+    harness session dir is available. Fail closed on prompt-echo-only spawn
+    or a wrap-token recap with no spawn chrome.
+    """
+
+    failures: list[str] = []
+    sent = (prompt or "").strip()
+    current = _muse_current_turn_text(pane, prompt, after_echo_index)
+    session_paths = _muse_session_jsonl_paths(session_dir, since_mtime=since_mtime)
+    tool_names: set[str] = set()
+    event_kinds: set[str] = set()
+    result_ready = False
+    for path in session_paths:
+        for obj in _iter_jsonl_objects(path):
+            kind = _muse_event_kind(obj)
+            if kind:
+                event_kinds.add(kind)
+            names = _muse_tool_names(obj)
+            tool_names.update(names)
+            if kind in _MUSE_RESULT_EVENTS or names & _MUSE_RESULT_TOOLS:
+                result_ready = True
+
+    spawn_chrome = False
+    for match in _MUSE_SPAWN_CHROME_RE.finditer(current):
+        line = current[max(0, match.start() - 80) : match.end() + 80]
+        if _MUSE_PROMPT_SPAWN_RE.search(line) and "Call subagent_spawn" in sent:
+            continue
+        spawn_chrome = True
+        break
+    if not spawn_chrome:
+        spawn_chrome = bool(tool_names & _MUSE_SPAWN_TOOLS) or bool(
+            event_kinds & _MUSE_SPAWN_EVENTS
+        )
+    child_completed = bool(result_ready or _MUSE_RESULT_CHROME_RE.search(current))
+
+    if not spawn_chrome:
+        failures.append(
+            "Muse orchestration is missing current-turn spawn chrome "
+            "(subagent_spawn / Spawn accepted, or session JSONL "
+            "subagent.control.spawn_accepted); prompt-echo-only spawn is "
+            "not evidence"
+        )
+    if spawn_chrome and not child_completed:
+        failures.append(
+            "Muse orchestration spawned a child but has no completion "
+            "evidence (subagent.control.result_ready / Reading result for); "
+            "wrap-token recap is not child-spawn evidence"
+        )
+
+    return {
+        "ok": not failures,
+        "failures": failures,
+        "spawn_chrome": spawn_chrome,
+        "child_completed": child_completed,
+        "tool_names": sorted(tool_names),
+        "event_kinds": sorted(event_kinds),
+        "session_jsonl": [str(path) for path in session_paths[:4]],
+        "kind": "muse_spawn_tool",
+    }

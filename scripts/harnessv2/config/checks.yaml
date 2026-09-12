@@ -114,6 +114,8 @@ checks:
         - /internal/aawm/session-transfer-status
         - /grok/v1
         - /grok/v1/models
+        - /muse-code/models
+        - /responses
         - /v1/chat/completions
     rollup:
       header_regex: '^\d{8} \d{2}:\d{2}:\d{2}(?: \[EARLY\])? \S+ /\S+'
@@ -247,6 +249,8 @@ child_env:
     - OPENAI_
     - XAI_
     - GROK_
+    - MUSE_
+    - META_
     - PI_
     - OMP_
   deny_keys:

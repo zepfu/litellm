@@ -45,10 +45,10 @@ services:
       - /usr/bin/env
       - LITELLM_KIMI_NATIVE_CONTRACT_PATH=/run/aawm/kimi-descriptor/native-contract.json
       - watchfiles
-      - litellm --config /app/litellm-dev-config.yaml --port 4011 --run_hypercorn
+      - litellm --config /app/litellm-alpha-config.yaml --port 4011 --run_hypercorn
       - /app/litellm
       - /app/enterprise
-      - /app/litellm-dev-config.yaml
+      - /app/litellm-alpha-config.yaml
       - /app/model_prices_and_context_window.json
       - /app/context-replacement
     logging:
@@ -203,6 +203,10 @@ services:
       - AAWM_OPENAI_FAULT_PLAN_ENABLED=${AAWM_OPENAI_FAULT_PLAN_ENABLED:-0}
       - AAWM_CFG004_ACCEPTANCE_ENABLED=${AAWM_CFG004_ACCEPTANCE_ENABLED:-0}
       - AAWM_CFG004_ACCEPTANCE_RUN_ID=${AAWM_CFG004_ACCEPTANCE_RUN_ID:-}
+      # MUSE-008: enable the Muse code facade on alpha only. Model aliases,
+      # credentials, timeouts, and body limits remain deferred.
+      - AAWM_MUSE_CODE_FACADE_ENABLED=1
+      - AAWM_MUSE_CODE_MODEL_IDS=muse-spark-1.3-contributor,muse-spark-1.3,muse-spark-1.2-contributor,muse-spark-1.2
     healthcheck:
       test:
         - CMD

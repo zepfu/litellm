@@ -1,0 +1,348 @@
+# Alpha-only LiteLLM config for litellm-alpha (:4011).
+# Do not load this file from litellm-dev (:4001) or production (:4000).
+model_list:
+  - model_name: "claude-sonnet-4-6"
+    litellm_params:
+      model: "anthropic/claude-sonnet-4-6"
+  - model_name: "qwen3-heretic-gguf"
+    litellm_params:
+      model: "openai/qwen3-4b-heretic-q8"
+      api_base: "http://172.20.0.1:8093/v1"
+      api_key: "fake-api-key"
+    model_info:
+      mode: chat
+      base_model: "qwen3-4b-heretic-q8"
+      input_cost_per_token: 0.0
+      output_cost_per_token: 0.0
+  - model_name: "ministral3-3b-adjudicator-q4-k-m"
+    litellm_params:
+      model: "openai/ministral3-3b-adjudicator-q4-k-m"
+      api_base: "http://172.20.0.1:8096/v1"
+      api_key: "fake-api-key"
+    model_info:
+      mode: chat
+      base_model: "mistralai/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf"
+      input_cost_per_token: 0.0
+      output_cost_per_token: 0.0
+  - model_name: "tei-medcpt-article"
+    litellm_params:
+      model: "local_embed/ncbi/MedCPT-Article-Encoder"
+      api_base: "http://os.environ/AAWM_TAP_MODEL_HOST:8083/v1"
+      api_key: "fake-api-key"
+    model_info:
+      mode: embedding
+      base_model: "ncbi/MedCPT-Article-Encoder"
+      input_cost_per_token: 4.6e-09
+      output_cost_per_token: 0.0
+  - model_name: "tei-medcpt-query"
+    litellm_params:
+      model: "local_embed/ncbi/MedCPT-Query-Encoder"
+      api_base: "http://os.environ/AAWM_TAP_MODEL_HOST:8084/v1"
+      api_key: "fake-api-key"
+    model_info:
+      mode: embedding
+      base_model: "ncbi/MedCPT-Query-Encoder"
+      input_cost_per_token: 2.8e-09
+      output_cost_per_token: 0.0
+  - model_name: "specter2-adapter"
+    litellm_params:
+      model: "local_embed/allenai/specter2_base"
+      api_base: "http://os.environ/AAWM_TAP_MODEL_HOST:8086/v1"
+      api_key: "fake-api-key"
+    model_info:
+      mode: embedding
+      base_model: "allenai/specter2_base"
+      input_cost_per_token: 4.6e-09
+      output_cost_per_token: 0.0
+  - model_name: "tei-indus"
+    litellm_params:
+      model: "local_embed/nasa-impact/nasa-ibm-st.38m"
+      api_base: "http://os.environ/AAWM_TAP_MODEL_HOST:8087/v1"
+      api_key: "fake-api-key"
+    model_info:
+      mode: embedding
+      base_model: "nasa-impact/nasa-ibm-st.38m"
+      input_cost_per_token: 5.6e-09
+      output_cost_per_token: 0.0
+  - model_name: "tei-indus-v2"
+    litellm_params:
+      model: "local_embed/nasa-impact/nasa-smd-ibm-st-v2"
+      api_base: "http://os.environ/AAWM_TAP_MODEL_HOST:8091/v1"
+      api_key: "fake-api-key"
+    model_info:
+      mode: embedding
+      base_model: "nasa-impact/nasa-smd-ibm-st-v2"
+      input_cost_per_token: 5.6e-09
+      output_cost_per_token: 0.0
+  - model_name: "tei-sapbert"
+    litellm_params:
+      model: "local_embed/cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
+      api_base: "http://os.environ/AAWM_TAP_MODEL_HOST:8088/v1"
+      api_key: "fake-api-key"
+    model_info:
+      mode: embedding
+      base_model: "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
+      input_cost_per_token: 4.6e-09
+      output_cost_per_token: 0.0
+  - model_name: "tei-sapbert-source"
+    litellm_params:
+      model: "local_embed/cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
+      api_base: "http://os.environ/AAWM_TAP_MODEL_HOST:8092/v1"
+      api_key: "fake-api-key"
+    model_info:
+      mode: embedding
+      base_model: "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
+      input_cost_per_token: 4.6e-09
+      output_cost_per_token: 0.0
+  - model_name: "nomic-embed-code"
+    litellm_params:
+      model: "local_embed/nomic-embed-code.Q8_0.gguf"
+      api_base: "http://172.20.0.1:8082/v1"
+      api_key: "fake-api-key"
+    model_info:
+      mode: embedding
+      base_model: "nomic-embed-code.Q8_0.gguf"
+      input_cost_per_token: 1.5e-07
+      output_cost_per_token: 0.0
+  - model_name: "tei-reranker"
+    litellm_params:
+      model: "local_rerank/BAAI/bge-reranker-v2-m3"
+      api_base: "http://os.environ/AAWM_TAP_MODEL_HOST:8090"
+      api_key: "fake-api-key"
+    model_info:
+      mode: rerank
+      base_model: "BAAI/bge-reranker-v2-m3"
+      input_cost_per_query: 0.0
+      input_cost_per_token: 2.5e-08
+      output_cost_per_token: 0.0
+  - model_name: "openrouter/qwen/qwen3.5-flash-02-23"
+    litellm_params:
+      model: "openrouter/qwen/qwen3.5-flash-02-23"
+      api_base: "https://openrouter.ai/api/v1"
+    model_info:
+      mode: chat
+  - model_name: "openrouter/qwen/qwen3.6-flash"
+    litellm_params:
+      model: "openrouter/qwen/qwen3.6-flash"
+      api_base: "https://openrouter.ai/api/v1"
+    model_info:
+      mode: chat
+  - model_name: "deepseek/deepseek-v4-flash:free"
+    litellm_params:
+      model: "openrouter/deepseek/deepseek-v4-flash:free"
+      api_base: "https://openrouter.ai/api/v1"
+      api_key: "os.environ/AAWM_OPENROUTER_API_KEY"
+    model_info:
+      mode: chat
+  - model_name: "openrouter/inclusionai/ling-2.6-flash"
+    litellm_params:
+      model: "openrouter/inclusionai/ling-2.6-flash"
+      api_base: "https://openrouter.ai/api/v1"
+      api_key: "os.environ/AAWM_OPENROUTER_API_KEY"
+    model_info:
+      mode: chat
+  - model_name: "openrouter/*"
+    litellm_params:
+      model: "openrouter/*"
+      api_base: "https://openrouter.ai/api/v1"
+      api_key: "os.environ/AAWM_OPENROUTER_API_KEY"
+    model_info:
+      mode: chat
+      health_check_model: "openrouter/owl-alpha"
+  - model_name: "openrouter/baai/bge-base-en-v1.5"
+    litellm_params:
+      model: "openrouter/baai/bge-base-en-v1.5"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/baai/bge-large-en-v1.5"
+    litellm_params:
+      model: "openrouter/baai/bge-large-en-v1.5"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/baai/bge-m3"
+    litellm_params:
+      model: "openrouter/baai/bge-m3"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/cohere/rerank-4-fast"
+    litellm_params:
+      model: "openrouter/cohere/rerank-4-fast"
+    model_info:
+      mode: rerank
+  - model_name: "openrouter/cohere/rerank-4-pro"
+    litellm_params:
+      model: "openrouter/cohere/rerank-4-pro"
+    model_info:
+      mode: rerank
+  - model_name: "openrouter/cohere/rerank-v3.5"
+    litellm_params:
+      model: "openrouter/cohere/rerank-v3.5"
+    model_info:
+      mode: rerank
+  - model_name: "openrouter/google/gemini-embedding-001"
+    litellm_params:
+      model: "openrouter/google/gemini-embedding-001"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/google/gemini-embedding-2-preview"
+    litellm_params:
+      model: "openrouter/google/gemini-embedding-2-preview"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/intfloat/e5-base-v2"
+    litellm_params:
+      model: "openrouter/intfloat/e5-base-v2"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/intfloat/e5-large-v2"
+    litellm_params:
+      model: "openrouter/intfloat/e5-large-v2"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/intfloat/multilingual-e5-large"
+    litellm_params:
+      model: "openrouter/intfloat/multilingual-e5-large"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/mistralai/codestral-embed-2505"
+    litellm_params:
+      model: "openrouter/mistralai/codestral-embed-2505"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/mistralai/mistral-embed-2312"
+    litellm_params:
+      model: "openrouter/mistralai/mistral-embed-2312"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/nvidia/llama-nemotron-embed-vl-1b-v2:free"
+    litellm_params:
+      model: "openrouter/nvidia/llama-nemotron-embed-vl-1b-v2:free"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/openai/text-embedding-3-large"
+    litellm_params:
+      model: "openrouter/openai/text-embedding-3-large"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/openai/text-embedding-3-small"
+    litellm_params:
+      model: "openrouter/openai/text-embedding-3-small"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/openai/text-embedding-ada-002"
+    litellm_params:
+      model: "openrouter/openai/text-embedding-ada-002"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/perplexity/pplx-embed-v1-0.6b"
+    litellm_params:
+      model: "openrouter/perplexity/pplx-embed-v1-0.6b"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/perplexity/pplx-embed-v1-4b"
+    litellm_params:
+      model: "openrouter/perplexity/pplx-embed-v1-4b"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/qwen/qwen3-embedding-4b"
+    litellm_params:
+      model: "openrouter/qwen/qwen3-embedding-4b"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/qwen/qwen3-embedding-8b"
+    litellm_params:
+      model: "openrouter/qwen/qwen3-embedding-8b"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/sentence-transformers/all-minilm-l12-v2"
+    litellm_params:
+      model: "openrouter/sentence-transformers/all-minilm-l12-v2"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/sentence-transformers/all-minilm-l6-v2"
+    litellm_params:
+      model: "openrouter/sentence-transformers/all-minilm-l6-v2"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/sentence-transformers/all-mpnet-base-v2"
+    litellm_params:
+      model: "openrouter/sentence-transformers/all-mpnet-base-v2"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/sentence-transformers/multi-qa-mpnet-base-dot-v1"
+    litellm_params:
+      model: "openrouter/sentence-transformers/multi-qa-mpnet-base-dot-v1"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/sentence-transformers/paraphrase-minilm-l6-v2"
+    litellm_params:
+      model: "openrouter/sentence-transformers/paraphrase-minilm-l6-v2"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/thenlper/gte-base"
+    litellm_params:
+      model: "openrouter/thenlper/gte-base"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/thenlper/gte-large"
+    litellm_params:
+      model: "openrouter/thenlper/gte-large"
+    model_info:
+      mode: embedding
+  - model_name: "nvidia_nim/nvidia/nv-embed-v1"
+    litellm_params:
+      model: "nvidia_nim/nvidia/nv-embed-v1"
+      api_key: "os.environ/NVIDIA_NIM_API_KEY"
+    model_info:
+      mode: embedding
+  - model_name: "nvidia_nim/nvidia/nv-embedcode-7b-v1"
+    litellm_params:
+      model: "nvidia_nim/nvidia/nv-embedcode-7b-v1"
+      api_key: "os.environ/NVIDIA_NIM_API_KEY"
+    model_info:
+      mode: embedding
+  - model_name: "nvidia_nim/nvidia/rerank-qa-mistral-4b"
+    litellm_params:
+      model: "nvidia_nim/nvidia/rerank-qa-mistral-4b"
+      api_key: "os.environ/NVIDIA_NIM_API_KEY"
+    model_info:
+      mode: rerank
+litellm_settings:
+  drop_params: true
+  success_callback: ["litellm.integrations.aawm_agent_identity.aawm_agent_identity_instance", "langfuse", "litellm.integrations.aawm_payload_capture.aawm_payload_capture_instance"]
+  failure_callback: ["litellm.integrations.aawm_agent_identity.aawm_agent_identity_instance"]
+  model_group_settings:
+    forward_client_headers_to_llm_api:
+      - "claude-sonnet-4-6"
+router_settings:
+  num_retries: 2
+  retry_after: 10
+  allowed_fails: 3
+  cooldown_time: 60
+general_settings:
+  aawm_route_use_x_forwarded_for: true
+  aawm_route_trusted_proxy_ranges:
+    - "172.18.0.1/32"
+  pass_through_endpoints:
+    - path: "/aawm/local/scispacy"
+      target: "http://172.20.0.1:8094"
+      include_subpath: true
+      methods: ["GET", "POST"]
+      headers:
+        content-type: application/json
+        accept: application/json
+      forward_headers: false
+      cost_per_request: 0.0
+    - path: "/aawm/local/tinybern2"
+      target: "http://172.20.0.1:8095"
+      include_subpath: true
+      methods: ["GET", "POST"]
+      headers:
+        content-type: application/json
+        accept: application/json
+      forward_headers: false
+      cost_per_request: 0.0
+
+environment_variables:
+  LITELLM_KIMI_NATIVE_CONTRACT_PATH: "/app/kimi-descriptor/native-contract.json"
+  LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED: "true"

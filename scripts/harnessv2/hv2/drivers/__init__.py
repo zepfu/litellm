@@ -1,4 +1,4 @@
-"""TUI drivers. Ohmypi and Codex are implemented. No Claude module."""
+"""TUI drivers. Ohmypi, Codex, Grok, and Muse are implemented. No Claude module."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from typing import Any, Mapping
 
 from hv2.drivers.codex import CodexDriver
 from hv2.drivers.grok import GrokDriver
+from hv2.drivers.muse import MuseDriver
 from hv2.drivers.ohmypi import OhmypiDriver
 from hv2.drivers.stub import StubDriver
 from hv2.errors import PlanError
@@ -29,4 +30,6 @@ def driver_for(tui: str, config: Mapping[str, Any]):
         return CodexDriver(config)
     if tui == "grok":
         return GrokDriver(config)
+    if tui == "muse":
+        return MuseDriver(config)
     raise PlanError(f"unknown TUI driver {tui!r}")

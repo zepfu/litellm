@@ -330,6 +330,10 @@ from litellm.proxy.guardrails.guardrail_endpoints import router as guardrails_ro
 from litellm.proxy.pass_through_endpoints.kimi_gateway import (
     router as kimi_gateway_router,
 )
+from litellm.proxy.pass_through_endpoints.muse_code_gateway import (
+    is_muse_code_facade_enabled,
+    router as muse_code_gateway_router,
+)
 from litellm.proxy.guardrails.init_guardrails import (
     init_guardrails_v2,
     initialize_guardrails,
@@ -13572,6 +13576,8 @@ app.include_router(evals_router)
 app.include_router(claude_code_marketplace_router)
 app.include_router(google_router)
 app.include_router(kimi_gateway_router)
+if is_muse_code_facade_enabled():
+    app.include_router(muse_code_gateway_router)
 app.include_router(langfuse_router)
 app.include_router(pass_through_router)
 app.include_router(health_router)
