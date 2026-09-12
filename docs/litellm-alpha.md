@@ -239,7 +239,6 @@ musela
 # settings.endpoint_transport.base_url =
 #   http://litellm-dev.tailf1878c.ts.net:4011
 # settings.endpoint_transport.auth = bearer
-# settings.reasoning_effort = low
 ```
 
 Override with `AAWM_MUSE_LITELLM_ALPHA_URL`. The value must be an origin
@@ -247,11 +246,6 @@ only (`http://host:4011`), not `.../v1` and not `.../muse-code`. Muse
 then calls `GET /muse-code/models` and `POST /responses` on that origin.
 Native `muse` (no overlay) stays on Meta's front door. `musel` /
 `muselt` still pass `--base-url` and are not this route.
-
-Muse's implicit default is `reasoning_effort=high`. `musela` pins
-`low` unless `AAWM_MUSE_REASONING_EFFORT` or host
-`~/.config/muse/settings.json` `reasoning_effort` is set. Native Muse
-settings are not rewritten.
 
 Confirm the function in a fresh shell:
 
@@ -315,6 +309,9 @@ Leave that variable unset on `litellm-dev` and production. When unset,
   `/app/.analysis/runtime/litellm-alpha/session_history`
 - Route family for Muse catalog/call attribution: `muse_code` (no
   credentials in tags)
+- Rollup effort is the request `reasoning.effort` (or top-level
+  `reasoning_effort`). Catalog rows stay `:none`. A Muse call that
+  sent `high` renders `muse-spark-1.3-contributor:high`, not `:none`.
 
 ### Rollback / removal
 

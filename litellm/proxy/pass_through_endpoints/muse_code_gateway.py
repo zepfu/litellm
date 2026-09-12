@@ -258,17 +258,33 @@ def _request_requires_streaming_response(request_body: bytes) -> bool:
     return isinstance(body, dict) and body.get("stream") is True
 
 
-def _get_gateway_route_model(request_body: bytes, *, catalog: bool) -> str:
-    if catalog:
-        return "muse_code/catalog"
+def _parse_gateway_json_body(request_body: bytes) -> Optional[dict[str, Any]]:
     try:
         body = json.loads(request_body)
     except (TypeError, ValueError):
-        return "muse_code/unknown"
-    model = body.get("model") if isinstance(body, dict) else None
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _get_gateway_route_model(request_body: bytes, *, catalog: bool) -> str:
+    if catalog:
+        return "muse_code/catalog"
+    body = _parse_gateway_json_body(request_body)
+    model = body.get("model") if body is not None else None
     if not isinstance(model, str) or not model.strip():
         return "muse_code/unknown"
     return " ".join(model.split())
+
+
+def _gateway_reasoning_effort(body: Optional[dict[str, Any]]) -> Optional[object]:
+    if not isinstance(body, dict):
+        return None
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict) and "effort" in reasoning:
+        return reasoning.get("effort")
+    if "reasoning_effort" in body:
+        return body.get("reasoning_effort")
+    return None
 
 
 def _extract_gateway_error_value(payload: object) -> Optional[str]:
@@ -330,7 +346,8 @@ def _build_gateway_route_state(
     request_body: bytes,
     catalog: bool,
     session_id: str,
-) -> tuple[_GatewayRequestPayload, _GatewayRouteKwargs]:
+) -> tuple[_GatewayRequestPayload, _GatewayRouteKwargs, Optional[dict[str, Any]]]:
+    parsed_body = None if catalog else _parse_gateway_json_body(request_body)
     model = _get_gateway_route_model(request_body, catalog=catalog)
     request_payload = _GatewayRequestPayload(model=model)
     metadata: dict[str, object] = {
@@ -342,11 +359,14 @@ def _build_gateway_route_state(
             "muse-code",
         ],
     }
+    native_effort = _gateway_reasoning_effort(parsed_body)
+    if native_effort is not None:
+        metadata["reasoning_effort_native_value"] = native_effort
     if session_id:
         metadata["session_id"] = session_id
         metadata["muse_code_session_id"] = session_id
     kwargs = _GatewayRouteKwargs(litellm_params={"metadata": metadata})
-    return request_payload, kwargs
+    return request_payload, kwargs, parsed_body
 
 
 def _emit_gateway_route_context(
@@ -355,12 +375,14 @@ def _emit_gateway_route_context(
     target: str,
     request_payload: _GatewayRequestPayload,
     kwargs: _GatewayRouteKwargs,
+    provider_bound_body: Optional[dict[str, Any]] = None,
 ) -> None:
     emit_aawm_route_access_log(
         request=request,
         target=target,
         request_body=request_payload,
         kwargs=kwargs,
+        provider_bound_body=provider_bound_body,
         route_type="MUSE",
     )
 
@@ -376,12 +398,14 @@ def _log_gateway_failure(
     failure_kind: str,
     session_id: str = "",
     trace_id: Optional[str] = None,
+    provider_bound_body: Optional[dict[str, Any]] = None,
 ) -> str:
     _emit_gateway_route_context(
         request=request,
         target=target,
         request_payload=request_payload,
         kwargs=kwargs,
+        provider_bound_body=provider_bound_body,
     )
     summary = _sanitize_gateway_error_summary(
         detail,
@@ -431,6 +455,7 @@ async def _stream_response(
     request_payload: _GatewayRequestPayload,
     route_kwargs: _GatewayRouteKwargs,
     session_id: str,
+    provider_bound_body: Optional[dict[str, Any]] = None,
 ) -> AsyncIterator[bytes]:
     try:
         async for chunk in response.aiter_raw():
@@ -445,6 +470,7 @@ async def _stream_response(
             detail="Muse Code gateway upstream response stream failed.",
             failure_kind="gateway_upstream_stream_failed",
             session_id=session_id,
+            provider_bound_body=provider_bound_body,
             trace_id=response.headers.get("x-trace-id")
             or response.headers.get("x-request-id")
             or response.headers.get("x-fb-trace-id"),
@@ -465,7 +491,7 @@ async def _proxy_muse_code_request(
     register_aawm_route_rollup_access_log_replacement(request)
     request_body = await request.body()
     session_id = _muse_code_session_id(request)
-    request_payload, route_kwargs = _build_gateway_route_state(
+    request_payload, route_kwargs, provider_bound_body = _build_gateway_route_state(
         request_body=request_body,
         catalog=catalog,
         session_id=session_id,
@@ -483,6 +509,7 @@ async def _proxy_muse_code_request(
             detail=exc.detail,
             failure_kind="gateway_authentication_rejected",
             session_id=session_id,
+            provider_bound_body=provider_bound_body,
         )
         raise
 
@@ -491,6 +518,7 @@ async def _proxy_muse_code_request(
         target=upstream_url,
         request_payload=request_payload,
         kwargs=route_kwargs,
+        provider_bound_body=provider_bound_body,
     )
     client = httpx.AsyncClient(
         timeout=MUSE_CODE_GATEWAY_TIMEOUT_SECONDS,
@@ -516,6 +544,7 @@ async def _proxy_muse_code_request(
             detail=detail,
             failure_kind="gateway_upstream_request_failed",
             session_id=session_id,
+            provider_bound_body=provider_bound_body,
         )
         raise HTTPException(
             status_code=502,
@@ -538,6 +567,7 @@ async def _proxy_muse_code_request(
                 request_payload=request_payload,
                 route_kwargs=route_kwargs,
                 session_id=session_id,
+                provider_bound_body=provider_bound_body,
             ),
             status_code=upstream_response.status_code,
             headers=response_headers,
@@ -557,6 +587,7 @@ async def _proxy_muse_code_request(
             detail=detail,
             failure_kind="gateway_upstream_response_read_failed",
             session_id=session_id,
+            provider_bound_body=provider_bound_body,
             trace_id=upstream_response.headers.get("x-trace-id")
             or upstream_response.headers.get("x-request-id")
             or upstream_response.headers.get("x-fb-trace-id"),
@@ -576,6 +607,7 @@ async def _proxy_muse_code_request(
             detail=response_body,
             failure_kind="gateway_upstream_non_success",
             session_id=session_id,
+            provider_bound_body=provider_bound_body,
             trace_id=upstream_response.headers.get("x-trace-id")
             or upstream_response.headers.get("x-request-id")
             or upstream_response.headers.get("x-fb-trace-id"),
