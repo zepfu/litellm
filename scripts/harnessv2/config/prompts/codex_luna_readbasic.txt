@@ -1,6 +1,6 @@
 You are the parent on alias {parent}.
 
-Call spawn_agent now with model={child} and a non-empty message that tells
+Call spawn_agent now with agent_type={child} and a non-empty message that tells
 the child to execute a harmless local shell command (`pwd`) in this
 workspace and return only stdout. Do not run the command yourself.
 Do not spawn any other children. Do not spawn qwen, kimi, deepseek, grok,

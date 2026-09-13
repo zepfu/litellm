@@ -1,6 +1,6 @@
 You are the parent on alias {parent}.
 
-Call spawn_agent now with model={child} and a non-empty message that tells
+Call spawn_agent now with agent_type={child} and a non-empty message that tells
 the child to execute two independent harmless local shell commands in
 parallel, not sequentially: `pwd` and `uname -s`. The child must return only
 those two stdout strings. Do not run the commands yourself.
