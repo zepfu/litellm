@@ -379,6 +379,9 @@ def _codex_auto_agent_candidate_public_shape(
         "selection_priority": candidate.get("selection_priority"),
         "last_resort": bool(candidate.get("last_resort")),
     }
+    for field in ("resolved_alias", "cooldown_identity_tag"):
+        if candidate.get(field) is not None:
+            shaped[field] = candidate[field]
     for source_field, public_field in (
         ("codex_oauth_account_label", "account_label"),
         ("codex_oauth_account_hash", "account_hash"),
@@ -712,6 +715,17 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
                 return value
         return ""
 
+    def _identity_value(
+        candidate: Mapping[str, Any],
+        field: str,
+    ) -> tuple[str, Any]:
+        if field not in candidate or candidate[field] is None:
+            return ("missing", None)
+        value = candidate[field]
+        if isinstance(value, str):
+            value = value.strip()
+        return ("present", value)
+
     def _occurrence_discriminator(
         candidate: Mapping[str, Any],
     ) -> tuple[Any, ...]:
@@ -719,14 +733,18 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
 
         Provider/model/route are not sufficient: nested aliases can promote
         the same route at a different priority or across the last-resort
-        boundary. Those fields are stable for compiled candidates and are
-        retained on captured attempt/skip records.
+        boundary. The owning alias and cooldown identity distinguish
+        otherwise identical compiled occurrences. Priority presence is
+        explicit so a configured ``0`` is not collapsed into a missing value.
+        These fields are retained on captured attempt/skip records.
         """
 
         return (
             *_identity(candidate),
-            _first_identity_value(candidate, "selection_priority"),
+            _identity_value(candidate, "selection_priority"),
             bool(candidate.get("last_resort")),
+            _first_identity_value(candidate, "resolved_alias"),
+            _first_identity_value(candidate, "cooldown_identity_tag"),
         )
 
     def _capture_identity(candidate: Mapping[str, Any]) -> tuple[Any, ...]:
