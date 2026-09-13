@@ -6681,15 +6681,27 @@ async def pass_through_request(  # noqa: PLR0915
             return closed
 
         def _authorize_openai_capacity_retry(
-            failure: ResponsesStreamPreCommitFailure,
+            failure: Exception,
             response: Optional[httpx.Response],
         ) -> None:
+            if openai_call_ledger is None or capacity_retry_coordinator is None:
+                return
+            if isinstance(failure, ResponsesStreamPreCommitFailure):
+                failure_error_class = failure.error_class
+                failure_retryable = failure.retryable
+            else:
+                if getattr(failure, "_aawm_provider_returned", False) is not True:
+                    return
+                raw_http_classification = _classify_passthrough_raw_http_error(
+                    failure,
+                    status_code=_extract_exception_status_code(failure),
+                )
+                if raw_http_classification is None:
+                    return
+                failure_error_class, _, failure_retryable = raw_http_classification
             if (
-                openai_call_ledger is None
-                or capacity_retry_coordinator is None
-                or not failure.retryable
-                or failure.error_class
-                not in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
+                not failure_retryable
+                or failure_error_class not in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
             ):
                 return
             response_request = (
@@ -7048,10 +7060,12 @@ async def pass_through_request(  # noqa: PLR0915
                                 ),
                             },
                         )
-                        raise _build_http_exception_from_upstream_status_error(
+                        provider_exception = _build_http_exception_from_upstream_status_error(
                             e,
                             error_content,
-                        ) from e
+                        )
+                        _authorize_openai_capacity_retry(provider_exception, e.response)
+                        raise provider_exception from e
                     if is_xai_responses_wire_owned_route:
                         extensions = getattr(response, "extensions", None)
                         if isinstance(extensions, dict):
@@ -7513,10 +7527,12 @@ async def pass_through_request(  # noqa: PLR0915
                                 ),
                             },
                         )
-                        raise _build_http_exception_from_upstream_status_error(
+                        provider_exception = _build_http_exception_from_upstream_status_error(
                             e,
                             error_content,
-                        ) from e
+                        )
+                        _authorize_openai_capacity_retry(provider_exception, e.response)
+                        raise provider_exception from e
                     if (
                         response.status_code == status.HTTP_200_OK
                         and capacity_retry_coordinator is not None
@@ -7577,10 +7593,12 @@ async def pass_through_request(  # noqa: PLR0915
                             ),
                         },
                     )
-                    raise _build_http_exception_from_upstream_status_error(
+                    provider_exception = _build_http_exception_from_upstream_status_error(
                         e,
                         error_text,
-                    ) from e
+                    )
+                    _authorize_openai_capacity_retry(provider_exception, e.response)
+                    raise provider_exception from e
                 if (
                     response.status_code == status.HTTP_200_OK
                     and capacity_retry_coordinator is not None
