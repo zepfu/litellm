@@ -901,6 +901,7 @@ def install(host_globals: dict) -> None:
             "resolve_schema_rejection_failure_identity",
             resolve_schema_rejection_failure_identity,
         ),
+        ("_auto_agent_alias_skip_identity", _auto_agent_alias_skip_identity),
         ("SCHEMA_REJECTION_FAILURE_CLASS", SCHEMA_REJECTION_FAILURE_CLASS),
         ("SCHEMA_REJECTION_ERROR_CODE", SCHEMA_REJECTION_ERROR_CODE),
     ):
