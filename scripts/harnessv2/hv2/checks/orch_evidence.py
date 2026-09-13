@@ -483,7 +483,8 @@ def child_spawn_evidence(
         session_paths.append(str(path))
         file_agent: str | None = None
         file_completed = False
-        for obj in _iter_jsonl_objects(path):
+        bounded_read = _iter_jsonl_objects(path)
+        for obj in bounded_read:
             payload = _message_payload(obj)
             tool_name = str(payload.get("toolName") or obj.get("toolName") or "")
             text = _content_text(payload)
@@ -522,6 +523,10 @@ def child_spawn_evidence(
                 and payload.get("isError") is not True
             ):
                 file_completed = True
+        if bounded_read.truncated:
+            failures.append(
+                f"Ohmypi transcript exceeded bounded evidence read: {path.name}"
+            )
         if root is not None and path.parent != root:
             nested_route = _nested_child_route_row(path, wanted)
             if nested_route:
