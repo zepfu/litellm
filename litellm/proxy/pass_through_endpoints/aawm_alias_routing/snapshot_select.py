@@ -258,6 +258,8 @@ def _commit_round_robin_selection(
     """
     if token is None:
         return
+    if bool(selected_candidate.get("last_resort")):
+        return
     identity = (selected_candidate.get("provider"), selected_candidate.get("model"))
     try:
         index = token.tied_candidate_ids.index(identity)
@@ -664,12 +666,17 @@ def _derive_round_robin_commit_token(
             now_utc=now_utc,
             request=request,
         )
-    if len(resolved_candidates) < 2:
-        return None
-    top_priority = resolved_candidates[0].get("selection_priority", 0)
-    tied = [
+    non_last_resort_candidates = [
         candidate
         for candidate in resolved_candidates
+        if not bool(candidate.get("last_resort"))
+    ]
+    if len(non_last_resort_candidates) < 2:
+        return None
+    top_priority = non_last_resort_candidates[0].get("selection_priority", 0)
+    tied = [
+        candidate
+        for candidate in non_last_resort_candidates
         if candidate.get("selection_priority", 0) == top_priority
     ]
     if len(tied) < 2:
