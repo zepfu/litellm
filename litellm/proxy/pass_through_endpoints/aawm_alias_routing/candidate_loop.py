@@ -2006,6 +2006,13 @@ async def handle_alias_route(  # noqa: PLR0915
                 # carry attempted_provider_call=True and remain terminal.
                 cooling_candidates = selection_detail.get("candidates")
                 if isinstance(cooling_candidates, list):
+                    terminal_skip_reasons = {
+                        "auth_degraded",
+                        "auth_unavailable",
+                        "quota_exhausted",
+                        "token_invalidated",
+                        "candidate_ineligible",
+                    }
                     provider_candidate = next(
                         (
                             candidate
@@ -2013,7 +2020,11 @@ async def handle_alias_route(  # noqa: PLR0915
                             if isinstance(candidate, dict)
                             and str(candidate.get("provider") or "").strip().lower()
                             == "openai"
-                            and bool(candidate.get("attempted_provider_call"))
+                            and float(candidate.get("cooldown_seconds") or 0.0) > 0
+                            and str(candidate.get("skip_reason") or "")
+                            .strip()
+                            .lower()
+                            not in terminal_skip_reasons
                         ),
                         None,
                     )
