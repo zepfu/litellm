@@ -36,6 +36,7 @@ from .schema_rejections import (
     normalize_schema_rejection,
     resolve_schema_rejection_failure_identity,
 )
+from .skip_identity import _auto_agent_alias_skip_identity
 
 _AAWM_ALIAS_REQUEST_CALL_ID_STATE_KEY = "aawm_alias_request_litellm_call_id"
 _AAWM_ALIAS_REQUEST_OUTCOME_STATE_KEY = "aawm_alias_request_outcome"
@@ -674,6 +675,56 @@ def _update_codex_auto_agent_retryable_attempt_record(  # noqa: PLR0915
 # ---------------------------------------------------------------------------
 # Attempt-start / failure records
 # ---------------------------------------------------------------------------
+
+
+def _is_auto_agent_alias_skipped_audit_event(event: Mapping[str, Any]) -> bool:
+    event_type = str(event.get("event_type") or "")
+    return (
+        event_type in _AAWM_ALIAS_SKIPPED_EVENT_TYPES
+        or event.get("skipped") is True
+    )
+
+
+def _auto_agent_alias_skipped_event_key(
+    event: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return a stable, occurrence-aware request-local identity."""
+    return _auto_agent_alias_skip_identity(event)
+
+
+def _emit_auto_agent_alias_skipped_events_once(
+    *,
+    request: Request,
+    audit_events: list[dict[str, Any]],
+) -> set[tuple[str, ...]]:
+    """Publish each skipped decision once for this request."""
+    request_state = getattr(request, "state", None)
+    if request_state is None:
+        return set()
+    emitted_keys = getattr(
+        request_state,
+        _AAWM_ALIAS_SKIPPED_EVENT_KEYS_STATE_KEY,
+        None,
+    )
+    if not isinstance(emitted_keys, set):
+        emitted_keys = set()
+        setattr(
+            request_state,
+            _AAWM_ALIAS_SKIPPED_EVENT_KEYS_STATE_KEY,
+            emitted_keys,
+        )
+
+    newly_emitted_keys: set[tuple[str, ...]] = set()
+    for event in audit_events:
+        if not _is_auto_agent_alias_skipped_audit_event(event):
+            continue
+        event_key = _auto_agent_alias_skipped_event_key(event)
+        if event_key in emitted_keys:
+            continue
+        emitted_keys.add(event_key)
+        newly_emitted_keys.add(event_key)
+        _emit_auto_agent_alias_route_event(event)
+    return newly_emitted_keys
 
 
 def _record_auto_agent_alias_attempt_started(

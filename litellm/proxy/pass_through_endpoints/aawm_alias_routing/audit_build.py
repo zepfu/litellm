@@ -34,6 +34,7 @@ from .schema_rejections import (
     normalize_schema_rejection,
     resolve_schema_rejection_failure_identity,
 )
+from .skip_identity import _auto_agent_alias_skip_identity
 
 # ---------------------------------------------------------------------------
 # Injected runtime seams (god-module / audit_context.py)
@@ -461,14 +462,28 @@ def _build_auto_agent_alias_audit_events(  # noqa: PLR0915
 ) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
 
-    def _identity(candidate: Mapping[str, Any]) -> tuple[str, str, str]:
-        return tuple(
-            str(candidate.get(field) or "")
-            for field in ("provider", "model", "route_family")
+    def _skip_identity(
+        candidate: Mapping[str, Any],
+        *,
+        skip_reason: Optional[str] = None,
+    ) -> tuple[str, ...]:
+        return _auto_agent_alias_skip_identity(
+            candidate,
+            alias_family=alias_family,
+            alias_model=alias_model,
+            skip_reason=skip_reason,
+            cooldown_scope=candidate.get("cooldown_scope"),
         )
 
     terminal_skipped_attempt_identities = {
-        _identity(attempt)
+        _skip_identity(
+            attempt,
+            skip_reason=(
+                attempt.get("skip_reason")
+                or attempt.get("reason")
+                or "unavailable"
+            ),
+        )
         for attempt in attempts
         if isinstance(attempt, dict)
         and attempt.get("terminal_disposition") == "skipped"
@@ -478,9 +493,12 @@ def _build_auto_agent_alias_audit_events(  # noqa: PLR0915
         for skipped_candidate in skipped_candidates:
             if not isinstance(skipped_candidate, dict):
                 continue
-            if _identity(skipped_candidate) in terminal_skipped_attempt_identities:
-                continue
             reason = str(skipped_candidate.get("reason") or "cooldown")
+            if _skip_identity(
+                skipped_candidate,
+                skip_reason=reason,
+            ) in terminal_skipped_attempt_identities:
+                continue
             event_type = (
                 "candidate_skipped_provider_degraded" if reason == "auth_degraded" else "candidate_skipped_cooldown"
             )
