@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import heapq
 import json
 import re
 from pathlib import Path
@@ -61,6 +62,7 @@ def _session_jsonl_paths(session_dir: Path, *, since_mtime: float | None) -> lis
     if not session_dir.is_dir():
         return []
     rows: list[Path] = []
+    mtimes: dict[Path, float] = {}
     for path in (*session_dir.glob("*.jsonl"), *session_dir.glob("*/*.jsonl")):
         try:
             mtime = path.stat().st_mtime
@@ -69,12 +71,9 @@ def _session_jsonl_paths(session_dir: Path, *, since_mtime: float | None) -> lis
         if since_mtime is not None and mtime < (since_mtime - 2):
             continue
         rows.append(path)
-    rows.sort(
-        key=lambda item: (
-            -item.stat().st_mtime,
-            str(item),
-        )
-    )
+        mtimes[path] = mtime
+    # Capture mtimes before sorting so disappearing files cannot raise here.
+    rows.sort(key=lambda item: (mtimes[item], str(item)), reverse=True)
     return rows[:_JSONL_SCAN_CAP]
 
 
@@ -1003,6 +1002,7 @@ def _muse_session_jsonl_paths(
     if root is None or not root.is_dir():
         return []
     rows: list[Path] = []
+    mtimes: dict[Path, float] = {}
     for path in root.rglob("session.jsonl"):
         try:
             mtime = path.stat().st_mtime
@@ -1011,9 +1011,9 @@ def _muse_session_jsonl_paths(
         if since_mtime is not None and mtime < (since_mtime - 2):
             continue
         rows.append(path)
-    return sorted(rows, key=lambda item: item.stat().st_mtime, reverse=True)[
-        :_JSONL_SCAN_CAP
-    ]
+        mtimes[path] = mtime
+    rows.sort(key=lambda item: (mtimes[item], str(item)), reverse=True)
+    return rows[:_JSONL_SCAN_CAP]
 
 
 def _muse_event_kind(obj: Mapping[str, Any]) -> str:
@@ -1155,7 +1155,7 @@ def _codex_jsonl_paths(
     root = Path(session_dir) if session_dir else None
     if root is None or not root.is_dir():
         return []
-    rows: list[Path] = []
+    rows: list[tuple[float, str, Path]] = []
     for path in root.rglob("*.jsonl"):
         try:
             mtime = path.stat().st_mtime
@@ -1163,8 +1163,13 @@ def _codex_jsonl_paths(
             continue
         if since_mtime is not None and mtime < (since_mtime - 2):
             continue
-        rows.append(path)
-    return sorted(rows, key=lambda item: item.stat().st_mtime, reverse=True)
+        rows.append((mtime, str(path), path))
+    newest = heapq.nlargest(
+        _JSONL_SCAN_CAP,
+        rows,
+        key=lambda item: (item[0], item[1]),
+    )
+    return [item[2] for item in newest]
 
 
 def _codex_session_meta(path: Path) -> dict[str, Any]:
