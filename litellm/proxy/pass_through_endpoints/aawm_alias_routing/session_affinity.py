@@ -3772,19 +3772,19 @@ async def finalize_request_session_owner_lease(
     active = lease if lease is not None else get_request_session_owner_lease(request)
     if active is None:
         record_session_owner_continuity_receipt(
-            request, phase="owner_finalize", source="success", outcome="no_session"
+            request, phase="owner_finalize", source="request_lease", outcome="no_session"
         )
         return None
     if not active.held_reservation:
         record_session_owner_continuity_receipt(
-            request, phase="owner_finalize", source="success",
+            request, phase="owner_finalize", source="request_lease",
             session_identity=active.session_identity, cache_key=active.cache_key,
             outcome="not_held",
         )
         return None
     if active.promoted or active.released:
         record_session_owner_continuity_receipt(
-            request, phase="owner_finalize", source="success",
+            request, phase="owner_finalize", source="request_lease",
             session_identity=active.session_identity, cache_key=active.cache_key,
             outcome=(
                 "already_owned"
