@@ -377,8 +377,9 @@ def _codex_auto_agent_candidate_public_shape(
         "model": candidate["model"],
         "route_family": candidate["route_family"],
         "selection_priority": candidate.get("selection_priority"),
-        "last_resort": bool(candidate.get("last_resort")),
     }
+    if "last_resort" in candidate:
+        shaped["last_resort"] = candidate["last_resort"]
     for field in ("resolved_alias", "cooldown_identity_tag"):
         if candidate.get(field) is not None:
             shaped[field] = candidate[field]
@@ -778,7 +779,7 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
         return (
             *_identity(candidate),
             _identity_value(candidate, "selection_priority"),
-            bool(candidate.get("last_resort")),
+            _identity_value(candidate, "last_resort"),
             _first_identity_value(candidate, "resolved_alias"),
             _first_identity_value(candidate, "cooldown_identity_tag"),
         )
@@ -940,6 +941,10 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
         attempt: Mapping[str, Any],
     ) -> dict[str, Any]:
         shaped = _codex_auto_agent_candidate_public_shape(dict(attempt))
+        if "last_resort" in attempt:
+            shaped["last_resort"] = attempt["last_resort"]
+        else:
+            shaped.pop("last_resort", None)
         if attempt.get("reasoning_effort") is not None:
             shaped["reasoning_effort"] = attempt["reasoning_effort"]
         for field in skip_metadata_fields:

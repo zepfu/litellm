@@ -706,6 +706,7 @@ def _emit_auto_agent_alias_skipped_events_once(
     *,
     request: Request,
     audit_events: list[dict[str, Any]],
+    level: Optional[str] = None,
 ) -> set[tuple[Any, ...]]:
     """Publish each skipped decision once for this request."""
     request_state = getattr(request, "state", None)
@@ -734,7 +735,10 @@ def _emit_auto_agent_alias_skipped_events_once(
         emitted_keys.add(event_key)
         newly_emitted_keys.add(event_key)
         _stamp_auto_agent_alias_request_identity(request=request, target=event)
-        _emit_auto_agent_alias_route_event(event)
+        if level is None:
+            _emit_auto_agent_alias_route_event(event)
+        else:
+            _emit_auto_agent_alias_route_event(event, level=level)
     return newly_emitted_keys
 
 
@@ -939,6 +943,17 @@ def _record_auto_agent_alias_attempt_failure(
     _stamp_auto_agent_alias_request_identity(request=request, target=audit_event)
     if defer_terminal_error:
         audit_event["_aawm_terminal_error_already_emitted"] = True
+    if _is_auto_agent_alias_skipped_audit_event(audit_event):
+        _emit_auto_agent_alias_skipped_events_once(
+            request=request,
+            audit_events=[audit_event],
+            level="warning",
+        )
+    else:
+        _emit_auto_agent_alias_route_event(
+            audit_event,
+            level="warning",
+        )
     if (
         audit_events
         and (
@@ -950,10 +965,6 @@ def _record_auto_agent_alias_attempt_failure(
             request=request,
             audit_events=audit_events,
         )
-    _emit_auto_agent_alias_route_event(
-        audit_event,
-        level="warning",
-    )
     # Only terminal redispatch outcomes use audit-only persistence. Mid-loop
     # retryable 429s that continue failover still reach a normal success or
     # no-candidate write path and must not double-write audit rows.
