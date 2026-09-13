@@ -561,6 +561,41 @@ def get_session_owner_continuity_receipt(request: Any) -> Optional[Payload]:
         events = receipt.get("events")
         identity = snapshot_event(receipt.get("identity"))
         intake = receipt.get("intake")
+        intake_specs = {
+            "body": _CONTINUITY_IDENTITY_KEYS,
+            "client_metadata": _CONTINUITY_IDENTITY_KEYS,
+            "litellm_metadata": _CONTINUITY_IDENTITY_KEYS,
+            "headers": (
+                "thread_id", "x_thread_id", "x_aawm_thread_id",
+                "x_codex_thread_id", "x_claude_thread_id", "session_id",
+                "x_session_id", "x_aawm_session_id", "x_codex_session_id",
+                "x_claude_session_id", "anthropic_beta_session_id",
+            ),
+        }
+        intake_snapshot: Optional[Payload] = None
+        if isinstance(intake, Mapping):
+            intake_snapshot = {}
+            for key, expected_fields in intake_specs.items():
+                raw_values = intake.get(key)
+                if (
+                    not isinstance(raw_values, list)
+                    or len(raw_values) != len(expected_fields)
+                ):
+                    continue
+                accepted: list[str] = []
+                for expected_field, raw_value in zip(expected_fields, raw_values):
+                    if not isinstance(raw_value, str):
+                        break
+                    field, separator, state_value = raw_value.partition(":")
+                    if (
+                        not separator
+                        or field != expected_field
+                        or state_value not in {"string", "missing", "invalid"}
+                    ):
+                        break
+                    accepted.append(raw_value)
+                if len(accepted) == len(expected_fields):
+                    intake_snapshot[key] = list(accepted)
         return {
             "latest": snapshot_event(receipt.get("latest")),
             "events": [snapshot_event(event) for event in events[-16:]]
@@ -568,19 +603,7 @@ def get_session_owner_continuity_receipt(request: Any) -> Optional[Payload]:
             "sequence": max(0, int(receipt.get("sequence") or 0)),
             "dropped_events": max(0, int(receipt.get("dropped_events") or 0)),
             "identity": identity or None,
-            "intake": {
-                key: value for key, value in intake.items()
-                if key in {"body", "client_metadata", "litellm_metadata", "headers"}
-                and isinstance(value, list)
-                and all(
-                    isinstance(item, str)
-                    and re.fullmatch(
-                        r"(?:x_)?(?:aawm_|codex_|claude_|anthropic_|anthropic_beta_)?"
-                        r"(?:thread_id|session_id):(string|missing|invalid)", item
-                    )
-                    for item in value
-                )
-            } if isinstance(intake, Mapping) else None,
+            "intake": intake_snapshot,
         }
     except Exception:  # noqa: BLE001
         return None
@@ -3561,14 +3584,26 @@ async def finalize_session_owner_lease_on_success(
     attributes: Optional[Mapping[str, Any]] = None,
     candidate: Optional[Mapping[str, Any]] = None,
 ) -> Optional[SessionOwnerMutationResult]:
-    if lease is None or not lease.held_reservation or lease.promoted or lease.released:
+    if lease is None:
+        record_session_owner_continuity_receipt(
+            request, phase="owner_finalize", source="success", outcome="no_session"
+        )
+        return None
+    if not lease.held_reservation:
+        record_session_owner_continuity_receipt(
+            request, phase="owner_finalize", source="success",
+            session_identity=lease.session_identity, cache_key=lease.cache_key,
+            outcome="not_held",
+        )
+        return None
+    if lease.promoted or lease.released:
         record_session_owner_continuity_receipt(
             request,
             phase="owner_finalize",
             source="success",
-            session_identity=getattr(lease, "session_identity", None),
-            cache_key=getattr(lease, "cache_key", None),
-            outcome="skipped",
+            session_identity=lease.session_identity,
+            cache_key=lease.cache_key,
+            outcome="already_owned",
         )
         return None
     if lease.wire_terminal_pending:
@@ -3602,6 +3637,7 @@ async def finalize_session_owner_lease_on_success(
         session_identity=lease.session_identity,
         cache_key=lease.cache_key,
         outcome=result.outcome.value,
+        reason_code="mutation_failed" if result.error else None,
     )
     return result
 
@@ -3611,14 +3647,26 @@ async def finalize_session_owner_lease_on_failure(
     *,
     request: Any = None,
 ) -> Optional[SessionOwnerMutationResult]:
-    if lease is None or not lease.held_reservation or lease.promoted or lease.released:
+    if lease is None:
+        record_session_owner_continuity_receipt(
+            request, phase="owner_finalize", source="failure", outcome="no_session"
+        )
+        return None
+    if not lease.held_reservation:
+        record_session_owner_continuity_receipt(
+            request, phase="owner_finalize", source="failure",
+            session_identity=lease.session_identity, cache_key=lease.cache_key,
+            outcome="not_held",
+        )
+        return None
+    if lease.promoted or lease.released:
         record_session_owner_continuity_receipt(
             request,
             phase="owner_finalize",
             source="failure",
-            session_identity=getattr(lease, "session_identity", None),
-            cache_key=getattr(lease, "cache_key", None),
-            outcome="skipped",
+            session_identity=lease.session_identity,
+            cache_key=lease.cache_key,
+            outcome="already_owned",
         )
         return None
     if lease.wire_terminal_pending and lease.wire_disposition is None:
@@ -3643,6 +3691,7 @@ async def finalize_session_owner_lease_on_failure(
         session_identity=lease.session_identity,
         cache_key=lease.cache_key,
         outcome=result.outcome.value,
+        reason_code="mutation_failed" if result.error else None,
     )
     return result
 
@@ -3714,17 +3763,6 @@ async def finalize_request_session_owner_lease(
         return None
     if exc is not None:
         result = await finalize_session_owner_lease_on_failure(active, request=request)
-        record_session_owner_continuity_receipt(
-            request,
-            phase="owner_finalize",
-            source="failure",
-            session_identity=active.session_identity,
-            cache_key=active.cache_key,
-            outcome=result.outcome.value if result is not None else "skipped",
-            reason_code="mutation_failed"
-            if result is not None and result.error
-            else None,
-        )
         return result
 
     status = getattr(response, "status_code", None)
@@ -3733,17 +3771,6 @@ async def finalize_request_session_owner_lease(
     )
     if not ok:
         result = await finalize_session_owner_lease_on_failure(active, request=request)
-        record_session_owner_continuity_receipt(
-            request,
-            phase="owner_finalize",
-            source="non_success_response",
-            session_identity=active.session_identity,
-            cache_key=active.cache_key,
-            outcome=result.outcome.value if result is not None else "skipped",
-            reason_code="mutation_failed"
-            if result is not None and result.error
-            else None,
-        )
         return result
 
     result = await finalize_session_owner_lease_on_success(
@@ -3751,17 +3778,6 @@ async def finalize_request_session_owner_lease(
         request=request,
         attributes=attributes or active.attributes,
         candidate=candidate,
-    )
-    record_session_owner_continuity_receipt(
-        request,
-        phase="owner_finalize",
-        source="success",
-        session_identity=active.session_identity,
-        cache_key=active.cache_key,
-        outcome=result.outcome.value if result is not None else "skipped",
-        reason_code="mutation_failed"
-        if result is not None and result.error
-        else None,
     )
     if (
         raise_on_promote_failure
@@ -3910,7 +3926,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
     ]:
         """Release a failed deferred lease without losing the failure callback."""
         cleanup_task = asyncio.ensure_future(
-            finalize_session_owner_lease_on_failure(lease)
+            finalize_session_owner_lease_on_failure(lease, request=request)
         )
         release_result: Optional[SessionOwnerMutationResult] = None
         cleanup_error: Optional[BaseException] = None
@@ -3935,7 +3951,9 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
         cause: Optional[BaseException],
     ) -> None:
         if not success:
-            release_result = await finalize_session_owner_lease_on_failure(lease)
+            release_result = await finalize_session_owner_lease_on_failure(
+                lease, request=request
+            )
             await _notify_failure(cause)
             if (
                 cause is None
@@ -3950,7 +3968,9 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
 
         renewal_error = _renewal_error()
         if renewal_error is not None:
-            release_result = await finalize_session_owner_lease_on_failure(lease)
+            release_result = await finalize_session_owner_lease_on_failure(
+                lease, request=request
+            )
             await _notify_failure(renewal_error)
             _raise_structured_failure(
                 mutation=(
@@ -3965,7 +3985,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
 
         validation_ok, validation_reason = _validation_status()
         if not validation_ok:
-            await finalize_session_owner_lease_on_failure(lease)
+            await finalize_session_owner_lease_on_failure(lease, request=request)
             validation_error = RuntimeError(
                 f"session_owner: deferred response validation failed: "
                 f"{validation_reason}"
@@ -4000,7 +4020,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
             result is not None
             and result.outcome not in success_outcomes
         ):
-            await finalize_session_owner_lease_on_failure(lease)
+            await finalize_session_owner_lease_on_failure(lease, request=request)
             finalization_error = RuntimeError(
                 "session_owner: deferred lease finalization did not commit "
                 f"outcome={result.outcome.value}"

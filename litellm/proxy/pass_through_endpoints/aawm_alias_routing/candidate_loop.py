@@ -2841,6 +2841,13 @@ async def handle_alias_route(  # noqa: PLR0915
                                                 ),
                                             )
                                 assert response is not None
+                                continuity_receipt = (
+                                    sa.get_session_owner_continuity_receipt(request)
+                                )
+                                if continuity_receipt is not None:
+                                    selection["session_owner_continuity_receipt"] = (
+                                        continuity_receipt
+                                    )
                                 attempt_record["attempted_provider_call"] = (
                                     attempted_provider_call
                                 )

@@ -902,7 +902,7 @@ def _record_auto_agent_alias_attempt_success(
     )
     if _safe_set_request_parsed_body is not None:
         _safe_set_request_parsed_body(request, success_body)
-    if not recovered or _emit_auto_agent_alias_route_event is None:
+    if _emit_auto_agent_alias_route_event is None:
         return success_body
 
     success_metadata = success_body.get("litellm_metadata")
@@ -921,8 +921,10 @@ def _record_auto_agent_alias_attempt_success(
             request_body=prepared_request_body,
             selection=selection,
             candidate=attempt_record,
-            event_type="candidate_recovered",
-            candidate_status=attempt_record.get("status") or "recovered",
+            event_type="candidate_recovered" if recovered else "candidate_completed",
+            candidate_status=attempt_record.get("status") or (
+                "recovered" if recovered else "completed"
+            ),
             attempt_number=(
                 _provider_attempt_count(attempts)
                 if _attempt_has_provider_call(attempt_record)
@@ -941,18 +943,27 @@ def _record_auto_agent_alias_attempt_success(
         )
     if audit_event is None:
         audit_event = {
-            "event_type": "candidate_recovered",
-            "candidate_status": attempt_record.get("status") or "recovered",
+            "event_type": "candidate_recovered" if recovered else "candidate_completed",
+            "candidate_status": attempt_record.get("status") or (
+                "recovered" if recovered else "completed"
+            ),
             "alias_family": alias_family,
             "alias_model": alias_model,
             "selected": True,
             "selection_reason": selection.get("selection_reason"),
         }
-    audit_event["event_type"] = "candidate_recovered"
-    audit_event["candidate_status"] = attempt_record.get("status") or "recovered"
-    audit_event["request_outcome"] = "recovered"
+    audit_event["event_type"] = (
+        "candidate_recovered" if recovered else "candidate_completed"
+    )
+    audit_event["candidate_status"] = attempt_record.get("status") or (
+        "recovered" if recovered else "completed"
+    )
+    audit_event["request_outcome"] = "recovered" if recovered else "success"
     audit_event["attempts"] = copy.deepcopy(attempts)
     audit_event["attempt_count"] = _provider_attempt_count(attempts)
+    audit_event["session_owner_continuity_receipt"] = selection.get(
+        "session_owner_continuity_receipt"
+    )
     _stamp_auto_agent_alias_request_identity(request=request, target=audit_event)
     _emit_auto_agent_alias_route_event(audit_event)
     return success_body
