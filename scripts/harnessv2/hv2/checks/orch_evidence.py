@@ -322,7 +322,8 @@ def _nested_child_route_row(path: Path, wanted: Sequence[str]) -> dict[str, Any]
     fallback = False
     error = ""
     completed = False
-    for obj in _iter_jsonl_objects(path):
+    bounded_read = _iter_jsonl_objects(path)
+    for obj in bounded_read:
         records.append(obj)
         payload = _message_payload(obj)
         obj_type = str(obj.get("type") or "")
@@ -404,6 +405,9 @@ def _nested_child_route_row(path: Path, wanted: Sequence[str]) -> dict[str, Any]
         and not error
         and (observed_identity if requires_observed_identity else True)
     )
+    if bounded_read.truncated:
+        ok = False
+        error = "child transcript exceeded bounded evidence read"
     return {
         "requested_alias": requested,
         "selected_provider": selected_provider,
