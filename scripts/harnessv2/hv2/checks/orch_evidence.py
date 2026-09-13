@@ -30,7 +30,14 @@ _COMPLETION_TOOLS = {"task", "hub", "bash", "yield"}
 _JSONL_SCAN_CAP = 64
 _JSONL_MAX_BYTES = 2 * 1024 * 1024
 _JSONL_MAX_LINES = 20000
-_JSONL_TRUNCATED_PATHS: set[Path] = set()
+
+class _BoundedJSONLRead:
+    def __init__(self, records: list[dict[str, Any]], truncated: bool) -> None:
+        self.records = records
+        self.truncated = truncated
+
+    def __iter__(self) -> Iterable[dict[str, Any]]:
+        return iter(self.records)
 _OPERATIONAL_FALLBACK_ALIASES = frozenset(
     {
         "basic",
@@ -72,19 +79,21 @@ def _session_jsonl_paths(session_dir: Path, *, since_mtime: float | None) -> lis
 
 
 def _iter_jsonl_objects(path: Path) -> Iterable[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    truncated = False
     try:
         handle = path.open("r", encoding="utf-8", errors="replace")
     except OSError:
-        return
+        return _BoundedJSONLRead(records, truncated)
     with handle:
         consumed = 0
         for index, line in enumerate(handle):
             if index >= _JSONL_MAX_LINES:
-                _JSONL_TRUNCATED_PATHS.add(path)
+                truncated = True
                 break
             line_bytes = len(line.encode("utf-8", errors="replace"))
             if line_bytes > _JSONL_MAX_BYTES or consumed + line_bytes > _JSONL_MAX_BYTES:
-                _JSONL_TRUNCATED_PATHS.add(path)
+                truncated = True
                 break
             consumed += line_bytes
             line = line.strip()
@@ -95,7 +104,8 @@ def _iter_jsonl_objects(path: Path) -> Iterable[dict[str, Any]]:
             except json.JSONDecodeError:
                 continue
             if isinstance(obj, dict):
-                yield obj
+                records.append(obj)
+    return _BoundedJSONLRead(records, truncated)
 
 
 def _message_payload(obj: Mapping[str, Any]) -> dict[str, Any]:
@@ -1192,7 +1202,8 @@ def _codex_child_contract(
 ) -> dict[str, Any]:
     """Validate one child transcript against the two-command acceptance contract."""
 
-    records = list(_iter_jsonl_objects(path))
+    bounded_read = _iter_jsonl_objects(path)
+    records = list(bounded_read)
     calls: list[dict[str, Any]] = []
     outputs: dict[str, Mapping[str, Any]] = {}
     command_events: dict[str, Mapping[str, Any]] = {}
@@ -1429,7 +1440,7 @@ def _codex_child_contract(
             final_answer = True
 
     failures: list[str] = []
-    if path in _JSONL_TRUNCATED_PATHS:
+    if bounded_read.truncated:
         failures.append("child transcript exceeded bounded evidence read")
     expected = {"pwd": f"{workspace}\n", "uname -s": "Linux\n"}
     call_indices = [call["index"] for call in calls]
@@ -1550,10 +1561,6 @@ def codex_spawn_tool_evidence(
         if workspace_cwd and cwd and cwd != workspace_cwd:
             continue
         session_paths.append(str(path))
-        if path in _JSONL_TRUNCATED_PATHS:
-            failures.append(
-                f"Codex transcript exceeded bounded evidence read: {path.name}"
-            )
         session_id = str(meta.get("id") or meta.get("session_id") or "").strip()
         if session_id:
             child_paths_by_id[session_id] = path
