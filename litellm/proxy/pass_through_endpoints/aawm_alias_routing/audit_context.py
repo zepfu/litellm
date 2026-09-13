@@ -741,7 +741,14 @@ def _attach_auto_agent_alias_terminal_context_fields(
     cooldown_state_source = None
     if isinstance(candidate, dict):
         cooldown_state_source = candidate.get("cooldown_state_source")
-    if cooldown_state_source is None and isinstance(selection, dict):
+    is_skipped_event = bool(event.get("skipped")) or str(
+        event.get("event_type") or ""
+    ).startswith("candidate_skipped_")
+    if (
+        cooldown_state_source is None
+        and isinstance(selection, dict)
+        and not is_skipped_event
+    ):
         cooldown_state_source = selection.get("cooldown_state_source")
     if cooldown_state_source is not None and event.get("cooldown_state_source") is None:
         event["cooldown_state_source"] = cooldown_state_source

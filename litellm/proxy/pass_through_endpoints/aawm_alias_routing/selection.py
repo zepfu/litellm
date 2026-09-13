@@ -652,6 +652,7 @@ def _build_auto_agent_skipped_candidates_from_states(
             reason=state.get("skip_reason") or "cooldown",
         )
         for field in (
+            "cooldown_key",
             "cooldown_state_source",
             "cooldown_scope",
             "failure_phase",
@@ -742,6 +743,7 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
         "credential_affinity",
         "selection_strategy",
         "lane_key",
+        "cooldown_key",
         "cooldown_seconds",
         "cooldown_state_source",
         "cooldown_scope",

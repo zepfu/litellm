@@ -234,15 +234,25 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
     assert _extract_auto_agent_alias_incoming_endpoint is not None
     assert _resolve_auto_agent_alias_route_rollup_outgoing_target is not None
 
+    is_skipped_event = skipped or event_type.startswith("candidate_skipped_")
     normalized_cooldown_seconds = _auto_agent_alias_float(cooldown_seconds)
     if lane_key is None:
-        lane_key = selection.get("lane_key")
-    if cooldown_key is None and lane_key is not None:
-        cooldown_key = _codex_auto_agent_candidate_key(
-            candidate,
-            lane_key,
-            cooldown_identity_tag=candidate.get("cooldown_identity_tag"),
+        lane_key = (
+            candidate.get("lane_key")
+            if is_skipped_event
+            else selection.get("lane_key")
         )
+    if cooldown_key is None:
+        if is_skipped_event:
+            cooldown_key = candidate.get("cooldown_key")
+        elif lane_key is not None:
+            cooldown_key = _codex_auto_agent_candidate_key(
+                candidate,
+                lane_key,
+                cooldown_identity_tag=candidate.get("cooldown_identity_tag"),
+            )
+    if cooldown_scope is None and is_skipped_event:
+        cooldown_scope = candidate.get("cooldown_scope")
     context = _get_auto_agent_alias_request_context(
         request,
         request_body,
@@ -389,7 +399,7 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
             event[field] = value
 
     cooldown_state_source = candidate.get("cooldown_state_source")
-    if cooldown_state_source is None:
+    if cooldown_state_source is None and not is_skipped_event:
         cooldown_state_source = selection.get("cooldown_state_source")
     if cooldown_state_source is not None:
         event["cooldown_state_source"] = cooldown_state_source
@@ -496,7 +506,9 @@ def _build_auto_agent_alias_audit_events(  # noqa: PLR0915
                     skipped=True,
                     selection_reason=reason,
                     lane_key=skipped_candidate.get("lane_key"),
+                    cooldown_key=skipped_candidate.get("cooldown_key"),
                     cooldown_seconds=skipped_candidate.get("cooldown_seconds"),
+                    cooldown_scope=skipped_candidate.get("cooldown_scope"),
                     failure_phase=skipped_candidate.get("failure_phase"),
                     attempted_provider_call=skipped_candidate.get("attempted_provider_call"),
                 )
@@ -603,11 +615,21 @@ def _build_auto_agent_alias_audit_events(  # noqa: PLR0915
                 selected=selected,
                 skipped=skipped,
                 selection_reason=selection_reason,
-                lane_key=attempt.get("lane_key") or selection.get("lane_key"),
-                # RR-054 #51: attach the attempt's own cooldown key (fall back to selection).
+                lane_key=(
+                    attempt.get("lane_key")
+                    if terminal_skipped
+                    else attempt.get("lane_key") or selection.get("lane_key")
+                ),
+                # RR-054 #51: preserve per-attempt provenance; only non-skips
+                # may use the selected event's legacy fallback.
                 cooldown_key=(
-                    attempt.get("cooldown_key") or selection.get("cooldown_key")
-                    if attempt_record_index == len(audit_attempts) - 1
+                    (
+                        attempt.get("cooldown_key") or selection.get("cooldown_key")
+                    )
+                    if (
+                        not terminal_skipped
+                        and attempt_record_index == len(audit_attempts) - 1
+                    )
                     else attempt.get("cooldown_key")
                 ),
                 cooldown_seconds=attempt.get("cooldown_seconds"),
