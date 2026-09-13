@@ -19,6 +19,11 @@ from fastapi import HTTPException, Request
 
 from litellm._logging import verbose_proxy_logger
 
+from .attempt_records import (
+    _emit_auto_agent_alias_skipped_events_once,
+    _stamp_auto_agent_alias_request_identity,
+)
+
 # ---------------------------------------------------------------------------
 # Injected runtime seams (god-module / sibling-module dependencies)
 # ---------------------------------------------------------------------------
@@ -413,6 +418,12 @@ def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
                 )
             )
 
+        if audit_events:
+            _emit_auto_agent_alias_skipped_events_once(
+                request=request,
+                audit_events=audit_events,
+            )
+        _stamp_auto_agent_alias_request_identity(request=request, target=event)
         _emit_auto_agent_alias_route_event(event, level="warning")
         _persist_auto_agent_alias_audit_only_events_best_effort(
             [*audit_events[:-1], event],
@@ -576,37 +587,59 @@ def _emit_auto_agent_alias_no_candidate_event(  # noqa: PLR0915
             "Failed to append terminal alias error intake",
             exc_info=True,
         )
-    _emit_auto_agent_alias_route_event(
-        event,
-        level="warning",
-    )
     # Terminal no-candidate outcomes never complete a normal provider write path.
     # Persist audit rows only so partial-activity vs no-op failures remain queryable.
     audit_events: list[dict[str, Any]] = []
+    terminal_skipped = [
+        candidate
+        for candidate in terminal_candidates
+        if candidate.get("terminal_disposition") == "skipped"
+    ]
+    audit_selection: dict[str, Any] = {
+        "session_key": event.get("session_key"),
+        "skipped": terminal_skipped,
+    }
     if normalized_attempts:
         last_attempt = normalized_attempts[-1]
-        terminal_skipped = [
-            candidate
-            for candidate in terminal_candidates
-            if candidate.get("terminal_disposition") == "skipped"
-        ]
+        audit_selection.update(
+            {
+                "candidate": last_attempt,
+                "lane_key": last_attempt.get("lane_key"),
+                "selection_reason": last_attempt.get("reason"),
+            }
+        )
         audit_events.extend(
             _build_auto_agent_alias_audit_events(
                 alias_family=alias_family,
                 alias_model=alias_model,
                 request=request,
                 request_body=request_body,
-                selection={
-                    "candidate": last_attempt,
-                    "session_key": event.get("session_key"),
-                    "lane_key": last_attempt.get("lane_key"),
-                    "selection_reason": last_attempt.get("reason"),
-                    "skipped": terminal_skipped,
-                },
+                selection=audit_selection,
                 attempts=normalized_attempts,
             )
         )
+    else:
+        audit_events.extend(
+            _build_auto_agent_alias_audit_events(
+                alias_family=alias_family,
+                alias_model=alias_model,
+                request=request,
+                request_body=request_body,
+                selection=audit_selection,
+                attempts=[],
+            )
+        )
     audit_events.append(event)
+    if audit_events:
+        _emit_auto_agent_alias_skipped_events_once(
+            request=request,
+            audit_events=audit_events,
+        )
+    _stamp_auto_agent_alias_request_identity(request=request, target=event)
+    _emit_auto_agent_alias_route_event(
+        event,
+        level="warning",
+    )
     _persist_auto_agent_alias_audit_only_events_best_effort(
         audit_events,
         request_body=request_body,
@@ -714,6 +747,14 @@ def install(host_globals: dict) -> None:
         ("_resolve_codex_auto_agent_session_key", _resolve_codex_auto_agent_session_key),
         ("_resolve_anthropic_auto_agent_session_key", _resolve_anthropic_auto_agent_session_key),
         ("_emit_auto_agent_alias_route_event", _emit_auto_agent_alias_route_event),
+        (
+            "_emit_auto_agent_alias_skipped_events_once",
+            _emit_auto_agent_alias_skipped_events_once,
+        ),
+        (
+            "_stamp_auto_agent_alias_request_identity",
+            _stamp_auto_agent_alias_request_identity,
+        ),
         ("_build_auto_agent_alias_audit_events", _build_auto_agent_alias_audit_events),
         ("_persist_auto_agent_alias_audit_only_events_best_effort", _persist_auto_agent_alias_audit_only_events_best_effort),
         ("_build_auto_agent_terminal_candidate_inventory", _build_auto_agent_terminal_candidate_inventory),

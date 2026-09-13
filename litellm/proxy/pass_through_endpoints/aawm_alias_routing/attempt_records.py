@@ -723,6 +723,7 @@ def _emit_auto_agent_alias_skipped_events_once(
             continue
         emitted_keys.add(event_key)
         newly_emitted_keys.add(event_key)
+        _stamp_auto_agent_alias_request_identity(request=request, target=event)
         _emit_auto_agent_alias_route_event(event)
     return newly_emitted_keys
 
@@ -759,8 +760,21 @@ def _record_auto_agent_alias_attempt_started(
         and audit_events
         and (_aawm_alias_route_verbose_json_enabled() or _aawm_alias_route_healthy_json_enabled())
     ):
+        _emit_auto_agent_alias_skipped_events_once(
+            request=request,
+            audit_events=[
+                event for event in audit_events if isinstance(event, dict)
+            ],
+        )
         latest_event = audit_events[-1]
-        if isinstance(latest_event, dict):
+        if (
+            isinstance(latest_event, dict)
+            and not _is_auto_agent_alias_skipped_audit_event(latest_event)
+        ):
+            _stamp_auto_agent_alias_request_identity(
+                request=request,
+                target=latest_event,
+            )
             _emit_auto_agent_alias_route_event(latest_event)
     return candidate_body
 
@@ -915,6 +929,17 @@ def _record_auto_agent_alias_attempt_failure(
     _stamp_auto_agent_alias_request_identity(request=request, target=audit_event)
     if defer_terminal_error:
         audit_event["_aawm_terminal_error_already_emitted"] = True
+    if (
+        audit_events
+        and (
+            _aawm_alias_route_verbose_json_enabled()
+            or _aawm_alias_route_healthy_json_enabled()
+        )
+    ):
+        _emit_auto_agent_alias_skipped_events_once(
+            request=request,
+            audit_events=audit_events,
+        )
     _emit_auto_agent_alias_route_event(
         audit_event,
         level="warning",
@@ -1016,6 +1041,17 @@ def _record_auto_agent_alias_attempt_success(
         "session_owner_continuity_receipt"
     )
     _stamp_auto_agent_alias_request_identity(request=request, target=audit_event)
+    if (
+        audit_events
+        and (
+            _aawm_alias_route_verbose_json_enabled()
+            or _aawm_alias_route_healthy_json_enabled()
+        )
+    ):
+        _emit_auto_agent_alias_skipped_events_once(
+            request=request,
+            audit_events=audit_events,
+        )
     _emit_auto_agent_alias_route_event(audit_event)
     return success_body
 
