@@ -1149,10 +1149,14 @@ def _codex_jsonl_paths(
 
 
 def _codex_session_meta(path: Path) -> dict[str, Any]:
-    for obj in _iter_jsonl_objects(path):
+    bounded_read = _iter_jsonl_objects(path)
+    found: dict[str, Any] = {}
+    for obj in bounded_read:
         if obj.get("type") == "session_meta" and isinstance(obj.get("payload"), dict):
-            return dict(obj["payload"])
-    return {}
+            found = dict(obj["payload"])
+    if bounded_read.truncated:
+        found["_bounded_read_truncated"] = True
+    return found
 
 
 def _codex_function_call_name(payload: Mapping[str, Any]) -> str:
@@ -1557,6 +1561,10 @@ def codex_spawn_tool_evidence(
 
     for path in paths:
         meta = _codex_session_meta(path)
+        if meta.get("_bounded_read_truncated"):
+            failures.append(
+                f"Codex transcript exceeded bounded evidence read: {path.name}"
+            )
         cwd = str(meta.get("cwd") or "").rstrip("/")
         if workspace_cwd and cwd and cwd != workspace_cwd:
             continue
