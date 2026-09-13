@@ -446,9 +446,9 @@ async def _get_codex_auto_agent_session_affinity(
 async def _set_codex_auto_agent_session_affinity(
     session_key: Optional[str],
     candidate: dict[str, Any],
-) -> None:
+) -> dict[str, bool]:
     if session_key is None:
-        return
+        return {"memory": False, "durable": False}
     mgr = _require_manager()
     family = mgr.codex
     # Wave 3 R3-4: carry the semantic config digest observed when affinity
@@ -488,13 +488,14 @@ async def _set_codex_auto_agent_session_affinity(
     }
     if config_hash is not None:
         durable_payload["config_hash"] = config_hash
-    await write_aawm_alias_routing_durable_payload(
+    durable_written = await write_aawm_alias_routing_durable_payload(
         alias_family="codex",
         state_kind="affinity",
         state_key=session_key,
         payload=durable_payload,
         ttl_seconds=_CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS,
     )
+    return {"memory": True, "durable": bool(durable_written)}
 
 
 # ---------------------------------------------------------------------------

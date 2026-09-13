@@ -2817,10 +2817,29 @@ async def handle_alias_route(  # noqa: PLR0915
                                     request=request,
                                     candidate=candidate,
                                 ):
-                                    await set_session_affinity_fn(
+                                    affinity_result = await set_session_affinity_fn(
                                         selection.get("session_key"),
                                         candidate,
                                     )
+                                    if isinstance(affinity_result, Mapping):
+                                        for source, written in (
+                                            ("memory", affinity_result.get("memory")),
+                                            ("durable", affinity_result.get("durable")),
+                                        ):
+                                            sa.record_session_owner_continuity_receipt(
+                                                request,
+                                                phase="legacy_affinity",
+                                                source=source,
+                                                session_identity=selection.get(
+                                                    "canonical_session_identity"
+                                                ),
+                                                cache_key=selection.get("session_key"),
+                                                outcome=(
+                                                    "written"
+                                                    if written is True
+                                                    else "not_written"
+                                                ),
+                                            )
                                 assert response is not None
                                 attempt_record["attempted_provider_call"] = (
                                     attempted_provider_call
@@ -2879,6 +2898,7 @@ async def handle_alias_route(  # noqa: PLR0915
                                 )
                             return await sa.finalize_session_owner_lease_on_success(
                                 session_owner_lease,
+                                request=request,
                                 attributes=owner_attributes,
                                 candidate=candidate,
                             )
@@ -2947,6 +2967,7 @@ async def handle_alias_route(  # noqa: PLR0915
                             finalize_result = (
                                 await sa.finalize_session_owner_lease_on_success(
                                     session_owner_lease,
+                                    request=request,
                                     attributes=owner_attributes,
                                     candidate=candidate,
                                 )
@@ -2974,7 +2995,8 @@ async def handle_alias_route(  # noqa: PLR0915
                         if session_owner_lease is not None:
                             try:
                                 await _session_affinity_mod().finalize_session_owner_lease_on_failure(
-                                    session_owner_lease
+                                    session_owner_lease,
+                                    request=request,
                                 )
                             except Exception:  # noqa: BLE001
                                 pass
@@ -2984,7 +3006,8 @@ async def handle_alias_route(  # noqa: PLR0915
                         if session_owner_lease is not None:
                             try:
                                 await _session_affinity_mod().finalize_session_owner_lease_on_failure(
-                                    session_owner_lease
+                                    session_owner_lease,
+                                    request=request,
                                 )
                             except Exception:  # noqa: BLE001
                                 pass

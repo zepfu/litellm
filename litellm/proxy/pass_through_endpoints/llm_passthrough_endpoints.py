@@ -1465,27 +1465,58 @@ def _resolve_codex_auto_agent_session_key(
 ) -> Optional[str]:
     if not alias_model or alias_model.strip() != alias_model:
         raise ValueError("alias_model must be an explicit canonical alias")
-    metadata = request_body.get("litellm_metadata")
-    metadata_session_id = metadata.get("session_id") if isinstance(metadata, dict) else None
-    session_id = _clean_codex_auth_value(metadata_session_id)
-    client_metadata = request_body.get("client_metadata")
-    if session_id is None and isinstance(client_metadata, dict):
-        for key in (
-            "session_id",
-            "aawm_session_id",
-            "codex_session_id",
-            "thread_id",
-            "aawm_thread_id",
-            "codex_thread_id",
+
+    def _first_mapping_value(keys: tuple[str, ...]) -> Optional[str]:
+        for mapping in (
+            request_body.get("client_metadata"),
+            request_body.get("litellm_metadata"),
+            request_body.get("metadata"),
         ):
-            session_id = _clean_codex_auth_value(client_metadata.get(key))
-            if session_id is not None:
-                break
+            if not isinstance(mapping, dict):
+                continue
+            for key in keys:
+                value = _clean_codex_auth_value(mapping.get(key))
+                if value is not None:
+                    return value
+        return None
+
+    # Thread identity is the execution identity and must win over all session
+    # fallbacks, matching session_affinity.resolve_canonical_session_identity.
+    session_id = _first_mapping_value(
+        ("thread_id", "aawm_thread_id", "codex_thread_id", "claude_thread_id")
+    )
     headers = _safe_get_request_headers(request)
     if session_id is None:
-        session_id = _get_codex_auto_agent_header(headers, "session_id") or _get_codex_auto_agent_header(
-            headers, "session-id"
+        for header_name in (
+            "thread-id",
+            "x-thread-id",
+            "x-aawm-thread-id",
+            "x-codex-thread-id",
+            "x-claude-thread-id",
+        ):
+            session_id = _get_codex_auto_agent_header(headers, header_name)
+            if session_id is not None:
+                break
+    if session_id is None:
+        for key in ("thread_id", "aawm_thread_id", "codex_thread_id"):
+            value = _clean_codex_auth_value(request_body.get(key))
+            if value is not None:
+                session_id = value
+                break
+    if session_id is None:
+        session_id = _first_mapping_value(
+            (
+                "session_id",
+                "aawm_session_id",
+                "codex_session_id",
+                "claude_session_id",
+            )
         )
+    if session_id is None:
+        for header_name in ("session_id", "session-id", "x-session-id"):
+            session_id = _get_codex_auto_agent_header(headers, header_name)
+            if session_id is not None:
+                break
     if session_id is None:
         return None
     return f"{alias_model}:{session_id}:" f"{_resolve_codex_auto_agent_openai_lane_key(request)}"

@@ -177,6 +177,53 @@ _REQUEST_STATE_CODEX_AUTO_REVIEW_PARENT_SESSION_IDENTITY_ATTR = (
     "_aawm_codex_auto_review_parent_session_identity"
 )
 _REQUEST_STATE_CONTINUITY_RECEIPT_ATTR = "_aawm_session_owner_continuity_receipt"
+_CONTINUITY_IDENTITY_KEYS = (
+    "thread_id",
+    "aawm_thread_id",
+    "codex_thread_id",
+    "claude_thread_id",
+    "session_id",
+    "aawm_session_id",
+    "codex_session_id",
+    "claude_session_id",
+    "anthropic_session_id",
+)
+_CONTINUITY_PHASES = frozenset(
+    {"identity_resolve", "owner_lookup", "owner_guard", "owner_finalize",
+     "owner_rejection", "legacy_affinity"}
+)
+_CONTINUITY_SOURCES = frozenset(
+    {"explicit", "request_effective", "codex_auto_review", "session_identity",
+     "durable_cache", "redis", "request_lease", "session_owner_guard", "success",
+     "failure", "non_success_response", "redispatch", "memory", "durable",
+     "wire_terminal"}
+    | {
+        f"{location}.{key}"
+        for location in ("client_metadata", "litellm_metadata", "body")
+        for key in _CONTINUITY_IDENTITY_KEYS
+    }
+    | {
+        f"header.{key}"
+        for key in (
+            "thread_id", "x_thread_id", "x_aawm_thread_id", "x_codex_thread_id",
+            "x_claude_thread_id", "session_id", "x_session_id",
+            "x_aawm_session_id", "x_codex_session_id", "x_claude_session_id",
+            "anthropic_beta_session_id", "aawm_session_id", "codex_session_id",
+            "claude_session_id",
+        )
+    }
+)
+_CONTINUITY_OUTCOMES = frozenset(
+    {"resolved", "owned", "reserved", "missing", "error", "unknown",
+     "skipped_missing_identity", "pending_wire_terminal", "written", "unverified",
+     "not_written"}
+    | {decision.value for decision in SessionOwnerGuardDecision}
+    | {outcome.value for outcome in SessionOwnerMutationOutcome}
+)
+_CONTINUITY_REASONS = frozenset(
+    {"durable_cache_unavailable", "owner_read_failed", "reservation_wait_failed",
+     "identity_conflict", "guard_rejected", "mutation_failed"}
+)
 _RECORD_STATE_FIELD = "state"
 _RECORD_OWNER_FIELD = "owner"
 _RECORD_ATTRIBUTES_FIELD = "attributes"
@@ -312,6 +359,15 @@ def _clean_optional_str(value: Any) -> Optional[str]:
     return cleaned or None
 
 
+def _clean_identity_str(value: Any) -> Optional[str]:
+    """Accept only non-empty strings for externally supplied identities."""
+
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
 def _clean_session_identity(session_identity: str) -> str:
     cleaned = _clean_optional_str(session_identity)
     if cleaned is None:
@@ -410,36 +466,57 @@ def record_session_owner_continuity_receipt(
     session_identity: Optional[str] = None,
     outcome: Optional[str] = None,
     cache_key: Optional[str] = None,
-    detail: Optional[str] = None,
+    reason_code: Optional[str] = None,
+    held_reservation: Optional[bool] = None,
 ) -> None:
     """Keep bounded, secret-free evidence for identity and owner transitions."""
-
-    state = getattr(request, "state", None) if request is not None else None
-    if state is None:
-        return
-    event: Payload = {
-        "phase": _sanitize_session_owner_log_label(phase, max_length=64),
-        "source": _sanitize_session_owner_log_label(source, max_length=96),
-        "outcome": _sanitize_session_owner_log_label(outcome, max_length=96),
-        "canonical_session_identity_hash": _hash_session_owner_log_identifier(
-            session_identity
-        ),
-        "cache_key_hash": _hash_session_owner_log_identifier(cache_key),
-        "detail": _sanitize_session_owner_log_label(detail, max_length=160),
-        "recorded_at_epoch": round(time.time(), 3),
-    }
-    event = {key: value for key, value in event.items() if value is not None}
     try:
-        existing = getattr(state, _REQUEST_STATE_CONTINUITY_RECEIPT_ATTR, None)
-        events = (
-            list(existing.get("events") or ())
-            if isinstance(existing, Mapping)
-            else []
+        state = getattr(request, "state", None) if request is not None else None
+        if state is None:
+            return
+        existing = get_session_owner_continuity_receipt(request) or {}
+        sequence = int(existing.get("sequence") or 0) + 1
+        phase_value = phase if phase in _CONTINUITY_PHASES else "unknown"
+        normalized_source = source.replace("-", "_") if isinstance(source, str) else None
+        source_value = (
+            normalized_source if normalized_source in _CONTINUITY_SOURCES else "unknown"
         )
+        event: Payload = {
+            "sequence": sequence,
+            "phase": phase_value,
+            "source": source_value,
+            "outcome": outcome if outcome in _CONTINUITY_OUTCOMES else "unknown",
+            "reason_code": reason_code if reason_code in _CONTINUITY_REASONS else None,
+            "canonical_session_identity_hash": _hash_session_owner_log_identifier(
+                session_identity
+            ),
+            (
+                "legacy_key_hash" if phase_value == "legacy_affinity" else "owner_key_hash"
+            ): _hash_session_owner_log_identifier(cache_key),
+            "held_reservation": held_reservation if isinstance(held_reservation, bool) else None,
+            "recorded_at_epoch": round(time.time(), 3),
+        }
+        event = {key: value for key, value in event.items() if value is not None}
+        events = list(existing.get("events") or ())
         events.append(event)
+        identity = existing.get("identity")
+        if identity is None and phase_value == "identity_resolve" and session_identity:
+            identity = {
+                **event,
+                "identity_kind": (
+                    "thread" if "thread_id" in source_value else
+                    "session" if "session_id" in source_value else "server_derived"
+                ),
+            }
+        dropped_events = int(existing.get("dropped_events") or 0)
+        dropped_events += max(0, len(events) - 16)
         receipt = {
             "latest": event,
             "events": events[-16:],
+            "sequence": sequence,
+            "dropped_events": dropped_events,
+            "identity": identity,
+            "intake": existing.get("intake"),
         }
         setattr(state, _REQUEST_STATE_CONTINUITY_RECEIPT_ATTR, receipt)
     except Exception:  # noqa: BLE001
@@ -447,13 +524,104 @@ def record_session_owner_continuity_receipt(
 
 
 def get_session_owner_continuity_receipt(request: Any) -> Optional[Payload]:
-    state = getattr(request, "state", None) if request is not None else None
-    receipt = (
-        getattr(state, _REQUEST_STATE_CONTINUITY_RECEIPT_ATTR, None)
-        if state is not None
-        else None
-    )
-    return cast(Payload, receipt) if isinstance(receipt, Mapping) else None
+    try:
+        state = getattr(request, "state", None) if request is not None else None
+        receipt = (
+            getattr(state, _REQUEST_STATE_CONTINUITY_RECEIPT_ATTR, None)
+            if state is not None
+            else None
+        )
+        if not isinstance(receipt, Mapping):
+            return None
+        def snapshot_event(value: Any) -> Payload:
+            if not isinstance(value, Mapping):
+                return {}
+            result: Payload = {}
+            for key, labels in (
+                ("phase", _CONTINUITY_PHASES),
+                ("source", _CONTINUITY_SOURCES),
+                ("outcome", _CONTINUITY_OUTCOMES),
+                ("reason_code", _CONTINUITY_REASONS),
+                ("identity_kind", {"thread", "session", "server_derived"}),
+            ):
+                if isinstance(value.get(key), str) and value[key] in labels:
+                    result[key] = value[key]
+            for key in ("canonical_session_identity_hash", "owner_key_hash", "legacy_key_hash"):
+                item = value.get(key)
+                if isinstance(item, str) and re.fullmatch(r"[0-9a-f]{16}", item):
+                    result[key] = item
+            for key in ("sequence", "recorded_at_epoch"):
+                item = value.get(key)
+                if type(item) in (int, float) and math.isfinite(item) and item >= 0:
+                    result[key] = item
+            if isinstance(value.get("held_reservation"), bool):
+                result["held_reservation"] = value["held_reservation"]
+            return result
+
+        events = receipt.get("events")
+        identity = snapshot_event(receipt.get("identity"))
+        intake = receipt.get("intake")
+        return {
+            "latest": snapshot_event(receipt.get("latest")),
+            "events": [snapshot_event(event) for event in events[-16:]]
+            if isinstance(events, list) else [],
+            "sequence": max(0, int(receipt.get("sequence") or 0)),
+            "dropped_events": max(0, int(receipt.get("dropped_events") or 0)),
+            "identity": identity or None,
+            "intake": {
+                key: value for key, value in intake.items()
+                if key in {"body", "client_metadata", "litellm_metadata", "headers"}
+                and isinstance(value, list)
+                and all(
+                    isinstance(item, str)
+                    and re.fullmatch(
+                        r"(?:x_)?(?:aawm_|codex_|claude_|anthropic_|anthropic_beta_)?"
+                        r"(?:thread_id|session_id):(string|missing|invalid)", item
+                    )
+                    for item in value
+                )
+            } if isinstance(intake, Mapping) else None,
+        }
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _record_session_identity_intake(request: Any, body: Mapping[str, Any]) -> None:
+    """Record only supported field names and types, never request content."""
+    try:
+        state = getattr(request, "state", None)
+        if state is None:
+            return
+        receipt = get_session_owner_continuity_receipt(request) or {}
+        if receipt.get("intake") is not None:
+            return
+        headers = {
+            str(key).lower().replace("-", "_"): value
+            for key, value in request.headers.items()
+        }
+        intake = {}
+        for location, mapping, keys in (
+            ("body", body, _CONTINUITY_IDENTITY_KEYS),
+            ("client_metadata", body.get("client_metadata"), _CONTINUITY_IDENTITY_KEYS),
+            ("litellm_metadata", body.get("litellm_metadata"), _CONTINUITY_IDENTITY_KEYS),
+            ("headers", headers, (
+                "thread_id", "x_thread_id", "x_aawm_thread_id", "x_codex_thread_id",
+                "x_claude_thread_id", "session_id", "x_session_id",
+                "x_aawm_session_id", "x_codex_session_id", "x_claude_session_id",
+                "anthropic_beta_session_id",
+            )),
+        ):
+            values = mapping if isinstance(mapping, Mapping) else {}
+            intake[location] = [
+                f"{key}:"
+                + ("missing" if key not in values else
+                   "string" if _clean_identity_str(values[key]) is not None else "invalid")
+                for key in keys
+            ]
+        receipt["intake"] = intake
+        setattr(state, _REQUEST_STATE_CONTINUITY_RECEIPT_ATTR, receipt)
+    except Exception:  # noqa: BLE001
+        return
 
 
 def activate_codex_auto_review_session_identity(
@@ -784,7 +952,7 @@ def resolve_canonical_session_identity(
     """
 
     def _resolved(value: Any, source: str) -> Optional[str]:
-        cleaned = _clean_optional_str(value)
+        cleaned = _clean_identity_str(value)
         if cleaned is None:
             return None
         canonical = _strip_legacy_affinity_prefixes(cleaned)
@@ -798,7 +966,7 @@ def resolve_canonical_session_identity(
         return canonical
 
     if session_identity is not None:
-        cleaned = _clean_optional_str(session_identity)
+        cleaned = _clean_identity_str(session_identity)
         if cleaned is None:
             return None
         return _resolved(cleaned, "explicit")
@@ -812,34 +980,39 @@ def resolve_canonical_session_identity(
         return _resolved(review_identity, "codex_auto_review")
 
     body = request_body if isinstance(request_body, Mapping) else {}
-    metadata = body.get("litellm_metadata") if isinstance(body, Mapping) else None
-    client_metadata = (
-        body.get("client_metadata") if isinstance(body, Mapping) else None
+    _record_session_identity_intake(request, body)
+    metadata = body.get("litellm_metadata")
+    client_metadata = body.get("client_metadata")
+    thread_keys = (
+        "thread_id",
+        "aawm_thread_id",
+        "codex_thread_id",
+        "claude_thread_id",
     )
-    if isinstance(metadata, dict):
-        for key in (
-            "thread_id",
-            "aawm_thread_id",
-            "codex_thread_id",
-            "claude_thread_id",
-        ):
-            value = _clean_optional_str(metadata.get(key))
+    session_keys = (
+        "session_id",
+        "aawm_session_id",
+        "codex_session_id",
+        "claude_session_id",
+        "anthropic_session_id",
+    )
+
+    def _mapping_value(mapping: Any, key: str) -> Optional[str]:
+        if not isinstance(mapping, Mapping):
+            return None
+        return _clean_identity_str(mapping.get(key))
+
+    # Execution-thread identity is authoritative regardless of where the
+    # provider client placed it. Session identifiers are considered only after
+    # all supported thread sources have been checked.
+    for mapping_name, mapping in (
+        ("client_metadata", client_metadata),
+        ("litellm_metadata", metadata),
+    ):
+        for key in thread_keys:
+            value = _mapping_value(mapping, key)
             if value is not None:
-                return _resolved(value, f"litellm_metadata.{key}")
-    if isinstance(client_metadata, Mapping):
-        for key in (
-            "thread_id",
-            "aawm_thread_id",
-            "codex_thread_id",
-            "claude_thread_id",
-            "session_id",
-            "aawm_session_id",
-            "codex_session_id",
-            "claude_session_id",
-        ):
-            value = _clean_optional_str(client_metadata.get(key))
-            if value is not None:
-                return _resolved(value, f"client_metadata.{key}")
+                return _resolved(value, f"{mapping_name}.{key}")
 
     headers = None
     if request is not None:
@@ -850,7 +1023,7 @@ def resolve_canonical_session_identity(
         except Exception:  # noqa: BLE001
             items = []
         header_map = {
-            str(name).lower(): _clean_optional_str(value) for name, value in items
+            str(name).lower(): _clean_identity_str(value) for name, value in items
         }
         for key in (
             "thread-id",
@@ -880,21 +1053,18 @@ def resolve_canonical_session_identity(
             "codex_thread_id",
             "claude_thread_id",
         ):
-            value = _clean_optional_str(body.get(key))
+            value = _clean_identity_str(body.get(key))
             if value is not None:
                 return _resolved(value, f"body.{key}")
 
-    if isinstance(metadata, dict):
-        for key in (
-            "session_id",
-            "aawm_session_id",
-            "codex_session_id",
-            "claude_session_id",
-            "anthropic_session_id",
-        ):
-            value = _clean_optional_str(metadata.get(key))
+    for mapping_name, mapping in (
+        ("client_metadata", client_metadata),
+        ("litellm_metadata", metadata),
+    ):
+        for key in session_keys:
+            value = _mapping_value(mapping, key)
             if value is not None:
-                return _resolved(value, f"litellm_metadata.{key}")
+                return _resolved(value, f"{mapping_name}.{key}")
 
     if headers is not None:
         for key in (
@@ -920,9 +1090,15 @@ def resolve_canonical_session_identity(
 
     if isinstance(body, Mapping):
         for key in ("session_id", "aawm_session_id"):
-            value = _clean_optional_str(body.get(key))
+            value = _clean_identity_str(body.get(key))
             if value is not None:
                 return _resolved(value, f"body.{key}")
+    record_session_owner_continuity_receipt(
+        request,
+        phase="identity_resolve",
+        source="session_identity",
+        outcome="missing",
+    )
     return None
 
 
@@ -1950,7 +2126,7 @@ async def get_session_owner_record(
             session_identity=cleaned,
             cache_key=cache_key,
             outcome="error",
-            detail=error,
+            reason_code="durable_cache_unavailable",
         )
         return None, cache_key, error or "session_owner: durable cache unavailable"
     try:
@@ -1973,6 +2149,15 @@ async def get_session_owner_record(
                 poll_seconds=reservation_wait_poll_seconds,
             )
             if wait_error is not None:
+                record_session_owner_continuity_receipt(
+                    request,
+                    phase="owner_lookup",
+                    source="redis",
+                    session_identity=cleaned,
+                    cache_key=cache_key,
+                    outcome="error",
+                    reason_code="reservation_wait_failed",
+                )
                 return record, cache_key, wait_error
     except RuntimeError as exc:
         record_session_owner_continuity_receipt(
@@ -1982,7 +2167,7 @@ async def get_session_owner_record(
             session_identity=cleaned,
             cache_key=cache_key,
             outcome="error",
-            detail=str(exc),
+            reason_code="owner_read_failed",
         )
         return None, cache_key, str(exc)
     record_session_owner_continuity_receipt(
@@ -3372,12 +3557,29 @@ def lease_from_guard_result(
 async def finalize_session_owner_lease_on_success(
     lease: Optional[SessionOwnerLease],
     *,
+    request: Any = None,
     attributes: Optional[Mapping[str, Any]] = None,
     candidate: Optional[Mapping[str, Any]] = None,
 ) -> Optional[SessionOwnerMutationResult]:
     if lease is None or not lease.held_reservation or lease.promoted or lease.released:
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_finalize",
+            source="success",
+            session_identity=getattr(lease, "session_identity", None),
+            cache_key=getattr(lease, "cache_key", None),
+            outcome="skipped",
+        )
         return None
     if lease.wire_terminal_pending:
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_finalize",
+            source="success",
+            session_identity=lease.session_identity,
+            cache_key=lease.cache_key,
+            outcome="pending_wire_terminal",
+        )
         return None
     await _barrier_session_owner_lease_renewal(lease)
     result = await promote_session_owner_reservation(
@@ -3393,13 +3595,31 @@ async def finalize_session_owner_lease_on_success(
     }:
         lease.promoted = True
         _stop_session_owner_lease_renewal(lease)
+    record_session_owner_continuity_receipt(
+        request,
+        phase="owner_finalize",
+        source="success",
+        session_identity=lease.session_identity,
+        cache_key=lease.cache_key,
+        outcome=result.outcome.value,
+    )
     return result
 
 
 async def finalize_session_owner_lease_on_failure(
     lease: Optional[SessionOwnerLease],
+    *,
+    request: Any = None,
 ) -> Optional[SessionOwnerMutationResult]:
     if lease is None or not lease.held_reservation or lease.promoted or lease.released:
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_finalize",
+            source="failure",
+            session_identity=getattr(lease, "session_identity", None),
+            cache_key=getattr(lease, "cache_key", None),
+            outcome="skipped",
+        )
         return None
     if lease.wire_terminal_pending and lease.wire_disposition is None:
         lease.wire_disposition = "failed"
@@ -3416,6 +3636,14 @@ async def finalize_session_owner_lease_on_failure(
     }:
         lease.released = True
         _stop_session_owner_lease_renewal(lease)
+    record_session_owner_continuity_receipt(
+        request,
+        phase="owner_finalize",
+        source="failure",
+        session_identity=lease.session_identity,
+        cache_key=lease.cache_key,
+        outcome=result.outcome.value,
+    )
     return result
 
 
@@ -3456,10 +3684,11 @@ async def finalize_session_owner_lease_on_wire_disposition(
     if normalized == "completed":
         return await finalize_session_owner_lease_on_success(
             lease,
+            request=request,
             attributes=attributes,
             candidate=candidate,
         )
-    return await finalize_session_owner_lease_on_failure(lease)
+    return await finalize_session_owner_lease_on_failure(lease, request=request)
 
 
 async def finalize_request_session_owner_lease(
@@ -3484,7 +3713,7 @@ async def finalize_request_session_owner_lease(
     if active is None or not active.held_reservation or active.promoted or active.released:
         return None
     if exc is not None:
-        result = await finalize_session_owner_lease_on_failure(active)
+        result = await finalize_session_owner_lease_on_failure(active, request=request)
         record_session_owner_continuity_receipt(
             request,
             phase="owner_finalize",
@@ -3492,7 +3721,9 @@ async def finalize_request_session_owner_lease(
             session_identity=active.session_identity,
             cache_key=active.cache_key,
             outcome=result.outcome.value if result is not None else "skipped",
-            detail=result.error if result is not None else None,
+            reason_code="mutation_failed"
+            if result is not None and result.error
+            else None,
         )
         return result
 
@@ -3501,7 +3732,7 @@ async def finalize_request_session_owner_lease(
         status is None or (isinstance(status, int) and status < 300)
     )
     if not ok:
-        result = await finalize_session_owner_lease_on_failure(active)
+        result = await finalize_session_owner_lease_on_failure(active, request=request)
         record_session_owner_continuity_receipt(
             request,
             phase="owner_finalize",
@@ -3509,12 +3740,15 @@ async def finalize_request_session_owner_lease(
             session_identity=active.session_identity,
             cache_key=active.cache_key,
             outcome=result.outcome.value if result is not None else "skipped",
-            detail=result.error if result is not None else None,
+            reason_code="mutation_failed"
+            if result is not None and result.error
+            else None,
         )
         return result
 
     result = await finalize_session_owner_lease_on_success(
         active,
+        request=request,
         attributes=attributes or active.attributes,
         candidate=candidate,
     )
@@ -3525,7 +3759,9 @@ async def finalize_request_session_owner_lease(
         session_identity=active.session_identity,
         cache_key=active.cache_key,
         outcome=result.outcome.value if result is not None else "skipped",
-        detail=result.error if result is not None else None,
+        reason_code="mutation_failed"
+        if result is not None and result.error
+        else None,
     )
     if (
         raise_on_promote_failure
@@ -3588,6 +3824,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
     async def _promote() -> Optional[SessionOwnerMutationResult]:
         return await finalize_session_owner_lease_on_success(
             lease,
+            request=request,
             attributes=attributes,
             candidate=candidate,
         )
@@ -4672,11 +4909,11 @@ def raise_session_owner_redispatch_required(
         record_session_owner_continuity_receipt(
             request,
             phase="owner_rejection",
-            source=failure_phase,
+            source="redispatch",
             session_identity=session_identity,
             cache_key=cache_key,
             outcome="redispatch_required",
-            detail=mismatch_reason or message,
+            reason_code="guard_rejected",
         )
         _emit_session_owner_redispatch_observability(
             session_identity=session_identity,
@@ -5160,7 +5397,7 @@ async def ensure_session_owner_guard_for_request(
                 session_identity=resolved_session_identity,
                 cache_key=mismatch_cache_key,
                 outcome=guard.decision.value,
-                detail=mismatch_reason,
+                reason_code="identity_conflict",
             )
             if raise_on_redispatch:
                 raise_session_owner_redispatch_required(
@@ -5192,7 +5429,9 @@ async def ensure_session_owner_guard_for_request(
         session_identity=guard.session_identity,
         cache_key=guard.cache_key,
         outcome=guard.decision.value,
-        detail=guard.mismatch_reason,
+        reason_code="guard_rejected"
+        if guard.mismatch_reason
+        else None,
     )
     if (
         raise_on_redispatch
