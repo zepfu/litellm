@@ -1994,6 +1994,63 @@ async def handle_alias_route(  # noqa: PLR0915
                 else None
             )
             if (
+                exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+                and selection_error_code
+                == "aawm_codex_auto_agent_all_candidates_cooling_down"
+                and is_codex_alias
+            ):
+                # A provider-attributed failure can cool every candidate before
+                # the next selection pass. Keep that recoverable state inside
+                # the request-wide coordinator instead of terminalizing at the
+                # selector boundary. Local admission/quota/auth failures do not
+                # carry attempted_provider_call=True and remain terminal.
+                cooling_candidates = selection_detail.get("candidates")
+                if isinstance(cooling_candidates, list):
+                    provider_candidate = next(
+                        (
+                            candidate
+                            for candidate in cooling_candidates
+                            if isinstance(candidate, dict)
+                            and str(candidate.get("provider") or "").strip().lower()
+                            == "openai"
+                            and bool(candidate.get("attempted_provider_call"))
+                        ),
+                        None,
+                    )
+                else:
+                    provider_candidate = None
+                if provider_candidate is not None:
+                    capacity_retry_coordinator = (
+                        _get_openai_alpha_capacity_retry_coordinator(
+                            provider_candidate
+                        )
+                    )
+                    if capacity_retry_coordinator is not None:
+                        wait_seconds = capacity_retry_coordinator.next_wait_seconds()
+                        cooldown_values = [
+                            float(candidate.get("cooldown_seconds") or 0.0)
+                            for candidate in cooling_candidates
+                            if isinstance(candidate, dict)
+                            and float(candidate.get("cooldown_seconds") or 0.0) > 0
+                        ]
+                        if cooldown_values:
+                            wait_seconds = min(wait_seconds, min(cooldown_values))
+                        if capacity_retry_coordinator.within_deadline():
+                            wakeup_reason = await await_with_client_disconnect(
+                                lambda: capacity_retry_coordinator.sleep_with_wakeup(
+                                    wait_seconds,
+                                    error_class="upstream_capacity",
+                                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                                ),
+                                request=request,
+                            )
+                            capacity_retry_coordinator.record_retry(
+                                wakeup_reason,
+                                error_class="upstream_capacity",
+                                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            )
+                            continue
+            if (
                 exc.status_code == status.HTTP_409_CONFLICT
                 and selection_error_code
                 == "aawm_session_owner_redispatch_required"

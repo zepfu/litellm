@@ -6513,6 +6513,21 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             "type": "rate_limit_error",
             "code": "aawm_codex_auto_agent_all_candidates_cooling_down",
         },
+        "alias_model": alias_model,
+        "route_family": "codex_responses",
+        "failure_phase": "alias_selection_cooling_down",
+        "attempted_provider_call": any(
+            candidate.get("attempted_provider_call") is True
+            for candidate in skipped
+            if isinstance(candidate, dict)
+        ),
+        "provider_returned": any(
+            candidate.get("attempted_provider_call") is True
+            and str(candidate.get("provider") or "").strip().lower() == "openai"
+            for candidate in skipped
+            if isinstance(candidate, dict)
+        ),
+        "status_code": 429,
         "candidates": _redact_auto_agent_account_identity(
             skipped,
             redact_cooldown_keys=True,
