@@ -1,0 +1,45 @@
+# Codex on the configured alpha target using muse-spark-1.3-contributor.
+# Minimal-token success is exact PONG, not the default tool_command walk.
+# Use with:
+#   python scripts/harnessv2/run.py --instance litellm-alpha --tui codex \
+#     --test model \
+#     --overlay scripts/harnessv2/config/overlays/codex_muse_spark_contributor.yaml
+# Optional meta agent enablement for the same ID:
+#   extra_c_overrides include agents.meta.enabled=true
+models:
+  compiled_aliases:
+    - muse-spark-1.3-contributor
+    - muse-spark-1.3
+  groups:
+    muse_spark_13_contributor:
+      - muse-spark-1.3-contributor
+prompts:
+  codex_muse_spark_minimal:
+    file: prompts/codex_muse_spark_minimal.txt
+tuis:
+  codex:
+    default_models:
+      - muse-spark-1.3-contributor
+    model_prompt: codex_muse_spark_minimal
+    extra_c_overrides:
+      - 'approval_policy="never"'
+      - 'sandbox_mode="workspace-write"'
+      - 'features.guardian_approval=false'
+      - 'projects."{cwd}".trust_level="trusted"'
+      - 'model_reasoning_effort="minimal"'
+      - 'agents.meta.enabled=true'
+    select_model:
+      tools_for_model: false
+      pass_mode: exact_pong
+      standalone_pass_tokens: []
+      reply_needles:
+        - PONG
+        - "No endpoints found for"
+        - "404 Not Found"
+        - "status code 404"
+        - "Error: 404"
+        - "Unknown model"
+      selected_needles:
+        - "{selector}"
+        - "{model}"
+        - muse-spark-1.3-contributor

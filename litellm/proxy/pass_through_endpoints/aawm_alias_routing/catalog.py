@@ -47,6 +47,8 @@ SERVED_CONCRETE_MODELS: Tuple[Tuple[str, str, str], ...] = (
         "opencode_zen",
     ),
     ("big-pickle", "opencode/big-pickle", "opencode_zen"),
+    ("muse-spark-1.3", "muse-spark-1.3", "muse_code"),
+    ("muse-spark-1.3-contributor", "muse-spark-1.3-contributor", "muse_code"),
 )
 
 PROVENANCE_BUNDLED_MAP = "bundled_map"

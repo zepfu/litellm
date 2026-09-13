@@ -5,10 +5,14 @@ When ``AAWM_MUSE_CODE_FACADE_ENABLED`` is truthy (``1`` / ``true`` /
 
 - ``GET /muse-code/models`` forwards to ``https://api.meta.ai/muse-code/models``
 - Muse-shaped ``POST /responses`` forwards to ``https://api.meta.ai/v1/responses``
+- Codex ``POST /openai_passthrough/v1/responses`` with those same catalog ids
+  uses the same Meta contract (no LiteLLM aliases)
 
-The client's Meta OAuth/API ``Authorization: Bearer`` is forwarded. Catalog
-and call bodies are not rewritten onto LiteLLM aliases. Observability is a
-side channel (``route_family=muse_code``) and never persists credentials.
+Muse TUI/exec traffic forwards the client's Meta ``Authorization: Bearer``.
+Codex traffic that only names a Muse catalog id uses the host Muse auth file
+when the inbound Bearer is a LiteLLM key. Catalog and call bodies are not
+rewritten onto LiteLLM aliases. Observability is a side channel
+(``route_family=muse_code``) and never persists credentials.
 
 When the facade is disabled, ``GET /muse-code/models`` is unregistered and
 ``POST /responses`` stays on the stock LiteLLM handler.
@@ -28,6 +32,10 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
 from litellm._logging import _redact_string, verbose_proxy_logger
+from litellm.litellm_core_utils.prompt_templates.common_utils import unpack_defs
+from litellm.secret_managers.credential_error_sanitizer import (
+    sanitize_credential_error_message,
+)
 from litellm.proxy.aawm_route_logging import (
     emit_aawm_route_access_log,
     record_aawm_route_rollup_failure,
@@ -47,6 +55,8 @@ from litellm.proxy.auth.user_api_key_auth import (
 
 AAWM_MUSE_CODE_FACADE_ENABLED_ENV = "AAWM_MUSE_CODE_FACADE_ENABLED"
 AAWM_MUSE_CODE_MODEL_IDS_ENV = "AAWM_MUSE_CODE_MODEL_IDS"
+AAWM_MUSE_CODE_AUTH_FILE_ENV = "AAWM_MUSE_CODE_AUTH_FILE"
+DEFAULT_MUSE_CODE_AUTH_FILE = "/home/zepfu/.config/muse/auth.json"
 MUSE_CODE_GATEWAY_PREFIX = "/muse-code"
 MUSE_CODE_ROUTE_FAMILY = "muse_code"
 MUSE_CODE_CLIENT_ID_PREFIX = "tbh:"
@@ -133,6 +143,16 @@ def _muse_code_client_id(request: Request) -> str:
     return _header_value(request, "x-client-id")
 
 
+def _is_muse_client_identity(request: Request) -> bool:
+    """True for Muse TUI/exec identity. Codex model-id traffic is False."""
+
+    client_id = _muse_code_client_id(request)
+    if client_id.startswith(MUSE_CODE_CLIENT_ID_PREFIX):
+        return True
+    user_agent = _muse_code_user_agent(request)
+    return user_agent.lower().startswith(MUSE_CODE_USER_AGENT_PREFIX)
+
+
 def _muse_code_session_id(request: Request) -> str:
     for name in _MUSE_CODE_SESSION_HEADER_NAMES:
         value = _header_value(request, name)
@@ -210,6 +230,62 @@ def _get_upstream_transport() -> Optional[httpx.AsyncBaseTransport]:
     return None
 
 
+def resolve_muse_code_auth_path() -> str:
+    """Return the host Muse auth-file path used to fill a missing inbound Bearer."""
+
+    raw = os.getenv(AAWM_MUSE_CODE_AUTH_FILE_ENV)
+    if isinstance(raw, str) and raw.strip():
+        return os.path.expanduser(raw.strip())
+    return DEFAULT_MUSE_CODE_AUTH_FILE
+
+
+def _usable_muse_code_token(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    return cleaned
+
+
+def load_muse_code_server_bearer() -> Optional[str]:
+    """Read Meta api_key then access_token from the host Muse auth file.
+
+    Missing or unreadable files return None so inbound Muse client Bearer
+    remains the primary credential. Values are never logged.
+    """
+
+    path = resolve_muse_code_auth_path()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        message = sanitize_credential_error_message(str(exc))
+        verbose_proxy_logger.warning(
+            "Muse Code gateway could not read host auth file: %s",
+            message,
+            extra={
+                "source": "muse_code_gateway",
+                "failure_kind": "gateway_auth_file_unreadable",
+                "route_family": MUSE_CODE_ROUTE_FAMILY,
+            },
+        )
+        return None
+    if not isinstance(payload, dict):
+        return None
+    providers = payload.get("providers")
+    if not isinstance(providers, dict):
+        return None
+    meta = providers.get("meta")
+    if not isinstance(meta, dict):
+        return None
+    return _usable_muse_code_token(meta.get("api_key")) or _usable_muse_code_token(
+        meta.get("access_token")
+    )
+
+
 def _extract_inbound_bearer(request: Request) -> Optional[str]:
     authorization = request.headers.get("authorization") or request.headers.get(
         "Authorization"
@@ -228,8 +304,20 @@ def _extract_inbound_bearer(request: Request) -> Optional[str]:
     return bearer
 
 
-def _require_inbound_bearer(request: Request) -> str:
-    bearer = _extract_inbound_bearer(request)
+def _require_inbound_bearer(
+    request: Request,
+    *,
+    allow_host_file: bool = False,
+) -> str:
+    if _is_muse_client_identity(request) or not allow_host_file:
+        bearer = _extract_inbound_bearer(request)
+        if bearer is None:
+            raise HTTPException(
+                status_code=401,
+                detail="Muse Code gateway authorization is invalid.",
+            )
+        return bearer
+    bearer = load_muse_code_server_bearer()
     if bearer is None:
         raise HTTPException(
             status_code=401,
@@ -238,12 +326,222 @@ def _require_inbound_bearer(request: Request) -> str:
     return bearer
 
 
+_MUSE_CODE_SCHEMA_REF_KEYS: frozenset[str] = frozenset({"$ref", "$dynamicRef"})
+_MUSE_CODE_SCHEMA_DEF_KEYS: frozenset[str] = frozenset({"$defs", "definitions"})
+
+
+def _schema_contains_ref(value: Any) -> bool:
+    if isinstance(value, dict):
+        if _MUSE_CODE_SCHEMA_REF_KEYS & set(value.keys()):
+            return True
+        return any(_schema_contains_ref(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_schema_contains_ref(item) for item in value)
+    return False
+
+
+def _drop_schema_def_keys(value: Any) -> None:
+    if isinstance(value, dict):
+        for key in list(value.keys()):
+            if key in _MUSE_CODE_SCHEMA_DEF_KEYS:
+                value.pop(key, None)
+                continue
+            _drop_schema_def_keys(value[key])
+    elif isinstance(value, list):
+        for item in value:
+            _drop_schema_def_keys(item)
+
+
+def _replace_leftover_schema_refs(value: Any) -> Any:
+    """Replace unresolved circular ``$ref`` nodes with a non-recursive object."""
+
+    if isinstance(value, dict):
+        if _MUSE_CODE_SCHEMA_REF_KEYS & set(value.keys()):
+            return {"type": "object"}
+        return {
+            key: _replace_leftover_schema_refs(item) for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_replace_leftover_schema_refs(item) for item in value]
+    return value
+
+
+def _flatten_muse_code_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    flattened = json.loads(json.dumps(schema))
+    unpack_defs(flattened, {})
+    _drop_schema_def_keys(flattened)
+    replaced = _replace_leftover_schema_refs(flattened)
+    return replaced if isinstance(replaced, dict) else flattened
+
+
+_MUSE_CODE_SUPPORTED_INPUT_ITEM_TYPES: frozenset[str] = frozenset(
+    {
+        "message",
+        "function_call",
+        "function_call_output",
+        "reasoning",
+        "item_reference",
+    }
+)
+_MUSE_CODE_SUPPORTED_CONTENT_TYPES: frozenset[str] = frozenset(
+    {
+        "input_text",
+        "output_text",
+        "text",
+        "input_image",
+        "output_image",
+        "refusal",
+    }
+)
+
+
+def _muse_code_text_from_content(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                parts.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            for key in ("text", "encrypted_content", "output"):
+                nested = item.get(key)
+                if isinstance(nested, str) and nested.strip():
+                    parts.append(nested)
+                    break
+        return "\n".join(parts)
+    if isinstance(value, dict):
+        for key in ("text", "encrypted_content", "output"):
+            nested = value.get(key)
+            if isinstance(nested, str) and nested.strip():
+                return nested
+    return ""
+
+
+def _rewrite_muse_code_input_item(item: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(item, dict):
+        return None
+    item_type = item.get("type")
+    if not isinstance(item_type, str) or not item_type.strip():
+        text = _muse_code_text_from_content(item.get("content") or item.get("text"))
+        if not text.strip():
+            return None
+        return {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        }
+    if item_type in _MUSE_CODE_SUPPORTED_INPUT_ITEM_TYPES:
+        if item_type != "message":
+            return item
+        rewritten = dict(item)
+        content = rewritten.get("content")
+        if isinstance(content, list):
+            parts: list[Any] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    parts.append(part)
+                    continue
+                part_type = part.get("type")
+                if (
+                    isinstance(part_type, str)
+                    and part_type in _MUSE_CODE_SUPPORTED_CONTENT_TYPES
+                ):
+                    parts.append(part)
+                    continue
+                text = _muse_code_text_from_content(part)
+                if text.strip():
+                    parts.append({"type": "input_text", "text": text})
+            rewritten["content"] = parts
+        return rewritten
+    text = _muse_code_text_from_content(
+        item.get("content")
+        or item.get("text")
+        or item.get("encrypted_content")
+        or item.get("message")
+        or item.get("output")
+    )
+    if not text.strip():
+        return None
+    role = item.get("role") if item.get("role") in {"user", "assistant", "developer", "system"} else "user"
+    return {
+        "type": "message",
+        "role": role,
+        "content": [{"type": "input_text", "text": text}],
+    }
+
+
+def _rewrite_muse_code_input(value: Any) -> Any:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return value
+    rewritten: list[Any] = []
+    for item in value:
+        converted = _rewrite_muse_code_input_item(item)
+        if converted is not None:
+            rewritten.append(converted)
+    return rewritten
+
+
+def _rewrite_muse_code_tool_schema(value: Any) -> Any:
+    if isinstance(value, dict):
+        rewritten = {
+            key: _rewrite_muse_code_tool_schema(item) for key, item in value.items()
+        }
+        parameters = rewritten.get("parameters")
+        if isinstance(parameters, dict) and _schema_contains_ref(parameters):
+            rewritten["parameters"] = _flatten_muse_code_json_schema(parameters)
+        return rewritten
+    if isinstance(value, list):
+        return [_rewrite_muse_code_tool_schema(item) for item in value]
+    return value
+
+
+def _prepare_codex_muse_code_request_body(
+    request: Request,
+    request_body: bytes,
+    parsed_body: Optional[dict[str, Any]],
+) -> bytes:
+    """Flatten Codex recursive tool JSON schemas for Meta. Muse TUI bodies stay intact."""
+
+    if _is_muse_client_identity(request) or not parsed_body:
+        return request_body
+    rewritten = dict(parsed_body)
+    changed = False
+    tools = rewritten.get("tools")
+    if isinstance(tools, list) and _schema_contains_ref(tools):
+        rewritten["tools"] = _rewrite_muse_code_tool_schema(tools)
+        changed = True
+    inbound_input = rewritten.get("input")
+    converted_input = _rewrite_muse_code_input(inbound_input)
+    if converted_input != inbound_input:
+        rewritten["input"] = converted_input
+        changed = True
+    if not changed:
+        return request_body
+    return json.dumps(rewritten, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+
+
 def _get_upstream_headers(request: Request) -> dict[str, str]:
     headers: dict[str, str] = {}
+    muse_client = _is_muse_client_identity(request)
     for name, value in request.headers.items():
         lowered = name.lower()
         if lowered in _MUSE_CODE_FORWARDED_REQUEST_HEADERS and value:
+            if lowered == "authorization" and not muse_client:
+                continue
+            if lowered == "content-length":
+                continue
             headers[lowered] = value
+    if "authorization" not in headers:
+        bearer = load_muse_code_server_bearer()
+        if bearer is not None:
+            headers["authorization"] = f"Bearer {bearer}"
     return headers
 
 
@@ -656,9 +954,23 @@ async def _proxy_muse_code_request(
         catalog=catalog,
         session_id=session_id,
     )
+    if not catalog:
+        request_body = _prepare_codex_muse_code_request_body(
+            request,
+            request_body,
+            provider_bound_body,
+        )
+        request_payload, route_kwargs, provider_bound_body = _build_gateway_route_state(
+            request_body=request_body,
+            catalog=catalog,
+            session_id=session_id,
+        )
 
     try:
-        _require_inbound_bearer(request)
+        _require_inbound_bearer(
+            request,
+            allow_host_file=not catalog,
+        )
     except HTTPException as copilot_exc:
         _log_gateway_failure(
             request=request,

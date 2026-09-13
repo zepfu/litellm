@@ -258,9 +258,25 @@ Default client model: `muse-spark-1.3-contributor` (host
 `~/.config/muse/settings.json`). Alpha does not synthesize a catalog or
 remap those ids. `GET /muse-code/models` is
 `GET https://api.meta.ai/muse-code/models`; Muse-shaped
-`POST /responses` is `POST https://api.meta.ai/v1/responses`. Meta
-keeps `muse-spark-*` ids. Do not map them onto Z.AI, OpenRouter, TAP,
-or any other unrelated provider.
+`POST /responses` is `POST https://api.meta.ai/v1/responses`. Codex on
+the configured alpha target (`model_provider=litellm-alpha`) may select
+the same existing ids `muse-spark-1.3` and
+`muse-spark-1.3-contributor` on `POST /openai_passthrough/v1/responses`;
+that path uses the same Meta contract and does not create LiteLLM
+aliases. Optional host Codex agent `~/.codex/agents/meta.toml` points
+at `muse-spark-1.3-contributor` when enabled for a run
+(`agents.meta.enabled=true`). Meta keeps `muse-spark-*` ids. Do not
+map them onto Z.AI, OpenRouter, TAP, or any other unrelated provider.
+
+Pay-as-you-go list rates for session-history / `get_model_info` come from
+Meta Model API [Pricing and rate limits](https://dev.meta.ai/docs/pricing-rate-limits.md)
+(verified 2026-09-12). Standard (`muse-spark-1.3`): cached input $0.15 /
+input $1.25 / output $4.25 per 1M tokens. Contributor
+(`muse-spark-1.3-contributor`): cached input $0.002 / input $0.10 /
+output $0.20 per 1M tokens. Cached input is a subset of input tokens,
+not an extra charge. Web search grounding is $2.50 per 1,000 queries in
+addition. Muse Code monthly subscriptions are a different billing path
+and are not these per-token rates.
 
 ### Credentials
 
@@ -268,10 +284,14 @@ or any other unrelated provider.
 Meta; alpha forwards the inbound `Authorization: Bearer` plus
 `x-client-id` and, on model calls, `x-tbh-session-id` /
 `x-meta-ai-gateway-session-id` / `traceparent`. Missing or malformed
-Bearer fails closed. Do not treat the Meta token as a LiteLLM virtual
-key, and do not put Meta OAuth tokens or API keys in Compose,
-Langfuse, or `session_history`. Host Muse login stays in
-`~/.config/muse/auth.json` and is not an alpha bind-mount.
+Bearer from a Muse client fails closed. Do not treat the Meta token as
+a LiteLLM virtual key, and do not put Meta OAuth tokens or API keys in
+Compose, Langfuse, or `session_history`. Host Muse login stays in
+`~/.config/muse/auth.json`. Alpha mounts that directory read-only so
+Codex-selected `muse-spark-*` ids can use the same Meta credential
+(`AAWM_MUSE_CODE_AUTH_FILE`, default
+`/home/zepfu/.config/muse/auth.json`) without forwarding Codex's
+LiteLLM Bearer.
 
 Enable the facade only on alpha:
 
@@ -292,8 +312,12 @@ Leave that variable unset on `litellm-dev` and production. When unset,
   LiteLLM must not run those tools. Namespace tool bodies are forwarded
   unmodified.
 - Approvals are local Muse/MSP, not Meta HTTP.
-- Harness v2 Muse TUI source may exist under `scripts/harnessv2/`;
-  running it still needs an explicit operator request.
+- Harness v2 Muse TUI source may exist under `scripts/harnessv2/`.
+  Codex Spark 1.3 overlays:
+  `scripts/harnessv2/config/overlays/codex_muse_spark_contributor.yaml`
+  (minimal-token `muse-spark-1.3-contributor`) and
+  `scripts/harnessv2/config/overlays/codex_luna_muse_spark.yaml`
+  (`gpt-5.6-luna` spawning that child with parallel tools).
 - Body limits and stream timeouts remain alpha-config knobs and must
   not be added to `litellm-dev-config.yaml`. Do not add Muse spark
   aliases to `litellm-alpha-config.yaml`.

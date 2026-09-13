@@ -81,6 +81,8 @@ services:
       # Mount the containing directory (not the single auth file) so sidecar
       # atomic auth replacement is visible without recreating alpha.
       - /home/zepfu/.config/cursor:/home/zepfu/.config/cursor:ro
+      # Host Muse login for Codex-selected muse-spark-* ids on alpha only.
+      - /home/zepfu/.config/muse:/home/zepfu/.config/muse:ro
       - ${AAWM_KIMI_NATIVE_DESCRIPTOR_DIR:-/home/zepfu/.kimi-code/native-contract}:/run/aawm/kimi-descriptor:ro
       - ${AAWM_GROK_CLIENT_VERSION_CACHE_DIR:-/home/zepfu/.cache/aawm/grok}:/run/aawm/grok:ro
       - /home/zepfu/.qwen/settings.json:/home/zepfu/.qwen/settings.json:ro
@@ -207,6 +209,7 @@ services:
       # Catalog and calls forward the client's Meta Bearer to api.meta.ai.
       - AAWM_MUSE_CODE_FACADE_ENABLED=1
       - AAWM_MUSE_CODE_MODEL_IDS=muse-spark-1.3-contributor,muse-spark-1.3,muse-spark-1.2-contributor,muse-spark-1.2
+      - AAWM_MUSE_CODE_AUTH_FILE=${AAWM_MUSE_CODE_AUTH_FILE:-/home/zepfu/.config/muse/auth.json}
     healthcheck:
       test:
         - CMD

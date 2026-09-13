@@ -1,0 +1,12 @@
+You are the parent on model {parent}.
+
+Call spawn_agent now with agent_type={child} and model={child} and a non-empty message that tells
+the child to run two independent local shell commands in one turn, in
+parallel, not sequentially: `pwd` and `uname -s`. The child must return
+only those two stdout strings. Do not run the commands yourself. Do not
+spawn any other children.
+
+After the child returns, print that exact stdout on its own lines, list
+the child model {child}, then reply with the exact token hv2-codex-child
+on its own line. Do not print the token until the child's stdout is
+visible.

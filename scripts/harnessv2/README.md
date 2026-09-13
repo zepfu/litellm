@@ -125,6 +125,26 @@ python scripts/harnessv2/run.py \
   --dry-run
 ```
 
+Codex Muse Spark 1.3 on alpha (existing ids, no aliases). Minimal-token
+parent and `gpt-5.6-luna` spawning `muse-spark-1.3-contributor` with
+parallel child tools:
+
+```text
+python scripts/harnessv2/run.py \
+  --instance litellm-alpha \
+  --tui codex \
+  --test model \
+  --overlay scripts/harnessv2/config/overlays/codex_muse_spark_contributor.yaml \
+  --dry-run
+
+python scripts/harnessv2/run.py \
+  --instance litellm-alpha \
+  --tui codex \
+  --test orchestration \
+  --overlay scripts/harnessv2/config/overlays/codex_luna_muse_spark.yaml \
+  --dry-run
+```
+
 Minimal Codex OpenAI-egress check (parent `gpt-5.6-luna` dispatches
 `readbasic`; overlay only, not the default Codex orch walk):
 

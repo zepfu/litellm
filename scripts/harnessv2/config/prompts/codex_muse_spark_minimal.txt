@@ -1,0 +1,1 @@
+Reply with exactly the word PONG. Do not spawn agents. Do not run tools.

@@ -1,0 +1,39 @@
+# Codex gpt-5.6-luna parent spawns muse-spark-1.3-contributor with parallel tools.
+# Use with:
+#   python scripts/harnessv2/run.py --instance litellm-alpha --tui codex \
+#     --test orchestration \
+#     --overlay scripts/harnessv2/config/overlays/codex_luna_muse_spark.yaml
+# Host Codex ships ~/.codex/agents/meta.toml pointing at muse-spark-1.3-contributor.
+models:
+  compiled_aliases:
+    - gpt-5.6-luna
+    - muse-spark-1.3-contributor
+    - meta
+  groups:
+    luna_muse_spark_parent:
+      - gpt-5.6-luna
+    luna_muse_spark_children:
+      - muse-spark-1.3-contributor
+prompts:
+  codex_luna_muse_spark:
+    file: prompts/codex_luna_muse_spark.txt
+tuis:
+  codex:
+    default_orchestration_parent: gpt-5.6-luna
+    default_orchestration_children:
+      - muse-spark-1.3-contributor
+    orchestration_prompt: codex_luna_muse_spark
+    extra_c_overrides:
+      - 'approval_policy="never"'
+      - 'sandbox_mode="workspace-write"'
+      - 'features.guardian_approval=false'
+      - 'projects."{cwd}".trust_level="trusted"'
+      - 'agents.meta.enabled=true'
+    select_model:
+      tools_for_orchestration: true
+      pass_mode: tool_command
+      spawn_evidence: codex_parallel_child_tools
+      standalone_pass_tokens:
+        - hv2-codex-child
+      orchestration_pass_needles:
+        - hv2-codex-child

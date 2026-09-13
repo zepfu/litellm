@@ -483,6 +483,8 @@ From `config/tuis.yaml`:
 | Default models | `basic` |
 | Default orch | parent `basic`; `--orchestration-children` required |
 | Minimal OpenAI egress overlay | `config/overlays/codex_luna_readbasic.yaml`: parent `gpt-5.6-luna`, child `readbasic`, prompt `codex_luna_readbasic`. Not the default Codex orch walk. |
+| Muse Spark 1.3 contributor overlay | `config/overlays/codex_muse_spark_contributor.yaml`: `--test model` with `muse-spark-1.3-contributor`, `pass_mode: exact_pong`, optional `agents.meta.enabled=true`. Not the default Codex `tool_command` walk. |
+| Luna → Muse Spark overlay | `config/overlays/codex_luna_muse_spark.yaml`: parent `gpt-5.6-luna`, child `muse-spark-1.3-contributor`, `spawn_evidence: codex_parallel_child_tools` (≥2 consecutive child `function_call` rows). |
 | Forbid | `-p`, `--print`, `--profile`, `exec` |
 | Model tools | on (not `--no-tools` PONG) |
 | Orchestration tools | on |

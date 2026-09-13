@@ -100,6 +100,9 @@ from litellm.proxy.common_utils.http_parsing_utils import (
     get_request_body,
 )
 from litellm.proxy.pass_through_endpoints.common_utils import get_litellm_virtual_key
+from litellm.proxy.pass_through_endpoints.muse_code_gateway import (
+    maybe_proxy_muse_code_responses,
+)
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     HttpPassThroughEndpointHelpers,
     PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS,  # noqa: F401  # consumed by rebound env_policy functions
@@ -6314,6 +6317,10 @@ async def openai_proxy_route(  # noqa: PLR0915
     is_codex_auto_agent_alias_request = False
     if request.method == "POST":
         request_body = await get_request_body(request)
+        if _is_openai_responses_endpoint(endpoint):
+            muse_passthrough = await maybe_proxy_muse_code_responses(request)
+            if muse_passthrough is not None:
+                return muse_passthrough
         is_oa_xai_request = _is_oa_xai_request_body(request_body)
         is_grok_native_oauth_request = _is_openai_responses_endpoint(endpoint) and _is_grok_native_oauth_request_body(
             request_body
