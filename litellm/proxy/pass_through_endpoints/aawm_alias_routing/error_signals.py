@@ -2710,11 +2710,26 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     )
     if openai_alpha_capacity_error_class is not None:
         return openai_alpha_capacity_error_class
-    if "server_overloaded" in tokens or tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS:
+    provider_returned = (
+        getattr(exc, "_aawm_provider_returned", False) is True
+        or getattr(exc, "provider_returned", False) is True
+    )
+    if (
+        attempted_provider_call
+        and provider_returned
+        and (
+            "server_overloaded" in tokens
+            or tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS
+        )
+    ):
         if "server_overloaded" in tokens:
             return "server_overloaded"
         return "capacity_exhausted"
-    if tokens & _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS:
+    if (
+        attempted_provider_call
+        and provider_returned
+        and tokens & _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS
+    ):
         return "rate_limited"
     if "aawm_codex_auto_agent_candidate_unavailable" in tokens:
         return "candidate_unavailable"
@@ -2744,10 +2759,8 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         attempted_provider_call=attempted_provider_call,
     ):
         return "candidate_unavailable"
-    if status_code == 429:
+    if status_code == 429 and attempted_provider_call and provider_returned:
         return "rate_limited"
-    from litellm.proxy._types import ProxyException
-
     route_family = (
         str(candidate.get("route_family") or "").strip().lower()
         if isinstance(candidate, dict)
@@ -2760,8 +2773,8 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         and bool(route_family)
         and not route_family.startswith("anthropic_")
         and (
-            isinstance(exc, ProxyException)
-            or bool(getattr(exc, "_aawm_provider_returned", False))
+            bool(getattr(exc, "_aawm_provider_returned", False))
+            or bool(getattr(exc, "provider_returned", False))
             or _is_codex_auto_agent_cursor_agent_candidate(candidate)
         )
     )

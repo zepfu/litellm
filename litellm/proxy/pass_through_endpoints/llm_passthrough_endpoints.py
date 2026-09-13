@@ -6425,11 +6425,14 @@ async def openai_proxy_route(  # noqa: PLR0915
             identity_readiness = (
                 getattr(exc, "_aawm_xai_identity_readiness", False) is True
             )
+            detail = getattr(exc, "detail", None)
+            detail_mapping = detail if isinstance(detail, dict) else {}
             provider_returned = (
                 not identity_readiness
                 and (
-                    isinstance(exc, ProxyException)
-                    or bool(getattr(exc, "_aawm_provider_returned", False))
+                    getattr(exc, "_aawm_provider_returned", False) is True
+                    or getattr(exc, "provider_returned", False) is True
+                    or detail_mapping.get("provider_returned") is True
                 )
             )
             if identity_readiness:
@@ -6448,7 +6451,15 @@ async def openai_proxy_route(  # noqa: PLR0915
                     if hasattr(exc, field):
                         setattr(terminal_exc, field, getattr(exc, field))
                 raise terminal_exc from exc
-            attempted_provider_call = provider_returned
+            attempted_provider_call = getattr(
+                exc, "attempted_provider_call", None
+            )
+            if not isinstance(attempted_provider_call, bool):
+                attempted_provider_call = detail_mapping.get(
+                    "attempted_provider_call"
+                )
+            if not isinstance(attempted_provider_call, bool):
+                attempted_provider_call = provider_returned
             provider_status_code = (
                 _aawm_error_signals._extract_adapter_exception_status_code(exc)
             )

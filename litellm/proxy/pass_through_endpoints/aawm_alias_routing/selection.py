@@ -655,6 +655,11 @@ def _build_auto_agent_skipped_candidates_from_states(
             "cooldown_scope",
             "failure_phase",
             "attempted_provider_call",
+            "provider_returned",
+            "upstream_status_code",
+            "error_status_code",
+            "error_code",
+            "error_type",
             "auth_status",
             "quota_remaining_pct",
             "quota_snapshot_age_seconds",
@@ -740,6 +745,11 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
         "cooldown_state_source",
         "cooldown_scope",
         "failure_phase",
+        "provider_returned",
+        "upstream_status_code",
+        "error_status_code",
+        "error_code",
+        "error_type",
         "auth_status",
         "quota_remaining_pct",
         "quota_snapshot_age_seconds",
@@ -6522,8 +6532,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             if isinstance(candidate, dict)
         ),
         "provider_returned": any(
-            candidate.get("attempted_provider_call") is True
-            and str(candidate.get("provider") or "").strip().lower() == "openai"
+            candidate.get("provider_returned") is True
             for candidate in skipped
             if isinstance(candidate, dict)
         ),

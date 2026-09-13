@@ -173,9 +173,13 @@ def _store_attempt_failure_state(
     attempt_record: dict[str, Any],
     exc: Any,
 ) -> bool:
+    detail = getattr(exc, "detail", None)
+    detail_mapping = detail if isinstance(detail, dict) else {}
     attempted_provider_call = attempt_record.get("attempted_provider_call")
     if not isinstance(attempted_provider_call, bool):
         attempted_provider_call = getattr(exc, "attempted_provider_call", None)
+    if not isinstance(attempted_provider_call, bool):
+        attempted_provider_call = detail_mapping.get("attempted_provider_call")
     if not isinstance(attempted_provider_call, bool):
         attempted_provider_call = True
     attempt_record["attempted_provider_call"] = attempted_provider_call
@@ -184,6 +188,7 @@ def _store_attempt_failure_state(
         provider_returned = (
             getattr(exc, "_aawm_provider_returned", False) is True
             or getattr(exc, "provider_returned", False) is True
+            or detail_mapping.get("provider_returned") is True
         )
     attempt_record["provider_returned"] = provider_returned
 
@@ -2021,7 +2026,13 @@ async def handle_alias_route(  # noqa: PLR0915
                             and str(candidate.get("provider") or "").strip().lower()
                             == "openai"
                             and float(candidate.get("cooldown_seconds") or 0.0) > 0
-                            and str(candidate.get("skip_reason") or "")
+                            and candidate.get("attempted_provider_call") is True
+                            and candidate.get("provider_returned") is True
+                            and str(
+                                candidate.get("skip_reason")
+                                or candidate.get("reason")
+                                or ""
+                            )
                             .strip()
                             .lower()
                             not in terminal_skip_reasons
