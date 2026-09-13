@@ -303,6 +303,7 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
         "cooldown_until": _auto_agent_alias_cooldown_until(normalized_cooldown_seconds),
         "selected": selected,
         "skipped": skipped,
+        "selection_priority": candidate.get("selection_priority"),
         "last_resort": bool(candidate.get("last_resort")),
         "in_flight_session": bool(selection.get("in_flight_session")),
         "redispatch_required": redispatch_required,

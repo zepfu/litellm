@@ -376,6 +376,7 @@ def _codex_auto_agent_candidate_public_shape(
         "provider": candidate["provider"],
         "model": candidate["model"],
         "route_family": candidate["route_family"],
+        "selection_priority": candidate.get("selection_priority"),
         "last_resort": bool(candidate.get("last_resort")),
     }
     for source_field, public_field in (

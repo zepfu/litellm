@@ -1378,6 +1378,7 @@ def _add_codex_auto_agent_alias_metadata(
             "codex_auto_agent_selected_provider": candidate["provider"],
             "codex_auto_agent_selected_model": target_model,
             "codex_auto_agent_selected_route_family": candidate["route_family"],
+            "codex_auto_agent_selected_priority": candidate.get("selection_priority"),
             "codex_auto_agent_selected_last_resort": bool(candidate.get("last_resort")),
             **(
                 {"codex_auto_agent_config_reasoning_effort": configured_reasoning_effort}
@@ -1595,6 +1596,7 @@ def _add_anthropic_auto_agent_alias_metadata(
             "anthropic_auto_agent_selected_provider": candidate["provider"],
             "anthropic_auto_agent_selected_model": target_model,
             "anthropic_auto_agent_selected_route_family": candidate["route_family"],
+            "anthropic_auto_agent_selected_priority": candidate.get("selection_priority"),
             "anthropic_auto_agent_selected_last_resort": bool(candidate.get("last_resort")),
             **(
                 {"anthropic_auto_agent_config_reasoning_effort": configured_reasoning_effort}

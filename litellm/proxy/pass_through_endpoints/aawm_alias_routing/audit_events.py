@@ -263,6 +263,7 @@ def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
             "cooldown_seconds",
             "cooldown_scope",
             "retry_after_seconds",
+            "selection_priority",
         ):
             if terminal_candidate.get(key) is None:
                 value = detail_mapping.get(key)
