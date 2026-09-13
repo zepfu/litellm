@@ -130,6 +130,7 @@ def _first_auto_agent_alias_identity_from_mappings(
     mappings: list[Any] = [
         request_body.get("litellm_metadata"),
         request_body.get("metadata"),
+        request_body.get("client_metadata"),
         request_body.get("source"),
     ]
     for mapping in list(mappings):

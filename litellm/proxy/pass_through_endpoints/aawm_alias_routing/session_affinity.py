@@ -176,6 +176,7 @@ _REQUEST_STATE_CODEX_AUTO_REVIEW_SESSION_IDENTITY_ATTR = (
 _REQUEST_STATE_CODEX_AUTO_REVIEW_PARENT_SESSION_IDENTITY_ATTR = (
     "_aawm_codex_auto_review_parent_session_identity"
 )
+_REQUEST_STATE_CONTINUITY_RECEIPT_ATTR = "_aawm_session_owner_continuity_receipt"
 _RECORD_STATE_FIELD = "state"
 _RECORD_OWNER_FIELD = "owner"
 _RECORD_ATTRIBUTES_FIELD = "attributes"
@@ -399,6 +400,60 @@ def get_request_codex_auto_review_parent_session_identity(
 
 def request_has_effective_session_identity(request: Any) -> bool:
     return get_request_effective_session_identity(request) is not None
+
+
+def record_session_owner_continuity_receipt(
+    request: Any,
+    *,
+    phase: str,
+    source: Optional[str] = None,
+    session_identity: Optional[str] = None,
+    outcome: Optional[str] = None,
+    cache_key: Optional[str] = None,
+    detail: Optional[str] = None,
+) -> None:
+    """Keep bounded, secret-free evidence for identity and owner transitions."""
+
+    state = getattr(request, "state", None) if request is not None else None
+    if state is None:
+        return
+    event: Payload = {
+        "phase": _sanitize_session_owner_log_label(phase, max_length=64),
+        "source": _sanitize_session_owner_log_label(source, max_length=96),
+        "outcome": _sanitize_session_owner_log_label(outcome, max_length=96),
+        "canonical_session_identity_hash": _hash_session_owner_log_identifier(
+            session_identity
+        ),
+        "cache_key_hash": _hash_session_owner_log_identifier(cache_key),
+        "detail": _sanitize_session_owner_log_label(detail, max_length=160),
+        "recorded_at_epoch": round(time.time(), 3),
+    }
+    event = {key: value for key, value in event.items() if value is not None}
+    try:
+        existing = getattr(state, _REQUEST_STATE_CONTINUITY_RECEIPT_ATTR, None)
+        events = (
+            list(existing.get("events") or ())
+            if isinstance(existing, Mapping)
+            else []
+        )
+        events.append(event)
+        receipt = {
+            "latest": event,
+            "events": events[-16:],
+        }
+        setattr(state, _REQUEST_STATE_CONTINUITY_RECEIPT_ATTR, receipt)
+    except Exception:  # noqa: BLE001
+        return
+
+
+def get_session_owner_continuity_receipt(request: Any) -> Optional[Payload]:
+    state = getattr(request, "state", None) if request is not None else None
+    receipt = (
+        getattr(state, _REQUEST_STATE_CONTINUITY_RECEIPT_ATTR, None)
+        if state is not None
+        else None
+    )
+    return cast(Payload, receipt) if isinstance(receipt, Mapping) else None
 
 
 def activate_codex_auto_review_session_identity(
@@ -728,22 +783,39 @@ def resolve_canonical_session_identity(
     legacy affinity keys are stripped.
     """
 
+    def _resolved(value: Any, source: str) -> Optional[str]:
+        cleaned = _clean_optional_str(value)
+        if cleaned is None:
+            return None
+        canonical = _strip_legacy_affinity_prefixes(cleaned)
+        record_session_owner_continuity_receipt(
+            request,
+            phase="identity_resolve",
+            source=source,
+            session_identity=canonical,
+            outcome="resolved",
+        )
+        return canonical
+
     if session_identity is not None:
         cleaned = _clean_optional_str(session_identity)
         if cleaned is None:
             return None
-        return _strip_legacy_affinity_prefixes(cleaned)
+        return _resolved(cleaned, "explicit")
 
     effective_identity = get_request_effective_session_identity(request)
     if effective_identity is not None:
-        return effective_identity
+        return _resolved(effective_identity, "request_effective")
 
     review_identity = get_request_codex_auto_review_session_identity(request)
     if review_identity is not None:
-        return review_identity
+        return _resolved(review_identity, "codex_auto_review")
 
     body = request_body if isinstance(request_body, Mapping) else {}
     metadata = body.get("litellm_metadata") if isinstance(body, Mapping) else None
+    client_metadata = (
+        body.get("client_metadata") if isinstance(body, Mapping) else None
+    )
     if isinstance(metadata, dict):
         for key in (
             "thread_id",
@@ -753,7 +825,21 @@ def resolve_canonical_session_identity(
         ):
             value = _clean_optional_str(metadata.get(key))
             if value is not None:
-                return _strip_legacy_affinity_prefixes(value)
+                return _resolved(value, f"litellm_metadata.{key}")
+    if isinstance(client_metadata, Mapping):
+        for key in (
+            "thread_id",
+            "aawm_thread_id",
+            "codex_thread_id",
+            "claude_thread_id",
+            "session_id",
+            "aawm_session_id",
+            "codex_session_id",
+            "claude_session_id",
+        ):
+            value = _clean_optional_str(client_metadata.get(key))
+            if value is not None:
+                return _resolved(value, f"client_metadata.{key}")
 
     headers = None
     if request is not None:
@@ -775,7 +861,7 @@ def resolve_canonical_session_identity(
         ):
             value = header_map.get(key)
             if value is not None:
-                return _strip_legacy_affinity_prefixes(value)
+                return _resolved(value, f"header.{key}")
         # Common dash/underscore variants
         for name, value in header_map.items():
             if value and name.replace("-", "_") in {
@@ -785,7 +871,7 @@ def resolve_canonical_session_identity(
                 "x_codex_thread_id",
                 "x_claude_thread_id",
             }:
-                return _strip_legacy_affinity_prefixes(value)
+                return _resolved(value, f"header.{name}")
 
     if isinstance(body, Mapping):
         for key in (
@@ -796,7 +882,7 @@ def resolve_canonical_session_identity(
         ):
             value = _clean_optional_str(body.get(key))
             if value is not None:
-                return _strip_legacy_affinity_prefixes(value)
+                return _resolved(value, f"body.{key}")
 
     if isinstance(metadata, dict):
         for key in (
@@ -808,7 +894,7 @@ def resolve_canonical_session_identity(
         ):
             value = _clean_optional_str(metadata.get(key))
             if value is not None:
-                return _strip_legacy_affinity_prefixes(value)
+                return _resolved(value, f"litellm_metadata.{key}")
 
     if headers is not None:
         for key in (
@@ -821,7 +907,7 @@ def resolve_canonical_session_identity(
         ):
             value = header_map.get(key)
             if value is not None:
-                return _strip_legacy_affinity_prefixes(value)
+                return _resolved(value, f"header.{key}")
         # Common dash/underscore variants
         for name, value in header_map.items():
             if value and name.replace("-", "_") in {
@@ -830,13 +916,13 @@ def resolve_canonical_session_identity(
                 "codex_session_id",
                 "claude_session_id",
             }:
-                return _strip_legacy_affinity_prefixes(value)
+                return _resolved(value, f"header.{name}")
 
     if isinstance(body, Mapping):
         for key in ("session_id", "aawm_session_id"):
             value = _clean_optional_str(body.get(key))
             if value is not None:
-                return _strip_legacy_affinity_prefixes(value)
+                return _resolved(value, f"body.{key}")
     return None
 
 
@@ -1844,6 +1930,12 @@ async def get_session_owner_record(
 
     cleaned = _clean_optional_str(session_identity)
     if cleaned is None:
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_lookup",
+            source="session_identity",
+            outcome="skipped_missing_identity",
+        )
         return None, None, None
     cleaned = _strip_legacy_affinity_prefixes(cleaned)
     cache_key = build_aawm_alias_routing_session_owner_cache_key(
@@ -1851,6 +1943,15 @@ async def get_session_owner_record(
     )
     redis_cache, error = await _get_redis_cache()
     if error is not None or redis_cache is None:
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_lookup",
+            source="durable_cache",
+            session_identity=cleaned,
+            cache_key=cache_key,
+            outcome="error",
+            detail=error,
+        )
         return None, cache_key, error or "session_owner: durable cache unavailable"
     try:
         record = await _read_session_owner_record(
@@ -1874,7 +1975,32 @@ async def get_session_owner_record(
             if wait_error is not None:
                 return record, cache_key, wait_error
     except RuntimeError as exc:
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_lookup",
+            source="redis",
+            session_identity=cleaned,
+            cache_key=cache_key,
+            outcome="error",
+            detail=str(exc),
+        )
         return None, cache_key, str(exc)
+    record_session_owner_continuity_receipt(
+        request,
+        phase="owner_lookup",
+        source="redis",
+        session_identity=cleaned,
+        cache_key=cache_key,
+        outcome=(
+            "owned"
+            if _record_state(record) == SessionOwnerRecordState.OWNED.value
+            else (
+                "reserved"
+                if _record_state(record) == SessionOwnerRecordState.RESERVED.value
+                else "missing"
+            )
+        ),
+    )
     return record, cache_key, None
 
 
@@ -3358,19 +3484,48 @@ async def finalize_request_session_owner_lease(
     if active is None or not active.held_reservation or active.promoted or active.released:
         return None
     if exc is not None:
-        return await finalize_session_owner_lease_on_failure(active)
+        result = await finalize_session_owner_lease_on_failure(active)
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_finalize",
+            source="failure",
+            session_identity=active.session_identity,
+            cache_key=active.cache_key,
+            outcome=result.outcome.value if result is not None else "skipped",
+            detail=result.error if result is not None else None,
+        )
+        return result
 
     status = getattr(response, "status_code", None)
     ok = response is not None and (
         status is None or (isinstance(status, int) and status < 300)
     )
     if not ok:
-        return await finalize_session_owner_lease_on_failure(active)
+        result = await finalize_session_owner_lease_on_failure(active)
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_finalize",
+            source="non_success_response",
+            session_identity=active.session_identity,
+            cache_key=active.cache_key,
+            outcome=result.outcome.value if result is not None else "skipped",
+            detail=result.error if result is not None else None,
+        )
+        return result
 
     result = await finalize_session_owner_lease_on_success(
         active,
         attributes=attributes or active.attributes,
         candidate=candidate,
+    )
+    record_session_owner_continuity_receipt(
+        request,
+        phase="owner_finalize",
+        source="success",
+        session_identity=active.session_identity,
+        cache_key=active.cache_key,
+        outcome=result.outcome.value if result is not None else "skipped",
+        detail=result.error if result is not None else None,
     )
     if (
         raise_on_promote_failure
@@ -4127,6 +4282,7 @@ def _emit_session_owner_redispatch_observability(
         failure_phase=failure_phase,
         attempted_provider_call=attempted_provider_call,
     )
+    continuity_receipt = get_session_owner_continuity_receipt(request)
     try:
         endpoint = None
         if request is not None:
@@ -4239,6 +4395,7 @@ def _emit_session_owner_redispatch_observability(
                     mismatch_reason,
                     max_length=_SESSION_OWNER_LOG_MAX_REASON_CHARS,
                 ),
+                "session_owner_continuity_receipt": continuity_receipt,
             },
             failure_class="session_owner_redispatch",
             attempts=None,
@@ -4512,6 +4669,15 @@ def raise_session_owner_redispatch_required(
         failure_phase == "session_owner_competing_reservation"
         and _competing_reservation_log_is_deferred(request)
     ):
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_rejection",
+            source=failure_phase,
+            session_identity=session_identity,
+            cache_key=cache_key,
+            outcome="redispatch_required",
+            detail=mismatch_reason or message,
+        )
         _emit_session_owner_redispatch_observability(
             session_identity=session_identity,
             failure_phase=failure_phase,
@@ -4987,6 +5153,15 @@ async def ensure_session_owner_guard_for_request(
                     reservation_token=active_lease.reservation_token,
                 ),
             )
+            record_session_owner_continuity_receipt(
+                request,
+                phase="owner_guard",
+                source="request_lease",
+                session_identity=resolved_session_identity,
+                cache_key=mismatch_cache_key,
+                outcome=guard.decision.value,
+                detail=mismatch_reason,
+            )
             if raise_on_redispatch:
                 raise_session_owner_redispatch_required(
                     session_identity=resolved_session_identity,
@@ -5009,6 +5184,15 @@ async def ensure_session_owner_guard_for_request(
         or (active_lease.owner_id if active_lease is not None else None),
         reservation_token=token,
         require_exact_attributes=require_exact_attributes,
+    )
+    record_session_owner_continuity_receipt(
+        request,
+        phase="owner_guard",
+        source="session_owner_guard",
+        session_identity=guard.session_identity,
+        cache_key=guard.cache_key,
+        outcome=guard.decision.value,
+        detail=guard.mismatch_reason,
     )
     if (
         raise_on_redispatch

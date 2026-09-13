@@ -1468,6 +1468,19 @@ def _resolve_codex_auto_agent_session_key(
     metadata = request_body.get("litellm_metadata")
     metadata_session_id = metadata.get("session_id") if isinstance(metadata, dict) else None
     session_id = _clean_codex_auth_value(metadata_session_id)
+    client_metadata = request_body.get("client_metadata")
+    if session_id is None and isinstance(client_metadata, dict):
+        for key in (
+            "session_id",
+            "aawm_session_id",
+            "codex_session_id",
+            "thread_id",
+            "aawm_thread_id",
+            "codex_thread_id",
+        ):
+            session_id = _clean_codex_auth_value(client_metadata.get(key))
+            if session_id is not None:
+                break
     headers = _safe_get_request_headers(request)
     if session_id is None:
         session_id = _get_codex_auto_agent_header(headers, "session_id") or _get_codex_auto_agent_header(
