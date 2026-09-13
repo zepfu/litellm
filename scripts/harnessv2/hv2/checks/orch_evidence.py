@@ -682,8 +682,9 @@ def _grok_session_tool_records(
     session_dir: str | None,
     *,
     since_mtime: float | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], bool]:
     records: list[dict[str, Any]] = []
+    truncated = False
     seen: set[str] = set()
     for root in _grok_workspace_session_roots(session_dir):
         for path in _session_jsonl_paths(root, since_mtime=since_mtime)[
@@ -693,9 +694,11 @@ def _grok_session_tool_records(
             if key in seen:
                 continue
             seen.add(key)
-            for obj in _iter_jsonl_objects(path):
+            bounded_read = _iter_jsonl_objects(path)
+            for obj in bounded_read:
                 records.append(obj)
-    return records
+            truncated = truncated or bounded_read.truncated
+    return records, truncated
 
 
 def _grok_nested_update(obj: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -827,9 +830,11 @@ def grok_spawn_tool_evidence(
     failures: list[str] = []
     sent = (prompt or "").strip()
     current = _grok_current_turn_text(pane, prompt, after_echo_index)
-    session_records = _grok_session_tool_records(
+    session_records, session_truncated = _grok_session_tool_records(
         session_dir, since_mtime=since_mtime
     )
+    if session_truncated:
+        failures.append("Grok transcript exceeded bounded evidence read")
     session_tool_calls = [
         obj for obj in session_records if _grok_record_is_tool_call(obj)
     ]
@@ -1077,8 +1082,10 @@ def muse_spawn_tool_evidence(
     tool_names: set[str] = set()
     event_kinds: set[str] = set()
     result_ready = False
+    session_truncated = False
     for path in session_paths:
-        for obj in _iter_jsonl_objects(path):
+        bounded_read = _iter_jsonl_objects(path)
+        for obj in bounded_read:
             kind = _muse_event_kind(obj)
             if kind:
                 event_kinds.add(kind)
@@ -1086,6 +1093,9 @@ def muse_spawn_tool_evidence(
             tool_names.update(names)
             if kind in _MUSE_RESULT_EVENTS or names & _MUSE_RESULT_TOOLS:
                 result_ready = True
+        session_truncated = session_truncated or bounded_read.truncated
+    if session_truncated:
+        failures.append("Muse transcript exceeded bounded evidence read")
 
     spawn_chrome = False
     for match in _MUSE_SPAWN_CHROME_RE.finditer(current):
