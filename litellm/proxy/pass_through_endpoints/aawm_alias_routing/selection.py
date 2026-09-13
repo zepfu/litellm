@@ -712,54 +712,28 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
                 return value
         return ""
 
-    def _skip_observation_base(
+    def _occurrence_discriminator(
         candidate: Mapping[str, Any],
-    ) -> tuple[str, ...]:
+    ) -> tuple[Any, ...]:
+        """Identify one compiled route occurrence without account state.
+
+        Provider/model/route are not sufficient: nested aliases can promote
+        the same route at a different priority or across the last-resort
+        boundary. Those fields are stable for compiled candidates and are
+        retained on captured attempt/skip records.
+        """
+
         return (
             *_identity(candidate),
-            _first_identity_value(
-                candidate,
-                "account_hash",
-                "codex_oauth_account_hash",
-                "xai_oauth_account_hash",
-            ),
-            _first_identity_value(
-                candidate,
-                "account_lane",
-                "codex_oauth_lane_key",
-                "xai_oauth_lane_key",
-            ),
-            _first_identity_value(candidate, "lane_key"),
-            str(candidate.get("cooldown_scope") or "").strip(),
-            str(
-                candidate.get("reason")
-                or candidate.get("skip_reason")
-                or "unavailable"
-            ).strip(),
-            str(
-                candidate.get("candidate_semantic_ineligibility_reason")
-                or ""
-            ).strip(),
+            _first_identity_value(candidate, "selection_priority"),
+            bool(candidate.get("last_resort")),
         )
 
-    def _skip_observations_are_same_occurrence(
-        left: Mapping[str, Any],
-        right: Mapping[str, Any],
-    ) -> bool:
-        if _skip_observation_base(left) != _skip_observation_base(right):
-            return False
-        left_cooldown_key = str(left.get("cooldown_key") or "").strip()
-        right_cooldown_key = str(right.get("cooldown_key") or "").strip()
-        return not (
-            left_cooldown_key
-            and right_cooldown_key
-            and left_cooldown_key != right_cooldown_key
-        )
+    def _capture_identity(candidate: Mapping[str, Any]) -> tuple[Any, ...]:
+        """Identify one route occurrence plus its account/lane/cooldown."""
 
-    def _skip_occurrence_values(
-        candidate: Mapping[str, Any],
-    ) -> tuple[str, ...]:
         return (
+            _occurrence_discriminator(candidate),
             _first_identity_value(
                 candidate,
                 "account_hash",
@@ -773,26 +747,37 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
                 "xai_oauth_lane_key",
             ),
             _first_identity_value(candidate, "lane_key"),
-            _first_identity_value(candidate, "cooldown_key"),
-            str(candidate.get("cooldown_scope") or "").strip(),
+            _first_identity_value(
+                candidate,
+                "cooldown_key",
+                "logical_cooldown_key",
+            ),
+            _first_identity_value(candidate, "cooldown_scope"),
+        )
+
+    def _skip_identity(candidate: Mapping[str, Any]) -> tuple[Any, ...]:
+        return (
+            *_capture_identity(candidate),
+            _first_identity_value(candidate, "skip_reason", "reason")
+            or "unavailable",
+            _first_identity_value(
+                candidate,
+                "candidate_semantic_ineligibility_reason",
+            ),
         )
 
     normalized_skipped: list[dict[str, Any]] = []
+    normalized_skipped_by_identity: dict[tuple[Any, ...], dict[str, Any]] = {}
     for candidate in (
         *(stored_skipped if isinstance(stored_skipped, list) else []),
         *(skipped_candidates or []),
     ):
         if not isinstance(candidate, dict):
             continue
-        existing = next(
-            (
-                prior
-                for prior in normalized_skipped
-                if _skip_observations_are_same_occurrence(prior, candidate)
-            ),
-            None,
-        )
+        occurrence_identity = _skip_identity(candidate)
+        existing = normalized_skipped_by_identity.get(occurrence_identity)
         if existing is None:
+            normalized_skipped_by_identity[occurrence_identity] = candidate
             normalized_skipped.append(candidate)
             continue
         for field, value in candidate.items():
@@ -806,28 +791,31 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
             ingress=ingress,
         ).candidates
     )
-    if not compiled_candidates:
-        if normalized_attempts:
-            seen_attempt_identities: set[tuple[str, str, str]] = set()
-            for attempt in normalized_attempts:
-                identity = _identity(attempt)
-                if identity in seen_attempt_identities:
-                    continue
-                seen_attempt_identities.add(identity)
-                compiled_candidates.append(attempt)
-        else:
-            compiled_candidates.extend(normalized_skipped)
-
-    attempts_by_identity: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
-    for attempt in normalized_attempts:
-        attempts_by_identity.setdefault(_identity(attempt), []).append(attempt)
-    skipped_by_identity: dict[
-        tuple[str, str, str], list[tuple[int, dict[str, Any]]]
+    # Captured records are authoritative for an occurrence.  Group provider
+    # attempts by exact account/lane/cooldown identity so failover records do
+    # not overwrite one another, while preserving the provider-attempt count
+    # within each captured occurrence.
+    provider_attempt_groups: dict[
+        tuple[Any, ...], dict[str, Any]
     ] = {}
-    for skipped_index, skipped_candidate in enumerate(normalized_skipped):
-        skipped_by_identity.setdefault(
-            _identity(skipped_candidate), []
-        ).append((skipped_index, skipped_candidate))
+    terminal_skip_groups: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for attempt_index, attempt in enumerate(normalized_attempts):
+        if attempt.get("terminal_disposition") == "skipped":
+            group_identity = _skip_identity(attempt)
+            groups = terminal_skip_groups
+        else:
+            group_identity = _capture_identity(attempt)
+            groups = provider_attempt_groups
+        group = groups.get(group_identity)
+        if group is None:
+            group = {
+                "occurrence": _occurrence_discriminator(attempt),
+                "first_index": attempt_index,
+                "records": [],
+            }
+            groups[group_identity] = group
+        group["records"].append(attempt)
+
     skip_metadata_fields = (
         "account_label",
         "account_hash",
@@ -857,6 +845,21 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
         "candidate_semantic_ineligibility_remaining_seconds",
         "skip_reason",
         "provider_attempt_budget_refunded",
+        "logical_cooldown_key",
+        "selection_reason",
+        "status",
+        "error_class",
+        "source_error",
+        "error_tokens",
+        "retry_after_seconds",
+        "attempted_provider_call",
+        "provider_returned",
+        "terminal_disposition",
+        "origin",
+        "outcome",
+        "attempt_count",
+        "quota_balancing",
+        "selection_diagnostics",
     )
 
     def _apply_skip_overlay(
@@ -869,97 +872,131 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
         shaped["terminal_disposition"] = "skipped"
         shaped["attempted_provider_call"] = False
         shaped["reason"] = (
-            skipped.get("reason")
-            or skipped.get("skip_reason")
+            skipped.get("skip_reason")
+            or skipped.get("reason")
             or "unavailable"
         )
         return shaped
 
-    consumed_skipped_indices: set[int] = set()
+    def _shape_captured_attempt(
+        attempt: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        shaped = _codex_auto_agent_candidate_public_shape(dict(attempt))
+        if attempt.get("reasoning_effort") is not None:
+            shaped["reasoning_effort"] = attempt["reasoning_effort"]
+        for field in skip_metadata_fields:
+            if field in attempt:
+                shaped[field] = attempt[field]
+        return shaped
+
+    def _render_provider_attempt_group(
+        group: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        records = group["records"]
+        last_attempt = records[-1]
+        shaped = _shape_captured_attempt(last_attempt)
+        shaped.update(
+            {
+                "terminal_disposition": "attempted",
+                "attempt_count": _provider_attempt_count(records),
+                "outcome": (
+                    last_attempt.get("status")
+                    or last_attempt.get("error_class")
+                    or "attempted"
+                ),
+            }
+        )
+        continue_reason = last_attempt.get("error_class")
+        if continue_reason is not None:
+            shaped["reason"] = continue_reason
+        return shaped
+
+    def _render_terminal_skip_group(
+        group: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        shaped = _shape_captured_attempt(group["records"][-1])
+        return _apply_skip_overlay(shaped, group["records"][-1])
+
+    captured_groups: list[dict[str, Any]] = [
+        *provider_attempt_groups.values(),
+        *terminal_skip_groups.values(),
+    ]
+    terminal_skip_identities = set(terminal_skip_groups)
+    for skipped_index, skipped_candidate in enumerate(normalized_skipped):
+        occurrence_identity = _skip_identity(skipped_candidate)
+        if occurrence_identity in terminal_skip_identities:
+            continue
+        captured_groups.append(
+            {
+                "occurrence": _occurrence_discriminator(skipped_candidate),
+                "first_index": len(normalized_attempts) + skipped_index,
+                "records": [skipped_candidate],
+                "kind": "skipped_candidate",
+            }
+        )
+    for group in provider_attempt_groups.values():
+        group["kind"] = "provider_attempt"
+    for group in terminal_skip_groups.values():
+        group["kind"] = "terminal_skip"
+    captured_groups.sort(key=lambda group: int(group["first_index"]))
+    captured_groups_by_occurrence: dict[
+        tuple[Any, ...], list[dict[str, Any]]
+    ] = {}
+    for group in captured_groups:
+        captured_groups_by_occurrence.setdefault(
+            group["occurrence"], []
+        ).append(group)
+
+    consumed_group_ids: set[int] = set()
     inventory: list[dict[str, Any]] = []
     for candidate in compiled_candidates:
-        identity = _identity(candidate)
-        candidate_attempts = attempts_by_identity.get(identity) or []
-        skipped: Optional[dict[str, Any]] = None
-        if not candidate_attempts:
-            for skipped_index, skipped_candidate in (
-                skipped_by_identity.get(identity) or []
-            ):
-                if skipped_index in consumed_skipped_indices:
+        occurrence = _occurrence_discriminator(candidate)
+        captured_for_occurrence = captured_groups_by_occurrence.get(occurrence)
+        if captured_for_occurrence:
+            for group in captured_for_occurrence:
+                group_id = id(group)
+                if group_id in consumed_group_ids:
                     continue
-                candidate_identity = _skip_occurrence_values(candidate)
-                skipped_identity = _skip_occurrence_values(skipped_candidate)
-                if all(
-                    not candidate_value
-                    or not skipped_value
-                    or candidate_value == skipped_value
-                    for candidate_value, skipped_value in zip(
-                        candidate_identity,
-                        skipped_identity,
+                consumed_group_ids.add(group_id)
+                if group["kind"] == "provider_attempt":
+                    inventory.append(_render_provider_attempt_group(group))
+                elif group["kind"] == "terminal_skip":
+                    inventory.append(_render_terminal_skip_group(group))
+                else:
+                    inventory.append(
+                        _apply_skip_overlay(
+                            _shape_captured_attempt(group["records"][-1]),
+                            group["records"][-1],
+                        )
                     )
-                ):
-                    consumed_skipped_indices.add(skipped_index)
-                    skipped = skipped_candidate
-                    break
+            continue
         shaped = _codex_auto_agent_candidate_public_shape(candidate)
         if candidate.get("reasoning_effort") is not None:
             shaped["reasoning_effort"] = candidate["reasoning_effort"]
-        if candidate_attempts:
-            last_attempt = candidate_attempts[-1]
-            terminal_skip = (
-                last_attempt.get("terminal_disposition") == "skipped"
-                and not any(
-                    attempt.get("attempted_provider_call") is True
-                    for attempt in candidate_attempts
-                )
-            )
-            if terminal_skip:
-                for field in skip_metadata_fields:
-                    if field in last_attempt:
-                        shaped[field] = last_attempt[field]
-                shaped["terminal_disposition"] = "skipped"
-                shaped["attempted_provider_call"] = False
-                shaped["reason"] = (
-                    last_attempt.get("skip_reason")
-                    or last_attempt.get("reason")
-                    or "unavailable"
-                )
-                inventory.append(shaped)
-                continue
-            outcome = (
-                last_attempt.get("status")
-                or last_attempt.get("error_class")
-                or "attempted"
-            )
-            shaped.update(
-                {
-                    "terminal_disposition": "attempted",
-                    "attempt_count": _provider_attempt_count(candidate_attempts),
-                    "outcome": outcome,
-                }
-            )
-            continue_reason = last_attempt.get("error_class")
-            if continue_reason is not None:
-                shaped["reason"] = continue_reason
-        elif skipped is not None:
-            _apply_skip_overlay(shaped, skipped)
-        else:
-            shaped["terminal_disposition"] = "skipped"
-            shaped["attempted_provider_call"] = False
-            shaped["reason"] = (
-                "traversal_budget_exhausted"
-                if traversal_budget_exhausted
-                else "not_reached_before_terminal"
-            )
+        shaped["terminal_disposition"] = "skipped"
+        shaped["attempted_provider_call"] = False
+        shaped["reason"] = (
+            "traversal_budget_exhausted"
+            if traversal_budget_exhausted
+            else "not_reached_before_terminal"
+        )
         inventory.append(shaped)
 
-    for skipped_index, skipped in enumerate(normalized_skipped):
-        if skipped_index in consumed_skipped_indices:
+    for group in captured_groups:
+        if id(group) in consumed_group_ids:
             continue
-        shaped = _codex_auto_agent_candidate_public_shape(skipped)
-        if skipped.get("reasoning_effort") is not None:
-            shaped["reasoning_effort"] = skipped["reasoning_effort"]
-        inventory.append(_apply_skip_overlay(shaped, skipped))
+        consumed_group_ids.add(id(group))
+        if group["kind"] == "provider_attempt":
+            inventory.append(_render_provider_attempt_group(group))
+        elif group["kind"] == "terminal_skip":
+            inventory.append(_render_terminal_skip_group(group))
+        else:
+            inventory.append(
+                _apply_skip_overlay(
+                    _shape_captured_attempt(group["records"][-1]),
+                    group["records"][-1],
+                )
+            )
     return inventory
 
 
