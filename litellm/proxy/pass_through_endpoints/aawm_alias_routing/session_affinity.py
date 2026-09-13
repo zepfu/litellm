@@ -137,6 +137,7 @@ class SessionOwnerLease:
     # terminal disposition.
     wire_terminal_pending: bool = False
     wire_disposition: Optional[str] = None
+    last_finalization_outcome: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -216,7 +217,7 @@ _CONTINUITY_SOURCES = frozenset(
 _CONTINUITY_OUTCOMES = frozenset(
     {"resolved", "owned", "reserved", "missing", "error", "unknown",
      "skipped_missing_identity", "pending_wire_terminal", "written", "unverified",
-     "not_written"}
+     "not_written", "already_finalized"}
     | {decision.value for decision in SessionOwnerGuardDecision}
     | {outcome.value for outcome in SessionOwnerMutationOutcome}
 )
@@ -3603,7 +3604,11 @@ async def finalize_session_owner_lease_on_success(
             source="success",
             session_identity=lease.session_identity,
             cache_key=lease.cache_key,
-            outcome="already_owned",
+            outcome=(
+                "already_owned"
+                if lease.promoted
+                else (lease.last_finalization_outcome or "already_finalized")
+            ),
         )
         return None
     if lease.wire_terminal_pending:
@@ -3630,6 +3635,7 @@ async def finalize_session_owner_lease_on_success(
     }:
         lease.promoted = True
         _stop_session_owner_lease_renewal(lease)
+    lease.last_finalization_outcome = result.outcome.value
     record_session_owner_continuity_receipt(
         request,
         phase="owner_finalize",
@@ -3666,7 +3672,11 @@ async def finalize_session_owner_lease_on_failure(
             source="failure",
             session_identity=lease.session_identity,
             cache_key=lease.cache_key,
-            outcome="already_owned",
+            outcome=(
+                "already_owned"
+                if lease.promoted
+                else (lease.last_finalization_outcome or "already_finalized")
+            ),
         )
         return None
     if lease.wire_terminal_pending and lease.wire_disposition is None:
@@ -3684,6 +3694,7 @@ async def finalize_session_owner_lease_on_failure(
     }:
         lease.released = True
         _stop_session_owner_lease_renewal(lease)
+    lease.last_finalization_outcome = result.outcome.value
     record_session_owner_continuity_receipt(
         request,
         phase="owner_finalize",
@@ -3759,7 +3770,28 @@ async def finalize_request_session_owner_lease(
     """
 
     active = lease if lease is not None else get_request_session_owner_lease(request)
-    if active is None or not active.held_reservation or active.promoted or active.released:
+    if active is None:
+        record_session_owner_continuity_receipt(
+            request, phase="owner_finalize", source="success", outcome="no_session"
+        )
+        return None
+    if not active.held_reservation:
+        record_session_owner_continuity_receipt(
+            request, phase="owner_finalize", source="success",
+            session_identity=active.session_identity, cache_key=active.cache_key,
+            outcome="not_held",
+        )
+        return None
+    if active.promoted or active.released:
+        record_session_owner_continuity_receipt(
+            request, phase="owner_finalize", source="success",
+            session_identity=active.session_identity, cache_key=active.cache_key,
+            outcome=(
+                "already_owned"
+                if active.promoted
+                else (active.last_finalization_outcome or "already_finalized")
+            ),
+        )
         return None
     if exc is not None:
         result = await finalize_session_owner_lease_on_failure(active, request=request)
