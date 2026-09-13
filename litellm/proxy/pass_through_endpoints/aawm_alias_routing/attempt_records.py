@@ -950,11 +950,10 @@ def _record_auto_agent_alias_attempt_failure(
             request=request,
             audit_events=audit_events,
         )
-    if not _is_auto_agent_alias_skipped_audit_event(audit_event):
-        _emit_auto_agent_alias_route_event(
-            audit_event,
-            level="warning",
-        )
+    _emit_auto_agent_alias_route_event(
+        audit_event,
+        level="warning",
+    )
     # Only terminal redispatch outcomes use audit-only persistence. Mid-loop
     # retryable 429s that continue failover still reach a normal success or
     # no-candidate write path and must not double-write audit rows.
