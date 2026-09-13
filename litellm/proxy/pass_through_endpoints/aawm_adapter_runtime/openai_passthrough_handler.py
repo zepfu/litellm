@@ -517,7 +517,14 @@ class BaseOpenAIPassThroughHandler:
                 rt.request_uses_codex_native_auth_fn(request)
                 and is_responses_endpoint
             ) or bound_codex_oauth_identity is not None
-            if is_codex_responses_request:
+            codex_auto_agent_alias_model = (
+                rt.resolve_codex_auto_agent_alias_model_fn(
+                    prepared_request_body,
+                    endpoint=endpoint,
+                    request=request,
+                )
+            )
+            if is_codex_responses_request and codex_auto_agent_alias_model is None:
                 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
                     _load_bound_codex_oauth_auth,
                 )
@@ -531,13 +538,6 @@ class BaseOpenAIPassThroughHandler:
                         "lane_key": selected_auth.lane_key,
                         "model": "",
                     }
-            codex_auto_agent_alias_model = (
-                rt.resolve_codex_auto_agent_alias_model_fn(
-                    prepared_request_body,
-                    endpoint=endpoint,
-                    request=request,
-                )
-            )
             if codex_auto_agent_alias_model is not None:
                 is_codex_responses_request = True
             direct_codex_kimi_adapter_model: Optional[str] = None

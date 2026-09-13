@@ -1585,13 +1585,13 @@ def codex_spawn_tool_evidence(
 
     for path in paths:
         meta = _codex_session_meta(path)
+        cwd = str(meta.get("cwd") or "").rstrip("/")
+        if workspace_cwd and cwd and cwd != workspace_cwd:
+            continue
         if meta.get("_bounded_read_truncated"):
             failures.append(
                 f"Codex transcript exceeded bounded evidence read: {path.name}"
             )
-        cwd = str(meta.get("cwd") or "").rstrip("/")
-        if workspace_cwd and cwd and cwd != workspace_cwd:
-            continue
         session_paths.append(str(path))
         session_id = str(meta.get("id") or meta.get("session_id") or "").strip()
         if session_id:
@@ -1633,6 +1633,7 @@ def codex_spawn_tool_evidence(
                 index
                 for index, request in enumerate(remaining_requests)
                 if target in request["targets"]
+                and request["call_id"] in activity_by_call_id
             ),
             None,
         )

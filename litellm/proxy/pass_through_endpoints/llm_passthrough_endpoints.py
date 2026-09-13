@@ -6325,13 +6325,13 @@ async def openai_proxy_route(  # noqa: PLR0915
         is_grok_native_oauth_request = _is_openai_responses_endpoint(endpoint) and _is_grok_native_oauth_request_body(
             request_body
         )
+        resolved_codex_auto_agent_alias = _resolve_codex_auto_agent_alias_model(
+            request_body,
+            endpoint,
+            request=request,
+        )
         is_codex_auto_agent_alias_request = (
-            _resolve_codex_auto_agent_alias_model(
-                request_body,
-                endpoint,
-                request=request,
-            )
-            is not None
+            resolved_codex_auto_agent_alias is not None
         )
 
     base_target_url = _get_openai_passthrough_target_base(

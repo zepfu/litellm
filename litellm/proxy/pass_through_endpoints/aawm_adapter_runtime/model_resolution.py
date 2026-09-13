@@ -6,7 +6,10 @@ Do not import llm_passthrough_endpoints at module scope.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Optional
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from fastapi import Request
@@ -422,10 +425,38 @@ def _resolve_codex_auto_agent_alias_model(
     ):
         requested_model = "codex-auto-review"
 
-    return _lookup_active_snapshot_canonical_alias(
+    resolved_alias = _lookup_active_snapshot_canonical_alias(
         requested_model,
         request=request,
     )
+    if resolved_alias is None and isinstance(requested_model, str):
+        startup_state = None
+        alias_count = None
+        configured_alias = False
+        try:
+            from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+                get_startup_status,
+            )
+
+            startup_status = get_startup_status()
+            startup_state = startup_status.get("state")
+            alias_count = startup_status.get("alias_count")
+            configured_alias = requested_model in set(
+                startup_status.get("aliases") or ()
+            )
+        except Exception:
+            pass
+        if configured_alias:
+            logger.warning(
+                "AAWM_ALIAS_ROUTE alias_resolution_miss model=%r endpoint=%s "
+                "startup_state=%s alias_count=%s",
+                requested_model,
+                endpoint,
+                startup_state,
+                alias_count,
+            )
+    return resolved_alias
+
 
 def _resolve_anthropic_openai_responses_adapter_model(
     request_body: dict[str, Any],
