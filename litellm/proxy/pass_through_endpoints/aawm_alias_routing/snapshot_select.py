@@ -534,7 +534,13 @@ def _resolve_snapshot_alias_candidates(
             for child in children:
                 shaped = dict(child)
                 shaped["selection_priority"] = entry.priority
-                shaped["last_resort"] = entry.priority == 0
+                # A delegated alias may be promoted as a group without
+                # promoting a nested priority-zero tail. Preserve the
+                # child's terminal last-resort boundary while applying the
+                # reference's outer ordering priority.
+                shaped["last_resort"] = bool(child.get("last_resort")) or (
+                    entry.priority == 0
+                )
                 shaped["alias_reference"] = entry.alias_name
                 shaped["alias_path"] = [*next_path, entry.alias_name]
                 if alias.distribution_strategy is not None:
