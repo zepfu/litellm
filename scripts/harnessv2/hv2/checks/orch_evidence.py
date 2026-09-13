@@ -30,6 +30,7 @@ _COMPLETION_TOOLS = {"task", "hub", "bash", "yield"}
 _JSONL_SCAN_CAP = 64
 _JSONL_MAX_BYTES = 2 * 1024 * 1024
 _JSONL_MAX_LINES = 20000
+_JSONL_TRUNCATED_PATHS: set[Path] = set()
 _OPERATIONAL_FALLBACK_ALIASES = frozenset(
     {
         "basic",
@@ -79,10 +80,13 @@ def _iter_jsonl_objects(path: Path) -> Iterable[dict[str, Any]]:
         consumed = 0
         for index, line in enumerate(handle):
             if index >= _JSONL_MAX_LINES:
+                _JSONL_TRUNCATED_PATHS.add(path)
                 break
-            consumed += len(line.encode("utf-8", errors="replace"))
-            if consumed > _JSONL_MAX_BYTES:
+            line_bytes = len(line.encode("utf-8", errors="replace"))
+            if line_bytes > _JSONL_MAX_BYTES or consumed + line_bytes > _JSONL_MAX_BYTES:
+                _JSONL_TRUNCATED_PATHS.add(path)
                 break
+            consumed += line_bytes
             line = line.strip()
             if not line:
                 continue
@@ -1425,6 +1429,8 @@ def _codex_child_contract(
             final_answer = True
 
     failures: list[str] = []
+    if path in _JSONL_TRUNCATED_PATHS:
+        failures.append("child transcript exceeded bounded evidence read")
     expected = {"pwd": f"{workspace}\n", "uname -s": "Linux\n"}
     call_indices = [call["index"] for call in calls]
     if len(calls) != 2:
@@ -1544,6 +1550,10 @@ def codex_spawn_tool_evidence(
         if workspace_cwd and cwd and cwd != workspace_cwd:
             continue
         session_paths.append(str(path))
+        if path in _JSONL_TRUNCATED_PATHS:
+            failures.append(
+                f"Codex transcript exceeded bounded evidence read: {path.name}"
+            )
         session_id = str(meta.get("id") or meta.get("session_id") or "").strip()
         if session_id:
             child_paths_by_id[session_id] = path
