@@ -695,21 +695,109 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
         "aawm_alias_terminal_skipped_candidates",
         None,
     )
-    normalized_skipped = [
-        candidate
-        for candidate in (
-            *(stored_skipped if isinstance(stored_skipped, list) else []),
-            *(skipped_candidates or []),
-        )
-        if isinstance(candidate, dict)
-    ]
-
     def _identity(candidate: Mapping[str, Any]) -> tuple[str, str, str]:
         return (
             str(candidate.get("provider") or ""),
             str(candidate.get("model") or ""),
             str(candidate.get("route_family") or ""),
         )
+
+    def _first_identity_value(
+        candidate: Mapping[str, Any],
+        *fields: str,
+    ) -> str:
+        for field in fields:
+            value = str(candidate.get(field) or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _skip_observation_base(
+        candidate: Mapping[str, Any],
+    ) -> tuple[str, ...]:
+        return (
+            *_identity(candidate),
+            _first_identity_value(
+                candidate,
+                "account_hash",
+                "codex_oauth_account_hash",
+                "xai_oauth_account_hash",
+            ),
+            _first_identity_value(
+                candidate,
+                "account_lane",
+                "codex_oauth_lane_key",
+                "xai_oauth_lane_key",
+            ),
+            _first_identity_value(candidate, "lane_key"),
+            str(candidate.get("cooldown_scope") or "").strip(),
+            str(
+                candidate.get("reason")
+                or candidate.get("skip_reason")
+                or "unavailable"
+            ).strip(),
+            str(
+                candidate.get("candidate_semantic_ineligibility_reason")
+                or ""
+            ).strip(),
+        )
+
+    def _skip_observations_are_same_occurrence(
+        left: Mapping[str, Any],
+        right: Mapping[str, Any],
+    ) -> bool:
+        if _skip_observation_base(left) != _skip_observation_base(right):
+            return False
+        left_cooldown_key = str(left.get("cooldown_key") or "").strip()
+        right_cooldown_key = str(right.get("cooldown_key") or "").strip()
+        return not (
+            left_cooldown_key
+            and right_cooldown_key
+            and left_cooldown_key != right_cooldown_key
+        )
+
+    def _skip_occurrence_values(
+        candidate: Mapping[str, Any],
+    ) -> tuple[str, ...]:
+        return (
+            _first_identity_value(
+                candidate,
+                "account_hash",
+                "codex_oauth_account_hash",
+                "xai_oauth_account_hash",
+            ),
+            _first_identity_value(
+                candidate,
+                "account_lane",
+                "codex_oauth_lane_key",
+                "xai_oauth_lane_key",
+            ),
+            _first_identity_value(candidate, "lane_key"),
+            _first_identity_value(candidate, "cooldown_key"),
+            str(candidate.get("cooldown_scope") or "").strip(),
+        )
+
+    normalized_skipped: list[dict[str, Any]] = []
+    for candidate in (
+        *(stored_skipped if isinstance(stored_skipped, list) else []),
+        *(skipped_candidates or []),
+    ):
+        if not isinstance(candidate, dict):
+            continue
+        existing = next(
+            (
+                prior
+                for prior in normalized_skipped
+                if _skip_observations_are_same_occurrence(prior, candidate)
+            ),
+            None,
+        )
+        if existing is None:
+            normalized_skipped.append(candidate)
+            continue
+        for field, value in candidate.items():
+            if existing.get(field) is None and value is not None:
+                existing[field] = value
 
     compiled_candidates = list(
         _resolve_aawm_alias_selection_enumeration(
@@ -719,20 +807,27 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
         ).candidates
     )
     if not compiled_candidates:
-        seen: set[tuple[str, str, str]] = set()
-        for candidate in (*normalized_attempts, *normalized_skipped):
-            identity = _identity(candidate)
-            if identity in seen:
-                continue
-            seen.add(identity)
-            compiled_candidates.append(candidate)
+        if normalized_attempts:
+            seen_attempt_identities: set[tuple[str, str, str]] = set()
+            for attempt in normalized_attempts:
+                identity = _identity(attempt)
+                if identity in seen_attempt_identities:
+                    continue
+                seen_attempt_identities.add(identity)
+                compiled_candidates.append(attempt)
+        else:
+            compiled_candidates.extend(normalized_skipped)
 
     attempts_by_identity: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for attempt in normalized_attempts:
         attempts_by_identity.setdefault(_identity(attempt), []).append(attempt)
-    skipped_by_identity = {
-        _identity(candidate): candidate for candidate in normalized_skipped
-    }
+    skipped_by_identity: dict[
+        tuple[str, str, str], list[tuple[int, dict[str, Any]]]
+    ] = {}
+    for skipped_index, skipped_candidate in enumerate(normalized_skipped):
+        skipped_by_identity.setdefault(
+            _identity(skipped_candidate), []
+        ).append((skipped_index, skipped_candidate))
     skip_metadata_fields = (
         "account_label",
         "account_hash",
@@ -764,11 +859,48 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
         "provider_attempt_budget_refunded",
     )
 
+    def _apply_skip_overlay(
+        shaped: dict[str, Any],
+        skipped: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        for field in skip_metadata_fields:
+            if field in skipped:
+                shaped[field] = skipped[field]
+        shaped["terminal_disposition"] = "skipped"
+        shaped["attempted_provider_call"] = False
+        shaped["reason"] = (
+            skipped.get("reason")
+            or skipped.get("skip_reason")
+            or "unavailable"
+        )
+        return shaped
+
+    consumed_skipped_indices: set[int] = set()
     inventory: list[dict[str, Any]] = []
     for candidate in compiled_candidates:
         identity = _identity(candidate)
         candidate_attempts = attempts_by_identity.get(identity) or []
-        skipped = skipped_by_identity.get(identity)
+        skipped: Optional[dict[str, Any]] = None
+        if not candidate_attempts:
+            for skipped_index, skipped_candidate in (
+                skipped_by_identity.get(identity) or []
+            ):
+                if skipped_index in consumed_skipped_indices:
+                    continue
+                candidate_identity = _skip_occurrence_values(candidate)
+                skipped_identity = _skip_occurrence_values(skipped_candidate)
+                if all(
+                    not candidate_value
+                    or not skipped_value
+                    or candidate_value == skipped_value
+                    for candidate_value, skipped_value in zip(
+                        candidate_identity,
+                        skipped_identity,
+                    )
+                ):
+                    consumed_skipped_indices.add(skipped_index)
+                    skipped = skipped_candidate
+                    break
         shaped = _codex_auto_agent_candidate_public_shape(candidate)
         if candidate.get("reasoning_effort") is not None:
             shaped["reasoning_effort"] = candidate["reasoning_effort"]
@@ -810,16 +942,7 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
             if continue_reason is not None:
                 shaped["reason"] = continue_reason
         elif skipped is not None:
-            for field in skip_metadata_fields:
-                if field in skipped:
-                    shaped[field] = skipped[field]
-            shaped["terminal_disposition"] = "skipped"
-            shaped["attempted_provider_call"] = False
-            shaped["reason"] = (
-                skipped.get("reason")
-                or skipped.get("skip_reason")
-                or "unavailable"
-            )
+            _apply_skip_overlay(shaped, skipped)
         else:
             shaped["terminal_disposition"] = "skipped"
             shaped["attempted_provider_call"] = False
@@ -829,6 +952,14 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
                 else "not_reached_before_terminal"
             )
         inventory.append(shaped)
+
+    for skipped_index, skipped in enumerate(normalized_skipped):
+        if skipped_index in consumed_skipped_indices:
+            continue
+        shaped = _codex_auto_agent_candidate_public_shape(skipped)
+        if skipped.get("reasoning_effort") is not None:
+            shaped["reasoning_effort"] = skipped["reasoning_effort"]
+        inventory.append(_apply_skip_overlay(shaped, skipped))
     return inventory
 
 
