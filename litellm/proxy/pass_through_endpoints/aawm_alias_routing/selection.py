@@ -698,6 +698,42 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
         "aawm_alias_terminal_skipped_candidates",
         None,
     )
+
+    def _separate_skipped_projection_rows(
+        candidate_rows: Optional[list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        """Remove only rows proven to project the request-local skip snapshot."""
+
+        if not isinstance(candidate_rows, list):
+            return []
+        if not isinstance(stored_skipped, list):
+            return [
+                candidate for candidate in candidate_rows if isinstance(candidate, dict)
+            ]
+        stored_projection = _redact_auto_agent_account_identity(
+            stored_skipped,
+            redact_cooldown_keys=True,
+        )
+        consumed_projection_indexes: set[int] = set()
+        separate_rows: list[dict[str, Any]] = []
+        for candidate in candidate_rows:
+            if not isinstance(candidate, dict):
+                continue
+            projection_index = next(
+                (
+                    index
+                    for index, projected in enumerate(stored_projection)
+                    if index not in consumed_projection_indexes
+                    and projected == candidate
+                ),
+                None,
+            )
+            if projection_index is None:
+                separate_rows.append(candidate)
+            else:
+                consumed_projection_indexes.add(projection_index)
+        return separate_rows
+
     def _identity(candidate: Mapping[str, Any]) -> tuple[str, str, str]:
         return (
             str(candidate.get("provider") or ""),
@@ -786,21 +822,25 @@ def _build_auto_agent_terminal_candidate_inventory(  # noqa: PLR0915
 
     normalized_skipped: list[dict[str, Any]] = []
     normalized_skipped_by_identity: dict[tuple[Any, ...], dict[str, Any]] = {}
-    for candidate in (
-        *(stored_skipped if isinstance(stored_skipped, list) else []),
-        *(skipped_candidates or []),
-    ):
-        if not isinstance(candidate, dict):
-            continue
-        occurrence_identity = _skip_identity(candidate)
-        existing = normalized_skipped_by_identity.get(occurrence_identity)
-        if existing is None:
-            normalized_skipped_by_identity[occurrence_identity] = candidate
-            normalized_skipped.append(candidate)
-            continue
-        for field, value in candidate.items():
-            if existing.get(field) is None and value is not None:
-                existing[field] = value
+    skipped_sources: list[list[dict[str, Any]]] = []
+    if isinstance(stored_skipped, list):
+        skipped_sources.append(stored_skipped)
+    separate_skipped_rows = _separate_skipped_projection_rows(skipped_candidates)
+    if separate_skipped_rows:
+        skipped_sources.append(separate_skipped_rows)
+    for source in skipped_sources:
+        for candidate in source:
+            if not isinstance(candidate, dict):
+                continue
+            occurrence_identity = _skip_identity(candidate)
+            existing = normalized_skipped_by_identity.get(occurrence_identity)
+            if existing is None:
+                normalized_skipped_by_identity[occurrence_identity] = candidate
+                normalized_skipped.append(candidate)
+                continue
+            for field, value in candidate.items():
+                if existing.get(field) is None and value is not None:
+                    existing[field] = value
 
     compiled_candidates = list(
         _resolve_aawm_alias_selection_enumeration(
