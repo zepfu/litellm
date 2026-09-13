@@ -697,7 +697,7 @@ def _is_auto_agent_alias_skipped_audit_event(event: Mapping[str, Any]) -> bool:
 
 def _auto_agent_alias_skipped_event_key(
     event: Mapping[str, Any],
-) -> tuple[str, ...]:
+) -> tuple[Any, ...]:
     """Return a stable, occurrence-aware request-local identity."""
     return _auto_agent_alias_skip_identity(event)
 
@@ -706,7 +706,7 @@ def _emit_auto_agent_alias_skipped_events_once(
     *,
     request: Request,
     audit_events: list[dict[str, Any]],
-) -> set[tuple[str, ...]]:
+) -> set[tuple[Any, ...]]:
     """Publish each skipped decision once for this request."""
     request_state = getattr(request, "state", None)
     if request_state is None:
@@ -724,7 +724,7 @@ def _emit_auto_agent_alias_skipped_events_once(
             emitted_keys,
         )
 
-    newly_emitted_keys: set[tuple[str, ...]] = set()
+    newly_emitted_keys: set[tuple[Any, ...]] = set()
     for event in audit_events:
         if not _is_auto_agent_alias_skipped_audit_event(event):
             continue

@@ -292,6 +292,10 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
         "provider": candidate.get("provider"),
         "model": candidate.get("model"),
         "route_family": candidate.get("route_family"),
+        # Keep terminal occurrence identity candidate-owned.  A not-reached
+        # row may have no selected candidate or concrete cooldown key.
+        "resolved_alias": candidate.get("resolved_alias"),
+        "cooldown_identity_tag": candidate.get("cooldown_identity_tag"),
         "lane_key": lane_key,
         "cooldown_key": cooldown_key,
         "attempt_number": attempt_number,
@@ -315,7 +319,9 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
         "selected": selected,
         "skipped": skipped,
         "selection_priority": candidate.get("selection_priority"),
-        "last_resort": bool(candidate.get("last_resort")),
+        "last_resort": (
+            candidate.get("last_resort") if "last_resort" in candidate else None
+        ),
         "in_flight_session": bool(selection.get("in_flight_session")),
         "redispatch_required": redispatch_required,
         "redispatch_threshold_crossed": False,
@@ -466,7 +472,7 @@ def _build_auto_agent_alias_audit_events(  # noqa: PLR0915
         candidate: Mapping[str, Any],
         *,
         skip_reason: Optional[str] = None,
-    ) -> tuple[str, ...]:
+    ) -> tuple[Any, ...]:
         return _auto_agent_alias_skip_identity(
             candidate,
             alias_family=alias_family,

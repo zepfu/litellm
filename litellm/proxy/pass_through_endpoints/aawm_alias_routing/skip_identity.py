@@ -22,6 +22,16 @@ def _first_skip_identity_value(
     return ""
 
 
+def _skip_identity_presence_value(
+    candidate: Mapping[str, Any],
+    field: str,
+) -> tuple[str, str]:
+    """Preserve whether an optional occurrence field was supplied."""
+    if field not in candidate or candidate[field] is None:
+        return ("missing", "")
+    return ("present", _clean_skip_identity_value(candidate[field]))
+
+
 def _auto_agent_alias_skip_identity(
     candidate: Mapping[str, Any],
     *,
@@ -29,14 +39,14 @@ def _auto_agent_alias_skip_identity(
     alias_model: Optional[Any] = None,
     skip_reason: Optional[Any] = None,
     cooldown_scope: Optional[Any] = None,
-) -> tuple[str, ...]:
+) -> tuple[Any, ...]:
     """Return the stable identity for one skipped candidate occurrence.
 
     The identity is scoped to the owning alias and resolved candidate route.
-    Account/lane and cooldown identities distinguish otherwise equal routes;
-    semantic skip reason/scope distinguish different decisions for that
-    occurrence. Volatile source labels, remaining durations, and attempt-list
-    positions are intentionally excluded.
+    Compiled occurrence identity, account/lane and cooldown identities
+    distinguish otherwise equal routes; semantic skip reason/scope distinguish
+    different decisions for that occurrence. Volatile source labels, remaining
+    durations, and attempt-list positions are intentionally excluded.
     """
 
     resolved_skip_reason = _clean_skip_identity_value(skip_reason)
@@ -67,6 +77,10 @@ def _auto_agent_alias_skip_identity(
         _first_skip_identity_value(candidate, "provider"),
         _first_skip_identity_value(candidate, "model"),
         _first_skip_identity_value(candidate, "route_family"),
+        _skip_identity_presence_value(candidate, "selection_priority"),
+        _skip_identity_presence_value(candidate, "last_resort"),
+        _first_skip_identity_value(candidate, "resolved_alias"),
+        _first_skip_identity_value(candidate, "cooldown_identity_tag"),
         _first_skip_identity_value(
             candidate,
             "account_hash",
