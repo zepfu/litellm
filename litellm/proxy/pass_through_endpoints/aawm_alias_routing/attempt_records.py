@@ -40,6 +40,16 @@ from .skip_identity import _auto_agent_alias_skip_identity
 
 _AAWM_ALIAS_REQUEST_CALL_ID_STATE_KEY = "aawm_alias_request_litellm_call_id"
 _AAWM_ALIAS_REQUEST_OUTCOME_STATE_KEY = "aawm_alias_request_outcome"
+_AAWM_ALIAS_SKIPPED_EVENT_KEYS_STATE_KEY = (
+    "aawm_alias_request_emitted_skipped_event_keys"
+)
+_AAWM_ALIAS_SKIPPED_EVENT_TYPES = frozenset(
+    {
+        "candidate_skipped_cooldown",
+        "candidate_skipped_provider_degraded",
+        "candidate_skipped_semantic_ineligible",
+    }
+)
 
 # Capability helper resolved lazily (import-safe within the litellm package).
 # Unlike the injected ``_get_model_info`` seam, this reads the real model

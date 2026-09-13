@@ -528,7 +528,7 @@ def _build_auto_agent_alias_audit_events(  # noqa: PLR0915
                     cooldown_seconds=skipped_candidate.get("cooldown_seconds"),
                     cooldown_scope=skipped_candidate.get("cooldown_scope"),
                     failure_phase=skipped_candidate.get("failure_phase"),
-                    attempted_provider_call=skipped_candidate.get("attempted_provider_call"),
+                    attempted_provider_call=False,
                 )
             )
 
