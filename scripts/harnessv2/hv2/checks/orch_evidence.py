@@ -1177,7 +1177,13 @@ def _codex_session_meta(path: Path) -> dict[str, Any]:
     found: dict[str, Any] = {}
     for obj in bounded_read:
         if obj.get("type") == "session_meta" and isinstance(obj.get("payload"), dict):
-            found = dict(obj["payload"])
+            candidate = dict(obj["payload"])
+            source = candidate.get("source")
+            if not found or (
+                isinstance(source, Mapping)
+                and isinstance(source.get("subagent"), Mapping)
+            ):
+                found = candidate
     if bounded_read.truncated:
         found["_bounded_read_truncated"] = True
     return found
