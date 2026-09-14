@@ -7838,15 +7838,7 @@ async def pass_through_request(  # noqa: PLR0915
                     False,
                 ):
                     return False
-                alias_outcome = getattr(
-                    state,
-                    "aawm_alias_request_outcome",
-                    None,
-                )
-                return not (
-                    isinstance(alias_outcome, Mapping)
-                    and alias_outcome.get("pending_failover") is True
-                )
+                return True
 
             def _build_final_openai_owner_attributes(
                 *,
