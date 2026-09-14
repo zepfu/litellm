@@ -4268,7 +4268,7 @@ _REQUIRED_AVAILABILITY_WINDOWS: dict[tuple[str, str], frozenset[str]] = {
     ),
     (
         "alibaba_token_plan",
-        "alibaba_token_plan/deepseek-v4-flash-0731",
+        "alibaba_token_plan/deepseek-v4.1-flash",
     ): frozenset(
         {"alibaba_token_plan_5h:credits", "alibaba_token_plan_7d:credits"}
     ),
