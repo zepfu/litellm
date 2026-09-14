@@ -111,10 +111,8 @@ totals are metadata only and do not populate `response_cost` or
 `session_history.response_cost_usd`.
 
 DeepSeek V4.1 Flash uses Singapore/International Model Studio direct reference
-rates of `$0.30/$1.20` per million input/output tokens during busy hours.
-Alibaba lists idle-hour rates of `$0.15/$0.60` from 22:00 to 08:00 UTC+8,
-based on billing time. Cached input costs 10% of the applicable input rate:
-`$0.03` per million during busy hours or `$0.015` during idle hours.
+base rates of `$0.30/$1.20` per million input/output tokens and `$0.03` per
+million cached input tokens. Off-peak and promotional discounts are excluded.
 These are reference rates, not known Token Plan invoice costs.
 Sources: [Model pricing](https://www.alibabacloud.com/help/en/model-studio/model-pricing)
 and [context cache](https://www.alibabacloud.com/help/en/model-studio/context-cache).
