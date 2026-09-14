@@ -5024,6 +5024,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         expected_account_hash: Optional[str] = None,
         expected_lane_key: Optional[str] = None,
         selected_account_context: Optional[Mapping[str, Any]] = None,
+        expected_model: Optional[str] = None,
+        selected_openai_headers: Optional[Mapping[str, str]] = None,
     ) -> None:
         """Validate the immutable native/Codex OpenAI send contract."""
 
@@ -5089,6 +5091,50 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 ),
             )
 
+        if expected_model is not None:
+            serialized_model = (
+                HttpPassThroughEndpointHelpers._get_prepared_openai_model(
+                    prepared_request
+                )
+            )
+            if serialized_model != expected_model:
+                HttpPassThroughEndpointHelpers._raise_egress_guard_block(
+                    detail=(
+                        "Blocked OpenAI egress: serialized model differs from "
+                        "the server-selected model."
+                    ),
+                    url=expected_openai_url,
+                    credential_family=egress_credential_family,
+                    target_family=(
+                        expected_target_family
+                        or HttpPassThroughEndpointHelpers.get_target_provider_family(
+                            expected_openai_url
+                        )
+                    ),
+                )
+
+        if selected_openai_headers:
+            prepared_headers = {
+                str(name).casefold(): str(value)
+                for name, value in prepared_request.headers.items()
+            }
+            for name, value in selected_openai_headers.items():
+                if prepared_headers.get(str(name).casefold()) != str(value):
+                    HttpPassThroughEndpointHelpers._raise_egress_guard_block(
+                        detail=(
+                            "Blocked OpenAI egress: final authentication "
+                            "headers differ from the server-loaded binding."
+                        ),
+                        url=expected_openai_url,
+                        credential_family=egress_credential_family,
+                        target_family=(
+                            expected_target_family
+                            or HttpPassThroughEndpointHelpers.get_target_provider_family(
+                                expected_openai_url
+                            )
+                        ),
+                    )
+
         validate_credential_family = egress_credential_family
         if validate_credential_family is None:
             validate_credential_family = (
@@ -5099,6 +5145,23 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             credential_family=validate_credential_family,
             expected_target_family=expected_target_family,
         )
+
+    @staticmethod
+    def _get_prepared_openai_model(
+        prepared_request: httpx.Request,
+    ) -> Optional[str]:
+        """Read the concrete model from the exact serialized JSON body."""
+
+        try:
+            body = json.loads(prepared_request.content)
+        except (TypeError, ValueError, UnicodeDecodeError):
+            return None
+        if not isinstance(body, Mapping):
+            return None
+        model = body.get("model")
+        if not isinstance(model, str) or not model.strip():
+            return None
+        return model.strip()
 
     @staticmethod
     async def reject_managed_xai_redirect_response(
@@ -7753,6 +7816,14 @@ async def pass_through_request(  # noqa: PLR0915
                         return model.strip()
                 return None
 
+            def _current_openai_account_context() -> dict[str, Any]:
+                context = getattr(
+                    getattr(request, "state", None),
+                    "aawm_codex_oauth_selected_account",
+                    None,
+                )
+                return dict(context) if isinstance(context, Mapping) else {}
+
             def _strict_managed_openai_owner_enabled(
                 expected_model: Optional[str],
             ) -> bool:
@@ -7822,6 +7893,47 @@ async def pass_through_request(  # noqa: PLR0915
                     ),
                 )
 
+            def _validate_final_openai_binding(
+                prepared_request: httpx.Request,
+            ) -> tuple[Optional[str], dict[str, Any], Optional[str], bool]:
+                current_context = _current_openai_account_context()
+                expected_model = (
+                    _selected_openai_model() if selected_openai_headers else None
+                )
+                serialized_model = (
+                    HttpPassThroughEndpointHelpers._get_prepared_openai_model(
+                        prepared_request
+                    )
+                    if selected_openai_headers
+                    else None
+                )
+                HttpPassThroughEndpointHelpers.validate_openai_final_send_binding(
+                    prepared_request=prepared_request,
+                    expected_url=url,
+                    custom_llm_provider=custom_llm_provider,
+                    egress_credential_family=egress_credential_family,
+                    expected_target_family=expected_target_family,
+                    expected_account_hash=(
+                        selected_openai_account_context.get("account_hash")
+                        if isinstance(selected_openai_account_context, Mapping)
+                        else None
+                    ),
+                    expected_lane_key=(
+                        selected_openai_account_context.get("lane_key")
+                        if isinstance(selected_openai_account_context, Mapping)
+                        else None
+                    ),
+                    selected_account_context=current_context,
+                    expected_model=expected_model,
+                    selected_openai_headers=selected_openai_headers,
+                )
+                return (
+                    serialized_model,
+                    current_context,
+                    expected_model,
+                    _strict_managed_openai_owner_enabled(expected_model),
+                )
+
             async def _send_prepared_openai_request(
                 prepared_request: httpx.Request,
                 send_stream: bool,
@@ -7845,39 +7957,113 @@ async def pass_through_request(  # noqa: PLR0915
                     if request_state is not None
                     else None
                 )
-                if openai_bound_egress and egress_selected_openai_headers:
+                ledger_calls_before = openai_call_ledger.snapshot().get(
+                    "logical_provider_calls"
+                )
+                if openai_bound_egress and selected_openai_headers:
                     prepared_request.headers = (
                         HttpPassThroughEndpointHelpers.canonicalize_openai_protected_headers(
                             dict(prepared_request.headers),
-                            protected_headers=egress_selected_openai_headers,
+                            protected_headers=selected_openai_headers,
                         )
                     )
-                current_selected_account_context = getattr(
-                    getattr(request, "state", None),
-                    "aawm_codex_oauth_selected_account",
-                    None,
+                owner_comparison_mode = (
+                    "strict_managed_openai"
+                    if selected_openai_headers
+                    else "none"
                 )
-                if isinstance(current_selected_account_context, Mapping):
-                    current_selected_account_context = dict(
-                        current_selected_account_context
+                serialized_model: Optional[str] = None
+                current_selected_account_context: dict[str, Any] = {}
+                expected_model: Optional[str] = None
+                owner_comparison_result: Optional[str] = None
+                protected_headers_match: Optional[bool] = None
+                try:
+                    (
+                        serialized_model,
+                        current_selected_account_context,
+                        expected_model,
+                        strict_owner_enabled,
+                    ) = _validate_final_openai_binding(prepared_request)
+                    protected_headers_match = (
+                        True if selected_openai_headers else None
                     )
-                HttpPassThroughEndpointHelpers.validate_openai_final_send_binding(
-                    prepared_request=prepared_request,
-                    expected_url=url,
-                    custom_llm_provider=custom_llm_provider,
-                    egress_credential_family=egress_credential_family,
-                    expected_target_family=expected_target_family,
-                    expected_account_hash=(
-                        selected_openai_account_context.get("account_hash")
-                        if isinstance(selected_openai_account_context, Mapping)
-                        else None
-                    ),
-                    expected_lane_key=(
-                        selected_openai_account_context.get("lane_key")
-                        if isinstance(selected_openai_account_context, Mapping)
-                        else None
-                    ),
-                    selected_account_context=current_selected_account_context,
+                    if not strict_owner_enabled:
+                        owner_comparison_mode = (
+                            "portable_transition"
+                            if selected_openai_headers
+                            else "none"
+                        )
+                    if strict_owner_enabled:
+                        owner_attributes = (
+                            _build_final_openai_owner_attributes(
+                                model=serialized_model or expected_model or "",
+                                account_context=current_selected_account_context,
+                            )
+                        )
+                        guard = await _session_affinity_mod().ensure_session_owner_guard_for_request(
+                            request=request,
+                            request_body=(
+                                _parsed_body
+                                if isinstance(_parsed_body, dict)
+                                else (
+                                    provider_bound_body
+                                    if isinstance(provider_bound_body, dict)
+                                    else {}
+                                )
+                            ),
+                            requested_attributes=owner_attributes,
+                            alias_model=serialized_model or expected_model,
+                            require_exact_attributes=True,
+                            strict_managed_openai_owner=True,
+                            failure_phase="session_owner_openai_final_send",
+                        )
+                        owner_comparison_result = getattr(
+                            getattr(guard, "decision", None),
+                            "value",
+                            None,
+                        )
+                        ensure_openai_wire_replay_allowed(
+                            request,
+                            ledger=openai_call_ledger,
+                        )
+                        (
+                            serialized_model,
+                            current_selected_account_context,
+                            _post_guard_expected_model,
+                            _post_guard_strict_owner_enabled,
+                        ) = _validate_final_openai_binding(prepared_request)
+                    else:
+                        owner_comparison_result = "skipped"
+                except Exception:
+                    _record_openai_final_send_binding_observation(
+                        request=request,
+                        metadata=passthrough_metadata,
+                        correlation_id=litellm_call_id,
+                        outcome="rejected",
+                        owner_comparison_mode=owner_comparison_mode,
+                        owner_comparison_result=owner_comparison_result,
+                        selected_account_context=selected_openai_account_context,
+                        current_account_context=current_selected_account_context,
+                        expected_model=expected_model,
+                        serialized_model=serialized_model,
+                        protected_headers_match=protected_headers_match,
+                        ledger_calls_before=ledger_calls_before,
+                        rejection_reason="final_send_binding_or_owner_guard",
+                    )
+                    raise
+                _record_openai_final_send_binding_observation(
+                    request=request,
+                    metadata=passthrough_metadata,
+                    correlation_id=litellm_call_id,
+                    outcome="validated",
+                    owner_comparison_mode=owner_comparison_mode,
+                    owner_comparison_result=owner_comparison_result,
+                    selected_account_context=selected_openai_account_context,
+                    current_account_context=current_selected_account_context,
+                    expected_model=expected_model,
+                    serialized_model=serialized_model,
+                    protected_headers_match=protected_headers_match,
+                    ledger_calls_before=ledger_calls_before,
                 )
                 if openai_call_ledger is not None:
                     reservation = openai_call_ledger.reserve(
@@ -7891,6 +8077,21 @@ async def pass_through_request(  # noqa: PLR0915
                         request,
                         reservation=reservation,
                         metadata=passthrough_metadata,
+                    )
+                    _record_openai_final_send_binding_observation(
+                        request=request,
+                        metadata=passthrough_metadata,
+                        correlation_id=litellm_call_id,
+                        outcome="reserved",
+                        owner_comparison_mode=owner_comparison_mode,
+                        owner_comparison_result=owner_comparison_result,
+                        selected_account_context=selected_openai_account_context,
+                        current_account_context=current_selected_account_context,
+                        expected_model=expected_model,
+                        serialized_model=serialized_model,
+                        protected_headers_match=protected_headers_match,
+                        ledger_calls_before=ledger_calls_before,
+                        reservation_ordinal=reservation.ordinal,
                     )
                 try:
                     if managed_xai_oauth_request:
@@ -7915,6 +8116,22 @@ async def pass_through_request(  # noqa: PLR0915
                         stream=send_stream,
                         follow_redirects=False,
                     )
+                    _record_openai_final_send_binding_observation(
+                        request=request,
+                        metadata=passthrough_metadata,
+                        correlation_id=litellm_call_id,
+                        outcome="transport_returned",
+                        owner_comparison_mode=owner_comparison_mode,
+                        owner_comparison_result=owner_comparison_result,
+                        selected_account_context=selected_openai_account_context,
+                        current_account_context=current_selected_account_context,
+                        expected_model=expected_model,
+                        serialized_model=serialized_model,
+                        protected_headers_match=protected_headers_match,
+                        ledger_calls_before=ledger_calls_before,
+                        reservation_ordinal=reservation.ordinal,
+                        transport_outcome="response_returned",
+                    )
                     await HttpPassThroughEndpointHelpers.reject_managed_xai_redirect_response(
                         response=response,
                         url=url,
@@ -7923,6 +8140,22 @@ async def pass_through_request(  # noqa: PLR0915
                         custom_llm_provider=custom_llm_provider,
                     )
                 except (httpx.ConnectError, httpx.ConnectTimeout):
+                    _record_openai_final_send_binding_observation(
+                        request=request,
+                        metadata=passthrough_metadata,
+                        correlation_id=litellm_call_id,
+                        outcome="transport_failed",
+                        owner_comparison_mode=owner_comparison_mode,
+                        owner_comparison_result=owner_comparison_result,
+                        selected_account_context=selected_openai_account_context,
+                        current_account_context=current_selected_account_context,
+                        expected_model=expected_model,
+                        serialized_model=serialized_model,
+                        protected_headers_match=protected_headers_match,
+                        ledger_calls_before=ledger_calls_before,
+                        reservation_ordinal=reservation.ordinal,
+                        transport_outcome="connection_error",
+                    )
                     record_transport_connection_attempt(request)
                     raise
                 register_active_upstream_response(request, response)
