@@ -1,0 +1,16 @@
+# Diagnostic xAI-first alias with an OpenAI/Codex last-resort tail.
+defaults: {}
+
+aliases:
+  - name: xai_basic
+    candidates:
+      - provider: xai
+        model: xai/grok-4.6
+        route_family: codex_grok_native_responses_adapter
+        priority: 100
+
+      - provider: openai
+        model: gpt-5.6-luna
+        route_family: codex_responses
+        priority: 0
+        reasoning_effort: low
