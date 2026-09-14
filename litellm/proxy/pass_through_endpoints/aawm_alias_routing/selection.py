@@ -5813,9 +5813,19 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         if session_owner_identity is not None
         else None
     )
-    reuse_consult_record = (
-        not is_auto_review
+    consult_reuse_eligible = (
+        request_mode == "fresh"
+        and not has_continuation_state
+        and not has_previous_response_id
+        and not has_account_bound_state
+        and not codex_oauth_continuation.declared
+        and token_affinity is None
+        and not server_validated_replay
+        and not is_auto_review
         and not sa.request_has_effective_session_identity(request)
+    )
+    reuse_consult_record = (
+        consult_reuse_eligible
         and session_owner_identity is not None
         and consult_identity == session_owner_identity
         and consult_cache_key == computed_cache_key

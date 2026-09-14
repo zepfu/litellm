@@ -1649,6 +1649,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         session_affinity as _sa,
     )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_build import (
+        _aawm_auto_agent_audit_request_has_account_bound_state,
         _codex_auto_agent_request_has_continuation_state,
     )
     from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
@@ -1745,6 +1746,18 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         planned_portable_failover = False
     owner_affinity: Optional[dict[str, Any]] = None
     if session_identity is not None and not planned_portable_failover:
+        has_body_continuation_state = _codex_auto_agent_request_has_continuation_state(
+            body
+        )
+        has_previous_response_id = bool(body.get("previous_response_id"))
+        has_account_bound_state = (
+            _aawm_auto_agent_audit_request_has_account_bound_state(body)
+            or token_affinity is not None
+        )
+        server_validated_replay = _sa.validate_cursor_replay_matches_body(
+            request,
+            body=body,
+        )
         request_state = getattr(request, "state", None)
         consult_identity = getattr(
             request_state,
@@ -1764,9 +1777,18 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         computed_cache_key = _sa.build_aawm_alias_routing_session_owner_cache_key(
             session_identity=session_identity
         )
-        reuse_consult_record = (
-            _sa.get_request_codex_auto_review_session_identity(request) is None
+        consult_reuse_eligible = (
+            not has_body_continuation_state
+            and not has_previous_response_id
+            and not continuation.declared
+            and token_affinity is None
+            and not has_account_bound_state
+            and not server_validated_replay
+            and _sa.get_request_codex_auto_review_session_identity(request) is None
             and not _sa.request_has_effective_session_identity(request)
+        )
+        reuse_consult_record = (
+            consult_reuse_eligible
             and consult_identity == session_identity
             and consult_cache_key == computed_cache_key
             and isinstance(consult_record, dict)

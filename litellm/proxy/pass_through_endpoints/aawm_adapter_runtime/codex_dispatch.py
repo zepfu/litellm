@@ -299,16 +299,19 @@ def _stash_codex_nested_owner_consult(
     if state is None:
         return
     _sa = _session_affinity_mod()
-    setattr(state, "_aawm_session_owner_consult_identity", session_identity)
-    setattr(state, "_aawm_session_owner_consult_cache_key", cache_key)
-    if isinstance(owner_record, dict):
-        setattr(state, "_aawm_session_owner_consult_record", owner_record)
-        affinity = _sa.owner_record_as_affinity_hint(
-            owner_record,
+    consult_record = owner_record if isinstance(owner_record, dict) else None
+    consult_affinity = (
+        _sa.owner_record_as_affinity_hint(
+            consult_record,
             preserve_account_identity=True,
         )
-        if affinity:
-            setattr(state, "_aawm_session_owner_consult_affinity", affinity)
+        if consult_record is not None
+        else None
+    )
+    setattr(state, "_aawm_session_owner_consult_identity", session_identity)
+    setattr(state, "_aawm_session_owner_consult_cache_key", cache_key)
+    setattr(state, "_aawm_session_owner_consult_record", consult_record)
+    setattr(state, "_aawm_session_owner_consult_affinity", consult_affinity)
 
 
 async def _consult_codex_nested_session_owner(
