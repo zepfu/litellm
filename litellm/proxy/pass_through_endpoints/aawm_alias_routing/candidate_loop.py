@@ -1296,6 +1296,46 @@ async def handle_alias_route(  # noqa: PLR0915
         setattr(state, _ALPHA_PROBE_INJECTION_COUNT_STATE_KEY, injection_ordinal)
         return injection_ordinal
 
+    def _record_alpha_probe_not_injected(
+        *,
+        attempt_record: dict[str, Any],
+        candidate: dict[str, Any],
+        selection: dict[str, Any],
+        reason: str,
+        fresh_reservation: bool,
+        managed_codex_oauth_candidate: bool,
+    ) -> None:
+        """Record an intentional no-injection decision in existing telemetry."""
+        diagnostics = attempt_record.get("selection_diagnostics")
+        if not isinstance(diagnostics, dict):
+            diagnostics = {}
+        diagnostics["alpha_probe"] = {
+            "requested": True,
+            "plan": alpha_probe_control.plan.name
+            if alpha_probe_control is not None
+            else None,
+            "injected": False,
+            "reason": reason,
+            "fresh_reservation": fresh_reservation,
+            "managed_codex_oauth_candidate": managed_codex_oauth_candidate,
+            "last_resort": candidate.get("last_resort"),
+        }
+        attempt_record["selection_diagnostics"] = diagnostics
+        verbose_proxy_logger.debug(
+            "%s auto-agent alias %s alpha probe plan=%s candidate=%s/%s "
+            "not injected (reason=%s, selection_reason=%s, request_mode=%s)",
+            log_label,
+            alias_model,
+            alpha_probe_control.plan.name
+            if alpha_probe_control is not None
+            else "none",
+            candidate.get("provider"),
+            candidate.get("model"),
+            reason,
+            selection.get("selection_reason"),
+            selection.get("request_mode"),
+        )
+
     def _prepare_alpha_probe_candidate_unavailable(
         *,
         injection_ordinal: int,
@@ -2642,36 +2682,74 @@ async def handle_alias_route(  # noqa: PLR0915
                             # dispatch. Owned, continuation, effective
                             # identity, auto-review, and validated-replay
                             # paths must retain their selected candidate.
-                            alpha_probe_fresh_reservation = (
+                            alpha_probe_skip_reason: Optional[str] = None
+                            if (
                                 guard.decision
-                                is sa.SessionOwnerGuardDecision.UNOWNED_RESERVED
-                                and guard.held_reservation
-                                and _genuinely_fresh_dispatch(selection)
-                                and not sa.request_has_effective_session_identity(
+                                is not sa.SessionOwnerGuardDecision.UNOWNED_RESERVED
+                            ):
+                                alpha_probe_skip_reason = (
+                                    "session_owner_guard_not_unowned_reserved"
+                                )
+                            elif not guard.held_reservation:
+                                alpha_probe_skip_reason = (
+                                    "session_owner_reservation_not_held"
+                                )
+                            elif not _genuinely_fresh_dispatch(selection):
+                                alpha_probe_skip_reason = "dispatch_not_fresh"
+                            elif sa.request_has_effective_session_identity(request):
+                                alpha_probe_skip_reason = "effective_session_identity"
+                            elif (
+                                selection.get("alias_model") or alias_model
+                            ) in {"codex-auto-review", "auto-review"}:
+                                alpha_probe_skip_reason = "auto_review_alias"
+                            elif (
+                                sa.get_request_codex_auto_review_parent_session_identity(
                                     request
                                 )
-                                and (
-                                    selection.get("alias_model") or alias_model
-                                )
-                                not in {"codex-auto-review", "auto-review"}
-                                and not sa.get_request_codex_auto_review_parent_session_identity(
-                                    request
-                                )
-                                and not sa.validate_cursor_replay_matches_body(
-                                    request,
-                                    body=prepared_request_body,
-                                )
+                            ):
+                                alpha_probe_skip_reason = "auto_review_parent_session"
+                            elif sa.validate_cursor_replay_matches_body(
+                                request,
+                                body=prepared_request_body,
+                            ):
+                                alpha_probe_skip_reason = "validated_cursor_replay"
+                            alpha_probe_fresh_reservation = (
+                                alpha_probe_skip_reason is None
                             )
-                            inject_alpha_probe = alpha_probe_fresh_reservation and (
-                                (
-                                    alpha_probe_control.plan.name == "basic"
-                                    and candidate.get("last_resort") is False
+                            if alpha_probe_fresh_reservation:
+                                if alpha_probe_control.plan.name == "basic":
+                                    inject_alpha_probe = (
+                                        candidate.get("last_resort") is False
+                                    )
+                                    if not inject_alpha_probe:
+                                        alpha_probe_skip_reason = (
+                                            "basic_plan_requires_explicit_non_last_resort"
+                                        )
+                                else:
+                                    inject_alpha_probe = (
+                                        alpha_probe_control.plan.name == "work"
+                                        and managed_codex_oauth_candidate
+                                    )
+                                    if not inject_alpha_probe:
+                                        alpha_probe_skip_reason = (
+                                            "work_plan_requires_managed_openai_oauth"
+                                        )
+                            else:
+                                inject_alpha_probe = False
+                            if not inject_alpha_probe:
+                                assert alpha_probe_skip_reason is not None
+                                _record_alpha_probe_not_injected(
+                                    attempt_record=attempt_record,
+                                    candidate=candidate,
+                                    selection=selection,
+                                    reason=alpha_probe_skip_reason,
+                                    fresh_reservation=(
+                                        alpha_probe_fresh_reservation
+                                    ),
+                                    managed_codex_oauth_candidate=(
+                                        managed_codex_oauth_candidate
+                                    ),
                                 )
-                                or (
-                                    alpha_probe_control.plan.name == "work"
-                                    and managed_codex_oauth_candidate
-                                )
-                            )
                             if inject_alpha_probe:
                                 injection_ordinal = _claim_alpha_probe_injection_slot()
                                 if injection_ordinal is not None:
@@ -2786,6 +2864,16 @@ async def handle_alias_route(  # noqa: PLR0915
                                         except Exception:  # noqa: BLE001
                                             pass
                                     raise _AlphaProbeCandidateSkip
+                                _record_alpha_probe_not_injected(
+                                    attempt_record=attempt_record,
+                                    candidate=candidate,
+                                    selection=selection,
+                                    reason="injection_slot_exhausted",
+                                    fresh_reservation=True,
+                                    managed_codex_oauth_candidate=(
+                                        managed_codex_oauth_candidate
+                                    ),
+                                )
 
                         if _is_native_openai_responses_candidate(
                             request=request,
