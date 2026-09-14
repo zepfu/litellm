@@ -7824,6 +7824,120 @@ async def pass_through_request(  # noqa: PLR0915
                 )
                 return dict(context) if isinstance(context, Mapping) else {}
 
+            def _candidate_scoped_openai_failover_context(
+                expected_model: Optional[str],
+            ) -> Optional[dict[str, Any]]:
+                if not selected_openai_headers or not expected_model:
+                    return None
+                state = getattr(request, "state", None)
+                if state is None:
+                    return None
+                candidate = dict(current_candidate_context(request))
+                candidate.setdefault("provider", "openai")
+                candidate.setdefault("model", expected_model)
+                candidate.setdefault("route_family", "codex_responses")
+                selected_context = _current_openai_account_context()
+                if selected_context.get("account_hash"):
+                    candidate.setdefault(
+                        "codex_oauth_account_hash",
+                        selected_context.get("account_hash"),
+                    )
+                if selected_context.get("lane_key"):
+                    candidate.setdefault(
+                        "codex_oauth_lane_key",
+                        selected_context.get("lane_key"),
+                    )
+                try:
+                    from .aawm_alias_routing import selection as _selection
+
+                    context = (
+                        _selection._get_codex_oauth_request_local_failover_context(
+                            request,
+                            candidate=candidate,
+                        )
+                    )
+                except Exception:
+                    return None
+                if (
+                    not isinstance(context, Mapping)
+                    or context.get("portable_replay") is not True
+                ):
+                    return None
+                return dict(context)
+
+            def _openai_portable_transition_authority(
+                expected_model: Optional[str],
+            ) -> Optional[dict[str, Any]]:
+                context = _candidate_scoped_openai_failover_context(
+                    expected_model
+                )
+                if context is None:
+                    return None
+                state = getattr(request, "state", None)
+                pending = getattr(
+                    state,
+                    "_aawm_native_openai_responses_affinity_commitment",
+                    None,
+                )
+                transition = (
+                    pending.get("canonical_owner_transition")
+                    if isinstance(pending, Mapping)
+                    else None
+                )
+                if not isinstance(transition, Mapping):
+                    return None
+                if (
+                    transition.get("authorization")
+                    != "codex_oauth_portable_account_failover"
+                    or type(transition.get("failover_ordinal")) is not int
+                    or transition.get("failover_ordinal") != 1
+                ):
+                    return None
+                source_owner_id = transition.get("source_owner_id")
+                source_attributes = transition.get("source_attributes")
+                destination_attributes = transition.get(
+                    "destination_attributes"
+                )
+                if (
+                    not isinstance(source_owner_id, str)
+                    or not source_owner_id.strip()
+                    or not isinstance(source_attributes, Mapping)
+                    or not isinstance(destination_attributes, Mapping)
+                ):
+                    return None
+                source_account_hash = source_attributes.get("account_hash")
+                prior_account_hash = context.get("prior_account_hash")
+                if (
+                    prior_account_hash is not None
+                    and str(source_account_hash or "") != str(prior_account_hash)
+                ):
+                    return None
+                selected_context = _current_openai_account_context()
+                for context_key, attribute_key in (
+                    ("account_label", "account_label"),
+                    ("account_hash", "account_hash"),
+                    ("lane_key", "account_lane"),
+                ):
+                    current_value = selected_context.get(context_key)
+                    destination_value = destination_attributes.get(attribute_key)
+                    if (
+                        current_value is not None
+                        and destination_value is not None
+                        and str(current_value) != str(destination_value)
+                    ):
+                        return None
+                for attributes in (source_attributes, destination_attributes):
+                    if str(attributes.get("model") or "") != str(
+                        expected_model
+                    ):
+                        return None
+                if not transition.get("session_identity"):
+                    return None
+                return {
+                    "context": context,
+                    "transition": dict(transition),
+                }
+
             def _strict_managed_openai_owner_enabled(
                 expected_model: Optional[str],
             ) -> bool:
@@ -7832,23 +7946,10 @@ async def pass_through_request(  # noqa: PLR0915
                 state = getattr(request, "state", None)
                 if state is None:
                     return False
-                if getattr(
-                    state,
-                    "_aawm_direct_codex_account_failover_planned",
-                    False,
-                ):
-                    return False
-                failover_context = getattr(
-                    state,
-                    "aawm_codex_oauth_request_local_failover_context",
-                    None,
+                return (
+                    _openai_portable_transition_authority(expected_model)
+                    is None
                 )
-                if (
-                    isinstance(failover_context, Mapping)
-                    and failover_context.get("portable_replay") is True
-                ):
-                    return False
-                return True
 
             def _build_final_openai_owner_attributes(
                 *,
@@ -7936,6 +8037,270 @@ async def pass_through_request(  # noqa: PLR0915
                     _strict_managed_openai_owner_enabled(expected_model),
                 )
 
+            def _openai_owner_attributes_exact(
+                left: Mapping[str, Any],
+                right: Mapping[str, Any],
+            ) -> bool:
+                session_affinity = _session_affinity_mod()
+                core_builder = getattr(
+                    session_affinity,
+                    "_core_owner_attributes",
+                    None,
+                )
+                attribute_builder = getattr(
+                    session_affinity,
+                    "build_session_owner_attributes",
+                    None,
+                )
+                if not callable(core_builder) or not callable(
+                    attribute_builder
+                ):
+                    return False
+                left_core = dict(core_builder(attribute_builder(extra=left)))
+                right_core = dict(core_builder(attribute_builder(extra=right)))
+                if set(left_core) != set(right_core):
+                    return False
+                return all(
+                    str(left_core[key]) == str(right_core[key])
+                    for key in left_core
+                )
+
+            def _raise_openai_portable_owner_validation_failure(
+                *,
+                session_identity: Optional[str],
+                cache_key: Optional[str],
+                owner_record: Optional[Mapping[str, Any]],
+                owner_id: Optional[str],
+                reason: str,
+                model: Optional[str],
+                candidate: Optional[Mapping[str, Any]],
+            ) -> None:
+                session_affinity = _session_affinity_mod()
+                guard = session_affinity.SessionOwnerGuardResult(
+                    decision=(
+                        session_affinity.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
+                    ),
+                    session_identity=session_identity,
+                    cache_key=cache_key,
+                    owner_id=owner_id,
+                    owner_record=(
+                        dict(owner_record)
+                        if isinstance(owner_record, Mapping)
+                        else None
+                    ),
+                    mismatch_reason=reason,
+                    provenance=session_affinity.build_session_owner_provenance(
+                        session_identity=session_identity,
+                        decision=(
+                            session_affinity.SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value
+                        ),
+                        owner_record=owner_record,
+                        owner_id=owner_id,
+                        mismatch_reason=reason,
+                        cache_key=cache_key,
+                    ),
+                )
+                session_affinity.raise_session_owner_redispatch_required(
+                    session_identity=session_identity,
+                    guard=guard,
+                    alias_model=model,
+                    candidate=candidate,
+                    failure_phase="session_owner_openai_portable_final_send",
+                    request=request,
+                )
+
+            async def _validate_openai_portable_owner_transition(
+                authority: Mapping[str, Any],
+                *,
+                model: str,
+                account_context: Mapping[str, Any],
+            ) -> str:
+                session_affinity = _session_affinity_mod()
+                transition = authority.get("transition")
+                if not isinstance(transition, Mapping):
+                    _raise_openai_portable_owner_validation_failure(
+                        session_identity=None,
+                        cache_key=None,
+                        owner_record=None,
+                        owner_id=None,
+                        reason=(
+                            "session_owner: portable transition authority "
+                            "is missing"
+                        ),
+                        model=model,
+                        candidate=None,
+                    )
+                source_owner_id = str(
+                    transition.get("source_owner_id") or ""
+                ).strip()
+                source_attributes = transition.get("source_attributes")
+                destination_attributes = transition.get(
+                    "destination_attributes"
+                )
+                if (
+                    not source_owner_id
+                    or not isinstance(source_attributes, Mapping)
+                    or not isinstance(destination_attributes, Mapping)
+                ):
+                    _raise_openai_portable_owner_validation_failure(
+                        session_identity=transition.get("session_identity"),
+                        cache_key=None,
+                        owner_record=None,
+                        owner_id=None,
+                        reason=(
+                            "session_owner: portable transition authority "
+                            "is incomplete"
+                        ),
+                        model=model,
+                        candidate=destination_attributes
+                        if isinstance(destination_attributes, Mapping)
+                        else None,
+                    )
+                destination_owner_id = session_affinity.build_session_owner_id(
+                    attributes=destination_attributes
+                )
+                current_attributes = _build_final_openai_owner_attributes(
+                    model=model,
+                    account_context=account_context,
+                )
+                if not _openai_owner_attributes_exact(
+                    current_attributes,
+                    destination_attributes,
+                ):
+                    _raise_openai_portable_owner_validation_failure(
+                        session_identity=transition.get("session_identity"),
+                        cache_key=None,
+                        owner_record=None,
+                        owner_id=None,
+                        reason=(
+                            "session_owner: portable transition destination "
+                            "does not match the selected OpenAI candidate"
+                        ),
+                        model=model,
+                        candidate=destination_attributes,
+                    )
+                request_body: dict[str, Any] = (
+                    _parsed_body
+                    if isinstance(_parsed_body, dict)
+                    else (
+                        provider_bound_body
+                        if isinstance(provider_bound_body, dict)
+                        else {}
+                    )
+                )
+                session_identity = session_affinity.resolve_canonical_session_identity(
+                    request,
+                    request_body,
+                    session_identity=transition.get("session_identity"),
+                )
+                get_owner_record = getattr(
+                    session_affinity,
+                    "get_session_owner_record",
+                    None,
+                )
+                if not callable(get_owner_record) or session_identity is None:
+                    _raise_openai_portable_owner_validation_failure(
+                        session_identity=session_identity,
+                        cache_key=None,
+                        owner_record=None,
+                        owner_id=None,
+                        reason=(
+                            "session_owner: portable transition canonical "
+                            "identity is unavailable"
+                        ),
+                        model=model,
+                        candidate=destination_attributes,
+                    )
+
+                owner_record, cache_key, owner_error = await get_owner_record(
+                    session_identity=session_identity,
+                    request=request,
+                    wait_for_foreign_reservation=False,
+                )
+                actual_owner_id = (
+                    str(owner_record.get("owner") or "").strip()
+                    if isinstance(owner_record, Mapping)
+                    else ""
+                )
+                if owner_error is not None:
+                    _raise_openai_portable_owner_validation_failure(
+                        session_identity=session_identity,
+                        cache_key=cache_key,
+                        owner_record=owner_record,
+                        owner_id=actual_owner_id or None,
+                        reason=(
+                            "session_owner: portable transition owner "
+                            "lookup failed"
+                        ),
+                        model=model,
+                        candidate=destination_attributes,
+                    )
+                if not isinstance(owner_record, Mapping):
+                    _raise_openai_portable_owner_validation_failure(
+                        session_identity=session_identity,
+                        cache_key=cache_key,
+                        owner_record=owner_record,
+                        owner_id=None,
+                        reason=(
+                            "session_owner: portable transition owner "
+                            "is missing"
+                        ),
+                        model=model,
+                        candidate=destination_attributes,
+                    )
+                record_state_fn = getattr(
+                    session_affinity,
+                    "_record_state",
+                    lambda record: record.get("state"),
+                )
+                if record_state_fn(owner_record) != "owned":
+                    _raise_openai_portable_owner_validation_failure(
+                        session_identity=session_identity,
+                        cache_key=cache_key,
+                        owner_record=owner_record,
+                        owner_id=actual_owner_id or None,
+                        reason=(
+                            "session_owner: portable transition owner "
+                            "is not established"
+                        ),
+                        model=model,
+                        candidate=destination_attributes,
+                    )
+                owner_attributes = getattr(
+                    session_affinity,
+                    "_owner_attributes",
+                    lambda record: {},
+                )(owner_record)
+                if (
+                    actual_owner_id == source_owner_id
+                    and _openai_owner_attributes_exact(
+                        owner_attributes,
+                        source_attributes,
+                    )
+                ):
+                    return "source"
+                if (
+                    actual_owner_id == destination_owner_id
+                    and _openai_owner_attributes_exact(
+                        owner_attributes,
+                        destination_attributes,
+                    )
+                ):
+                    return "destination"
+                _raise_openai_portable_owner_validation_failure(
+                    session_identity=session_identity,
+                    cache_key=cache_key,
+                    owner_record=owner_record,
+                    owner_id=actual_owner_id or None,
+                    reason=(
+                        "session_owner: portable transition owner is "
+                        "outside the authorized source/destination"
+                    ),
+                    model=model,
+                    candidate=destination_attributes,
+                )
+                raise AssertionError("unreachable")
+
             async def _send_prepared_openai_request(
                 prepared_request: httpx.Request,
                 send_stream: bool,
@@ -8009,11 +8374,20 @@ async def pass_through_request(  # noqa: PLR0915
                     protected_headers_match = (
                         True if selected_openai_headers else None
                     )
+                    portable_transition_authority = (
+                        _openai_portable_transition_authority(expected_model)
+                        if selected_openai_headers
+                        else None
+                    )
                     if not strict_owner_enabled:
                         owner_comparison_mode = (
                             "portable_transition"
-                            if selected_openai_headers
-                            else "none"
+                            if portable_transition_authority is not None
+                            else (
+                                "not_applicable"
+                                if selected_openai_headers
+                                else "none"
+                            )
                         )
                     if strict_owner_enabled:
                         owner_attributes = (
@@ -8054,8 +8428,88 @@ async def pass_through_request(  # noqa: PLR0915
                             _post_guard_expected_model,
                             _post_guard_strict_owner_enabled,
                         ) = _validate_final_openai_binding(prepared_request)
+                    elif portable_transition_authority is not None:
+                        owner_comparison_result = (
+                            await _validate_openai_portable_owner_transition(
+                                portable_transition_authority,
+                                model=serialized_model or expected_model or "",
+                                account_context=current_selected_account_context,
+                            )
+                        )
+                        ensure_openai_wire_replay_allowed(
+                            request,
+                            ledger=openai_call_ledger,
+                        )
+                        (
+                            serialized_model,
+                            current_selected_account_context,
+                            _post_guard_expected_model,
+                            _post_guard_strict_owner_enabled,
+                        ) = _validate_final_openai_binding(prepared_request)
+                        post_transition_authority = (
+                            _openai_portable_transition_authority(
+                                _post_guard_expected_model
+                            )
+                        )
+                        if post_transition_authority is None:
+                            _raise_openai_portable_owner_validation_failure(
+                                session_identity=(
+                                    portable_transition_authority[
+                                        "transition"
+                                    ].get("session_identity")
+                                ),
+                                cache_key=None,
+                                owner_record=None,
+                                owner_id=None,
+                                reason=(
+                                    "session_owner: portable transition "
+                                    "authority changed before send"
+                                ),
+                                model=(
+                                    serialized_model
+                                    or _post_guard_expected_model
+                                    or ""
+                                ),
+                                candidate=(
+                                    portable_transition_authority[
+                                        "transition"
+                                    ].get("destination_attributes")
+                                ),
+                            )
+                        if (
+                            post_transition_authority.get("transition")
+                            != portable_transition_authority.get("transition")
+                        ):
+                            _raise_openai_portable_owner_validation_failure(
+                                session_identity=(
+                                    portable_transition_authority[
+                                        "transition"
+                                    ].get("session_identity")
+                                ),
+                                cache_key=None,
+                                owner_record=None,
+                                owner_id=None,
+                                reason=(
+                                    "session_owner: portable transition "
+                                    "authority changed before send"
+                                ),
+                                model=(
+                                    serialized_model
+                                    or _post_guard_expected_model
+                                    or ""
+                                ),
+                                candidate=(
+                                    portable_transition_authority[
+                                        "transition"
+                                    ].get("destination_attributes")
+                                ),
+                            )
                     else:
-                        owner_comparison_result = "skipped"
+                        owner_comparison_result = (
+                            "not_applicable"
+                            if selected_openai_headers
+                            else "skipped"
+                        )
                 except Exception:
                     _record_openai_final_send_binding_observation(
                         request=request,
