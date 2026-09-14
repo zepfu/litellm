@@ -4939,6 +4939,14 @@ _XAI_DEFERRED_STREAM_PHASES = frozenset(
         "finalization_wait_cancelled",
         "finalization_task_returned",
         "finalization_task_raised",
+        "release_result",
+        "cleanup_outcome",
+        "validator_decision",
+        "finalizer_enter",
+        "finalizer_result",
+        "finalize_enter",
+        "finalization_task_created",
+        "finalization_task_reused",
         "success_finalizer_called",
         "success_finalizer_returned",
         "success_finalizer_raised",
@@ -4949,6 +4957,19 @@ _XAI_DEFERRED_STREAM_PHASES = frozenset(
 )
 _XAI_DEFERRED_STREAM_BINDING_OUTCOMES = frozenset(
     {"not_streaming_response", "already_bound", "missing_iterator", "bound"}
+)
+_XAI_DEFERRED_STREAM_SUCCESS_PATHS = frozenset(
+    {
+        "not_streaming_response",
+        "already_bound",
+        "missing_iterator",
+        "bound",
+        "finalization",
+        "iterator_pre_pull",
+        "iterator_wait",
+        "iterator_post_pull",
+        "stream_response",
+    }
 )
 _XAI_DEFERRED_STREAM_MUTATION_OUTCOMES = frozenset(
     outcome.value for outcome in SessionOwnerMutationOutcome
@@ -5117,6 +5138,19 @@ def _make_xai_deferred_stream_observer(
         def _optional_bool(value: Any, *, absent: Any = "unknown") -> Any:
             return value if isinstance(value, bool) else absent
 
+        def _normalize_success_path(value: Any) -> Any:
+            if isinstance(value, bool):
+                return value
+            raw = value.value if isinstance(value, Enum) else value
+            if not isinstance(raw, str) or not raw.strip():
+                return "unknown"
+            normalized = raw.strip().casefold()
+            return (
+                normalized
+                if normalized in _XAI_DEFERRED_STREAM_SUCCESS_PATHS
+                else "unknown"
+            )
+
         def _lease_snapshot() -> dict[str, Any]:
             present = lease is not None
             if not present:
@@ -5237,9 +5271,13 @@ def _make_xai_deferred_stream_observer(
                 "success_finalizer_called": "success_finalizer",
                 "success_finalizer_returned": "success_finalizer",
                 "success_finalizer_raised": "success_finalizer",
+                "finalizer_enter": "success_finalizer",
+                "finalizer_result": "success_finalizer",
                 "release_called": "release",
                 "release_returned": "release",
                 "release_raised": "release",
+                "release_result": "release",
+                "cleanup_outcome": "release",
             }.get(phase)
             if operation is not None:
                 snapshot["operation"] = operation
@@ -5277,6 +5315,11 @@ def _make_xai_deferred_stream_observer(
         def _observe(phase: Any, **fields: Any) -> None:
             try:
                 normalized_phase = _normalize_phase(phase)
+                success_path = (
+                    _normalize_success_path(fields.get("success_path"))
+                    if "success_path" in fields
+                    else "unknown"
+                )
                 payload: dict[str, Any] = {
                     "event": _XAI_DEFERRED_STREAM_EVENT,
                     "phase": normalized_phase,
@@ -5285,8 +5328,13 @@ def _make_xai_deferred_stream_observer(
                     **_lease_snapshot(),
                     **_validation_snapshot(),
                 }
-                if normalized_phase in _XAI_DEFERRED_STREAM_BINDING_OUTCOMES:
-                    payload["binding_outcome"] = normalized_phase
+                binding_outcome = (
+                    success_path
+                    if normalized_phase == "binding"
+                    else normalized_phase
+                )
+                if binding_outcome in _XAI_DEFERRED_STREAM_BINDING_OUTCOMES:
+                    payload["binding_outcome"] = binding_outcome
 
                 for key in (
                     "success_path",
@@ -5294,7 +5342,11 @@ def _make_xai_deferred_stream_observer(
                     "stream_response_wrapped",
                 ):
                     if key in fields:
-                        payload[key] = _optional_bool(fields.get(key))
+                        payload[key] = (
+                            success_path
+                            if key == "success_path"
+                            else _optional_bool(fields.get(key))
+                        )
 
                 error_category = _exception_category(fields.get("error"))
                 if error_category is None:
