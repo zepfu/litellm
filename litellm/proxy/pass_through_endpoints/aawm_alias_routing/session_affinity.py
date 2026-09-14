@@ -4231,16 +4231,25 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
 
     from fastapi.responses import StreamingResponse
 
+    observe = _make_xai_deferred_stream_observer(
+        request,
+        lease,
+        response,
+        success_finalizer,
+    )
     if not isinstance(response, StreamingResponse):
+        observe("binding", success_path="not_streaming_response")
         return False
     if getattr(
         response,
         "_aawm_session_owner_deferred_finalizer_bound",
         False,
     ):
+        observe("binding", success_path="already_bound")
         return True
     original_iterator = getattr(response, "body_iterator", None)
     if original_iterator is None:
+        observe("binding", success_path="missing_iterator")
         return False
 
     renewal_task = start_session_owner_lease_renewal(lease)
@@ -4347,11 +4356,13 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                 cleanup_error = exc
         except BaseException as exc:  # noqa: BLE001
             cleanup_error = exc
+        observe("release_result", result=release_result, success_path=False)
         try:
             await _notify_failure(cause)
         except BaseException as exc:  # noqa: BLE001
             if cleanup_error is None:
                 cleanup_error = exc
+        observe("cleanup_outcome", result=release_result, error=cleanup_error)
         return release_result, cleanup_error
 
     async def _run_finalization(
@@ -4362,6 +4373,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
             release_result = await finalize_session_owner_lease_on_failure(
                 lease, request=request
             )
+            observe("release_result", result=release_result, success_path=False)
             await _notify_failure(cause)
             if (
                 cause is None
@@ -4376,9 +4388,15 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
 
         renewal_error = _renewal_error()
         if renewal_error is not None:
+            observe(
+                "renewal_failed",
+                renewal_error=renewal_error,
+                success_path="finalization",
+            )
             release_result = await finalize_session_owner_lease_on_failure(
                 lease, request=request
             )
+            observe("release_result", result=release_result, success_path=False)
             await _notify_failure(renewal_error)
             _raise_structured_failure(
                 mutation=(
@@ -4392,8 +4410,12 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
             )
 
         validation_ok, validation_reason = _validation_status()
+        observe("validator_decision", success_path=validation_ok)
         if not validation_ok:
-            await finalize_session_owner_lease_on_failure(lease, request=request)
+            release_result = await finalize_session_owner_lease_on_failure(
+                lease, request=request
+            )
+            observe("release_result", result=release_result, success_path=False)
             validation_error = RuntimeError(
                 f"session_owner: deferred response validation failed: "
                 f"{validation_reason}"
@@ -4405,8 +4427,11 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
             )
 
         try:
+            observe("finalizer_enter", success_path=True)
             result = await success_finalizer()
+            observe("finalizer_result", result=result, success_path=True)
         except BaseException as finalization_error:  # noqa: BLE001
+            observe("finalizer_result", error=finalization_error, success_path=True)
             release_result, cleanup_error = await _attempt_failure_cleanup(
                 finalization_error
             )
@@ -4428,7 +4453,10 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
             result is not None
             and result.outcome not in success_outcomes
         ):
-            await finalize_session_owner_lease_on_failure(lease, request=request)
+            release_result = await finalize_session_owner_lease_on_failure(
+                lease, request=request
+            )
+            observe("release_result", result=release_result, success_path=False)
             finalization_error = RuntimeError(
                 "session_owner: deferred lease finalization did not commit "
                 f"outcome={result.outcome.value}"
@@ -4446,16 +4474,42 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
         cause: Optional[BaseException] = None,
     ) -> None:
         nonlocal finalization_task
+        observe("finalize_enter", success_path=success, error=cause)
         if finalization_task is None:
             finalization_task = asyncio.create_task(
                 _run_finalization(success, cause)
             )
+            observe("finalization_task_created", success_path=success)
+        else:
+            observe("finalization_task_reused", success_path=success)
         task = finalization_task
         try:
             await asyncio.shield(task)
-        except asyncio.CancelledError:
-            await asyncio.shield(task)
+        except asyncio.CancelledError as wait_error:
+            observe(
+                "finalization_wait_cancelled",
+                error=wait_error,
+                success_path=success,
+            )
+            try:
+                await asyncio.shield(task)
+            except BaseException as finalization_error:  # noqa: BLE001
+                observe(
+                    "finalization_task_raised",
+                    error=finalization_error,
+                    success_path=success,
+                )
+                raise
+            observe("finalization_task_returned", success_path=success)
             raise
+        except BaseException as finalization_error:  # noqa: BLE001
+            observe(
+                "finalization_task_raised",
+                error=finalization_error,
+                success_path=success,
+            )
+            raise
+        observe("finalization_task_returned", success_path=success)
 
     original_closed = False
 
@@ -4492,6 +4546,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
             self._iterator = original_iterator.__aiter__()
             self._closed = False
             self._completed = False
+            self._first_pull_observed = False
 
         def __aiter__(self) -> "_DeferredLeaseIterator":
             return self
@@ -4499,8 +4554,16 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
         async def __anext__(self) -> Any:
             if self._closed:
                 raise StopAsyncIteration
+            if not self._first_pull_observed:
+                self._first_pull_observed = True
+                observe("first_pull")
             renewal_error = _renewal_error()
             if renewal_error is not None:
+                observe(
+                    "renewal_failed",
+                    renewal_error=renewal_error,
+                    success_path="iterator_pre_pull",
+                )
                 await _finalize(False, renewal_error)
                 await _close_original_iterator()
                 _raise_structured_failure(
@@ -4519,6 +4582,11 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                     if renewal_task in done:
                         renewal_error = _renewal_error()
                         if renewal_error is not None:
+                            observe(
+                                "renewal_failed",
+                                renewal_error=renewal_error,
+                                success_path="iterator_wait",
+                            )
                             await _cancel_and_await_tasks(next_task)
                             await _finalize(False, renewal_error)
                             await _close_original_iterator()
@@ -4530,6 +4598,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                     chunk = await next_task
             except StopAsyncIteration:
                 self._completed = True
+                observe("iterator_eof", success_path=True)
                 try:
                     await _finalize(True)
                 finally:
@@ -4537,6 +4606,18 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                     await _close_original_iterator()
                 raise
             except BaseException as exc:
+                observe(
+                    (
+                        "iterator_cancelled"
+                        if isinstance(exc, asyncio.CancelledError)
+                        else (
+                            "iterator_closed"
+                            if isinstance(exc, GeneratorExit)
+                            else "iterator_exception"
+                        )
+                    ),
+                    error=exc,
+                )
                 try:
                     await _cancel_and_await_tasks(next_task)
                     await _finalize(False, exc)
@@ -4546,6 +4627,11 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                 raise
             renewal_error = _renewal_error()
             if renewal_error is not None:
+                observe(
+                    "renewal_failed",
+                    renewal_error=renewal_error,
+                    success_path="iterator_post_pull",
+                )
                 try:
                     await _finalize(False, renewal_error)
                 finally:
@@ -4560,6 +4646,8 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
         async def aclose(self) -> None:
             if self._closed:
                 return
+            if not self._completed:
+                observe("close_before_eof")
             self._closed = True
             try:
                 if not self._completed:
@@ -4572,12 +4660,18 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
     setattr(response, "_aawm_session_owner_deferred_finalizer_bound", True)
 
     original_stream_response = getattr(response, "stream_response", None)
+    stream_response_wrapped = False
     if callable(original_stream_response):
 
         async def _stream_response_with_finalizer(send: Any) -> None:
             try:
                 renewal_error = _renewal_error()
                 if renewal_error is not None:
+                    observe(
+                        "renewal_failed",
+                        renewal_error=renewal_error,
+                        success_path="stream_response",
+                    )
                     await _finalize(False, renewal_error)
                     _raise_structured_failure(
                         mutation=_mutation_error(str(renewal_error)),
@@ -4585,12 +4679,27 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                     )
                 await original_stream_response(send)
             except BaseException as exc:
+                observe(
+                    (
+                        "stream_response_cancelled"
+                        if isinstance(exc, asyncio.CancelledError)
+                        else "stream_response_exception"
+                    ),
+                    error=exc,
+                )
                 await _finalize(False, exc)
                 raise
             finally:
                 await wrapped_iterator.aclose()
 
         response.stream_response = _stream_response_with_finalizer
+        stream_response_wrapped = True
+    observe(
+        "binding",
+        success_path="bound",
+        iterator_wrapped=True,
+        stream_response_wrapped=stream_response_wrapped,
+    )
     return True
 
 
