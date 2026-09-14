@@ -213,7 +213,15 @@ def resolve_alpha_probe_control(
     plan = _resolve_plan(raw_plan)
 
     state = _request_state(request)
-    existing = getattr(state, _CONTROL_STATE_KEY, None) if state else None
+    if state is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "alpha_probe_request_state_unavailable",
+                "message": "alpha probe request state unavailable",
+            },
+        )
+    existing = getattr(state, _CONTROL_STATE_KEY, None)
     if existing is not None:
         if not isinstance(existing, AlphaProbeControl) or existing.plan != plan:
             raise HTTPException(
@@ -221,6 +229,14 @@ def resolve_alpha_probe_control(
                 detail={
                     "error": "alpha_probe_control_conflict",
                     "message": "alpha probe control is already bound to this request",
+                },
+            )
+        if not isinstance(existing.request_identity, str) or not existing.request_identity.strip():
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "alpha_probe_request_identity_unavailable",
+                    "message": "alpha probe request identity unavailable",
                 },
             )
         return existing
@@ -234,12 +250,19 @@ def resolve_alpha_probe_control(
     request_identity = (
         _attempt_records._bind_auto_agent_alias_request_identity(request)
     )
+    if not isinstance(request_identity, str) or not request_identity.strip():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "alpha_probe_request_identity_unavailable",
+                "message": "alpha probe request identity unavailable",
+            },
+        )
     control = AlphaProbeControl(
         plan=plan,
         request_identity=request_identity,
     )
-    if state is not None:
-        setattr(state, _CONTROL_STATE_KEY, control)
+    setattr(state, _CONTROL_STATE_KEY, control)
     return control
 
 
