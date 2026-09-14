@@ -1521,6 +1521,8 @@ def _ensure_openai_raw_retry_failure_origin(
         )
         if isinstance(existing_origin, Mapping):
             return dict(existing_origin)
+        if response is None:
+            return {}
         origin = _build_openai_raw_retry_failure_origin(request, response)
         if origin:
             setattr(
@@ -1559,197 +1561,14 @@ def _openai_raw_retry_provider_returned(
 def _copy_openai_raw_retry_event(
     event: Any,
 ) -> Optional[Dict[str, Any]]:
-    """Return a schema-checked copy of a server-generated retry event."""
+    """Isolate one already allowlisted server-generated retry event."""
 
     if not isinstance(event, Mapping):
         return None
-    if event.get("event_source") != _AAWM_OPENAI_RAW_RETRY_EVENT_SOURCE:
+    try:
+        return copy.deepcopy(dict(event))
+    except Exception:
         return None
-    if not isinstance(event.get("event_type"), str) or not isinstance(
-        event.get("event_stage"), str
-    ):
-        return None
-    if event.get("route") != _AAWM_OPENAI_RAW_RETRY_ROUTE:
-        return None
-
-    copied: Dict[str, Any] = {
-        "event_source": _AAWM_OPENAI_RAW_RETRY_EVENT_SOURCE,
-        "event_type": _clean_passthrough_error_context_value(
-            event.get("event_type")
-        ),
-        "event_stage": _clean_passthrough_error_context_value(
-            event.get("event_stage")
-        ),
-        "route": _AAWM_OPENAI_RAW_RETRY_ROUTE,
-    }
-    string_fields = (
-        "litellm_call_id",
-        "provider",
-        "model",
-        "route_family",
-        "selected_account_hash",
-        "selected_account_lane",
-        "selected_account_context_source",
-        "provider_provenance",
-        "provider_provenance_source",
-        "error_class",
-        "classification",
-        "classification_reason",
-        "authorization_result",
-        "authorization_denial_reason",
-        "failure_source_request_fingerprint",
-        "failure_source_target_fingerprint",
-        "failure_source_candidate_fingerprint",
-        "failure_source_model_fingerprint",
-        "failure_source_account_fingerprint",
-    )
-    for key in string_fields:
-        if key not in event:
-            continue
-        value = event.get(key)
-        if value is not None and not isinstance(value, (str, int, float)):
-            return None
-        copied[key] = _clean_passthrough_error_context_value(value)
-
-    int_fields = (
-        "observed_http_status_code",
-        "classification_status_code",
-        "failure_source_send_ordinal",
-        "ledger_current_ordinal",
-        "authorization_prior_ordinal",
-        "event_sequence",
-        "history_dropped_count",
-    )
-    for key in int_fields:
-        if key not in event:
-            continue
-        value = event.get(key)
-        if value is None:
-            copied[key] = None
-        elif isinstance(value, int) and not isinstance(value, bool):
-            copied[key] = value
-        else:
-            return None
-
-    for key in ("provider_returned", "retryable"):
-        if key not in event:
-            continue
-        value = event.get(key)
-        if value is None or isinstance(value, bool):
-            copied[key] = value
-        else:
-            return None
-
-    provenance = copied.get("provider_provenance")
-    if provenance not in (None, "provider_returned", "not_returned", "unknown"):
-        return None
-    provenance_source = copied.get("provider_provenance_source")
-    if provenance_source not in (
-        None,
-        "response_observation",
-        "private_transport_marker",
-        "typed_precommit_failure",
-        "origin_observation",
-        "unknown",
-    ):
-        return None
-
-    ledger = event.get("ledger")
-    if ledger is not None:
-        if not isinstance(ledger, Mapping):
-            return None
-        copied_ledger: Dict[str, Any] = {}
-        for key in ("request_fingerprint", "ledger_current_ordinal"):
-            if key not in ledger:
-                continue
-            value = ledger.get(key)
-            if key == "request_fingerprint":
-                if value is not None and not isinstance(value, (str, int, float)):
-                    return None
-                copied_ledger[key] = _clean_passthrough_error_context_value(
-                    value
-                )
-            elif value is None or (
-                isinstance(value, int) and not isinstance(value, bool)
-            ):
-                copied_ledger[key] = value
-            else:
-                return None
-        for key in (
-            "logical_provider_calls",
-            "max_logical_provider_calls",
-            "remaining_logical_provider_calls",
-            "next_attempt_ordinal",
-        ):
-            if key not in ledger:
-                continue
-            value = ledger.get(key)
-            if value is None or (
-                isinstance(value, int) and not isinstance(value, bool)
-            ):
-                copied_ledger[key] = value
-            else:
-                return None
-        if "capacity_retry_authorized" in ledger:
-            value = ledger.get("capacity_retry_authorized")
-            if value is not None and not isinstance(value, bool):
-                return None
-            copied_ledger["capacity_retry_authorized"] = value
-        authorization = ledger.get("capacity_retry_authorization")
-        if authorization is not None:
-            if not isinstance(authorization, Mapping):
-                return None
-            copied_authorization: Dict[str, Any] = {}
-            for key in (
-                "prior_ordinal",
-                "target_fingerprint",
-                "model_fingerprint",
-                "account_fingerprint",
-            ):
-                if key not in authorization:
-                    continue
-                value = authorization.get(key)
-                if key == "prior_ordinal":
-                    if value is not None and not (
-                        isinstance(value, int) and not isinstance(value, bool)
-                    ):
-                        return None
-                    copied_authorization[key] = value
-                else:
-                    if value is not None and not isinstance(
-                        value, (str, int, float)
-                    ):
-                        return None
-                    copied_authorization[key] = (
-                        _clean_passthrough_error_context_value(value)
-                    )
-            if copied_authorization:
-                copied_ledger["capacity_retry_authorization"] = (
-                    copied_authorization
-                )
-        copied["ledger"] = copied_ledger
-
-    authorization_fingerprints = event.get("authorization_fingerprints")
-    if authorization_fingerprints is not None:
-        if not isinstance(authorization_fingerprints, Mapping):
-            return None
-        copied_authorization_fingerprints: Dict[str, Any] = {}
-        for key in (
-            "target_fingerprint",
-            "model_fingerprint",
-            "account_fingerprint",
-        ):
-            if key not in authorization_fingerprints:
-                continue
-            value = authorization_fingerprints.get(key)
-            if value is not None and not isinstance(value, (str, int, float)):
-                return None
-            copied_authorization_fingerprints[key] = (
-                _clean_passthrough_error_context_value(value)
-            )
-        copied["authorization_fingerprints"] = copied_authorization_fingerprints
-
-    return copied
 
 
 def _append_openai_raw_retry_event_to_state(
@@ -1770,13 +1589,12 @@ def _append_openai_raw_retry_event_to_state(
         if not isinstance(dropped, int) or isinstance(dropped, bool):
             dropped = 0
         if isinstance(state_events, list):
-            checked_events = []
-            for existing_event in state_events:
-                checked_event = _copy_openai_raw_retry_event(existing_event)
-                if checked_event is None:
-                    dropped += 1
-                else:
-                    checked_events.append(checked_event)
+            checked_events = [
+                existing_event
+                for existing_event in state_events
+                if isinstance(existing_event, Mapping)
+            ]
+            dropped += len(state_events) - len(checked_events)
         else:
             checked_events = []
             if state_events is not None:
@@ -1790,10 +1608,10 @@ def _append_openai_raw_retry_event_to_state(
         if not isinstance(sequence, int) or isinstance(sequence, bool):
             sequence = 0
         sequence += 1
-        event["event_sequence"] = sequence
         checked_event = _copy_openai_raw_retry_event(event)
         if checked_event is None:
             return None
+        checked_event["event_sequence"] = sequence
         checked_events.append(checked_event)
         overflow = max(0, len(checked_events) - _AAWM_OPENAI_RAW_RETRY_EVENT_MAX)
         if overflow:
@@ -1834,9 +1652,9 @@ def _export_openai_raw_retry_event_history(
             return None
         events = []
         for event in state_events:
-            checked_event = _copy_openai_raw_retry_event(event)
-            if checked_event is not None:
-                events.append(checked_event)
+            isolated_event = _copy_openai_raw_retry_event(event)
+            if isolated_event is not None:
+                events.append(isolated_event)
         dropped = getattr(
             request_state,
             _AAWM_OPENAI_RAW_RETRY_EVENT_DROPPED_STATE_KEY,
@@ -1867,7 +1685,6 @@ def _record_openai_raw_retry_event(
     event_stage: str,
     request: Optional[Request],
     kwargs: Optional[dict],
-    target: Any,
     custom_llm_provider: Optional[str],
     litellm_call_id: Optional[str],
     failure: Optional[Exception],
@@ -1885,14 +1702,19 @@ def _record_openai_raw_retry_event(
     if diagnostic_enabled is not True:
         return
     try:
+        observed_classification_status_code = classification_status_code
+        if (
+            observed_classification_status_code is None
+            and isinstance(failure, ResponsesStreamPreCommitFailure)
+        ):
+            try:
+                observed_classification_status_code = failure.status_code
+            except Exception:
+                observed_classification_status_code = None
+
         request_metadata: Optional[Dict[str, Any]] = None
         try:
             request_metadata = _ensure_passthrough_metadata(kwargs)
-            # Caller metadata is never evidence for this namespace.
-            request_metadata.pop(
-                _AAWM_OPENAI_RAW_RETRY_EVENT_METADATA_KEY,
-                None,
-            )
         except Exception:
             request_metadata = None
 
@@ -1929,13 +1751,6 @@ def _record_openai_raw_retry_event(
             )
             if isinstance(attached_origin, Mapping):
                 origin = attached_origin
-        if not origin and failure is not None:
-            origin = _ensure_openai_raw_retry_failure_origin(
-                failure,
-                request=request,
-                response=response,
-            )
-
         ledger = _build_openai_raw_retry_ledger_snapshot(request)
         provider_returned, provider_provenance_source = (
             _openai_raw_retry_provider_returned(failure, origin)
@@ -1973,9 +1788,9 @@ def _record_openai_raw_retry_event(
                 else None
             ),
             "classification_status_code": (
-                classification_status_code
-                if isinstance(classification_status_code, int)
-                and not isinstance(classification_status_code, bool)
+                observed_classification_status_code
+                if isinstance(observed_classification_status_code, int)
+                and not isinstance(observed_classification_status_code, bool)
                 else None
             ),
             "provider_returned": provider_returned,
@@ -2605,7 +2420,6 @@ def _classify_passthrough_raw_http_error(
     status_code: Optional[int],
     request: Optional[Request] = None,
     kwargs: Optional[dict] = None,
-    target: Any = None,
     custom_llm_provider: Optional[str] = None,
     litellm_call_id: Optional[str] = None,
     event_stage: str = "raw_classifier",
@@ -2624,7 +2438,6 @@ def _classify_passthrough_raw_http_error(
             event_stage=event_stage,
             request=request,
             kwargs=kwargs,
-            target=target,
             custom_llm_provider=custom_llm_provider,
             litellm_call_id=litellm_call_id,
             failure=exc,
@@ -3234,7 +3047,6 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         status_code=terminal_status,
                         request=request,
                         kwargs=kwargs,
-                        target=url,
                         custom_llm_provider=custom_llm_provider,
                         event_stage="retry_budget_terminal",
                         diagnostic_enabled=True,
@@ -3276,7 +3088,6 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     status_code=status_code,
                     request=request,
                     kwargs=kwargs,
-                    target=url,
                     custom_llm_provider=custom_llm_provider,
                     event_stage="retry_loop",
                     diagnostic_enabled=True,
@@ -5968,6 +5779,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             _metadata.update(litellm_metadata)
         if metadata:
             _metadata.update(metadata)
+        _metadata.pop(_AAWM_OPENAI_RAW_RETRY_EVENT_METADATA_KEY, None)
         if resolved_end_user_id:
             _metadata["user_api_key_end_user_id"] = resolved_end_user_id
 
@@ -7516,7 +7328,6 @@ async def pass_through_request(  # noqa: PLR0915
                     event_stage="authorization",
                     request=request,
                     kwargs=kwargs,
-                    target=url,
                     custom_llm_provider=custom_llm_provider,
                     litellm_call_id=litellm_call_id,
                     failure=failure,
@@ -7543,7 +7354,7 @@ async def pass_through_request(  # noqa: PLR0915
                 failure_error_class = failure.error_class
                 failure_classification = failure.classification
                 failure_retryable = failure.retryable
-                failure_classification_status_code = failure.status_code
+                failure_classification_status_code = None
             else:
                 if getattr(failure, "_aawm_provider_returned", False) is not True:
                     _record_authorization(
@@ -7551,12 +7362,12 @@ async def pass_through_request(  # noqa: PLR0915
                         denial_reason="provider_provenance_missing",
                     )
                     return
+                failure_status_code = _extract_exception_status_code(failure)
                 raw_http_classification = _classify_passthrough_raw_http_error(
                     failure,
-                    status_code=_extract_exception_status_code(failure),
+                    status_code=failure_status_code,
                     request=request,
                     kwargs=kwargs,
-                    target=url,
                     custom_llm_provider=custom_llm_provider,
                     litellm_call_id=litellm_call_id,
                     event_stage="authorization_classification",
@@ -7573,9 +7384,7 @@ async def pass_through_request(  # noqa: PLR0915
                     failure_classification,
                     failure_retryable,
                 ) = raw_http_classification
-                failure_classification_status_code = _extract_exception_status_code(
-                    failure
-                )
+                failure_classification_status_code = failure_status_code
             if (
                 not failure_retryable
                 or failure_error_class not in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
