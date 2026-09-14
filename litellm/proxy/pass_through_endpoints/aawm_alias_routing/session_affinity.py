@@ -37,7 +37,7 @@ from typing import Any, Awaitable, Callable, Mapping, Optional, TypeVar, cast
 
 from fastapi import HTTPException
 
-from litellm._logging import verbose_proxy_logger
+from litellm._logging import verbose_aawm_route_logger, verbose_proxy_logger
 from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
 )
@@ -4806,6 +4806,408 @@ def _hash_session_owner_log_identifier(value: Any) -> Optional[str]:
 # request correlation. Read-only here; identifiers are hashed before reuse.
 _SESSION_OWNER_REQUEST_CONTEXT_STATE_KEY = "aawm_alias_request_context"
 _SESSION_OWNER_REQUEST_CALL_ID_STATE_KEY = "aawm_alias_request_litellm_call_id"
+
+
+_XAI_DEFERRED_STREAM_EVENT = "session_owner_deferred_stream"
+_XAI_DEFERRED_STREAM_PHASES = frozenset(
+    {
+        "binding",
+        "not_streaming_response",
+        "already_bound",
+        "missing_iterator",
+        "bound",
+        "first_pull",
+        "iterator_eof",
+        "iterator_cancelled",
+        "iterator_closed",
+        "iterator_exception",
+        "close_before_eof",
+        "renewal_failed",
+        "stream_response_cancelled",
+        "stream_response_exception",
+        "validation",
+        "finalization_selected",
+        "finalization_wait_cancelled",
+        "finalization_task_returned",
+        "finalization_task_raised",
+        "success_finalizer_called",
+        "success_finalizer_returned",
+        "success_finalizer_raised",
+        "release_called",
+        "release_returned",
+        "release_raised",
+    }
+)
+_XAI_DEFERRED_STREAM_BINDING_OUTCOMES = frozenset(
+    {"not_streaming_response", "already_bound", "missing_iterator", "bound"}
+)
+_XAI_DEFERRED_STREAM_MUTATION_OUTCOMES = frozenset(
+    outcome.value for outcome in SessionOwnerMutationOutcome
+) | {"none"}
+_XAI_DEFERRED_STREAM_DECISIONS = frozenset(
+    decision.value for decision in SessionOwnerGuardDecision
+)
+_XAI_DEFERRED_STREAM_OWNER_STATES = frozenset({"reserved", "owned"})
+_XAI_DEFERRED_STREAM_TERMINAL_STATUSES = frozenset(
+    {
+        "completed",
+        "failed",
+        "cancelled",
+        "incomplete",
+        "in_progress",
+        "requires_action",
+    }
+)
+_XAI_DEFERRED_STREAM_WIRE_DISPOSITIONS = frozenset(
+    {"completed", "failed", "cancelled", "error"}
+)
+
+
+def _make_xai_deferred_stream_observer(
+    request: Any,
+    lease: Optional[SessionOwnerLease],
+    response: Any,
+    success_finalizer: Optional[Callable[..., Any]],
+) -> Callable[..., None]:
+    """Build a bounded, synchronous observer for the selected xAI stream.
+
+    This is intentionally observational. It captures request/lease
+    correlation at binding time and reads mutable stream state only inside the
+    guarded emitter so diagnostic failures cannot affect ownership lifecycle.
+    """
+
+    def _noop_observe(_phase: Any, **_fields: Any) -> None:
+        return None
+
+    try:
+        missing = object()
+
+        def _field(value: Any, key: str, default: Any = missing) -> Any:
+            if isinstance(value, Mapping):
+                return value.get(key, default)
+            try:
+                return getattr(value, key, default)
+            except BaseException:  # noqa: BLE001
+                return default
+
+        def _clean_correlation(value: Any) -> Optional[str]:
+            return value.strip() if isinstance(value, str) and value.strip() else None
+
+        def _is_xai_context(value: Any) -> bool:
+            if not isinstance(value, Mapping):
+                return False
+            provider = _clean_correlation(
+                value.get("provider") or value.get("custom_llm_provider")
+            )
+            hosted_provider = _clean_correlation(value.get("hosted_provider"))
+            route_family = _clean_correlation(
+                value.get("route_family") or value.get("endpoint_contract")
+            )
+            provider_value = provider.casefold() if provider is not None else ""
+            hosted_value = (
+                hosted_provider.casefold() if hosted_provider is not None else ""
+            )
+            route_value = route_family.casefold() if route_family is not None else ""
+            return (
+                provider_value == "xai"
+                or hosted_value == "xai"
+                or "xai" in route_value
+                or "grok_native" in route_value
+            )
+
+        state = _field(request, "state", None)
+        lease_attributes = _field(lease, "attributes", None)
+        candidate_context = _field(state, "aawm_openai_candidate_context", None)
+        if not (
+            _is_xai_context(lease_attributes)
+            or _is_xai_context(candidate_context)
+        ):
+            return _noop_observe
+
+        request_context = _field(
+            state, _SESSION_OWNER_REQUEST_CONTEXT_STATE_KEY, None
+        )
+        request_call_id = _clean_correlation(
+            _field(state, _SESSION_OWNER_REQUEST_CALL_ID_STATE_KEY, None)
+        )
+        if request_call_id is None:
+            request_call_id = _clean_correlation(
+                _field(request_context, "litellm_call_id", None)
+            )
+        trace_id = _clean_correlation(_field(request_context, "trace_id", None))
+
+        attempt_id = None
+        for key in (
+            "aawm_alias_request_attempt_id",
+            "aawm_alias_attempt_id",
+            "attempt_id",
+            "attempt_identity",
+        ):
+            attempt_id = _clean_correlation(_field(state, key, None))
+            if attempt_id is not None:
+                break
+        if attempt_id is None:
+            for key in ("attempt_id", "attempt_identity", "provider_attempt_id"):
+                attempt_id = _clean_correlation(_field(request_context, key, None))
+                if attempt_id is not None:
+                    break
+
+        dispatch_id = None
+        agent_dispatch = _field(request_context, "agent_dispatch", None)
+        if isinstance(agent_dispatch, Mapping):
+            dispatch_id = _clean_correlation(agent_dispatch.get("dispatch_id"))
+
+        correlation: dict[str, Any] = {}
+        for key, value in (
+            ("litellm_call_id", request_call_id),
+            ("trace_id", trace_id),
+            ("attempt_id", attempt_id),
+            ("dispatch_id", dispatch_id),
+        ):
+            if value is not None:
+                hashed = _hash_session_owner_log_identifier(value)
+                if hashed is not None:
+                    correlation[key] = hashed
+
+        session_identity = _field(lease, "session_identity", None)
+        cache_key = _field(lease, "cache_key", None)
+        session_hash = _hash_session_owner_log_identifier(session_identity)
+        owner_key_hash = _hash_session_owner_log_identifier(cache_key)
+        if session_hash is not None:
+            correlation["canonical_session_identity_hash"] = session_hash
+        if owner_key_hash is not None:
+            correlation["owner_key_hash"] = owner_key_hash
+
+        success_finalizer_source = (
+            "default" if success_finalizer is None else "supplied"
+        )
+
+        def _normalize_status(
+            value: Any,
+            allowed: frozenset[str],
+            *,
+            missing_value: str = "unknown",
+        ) -> str:
+            raw = value.value if isinstance(value, Enum) else value
+            if not isinstance(raw, str) or not raw.strip():
+                return missing_value
+            normalized = raw.strip().casefold()
+            return normalized if normalized in allowed else "other"
+
+        def _normalize_phase(value: Any) -> str:
+            raw = value.value if isinstance(value, Enum) else value
+            if not isinstance(raw, str) or not raw.strip():
+                return "unknown"
+            normalized = raw.strip().casefold()
+            return (
+                normalized
+                if normalized in _XAI_DEFERRED_STREAM_PHASES
+                else "unknown"
+            )
+
+        def _optional_bool(value: Any, *, absent: Any = "unknown") -> Any:
+            return value if isinstance(value, bool) else absent
+
+        def _lease_snapshot() -> dict[str, Any]:
+            present = lease is not None
+            if not present:
+                return {
+                    "lease_present": False,
+                    "lease_decision": "unknown",
+                    "held_reservation": False,
+                    "released": False,
+                    "promoted": False,
+                    "wire_terminal_pending": False,
+                    "wire_disposition": "unknown",
+                    "renewal_task_present": False,
+                }
+            held = _field(lease, "held_reservation", missing)
+            released = _field(lease, "released", missing)
+            promoted = _field(lease, "promoted", missing)
+            pending = _field(lease, "wire_terminal_pending", missing)
+            renewal_task = _field(lease, "renewal_task", missing)
+            return {
+                "lease_present": True,
+                "lease_decision": _normalize_status(
+                    _field(lease, "decision", missing),
+                    _XAI_DEFERRED_STREAM_DECISIONS,
+                ),
+                "held_reservation": (
+                    _optional_bool(held) if held is not missing else "unknown"
+                ),
+                "released": (
+                    _optional_bool(released) if released is not missing else "unknown"
+                ),
+                "promoted": (
+                    _optional_bool(promoted) if promoted is not missing else "unknown"
+                ),
+                "wire_terminal_pending": (
+                    _optional_bool(pending) if pending is not missing else "unknown"
+                ),
+                "wire_disposition": _normalize_status(
+                    _field(lease, "wire_disposition", missing),
+                    _XAI_DEFERRED_STREAM_WIRE_DISPOSITIONS,
+                ),
+                "renewal_task_present": (
+                    renewal_task is not missing and renewal_task is not None
+                ),
+            }
+
+        def _validation_snapshot() -> dict[str, Any]:
+            state_value = _field(
+                response, "_aawm_responses_validation_state", None
+            )
+            if not isinstance(state_value, Mapping):
+                return {
+                    "validation_ok": False,
+                    "validation_state_present": False,
+                    "complete": "unknown",
+                    "valid": "unknown",
+                    "terminal_seen": "unknown",
+                    "terminal_status": "unknown",
+                }
+            complete = state_value.get("complete")
+            valid = state_value.get("valid")
+            terminal_seen = state_value.get("terminal_seen")
+            terminal_status = _normalize_status(
+                state_value.get("terminal_status"),
+                _XAI_DEFERRED_STREAM_TERMINAL_STATUSES,
+            )
+            return {
+                "validation_ok": (
+                    complete is True
+                    and valid is True
+                    and terminal_seen is True
+                    and terminal_status == "completed"
+                ),
+                "validation_state_present": True,
+                "complete": (
+                    complete if isinstance(complete, bool) else "unknown"
+                ),
+                "valid": valid if isinstance(valid, bool) else "unknown",
+                "terminal_seen": (
+                    terminal_seen
+                    if isinstance(terminal_seen, bool)
+                    else "unknown"
+                ),
+                "terminal_status": terminal_status,
+            }
+
+        def _exception_category(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            if isinstance(value, asyncio.CancelledError):
+                return "cancelled"
+            if isinstance(value, (TimeoutError, asyncio.TimeoutError)):
+                return "timeout"
+            if isinstance(value, SessionOwnerLeaseRenewalError):
+                return "renewal"
+            if isinstance(value, ConnectionError):
+                return "connection"
+            if isinstance(value, HTTPException):
+                return "http"
+            if isinstance(value, (ValueError, TypeError, KeyError, AttributeError)):
+                return "programming"
+            if isinstance(value, RuntimeError):
+                return "runtime"
+            return "other"
+
+        def _mutation_snapshot(result: Any, phase: str) -> dict[str, Any]:
+            snapshot: dict[str, Any] = {
+                "result_present": result is not None,
+                "mutation_outcome": (
+                    "none"
+                    if result is None
+                    else _normalize_status(
+                        _field(result, "outcome", missing),
+                        _XAI_DEFERRED_STREAM_MUTATION_OUTCOMES,
+                    )
+                ),
+            }
+            operation = {
+                "success_finalizer_called": "success_finalizer",
+                "success_finalizer_returned": "success_finalizer",
+                "success_finalizer_raised": "success_finalizer",
+                "release_called": "release",
+                "release_returned": "release",
+                "release_raised": "release",
+            }.get(phase)
+            if operation is not None:
+                snapshot["operation"] = operation
+            if result is None:
+                snapshot.update(
+                    {
+                        "result_error_present": False,
+                        "returned_owner_record_present": False,
+                        "returned_owner_state": "unknown",
+                    }
+                )
+                return snapshot
+            result_error = _field(result, "error", missing)
+            owner_record = _field(result, "owner_record", missing)
+            snapshot["result_error_present"] = (
+                result_error is not missing and result_error is not None
+            )
+            snapshot["returned_owner_record_present"] = (
+                owner_record is not missing and owner_record is not None
+            )
+            snapshot["returned_owner_state"] = _normalize_status(
+                _field(owner_record, "state", missing),
+                _XAI_DEFERRED_STREAM_OWNER_STATES,
+            )
+            result_key = _field(result, "cache_key", missing)
+            result_key_hash = (
+                _hash_session_owner_log_identifier(result_key)
+                if result_key is not missing
+                else None
+            )
+            if result_key_hash is not None:
+                snapshot["result_owner_key_hash"] = result_key_hash
+            return snapshot
+
+        def _observe(phase: Any, **fields: Any) -> None:
+            try:
+                normalized_phase = _normalize_phase(phase)
+                payload: dict[str, Any] = {
+                    "event": _XAI_DEFERRED_STREAM_EVENT,
+                    "phase": normalized_phase,
+                    **correlation,
+                    "success_finalizer_source": success_finalizer_source,
+                    **_lease_snapshot(),
+                    **_validation_snapshot(),
+                }
+                if normalized_phase in _XAI_DEFERRED_STREAM_BINDING_OUTCOMES:
+                    payload["binding_outcome"] = normalized_phase
+
+                for key in (
+                    "success_path",
+                    "iterator_wrapped",
+                    "stream_response_wrapped",
+                ):
+                    if key in fields:
+                        payload[key] = _optional_bool(fields.get(key))
+
+                error_category = _exception_category(fields.get("error"))
+                if error_category is None:
+                    error_category = _exception_category(fields.get("renewal_error"))
+                if error_category is not None:
+                    payload["exception_category"] = error_category
+
+                if "result" in fields:
+                    payload.update(
+                        _mutation_snapshot(fields.get("result"), normalized_phase)
+                    )
+
+                verbose_aawm_route_logger.info(
+                    "AAWM_XAI_DEFERRED_STREAM: "
+                    + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+                )
+            except BaseException:  # noqa: BLE001
+                return None
+
+        return _observe
+    except BaseException:  # noqa: BLE001
+        return _noop_observe
 
 
 def _build_session_owner_rollup_kwargs(
