@@ -111,6 +111,10 @@ _ALPHA_PROBE_INJECTION_COUNT_STATE_KEY = (
 )
 
 
+class _AlphaProbeCandidateSkip(Exception):
+    """Short-circuit one synthetic no-I/O candidate after reservation."""
+
+
 def _session_affinity_mod():
     """Lazy session_affinity import (safe under module rebinding)."""
     import sys
@@ -2328,60 +2332,6 @@ async def handle_alias_route(  # noqa: PLR0915
         if selection_budget_counted:
             provider_candidate_attempts += 1
         selection_provider_egress_reached = False
-        if alpha_probe_control is not None:
-            managed_codex_oauth_candidate = (
-                _is_codex_oauth_account_candidate is not None
-                and _is_codex_oauth_account_candidate(candidate)
-            )
-            inject_alpha_probe = (
-                (
-                    alpha_probe_control.plan.name == "basic"
-                    and candidate.get("last_resort") is False
-                )
-                or (
-                    alpha_probe_control.plan.name == "work"
-                    and managed_codex_oauth_candidate
-                )
-            )
-            if inject_alpha_probe:
-                injection_ordinal = _claim_alpha_probe_injection_slot()
-                if injection_ordinal is not None:
-                    _prepare_alpha_probe_candidate_unavailable(
-                        injection_ordinal=injection_ordinal,
-                        attempt_record=attempt_record,
-                        candidate=candidate,
-                        selection=selection,
-                    )
-                    account_failover_planned = False
-                    if (
-                        alpha_probe_control.plan.name == "work"
-                        and managed_codex_oauth_candidate
-                    ):
-                        account_failover_planned = (
-                            _plan_codex_oauth_account_failover(
-                                request,
-                                candidate=candidate,
-                                selection=selection,
-                                attempt_record=attempt_record,
-                                error_class="candidate_unavailable",
-                                has_continuation_state=_provider_owned_continuation(),
-                                has_previous_response_id=has_previous_response_id,
-                                has_account_bound_state=bool(
-                                    selection.get("has_account_bound_state")
-                                ),
-                                account_failover_replay_safe=(
-                                    account_failover_replay_safe
-                                ),
-                            )
-                        )
-                    _finish_alpha_probe_candidate_unavailable(
-                        attempt_record=attempt_record,
-                        candidate=candidate,
-                        selection=selection,
-                        budget_was_counted=selection_budget_counted,
-                        account_failover_planned=account_failover_planned,
-                    )
-                    continue
         # D1-564: provider/account lane admission after selection and before
         # attempt-start / probe lock / provider I/O. Separate from cooldown and
         # session ownership. Fail-fast only: never queue/sleep/background-retry.
@@ -2679,6 +2629,79 @@ async def handle_alias_route(  # noqa: PLR0915
                         selection["session_owner_held_reservation"] = guard.held_reservation
                         if guard.provenance:
                             selection["session_owner_provenance"] = guard.provenance
+
+                        if alpha_probe_control is not None:
+                            managed_codex_oauth_candidate = (
+                                _is_codex_oauth_account_candidate is not None
+                                and _is_codex_oauth_account_candidate(candidate)
+                            )
+                            inject_alpha_probe = (
+                                (
+                                    alpha_probe_control.plan.name == "basic"
+                                    and candidate.get("last_resort") is False
+                                )
+                                or (
+                                    alpha_probe_control.plan.name == "work"
+                                    and managed_codex_oauth_candidate
+                                )
+                            )
+                            if inject_alpha_probe:
+                                injection_ordinal = _claim_alpha_probe_injection_slot()
+                                if injection_ordinal is not None:
+                                    _prepare_alpha_probe_candidate_unavailable(
+                                        injection_ordinal=injection_ordinal,
+                                        attempt_record=attempt_record,
+                                        candidate=candidate,
+                                        selection=selection,
+                                    )
+                                    account_failover_planned = False
+                                    if (
+                                        alpha_probe_control.plan.name == "work"
+                                        and managed_codex_oauth_candidate
+                                    ):
+                                        account_failover_planned = (
+                                            _plan_codex_oauth_account_failover(
+                                                request,
+                                                candidate=candidate,
+                                                selection=selection,
+                                                attempt_record=attempt_record,
+                                                error_class="candidate_unavailable",
+                                                has_continuation_state=(
+                                                    _provider_owned_continuation()
+                                                ),
+                                                has_previous_response_id=(
+                                                    has_previous_response_id
+                                                ),
+                                                has_account_bound_state=bool(
+                                                    selection.get(
+                                                        "has_account_bound_state"
+                                                    )
+                                                ),
+                                                account_failover_replay_safe=(
+                                                    account_failover_replay_safe
+                                                ),
+                                            )
+                                        )
+                                    _finish_alpha_probe_candidate_unavailable(
+                                        attempt_record=attempt_record,
+                                        candidate=candidate,
+                                        selection=selection,
+                                        budget_was_counted=(
+                                            selection_budget_counted
+                                        ),
+                                        account_failover_planned=(
+                                            account_failover_planned
+                                        ),
+                                    )
+                                    if session_owner_lease is not None:
+                                        try:
+                                            await _session_affinity_mod().finalize_session_owner_lease_on_failure(
+                                                session_owner_lease,
+                                                request=request,
+                                            )
+                                        except Exception:  # noqa: BLE001
+                                            pass
+                                    raise _AlphaProbeCandidateSkip
 
                         if _is_native_openai_responses_candidate(
                             request=request,
@@ -3163,6 +3186,9 @@ async def handle_alias_route(  # noqa: PLR0915
                             except Exception:  # noqa: BLE001
                                 pass
                         raise
+                    except _AlphaProbeCandidateSkip:
+                        skip_after_probe_wait = True
+                        probe_failure_exc = None
                     except Exception as probe_exc:  # noqa: PERF203
                         probe_failure_exc = probe_exc
                         if session_owner_lease is not None:
