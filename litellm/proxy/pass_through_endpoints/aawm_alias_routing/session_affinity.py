@@ -1685,6 +1685,58 @@ def _attributes_exactly_equal(
     return True
 
 
+def _strict_managed_openai_owner_comparison(
+    *,
+    owner_attributes: Mapping[str, Any],
+    requested_attributes: Mapping[str, Any],
+) -> tuple[bool, Optional[str]]:
+    """Compare a managed OpenAI owner without ordinary mobility exceptions.
+
+    The normal owner comparator intentionally permits model and account changes
+    for same-hosted-provider OpenAI routes. This separate mode is used only by
+    callers that have established an ordinary managed-OpenAI continuation.
+    Explicit portable transitions must leave this mode disabled and continue
+    through their existing transition validation.
+    """
+
+    owner = _core_owner_attributes(owner_attributes)
+    requested = _core_owner_attributes(requested_attributes)
+    owner_shape = _managed_direct_openai_owner_shape(owner)
+    requested_shape = _managed_direct_openai_owner_shape(requested)
+    if owner_shape is None and requested_shape is None:
+        return False, None
+    if owner_shape is None or requested_shape is None:
+        return (
+            True,
+            "session_owner: strict managed OpenAI route contract mismatch",
+        )
+
+    for key in ("provider", "model"):
+        owner_value = _clean_optional_str(owner.get(key))
+        requested_value = _clean_optional_str(requested.get(key))
+        if owner_value != requested_value:
+            return True, f"session_owner: strict {key} mismatch"
+
+    for key in ("account_label", "account_hash", "account_lane"):
+        owner_value = _clean_optional_str(owner.get(key))
+        requested_value = _clean_optional_str(requested.get(key))
+        if owner_value is None or requested_value is None:
+            return (
+                True,
+                "session_owner: strict managed OpenAI owner account identity "
+                "is incomplete",
+            )
+        if owner_value != requested_value:
+            return True, f"session_owner: strict {key} mismatch"
+
+    if not _managed_direct_openai_owner_shapes_are_equivalent(owner, requested):
+        return (
+            True,
+            "session_owner: strict managed OpenAI route contract mismatch",
+        )
+    return True, None
+
+
 def _compatibility_mismatch_reason(
     *,
     owner_record: Mapping[str, Any],
@@ -2273,6 +2325,7 @@ async def guard_session_owner_before_egress(  # noqa: PLR0915
     reservation_token: Optional[str] = None,
     reservation_ttl_seconds: float = _DEFAULT_RESERVATION_TTL_SECONDS,
     require_exact_attributes: bool = False,
+    strict_managed_openai_owner: bool = False,
     reserve_if_unowned: bool = True,
     reservation_wait_timeout_seconds: Optional[float] = None,
     reservation_wait_poll_seconds: Optional[float] = None,
@@ -2489,11 +2542,21 @@ async def guard_session_owner_before_egress(  # noqa: PLR0915
 
         if existing is not None:
             if state == SessionOwnerRecordState.OWNED.value:
-                mismatch = _compatibility_mismatch_reason(
-                    owner_record=existing,
-                    requested_attributes=attrs or None,
-                    require_exact_attributes=require_exact_attributes,
-                )
+                strict_applied = False
+                mismatch: Optional[str] = None
+                if strict_managed_openai_owner:
+                    strict_applied, mismatch = (
+                        _strict_managed_openai_owner_comparison(
+                            owner_attributes=_owner_attributes(existing),
+                            requested_attributes=attrs,
+                        )
+                    )
+                if not strict_applied:
+                    mismatch = _compatibility_mismatch_reason(
+                        owner_record=existing,
+                        requested_attributes=attrs or None,
+                        require_exact_attributes=require_exact_attributes,
+                    )
                 if mismatch is not None:
                     provenance = build_session_owner_provenance(
                         session_identity=cleaned,
@@ -2868,11 +2931,19 @@ async def guard_session_owner_before_egress(  # noqa: PLR0915
     winner_state = _record_state(winner)
     winner_owner = _clean_optional_str(winner.get(_RECORD_OWNER_FIELD))
     if winner_state == SessionOwnerRecordState.OWNED.value:
-        mismatch = _compatibility_mismatch_reason(
-            owner_record=winner,
-            requested_attributes=attrs or None,
-            require_exact_attributes=require_exact_attributes,
-        )
+        strict_applied = False
+        mismatch: Optional[str] = None
+        if strict_managed_openai_owner:
+            strict_applied, mismatch = _strict_managed_openai_owner_comparison(
+                owner_attributes=_owner_attributes(winner),
+                requested_attributes=attrs,
+            )
+        if not strict_applied:
+            mismatch = _compatibility_mismatch_reason(
+                owner_record=winner,
+                requested_attributes=attrs or None,
+                require_exact_attributes=require_exact_attributes,
+            )
         if mismatch is None:
             provenance = build_session_owner_provenance(
                 session_identity=cleaned,
@@ -5385,6 +5456,7 @@ async def ensure_session_owner_guard_for_request(
     candidate: Optional[Mapping[str, Any]] = None,
     owner_id: Optional[str] = None,
     require_exact_attributes: bool = False,
+    strict_managed_openai_owner: bool = False,
     alias_model: Optional[str] = None,
     failure_phase: str = "session_owner_pre_egress",
     raise_on_redispatch: bool = True,
@@ -5473,6 +5545,7 @@ async def ensure_session_owner_guard_for_request(
         or (active_lease.owner_id if active_lease is not None else None),
         reservation_token=token,
         require_exact_attributes=require_exact_attributes,
+        strict_managed_openai_owner=strict_managed_openai_owner,
     )
     record_session_owner_continuity_receipt(
         request,
