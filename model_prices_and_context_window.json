@@ -477,6 +477,74 @@
             "custom_tool_call_output"
         ]
     },
+    "alibaba_token_plan/deepseek-v4.1-flash": {
+        "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
+        "litellm_provider": "alibaba_token_plan",
+        "mode": "chat",
+        "provider_specific_entry": {
+            "alibaba_token_plan": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "priced",
+                    "kind": "provider_catalog_reference_tariff",
+                    "billing_mode": "alibaba_token_plan_subscription",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "alibaba_token_plan",
+                        "model": "alibaba_token_plan/deepseek-v4.1-flash"
+                    },
+                    "rates": {
+                        "input_usd_per_million_tokens": 0.3,
+                        "cache_read_usd_per_million_tokens": 0.03,
+                        "output_usd_per_million_tokens": 1.2
+                    },
+                    "cache_mode": "provider_cache_read",
+                    "equivalence_status": "direct_reference",
+                    "equivalence_evidence": "Alibaba DeepSeek V4.1 Flash Singapore International base Model Studio direct list-rate reference: cached input is $0.03/1M, input is $0.30/1M, and output is $1.20/1M. Not Token Plan subscription invoice pricing.",
+                    "source": {
+                        "kind": "official_provider_direct_list_rate_catalog",
+                        "label": "Alibaba Cloud Model Studio Singapore International direct list rates",
+                        "urls": [
+                            "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+                            "https://www.alibabacloud.com/help/en/model-studio/context-cache"
+                        ],
+                        "version": "2026-09-14",
+                        "verified_on": "2026-09-14"
+                    }
+                }
+            }
+        },
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
+        "source": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+        "supports_function_calling": true,
+        "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
+        "supports_tool_choice": true,
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search",
+            "web_search"
+        ],
+        "unsupported_input_item_types": [
+            "custom_tool_call",
+            "custom_tool_call_output"
+        ]
+    },
     "alibaba_token_plan/deepseek-v4-pro": {
         "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
         "custom_tool_function_adapters": [
