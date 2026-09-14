@@ -26,6 +26,7 @@ ALPHA_PROBE_PLAN_HEADER = "x-aawm-openai-alpha-probe-plan"
 _CONTROL_STATE_KEY = "aawm_openai_alpha_probe_control"
 _RECEIPTS_STATE_KEY = "aawm_openai_alpha_probe_receipts"
 _RECEIPT_SEQUENCE_STATE_KEY = "aawm_openai_alpha_probe_receipt_sequence"
+_REQUEST_IDENTITY_STATE_KEY = "aawm_alias_request_litellm_call_id"
 _RECEIPT_SCHEMA = "aawm_openai_alpha_probe_receipt_v1"
 _IDENTIFIER_RE = re.compile(r"[^A-Za-z0-9_.:/@+-]+")
 _HEX_RE = re.compile(r"\A[0-9A-Fa-f]{8,128}\Z")
@@ -123,8 +124,12 @@ def _safe_identifier(value: Any) -> Optional[str]:
 
 
 def _safe_account_hash(value: Any) -> Optional[str]:
-    text = _safe_text(value, max_length=128)
-    if text is None or _HEX_RE.fullmatch(text) is None:
+    if value is None or isinstance(value, (dict, list, tuple, set)):
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    text = str(value).strip()
+    if len(text) > 128 or _HEX_RE.fullmatch(text) is None:
         return None
     return text
 
@@ -146,16 +151,7 @@ def _request_identity(request: Any) -> Optional[str]:
     state = _request_state(request)
     if state is None:
         return None
-    for name in (
-        "aawm_alias_request_call_id",
-        "litellm_call_id",
-        "call_id",
-        "request_id",
-    ):
-        value = _safe_identifier(getattr(state, name, None))
-        if value:
-            return value
-    return None
+    return _safe_identifier(getattr(state, _REQUEST_IDENTITY_STATE_KEY, None))
 
 
 def _resolve_plan(raw_plan: str) -> AlphaProbePlan:
@@ -233,9 +229,14 @@ def resolve_alpha_probe_control(
     # dependency.  _check_admin_auth performs the exact CFG-004 role and
     # UserAPIKeyAuth master-key hash comparison.
     _check_cfg004_admin_auth(user_api_key_dict)
+    from . import attempt_records as _attempt_records
+
+    request_identity = (
+        _attempt_records._bind_auto_agent_alias_request_identity(request)
+    )
     control = AlphaProbeControl(
         plan=plan,
-        request_identity=_request_identity(request),
+        request_identity=request_identity,
     )
     if state is not None:
         setattr(state, _CONTROL_STATE_KEY, control)
@@ -263,25 +264,44 @@ def get_alpha_probe_control(request: Request) -> Optional[AlphaProbeControl]:
 
 def _mapping_value(
     candidate: Mapping[str, Any],
-    selection: Mapping[str, Any],
     *names: str,
 ) -> Any:
-    for source in (candidate, selection):
-        for name in names:
-            if name in source and source[name] is not None:
-                return source[name]
+    for name in names:
+        if name in candidate and candidate[name] is not None:
+            return candidate[name]
     return None
 
 
 def _mapping_presence_value(
     candidate: Mapping[str, Any],
-    selection: Mapping[str, Any],
     name: str,
 ) -> tuple[bool, Any]:
-    for source in (candidate, selection):
-        if name in source:
-            return True, source[name]
-    return False, None
+    return (True, candidate[name]) if name in candidate else (False, None)
+
+
+def _resolve_receipt_candidate(
+    candidate: Optional[Mapping[str, Any]],
+    selection: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    explicit_candidate = candidate if isinstance(candidate, Mapping) else None
+    selected_candidate = selection.get("candidate")
+    if selected_candidate is not None and not isinstance(
+        selected_candidate, Mapping
+    ):
+        raise ValueError("selection candidate must be a mapping")
+    if (
+        explicit_candidate is not None
+        and selected_candidate is not None
+        and dict(explicit_candidate) != dict(selected_candidate)
+    ):
+        raise ValueError(
+            "explicit candidate does not match selection candidate"
+        )
+    if explicit_candidate is not None:
+        return explicit_candidate
+    if isinstance(selected_candidate, Mapping):
+        return selected_candidate
+    return {}
 
 
 def _receipt_occurrence(
@@ -289,31 +309,28 @@ def _receipt_occurrence(
     candidate: Mapping[str, Any],
     selection: Mapping[str, Any],
 ) -> dict[str, Any]:
-    provider = _safe_identifier(_mapping_value(candidate, selection, "provider"))
-    model = _safe_identifier(_mapping_value(candidate, selection, "model"))
+    provider = _safe_identifier(_mapping_value(candidate, "provider"))
+    model = _safe_identifier(_mapping_value(candidate, "model"))
     route_family = _safe_identifier(
-        _mapping_value(candidate, selection, "route_family")
+        _mapping_value(candidate, "route_family")
     )
     resolved_alias = _safe_identifier(
-        _mapping_value(candidate, selection, "resolved_alias")
+        _mapping_value(candidate, "resolved_alias")
     )
     cooldown_identity_tag = _safe_identifier(
-        _mapping_value(candidate, selection, "cooldown_identity_tag")
+        _mapping_value(candidate, "cooldown_identity_tag")
     )
     priority_present, priority_value = _mapping_presence_value(
         candidate,
-        selection,
         "selection_priority",
     )
     last_resort_present, last_resort_value = _mapping_presence_value(
         candidate,
-        selection,
         "last_resort",
     )
     account_label = _safe_identifier(
         _mapping_value(
             candidate,
-            selection,
             "account_label",
             "codex_oauth_account_label",
             "xai_oauth_account_label",
@@ -322,7 +339,6 @@ def _receipt_occurrence(
     account_hash = _safe_account_hash(
         _mapping_value(
             candidate,
-            selection,
             "account_hash",
             "codex_oauth_account_hash",
             "xai_oauth_account_hash",
@@ -331,14 +347,13 @@ def _receipt_occurrence(
     account_lane = _safe_identifier(
         _mapping_value(
             candidate,
-            selection,
             "account_lane",
             "codex_oauth_lane_key",
             "xai_oauth_lane_key",
         )
     )
     lane_key = _safe_identifier(
-        _mapping_value(candidate, selection, "lane_key") or account_lane
+        _mapping_value(candidate, "lane_key") or account_lane
     )
 
     return {
@@ -389,7 +404,16 @@ def build_alpha_probe_receipt(
     provider-returned fields so downstream consumers cannot mistake the
     receipt for a real provider observation.
     """
-    resolved_control = control or get_alpha_probe_control(request)
+    bound_control = get_alpha_probe_control(request)
+    if control is not None and control is not bound_control:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "alpha_probe_control_mismatch",
+                "message": "alpha probe control is not bound to this request",
+            },
+        )
+    resolved_control = bound_control
     if not isinstance(resolved_control, AlphaProbeControl):
         raise HTTPException(
             status_code=403,
@@ -401,8 +425,11 @@ def build_alpha_probe_receipt(
     if not isinstance(phase, str) or not phase.strip():
         raise ValueError("alpha probe receipt phase must be non-empty")
 
-    candidate_mapping = candidate if isinstance(candidate, Mapping) else {}
     selection_mapping = selection if isinstance(selection, Mapping) else {}
+    candidate_mapping = _resolve_receipt_candidate(
+        candidate,
+        selection_mapping,
+    )
     occurrence = _receipt_occurrence(
         candidate=candidate_mapping,
         selection=selection_mapping,
