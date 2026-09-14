@@ -541,6 +541,9 @@ _registered_pass_through_subpath_index: Dict[str, List[str]] = {}
 _WEBSOCKET_PASSTHROUGH_MESSAGE_BUFFER_MAX = 256
 
 _AAWM_PASSTHROUGH_ERROR_LOG_MAX_FIELD_CHARS = 240
+_AAWM_OPENAI_RAW_RETRY_EVENT_STATE_KEY = "aawm_openai_raw_retry_events"
+_AAWM_OPENAI_RAW_RETRY_EVENT_METADATA_KEY = "aawm_openai_raw_retry_events"
+_AAWM_OPENAI_RAW_RETRY_EVENT_MAX = 32
 _AAWM_PASSTHROUGH_ERROR_LOG_SAFE_QUERY_KEYS = frozenset(
     {
         "alt",
@@ -1353,6 +1356,241 @@ def _ensure_passthrough_metadata(kwargs: Optional[dict]) -> Dict[str, Any]:
     return metadata
 
 
+def _build_openai_raw_retry_ledger_snapshot(
+    request: Optional[Request],
+) -> Optional[Dict[str, Any]]:
+    if request is None:
+        return None
+    try:
+        snapshot = get_request_provider_call_ledger_snapshot(request)
+    except Exception:
+        return None
+    if not isinstance(snapshot, Mapping):
+        return None
+
+    request_state = getattr(request, "state", None)
+    current_ordinal = (
+        getattr(request_state, "aawm_openai_send_ledger_ordinal", None)
+        if request_state is not None
+        else None
+    )
+    if not isinstance(current_ordinal, int) or isinstance(current_ordinal, bool):
+        next_attempt_ordinal = snapshot.get("next_attempt_ordinal")
+        if isinstance(next_attempt_ordinal, int) and not isinstance(
+            next_attempt_ordinal, bool
+        ):
+            current_ordinal = max(0, next_attempt_ordinal - 1)
+        else:
+            current_ordinal = None
+
+    result: Dict[str, Any] = {
+        "request_fingerprint": _clean_passthrough_error_context_value(
+            snapshot.get("request_fingerprint")
+        ),
+        "current_ordinal": current_ordinal,
+    }
+    for key in (
+        "logical_provider_calls",
+        "max_logical_provider_calls",
+        "remaining_logical_provider_calls",
+        "next_attempt_ordinal",
+    ):
+        value = snapshot.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            result[key] = value
+    capacity_retry_authorized = snapshot.get("capacity_retry_authorized")
+    if isinstance(capacity_retry_authorized, bool):
+        result["capacity_retry_authorized"] = capacity_retry_authorized
+    return result
+
+
+def _openai_raw_retry_provider_returned(
+    failure: Optional[Exception],
+) -> Optional[bool]:
+    if failure is None:
+        return None
+    for attribute_name in ("_aawm_provider_returned", "provider_returned"):
+        value = getattr(failure, attribute_name, None)
+        if isinstance(value, bool):
+            return value
+    detail = getattr(failure, "detail", None)
+    if isinstance(detail, Mapping):
+        value = detail.get("provider_returned")
+        if isinstance(value, bool):
+            return value
+        nested_error = detail.get("error")
+        if isinstance(nested_error, Mapping):
+            value = nested_error.get("provider_returned")
+            if isinstance(value, bool):
+                return value
+    return None
+
+
+def _record_openai_raw_retry_event(
+    *,
+    event_type: str,
+    event_stage: str,
+    request: Optional[Request],
+    kwargs: Optional[dict],
+    target: Any,
+    custom_llm_provider: Optional[str],
+    litellm_call_id: Optional[str],
+    failure: Optional[Exception],
+    upstream_status_code: Optional[int],
+    error_class: Optional[str] = None,
+    classification: Optional[str] = None,
+    retryable: Optional[bool] = None,
+    classification_reason: Optional[str] = None,
+    authorization_result: Optional[str] = None,
+    authorization_denial_reason: Optional[str] = None,
+) -> None:
+    try:
+        request_state = getattr(request, "state", None) if request is not None else None
+        candidate_context = (
+            current_candidate_context(request)
+            if request is not None
+            else {}
+        )
+        if not isinstance(candidate_context, Mapping):
+            candidate_context = {}
+
+        metadata: Mapping[str, Any] = {}
+        if isinstance(kwargs, dict):
+            litellm_params = kwargs.get("litellm_params")
+            if isinstance(litellm_params, Mapping):
+                candidate_metadata = litellm_params.get("metadata")
+                if isinstance(candidate_metadata, Mapping):
+                    metadata = candidate_metadata
+
+        correlation_id = litellm_call_id
+        if correlation_id is None and isinstance(kwargs, dict):
+            candidate_call_id = kwargs.get("litellm_call_id")
+            if candidate_call_id is not None:
+                correlation_id = str(candidate_call_id)
+        if correlation_id is None and request_state is not None:
+            for state_key in (
+                "aawm_alias_request_litellm_call_id",
+                "litellm_call_id",
+                "call_id",
+                "request_id",
+            ):
+                candidate_call_id = getattr(request_state, state_key, None)
+                if candidate_call_id is not None:
+                    correlation_id = str(candidate_call_id)
+                    break
+
+        target_path = None
+        if target is not None:
+            target_path = urlparse(str(target)).path or None
+        request_path = (
+            getattr(getattr(request, "url", None), "path", None)
+            if request is not None
+            else None
+        )
+        route_family = candidate_context.get("route_family") or metadata.get(
+            "route_family"
+        )
+        event = {
+            "event_type": _clean_passthrough_error_context_value(event_type),
+            "event_stage": _clean_passthrough_error_context_value(event_stage),
+            "litellm_call_id": _clean_passthrough_error_context_value(
+                correlation_id
+            ),
+            "provider": _clean_passthrough_error_context_value(
+                candidate_context.get("provider")
+                or custom_llm_provider
+                or metadata.get("provider")
+            ),
+            "model": _clean_passthrough_error_context_value(
+                candidate_context.get("model") or metadata.get("model")
+            ),
+            "route": _clean_passthrough_error_context_value(
+                request_path or route_family or target_path
+            ),
+            "route_family": _clean_passthrough_error_context_value(route_family),
+            "upstream_path": _clean_passthrough_error_context_value(target_path),
+            "account_hash": _clean_passthrough_error_context_value(
+                candidate_context.get("account_hash")
+            ),
+            "account_lane": _clean_passthrough_error_context_value(
+                candidate_context.get("lane_key")
+            ),
+            "upstream_status_code": (
+                upstream_status_code
+                if isinstance(upstream_status_code, int)
+                and not isinstance(upstream_status_code, bool)
+                else None
+            ),
+            "provider_returned": _openai_raw_retry_provider_returned(failure),
+            "error_class": _clean_passthrough_error_context_value(error_class),
+            "classification": _clean_passthrough_error_context_value(
+                classification
+            ),
+            "retryable": retryable if isinstance(retryable, bool) else None,
+            "classification_reason": _clean_passthrough_error_context_value(
+                classification_reason
+            ),
+            "authorization_result": _clean_passthrough_error_context_value(
+                authorization_result
+            ),
+            "authorization_denial_reason": _clean_passthrough_error_context_value(
+                authorization_denial_reason
+            ),
+            "ledger": _build_openai_raw_retry_ledger_snapshot(request),
+        }
+        event["provider_provenance"] = (
+            "provider_returned"
+            if event["provider_returned"] is True
+            else (
+                "local"
+                if event["provider_returned"] is False
+                else "unknown"
+            )
+        )
+
+        if request_state is not None:
+            state_events = getattr(
+                request_state,
+                _AAWM_OPENAI_RAW_RETRY_EVENT_STATE_KEY,
+                None,
+            )
+            if not isinstance(state_events, list):
+                state_events = []
+            state_events.append(dict(event))
+            del state_events[:-_AAWM_OPENAI_RAW_RETRY_EVENT_MAX]
+            setattr(
+                request_state,
+                _AAWM_OPENAI_RAW_RETRY_EVENT_STATE_KEY,
+                state_events,
+            )
+
+        request_metadata = _ensure_passthrough_metadata(kwargs)
+        if request_metadata:
+            metadata_events = request_metadata.get(
+                _AAWM_OPENAI_RAW_RETRY_EVENT_METADATA_KEY
+            )
+            if not isinstance(metadata_events, list):
+                metadata_events = []
+            metadata_events.append(dict(event))
+            del metadata_events[:-_AAWM_OPENAI_RAW_RETRY_EVENT_MAX]
+            request_metadata[_AAWM_OPENAI_RAW_RETRY_EVENT_METADATA_KEY] = (
+                metadata_events
+            )
+
+        event_json = json.dumps(event, sort_keys=True, separators=(",", ":"))
+        verbose_proxy_logger.info(
+            "AAWM_OPENAI_RAW_RETRY: %s",
+            event_json,
+            extra={
+                "aawm_openai_raw_retry": True,
+                "aawm_openai_raw_retry_event": event,
+            },
+        )
+    except Exception:
+        # Observability must never change retry or terminal behavior.
+        return
+
+
 _XAI_OAUTH_SEND_AUTH_SHAPE_FIELDS = (
     "xai_oauth_send_bearer_authorization_present",
     "xai_oauth_send_api_key_absent",
@@ -1861,14 +2099,45 @@ def _classify_passthrough_raw_http_error(
     exc: Exception,
     *,
     status_code: Optional[int],
+    request: Optional[Request] = None,
+    kwargs: Optional[dict] = None,
+    target: Any = None,
+    custom_llm_provider: Optional[str] = None,
+    litellm_call_id: Optional[str] = None,
+    event_stage: str = "raw_classifier",
 ) -> Optional[Tuple[str, str, bool]]:
+    def _finish(
+        result: Optional[Tuple[str, str, bool]],
+        *,
+        reason: str,
+    ) -> Optional[Tuple[str, str, bool]]:
+        result_error_class = result[0] if result is not None else None
+        result_classification = result[1] if result is not None else None
+        result_retryable = result[2] if result is not None else None
+        _record_openai_raw_retry_event(
+            event_type="openai_raw_http_classification",
+            event_stage=event_stage,
+            request=request,
+            kwargs=kwargs,
+            target=target,
+            custom_llm_provider=custom_llm_provider,
+            litellm_call_id=litellm_call_id,
+            failure=exc,
+            upstream_status_code=status_code,
+            error_class=result_error_class,
+            classification=result_classification,
+            retryable=result_retryable,
+            classification_reason=reason,
+        )
+        return result
+
     if not isinstance(exc, (HTTPException, httpx.HTTPStatusError)):
-        return None
+        return _finish(None, reason="unsupported_exception")
     if (
         status_code != status.HTTP_429_TOO_MANY_REQUESTS
         and status_code not in PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES
     ):
-        return None
+        return _finish(None, reason="status_not_retryable")
     provider_returned_429 = (
         status_code == status.HTTP_429_TOO_MANY_REQUESTS
         and getattr(exc, "_aawm_provider_returned", False) is True
@@ -1888,10 +2157,16 @@ def _classify_passthrough_raw_http_error(
         payload = {"message": error_text}
     if payload is None:
         if status_code == 520:
-            return "upstream_transient_internal", "transient_upstream", True
+            return _finish(
+                ("upstream_transient_internal", "transient_upstream", True),
+                reason="status_520_fallback",
+            )
         if provider_returned_429:
-            return "server_overloaded", "transient_capacity", True
-        return None
+            return _finish(
+                ("server_overloaded", "transient_capacity", True),
+                reason="provider_429_empty_payload",
+            )
+        return _finish(None, reason="upstream_payload_unavailable")
 
     if not payload.get("message") and error_text.strip():
         payload = {**payload, "message": error_text}
@@ -1912,11 +2187,21 @@ def _classify_passthrough_raw_http_error(
             "invalid request", "forbidden",
         )
     ):
-        return classified if not classified[2] else (
-            "provider_terminal_error", "provider_terminal_error", False
+        return _finish(
+            classified
+            if not classified[2]
+            else (
+                "provider_terminal_error",
+                "provider_terminal_error",
+                False,
+            ),
+            reason="explicit_terminal_semantics",
         )
     if status_code == 520:
-        return "upstream_transient_internal", "transient_upstream", True
+        return _finish(
+            ("upstream_transient_internal", "transient_upstream", True),
+            reason="status_520_fallback",
+        )
     # Some OpenAI capacity responses contain no body, or a provider-specific
     # shape that the shared Responses classifier cannot recognize. The
     # provider-returned marker is required so local/pre-egress 429s remain
@@ -1928,7 +2213,10 @@ def _classify_passthrough_raw_http_error(
         value is not None and str(value).strip()
         for value in (code, error_type, message)
     ):
-        return "server_overloaded", "transient_capacity", True
+        return _finish(
+            ("server_overloaded", "transient_capacity", True),
+            reason="provider_429_empty_fields",
+        )
     if provider_returned_429 and (
         code in {"capacity_exhausted", "server_is_overloaded"}
         or error_type in {
@@ -1936,8 +2224,11 @@ def _classify_passthrough_raw_http_error(
             "server_is_overloaded",
         }
     ):
-        return "server_overloaded", "transient_capacity", True
-    return classified
+        return _finish(
+            ("server_overloaded", "transient_capacity", True),
+            reason="provider_capacity_alias",
+        )
+    return _finish(classified, reason="responses_classifier")
 
 
 def _is_passthrough_pre_first_byte_hidden_retryable(
@@ -2433,7 +2724,13 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         )
                     )
                     raw_terminal = _classify_passthrough_raw_http_error(
-                        last_capacity_exception, status_code=terminal_status
+                        last_capacity_exception,
+                        status_code=terminal_status,
+                        request=request,
+                        kwargs=kwargs,
+                        target=url,
+                        custom_llm_provider=custom_llm_provider,
+                        event_stage="retry_budget_terminal",
                     )
                     if raw_terminal is not None:
                         terminal_class = raw_terminal[0]
@@ -2467,7 +2764,15 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 custom_llm_provider=custom_llm_provider,
             )
             raw_http_classification = (
-                _classify_passthrough_raw_http_error(exc, status_code=status_code)
+                _classify_passthrough_raw_http_error(
+                    exc,
+                    status_code=status_code,
+                    request=request,
+                    kwargs=kwargs,
+                    target=url,
+                    custom_llm_provider=custom_llm_provider,
+                    event_stage="retry_loop",
+                )
                 if openai_capacity_coordinator is not None
                 else None
             )
@@ -6686,37 +6991,110 @@ async def pass_through_request(  # noqa: PLR0915
             failure: Exception,
             response: Optional[httpx.Response],
         ) -> None:
-            if openai_call_ledger is None or capacity_retry_coordinator is None:
-                return
-            if isinstance(failure, ResponsesStreamPreCommitFailure):
-                failure_error_class = failure.error_class
-                failure_retryable = failure.retryable
-            else:
-                if getattr(failure, "_aawm_provider_returned", False) is not True:
-                    return
-                raw_http_classification = _classify_passthrough_raw_http_error(
-                    failure,
-                    status_code=_extract_exception_status_code(failure),
-                )
-                if raw_http_classification is None:
-                    return
-                failure_error_class, _, failure_retryable = raw_http_classification
-            if (
-                not failure_retryable
-                or failure_error_class not in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
-            ):
-                return
             response_request = (
                 getattr(response, "request", None) if response is not None else None
             )
             response_target = getattr(response_request, "url", None) or url
-            if not openai_call_ledger.authorize_capacity_retry(
+            failure_status_code = _extract_exception_status_code(failure)
+            if failure_status_code is None:
+                failure_status_code = getattr(response, "status_code", None)
+
+            def _record_authorization(
+                *,
+                authorization_result: str,
+                denial_reason: Optional[str] = None,
+                error_class: Optional[str] = None,
+                classification: Optional[str] = None,
+                retryable: Optional[bool] = None,
+                classification_reason: Optional[str] = None,
+            ) -> None:
+                _record_openai_raw_retry_event(
+                    event_type="openai_capacity_retry_authorization",
+                    event_stage="authorization",
+                    request=request,
+                    kwargs=kwargs,
+                    target=response_target,
+                    custom_llm_provider=custom_llm_provider,
+                    litellm_call_id=litellm_call_id,
+                    failure=failure,
+                    upstream_status_code=failure_status_code,
+                    error_class=error_class,
+                    classification=classification,
+                    retryable=retryable,
+                    classification_reason=classification_reason,
+                    authorization_result=authorization_result,
+                    authorization_denial_reason=denial_reason,
+                )
+
+            if openai_call_ledger is None or capacity_retry_coordinator is None:
+                _record_authorization(
+                    authorization_result="not_applicable",
+                    denial_reason="retry_dependencies_unavailable",
+                )
+                return
+            if isinstance(failure, ResponsesStreamPreCommitFailure):
+                failure_error_class = failure.error_class
+                failure_classification = failure.classification
+                failure_retryable = failure.retryable
+            else:
+                if getattr(failure, "_aawm_provider_returned", False) is not True:
+                    _record_authorization(
+                        authorization_result="denied",
+                        denial_reason="provider_provenance_missing",
+                    )
+                    return
+                raw_http_classification = _classify_passthrough_raw_http_error(
+                    failure,
+                    status_code=_extract_exception_status_code(failure),
+                    request=request,
+                    kwargs=kwargs,
+                    target=response_target,
+                    custom_llm_provider=custom_llm_provider,
+                    litellm_call_id=litellm_call_id,
+                    event_stage="authorization_classification",
+                )
+                if raw_http_classification is None:
+                    _record_authorization(
+                        authorization_result="denied",
+                        denial_reason="raw_classification_unavailable",
+                    )
+                    return
+                (
+                    failure_error_class,
+                    failure_classification,
+                    failure_retryable,
+                ) = raw_http_classification
+            if (
+                not failure_retryable
+                or failure_error_class not in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
+            ):
+                _record_authorization(
+                    authorization_result="denied",
+                    denial_reason=(
+                        "classification_not_retryable"
+                        if not failure_retryable
+                        else "classification_not_capacity"
+                    ),
+                    error_class=failure_error_class,
+                    classification=failure_classification,
+                    retryable=failure_retryable,
+                )
+                return
+            authorized = openai_call_ledger.authorize_capacity_retry(
                 target=response_target,
                 candidate_context=current_candidate_context(request),
                 deadline_at_monotonic=(
                     capacity_retry_coordinator.deadline_at_monotonic
                 ),
-            ):
+            )
+            if not authorized:
+                _record_authorization(
+                    authorization_result="denied",
+                    denial_reason="ledger_rejected",
+                    error_class=failure_error_class,
+                    classification=failure_classification,
+                    retryable=failure_retryable,
+                )
                 return
             request_state = getattr(request, "state", None)
             if request_state is not None:
@@ -6725,6 +7103,12 @@ async def pass_through_request(  # noqa: PLR0915
                     "aawm_openai_send_ledger_snapshot",
                     get_request_provider_call_ledger_snapshot(request),
                 )
+            _record_authorization(
+                authorization_result="authorized",
+                error_class=failure_error_class,
+                classification=failure_classification,
+                retryable=failure_retryable,
+            )
 
         def _classify_json_responses_precommit_failure(
             response_body: Any,
