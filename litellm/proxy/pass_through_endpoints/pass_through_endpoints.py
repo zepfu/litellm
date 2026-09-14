@@ -5843,6 +5843,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         if metadata:
             _metadata.update(metadata)
         _metadata.pop(_AAWM_OPENAI_RAW_RETRY_EVENT_METADATA_KEY, None)
+        _metadata.pop("aawm_openai_final_send_binding", None)
         if resolved_end_user_id:
             _metadata["user_api_key_end_user_id"] = resolved_end_user_id
 
