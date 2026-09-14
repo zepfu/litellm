@@ -1247,6 +1247,9 @@ def _codex_child_contract(
     route_families: set[str] = set()
     provenance_tuples: set[tuple[str, str, str, str]] = set()
     task_complete = False
+    task_complete_index: int | None = None
+    task_complete_message = ""
+    assistant_messages: list[tuple[int, str]] = []
     final_answer = False
 
     for index, obj in enumerate(records):
@@ -1461,6 +1464,14 @@ def _codex_child_contract(
 
         if kind == "task_complete":
             task_complete = True
+            task_complete_index = index
+            last_agent_message = payload.get("last_agent_message")
+            if isinstance(last_agent_message, str):
+                task_complete_message = last_agent_message.strip()
+        if kind == "message" and str(payload.get("role") or "") == "assistant":
+            assistant_text = _content_text(payload).strip()
+            if assistant_text:
+                assistant_messages.append((index, assistant_text))
         if (
             isinstance(item, Mapping)
             and str(item.get("type") or "") == "AgentMessage"
@@ -1472,6 +1483,17 @@ def _codex_child_contract(
             and str(payload.get("phase") or "") == "final_answer"
         ):
             final_answer = True
+
+    if (
+        not final_answer
+        and task_complete
+        and task_complete_index is not None
+        and task_complete_message
+        and assistant_messages
+        and assistant_messages[-1][0] < task_complete_index
+        and assistant_messages[-1][1] == task_complete_message
+    ):
+        final_answer = True
 
     failures: list[str] = []
     if bounded_read.truncated:
