@@ -106,6 +106,9 @@ from .schema_rejections import (
 from .state import alias_routing_state, validate_alias_family
 
 _MAX_ATTEMPT_FAILURE_PHASE_LENGTH = 128
+_ALPHA_PROBE_INJECTION_COUNT_STATE_KEY = (
+    "aawm_openai_alpha_probe_injection_count"
+)
 
 
 def _session_affinity_mod():
@@ -1020,6 +1023,20 @@ async def handle_alias_route(  # noqa: PLR0915
     add_alias_metadata_fn = services.add_alias_metadata_fn
     raise_redispatch_required_fn = services.raise_redispatch_fn
     is_codex_alias = validate_alias_family(alias_family) == "codex"
+    alpha_probe_control = None
+    _build_alpha_probe_receipt = None
+    _is_codex_oauth_account_candidate = None
+    if is_codex_alias:
+        from . import selection as _selection
+        from .alpha_probe_control import (
+            build_alpha_probe_receipt as _build_alpha_probe_receipt,
+            get_alpha_probe_control as _get_alpha_probe_control,
+        )
+
+        alpha_probe_control = _get_alpha_probe_control(request)
+        _is_codex_oauth_account_candidate = (
+            _selection._is_codex_oauth_account_candidate
+        )
 
     def _get_openai_alpha_capacity_retry_coordinator(
         candidate: dict[str, Any],
@@ -1258,6 +1275,90 @@ async def handle_alias_route(  # noqa: PLR0915
             attempt_record["provider_attempt_budget_refunded"] = True
         else:
             attempt_record["provider_attempt_budget_refunded"] = False
+
+    def _claim_alpha_probe_injection_slot() -> Optional[int]:
+        """Claim one bounded request-local synthetic probe slot."""
+        if alpha_probe_control is None:
+            return None
+        state = getattr(request, "state", None)
+        if state is None:
+            return None
+        current = getattr(state, _ALPHA_PROBE_INJECTION_COUNT_STATE_KEY, 0)
+        if isinstance(current, bool) or not isinstance(current, int) or current < 0:
+            current = 0
+        if current >= alpha_probe_control.plan.max_injections:
+            return None
+        injection_ordinal = current + 1
+        setattr(state, _ALPHA_PROBE_INJECTION_COUNT_STATE_KEY, injection_ordinal)
+        return injection_ordinal
+
+    def _prepare_alpha_probe_candidate_unavailable(
+        *,
+        injection_ordinal: int,
+        attempt_record: dict[str, Any],
+        candidate: dict[str, Any],
+        selection: dict[str, Any],
+    ) -> None:
+        """Prepare one synthetic no-I/O candidate observation."""
+        attempt_record.update(
+            {
+                "status": "skipped_alpha_probe",
+                "failure_phase": "alpha_probe_pre_egress",
+                "error_class": "candidate_unavailable",
+                "terminal_disposition": "skipped",
+                "skip_reason": "candidate_unavailable",
+                "attempted_provider_call": False,
+                "provider_returned": False,
+            }
+        )
+        attempts.append(attempt_record)
+        assert _build_alpha_probe_receipt is not None
+        _build_alpha_probe_receipt(
+            request,
+            control=alpha_probe_control,
+            candidate=candidate,
+            selection=selection,
+            phase="pre_egress",
+            injection_ordinal=injection_ordinal,
+            attempt_record_index=len(attempts) - 1,
+        )
+
+    def _finish_alpha_probe_candidate_unavailable(
+        *,
+        attempt_record: dict[str, Any],
+        candidate: dict[str, Any],
+        selection: dict[str, Any],
+        budget_was_counted: bool,
+        account_failover_planned: bool = False,
+    ) -> None:
+        """Apply request-local traversal and record a synthetic observation."""
+        if not account_failover_planned:
+            _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
+                request,
+                candidate=candidate,
+                lane_key=selection.get("lane_key"),
+            )
+        _refund_selection_budget_if_no_provider_egress(
+            attempt_record=attempt_record,
+            budget_was_counted=budget_was_counted,
+            selection_provider_egress_reached=False,
+        )
+        if account_failover_planned:
+            _mark_auto_agent_alias_request_failover_pending(
+                request,
+                attempt_record,
+            )
+        _record_auto_agent_alias_attempt_failure(
+            alias_family=alias_family,
+            alias_model=alias_model,
+            request=request,
+            prepared_request_body=prepared_request_body,
+            selection=selection,
+            attempts=attempts,
+            attempt_record=attempt_record,
+            error_class="candidate_unavailable",
+            add_alias_metadata_fn=add_alias_metadata_fn,
+        )
 
     def _account_xai_no_io_selection(
         *,
@@ -2227,6 +2328,60 @@ async def handle_alias_route(  # noqa: PLR0915
         if selection_budget_counted:
             provider_candidate_attempts += 1
         selection_provider_egress_reached = False
+        if alpha_probe_control is not None:
+            managed_codex_oauth_candidate = (
+                _is_codex_oauth_account_candidate is not None
+                and _is_codex_oauth_account_candidate(candidate)
+            )
+            inject_alpha_probe = (
+                (
+                    alpha_probe_control.plan.name == "basic"
+                    and candidate.get("last_resort") is False
+                )
+                or (
+                    alpha_probe_control.plan.name == "work"
+                    and managed_codex_oauth_candidate
+                )
+            )
+            if inject_alpha_probe:
+                injection_ordinal = _claim_alpha_probe_injection_slot()
+                if injection_ordinal is not None:
+                    _prepare_alpha_probe_candidate_unavailable(
+                        injection_ordinal=injection_ordinal,
+                        attempt_record=attempt_record,
+                        candidate=candidate,
+                        selection=selection,
+                    )
+                    account_failover_planned = False
+                    if (
+                        alpha_probe_control.plan.name == "work"
+                        and managed_codex_oauth_candidate
+                    ):
+                        account_failover_planned = (
+                            _plan_codex_oauth_account_failover(
+                                request,
+                                candidate=candidate,
+                                selection=selection,
+                                attempt_record=attempt_record,
+                                error_class="candidate_unavailable",
+                                has_continuation_state=_provider_owned_continuation(),
+                                has_previous_response_id=has_previous_response_id,
+                                has_account_bound_state=bool(
+                                    selection.get("has_account_bound_state")
+                                ),
+                                account_failover_replay_safe=(
+                                    account_failover_replay_safe
+                                ),
+                            )
+                        )
+                    _finish_alpha_probe_candidate_unavailable(
+                        attempt_record=attempt_record,
+                        candidate=candidate,
+                        selection=selection,
+                        budget_was_counted=selection_budget_counted,
+                        account_failover_planned=account_failover_planned,
+                    )
+                    continue
         # D1-564: provider/account lane admission after selection and before
         # attempt-start / probe lock / provider I/O. Separate from cooldown and
         # session ownership. Fail-fast only: never queue/sleep/background-retry.
