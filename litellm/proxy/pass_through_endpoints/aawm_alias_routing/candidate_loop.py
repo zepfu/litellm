@@ -1334,9 +1334,10 @@ async def handle_alias_route(  # noqa: PLR0915
         selection: dict[str, Any],
         budget_was_counted: bool,
         account_failover_planned: bool = False,
+        reselect_allowed: bool = True,
     ) -> None:
         """Apply request-local traversal and record a synthetic observation."""
-        if not account_failover_planned:
+        if reselect_allowed and not account_failover_planned:
             _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
                 request,
                 candidate=candidate,
@@ -2447,6 +2448,7 @@ async def handle_alias_route(  # noqa: PLR0915
                 xai_no_io_selection_skip_reason: Optional[str] = None
                 xai_no_io_selection_reselect_eligible = False
                 skip_after_probe_wait = False
+                alpha_probe_terminal_exc: Optional[HTTPException] = None
                 response: Optional[Response] = None
                 intent = None
 
@@ -2682,6 +2684,17 @@ async def handle_alias_route(  # noqa: PLR0915
                                                 ),
                                             )
                                         )
+                                    alpha_probe_reselect_allowed = (
+                                        alpha_probe_control.plan.name != "work"
+                                        or account_failover_planned
+                                    )
+                                    if not alpha_probe_reselect_allowed:
+                                        attempt_record["status"] = (
+                                            "terminal_alpha_probe_candidate_unavailable"
+                                        )
+                                        attempt_record["terminal_disposition"] = (
+                                            "terminal"
+                                        )
                                     _finish_alpha_probe_candidate_unavailable(
                                         attempt_record=attempt_record,
                                         candidate=candidate,
@@ -2692,7 +2705,53 @@ async def handle_alias_route(  # noqa: PLR0915
                                         account_failover_planned=(
                                             account_failover_planned
                                         ),
+                                        reselect_allowed=(
+                                            alpha_probe_reselect_allowed
+                                        ),
                                     )
+                                    if not alpha_probe_reselect_allowed:
+                                        rejection_reason = str(
+                                            attempt_record.get(
+                                                "account_failover_rejection_reason"
+                                            )
+                                            or "account_failover_not_planned"
+                                        )
+                                        alpha_probe_terminal_exc = HTTPException(
+                                            status_code=(
+                                                status.HTTP_503_SERVICE_UNAVAILABLE
+                                            ),
+                                            detail={
+                                                "error": {
+                                                    "message": (
+                                                        "No eligible Codex OAuth "
+                                                        "account is available for "
+                                                        "this dispatch."
+                                                    ),
+                                                    "type": "candidate_unavailable",
+                                                    "code": (
+                                                        "aawm_codex_auto_agent_"
+                                                        "candidate_unavailable"
+                                                    ),
+                                                },
+                                                "failure_phase": (
+                                                    "alpha_probe_pre_egress"
+                                                ),
+                                                "attempted_provider_call": False,
+                                                "account_failover_rejection_reason": (
+                                                    rejection_reason
+                                                ),
+                                            },
+                                        )
+                                        setattr(
+                                            alpha_probe_terminal_exc,
+                                            "attempted_provider_call",
+                                            False,
+                                        )
+                                        setattr(
+                                            alpha_probe_terminal_exc,
+                                            "failure_phase",
+                                            "alpha_probe_pre_egress",
+                                        )
                                     if session_owner_lease is not None:
                                         try:
                                             await _session_affinity_mod().finalize_session_owner_lease_on_failure(
@@ -3496,6 +3555,22 @@ async def handle_alias_route(  # noqa: PLR0915
                     if skip_after_probe_wait:
                         intent.complete()
                         alias_routing_state.publication_intents.remove(intent)
+                        if alpha_probe_terminal_exc is not None:
+                            _raise_terminal_alias_failure(
+                                alpha_probe_terminal_exc,
+                                extra_fields={
+                                    "account_failover_rejection_reason": (
+                                        alpha_probe_terminal_exc.detail.get(
+                                            "account_failover_rejection_reason"
+                                        )
+                                        if isinstance(
+                                            alpha_probe_terminal_exc.detail,
+                                            dict,
+                                        )
+                                        else None
+                                    ),
+                                },
+                            )
                         break
                     if probe_failure_exc is None:
                         if deferred_session_owner_stream:
