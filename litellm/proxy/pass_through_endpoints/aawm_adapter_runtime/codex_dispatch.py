@@ -531,6 +531,79 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
             endpoint=endpoint,
         )
     if codex_auto_agent_alias is not None:
+        # The alpha probe is an explicitly authorized, fresh-request control.
+        # Resolve it only after the authenticated alias branch is known, then
+        # fail closed before guidance or provider route handling.
+        from fastapi import HTTPException
+
+        from litellm.proxy.common_utils.http_parsing_utils import (
+            _safe_get_request_headers,
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
+            ALPHA_PROBE_PLAN_HEADER,
+            resolve_alpha_probe_control,
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_build import (
+            _codex_auto_agent_request_has_continuation_state,
+        )
+
+        alpha_probe_control = resolve_alpha_probe_control(
+            request,
+            user_api_key_dict=user_api_key_dict,
+        )
+        if alpha_probe_control is not None:
+            alpha_probe_rejection_reason: Optional[str] = None
+            if _codex_auto_agent_request_has_continuation_state(
+                prepared_request_body
+            ):
+                alpha_probe_rejection_reason = "non_fresh_or_bound_body"
+            elif _sa.request_session_owner_already_guarded(request):
+                alpha_probe_rejection_reason = "session_owner_guarded"
+            elif _sa.get_request_session_owner_lease(request) is not None:
+                alpha_probe_rejection_reason = "session_owner_lease"
+            elif _sa.request_has_effective_session_identity(request):
+                alpha_probe_rejection_reason = "effective_session_identity"
+
+            if alpha_probe_rejection_reason is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "alpha_probe_requires_fresh_unbound_request",
+                        "message": (
+                            "alpha probe requires a fresh, unbound Codex "
+                            "auto-agent request"
+                        ),
+                        "reason": alpha_probe_rejection_reason,
+                    },
+                )
+
+            # _safe_get_request_headers caches the forwarding map on request
+            # state. Replace that map without mutating the caller's body or
+            # raw Starlette scope, so pass_through_request cannot forward the
+            # server-only control header.
+            alpha_probe_headers = _safe_get_request_headers(request)
+            alpha_probe_state = getattr(request, "state", None)
+            if alpha_probe_state is None or not isinstance(alpha_probe_headers, dict):
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "alpha_probe_request_state_unavailable",
+                        "message": "alpha probe request state unavailable",
+                    },
+                )
+            setattr(
+                alpha_probe_state,
+                "_cached_headers",
+                {
+                    key: value
+                    for key, value in alpha_probe_headers.items()
+                    if not (
+                        isinstance(key, str)
+                        and key.casefold() == ALPHA_PROBE_PLAN_HEADER.casefold()
+                    )
+                },
+            )
+
         is_codex_auto_review_alias = (
             isinstance(codex_auto_agent_alias, str)
             and codex_auto_agent_alias.strip().casefold()
