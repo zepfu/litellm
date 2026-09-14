@@ -5979,6 +5979,15 @@ def _openai_binding_fingerprint(value: Any) -> Optional[str]:
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
 
 
+def _canonical_openai_final_send_uuid(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    try:
+        return value if str(UUID(value)) == value else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def _emit_openai_final_send_binding_observation(
     observation: Mapping[str, Any],
 ) -> None:
@@ -5998,14 +6007,6 @@ def _emit_openai_final_send_binding_observation(
                 return value
             return "unknown"
 
-        def _canonical_uuid(value: Any) -> Optional[str]:
-            if not isinstance(value, str):
-                return None
-            try:
-                return value if str(UUID(value)) == value else None
-            except (AttributeError, TypeError, ValueError):
-                return None
-
         def _optional_bool(value: Any) -> Optional[bool]:
             return value if isinstance(value, bool) else None
 
@@ -6023,8 +6024,11 @@ def _emit_openai_final_send_binding_observation(
 
         payload: dict[str, Any] = {
             "event": "openai_final_send_binding",
-            "correlation_id": _canonical_uuid(
+            "correlation_id": _canonical_openai_final_send_uuid(
                 observation.get("correlation_id")
+            ),
+            "alias_request_litellm_call_id": _canonical_openai_final_send_uuid(
+                observation.get("alias_request_litellm_call_id")
             ),
             "outcome": _optional_vocab(
                 observation.get("outcome"),
@@ -6142,8 +6146,17 @@ def _record_openai_final_send_binding_observation(
         if isinstance(current_account_context, Mapping)
         else {}
     )
+    request_state = getattr(request, "state", None)
+    alias_request_litellm_call_id = _canonical_openai_final_send_uuid(
+        (
+            getattr(request_state, "aawm_alias_request_litellm_call_id", None)
+            if request_state is not None
+            else None
+        )
+    )
     observation: dict[str, Any] = {
         "correlation_id": correlation_id,
+        "alias_request_litellm_call_id": alias_request_litellm_call_id,
         "outcome": outcome,
         "owner_comparison_mode": owner_comparison_mode,
         "owner_comparison_result": owner_comparison_result,
@@ -6183,10 +6196,9 @@ def _record_openai_final_send_binding_observation(
         "rejection_reason": rejection_reason,
     }
     _emit_openai_final_send_binding_observation(observation)
-    state = getattr(request, "state", None)
-    if state is not None:
+    if request_state is not None:
         try:
-            setattr(state, "aawm_openai_final_send_binding", observation)
+            setattr(request_state, "aawm_openai_final_send_binding", observation)
         except Exception:
             pass
     if isinstance(metadata, dict):
