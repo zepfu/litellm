@@ -38,6 +38,10 @@ from typing import Any, Awaitable, Callable, Mapping, Optional, TypeVar, cast
 from fastapi import HTTPException
 
 from litellm._logging import verbose_aawm_route_logger, verbose_proxy_logger
+from litellm.llms.xai.route_descriptors import (
+    GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+    XAI_OAUTH_ROUTE_FAMILY,
+)
 from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
 )
@@ -4921,10 +4925,6 @@ _XAI_DEFERRED_STREAM_EVENT = "session_owner_deferred_stream"
 _XAI_DEFERRED_STREAM_PHASES = frozenset(
     {
         "binding",
-        "not_streaming_response",
-        "already_bound",
-        "missing_iterator",
-        "bound",
         "first_pull",
         "iterator_eof",
         "iterator_cancelled",
@@ -4934,8 +4934,6 @@ _XAI_DEFERRED_STREAM_PHASES = frozenset(
         "renewal_failed",
         "stream_response_cancelled",
         "stream_response_exception",
-        "validation",
-        "finalization_selected",
         "finalization_wait_cancelled",
         "finalization_task_returned",
         "finalization_task_raised",
@@ -4947,28 +4945,36 @@ _XAI_DEFERRED_STREAM_PHASES = frozenset(
         "finalize_enter",
         "finalization_task_created",
         "finalization_task_reused",
-        "success_finalizer_called",
-        "success_finalizer_returned",
-        "success_finalizer_raised",
-        "release_called",
-        "release_returned",
-        "release_raised",
     }
 )
 _XAI_DEFERRED_STREAM_BINDING_OUTCOMES = frozenset(
     {"not_streaming_response", "already_bound", "missing_iterator", "bound"}
 )
-_XAI_DEFERRED_STREAM_SUCCESS_PATHS = frozenset(
+_XAI_DEFERRED_STREAM_SITES = frozenset(
     {
-        "not_streaming_response",
-        "already_bound",
-        "missing_iterator",
-        "bound",
         "finalization",
         "iterator_pre_pull",
         "iterator_wait",
         "iterator_post_pull",
         "stream_response",
+    }
+)
+_XAI_DEFERRED_STREAM_ROUTE_FAMILIES = frozenset(
+    {
+        XAI_OAUTH_ROUTE_FAMILY,
+        GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+    }
+)
+_XAI_DEFERRED_STREAM_REQUESTED_SUCCESS_PHASES = frozenset(
+    {
+        "finalizer_enter",
+        "finalizer_result",
+        "finalize_enter",
+        "finalization_task_created",
+        "finalization_task_reused",
+        "finalization_wait_cancelled",
+        "finalization_task_returned",
+        "finalization_task_raised",
     }
 )
 _XAI_DEFERRED_STREAM_MUTATION_OUTCOMES = frozenset(
@@ -5041,8 +5047,7 @@ def _make_xai_deferred_stream_observer(
             return (
                 provider_value == "xai"
                 or hosted_value == "xai"
-                or "xai" in route_value
-                or "grok_native" in route_value
+                or route_value in _XAI_DEFERRED_STREAM_ROUTE_FAMILIES
             )
 
         state = _field(request, "state", None)
@@ -5138,18 +5143,40 @@ def _make_xai_deferred_stream_observer(
         def _optional_bool(value: Any, *, absent: Any = "unknown") -> Any:
             return value if isinstance(value, bool) else absent
 
-        def _normalize_success_path(value: Any) -> Any:
-            if isinstance(value, bool):
-                return value
-            raw = value.value if isinstance(value, Enum) else value
-            if not isinstance(raw, str) or not raw.strip():
-                return "unknown"
-            normalized = raw.strip().casefold()
-            return (
-                normalized
-                if normalized in _XAI_DEFERRED_STREAM_SUCCESS_PATHS
-                else "unknown"
-            )
+        def _iterator_snapshot(iterator: Any) -> dict[str, Any]:
+            if iterator is missing:
+                return {
+                    "iterator_completed": "unknown",
+                    "iterator_closed": "unknown",
+                }
+            if iterator is None:
+                return {
+                    "iterator_completed": "unknown",
+                    "iterator_closed": "unknown",
+                }
+            completed = _field(iterator, "_completed", missing)
+            if completed is missing:
+                completed = _field(iterator, "completed", missing)
+            closed = _field(iterator, "_closed", missing)
+            if closed is missing:
+                closed = _field(iterator, "closed", missing)
+            return {
+                "iterator_completed": (
+                    _optional_bool(completed)
+                    if completed is not missing
+                    else "unknown"
+                ),
+                "iterator_closed": (
+                    _optional_bool(closed) if closed is not missing else "unknown"
+                ),
+            }
+
+        def _finalization_task_snapshot(task: Any) -> dict[str, Any]:
+            if task is missing:
+                return {"finalization_task_present": "unknown"}
+            return {
+                "finalization_task_present": task is not None,
+            }
 
         def _lease_snapshot() -> dict[str, Any]:
             present = lease is not None
@@ -5202,7 +5229,6 @@ def _make_xai_deferred_stream_observer(
             )
             if not isinstance(state_value, Mapping):
                 return {
-                    "validation_ok": False,
                     "validation_state_present": False,
                     "complete": "unknown",
                     "valid": "unknown",
@@ -5217,12 +5243,6 @@ def _make_xai_deferred_stream_observer(
                 _XAI_DEFERRED_STREAM_TERMINAL_STATUSES,
             )
             return {
-                "validation_ok": (
-                    complete is True
-                    and valid is True
-                    and terminal_seen is True
-                    and terminal_status == "completed"
-                ),
                 "validation_state_present": True,
                 "complete": (
                     complete if isinstance(complete, bool) else "unknown"
@@ -5268,14 +5288,8 @@ def _make_xai_deferred_stream_observer(
                 ),
             }
             operation = {
-                "success_finalizer_called": "success_finalizer",
-                "success_finalizer_returned": "success_finalizer",
-                "success_finalizer_raised": "success_finalizer",
                 "finalizer_enter": "success_finalizer",
                 "finalizer_result": "success_finalizer",
-                "release_called": "release",
-                "release_returned": "release",
-                "release_raised": "release",
                 "release_result": "release",
                 "cleanup_outcome": "release",
             }.get(phase)
@@ -5315,11 +5329,6 @@ def _make_xai_deferred_stream_observer(
         def _observe(phase: Any, **fields: Any) -> None:
             try:
                 normalized_phase = _normalize_phase(phase)
-                success_path = (
-                    _normalize_success_path(fields.get("success_path"))
-                    if "success_path" in fields
-                    else "unknown"
-                )
                 payload: dict[str, Any] = {
                     "event": _XAI_DEFERRED_STREAM_EVENT,
                     "phase": normalized_phase,
@@ -5327,26 +5336,35 @@ def _make_xai_deferred_stream_observer(
                     "success_finalizer_source": success_finalizer_source,
                     **_lease_snapshot(),
                     **_validation_snapshot(),
+                    **_iterator_snapshot(fields.get("iterator", missing)),
+                    **_finalization_task_snapshot(
+                        fields.get("finalization_task", missing)
+                    ),
                 }
-                binding_outcome = (
-                    success_path
-                    if normalized_phase == "binding"
-                    else normalized_phase
-                )
-                if binding_outcome in _XAI_DEFERRED_STREAM_BINDING_OUTCOMES:
-                    payload["binding_outcome"] = binding_outcome
 
-                for key in (
-                    "success_path",
-                    "iterator_wrapped",
-                    "stream_response_wrapped",
-                ):
+                if normalized_phase == "binding":
+                    payload["binding_outcome"] = _normalize_status(
+                        fields.get("binding_outcome", missing),
+                        _XAI_DEFERRED_STREAM_BINDING_OUTCOMES,
+                    )
+                elif normalized_phase == "renewal_failed":
+                    payload["site"] = _normalize_status(
+                        fields.get("site", missing),
+                        _XAI_DEFERRED_STREAM_SITES,
+                    )
+                elif normalized_phase == "validator_decision":
+                    payload["validation_ok"] = _optional_bool(
+                        fields.get("validation_ok", missing)
+                    )
+
+                if normalized_phase in _XAI_DEFERRED_STREAM_REQUESTED_SUCCESS_PHASES:
+                    payload["requested_success"] = _optional_bool(
+                        fields.get("requested_success", missing)
+                    )
+
+                for key in ("iterator_wrapped", "stream_response_wrapped"):
                     if key in fields:
-                        payload[key] = (
-                            success_path
-                            if key == "success_path"
-                            else _optional_bool(fields.get(key))
-                        )
+                        payload[key] = _optional_bool(fields.get(key))
 
                 error_category = _exception_category(fields.get("error"))
                 if error_category is None:
