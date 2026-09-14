@@ -387,7 +387,7 @@ ALIBABA_TOKEN_PLAN_MODEL = "qwen-token-plan"
 ALIBABA_TOKEN_PLAN_ACTIVE_MODELS = (
     "alibaba_token_plan/qwen3.8-max",
     "alibaba_token_plan/qwen3.7-max",
-    "alibaba_token_plan/deepseek-v4-flash-0731",
+    "alibaba_token_plan/deepseek-v4.1-flash",
     "alibaba_token_plan/qwen3.6-flash",
     "alibaba_token_plan/deepseek-v4-pro",
     "alibaba_token_plan/glm-5.2",

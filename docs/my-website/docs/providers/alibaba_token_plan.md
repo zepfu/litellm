@@ -20,13 +20,12 @@ alias routes remain separate.
 - `alibaba_token_plan/qwen3.7-plus`
 - `alibaba_token_plan/qwen3.7-max`
 - `alibaba_token_plan/qwen3.6-flash`
-- `alibaba_token_plan/deepseek-v4-flash-0731`
+- `alibaba_token_plan/deepseek-v4.1-flash`
 - `alibaba_token_plan/deepseek-v4-pro`
 - `alibaba_token_plan/glm-5.2`
 
-Alibaba's public Coding Plan documentation uses the family label
-`deepseek-v4-flash`; the authenticated Token Plan model catalog advertises the
-routable ID `deepseek-v4-flash-0731`, which is the identity configured here.
+The configured DeepSeek Flash model is `deepseek-v4.1-flash`; the provider
+receives that exact unprefixed ID.
 
 Other model IDs are rejected locally. The provider always resolves the public
 LiteLLM model identity to the unprefixed provider model before egress. A public
@@ -110,6 +109,13 @@ list rates are distinct from Token Plan subscription economics and do not claim
 the subscription invoice cost. Qwen 3.8 remains explicitly unpriced. Reference
 totals are metadata only and do not populate `response_cost` or
 `session_history.response_cost_usd`.
+
+DeepSeek V4.1 Flash uses Singapore/International Model Studio direct reference
+base rates of `$0.30/$1.20` per million input/output tokens and `$0.03` per
+million cached input tokens. Off-peak and promotional discounts are excluded.
+These are reference rates, not known Token Plan invoice costs.
+Sources: [Model pricing](https://www.alibabacloud.com/help/en/model-studio/model-pricing)
+and [context cache](https://www.alibabacloud.com/help/en/model-studio/context-cache).
 
 ## Quota observability
 

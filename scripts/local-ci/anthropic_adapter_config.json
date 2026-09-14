@@ -9031,7 +9031,7 @@
         {
           "candidate_order": 4,
           "provider": "alibaba_token_plan",
-          "model": "alibaba_token_plan/deepseek-v4-flash-0731",
+          "model": "alibaba_token_plan/deepseek-v4.1-flash",
           "route_family": "codex_alibaba_token_plan_chat_completions_adapter"
         },
         {
@@ -9177,7 +9177,7 @@
                 "openrouter/owl-alpha",
                 "deepseek-v4-flash",
                 "big-pickle",
-                "alibaba_token_plan/deepseek-v4-flash-0731",
+                "alibaba_token_plan/deepseek-v4.1-flash",
                 "alibaba_token_plan/qwen3.6-flash",
                 "gpt-5.6-luna"
               ]
@@ -9224,7 +9224,7 @@
               },
               {
                 "provider": "alibaba_token_plan",
-                "model": "alibaba_token_plan/deepseek-v4-flash-0731",
+                "model": "alibaba_token_plan/deepseek-v4.1-flash",
                 "route_family": "codex_alibaba_token_plan_chat_completions_adapter"
               },
               {
@@ -9345,7 +9345,7 @@
         {
           "candidate_order": 4,
           "provider": "alibaba_token_plan",
-          "model": "alibaba_token_plan/deepseek-v4-flash-0731",
+          "model": "alibaba_token_plan/deepseek-v4.1-flash",
           "route_family": "anthropic_alibaba_token_plan_chat_completions_adapter"
         },
         {
@@ -9443,7 +9443,7 @@
                 "openrouter/owl-alpha",
                 "deepseek-v4-flash",
                 "big-pickle",
-                "alibaba_token_plan/deepseek-v4-flash-0731",
+                "alibaba_token_plan/deepseek-v4.1-flash",
                 "alibaba_token_plan/qwen3.6-flash",
                 "claude-haiku-4-5-20251001"
               ]
@@ -9487,7 +9487,7 @@
               },
               {
                 "provider": "alibaba_token_plan",
-                "model": "alibaba_token_plan/deepseek-v4-flash-0731",
+                "model": "alibaba_token_plan/deepseek-v4.1-flash",
                 "route_family": "anthropic_alibaba_token_plan_chat_completions_adapter"
               },
               {

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from types import FunctionType
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
+from litellm._logging import verbose_aawm_route_logger
 from litellm.llms.xai.route_descriptors import (
     GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
     GROK_NATIVE_OAUTH_ROUTE_FAMILY,
@@ -64,6 +65,53 @@ _CURSOR_PROTO_STRUCTURE_MAX_ITEMS = 64
 _CURSOR_REPLAY_DIAGNOSTIC_MAX_INDEX = 4096
 _CURSOR_REPLAY_DIAGNOSTIC_MAX_KEY_COUNT = 32
 _CURSOR_REPLAY_DIAGNOSTIC_MAX_TOKEN_CHARS = 64
+_CURSOR_RETAINED_HISTORY_REJECTION_FIELD = (
+    "_cursor_retained_history_rejection"
+)
+_CURSOR_RETAINED_HISTORY_DIAGNOSTIC_TYPES = frozenset(
+    {
+        "message",
+        "agent_message",
+        "function_call",
+        "function_call_output",
+        "reasoning",
+        "computer_call",
+        "computer_call_output",
+        "mcp_call",
+        "mcp_call_output",
+        "mcp_approval_request",
+        "mcp_approval_response",
+        "item_reference",
+        "tool_use",
+        "tool_result",
+    }
+)
+_CURSOR_RETAINED_HISTORY_DIAGNOSTIC_KEYS = frozenset(
+    {
+        "type",
+        "id",
+        "status",
+        "role",
+        "author",
+        "recipient",
+        "content",
+        "summary",
+        "annotations",
+        "name",
+        "arguments",
+        "call_id",
+        "callId",
+        "output",
+        "namespace",
+        "action",
+        "computer",
+        "pending_safety_checks",
+        "acknowledged_safety_checks",
+        "server_label",
+        "item_id",
+        "internal_chat_message_metadata_passthrough",
+    }
+)
 _CURSOR_REQUEST_SCHEMA_REJECTION_REASONS = frozenset(
     {
         "function_call_fields",
@@ -123,6 +171,7 @@ _CURSOR_REPLAY_FRESH_DISPATCH_REJECTION_REASONS = frozenset(
         "item_not_object",
         "item_key_set",
         "item_type",
+        "agent_message_identity",
         "id_shape",
         "metadata_shape",
         "metadata_key_set",
@@ -300,6 +349,183 @@ def _cursor_replay_bounded_diagnostic_index(value: Any) -> Optional[int]:
     ):
         return None
     return value
+
+
+def _cursor_retained_history_diagnostic_type(
+    value: Any,
+    *,
+    non_object: bool = False,
+) -> str:
+    if non_object:
+        return "non_object"
+    return (
+        value
+        if isinstance(value, str)
+        and value in _CURSOR_RETAINED_HISTORY_DIAGNOSTIC_TYPES
+        else "other"
+    )
+
+
+def _cursor_retained_history_diagnostic_keys(
+    value: Any,
+) -> Optional[tuple[str, ...]]:
+    if not isinstance(value, Mapping):
+        return None
+    safe_keys: set[str] = set()
+    try:
+        for raw_key in value.keys():
+            if (
+                isinstance(raw_key, str)
+                and raw_key in _CURSOR_RETAINED_HISTORY_DIAGNOSTIC_KEYS
+            ):
+                safe_keys.add(raw_key)
+            else:
+                safe_keys.add("<other>")
+            if len(safe_keys) >= _CURSOR_REPLAY_DIAGNOSTIC_MAX_KEY_COUNT:
+                break
+    except Exception:  # noqa: BLE001
+        return None
+    return tuple(sorted(safe_keys)[:_CURSOR_REPLAY_DIAGNOSTIC_MAX_KEY_COUNT])
+
+
+def _cursor_retained_history_diagnostic_key_list(
+    value: Any,
+) -> Optional[list[str]]:
+    if not isinstance(value, (list, tuple)):
+        return None
+    safe_keys: set[str] = set()
+    for raw_key in list(value)[:_CURSOR_REPLAY_DIAGNOSTIC_MAX_KEY_COUNT]:
+        if (
+            isinstance(raw_key, str)
+            and raw_key in _CURSOR_RETAINED_HISTORY_DIAGNOSTIC_KEYS
+        ):
+            safe_keys.add(raw_key)
+        else:
+            safe_keys.add("<other>")
+    return sorted(safe_keys)[:_CURSOR_REPLAY_DIAGNOSTIC_MAX_KEY_COUNT]
+
+
+def _cursor_retained_history_diagnostic_reason(
+    value: Any,
+    *,
+    fallback: str,
+) -> str:
+    if (
+        isinstance(value, str)
+        and value in _CURSOR_REPLAY_FRESH_DISPATCH_REJECTION_REASONS
+    ):
+        return value
+    return fallback
+
+
+def _cursor_retained_history_rejection_diagnostic(
+    *,
+    item_present: bool,
+    item_index: Any = None,
+    item: Any = None,
+    validator_reason: Any,
+) -> dict[str, Any]:
+    diagnostic: dict[str, Any] = {
+        "item_type": (
+            _cursor_retained_history_diagnostic_type(
+                item.get("type") if isinstance(item, Mapping) else None,
+                non_object=item_present and not isinstance(item, Mapping),
+            )
+            if item_present
+            else "other"
+        ),
+        "validator_reason": _cursor_retained_history_diagnostic_reason(
+            validator_reason,
+            fallback="item_type",
+        ),
+    }
+    if item_present:
+        bounded_index = _cursor_replay_bounded_diagnostic_index(item_index)
+        if bounded_index is not None:
+            diagnostic["item_index"] = bounded_index
+        item_keys = _cursor_retained_history_diagnostic_keys(item)
+        if item_keys:
+            diagnostic["item_keys"] = list(item_keys)
+    return diagnostic
+
+
+def _cursor_retained_history_rejection_error(
+    *,
+    item_present: bool,
+    item_index: Any = None,
+    item: Any = None,
+    validator_reason: Any,
+) -> Exception:
+    from litellm.llms.cursor_agent.connect import CursorConnectError
+
+    exc = CursorConnectError(
+        "Cursor Agent retained continuation requires valid complete tool history.",
+        status_code=409,
+    )
+    try:
+        diagnostic = _cursor_retained_history_rejection_diagnostic(
+            item_present=item_present,
+            item_index=item_index,
+            item=item,
+            validator_reason=validator_reason,
+        )
+        setattr(exc, _CURSOR_RETAINED_HISTORY_REJECTION_FIELD, diagnostic)
+    except Exception:
+        # Diagnostic construction must never replace the original 409.
+        pass
+    return exc
+
+
+def _cursor_retained_history_correlation_id(request: Any) -> Optional[str]:
+    request_state = getattr(request, "state", None)
+    return _cursor_replay_safe_diagnostic_token(
+        getattr(request_state, "aawm_alias_request_litellm_call_id", None)
+    )
+
+
+def _emit_cursor_retained_history_rejection_diagnostic(
+    *,
+    request: Any,
+    diagnostic: Any,
+) -> None:
+    try:
+        if not isinstance(diagnostic, Mapping):
+            return
+        raw_item_type = diagnostic.get("item_type")
+        sanitized: dict[str, Any] = {
+            "item_type": _cursor_retained_history_diagnostic_type(
+                raw_item_type,
+                non_object=raw_item_type == "non_object",
+            ),
+            "validator_reason": _cursor_retained_history_diagnostic_reason(
+                diagnostic.get("validator_reason"),
+                fallback="item_type",
+            ),
+        }
+        bounded_index = _cursor_replay_bounded_diagnostic_index(
+            diagnostic.get("item_index")
+        )
+        if bounded_index is not None:
+            sanitized["item_index"] = bounded_index
+        item_keys = _cursor_retained_history_diagnostic_key_list(
+            diagnostic.get("item_keys")
+        )
+        if item_keys:
+            sanitized["item_keys"] = item_keys
+        payload: dict[str, Any] = {
+            "event": "cursor_retained_history_rejection",
+            "diagnostic": sanitized,
+        }
+        correlation_id = _cursor_retained_history_correlation_id(request)
+        if correlation_id is not None:
+            payload["litellm_call_id"] = correlation_id
+        verbose_aawm_route_logger.warning(
+            "AAWM_CURSOR_RETAINED_HISTORY_REJECTION: %s",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+    except Exception:
+        # Observability must never alter the retained-continuation outcome.
+        return
 
 
 def _cursor_request_schema_safe_keys(value: Any) -> tuple[str, ...]:
@@ -1867,49 +2093,85 @@ def _remember_cursor_message_tool_calls(
             function_calls[call_id] = name
 
 
+def _cursor_replay_stock_agent_message_item(
+    raw_item: Mapping[str, Any],
+    *,
+    item_index: Optional[int] = None,
+) -> _CursorReplayValidationResult:
+    item = raw_item
+    content = item.get("content")
+    author = item.get("author")
+    recipient = item.get("recipient")
+    identity_invalid = (
+        (author is None) != (recipient is None)
+        or (
+            author is not None
+            and (
+                not isinstance(author, str)
+                or not author.strip()
+                or not isinstance(recipient, str)
+                or not recipient.strip()
+            )
+        )
+    )
+    if set(item) - {
+        "type",
+        "id",
+        "author",
+        "recipient",
+        "content",
+        "internal_chat_message_metadata_passthrough",
+    }:
+        reason = "item_key_set"
+    elif identity_invalid:
+        reason = "agent_message_identity"
+    elif not isinstance(content, list) or not content:
+        reason = "content_container"
+    else:
+        reason = None
+        for part in content:
+            if not isinstance(part, dict):
+                reason = "content_part_container"
+                break
+            if set(part) != {"type", "text"}:
+                reason = "content_part_keys"
+                break
+            if part.get("type") not in ("input_text", "text"):
+                reason = "content_part_type"
+                break
+            if not isinstance(part.get("text"), str):
+                reason = "content_part_text_type"
+                break
+    if reason is not None:
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            reason,
+            item_index=item_index,
+            item=item,
+        )
+
+    text = "\n".join(part["text"] for part in content)
+    if not text.strip():
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "empty_user_text",
+            item_index=item_index,
+            item=item,
+        )
+    # Project only the Cursor chat view; keep the stock input item intact.
+    return _CursorReplayValidationResult(
+        value={"role": "user", "content": text}
+    )
+
+
 def _cursor_message_input_item(
     item: dict[str, Any],
     function_calls: dict[str, str],
 ) -> Optional[dict[str, Any]]:
     item_type = str(item.get("type") or "")
     if item_type == "agent_message":
-        content = item.get("content")
-        author = item.get("author")
-        recipient = item.get("recipient")
-        identity_invalid = (
-            (author is None) != (recipient is None)
-            or (
-                author is not None
-                and (
-                    not isinstance(author, str)
-                    or not author.strip()
-                    or not isinstance(recipient, str)
-                    or not recipient.strip()
-                )
-            )
-        )
-        if (
-            set(item) - {
-                "type", "id", "author", "recipient", "content",
-                "internal_chat_message_metadata_passthrough",
-            }
-            or identity_invalid
-            or not isinstance(content, list)
-            or not content
-            or any(
-                not isinstance(part, dict)
-                or set(part) != {"type", "text"}
-                or part.get("type") not in ("input_text", "text")
-                or not isinstance(part.get("text"), str)
-                for part in content
-            )
-        ):
-            return None
-        text = "\n".join(part["text"] for part in content)
-        if not text.strip():
-            return None
-        # Project only the Cursor chat view; keep the stock input item intact.
-        return {"role": "user", "content": text}
+        validated = _cursor_replay_stock_agent_message_item(item)
+        return validated.value if validated.rejection is None else None
     if item_type == "input_text":
         return {
             "role": "user",
@@ -2003,17 +2265,22 @@ def _find_cursor_full_history_retained_state(
 
     input_items = request_body.get("input")
     if not isinstance(input_items, list):
-        raise CursorConnectError(
-            "Cursor Agent retained continuation requires valid complete tool history.",
-            status_code=409,
+        raise _cursor_retained_history_rejection_error(
+            item_present=False,
+            validator_reason="input_container",
         )
     # Live continuation validates the trusted prefix, not the single-pair
     # grammar used to authorize a provider-neutral fallback.
-    for item in input_items:
+    for item_index, item in enumerate(input_items):
         item_type = item.get("type") if isinstance(item, Mapping) else None
         if item_type == "message":
             validated = _cursor_replay_stock_codex_message_item(
                 item, allow_missing_metadata=True
+            )
+        elif item_type == "agent_message":
+            validated = _cursor_replay_stock_agent_message_item(
+                item,
+                item_index=item_index,
             )
         elif item_type == "function_call":
             validated = _cursor_replay_stock_codex_function_call_item(
@@ -2026,9 +2293,20 @@ def _find_cursor_full_history_retained_state(
         else:
             validated = None
         if validated is None or validated.rejection is not None:
-            raise CursorConnectError(
-                "Cursor Agent retained continuation requires valid complete tool history.",
-                status_code=409,
+            rejection_reason = (
+                validated.rejection.reason
+                if validated is not None and validated.rejection is not None
+                else (
+                    "item_not_object"
+                    if not isinstance(item, Mapping)
+                    else "item_type"
+                )
+            )
+            raise _cursor_retained_history_rejection_error(
+                item_present=True,
+                item_index=item_index,
+                item=item,
+                validator_reason=rejection_reason,
             )
     messages = _responses_input_to_cursor_messages(request_body)
     if messages and messages[-1].get(_CURSOR_TOOL_CONTINUATION_CUE_MARKER):
@@ -2457,6 +2735,12 @@ def _cursor_replay_stock_codex_function_call_item(
         )
 
     item_id = item.get("id")
+    call_id = item.get("call_id")
+    call_id_is_valid = (
+        isinstance(call_id, str)
+        and bool(call_id)
+        and call_id == call_id.strip()
+    )
     item_id_match = (
         re.fullmatch(
             r"fc_([0-9a-f-]{36})(?:_(?:0|[1-9][0-9]*))?",
@@ -2465,9 +2749,17 @@ def _cursor_replay_stock_codex_function_call_item(
         if isinstance(item_id, str)
         else None
     )
-    if item_id_match is None or not _cursor_replay_is_canonical_uuid(
-        item_id_match.group(1)
-    ):
+    canonical_item_id = (
+        item_id_match is not None
+        and _cursor_replay_is_canonical_uuid(item_id_match.group(1))
+    )
+    # Cursor tool events may preserve their opaque provider id in both fields.
+    producer_coupled_item_id = (
+        call_id_is_valid
+        and isinstance(item_id, str)
+        and item_id == f"fc_{call_id}"
+    )
+    if not canonical_item_id and not producer_coupled_item_id:
         return _cursor_replay_rejected(
             "stock_full_history",
             "id_shape",
@@ -2495,7 +2787,6 @@ def _cursor_replay_stock_codex_function_call_item(
             item=item,
         )
 
-    call_id = item.get("call_id")
     name = item.get("name")
     namespace = item.get("namespace")
     if "namespace" in item and (
@@ -3910,10 +4201,21 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
                 status_code=409,
             )
     elif previous_response_id is None and cursor_tool_outputs:
-        matched = _find_cursor_full_history_retained_state(
-            request_body,
-            owner_scope=owner_scope,
-        )
+        try:
+            matched = _find_cursor_full_history_retained_state(
+                request_body,
+                owner_scope=owner_scope,
+            )
+        except CursorConnectError as exc:
+            _emit_cursor_retained_history_rejection_diagnostic(
+                request=request,
+                diagnostic=getattr(
+                    exc,
+                    _CURSOR_RETAINED_HISTORY_REJECTION_FIELD,
+                    None,
+                ),
+            )
+            raise
         if matched is not None:
             previous_response_id, replay_state, cursor_tool_outputs = matched
             full_history_continuation = True

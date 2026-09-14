@@ -1,0 +1,11 @@
+# Diagnostic OpenAI/Codex alias for low-reasoning Luna.
+defaults: {}
+
+aliases:
+  - name: oai_basic
+    candidates:
+      - provider: openai
+        model: gpt-5.6-luna
+        route_family: codex_responses
+        priority: 100
+        reasoning_effort: low

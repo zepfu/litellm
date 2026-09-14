@@ -209,7 +209,7 @@ The `basic` alias keeps the low-cost common prefix, in order:
 4. `alias_reference: basic-other` (priority 0)
 
 `basic-other` orders Alibaba Token Plan
-`alibaba_token_plan/deepseek-v4-flash-0731` (priority 100, admitted only during
+`alibaba_token_plan/deepseek-v4.1-flash` (priority 100, admitted only during
 the recurring half-open `22:00-08:00 UTC+8` window), Z.AI Coding Plan
 `zai_coding_plan/glm-5.3-flash` (priority 90, admitted only from
 `03:00-23:00 America/Los_Angeles`), and Cursor Agent
@@ -264,7 +264,7 @@ candidates are the `qwen3.8-max-preview` promo, `kimi-for-coding`, and
 
 Cost metadata for these shared candidates is route-specific. OpenRouter North
 may carry a third-party hosted reference baseline. OpenCode Big Pickle and its
-free DeepSeek route remain unpriced, and Alibaba DeepSeek V4 Flash is
+free DeepSeek route remain unpriced, and Alibaba DeepSeek V4.1 Flash is
 reference-priced only under the
 subscription `actual_invoice_cost_known=false` contract, using the
 international Model Studio direct list rate rather than claiming Token Plan
@@ -362,7 +362,7 @@ OpenAI `gpt-5.6-luna` (priority 90) and priority-zero OpenRouter
 candidates use `reasoning_effort: low`.
 
 `auto-review-other` orders scheduled Alibaba Token Plan
-`alibaba_token_plan/deepseek-v4-flash-0731` (priority 100,
+`alibaba_token_plan/deepseek-v4.1-flash` (priority 100,
 `22:00-08:00 UTC+8`), Z.AI Coding Plan
 `zai_coding_plan/glm-5.3-flash` (priority 90, admitted only from
 `03:00-23:00 America/Los_Angeles`), and Cursor Agent

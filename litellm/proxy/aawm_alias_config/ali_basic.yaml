@@ -1,0 +1,16 @@
+# Diagnostic Alibaba-first alias with an OpenAI/Codex last-resort tail.
+defaults: {}
+
+aliases:
+  - name: ali_basic
+    candidates:
+      - provider: alibaba_token_plan
+        model: alibaba_token_plan/deepseek-v4.1-flash
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
+        priority: 100
+
+      - provider: openai
+        model: gpt-5.6-luna
+        route_family: codex_responses
+        priority: 0
+        reasoning_effort: low

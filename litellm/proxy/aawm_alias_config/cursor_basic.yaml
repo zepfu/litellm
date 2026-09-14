@@ -1,0 +1,16 @@
+# Diagnostic Cursor-first alias with an OpenAI/Codex last-resort tail.
+defaults: {}
+
+aliases:
+  - name: cursor_basic
+    candidates:
+      - provider: cursor_agent
+        model: cursor_agent/composer-2.5
+        route_family: codex_cursor_agent_aiserver_adapter
+        priority: 100
+
+      - provider: openai
+        model: gpt-5.6-luna
+        route_family: codex_responses
+        priority: 0
+        reasoning_effort: low
