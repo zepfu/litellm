@@ -34,6 +34,7 @@ from typing import (
 import httpx
 
 import litellm
+from litellm._logging import verbose_proxy_logger
 from litellm.llms.xai.route_descriptors import (
     GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
     GROK_NATIVE_OAUTH_ROUTE_FAMILY,
@@ -714,22 +715,45 @@ class BaseOpenAIPassThroughHandler:
                             forward_headers=forward_headers,
                         )
                     except BaseException as exc:  # noqa: BLE001
-                        import sys
+                        try:
+                            import sys
 
-                        _sa = sys.modules.get(
-                            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity"
-                        )
-                        if _sa is None:
-                            from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
-                                session_affinity as _sa,
+                            _sa = sys.modules.get(
+                                "litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity"
                             )
+                            if _sa is None:
+                                from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+                                    session_affinity as _sa,
+                                )
 
-                        await _sa.finalize_request_session_owner_lease(
-                            request,
-                            exc=exc,
-                            failure_phase="session_owner_codex_dispatch_preflight",
-                            raise_on_promote_failure=False,
-                        )
+                            await _sa.finalize_request_session_owner_lease(
+                                request,
+                                exc=exc,
+                                failure_phase="session_owner_codex_dispatch_preflight",
+                                raise_on_promote_failure=False,
+                            )
+                        except Exception as cleanup_exc:
+                            cleanup_exception_type = type(cleanup_exc).__name__
+                            try:
+                                state = getattr(request, "state", None)
+                                if state is not None:
+                                    setattr(
+                                        state,
+                                        "_aawm_session_owner_cleanup_error",
+                                        cleanup_exception_type,
+                                    )
+                            except Exception:
+                                pass
+                            try:
+                                verbose_proxy_logger.warning(
+                                    "Codex dispatch session-owner cleanup failed; "
+                                    "preserving primary_exception=%s "
+                                    "cleanup_exception=%s",
+                                    type(exc).__name__,
+                                    cleanup_exception_type,
+                                )
+                            except Exception:
+                                pass
                         raise
                     if dispatched_response is not None:
                         return dispatched_response
