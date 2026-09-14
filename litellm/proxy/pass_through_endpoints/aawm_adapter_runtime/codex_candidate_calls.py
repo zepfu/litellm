@@ -446,7 +446,11 @@ def _cursor_retained_history_rejection_diagnostic(
 
 
 def _cursor_retained_history_rejection_error(
-    diagnostic: dict[str, Any],
+    *,
+    item_present: bool,
+    item_index: Any = None,
+    item: Any = None,
+    validator_reason: Any,
 ) -> Exception:
     from litellm.llms.cursor_agent.connect import CursorConnectError
 
@@ -454,48 +458,40 @@ def _cursor_retained_history_rejection_error(
         "Cursor Agent retained continuation requires valid complete tool history.",
         status_code=409,
     )
-    setattr(exc, _CURSOR_RETAINED_HISTORY_REJECTION_FIELD, diagnostic)
+    try:
+        diagnostic = _cursor_retained_history_rejection_diagnostic(
+            item_present=item_present,
+            item_index=item_index,
+            item=item,
+            validator_reason=validator_reason,
+        )
+        setattr(exc, _CURSOR_RETAINED_HISTORY_REJECTION_FIELD, diagnostic)
+    except Exception:
+        # Diagnostic construction must never replace the original 409.
+        pass
     return exc
 
 
-def _cursor_retained_history_correlation_id(
-    request: Any,
-    request_body: dict[str, Any],
-) -> Optional[str]:
+def _cursor_retained_history_correlation_id(request: Any) -> Optional[str]:
     request_state = getattr(request, "state", None)
-    candidates = [
-        getattr(request_state, "aawm_alias_request_litellm_call_id", None),
-        request_body.get("litellm_call_id"),
-    ]
-    headers = getattr(request, "headers", None)
-    if headers is not None:
-        candidates.extend(
-            headers.get(header_name)
-            for header_name in (
-                "x-litellm-call-id",
-                "litellm-call-id",
-                "x-request-id",
-            )
-        )
-    for candidate in candidates:
-        normalized = _cursor_replay_safe_diagnostic_token(candidate)
-        if normalized is not None:
-            return normalized
-    return None
+    return _cursor_replay_safe_diagnostic_token(
+        getattr(request_state, "aawm_alias_request_litellm_call_id", None)
+    )
 
 
 def _emit_cursor_retained_history_rejection_diagnostic(
     *,
     request: Any,
-    request_body: dict[str, Any],
     diagnostic: Any,
 ) -> None:
     try:
         if not isinstance(diagnostic, Mapping):
             return
+        raw_item_type = diagnostic.get("item_type")
         sanitized: dict[str, Any] = {
             "item_type": _cursor_retained_history_diagnostic_type(
-                diagnostic.get("item_type")
+                raw_item_type,
+                non_object=raw_item_type == "non_object",
             ),
             "validator_reason": _cursor_retained_history_diagnostic_reason(
                 diagnostic.get("validator_reason"),
@@ -516,10 +512,7 @@ def _emit_cursor_retained_history_rejection_diagnostic(
             "event": "cursor_retained_history_rejection",
             "diagnostic": sanitized,
         }
-        correlation_id = _cursor_retained_history_correlation_id(
-            request,
-            request_body,
-        )
+        correlation_id = _cursor_retained_history_correlation_id(request)
         if correlation_id is not None:
             payload["litellm_call_id"] = correlation_id
         verbose_aawm_route_logger.warning(
@@ -2213,6 +2206,8 @@ def _find_cursor_full_history_retained_state(
     *,
     owner_scope: Optional[tuple[str, str]],
 ) -> Optional[tuple[str, dict[str, Any], list[tuple[str, str]]]]:
+    from litellm.llms.cursor_agent.connect import CursorConnectError
+
     if owner_scope is None:
         return None
     _prune_cursor_replay_registry()
@@ -2231,10 +2226,8 @@ def _find_cursor_full_history_retained_state(
     input_items = request_body.get("input")
     if not isinstance(input_items, list):
         raise _cursor_retained_history_rejection_error(
-            _cursor_retained_history_rejection_diagnostic(
-                item_present=False,
-                validator_reason="input_container",
-            )
+            item_present=False,
+            validator_reason="input_container",
         )
     # Live continuation validates the trusted prefix, not the single-pair
     # grammar used to authorize a provider-neutral fallback.
@@ -2265,12 +2258,10 @@ def _find_cursor_full_history_retained_state(
                 )
             )
             raise _cursor_retained_history_rejection_error(
-                _cursor_retained_history_rejection_diagnostic(
-                    item_present=True,
-                    item_index=item_index,
-                    item=item,
-                    validator_reason=rejection_reason,
-                )
+                item_present=True,
+                item_index=item_index,
+                item=item,
+                validator_reason=rejection_reason,
             )
     messages = _responses_input_to_cursor_messages(request_body)
     if messages and messages[-1].get(_CURSOR_TOOL_CONTINUATION_CUE_MARKER):
@@ -4160,7 +4151,6 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         except CursorConnectError as exc:
             _emit_cursor_retained_history_rejection_diagnostic(
                 request=request,
-                request_body=request_body,
                 diagnostic=getattr(
                     exc,
                     _CURSOR_RETAINED_HISTORY_REJECTION_FIELD,
