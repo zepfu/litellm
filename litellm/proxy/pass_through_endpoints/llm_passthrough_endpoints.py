@@ -4107,6 +4107,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             )
             return None
         retry_attempt_record["guard_reset_outcome"] = "rebind_succeeded"
+        source_owner_attributes = getattr(guard_rebound, "source_attributes", None)
         destination_candidate = retry_selection.get("candidate")
         destination_model = (
             destination_candidate.get("model")
@@ -4145,6 +4146,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
                 == _sa.SessionOwnerGuardDecision.COMPATIBLE_OWNER.value
                 and isinstance(source_owner_id, str)
                 and source_owner_id
+                and isinstance(source_owner_attributes, dict)
             ):
                 pending_commitment["canonical_owner_transition"] = {
                     "session_identity": source_session_identity
@@ -4154,7 +4156,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
                         request_body,
                     ),
                     "source_owner_id": source_owner_id,
-                    "source_attributes": dict(current_attributes),
+                    "source_attributes": dict(source_owner_attributes),
                     "destination_attributes": dict(alternate_attributes),
                     "authorization": "codex_oauth_portable_account_failover",
                     "failover_ordinal": int(
