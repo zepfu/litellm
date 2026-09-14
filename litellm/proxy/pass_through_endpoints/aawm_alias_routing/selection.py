@@ -5786,13 +5786,54 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         has_continuation_state and not server_validated_replay
     )
 
-    # Read-path ownership check before free selection. Reservation happens at
-    # pre-egress once a concrete candidate is chosen (candidate_loop).
-    session_owner_record, _cache_key, session_owner_error = await sa.get_session_owner_record(
-        session_identity=session_owner_identity,
-        request=request,
-        wait_for_foreign_reservation=True,
+    # Read-path ownership check before free selection. A nested Codex dispatch
+    # may already have consulted this exact canonical identity; reuse only an
+    # owned record from that consult, and reread durable storage for every
+    # mismatch, missing record, reservation, auto-review, or effective identity.
+    request_state = getattr(request, "state", None)
+    consult_identity = getattr(
+        request_state,
+        "_aawm_session_owner_consult_identity",
+        None,
     )
+    consult_cache_key = getattr(
+        request_state,
+        "_aawm_session_owner_consult_cache_key",
+        None,
+    )
+    consult_record = getattr(
+        request_state,
+        "_aawm_session_owner_consult_record",
+        None,
+    )
+    computed_cache_key = (
+        sa.build_aawm_alias_routing_session_owner_cache_key(
+            session_identity=session_owner_identity
+        )
+        if session_owner_identity is not None
+        else None
+    )
+    reuse_consult_record = (
+        not is_auto_review
+        and not sa.request_has_effective_session_identity(request)
+        and session_owner_identity is not None
+        and consult_identity == session_owner_identity
+        and consult_cache_key == computed_cache_key
+        and isinstance(consult_record, dict)
+        and sa._record_state(consult_record) == "owned"
+    )
+    if reuse_consult_record:
+        session_owner_record = consult_record
+        _cache_key = computed_cache_key
+        session_owner_error = None
+    else:
+        session_owner_record, _cache_key, session_owner_error = (
+            await sa.get_session_owner_record(
+                session_identity=session_owner_identity,
+                request=request,
+                wait_for_foreign_reservation=True,
+            )
+        )
     if session_owner_error is not None:
         sa.raise_session_owner_redispatch_required(
             session_identity=session_owner_identity,

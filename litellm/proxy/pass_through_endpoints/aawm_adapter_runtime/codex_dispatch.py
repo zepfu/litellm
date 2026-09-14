@@ -303,7 +303,10 @@ def _stash_codex_nested_owner_consult(
     setattr(state, "_aawm_session_owner_consult_cache_key", cache_key)
     if isinstance(owner_record, dict):
         setattr(state, "_aawm_session_owner_consult_record", owner_record)
-        affinity = _sa.owner_record_as_affinity_hint(owner_record)
+        affinity = _sa.owner_record_as_affinity_hint(
+            owner_record,
+            preserve_account_identity=True,
+        )
         if affinity:
             setattr(state, "_aawm_session_owner_consult_affinity", affinity)
 
@@ -551,6 +554,34 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
             request,
             user_api_key_dict=user_api_key_dict,
         )
+
+        # _safe_get_request_headers caches the forwarding map on request
+        # state. Replace that map without mutating the caller's body or raw
+        # Starlette scope, so pass_through_request cannot forward the
+        # server-only control header, even when the alpha gate is disabled.
+        alpha_probe_headers = _safe_get_request_headers(request)
+        alpha_probe_state = getattr(request, "state", None)
+        if alpha_probe_state is None or not isinstance(alpha_probe_headers, dict):
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "alpha_probe_request_state_unavailable",
+                    "message": "alpha probe request state unavailable",
+                },
+            )
+        setattr(
+            alpha_probe_state,
+            "_cached_headers",
+            {
+                key: value
+                for key, value in alpha_probe_headers.items()
+                if not (
+                    isinstance(key, str)
+                    and key.casefold() == ALPHA_PROBE_PLAN_HEADER.casefold()
+                )
+            },
+        )
+
         if alpha_probe_control is not None:
             alpha_probe_rejection_reason: Optional[str] = None
             if _codex_auto_agent_request_has_continuation_state(
@@ -576,33 +607,6 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
                         "reason": alpha_probe_rejection_reason,
                     },
                 )
-
-            # _safe_get_request_headers caches the forwarding map on request
-            # state. Replace that map without mutating the caller's body or
-            # raw Starlette scope, so pass_through_request cannot forward the
-            # server-only control header.
-            alpha_probe_headers = _safe_get_request_headers(request)
-            alpha_probe_state = getattr(request, "state", None)
-            if alpha_probe_state is None or not isinstance(alpha_probe_headers, dict):
-                raise HTTPException(
-                    status_code=503,
-                    detail={
-                        "error": "alpha_probe_request_state_unavailable",
-                        "message": "alpha probe request state unavailable",
-                    },
-                )
-            setattr(
-                alpha_probe_state,
-                "_cached_headers",
-                {
-                    key: value
-                    for key, value in alpha_probe_headers.items()
-                    if not (
-                        isinstance(key, str)
-                        and key.casefold() == ALPHA_PROBE_PLAN_HEADER.casefold()
-                    )
-                },
-            )
 
         is_codex_auto_review_alias = (
             isinstance(codex_auto_agent_alias, str)

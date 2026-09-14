@@ -701,17 +701,36 @@ class BaseOpenAIPassThroughHandler:
                     egress_credential_family = GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY
                     expected_target_family = GROK_NATIVE_OAUTH_ROUTE_FAMILY
                 elif is_codex_responses_request:
-                    dispatched_response = await rt.try_dispatch_codex_request_fn(
-                        endpoint=endpoint,
-                        request=request,
-                        request_body=request_body,
-                        prepared_request_body=prepared_request_body,
-                        fastapi_response=fastapi_response,
-                        user_api_key_dict=user_api_key_dict,
-                        target_url=str(updated_url),
-                        api_key=api_key,
-                        forward_headers=forward_headers,
-                    )
+                    try:
+                        dispatched_response = await rt.try_dispatch_codex_request_fn(
+                            endpoint=endpoint,
+                            request=request,
+                            request_body=request_body,
+                            prepared_request_body=prepared_request_body,
+                            fastapi_response=fastapi_response,
+                            user_api_key_dict=user_api_key_dict,
+                            target_url=str(updated_url),
+                            api_key=api_key,
+                            forward_headers=forward_headers,
+                        )
+                    except BaseException as exc:  # noqa: BLE001
+                        import sys
+
+                        _sa = sys.modules.get(
+                            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity"
+                        )
+                        if _sa is None:
+                            from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+                                session_affinity as _sa,
+                            )
+
+                        await _sa.finalize_request_session_owner_lease(
+                            request,
+                            exc=exc,
+                            failure_phase="session_owner_codex_dispatch_preflight",
+                            raise_on_promote_failure=False,
+                        )
+                        raise
                     if dispatched_response is not None:
                         return dispatched_response
             else:

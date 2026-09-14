@@ -1745,11 +1745,45 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         planned_portable_failover = False
     owner_affinity: Optional[dict[str, Any]] = None
     if session_identity is not None and not planned_portable_failover:
-        owner_record, _cache_key, owner_error = await _sa.get_session_owner_record(
-            session_identity=session_identity,
-            request=request,
-            wait_for_foreign_reservation=True,
+        request_state = getattr(request, "state", None)
+        consult_identity = getattr(
+            request_state,
+            "_aawm_session_owner_consult_identity",
+            None,
         )
+        consult_cache_key = getattr(
+            request_state,
+            "_aawm_session_owner_consult_cache_key",
+            None,
+        )
+        consult_record = getattr(
+            request_state,
+            "_aawm_session_owner_consult_record",
+            None,
+        )
+        computed_cache_key = _sa.build_aawm_alias_routing_session_owner_cache_key(
+            session_identity=session_identity
+        )
+        reuse_consult_record = (
+            _sa.get_request_codex_auto_review_session_identity(request) is None
+            and not _sa.request_has_effective_session_identity(request)
+            and consult_identity == session_identity
+            and consult_cache_key == computed_cache_key
+            and isinstance(consult_record, dict)
+            and _sa._record_state(consult_record) == "owned"
+        )
+        if reuse_consult_record:
+            owner_record = consult_record
+            _cache_key = computed_cache_key
+            owner_error = None
+        else:
+            owner_record, _cache_key, owner_error = (
+                await _sa.get_session_owner_record(
+                    session_identity=session_identity,
+                    request=request,
+                    wait_for_foreign_reservation=True,
+                )
+            )
         if owner_error is not None:
             _sa.raise_session_owner_redispatch_required(
                 session_identity=session_identity,
