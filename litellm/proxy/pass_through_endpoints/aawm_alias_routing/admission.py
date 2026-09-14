@@ -726,19 +726,15 @@ def is_confirmed_account_usage_exhaustion(
             return False
 
     now = time.time() if now_epoch is None else float(now_epoch)
-    reset_at = observation.get("provider_resets_at") or observation.get(
-        "expected_reset_at"
+    reset_at = (
+        observation.get("provider_resets_at")
+        or observation.get("expected_reset_at")
+        or observation.get("reset_at")
     )
     if reset_at is not None:
-        try:
-            if hasattr(reset_at, "timestamp"):
-                reset_epoch = float(reset_at.timestamp())
-            else:
-                reset_epoch = float(reset_at)
-            if reset_epoch <= now:
-                return False
-        except (TypeError, ValueError):
-            pass
+        reset_epoch = alias_routing_state._quota_observation_timestamp(reset_at)
+        if reset_epoch is None or reset_epoch <= now:
+            return False
     return True
 
 
