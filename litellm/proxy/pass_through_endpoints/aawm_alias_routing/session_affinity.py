@@ -37,7 +37,11 @@ from typing import Any, Awaitable, Callable, Mapping, Optional, TypeVar, cast
 
 from fastapi import HTTPException
 
-from litellm._logging import verbose_proxy_logger
+from litellm._logging import verbose_aawm_route_logger, verbose_proxy_logger
+from litellm.llms.xai.route_descriptors import (
+    GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+    XAI_OAUTH_ROUTE_FAMILY,
+)
 from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
 )
@@ -4231,16 +4235,25 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
 
     from fastapi.responses import StreamingResponse
 
+    observe = _make_xai_deferred_stream_observer(
+        request,
+        lease,
+        response,
+        success_finalizer,
+    )
     if not isinstance(response, StreamingResponse):
+        observe("binding", binding_outcome="not_streaming_response")
         return False
     if getattr(
         response,
         "_aawm_session_owner_deferred_finalizer_bound",
         False,
     ):
+        observe("binding", binding_outcome="already_bound")
         return True
     original_iterator = getattr(response, "body_iterator", None)
     if original_iterator is None:
+        observe("binding", binding_outcome="missing_iterator")
         return False
 
     renewal_task = start_session_owner_lease_renewal(lease)
@@ -4347,11 +4360,26 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                 cleanup_error = exc
         except BaseException as exc:  # noqa: BLE001
             cleanup_error = exc
+        observe(
+            "release_result",
+            result=release_result,
+            requested_success=True,
+            iterator=wrapped_iterator,
+            finalization_task=finalization_task,
+        )
         try:
             await _notify_failure(cause)
         except BaseException as exc:  # noqa: BLE001
             if cleanup_error is None:
                 cleanup_error = exc
+        observe(
+            "cleanup_outcome",
+            result=release_result,
+            error=cleanup_error,
+            requested_success=True,
+            iterator=wrapped_iterator,
+            finalization_task=finalization_task,
+        )
         return release_result, cleanup_error
 
     async def _run_finalization(
@@ -4361,6 +4389,13 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
         if not success:
             release_result = await finalize_session_owner_lease_on_failure(
                 lease, request=request
+            )
+            observe(
+                "release_result",
+                result=release_result,
+                requested_success=success,
+                iterator=wrapped_iterator,
+                finalization_task=finalization_task,
             )
             await _notify_failure(cause)
             if (
@@ -4376,8 +4411,23 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
 
         renewal_error = _renewal_error()
         if renewal_error is not None:
+            observe(
+                "renewal_failed",
+                renewal_error=renewal_error,
+                site="finalization",
+                requested_success=success,
+                iterator=wrapped_iterator,
+                finalization_task=finalization_task,
+            )
             release_result = await finalize_session_owner_lease_on_failure(
                 lease, request=request
+            )
+            observe(
+                "release_result",
+                result=release_result,
+                requested_success=success,
+                iterator=wrapped_iterator,
+                finalization_task=finalization_task,
             )
             await _notify_failure(renewal_error)
             _raise_structured_failure(
@@ -4392,8 +4442,24 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
             )
 
         validation_ok, validation_reason = _validation_status()
+        observe(
+            "validator_decision",
+            validation_ok=validation_ok,
+            requested_success=success,
+            iterator=wrapped_iterator,
+            finalization_task=finalization_task,
+        )
         if not validation_ok:
-            await finalize_session_owner_lease_on_failure(lease, request=request)
+            release_result = await finalize_session_owner_lease_on_failure(
+                lease, request=request
+            )
+            observe(
+                "release_result",
+                result=release_result,
+                requested_success=success,
+                iterator=wrapped_iterator,
+                finalization_task=finalization_task,
+            )
             validation_error = RuntimeError(
                 f"session_owner: deferred response validation failed: "
                 f"{validation_reason}"
@@ -4405,8 +4471,28 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
             )
 
         try:
+            observe(
+                "finalizer_enter",
+                requested_success=success,
+                iterator=wrapped_iterator,
+                finalization_task=finalization_task,
+            )
             result = await success_finalizer()
+            observe(
+                "finalizer_result",
+                result=result,
+                requested_success=success,
+                iterator=wrapped_iterator,
+                finalization_task=finalization_task,
+            )
         except BaseException as finalization_error:  # noqa: BLE001
+            observe(
+                "finalizer_result",
+                error=finalization_error,
+                requested_success=success,
+                iterator=wrapped_iterator,
+                finalization_task=finalization_task,
+            )
             release_result, cleanup_error = await _attempt_failure_cleanup(
                 finalization_error
             )
@@ -4428,7 +4514,16 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
             result is not None
             and result.outcome not in success_outcomes
         ):
-            await finalize_session_owner_lease_on_failure(lease, request=request)
+            release_result = await finalize_session_owner_lease_on_failure(
+                lease, request=request
+            )
+            observe(
+                "release_result",
+                result=release_result,
+                requested_success=success,
+                iterator=wrapped_iterator,
+                finalization_task=finalization_task,
+            )
             finalization_error = RuntimeError(
                 "session_owner: deferred lease finalization did not commit "
                 f"outcome={result.outcome.value}"
@@ -4446,16 +4541,83 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
         cause: Optional[BaseException] = None,
     ) -> None:
         nonlocal finalization_task
+        observe(
+            "finalize_enter",
+            error=cause,
+            requested_success=success,
+            iterator=wrapped_iterator,
+            finalization_task=finalization_task,
+        )
         if finalization_task is None:
             finalization_task = asyncio.create_task(
                 _run_finalization(success, cause)
             )
+            observe(
+                "finalization_task_created",
+                requested_success=success,
+                iterator=wrapped_iterator,
+                finalization_task=finalization_task,
+            )
+        else:
+            observe(
+                "finalization_task_reused",
+                requested_success=success,
+                iterator=wrapped_iterator,
+                finalization_task=finalization_task,
+            )
         task = finalization_task
         try:
             await asyncio.shield(task)
-        except asyncio.CancelledError:
-            await asyncio.shield(task)
+        except asyncio.CancelledError as wait_error:
+            observe(
+                "finalization_wait_cancelled",
+                error=wait_error,
+                requested_success=success,
+                iterator=wrapped_iterator,
+                finalization_task=task,
+            )
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as second_wait_error:
+                observe(
+                    "finalization_wait_cancelled",
+                    error=second_wait_error,
+                    requested_success=success,
+                    iterator=wrapped_iterator,
+                    finalization_task=task,
+                )
+                raise
+            except BaseException as finalization_error:  # noqa: BLE001
+                observe(
+                    "finalization_task_raised",
+                    error=finalization_error,
+                    requested_success=success,
+                    iterator=wrapped_iterator,
+                    finalization_task=task,
+                )
+                raise
+            observe(
+                "finalization_task_returned",
+                requested_success=success,
+                iterator=wrapped_iterator,
+                finalization_task=task,
+            )
             raise
+        except BaseException as finalization_error:  # noqa: BLE001
+            observe(
+                "finalization_task_raised",
+                error=finalization_error,
+                requested_success=success,
+                iterator=wrapped_iterator,
+                finalization_task=task,
+            )
+            raise
+        observe(
+            "finalization_task_returned",
+            requested_success=success,
+            iterator=wrapped_iterator,
+            finalization_task=task,
+        )
 
     original_closed = False
 
@@ -4492,6 +4654,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
             self._iterator = original_iterator.__aiter__()
             self._closed = False
             self._completed = False
+            self._first_pull_observed = False
 
         def __aiter__(self) -> "_DeferredLeaseIterator":
             return self
@@ -4499,8 +4662,22 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
         async def __anext__(self) -> Any:
             if self._closed:
                 raise StopAsyncIteration
+            if not self._first_pull_observed:
+                self._first_pull_observed = True
+                observe(
+                    "first_pull",
+                    iterator=self,
+                    finalization_task=finalization_task,
+                )
             renewal_error = _renewal_error()
             if renewal_error is not None:
+                observe(
+                    "renewal_failed",
+                    renewal_error=renewal_error,
+                    site="iterator_pre_pull",
+                    iterator=self,
+                    finalization_task=finalization_task,
+                )
                 await _finalize(False, renewal_error)
                 await _close_original_iterator()
                 _raise_structured_failure(
@@ -4519,6 +4696,13 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                     if renewal_task in done:
                         renewal_error = _renewal_error()
                         if renewal_error is not None:
+                            observe(
+                                "renewal_failed",
+                                renewal_error=renewal_error,
+                                site="iterator_wait",
+                                iterator=self,
+                                finalization_task=finalization_task,
+                            )
                             await _cancel_and_await_tasks(next_task)
                             await _finalize(False, renewal_error)
                             await _close_original_iterator()
@@ -4530,6 +4714,11 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                     chunk = await next_task
             except StopAsyncIteration:
                 self._completed = True
+                observe(
+                    "iterator_eof",
+                    iterator=self,
+                    finalization_task=finalization_task,
+                )
                 try:
                     await _finalize(True)
                 finally:
@@ -4537,6 +4726,20 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                     await _close_original_iterator()
                 raise
             except BaseException as exc:
+                observe(
+                    (
+                        "iterator_cancelled"
+                        if isinstance(exc, asyncio.CancelledError)
+                        else (
+                            "iterator_closed"
+                            if isinstance(exc, GeneratorExit)
+                            else "iterator_exception"
+                        )
+                    ),
+                    error=exc,
+                    iterator=self,
+                    finalization_task=finalization_task,
+                )
                 try:
                     await _cancel_and_await_tasks(next_task)
                     await _finalize(False, exc)
@@ -4546,6 +4749,13 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                 raise
             renewal_error = _renewal_error()
             if renewal_error is not None:
+                observe(
+                    "renewal_failed",
+                    renewal_error=renewal_error,
+                    site="iterator_post_pull",
+                    iterator=self,
+                    finalization_task=finalization_task,
+                )
                 try:
                     await _finalize(False, renewal_error)
                 finally:
@@ -4560,6 +4770,12 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
         async def aclose(self) -> None:
             if self._closed:
                 return
+            if not self._completed:
+                observe(
+                    "close_before_eof",
+                    iterator=self,
+                    finalization_task=finalization_task,
+                )
             self._closed = True
             try:
                 if not self._completed:
@@ -4572,12 +4788,20 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
     setattr(response, "_aawm_session_owner_deferred_finalizer_bound", True)
 
     original_stream_response = getattr(response, "stream_response", None)
+    stream_response_wrapped = False
     if callable(original_stream_response):
 
         async def _stream_response_with_finalizer(send: Any) -> None:
             try:
                 renewal_error = _renewal_error()
                 if renewal_error is not None:
+                    observe(
+                        "renewal_failed",
+                        renewal_error=renewal_error,
+                        site="stream_response",
+                        iterator=wrapped_iterator,
+                        finalization_task=finalization_task,
+                    )
                     await _finalize(False, renewal_error)
                     _raise_structured_failure(
                         mutation=_mutation_error(str(renewal_error)),
@@ -4585,12 +4809,31 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                     )
                 await original_stream_response(send)
             except BaseException as exc:
+                observe(
+                    (
+                        "stream_response_cancelled"
+                        if isinstance(exc, asyncio.CancelledError)
+                        else "stream_response_exception"
+                    ),
+                    error=exc,
+                    iterator=wrapped_iterator,
+                    finalization_task=finalization_task,
+                )
                 await _finalize(False, exc)
                 raise
             finally:
                 await wrapped_iterator.aclose()
 
         response.stream_response = _stream_response_with_finalizer
+        stream_response_wrapped = True
+    observe(
+        "binding",
+        binding_outcome="bound",
+        iterator_wrapped=True,
+        stream_response_wrapped=stream_response_wrapped,
+        iterator=wrapped_iterator,
+        finalization_task=finalization_task,
+    )
     return True
 
 
@@ -4806,6 +5049,474 @@ def _hash_session_owner_log_identifier(value: Any) -> Optional[str]:
 # request correlation. Read-only here; identifiers are hashed before reuse.
 _SESSION_OWNER_REQUEST_CONTEXT_STATE_KEY = "aawm_alias_request_context"
 _SESSION_OWNER_REQUEST_CALL_ID_STATE_KEY = "aawm_alias_request_litellm_call_id"
+
+
+_XAI_DEFERRED_STREAM_EVENT = "session_owner_deferred_stream"
+_XAI_DEFERRED_STREAM_PHASES = frozenset(
+    {
+        "binding",
+        "first_pull",
+        "iterator_eof",
+        "iterator_cancelled",
+        "iterator_closed",
+        "iterator_exception",
+        "close_before_eof",
+        "renewal_failed",
+        "stream_response_cancelled",
+        "stream_response_exception",
+        "finalization_wait_cancelled",
+        "finalization_task_returned",
+        "finalization_task_raised",
+        "release_result",
+        "cleanup_outcome",
+        "validator_decision",
+        "finalizer_enter",
+        "finalizer_result",
+        "finalize_enter",
+        "finalization_task_created",
+        "finalization_task_reused",
+    }
+)
+_XAI_DEFERRED_STREAM_BINDING_OUTCOMES = frozenset(
+    {"not_streaming_response", "already_bound", "missing_iterator", "bound"}
+)
+_XAI_DEFERRED_STREAM_SITES = frozenset(
+    {
+        "finalization",
+        "iterator_pre_pull",
+        "iterator_wait",
+        "iterator_post_pull",
+        "stream_response",
+    }
+)
+_XAI_DEFERRED_STREAM_ROUTE_FAMILIES = frozenset(
+    {
+        XAI_OAUTH_ROUTE_FAMILY,
+        GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+    }
+)
+_XAI_DEFERRED_STREAM_REQUESTED_SUCCESS_PHASES = frozenset(
+    {
+        "finalizer_enter",
+        "finalizer_result",
+        "finalize_enter",
+        "finalization_task_created",
+        "finalization_task_reused",
+        "finalization_wait_cancelled",
+        "finalization_task_returned",
+        "finalization_task_raised",
+    }
+)
+_XAI_DEFERRED_STREAM_MUTATION_OUTCOMES = frozenset(
+    outcome.value for outcome in SessionOwnerMutationOutcome
+) | {"none"}
+_XAI_DEFERRED_STREAM_DECISIONS = frozenset(
+    decision.value for decision in SessionOwnerGuardDecision
+)
+_XAI_DEFERRED_STREAM_OWNER_STATES = frozenset({"reserved", "owned"})
+_XAI_DEFERRED_STREAM_TERMINAL_STATUSES = frozenset(
+    {
+        "completed",
+        "failed",
+        "cancelled",
+        "incomplete",
+        "in_progress",
+        "requires_action",
+    }
+)
+_XAI_DEFERRED_STREAM_WIRE_DISPOSITIONS = frozenset(
+    {"completed", "failed", "cancelled", "error"}
+)
+
+
+def _make_xai_deferred_stream_observer(
+    request: Any,
+    lease: Optional[SessionOwnerLease],
+    response: Any,
+    success_finalizer: Optional[Callable[..., Any]],
+) -> Callable[..., None]:
+    """Build a bounded, synchronous observer for the selected xAI stream.
+
+    This is intentionally observational. It captures request/lease
+    correlation at binding time and reads mutable stream state only inside the
+    guarded emitter so diagnostic failures cannot affect ownership lifecycle.
+    """
+
+    def _noop_observe(_phase: Any, **_fields: Any) -> None:
+        return None
+
+    try:
+        missing = object()
+
+        def _field(value: Any, key: str, default: Any = missing) -> Any:
+            if isinstance(value, Mapping):
+                return value.get(key, default)
+            try:
+                return getattr(value, key, default)
+            except BaseException:  # noqa: BLE001
+                return default
+
+        def _clean_correlation(value: Any) -> Optional[str]:
+            return value.strip() if isinstance(value, str) and value.strip() else None
+
+        def _is_xai_context(value: Any) -> bool:
+            if not isinstance(value, Mapping):
+                return False
+            provider = _clean_correlation(
+                value.get("provider") or value.get("custom_llm_provider")
+            )
+            hosted_provider = _clean_correlation(value.get("hosted_provider"))
+            route_family = _clean_correlation(
+                value.get("route_family") or value.get("endpoint_contract")
+            )
+            provider_value = provider.casefold() if provider is not None else ""
+            hosted_value = (
+                hosted_provider.casefold() if hosted_provider is not None else ""
+            )
+            route_value = route_family.casefold() if route_family is not None else ""
+            return (
+                provider_value == "xai"
+                or hosted_value == "xai"
+                or route_value in _XAI_DEFERRED_STREAM_ROUTE_FAMILIES
+            )
+
+        state = _field(request, "state", None)
+        lease_attributes = _field(lease, "attributes", None)
+        candidate_context = _field(state, "aawm_openai_candidate_context", None)
+        if not (
+            _is_xai_context(lease_attributes)
+            or _is_xai_context(candidate_context)
+        ):
+            return _noop_observe
+
+        request_context = _field(
+            state, _SESSION_OWNER_REQUEST_CONTEXT_STATE_KEY, None
+        )
+        request_call_id = _clean_correlation(
+            _field(state, _SESSION_OWNER_REQUEST_CALL_ID_STATE_KEY, None)
+        )
+        if request_call_id is None:
+            request_call_id = _clean_correlation(
+                _field(request_context, "litellm_call_id", None)
+            )
+        trace_id = _clean_correlation(_field(request_context, "trace_id", None))
+
+        attempt_id = None
+        for key in (
+            "aawm_alias_request_attempt_id",
+            "aawm_alias_attempt_id",
+            "attempt_id",
+            "attempt_identity",
+        ):
+            attempt_id = _clean_correlation(_field(state, key, None))
+            if attempt_id is not None:
+                break
+        if attempt_id is None:
+            for key in ("attempt_id", "attempt_identity", "provider_attempt_id"):
+                attempt_id = _clean_correlation(_field(request_context, key, None))
+                if attempt_id is not None:
+                    break
+
+        dispatch_id = None
+        agent_dispatch = _field(request_context, "agent_dispatch", None)
+        if isinstance(agent_dispatch, Mapping):
+            dispatch_id = _clean_correlation(agent_dispatch.get("dispatch_id"))
+
+        correlation: dict[str, Any] = {}
+        for key, value in (
+            ("litellm_call_id", request_call_id),
+            ("trace_id", trace_id),
+            ("attempt_id", attempt_id),
+            ("dispatch_id", dispatch_id),
+        ):
+            if value is not None:
+                hashed = _hash_session_owner_log_identifier(value)
+                if hashed is not None:
+                    correlation[key] = hashed
+
+        session_identity = _field(lease, "session_identity", None)
+        cache_key = _field(lease, "cache_key", None)
+        session_hash = _hash_session_owner_log_identifier(session_identity)
+        owner_key_hash = _hash_session_owner_log_identifier(cache_key)
+        if session_hash is not None:
+            correlation["canonical_session_identity_hash"] = session_hash
+        if owner_key_hash is not None:
+            correlation["owner_key_hash"] = owner_key_hash
+
+        success_finalizer_source = (
+            "default" if success_finalizer is None else "supplied"
+        )
+
+        def _normalize_status(
+            value: Any,
+            allowed: frozenset[str],
+            *,
+            missing_value: str = "unknown",
+        ) -> str:
+            raw = value.value if isinstance(value, Enum) else value
+            if not isinstance(raw, str) or not raw.strip():
+                return missing_value
+            normalized = raw.strip().casefold()
+            return normalized if normalized in allowed else "other"
+
+        def _normalize_phase(value: Any) -> str:
+            raw = value.value if isinstance(value, Enum) else value
+            if not isinstance(raw, str) or not raw.strip():
+                return "unknown"
+            normalized = raw.strip().casefold()
+            return (
+                normalized
+                if normalized in _XAI_DEFERRED_STREAM_PHASES
+                else "unknown"
+            )
+
+        def _optional_bool(value: Any, *, absent: Any = "unknown") -> Any:
+            return value if isinstance(value, bool) else absent
+
+        def _iterator_snapshot(iterator: Any) -> dict[str, Any]:
+            if iterator is missing:
+                return {
+                    "iterator_completed": "unknown",
+                    "iterator_closed": "unknown",
+                }
+            if iterator is None:
+                return {
+                    "iterator_completed": "unknown",
+                    "iterator_closed": "unknown",
+                }
+            completed = _field(iterator, "_completed", missing)
+            if completed is missing:
+                completed = _field(iterator, "completed", missing)
+            closed = _field(iterator, "_closed", missing)
+            if closed is missing:
+                closed = _field(iterator, "closed", missing)
+            return {
+                "iterator_completed": (
+                    _optional_bool(completed)
+                    if completed is not missing
+                    else "unknown"
+                ),
+                "iterator_closed": (
+                    _optional_bool(closed) if closed is not missing else "unknown"
+                ),
+            }
+
+        def _finalization_task_snapshot(task: Any) -> dict[str, Any]:
+            if task is missing:
+                return {"finalization_task_present": "unknown"}
+            return {
+                "finalization_task_present": task is not None,
+            }
+
+        def _lease_snapshot() -> dict[str, Any]:
+            present = lease is not None
+            if not present:
+                return {
+                    "lease_present": False,
+                    "lease_decision": "unknown",
+                    "held_reservation": False,
+                    "released": False,
+                    "promoted": False,
+                    "wire_terminal_pending": False,
+                    "wire_disposition": "unknown",
+                    "renewal_task_present": False,
+                }
+            held = _field(lease, "held_reservation", missing)
+            released = _field(lease, "released", missing)
+            promoted = _field(lease, "promoted", missing)
+            pending = _field(lease, "wire_terminal_pending", missing)
+            renewal_task = _field(lease, "renewal_task", missing)
+            return {
+                "lease_present": True,
+                "lease_decision": _normalize_status(
+                    _field(lease, "decision", missing),
+                    _XAI_DEFERRED_STREAM_DECISIONS,
+                ),
+                "held_reservation": (
+                    _optional_bool(held) if held is not missing else "unknown"
+                ),
+                "released": (
+                    _optional_bool(released) if released is not missing else "unknown"
+                ),
+                "promoted": (
+                    _optional_bool(promoted) if promoted is not missing else "unknown"
+                ),
+                "wire_terminal_pending": (
+                    _optional_bool(pending) if pending is not missing else "unknown"
+                ),
+                "wire_disposition": _normalize_status(
+                    _field(lease, "wire_disposition", missing),
+                    _XAI_DEFERRED_STREAM_WIRE_DISPOSITIONS,
+                ),
+                "renewal_task_present": (
+                    renewal_task is not missing and renewal_task is not None
+                ),
+            }
+
+        def _validation_snapshot() -> dict[str, Any]:
+            state_value = _field(
+                response, "_aawm_responses_validation_state", None
+            )
+            if not isinstance(state_value, Mapping):
+                return {
+                    "validation_state_present": False,
+                    "complete": "unknown",
+                    "valid": "unknown",
+                    "terminal_seen": "unknown",
+                    "terminal_status": "unknown",
+                }
+            complete = state_value.get("complete")
+            valid = state_value.get("valid")
+            terminal_seen = state_value.get("terminal_seen")
+            terminal_status = _normalize_status(
+                state_value.get("terminal_status"),
+                _XAI_DEFERRED_STREAM_TERMINAL_STATUSES,
+            )
+            return {
+                "validation_state_present": True,
+                "complete": (
+                    complete if isinstance(complete, bool) else "unknown"
+                ),
+                "valid": valid if isinstance(valid, bool) else "unknown",
+                "terminal_seen": (
+                    terminal_seen
+                    if isinstance(terminal_seen, bool)
+                    else "unknown"
+                ),
+                "terminal_status": terminal_status,
+            }
+
+        def _exception_category(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            if isinstance(value, asyncio.CancelledError):
+                return "cancelled"
+            if isinstance(value, (TimeoutError, asyncio.TimeoutError)):
+                return "timeout"
+            if isinstance(value, SessionOwnerLeaseRenewalError):
+                return "renewal"
+            if isinstance(value, ConnectionError):
+                return "connection"
+            if isinstance(value, HTTPException):
+                return "http"
+            if isinstance(value, (ValueError, TypeError, KeyError, AttributeError)):
+                return "programming"
+            if isinstance(value, RuntimeError):
+                return "runtime"
+            return "other"
+
+        def _mutation_snapshot(result: Any, phase: str) -> dict[str, Any]:
+            snapshot: dict[str, Any] = {
+                "result_present": result is not None,
+                "mutation_outcome": (
+                    "none"
+                    if result is None
+                    else _normalize_status(
+                        _field(result, "outcome", missing),
+                        _XAI_DEFERRED_STREAM_MUTATION_OUTCOMES,
+                    )
+                ),
+            }
+            operation = {
+                "finalizer_enter": "success_finalizer",
+                "finalizer_result": "success_finalizer",
+                "release_result": "release",
+                "cleanup_outcome": "release",
+            }.get(phase)
+            if operation is not None:
+                snapshot["operation"] = operation
+            if result is None:
+                snapshot.update(
+                    {
+                        "result_error_present": False,
+                        "returned_owner_record_present": False,
+                        "returned_owner_state": "unknown",
+                    }
+                )
+                return snapshot
+            result_error = _field(result, "error", missing)
+            owner_record = _field(result, "owner_record", missing)
+            snapshot["result_error_present"] = (
+                result_error is not missing and result_error is not None
+            )
+            snapshot["returned_owner_record_present"] = (
+                owner_record is not missing and owner_record is not None
+            )
+            snapshot["returned_owner_state"] = _normalize_status(
+                _field(owner_record, "state", missing),
+                _XAI_DEFERRED_STREAM_OWNER_STATES,
+            )
+            result_key = _field(result, "cache_key", missing)
+            result_key_hash = (
+                _hash_session_owner_log_identifier(result_key)
+                if result_key is not missing
+                else None
+            )
+            if result_key_hash is not None:
+                snapshot["result_owner_key_hash"] = result_key_hash
+            return snapshot
+
+        def _observe(phase: Any, **fields: Any) -> None:
+            try:
+                normalized_phase = _normalize_phase(phase)
+                payload: dict[str, Any] = {
+                    "event": _XAI_DEFERRED_STREAM_EVENT,
+                    "phase": normalized_phase,
+                    **correlation,
+                    "success_finalizer_source": success_finalizer_source,
+                    **_lease_snapshot(),
+                    **_validation_snapshot(),
+                    **_iterator_snapshot(fields.get("iterator", missing)),
+                    **_finalization_task_snapshot(
+                        fields.get("finalization_task", missing)
+                    ),
+                }
+
+                if normalized_phase == "binding":
+                    payload["binding_outcome"] = _normalize_status(
+                        fields.get("binding_outcome", missing),
+                        _XAI_DEFERRED_STREAM_BINDING_OUTCOMES,
+                    )
+                elif normalized_phase == "renewal_failed":
+                    payload["site"] = _normalize_status(
+                        fields.get("site", missing),
+                        _XAI_DEFERRED_STREAM_SITES,
+                    )
+                elif normalized_phase == "validator_decision":
+                    payload["validation_ok"] = _optional_bool(
+                        fields.get("validation_ok", missing)
+                    )
+
+                if normalized_phase in _XAI_DEFERRED_STREAM_REQUESTED_SUCCESS_PHASES:
+                    payload["requested_success"] = _optional_bool(
+                        fields.get("requested_success", missing)
+                    )
+
+                for key in ("iterator_wrapped", "stream_response_wrapped"):
+                    if key in fields:
+                        payload[key] = _optional_bool(fields.get(key))
+
+                error_category = _exception_category(fields.get("error"))
+                if error_category is None:
+                    error_category = _exception_category(fields.get("renewal_error"))
+                if error_category is not None:
+                    payload["exception_category"] = error_category
+
+                if "result" in fields:
+                    payload.update(
+                        _mutation_snapshot(fields.get("result"), normalized_phase)
+                    )
+
+                verbose_aawm_route_logger.info(
+                    "AAWM_XAI_DEFERRED_STREAM: "
+                    + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+                )
+            except BaseException:  # noqa: BLE001
+                return None
+
+        return _observe
+    except BaseException:  # noqa: BLE001
+        return _noop_observe
 
 
 def _build_session_owner_rollup_kwargs(
