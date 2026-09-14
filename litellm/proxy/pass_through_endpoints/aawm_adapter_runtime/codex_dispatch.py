@@ -536,55 +536,58 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
             prepared_request_body,
             endpoint=endpoint,
         )
-    if codex_auto_agent_alias is not None:
-        # The alpha probe is an explicitly authorized, fresh-request control.
-        # Resolve it only after the authenticated alias branch is known, then
-        # fail closed before guidance or provider route handling.
-        from fastapi import HTTPException
+    from fastapi import HTTPException
 
-        from litellm.proxy.common_utils.http_parsing_utils import (
-            _safe_get_request_headers,
-        )
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
-            ALPHA_PROBE_PLAN_HEADER,
-            resolve_alpha_probe_control,
-        )
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_build import (
-            _codex_auto_agent_request_has_continuation_state,
-        )
+    from litellm.proxy.common_utils.http_parsing_utils import (
+        _safe_get_request_headers,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.alpha_probe_control import (
+        ALPHA_PROBE_PLAN_HEADER,
+        resolve_alpha_probe_control,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_build import (
+        _codex_auto_agent_request_has_continuation_state,
+    )
 
-        alpha_probe_control = resolve_alpha_probe_control(
+    # Resolve the control before removing its header from the request-local
+    # forwarding cache. Non-alias Codex routes still need the server-only
+    # header removed before their pass-through path runs.
+    alpha_probe_control = (
+        resolve_alpha_probe_control(
             request,
             user_api_key_dict=user_api_key_dict,
         )
+        if codex_auto_agent_alias is not None
+        else None
+    )
 
-        # _safe_get_request_headers caches the forwarding map on request
-        # state. Replace that map without mutating the caller's body or raw
-        # Starlette scope, so pass_through_request cannot forward the
-        # server-only control header, even when the alpha gate is disabled.
-        alpha_probe_headers = _safe_get_request_headers(request)
-        alpha_probe_state = getattr(request, "state", None)
-        if alpha_probe_state is None or not isinstance(alpha_probe_headers, dict):
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "error": "alpha_probe_request_state_unavailable",
-                    "message": "alpha probe request state unavailable",
-                },
-            )
-        setattr(
-            alpha_probe_state,
-            "_cached_headers",
-            {
-                key: value
-                for key, value in alpha_probe_headers.items()
-                if not (
-                    isinstance(key, str)
-                    and key.casefold() == ALPHA_PROBE_PLAN_HEADER.casefold()
-                )
+    # _safe_get_request_headers caches the forwarding map on request state.
+    # Replace that map without mutating the caller's body or raw Starlette
+    # scope, so no Codex route can forward the server-only control header.
+    alpha_probe_headers = _safe_get_request_headers(request)
+    alpha_probe_state = getattr(request, "state", None)
+    if alpha_probe_state is None or not isinstance(alpha_probe_headers, dict):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "alpha_probe_request_state_unavailable",
+                "message": "alpha probe request state unavailable",
             },
         )
+    setattr(
+        alpha_probe_state,
+        "_cached_headers",
+        {
+            key: value
+            for key, value in alpha_probe_headers.items()
+            if not (
+                isinstance(key, str)
+                and key.casefold() == ALPHA_PROBE_PLAN_HEADER.casefold()
+            )
+        },
+    )
 
+    if codex_auto_agent_alias is not None:
         if alpha_probe_control is not None:
             alpha_probe_rejection_reason: Optional[str] = None
             if _codex_auto_agent_request_has_continuation_state(
@@ -597,6 +600,45 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
                 alpha_probe_rejection_reason = "session_owner_lease"
             elif _sa.request_has_effective_session_identity(request):
                 alpha_probe_rejection_reason = "effective_session_identity"
+            else:
+                request_state = getattr(request, "state", None)
+                consult_identity = getattr(
+                    request_state,
+                    "_aawm_session_owner_consult_identity",
+                    None,
+                )
+                consult_cache_key = getattr(
+                    request_state,
+                    "_aawm_session_owner_consult_cache_key",
+                    None,
+                )
+                consult_record = getattr(
+                    request_state,
+                    "_aawm_session_owner_consult_record",
+                    None,
+                )
+                expected_cache_key = (
+                    _sa.build_aawm_alias_routing_session_owner_cache_key(
+                        session_identity=_sid
+                    )
+                    if _sid is not None
+                    else None
+                )
+                consulted_owner_id = (
+                    _sa._clean_optional_str(consult_record.get("owner"))
+                    if isinstance(consult_record, dict)
+                    else None
+                )
+                consulted_owned_thread = (
+                    _sid is not None
+                    and consult_identity == _sid
+                    and consult_cache_key == expected_cache_key
+                    and isinstance(consult_record, dict)
+                    and _sa._record_state(consult_record) == "owned"
+                    and consulted_owner_id is not None
+                )
+                if consulted_owned_thread:
+                    alpha_probe_rejection_reason = "session_owner_consult_owned"
 
             if alpha_probe_rejection_reason is not None:
                 raise HTTPException(
