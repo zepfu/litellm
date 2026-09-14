@@ -6393,9 +6393,66 @@ async def _finalize_native_openai_responses_legacy_affinity(
     if not isinstance(pending, dict):
         return
     try:
+        canonical_transition_ok = True
+        canonical_transition = pending.get("canonical_owner_transition")
         if (
             disposition is OpenAIResponsesWireDisposition.COMPLETED
             and owner_finalized
+            and isinstance(canonical_transition, dict)
+        ):
+            transition_fn = getattr(
+                _session_affinity_mod(),
+                "rebind_session_owner_for_portable_failover",
+                None,
+            )
+            if not callable(transition_fn):
+                canonical_transition_ok = False
+                if trace is not None:
+                    trace.metadata["canonical_owner_wire_commitment"] = (
+                        "unavailable"
+                    )
+            else:
+                transition_result = await transition_fn(
+                    session_identity=canonical_transition.get("session_identity"),
+                    source_owner_id=canonical_transition.get("source_owner_id"),
+                    source_attributes=(
+                        canonical_transition.get("source_attributes") or {}
+                    ),
+                    destination_attributes=(
+                        canonical_transition.get("destination_attributes") or {}
+                    ),
+                    authorization=canonical_transition.get("authorization"),
+                    failover_ordinal=canonical_transition.get("failover_ordinal"),
+                )
+                transition_outcome = getattr(
+                    getattr(transition_result, "outcome", None),
+                    "value",
+                    None,
+                )
+                canonical_transition_ok = (
+                    transition_result is True
+                    or transition_outcome in {"promoted", "already_owned"}
+                )
+                if trace is not None:
+                    trace.metadata["canonical_owner_wire_commitment"] = (
+                        "committed"
+                        if canonical_transition_ok
+                        else "discarded"
+                    )
+                    if transition_outcome is not None:
+                        trace.metadata["canonical_owner_wire_outcome"] = (
+                            transition_outcome
+                        )
+                if not canonical_transition_ok:
+                    verbose_proxy_logger.warning(
+                        "Native OpenAI Responses canonical owner transition "
+                        "returned outcome=%s; discarding staged legacy affinity",
+                        transition_outcome,
+                    )
+        if (
+            disposition is OpenAIResponsesWireDisposition.COMPLETED
+            and owner_finalized
+            and canonical_transition_ok
             and callable(pending.get("setter"))
         ):
             await pending["setter"](

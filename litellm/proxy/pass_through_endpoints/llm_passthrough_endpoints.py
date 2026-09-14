@@ -4019,6 +4019,14 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
     if retry_is_safe_continuation:
         current_candidate = candidate
         alternate_candidate = retry_selection.get("candidate")
+        source_owner_lease = _sa.get_request_session_owner_lease(request)
+        source_owner_decision = getattr(source_owner_lease, "decision", None)
+        source_owner_id = getattr(source_owner_lease, "owner_id", None)
+        source_session_identity = getattr(
+            source_owner_lease,
+            "session_identity",
+            None,
+        )
         current_attributes = _sa.build_session_owner_attributes(
             provider="openai",
             model=(
@@ -4125,6 +4133,34 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
                 candidate=destination_candidate,
                 setter=_set_codex_auto_agent_session_affinity,
             )
+            request_state = getattr(request, "state", None)
+            pending_commitment = getattr(
+                request_state,
+                "_aawm_native_openai_responses_affinity_commitment",
+                None,
+            )
+            if (
+                isinstance(pending_commitment, dict)
+                and source_owner_decision
+                == _sa.SessionOwnerGuardDecision.COMPATIBLE_OWNER.value
+                and isinstance(source_owner_id, str)
+                and source_owner_id
+            ):
+                pending_commitment["canonical_owner_transition"] = {
+                    "session_identity": source_session_identity
+                    or selection.get("canonical_session_identity")
+                    or _sa.resolve_canonical_session_identity(
+                        request,
+                        request_body,
+                    ),
+                    "source_owner_id": source_owner_id,
+                    "source_attributes": dict(current_attributes),
+                    "destination_attributes": dict(alternate_attributes),
+                    "authorization": "codex_oauth_portable_account_failover",
+                    "failover_ordinal": int(
+                        retry_selection.get("failover_ordinal") or 0
+                    ),
+                }
     return retry_auth, retry_selection
 
 
