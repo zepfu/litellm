@@ -5905,6 +5905,94 @@ def _session_affinity_mod():
     return mod
 
 
+def _openai_binding_fingerprint(value: Any) -> Optional[str]:
+    """Return a short non-secret fingerprint for final-send observations."""
+
+    if value in (None, ""):
+        return None
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+
+
+def _record_openai_final_send_binding_observation(
+    *,
+    request: Request,
+    metadata: Optional[dict[str, Any]],
+    correlation_id: Optional[str],
+    outcome: str,
+    owner_comparison_mode: str,
+    owner_comparison_result: Optional[str],
+    selected_account_context: Optional[Mapping[str, Any]],
+    current_account_context: Optional[Mapping[str, Any]],
+    expected_model: Optional[str],
+    serialized_model: Optional[str],
+    protected_headers_match: Optional[bool],
+    ledger_calls_before: Optional[int],
+    reservation_ordinal: Optional[int] = None,
+    transport_outcome: Optional[str] = None,
+    rejection_reason: Optional[str] = None,
+) -> None:
+    """Publish only bounded, non-secret final-send binding state."""
+
+    selected_context = (
+        selected_account_context
+        if isinstance(selected_account_context, Mapping)
+        else {}
+    )
+    current_context = (
+        current_account_context
+        if isinstance(current_account_context, Mapping)
+        else {}
+    )
+    observation: dict[str, Any] = {
+        "correlation_id": correlation_id,
+        "outcome": outcome,
+        "owner_comparison_mode": owner_comparison_mode,
+        "owner_comparison_result": owner_comparison_result,
+        "auth_binding_present": bool(protected_headers_match is not None),
+        "protected_headers_match": protected_headers_match,
+        "expected_model_fingerprint": _openai_binding_fingerprint(
+            expected_model
+        ),
+        "serialized_model_fingerprint": _openai_binding_fingerprint(
+            serialized_model
+        ),
+        "selected_account_hash_fingerprint": _openai_binding_fingerprint(
+            selected_context.get("account_hash")
+        ),
+        "selected_account_lane_fingerprint": _openai_binding_fingerprint(
+            selected_context.get("lane_key")
+        ),
+        "current_account_hash_fingerprint": _openai_binding_fingerprint(
+            current_context.get("account_hash")
+        ),
+        "current_account_lane_fingerprint": _openai_binding_fingerprint(
+            current_context.get("lane_key")
+        ),
+        "ledger_logical_calls_before": (
+            ledger_calls_before
+            if isinstance(ledger_calls_before, int)
+            and not isinstance(ledger_calls_before, bool)
+            else None
+        ),
+        "reservation_ordinal": (
+            reservation_ordinal
+            if isinstance(reservation_ordinal, int)
+            and not isinstance(reservation_ordinal, bool)
+            else None
+        ),
+        "transport_outcome": transport_outcome,
+        "rejection_reason": rejection_reason,
+    }
+    state = getattr(request, "state", None)
+    if state is not None:
+        try:
+            setattr(state, "aawm_openai_final_send_binding", observation)
+        except Exception:
+            pass
+    if isinstance(metadata, dict):
+        metadata["aawm_openai_final_send_binding"] = dict(observation)
+
+
 def _aawm_apply_openai_encrypted_reasoning_pre_send(
     *,
     request: Request,
@@ -6229,6 +6317,46 @@ async def _finalize_native_openai_responses_owner_wire_disposition(  # noqa: PLR
     sa = _session_affinity_mod()
     result = None
     owner_finalized = disposition is not OpenAIResponsesWireDisposition.COMPLETED
+    finalization_state = getattr(request, "state", None)
+    ledger_ordinal = getattr(
+        finalization_state,
+        "aawm_openai_send_ledger_ordinal",
+        None,
+    )
+
+    def _record_wire_finalization_observation(
+        *,
+        owner_outcome: Optional[str],
+        owner_record_source: str,
+        finalization_kind: str,
+        callback_error: Optional[str] = None,
+    ) -> None:
+        observation = {
+            "disposition": disposition.value,
+            "ledger_ordinal": (
+                ledger_ordinal
+                if isinstance(ledger_ordinal, int)
+                and not isinstance(ledger_ordinal, bool)
+                else None
+            ),
+            "owner_finalized": bool(owner_finalized),
+            "owner_outcome": owner_outcome,
+            "owner_record_source": owner_record_source,
+            "finalization_kind": finalization_kind,
+            "callback_error": callback_error,
+        }
+        if finalization_state is not None:
+            try:
+                setattr(
+                    finalization_state,
+                    "aawm_openai_wire_finalization",
+                    observation,
+                )
+            except Exception:
+                pass
+        if trace is not None:
+            trace.metadata["aawm_openai_wire_finalization"] = observation
+
     if trace is None:
         state = getattr(request, "state", None)
         if state is not None:
@@ -6292,6 +6420,27 @@ async def _finalize_native_openai_responses_owner_wire_disposition(  # noqa: PLR
             # reservation to promote. Treat that no-op as an established owner
             # so legacy affinity is not discarded as a false finalization error.
             owner_finalized = True
+        owner_record_source = (
+            "mutation_result"
+            if isinstance(getattr(result, "owner_record", None), Mapping)
+            else "none"
+        )
+        finalization_kind = (
+            "promotion"
+            if outcome == "promoted"
+            else (
+                "established_owner_noop"
+                if disposition is OpenAIResponsesWireDisposition.COMPLETED
+                and owner_finalized
+                and outcome in {None, "already_owned"}
+                else (outcome or "unknown")
+            )
+        )
+        _record_wire_finalization_observation(
+            owner_outcome=outcome,
+            owner_record_source=owner_record_source,
+            finalization_kind=finalization_kind,
+        )
         if result is not None and outcome not in expected_outcomes:
             verbose_proxy_logger.warning(
                 "Native OpenAI Responses owner finalization returned outcome=%s "
@@ -6311,6 +6460,11 @@ async def _finalize_native_openai_responses_owner_wire_disposition(  # noqa: PLR
                     fallback_outcome
                 )
             owner_finalized = False
+            _record_wire_finalization_observation(
+                owner_outcome=fallback_outcome,
+                owner_record_source="none",
+                finalization_kind="fallback_release",
+            )
         await _finalize_native_openai_responses_legacy_affinity(
             request=request,
             disposition=disposition,
@@ -6320,6 +6474,12 @@ async def _finalize_native_openai_responses_owner_wire_disposition(  # noqa: PLR
     except Exception as exc:  # noqa: BLE001
         if trace is not None:
             trace.metadata["session_owner_wire_callback_error"] = type(exc).__name__
+        _record_wire_finalization_observation(
+            owner_outcome=None,
+            owner_record_source="none",
+            finalization_kind="callback_error",
+            callback_error=type(exc).__name__,
+        )
         verbose_proxy_logger.exception(
             "Native OpenAI Responses owner finalization failed after wire "
             "disposition=%s; releasing reservation",
@@ -6455,10 +6615,17 @@ async def _finalize_native_openai_responses_legacy_affinity(
             and canonical_transition_ok
             and callable(pending.get("setter"))
         ):
-            await pending["setter"](
+            setter_result = await pending["setter"](
                 pending.get("session_key"),
                 pending.get("candidate") or {},
             )
+            if trace is not None and isinstance(setter_result, Mapping):
+                trace.metadata["legacy_affinity_memory_written"] = bool(
+                    setter_result.get("memory")
+                )
+                trace.metadata["legacy_affinity_durable_written"] = bool(
+                    setter_result.get("durable")
+                )
             if trace is not None:
                 trace.metadata["legacy_affinity_wire_commitment"] = "committed"
         elif trace is not None:
