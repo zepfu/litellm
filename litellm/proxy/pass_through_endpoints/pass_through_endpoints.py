@@ -6425,15 +6425,41 @@ async def _finalize_native_openai_responses_owner_wire_disposition(  # noqa: PLR
             if isinstance(getattr(result, "owner_record", None), Mapping)
             else "none"
         )
+        established_owner_without_mutation = (
+            result is None
+            and lease is not None
+            and (
+                getattr(lease, "promoted", False)
+                or (
+                    not getattr(lease, "held_reservation", False)
+                    and getattr(lease, "decision", None)
+                    == sa.SessionOwnerGuardDecision.COMPATIBLE_OWNER.value
+                )
+            )
+        )
         finalization_kind = (
             "promotion"
             if outcome == "promoted"
             else (
-                "established_owner_noop"
+                "no_lease"
                 if disposition is OpenAIResponsesWireDisposition.COMPLETED
-                and owner_finalized
-                and outcome in {None, "already_owned"}
-                else (outcome or "unknown")
+                and result is None
+                and lease is None
+                else (
+                    "established_owner_noop"
+                    if disposition is OpenAIResponsesWireDisposition.COMPLETED
+                    and owner_finalized
+                    and (
+                        outcome == "already_owned"
+                        or established_owner_without_mutation
+                    )
+                    else (
+                        "not_applicable"
+                        if disposition is OpenAIResponsesWireDisposition.COMPLETED
+                        and result is None
+                        else (outcome or "unknown")
+                    )
+                )
             )
         )
         _record_wire_finalization_observation(
