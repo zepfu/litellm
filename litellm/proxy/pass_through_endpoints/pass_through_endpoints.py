@@ -7964,11 +7964,31 @@ async def pass_through_request(  # noqa: PLR0915
                     if selected_openai_headers
                     else "none"
                 )
-                serialized_model: Optional[str] = None
-                current_selected_account_context: dict[str, Any] = {}
-                expected_model: Optional[str] = None
+                serialized_model: Optional[str] = (
+                    HttpPassThroughEndpointHelpers._get_prepared_openai_model(
+                        prepared_request
+                    )
+                    if selected_openai_headers
+                    else None
+                )
+                current_selected_account_context: dict[str, Any] = (
+                    _current_openai_account_context()
+                )
+                expected_model: Optional[str] = (
+                    _selected_openai_model() if selected_openai_headers else None
+                )
                 owner_comparison_result: Optional[str] = None
                 protected_headers_match: Optional[bool] = None
+                if selected_openai_headers:
+                    prepared_headers = {
+                        str(name).casefold(): str(value)
+                        for name, value in prepared_request.headers.items()
+                    }
+                    protected_headers_match = all(
+                        prepared_headers.get(str(name).casefold())
+                        == str(value)
+                        for name, value in selected_openai_headers.items()
+                    )
                 try:
                     (
                         serialized_model,
