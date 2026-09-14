@@ -2637,7 +2637,32 @@ async def handle_alias_route(  # noqa: PLR0915
                                 _is_codex_oauth_account_candidate is not None
                                 and _is_codex_oauth_account_candidate(candidate)
                             )
-                            inject_alpha_probe = (
+                            # Synthetic alpha probes are valid only for a
+                            # newly reserved, otherwise genuinely fresh
+                            # dispatch. Owned, continuation, effective
+                            # identity, auto-review, and validated-replay
+                            # paths must retain their selected candidate.
+                            alpha_probe_fresh_reservation = (
+                                guard.decision
+                                is sa.SessionOwnerGuardDecision.UNOWNED_RESERVED
+                                and guard.held_reservation
+                                and _genuinely_fresh_dispatch(selection)
+                                and not sa.request_has_effective_session_identity(
+                                    request
+                                )
+                                and (
+                                    selection.get("alias_model") or alias_model
+                                )
+                                not in {"codex-auto-review", "auto-review"}
+                                and not sa.get_request_codex_auto_review_parent_session_identity(
+                                    request
+                                )
+                                and not sa.validate_cursor_replay_matches_body(
+                                    request,
+                                    body=prepared_request_body,
+                                )
+                            )
+                            inject_alpha_probe = alpha_probe_fresh_reservation and (
                                 (
                                     alpha_probe_control.plan.name == "basic"
                                     and candidate.get("last_resort") is False
