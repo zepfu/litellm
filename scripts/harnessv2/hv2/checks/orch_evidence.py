@@ -1249,7 +1249,7 @@ def _codex_child_contract(
     task_complete = False
     task_complete_index: int | None = None
     task_complete_message = ""
-    assistant_messages: list[tuple[int, str]] = []
+    assistant_messages: list[tuple[int, Any, str]] = []
     final_answer = False
 
     for index, obj in enumerate(records):
@@ -1471,7 +1471,9 @@ def _codex_child_contract(
         if kind == "message" and str(payload.get("role") or "") == "assistant":
             assistant_text = _content_text(payload).strip()
             if assistant_text:
-                assistant_messages.append((index, assistant_text))
+                assistant_messages.append(
+                    (index, payload.get("phase"), assistant_text)
+                )
         if (
             isinstance(item, Mapping)
             and str(item.get("type") or "") == "AgentMessage"
@@ -1491,7 +1493,8 @@ def _codex_child_contract(
         and task_complete_message
         and assistant_messages
         and assistant_messages[-1][0] < task_complete_index
-        and assistant_messages[-1][1] == task_complete_message
+        and assistant_messages[-1][1] is None
+        and assistant_messages[-1][2] == task_complete_message
     ):
         final_answer = True
 
