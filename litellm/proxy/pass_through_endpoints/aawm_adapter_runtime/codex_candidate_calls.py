@@ -71,6 +71,7 @@ _CURSOR_RETAINED_HISTORY_REJECTION_FIELD = (
 _CURSOR_RETAINED_HISTORY_DIAGNOSTIC_TYPES = frozenset(
     {
         "message",
+        "agent_message",
         "function_call",
         "function_call_output",
         "reasoning",
@@ -91,6 +92,8 @@ _CURSOR_RETAINED_HISTORY_DIAGNOSTIC_KEYS = frozenset(
         "id",
         "status",
         "role",
+        "author",
+        "recipient",
         "content",
         "summary",
         "annotations",
