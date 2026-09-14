@@ -7444,6 +7444,7 @@ _HOST_FUNCTION_NAMES = (
     "_get_xai_oauth_request_local_failover_context",
     "_apply_xai_oauth_failover_context_to_state",
     "_plan_xai_oauth_account_failover",
+    "_codex_oauth_account_exhaustion_is_confirmed",
     "_plan_codex_oauth_account_failover",
     "_exclude_codex_auto_agent_request_local_candidate",
     "_exclude_codex_auto_agent_request_local_candidate_without_cooldown",
@@ -7584,6 +7585,9 @@ def install(host_globals: dict) -> None:
     host_globals.update({
         "alias_routing_state": alias_routing_state,
         "_codex_quota_balance": _codex_quota_balance,
+        "_admission": _admission,
+        "Mapping": Mapping,
+        "Sequence": Sequence,
         "inspect": inspect,
         "math": math,
         "_AUTO_AGENT_ACCOUNT_IDENTITY_FIELDS": (
