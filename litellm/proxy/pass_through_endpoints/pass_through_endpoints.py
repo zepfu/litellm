@@ -7884,6 +7884,45 @@ async def pass_through_request(  # noqa: PLR0915
                     if isinstance(pending, Mapping)
                     else None
                 )
+                selected_context = _current_openai_account_context()
+                if not isinstance(transition, Mapping):
+                    lease = _session_affinity_mod().get_request_session_owner_lease(
+                        request
+                    )
+                    lease_attributes = (
+                        getattr(lease, "attributes", None)
+                        if lease is not None
+                        else None
+                    )
+                    lease_owner_id = (
+                        getattr(lease, "owner_id", None)
+                        if lease is not None
+                        else None
+                    )
+                    if (
+                        isinstance(lease_attributes, Mapping)
+                        and isinstance(lease_owner_id, str)
+                        and lease_owner_id.strip()
+                    ):
+                        transition = {
+                            "session_identity": getattr(
+                                lease,
+                                "session_identity",
+                                None,
+                            ),
+                            "source_owner_id": lease_owner_id,
+                            "source_attributes": dict(lease_attributes),
+                            "destination_attributes": (
+                                _build_final_openai_owner_attributes(
+                                    model=expected_model,
+                                    account_context=selected_context,
+                                )
+                            ),
+                            "authorization": (
+                                "codex_oauth_portable_account_failover"
+                            ),
+                            "failover_ordinal": 1,
+                        }
                 if not isinstance(transition, Mapping):
                     return None
                 if (
@@ -7912,7 +7951,6 @@ async def pass_through_request(  # noqa: PLR0915
                     and str(source_account_hash or "") != str(prior_account_hash)
                 ):
                     return None
-                selected_context = _current_openai_account_context()
                 for context_key, attribute_key in (
                     ("account_label", "account_label"),
                     ("account_hash", "account_hash"),
