@@ -4096,6 +4096,32 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             )
             return None
         retry_attempt_record["guard_reset_outcome"] = "rebind_succeeded"
+        destination_candidate = retry_selection.get("candidate")
+        destination_model = (
+            destination_candidate.get("model")
+            if isinstance(destination_candidate, dict)
+            else None
+        ) or retry_selection.get("alias_model") or request_body.get("model")
+        destination_model = _clean_codex_auth_value(destination_model)
+        if (
+            isinstance(destination_candidate, dict)
+            and destination_model is not None
+            and _aawm_alias_candidate_loop._is_native_openai_responses_candidate(
+                request=request,
+                candidate=destination_candidate,
+            )
+        ):
+            destination_session_key = _resolve_codex_auto_agent_session_key(
+                request,
+                request_body,
+                alias_model=destination_model,
+            )
+            _aawm_alias_candidate_loop._stage_native_openai_responses_affinity_commitment(
+                request=request,
+                session_key=destination_session_key,
+                candidate=destination_candidate,
+                setter=_set_codex_auto_agent_session_affinity,
+            )
     return retry_auth, retry_selection
 
 
