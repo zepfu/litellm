@@ -146,6 +146,7 @@ class SessionOwnerLeaseRebindResult:
 
     rebound: bool
     rejection_reason: Optional[str] = None
+    source_attributes: Optional[Mapping[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -5672,6 +5673,7 @@ async def clear_compatible_non_held_request_session_owner_guard_for_failover(
     ):
         return SessionOwnerLeaseRebindResult(False, "request_lease_owner_mismatch")
 
+    source_attributes: Optional[Mapping[str, Any]] = None
     if validate_durable_owner:
         owner_record, _, error = await get_session_owner_record(
             session_identity=lease.session_identity,
@@ -5715,6 +5717,7 @@ async def clear_compatible_non_held_request_session_owner_guard_for_failover(
                     False,
                     "durable_owner_mismatch",
                 )
+            source_attributes = dict(owner_attributes)
 
     clear_request_lease = (
         reset_released_request_session_owner_guard
@@ -5723,7 +5726,10 @@ async def clear_compatible_non_held_request_session_owner_guard_for_failover(
     )
     if not clear_request_lease(request):
         return SessionOwnerLeaseRebindResult(False, "request_lease_clear_failed")
-    return SessionOwnerLeaseRebindResult(True)
+    return SessionOwnerLeaseRebindResult(
+        True,
+        source_attributes=source_attributes,
+    )
 
 
 def is_exact_owned_session_owner_route_mismatch(
