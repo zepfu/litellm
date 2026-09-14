@@ -582,6 +582,7 @@ def update_direct_openai_managed_failure_attempt(
     exc: Exception,
     cooldown_seconds: float,
     attempted_provider_call: Optional[bool] = None,
+    provider_returned: Optional[bool] = None,
     error_class: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """Apply existing classifier fields to a retryable direct attempt."""
@@ -615,6 +616,7 @@ def update_direct_openai_managed_failure_attempt(
         alias_model=_direct_alias_model(request_body, selection),
         candidate=candidate,
         attempted_provider_call=attempted_provider_call,
+        provider_returned=provider_returned,
     )
     return attempt_record
 

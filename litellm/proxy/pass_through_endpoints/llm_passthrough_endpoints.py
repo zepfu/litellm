@@ -3584,6 +3584,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
     exc: Exception,
     error_class: str,
     attempted_provider_call: bool,
+    provider_returned: bool,
 ) -> Optional[tuple[Any, dict[str, Any]]]:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         session_affinity as _sa,
@@ -3635,6 +3636,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             exc=exc,
             cooldown_seconds=cooldown_seconds,
             attempted_provider_call=attempted_provider_call,
+            provider_returned=provider_returned,
             error_class=error_class,
         )
     )
@@ -3643,6 +3645,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
         retry_attempt_record = {
             "failure_phase": "direct_openai_provider_response",
             "attempted_provider_call": attempted_provider_call,
+            "provider_returned": provider_returned,
             "cooldown_seconds": round(float(cooldown_seconds), 3),
             "error_status_code": _aawm_error_signals._extract_adapter_exception_status_code(
                 exc
@@ -6646,6 +6649,7 @@ async def openai_proxy_route(  # noqa: PLR0915
                 exc=exc,
                 error_class=direct_account_error_class,
                 attempted_provider_call=attempted_provider_call,
+                provider_returned=provider_returned,
             )
             if retry is None:
                 _aawm_dev_fault_plan.note_direct_openai_managed_terminal_exhaustion(

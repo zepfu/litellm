@@ -585,6 +585,7 @@ def _update_codex_auto_agent_retryable_attempt_record(  # noqa: PLR0915
     candidate: Optional[dict[str, Any]] = None,
     kimi_failure_metadata: Optional[dict[str, Any]] = None,
     attempted_provider_call: Optional[bool] = None,
+    provider_returned: Optional[bool] = None,
 ) -> set[str]:
     assert _extract_codex_auto_agent_error_tokens is not None
     assert _extract_exception_status_code is not None
@@ -620,6 +621,18 @@ def _update_codex_auto_agent_retryable_attempt_record(  # noqa: PLR0915
             attempted_provider_call = existing_attempted_provider_call
     if not isinstance(attempted_provider_call, bool):
         attempted_provider_call = False
+    if not isinstance(provider_returned, bool):
+        existing_provider_returned = attempt_record.get("provider_returned")
+        if isinstance(existing_provider_returned, bool):
+            provider_returned = existing_provider_returned
+    if not isinstance(provider_returned, bool):
+        detail = getattr(exc, "detail", None)
+        detail_mapping = detail if isinstance(detail, Mapping) else {}
+        provider_returned = (
+            getattr(exc, "_aawm_provider_returned", False) is True
+            or getattr(exc, "provider_returned", False) is True
+            or detail_mapping.get("provider_returned") is True
+        )
     update: dict[str, Any] = {
         "status": (
             "candidate_ineligible_no_cooldown"
@@ -634,6 +647,7 @@ def _update_codex_auto_agent_retryable_attempt_record(  # noqa: PLR0915
         "error_tokens": sorted(error_tokens),
         "failure_phase": getattr(exc, "failure_phase", "provider_attempt"),
         "attempted_provider_call": attempted_provider_call,
+        "provider_returned": provider_returned,
         "source_error": source_error,
     }
     if candidate_status is not None:
