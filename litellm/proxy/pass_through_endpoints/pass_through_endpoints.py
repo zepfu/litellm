@@ -6838,6 +6838,14 @@ async def pass_through_request(  # noqa: PLR0915
         else None
     )
     route_custom_headers = dict(custom_headers or {})
+    selected_openai_headers = (
+        {
+            str(name): str(value)
+            for name, value in egress_selected_openai_headers.items()
+        }
+        if isinstance(egress_selected_openai_headers, Mapping)
+        else None
+    )
     headers: Dict[str, Any] = dict(route_custom_headers)
     retryable_status_codes = {
         status_code
@@ -7732,6 +7740,87 @@ async def pass_through_request(  # noqa: PLR0915
             return failure
 
         if openai_call_ledger is not None:
+
+            def _selected_openai_model() -> Optional[str]:
+                for context in (
+                    selected_openai_account_context,
+                    current_candidate_context(request),
+                ):
+                    if not isinstance(context, Mapping):
+                        continue
+                    model = context.get("model")
+                    if isinstance(model, str) and model.strip():
+                        return model.strip()
+                return None
+
+            def _strict_managed_openai_owner_enabled(
+                expected_model: Optional[str],
+            ) -> bool:
+                if not selected_openai_headers or not expected_model:
+                    return False
+                state = getattr(request, "state", None)
+                if state is None:
+                    return False
+                if getattr(
+                    state,
+                    "_aawm_direct_codex_account_failover_planned",
+                    False,
+                ):
+                    return False
+                alias_outcome = getattr(
+                    state,
+                    "aawm_alias_request_outcome",
+                    None,
+                )
+                return not (
+                    isinstance(alias_outcome, Mapping)
+                    and alias_outcome.get("pending_failover") is True
+                )
+
+            def _build_final_openai_owner_attributes(
+                *,
+                model: str,
+                account_context: Mapping[str, Any],
+            ) -> dict[str, Any]:
+                state = getattr(request, "state", None)
+                candidate_context = current_candidate_context(request)
+                direct_inventory = bool(
+                    getattr(
+                        state,
+                        "aawm_direct_codex_oauth_inventory",
+                        False,
+                    )
+                )
+                route_family = (
+                    "codex_oauth"
+                    if direct_inventory
+                    else str(
+                        candidate_context.get("route_family")
+                        or "codex_responses"
+                    )
+                )
+                if route_family == "codex_oauth":
+                    endpoint_contract = "openai_responses"
+                    state_format = "openai_responses"
+                else:
+                    route_family = "codex_responses"
+                    endpoint_contract = "codex_responses"
+                    state_format = "codex_responses"
+                return _session_affinity_mod().build_session_owner_attributes(
+                    provider="openai",
+                    model=model,
+                    route_family=route_family,
+                    account_label=account_context.get("account_label"),
+                    account_hash=account_context.get("account_hash"),
+                    account_lane=account_context.get("lane_key"),
+                    endpoint_contract=endpoint_contract,
+                    state_format=state_format,
+                    ingress="pass_through_request",
+                    requested_model=model,
+                    credential_affinity=account_context.get(
+                        "credential_affinity"
+                    ),
+                )
 
             async def _send_prepared_openai_request(
                 prepared_request: httpx.Request,
