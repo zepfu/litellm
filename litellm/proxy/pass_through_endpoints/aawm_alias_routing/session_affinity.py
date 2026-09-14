@@ -3552,6 +3552,310 @@ async def promote_session_owner_reservation(  # noqa: PLR0911
     )
 
 
+async def rebind_session_owner_for_portable_failover(  # noqa: PLR0911
+    *,
+    session_identity: Optional[str],
+    source_owner_id: Optional[str],
+    source_attributes: Optional[Mapping[str, Any]],
+    destination_attributes: Optional[Mapping[str, Any]],
+    authorization: Optional[str],
+    failover_ordinal: Any,
+) -> SessionOwnerMutationResult:
+    """Atomically move one durable owner across an authorized portable failover."""
+
+    cleaned = resolve_canonical_session_identity(
+        session_identity=session_identity,
+    )
+    if cleaned is None:
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.SKIPPED,
+            session_identity=None,
+        )
+    try:
+        cache_key = build_aawm_alias_routing_session_owner_cache_key(
+            session_identity=cleaned
+        )
+    except Exception as exc:  # noqa: BLE001
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.ERROR,
+            session_identity=cleaned,
+            error=f"session_owner: portable failover cache key failed: {exc}",
+        )
+
+    def _error(reason: str, **kwargs: Any) -> SessionOwnerMutationResult:
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.ERROR,
+            session_identity=cleaned,
+            cache_key=cache_key,
+            error=reason,
+            **kwargs,
+        )
+
+    if authorization != "codex_oauth_portable_account_failover":
+        return _error("session_owner: portable failover authorization rejected")
+    if type(failover_ordinal) is not int or failover_ordinal != 1:
+        return _error("session_owner: portable failover ordinal rejected")
+
+    source_owner = _clean_optional_str(source_owner_id)
+    if source_owner is None:
+        return _error("session_owner: portable failover source owner missing")
+    if not isinstance(source_attributes, Mapping):
+        return _error("session_owner: portable failover source attributes missing")
+    if not isinstance(destination_attributes, Mapping):
+        return _error(
+            "session_owner: portable failover destination attributes missing"
+        )
+
+    source = _core_owner_attributes(
+        build_session_owner_attributes(extra=source_attributes)
+    )
+    destination = _core_owner_attributes(
+        build_session_owner_attributes(extra=destination_attributes)
+    )
+    for label, attributes in (("source", source), ("destination", destination)):
+        incomplete = incomplete_owner_attribute_reason(
+            attributes,
+            for_promotion=True,
+        )
+        if incomplete is not None:
+            return _error(
+                f"session_owner: portable failover {label} attributes incomplete"
+            )
+    if not _accounts_are_interchangeable(source, destination):
+        return _error(
+            "session_owner: portable failover accounts are not interchangeable"
+        )
+    if _clean_optional_str(source.get("model")) != _clean_optional_str(
+        destination.get("model")
+    ):
+        return _error("session_owner: portable failover model mismatch")
+    route_mismatch = _compatibility_mismatch_reason(
+        owner_record={
+            _RECORD_STATE_FIELD: SessionOwnerRecordState.OWNED.value,
+            _RECORD_OWNER_FIELD: source_owner,
+            _RECORD_ATTRIBUTES_FIELD: source,
+        },
+        requested_attributes=destination,
+        require_exact_attributes=True,
+    )
+    if route_mismatch is not None:
+        return _error(
+            "session_owner: portable failover route mismatch",
+        )
+
+    destination_owner = build_session_owner_id(attributes=destination)
+    owned_record = _build_owned_record(
+        owner_id=destination_owner,
+        attributes=destination,
+        reservation_token=None,
+    )
+
+    def _destination_record_matches(record: Optional[Mapping[str, Any]]) -> bool:
+        if not isinstance(record, Mapping):
+            return False
+        if record.get(_RECORD_STATE_FIELD) != SessionOwnerRecordState.OWNED.value:
+            return False
+        if (
+            _clean_optional_str(record.get(_RECORD_OWNER_FIELD))
+            != destination_owner
+        ):
+            return False
+        actual_attributes = _owner_attributes(record)
+        if set(actual_attributes) != set(destination):
+            return False
+        return all(
+            str(actual_attributes[key]) == str(value)
+            for key, value in destination.items()
+        )
+
+    try:
+        redis_cache, error = await _get_redis_cache()
+    except Exception as exc:  # noqa: BLE001
+        return _error(f"session_owner: portable failover cache failed: {exc}")
+    if error is not None or redis_cache is None:
+        return _error(error or "session_owner: durable cache unavailable")
+    try:
+        client = await _raw_redis_client(redis_cache)
+        namespaced = _namespaced_key(redis_cache, cache_key)
+    except Exception as exc:  # noqa: BLE001
+        return _error(f"session_owner: portable failover redis unavailable: {exc}")
+
+    lua = """
+    local function attributes_equal(left, right)
+      if type(left) ~= 'table' or type(right) ~= 'table' then
+        return false
+      end
+      local left_count = 0
+      for key, value in pairs(left) do
+        left_count = left_count + 1
+        if right[key] ~= value then
+          return false
+        end
+      end
+      local right_count = 0
+      for key, _ in pairs(right) do
+        right_count = right_count + 1
+      end
+      return left_count == right_count
+    end
+
+    local raw = redis.call('GET', KEYS[1])
+    if not raw then
+      return {0, 'missing'}
+    end
+    local ok, current = pcall(cjson.decode, raw)
+    if not ok or type(current) ~= 'table' then
+      return {-1, 'malformed'}
+    end
+    local source_ok, expected_source = pcall(cjson.decode, ARGV[2])
+    local destination_ok, expected_destination = pcall(cjson.decode, ARGV[4])
+    if (
+      not source_ok
+      or type(expected_source) ~= 'table'
+      or not destination_ok
+      or type(expected_destination) ~= 'table'
+    ) then
+      return {-1, 'malformed'}
+    end
+    if type(current['attributes']) ~= 'table' then
+      return {-1, 'malformed'}
+    end
+    if (
+      current['state'] == 'owned'
+      and current['owner'] == ARGV[3]
+      and attributes_equal(
+        current['attributes'],
+        expected_destination['attributes']
+      )
+    ) then
+      return {2, cjson.encode(current)}
+    end
+    if current['state'] ~= 'owned' then
+      return {3, cjson.encode(current)}
+    end
+    if (
+      current['owner'] ~= ARGV[1]
+      or not attributes_equal(current['attributes'], expected_source)
+    ) then
+      return {0, cjson.encode(current)}
+    end
+    local payload = expected_destination
+    if current['owned_at_epoch'] ~= nil then
+      payload['owned_at_epoch'] = current['owned_at_epoch']
+    end
+    if current['reserved_at_epoch'] ~= nil then
+      payload['reserved_at_epoch'] = current['reserved_at_epoch']
+    end
+    redis.call('SET', KEYS[1], cjson.encode(payload))
+    redis.call('PERSIST', KEYS[1])
+    return {1, cjson.encode(payload)}
+    """
+    try:
+        result = await client.eval(
+            lua,
+            1,
+            namespaced,
+            source_owner,
+            json.dumps(source),
+            destination_owner,
+            json.dumps(owned_record),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _error(f"session_owner: portable failover rebind failed: {exc}")
+
+    if not isinstance(result, (list, tuple)) or not result:
+        return _error("session_owner: portable failover returned malformed result")
+    try:
+        code = int(result[0])
+    except (TypeError, ValueError):
+        return _error("session_owner: portable failover returned invalid result")
+    raw_payload = result[1] if len(result) > 1 else None
+    if isinstance(raw_payload, (bytes, bytearray)):
+        raw_payload = raw_payload.decode("utf-8", errors="replace")
+    payload: Optional[Payload] = None
+    if isinstance(raw_payload, Mapping):
+        payload = cast(Payload, dict(raw_payload))
+    elif isinstance(raw_payload, str) and raw_payload not in {
+        "missing",
+        "malformed",
+    }:
+        try:
+            decoded = json.loads(raw_payload)
+            if isinstance(decoded, dict):
+                payload = cast(Payload, decoded)
+        except Exception:  # noqa: BLE001
+            payload = None
+
+    actual_owner = (
+        _clean_optional_str(payload.get(_RECORD_OWNER_FIELD))
+        if isinstance(payload, Mapping)
+        else None
+    )
+    if code == 1:
+        if not _destination_record_matches(payload):
+            return _error(
+                "session_owner: portable failover returned invalid owned record",
+                owner_id=actual_owner,
+                owner_record=payload,
+            )
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.PROMOTED,
+            session_identity=cleaned,
+            cache_key=cache_key,
+            owner_id=destination_owner,
+            owner_record=payload,
+        )
+    if code == 2:
+        if _destination_record_matches(payload):
+            return SessionOwnerMutationResult(
+                outcome=SessionOwnerMutationOutcome.ALREADY_OWNED,
+                session_identity=cleaned,
+                cache_key=cache_key,
+                owner_id=destination_owner,
+                owner_record=payload,
+            )
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.CONFLICT,
+            session_identity=cleaned,
+            cache_key=cache_key,
+            owner_id=actual_owner,
+            owner_record=payload,
+            error="session_owner: portable failover found different owned record",
+        )
+    if code == 0 and raw_payload == "missing":
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.NOT_HELD,
+            session_identity=cleaned,
+            cache_key=cache_key,
+            error="session_owner: portable failover record missing",
+        )
+    if code in {0, 3}:
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.CONFLICT,
+            session_identity=cleaned,
+            cache_key=cache_key,
+            owner_id=actual_owner,
+            owner_record=payload,
+            error=(
+                "session_owner: portable failover source owner or attributes "
+                "did not match"
+                if code == 0
+                else "session_owner: portable failover record is not owned"
+            ),
+        )
+    if code == -1:
+        return _error(
+            "session_owner: portable failover record is malformed",
+            owner_id=actual_owner,
+            owner_record=payload,
+        )
+    return _error(
+        "session_owner: portable failover returned unknown result",
+        owner_id=actual_owner,
+        owner_record=payload,
+    )
+
+
 async def release_session_owner_reservation(
     *,
     session_identity: Optional[str],
