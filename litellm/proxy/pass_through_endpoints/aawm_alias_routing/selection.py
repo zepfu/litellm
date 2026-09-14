@@ -26,6 +26,7 @@ from fastapi import HTTPException, Request
 from litellm._logging import verbose_proxy_logger
 from litellm.utils import get_model_info
 
+from . import admission as _admission
 from . import cooldown_state as _cooldown_state
 from . import codex_quota_balance as _codex_quota_balance
 from .cooldown_state import _attach_aawm_alias_routing_state_sources
@@ -1434,6 +1435,132 @@ def _plan_xai_oauth_account_failover(
     return True
 
 
+def _codex_oauth_account_exhaustion_is_confirmed(
+    *,
+    candidate: dict[str, Any],
+    selection: Mapping[str, Any],
+    attempt_record: Mapping[str, Any],
+    error_class: str,
+    provider_status_code: Optional[int],
+) -> bool:
+    """Authorize rotation only for exhaustion attributed to this account."""
+    if error_class not in {"usage_limit_reached", "candidate_unavailable"}:
+        return False
+    account_hash = str(candidate.get("codex_oauth_account_hash") or "").strip()
+    if not account_hash:
+        return False
+
+    admission_decision = str(
+        attempt_record.get("admission_decision") or ""
+    ).strip()
+    if admission_decision == "confirmed_exhausted":
+        return (
+            str(attempt_record.get("admission_account_hash") or "").strip()
+            == account_hash
+        )
+
+    attempted_provider_call = (
+        attempt_record.get("attempted_provider_call") is True
+    )
+    provider_returned = attempt_record.get("provider_returned") is True
+    if error_class == "usage_limit_reached" and (
+        attempted_provider_call and provider_returned
+    ):
+        raw_status_code = (
+            provider_status_code
+            if provider_status_code is not None
+            else attempt_record.get("error_status_code")
+        )
+        try:
+            status_code = int(raw_status_code)
+        except (TypeError, ValueError):
+            status_code = None
+        error_code = str(attempt_record.get("error_code") or "").strip().lower()
+        error_tokens = {
+            str(token).strip().lower()
+            for token in (attempt_record.get("error_tokens") or ())
+            if str(token).strip()
+        }
+        if (
+            status_code == 429
+            and (
+                error_code == "usage_limit_reached"
+                or "usage_limit_reached" in error_tokens
+            )
+        ):
+            return True
+    elif attempted_provider_call or provider_returned:
+        # A provider-returned candidate-unavailable response is not quota
+        # evidence; model capacity and generic throttling stay non-portable.
+        return False
+
+    def _iter_observations(value: Any) -> Sequence[Mapping[str, Any]]:
+        observations: list[Mapping[str, Any]] = []
+        if isinstance(value, Mapping):
+            observations.append(value)
+            nested_windows = value.get("windows")
+            if isinstance(nested_windows, list):
+                observations.extend(
+                    window
+                    for window in nested_windows
+                    if isinstance(window, Mapping)
+                )
+            for nested_key in ("valid_windows", "weekly"):
+                nested_value = value.get(nested_key)
+                if isinstance(nested_value, Mapping):
+                    observations.append(nested_value)
+                elif isinstance(nested_value, list):
+                    observations.extend(
+                        window
+                        for window in nested_value
+                        if isinstance(window, Mapping)
+                    )
+        elif isinstance(value, list):
+            observations.extend(
+                window for window in value if isinstance(window, Mapping)
+            )
+        return observations
+
+    quota_sources = (
+        selection.get("quota_observation"),
+        selection.get("codex_oauth_quota_evidence"),
+        selection.get("quota_exhausted_windows"),
+        selection.get("quota_windows"),
+    )
+    for source in quota_sources:
+        for window in _iter_observations(source):
+            observed_account_hash = str(
+                window.get("account_hash")
+                or window.get("codex_oauth_account_hash")
+                or ""
+            ).strip()
+            if observed_account_hash and observed_account_hash != account_hash:
+                continue
+            normalized = dict(window)
+            normalized.setdefault(
+                "quota_period",
+                normalized.get("window"),
+            )
+            normalized.setdefault(
+                "expected_reset_at",
+                normalized.get("reset_at"),
+            )
+            normalized.setdefault(
+                "observation_age_seconds",
+                normalized.get("snapshot_age_seconds"),
+            )
+            if not _codex_oauth_quota_window_is_confirmed_exhausted(
+                normalized
+            ):
+                continue
+            if not _admission.is_confirmed_account_usage_exhaustion(
+                normalized
+            ):
+                continue
+            return True
+    return False
+
+
 def _plan_codex_oauth_account_failover(
     request: Request,
     *,
@@ -1492,24 +1619,14 @@ def _plan_codex_oauth_account_failover(
         attempt_record["account_failover_limit_reached"] = True
         return reject("account_failover_limit_reached")
 
-    if error_class == "provider_terminal_error":
-        fresh_unbound_request_401 = (
-            not has_continuation_state
-            and not has_previous_response_id
-            and not has_account_bound_state
-            and bool(attempt_record.get("attempted_provider_call"))
-            and provider_status_code == 401
-        )
-        if not fresh_unbound_request_401:
-            return reject("provider_terminal_error_not_fresh_unbound_401")
-    elif error_class not in {
-        "capacity_exhausted",
-        "rate_limited",
-        "token_invalidated",
-        "usage_limit_reached",
-        "candidate_unavailable",
-    }:
-        return reject("error_class_not_failover_eligible")
+    if not _codex_oauth_account_exhaustion_is_confirmed(
+        candidate=candidate,
+        selection=selection,
+        attempt_record=attempt_record,
+        error_class=error_class,
+        provider_status_code=provider_status_code,
+    ):
+        return reject("account_exhaustion_not_confirmed")
 
     prior_account_outcome: dict[str, Any] = {
         "account_label": candidate.get("codex_oauth_account_label"),
