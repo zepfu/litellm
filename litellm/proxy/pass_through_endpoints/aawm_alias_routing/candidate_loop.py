@@ -1300,9 +1300,7 @@ async def handle_alias_route(  # noqa: PLR0915
         ):
             return None
         sa = _session_affinity_mod()
-        session_identity = selection.get("canonical_session_identity") or selection.get(
-            "session_owner_identity"
-        )
+        session_identity = selection.get("session_owner_identity")
         if not isinstance(session_identity, str) or not session_identity.strip():
             try:
                 session_identity = sa.resolve_canonical_session_identity(
