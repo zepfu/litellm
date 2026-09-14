@@ -5205,6 +5205,7 @@ _XAI_DEFERRED_STREAM_ROUTE_FAMILIES = frozenset(
         XAI_OAUTH_ROUTE_FAMILY,
         GROK_NATIVE_OAUTH_ROUTE_FAMILY,
         "codex_xai_oauth_responses_adapter",
+        "codex_grok_native_responses_adapter",
         "anthropic_xai_oauth_responses_adapter",
         "codex_auto_agent_xai_oauth_responses",
         "codex_auto_agent_grok_native_responses",
