@@ -2735,6 +2735,12 @@ def _cursor_replay_stock_codex_function_call_item(
         )
 
     item_id = item.get("id")
+    call_id = item.get("call_id")
+    call_id_is_valid = (
+        isinstance(call_id, str)
+        and bool(call_id)
+        and call_id == call_id.strip()
+    )
     item_id_match = (
         re.fullmatch(
             r"fc_([0-9a-f-]{36})(?:_(?:0|[1-9][0-9]*))?",
@@ -2743,9 +2749,17 @@ def _cursor_replay_stock_codex_function_call_item(
         if isinstance(item_id, str)
         else None
     )
-    if item_id_match is None or not _cursor_replay_is_canonical_uuid(
-        item_id_match.group(1)
-    ):
+    canonical_item_id = (
+        item_id_match is not None
+        and _cursor_replay_is_canonical_uuid(item_id_match.group(1))
+    )
+    # Cursor tool events may preserve their opaque provider id in both fields.
+    producer_coupled_item_id = (
+        call_id_is_valid
+        and isinstance(item_id, str)
+        and item_id == f"fc_{call_id}"
+    )
+    if not canonical_item_id and not producer_coupled_item_id:
         return _cursor_replay_rejected(
             "stock_full_history",
             "id_shape",
@@ -2773,7 +2787,6 @@ def _cursor_replay_stock_codex_function_call_item(
             item=item,
         )
 
-    call_id = item.get("call_id")
     name = item.get("name")
     namespace = item.get("namespace")
     if "namespace" in item and (
