@@ -7838,6 +7838,16 @@ async def pass_through_request(  # noqa: PLR0915
                     False,
                 ):
                     return False
+                failover_context = getattr(
+                    state,
+                    "aawm_codex_oauth_request_local_failover_context",
+                    None,
+                )
+                if (
+                    isinstance(failover_context, Mapping)
+                    and failover_context.get("portable_replay") is True
+                ):
+                    return False
                 return True
 
             def _build_final_openai_owner_attributes(
