@@ -158,22 +158,75 @@ def _stage_native_openai_responses_affinity_commitment(
     session_key: Optional[str],
     candidate: Mapping[str, Any],
     setter: Any,
+    canonical_owner_transition: Optional[Mapping[str, Any]] = None,
 ) -> None:
     state = getattr(request, "state", None)
     if state is None:
         return
     try:
+        existing = getattr(
+            state,
+            "_aawm_native_openai_responses_affinity_commitment",
+            None,
+        )
+        preserved_transition = (
+            existing.get("canonical_owner_transition")
+            if isinstance(existing, Mapping)
+            else None
+        )
+        transition = (
+            canonical_owner_transition
+            if isinstance(canonical_owner_transition, Mapping)
+            else preserved_transition
+        )
+        commitment: dict[str, Any] = {
+            "session_key": session_key,
+            "candidate": dict(candidate),
+            "setter": setter,
+        }
+        if isinstance(transition, Mapping) and transition:
+            commitment["canonical_owner_transition"] = copy.deepcopy(
+                dict(transition)
+            )
         setattr(
             state,
             "_aawm_native_openai_responses_affinity_commitment",
-            {
-                "session_key": session_key,
-                "candidate": dict(candidate),
-                "setter": setter,
-            },
+            commitment,
         )
     except Exception:
         return
+
+
+def _build_native_openai_responses_owner_attributes(
+    *,
+    candidate: Mapping[str, Any],
+    requested_model: Optional[str],
+) -> dict[str, Any]:
+    """Build the exact managed OpenAI shape used by final-send validation."""
+
+    model = str(candidate.get("model") or requested_model or "").strip()
+    route_family = (
+        str(candidate.get("route_family") or "codex_responses").strip()
+        or "codex_responses"
+    )
+    session_affinity = _session_affinity_mod()
+    return dict(
+        session_affinity.build_session_owner_attributes(
+            provider="openai",
+            model=model,
+            route_family=route_family,
+            account_label=candidate.get("codex_oauth_account_label"),
+            account_hash=candidate.get("codex_oauth_account_hash"),
+            account_lane=candidate.get("codex_oauth_lane_key"),
+            endpoint_contract=route_family,
+            state_format=route_family,
+            ingress="pass_through_request",
+            requested_model=model,
+            credential_affinity=candidate.get(
+                "codex_oauth_credential_affinity"
+            ),
+        )
+    )
 
 
 def _store_attempt_failure_state(
@@ -1233,6 +1286,142 @@ async def handle_alias_route(  # noqa: PLR0915
             and not bool(selection.get("has_account_bound_state"))
             and not bool(selection.get("in_flight_session"))
         )
+
+    async def _read_native_openai_responses_owner_snapshot(
+        *,
+        candidate: Mapping[str, Any],
+        selection: Mapping[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        """Capture the durable source before alias failover mutates the lease."""
+
+        if not _is_native_openai_responses_candidate(
+            request=request,
+            candidate=candidate,
+        ):
+            return None
+        sa = _session_affinity_mod()
+        session_identity = selection.get("canonical_session_identity") or selection.get(
+            "session_owner_identity"
+        )
+        if not isinstance(session_identity, str) or not session_identity.strip():
+            try:
+                session_identity = sa.resolve_canonical_session_identity(
+                    request,
+                    prepared_request_body,
+                )
+            except Exception:
+                return None
+        if not isinstance(session_identity, str) or not session_identity.strip():
+            return None
+        get_owner_record = getattr(sa, "get_session_owner_record", None)
+        record_state = getattr(sa, "_record_state", None)
+        owner_attributes = getattr(sa, "_owner_attributes", None)
+        if (
+            not callable(get_owner_record)
+            or not callable(record_state)
+            or not callable(owner_attributes)
+        ):
+            return None
+        try:
+            owner_record, _cache_key, owner_error = await get_owner_record(
+                session_identity=session_identity,
+                request=request,
+                wait_for_foreign_reservation=False,
+            )
+        except Exception:
+            return None
+        if (
+            owner_error is not None
+            or not isinstance(owner_record, Mapping)
+            or record_state(owner_record) != "owned"
+        ):
+            return None
+        source_owner_id = owner_record.get("owner")
+        source_attributes = owner_attributes(owner_record)
+        if (
+            not isinstance(source_owner_id, str)
+            or not source_owner_id.strip()
+            or not isinstance(source_attributes, Mapping)
+            or not source_attributes
+        ):
+            return None
+        return {
+            "session_identity": session_identity.strip(),
+            "source_owner_id": source_owner_id,
+            "source_attributes": dict(source_attributes),
+        }
+
+    def _carry_native_openai_responses_owner_snapshot(
+        snapshot: Optional[Mapping[str, Any]],
+    ) -> None:
+        if not isinstance(snapshot, Mapping):
+            return
+        state = getattr(request, "state", None)
+        context = getattr(
+            state,
+            "aawm_codex_oauth_request_local_failover_context",
+            None,
+        )
+        if (
+            not isinstance(context, dict)
+            or context.get("portable_replay") is not True
+            or isinstance(context.get("source_owner_snapshot"), Mapping)
+        ):
+            return
+        context["source_owner_snapshot"] = copy.deepcopy(dict(snapshot))
+
+    def _build_native_openai_responses_failover_transition(
+        *,
+        candidate: Mapping[str, Any],
+        selection: Mapping[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        if (
+            not _is_native_openai_responses_candidate(
+                request=request,
+                candidate=candidate,
+            )
+            or int(selection.get("failover_ordinal") or 0) != 1
+        ):
+            return None
+        state = getattr(request, "state", None)
+        context = getattr(
+            state,
+            "aawm_codex_oauth_request_local_failover_context",
+            None,
+        )
+        source_snapshot = (
+            context.get("source_owner_snapshot")
+            if isinstance(context, Mapping)
+            and context.get("portable_replay") is True
+            else None
+        )
+        if not isinstance(source_snapshot, Mapping):
+            return None
+        source_owner_id = source_snapshot.get("source_owner_id")
+        source_attributes = source_snapshot.get("source_attributes")
+        session_identity = source_snapshot.get("session_identity")
+        if (
+            not isinstance(source_owner_id, str)
+            or not source_owner_id.strip()
+            or not isinstance(source_attributes, Mapping)
+            or not isinstance(session_identity, str)
+            or not session_identity.strip()
+        ):
+            return None
+        destination_attributes = _build_native_openai_responses_owner_attributes(
+            candidate=candidate,
+            requested_model=selection.get("alias_model") or alias_model,
+        )
+        if not destination_attributes:
+            return None
+        return {
+            "session_identity": session_identity,
+            "source_owner_id": source_owner_id,
+            "source_attributes": dict(source_attributes),
+            "destination_attributes": destination_attributes,
+            "authorization": "codex_oauth_portable_account_failover",
+            "failover_ordinal": 1,
+        }
 
     def _xai_no_io_selection_skip_reason(
         *,
@@ -2386,6 +2575,12 @@ async def handle_alias_route(  # noqa: PLR0915
             admission_error_class = admission.admission_deny_error_class(
                 admission_decision
             )
+            durable_source_snapshot = (
+                await _read_native_openai_responses_owner_snapshot(
+                    candidate=candidate,
+                    selection=selection,
+                )
+            )
             account_failover_planned = _plan_codex_oauth_account_failover(
                 request,
                 candidate=candidate,
@@ -2401,6 +2596,9 @@ async def handle_alias_route(  # noqa: PLR0915
                 provider_status_code=attempt_record.get("error_status_code"),
             )
             if account_failover_planned:
+                _carry_native_openai_responses_owner_snapshot(
+                    durable_source_snapshot
+                )
                 _refund_selection_budget_if_no_provider_egress(
                     attempt_record=attempt_record,
                     budget_was_counted=selection_budget_counted,
@@ -2764,6 +2962,12 @@ async def handle_alias_route(  # noqa: PLR0915
                                         alpha_probe_control.plan.name == "work"
                                         and managed_codex_oauth_candidate
                                     ):
+                                        durable_source_snapshot = (
+                                            await _read_native_openai_responses_owner_snapshot(
+                                                candidate=candidate,
+                                                selection=selection,
+                                            )
+                                        )
                                         account_failover_planned = (
                                             _plan_codex_oauth_account_failover(
                                                 request,
@@ -2787,6 +2991,10 @@ async def handle_alias_route(  # noqa: PLR0915
                                                 ),
                                             )
                                         )
+                                        if account_failover_planned:
+                                            _carry_native_openai_responses_owner_snapshot(
+                                                durable_source_snapshot
+                                            )
                                     alpha_probe_reselect_allowed = (
                                         alpha_probe_control.plan.name != "work"
                                         or account_failover_planned
@@ -2879,6 +3087,12 @@ async def handle_alias_route(  # noqa: PLR0915
                             request=request,
                             candidate=candidate,
                         ):
+                            canonical_owner_transition = (
+                                _build_native_openai_responses_failover_transition(
+                                    candidate=candidate,
+                                    selection=selection,
+                                )
+                            )
                             # Stage legacy affinity before the provider call so
                             # buffered and streaming Responses paths can commit
                             # it from the same accepted wire disposition.
@@ -2887,6 +3101,9 @@ async def handle_alias_route(  # noqa: PLR0915
                                 session_key=selection.get("session_key"),
                                 candidate=candidate,
                                 setter=set_session_affinity_fn,
+                                canonical_owner_transition=(
+                                    canonical_owner_transition
+                                ),
                             )
 
                         _dev_fault_plan._raise_if_openai_fault_plan_slot_fails(
@@ -4658,6 +4875,12 @@ async def handle_alias_route(  # noqa: PLR0915
                 authenticated_token_pin = (
                     _is_authenticated_codex_continuation_pin(selection)
                 )
+                durable_source_snapshot = (
+                    await _read_native_openai_responses_owner_snapshot(
+                        candidate=candidate,
+                        selection=selection,
+                    )
+                )
                 account_failover_planned = (
                     False
                     if authenticated_token_pin
@@ -4678,6 +4901,10 @@ async def handle_alias_route(  # noqa: PLR0915
                         ),
                     )
                 )
+                if account_failover_planned:
+                    _carry_native_openai_responses_owner_snapshot(
+                        durable_source_snapshot
+                    )
                 if (
                     cooldown_scope == "none"
                     and not _provider_owned_continuation()
