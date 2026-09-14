@@ -4234,6 +4234,10 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
     """
 
     from fastapi.responses import StreamingResponse
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+        OpenAIResponsesStreamingResponse,
+        OpenAIResponsesWireDisposition,
+    )
 
     observe = _make_xai_deferred_stream_observer(
         request,
@@ -4255,6 +4259,39 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
     if original_iterator is None:
         observe("binding", binding_outcome="missing_iterator")
         return False
+
+    def _is_xai_wire_owner_context(value: Any) -> bool:
+        if not isinstance(value, Mapping):
+            return False
+        provider = str(
+            value.get("provider")
+            or value.get("custom_llm_provider")
+            or value.get("hosted_provider")
+            or ""
+        ).strip().casefold()
+        route_family = str(
+            value.get("route_family") or value.get("endpoint_contract") or ""
+        ).strip().casefold()
+        return (
+            provider == "xai"
+            and route_family in _XAI_DEFERRED_STREAM_ROUTE_FAMILIES
+        )
+
+    request_state = getattr(request, "state", None)
+    candidate_context = getattr(
+        request_state,
+        "aawm_openai_candidate_context",
+        None,
+    )
+    wire_trace = getattr(response, "wire_trace", None)
+    xai_wire_path = (
+        isinstance(response, OpenAIResponsesStreamingResponse)
+        and wire_trace is not None
+        and (
+            _is_xai_wire_owner_context(getattr(lease, "attributes", None))
+            or _is_xai_wire_owner_context(candidate_context)
+        )
+    )
 
     renewal_task = start_session_owner_lease_renewal(lease)
 
@@ -4334,6 +4371,20 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
         return _session_owner_renewal_task_error(renewal_task, lease)
 
     finalization_task: Optional[Any] = None
+    terminal_delivered = bool(
+        xai_wire_path
+        and getattr(wire_trace, "terminal_wire_committed", False)
+    )
+
+    def _wire_terminal_success_delivered() -> bool:
+        if not xai_wire_path:
+            return True
+        return (
+            bool(getattr(wire_trace, "terminal_wire_committed", False))
+            and getattr(wire_trace, "disposition", None)
+            is OpenAIResponsesWireDisposition.COMPLETED
+            and _validation_status()[0]
+        )
 
     async def _notify_failure(cause: Optional[BaseException]) -> None:
         if on_failure is not None:
@@ -4536,18 +4587,13 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
         if on_success is not None:
             await on_success()
 
-    async def _finalize(
+    def _select_finalization_task(
         success: bool,
-        cause: Optional[BaseException] = None,
-    ) -> None:
+        cause: Optional[BaseException],
+        *,
+        basis: str,
+    ) -> Any:
         nonlocal finalization_task
-        observe(
-            "finalize_enter",
-            error=cause,
-            requested_success=success,
-            iterator=wrapped_iterator,
-            finalization_task=finalization_task,
-        )
         if finalization_task is None:
             finalization_task = asyncio.create_task(
                 _run_finalization(success, cause)
@@ -4555,6 +4601,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
             observe(
                 "finalization_task_created",
                 requested_success=success,
+                finalization_basis=basis,
                 iterator=wrapped_iterator,
                 finalization_task=finalization_task,
             )
@@ -4562,10 +4609,28 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
             observe(
                 "finalization_task_reused",
                 requested_success=success,
+                finalization_basis=basis,
                 iterator=wrapped_iterator,
                 finalization_task=finalization_task,
             )
-        task = finalization_task
+        return finalization_task
+
+    async def _finalize(
+        success: bool,
+        cause: Optional[BaseException] = None,
+    ) -> None:
+        observe(
+            "finalize_enter",
+            error=cause,
+            requested_success=success,
+            iterator=wrapped_iterator,
+            finalization_task=finalization_task,
+        )
+        task = _select_finalization_task(
+            success,
+            cause,
+            basis="iterator_eof" if success else "failure",
+        )
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError as wait_error:
@@ -4719,8 +4784,13 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                     iterator=self,
                     finalization_task=finalization_task,
                 )
+                eof_success = (
+                    _wire_terminal_success_delivered()
+                    if xai_wire_path
+                    else True
+                )
                 try:
-                    await _finalize(True)
+                    await _finalize(eof_success)
                 finally:
                     self._closed = True
                     await _close_original_iterator()
@@ -4792,6 +4862,44 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
     if callable(original_stream_response):
 
         async def _stream_response_with_finalizer(send: Any) -> None:
+            async def _send_with_owner_terminal(message: Any) -> None:
+                nonlocal terminal_delivered
+                terminal_was_committed = bool(
+                    getattr(wire_trace, "terminal_wire_committed", False)
+                )
+                await send(message)
+                terminal_is_committed = bool(
+                    getattr(wire_trace, "terminal_wire_committed", False)
+                )
+                if (
+                    xai_wire_path
+                    and not terminal_delivered
+                    and not terminal_was_committed
+                    and terminal_is_committed
+                ):
+                    terminal_delivered = True
+                    validation_ok, _ = _validation_status()
+                    wire_disposition = getattr(wire_trace, "disposition", None)
+                    observe(
+                        "terminal_delivered",
+                        terminal_delivered=True,
+                        wire_disposition=wire_disposition,
+                        finalization_basis="terminal_delivery",
+                        validation_ok=validation_ok,
+                        iterator=wrapped_iterator,
+                        finalization_task=finalization_task,
+                    )
+                    if (
+                        wire_disposition
+                        is OpenAIResponsesWireDisposition.COMPLETED
+                        and validation_ok
+                    ):
+                        _select_finalization_task(
+                            True,
+                            None,
+                            basis="terminal_delivery",
+                        )
+
             try:
                 renewal_error = _renewal_error()
                 if renewal_error is not None:
@@ -4807,7 +4915,9 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                         mutation=_mutation_error(str(renewal_error)),
                         phase="session_owner_reservation_renewal",
                     )
-                await original_stream_response(send)
+                await original_stream_response(
+                    _send_with_owner_terminal if xai_wire_path else send
+                )
             except BaseException as exc:
                 observe(
                     (
@@ -5064,6 +5174,7 @@ _XAI_DEFERRED_STREAM_PHASES = frozenset(
         "renewal_failed",
         "stream_response_cancelled",
         "stream_response_exception",
+        "terminal_delivered",
         "finalization_wait_cancelled",
         "finalization_task_returned",
         "finalization_task_raised",
@@ -5093,6 +5204,10 @@ _XAI_DEFERRED_STREAM_ROUTE_FAMILIES = frozenset(
     {
         XAI_OAUTH_ROUTE_FAMILY,
         GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+        "codex_xai_oauth_responses_adapter",
+        "anthropic_xai_oauth_responses_adapter",
+        "codex_auto_agent_xai_oauth_responses",
+        "codex_auto_agent_grok_native_responses",
     }
 )
 _XAI_DEFERRED_STREAM_REQUESTED_SUCCESS_PHASES = frozenset(
@@ -5125,7 +5240,10 @@ _XAI_DEFERRED_STREAM_TERMINAL_STATUSES = frozenset(
     }
 )
 _XAI_DEFERRED_STREAM_WIRE_DISPOSITIONS = frozenset(
-    {"completed", "failed", "cancelled", "error"}
+    {"completed", "failed", "incomplete", "cancelled", "disconnected", "error"}
+)
+_XAI_DEFERRED_STREAM_FINALIZATION_BASES = frozenset(
+    {"terminal_delivery", "iterator_eof", "failure"}
 )
 
 
@@ -5267,6 +5385,17 @@ def _make_xai_deferred_stream_observer(
             return (
                 normalized
                 if normalized in _XAI_DEFERRED_STREAM_PHASES
+                else "unknown"
+            )
+
+        def _normalize_finalization_basis(value: Any) -> str:
+            raw = value.value if isinstance(value, Enum) else value
+            if not isinstance(raw, str) or not raw.strip():
+                return "unknown"
+            normalized = raw.strip().casefold()
+            return (
+                normalized
+                if normalized in _XAI_DEFERRED_STREAM_FINALIZATION_BASES
                 else "unknown"
             )
 
@@ -5485,6 +5614,31 @@ def _make_xai_deferred_stream_observer(
                 elif normalized_phase == "validator_decision":
                     payload["validation_ok"] = _optional_bool(
                         fields.get("validation_ok", missing)
+                    )
+                elif normalized_phase == "terminal_delivered":
+                    payload["terminal_delivered"] = _optional_bool(
+                        fields.get("terminal_delivered", missing)
+                    )
+                    payload["wire_disposition"] = _normalize_status(
+                        fields.get("wire_disposition", missing),
+                        _XAI_DEFERRED_STREAM_WIRE_DISPOSITIONS,
+                    )
+                    payload["finalization_basis"] = (
+                        _normalize_finalization_basis(
+                            fields.get("finalization_basis", missing)
+                        )
+                    )
+                    payload["validation_ok"] = _optional_bool(
+                        fields.get("validation_ok", missing)
+                    )
+                elif normalized_phase in {
+                    "finalization_task_created",
+                    "finalization_task_reused",
+                }:
+                    payload["finalization_basis"] = (
+                        _normalize_finalization_basis(
+                            fields.get("finalization_basis", missing)
+                        )
                     )
 
                 if normalized_phase in _XAI_DEFERRED_STREAM_REQUESTED_SUCCESS_PHASES:
