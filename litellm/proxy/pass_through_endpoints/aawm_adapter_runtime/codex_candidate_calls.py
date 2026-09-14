@@ -171,6 +171,7 @@ _CURSOR_REPLAY_FRESH_DISPATCH_REJECTION_REASONS = frozenset(
         "item_not_object",
         "item_key_set",
         "item_type",
+        "agent_message_identity",
         "id_shape",
         "metadata_shape",
         "metadata_key_set",
@@ -2092,49 +2093,85 @@ def _remember_cursor_message_tool_calls(
             function_calls[call_id] = name
 
 
+def _cursor_replay_stock_agent_message_item(
+    raw_item: Mapping[str, Any],
+    *,
+    item_index: Optional[int] = None,
+) -> _CursorReplayValidationResult:
+    item = raw_item
+    content = item.get("content")
+    author = item.get("author")
+    recipient = item.get("recipient")
+    identity_invalid = (
+        (author is None) != (recipient is None)
+        or (
+            author is not None
+            and (
+                not isinstance(author, str)
+                or not author.strip()
+                or not isinstance(recipient, str)
+                or not recipient.strip()
+            )
+        )
+    )
+    if set(item) - {
+        "type",
+        "id",
+        "author",
+        "recipient",
+        "content",
+        "internal_chat_message_metadata_passthrough",
+    }:
+        reason = "item_key_set"
+    elif identity_invalid:
+        reason = "agent_message_identity"
+    elif not isinstance(content, list) or not content:
+        reason = "content_container"
+    else:
+        reason = None
+        for part in content:
+            if not isinstance(part, dict):
+                reason = "content_part_container"
+                break
+            if set(part) != {"type", "text"}:
+                reason = "content_part_keys"
+                break
+            if part.get("type") not in ("input_text", "text"):
+                reason = "content_part_type"
+                break
+            if not isinstance(part.get("text"), str):
+                reason = "content_part_text_type"
+                break
+    if reason is not None:
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            reason,
+            item_index=item_index,
+            item=item,
+        )
+
+    text = "\n".join(part["text"] for part in content)
+    if not text.strip():
+        return _cursor_replay_rejected(
+            "stock_full_history",
+            "empty_user_text",
+            item_index=item_index,
+            item=item,
+        )
+    # Project only the Cursor chat view; keep the stock input item intact.
+    return _CursorReplayValidationResult(
+        value={"role": "user", "content": text}
+    )
+
+
 def _cursor_message_input_item(
     item: dict[str, Any],
     function_calls: dict[str, str],
 ) -> Optional[dict[str, Any]]:
     item_type = str(item.get("type") or "")
     if item_type == "agent_message":
-        content = item.get("content")
-        author = item.get("author")
-        recipient = item.get("recipient")
-        identity_invalid = (
-            (author is None) != (recipient is None)
-            or (
-                author is not None
-                and (
-                    not isinstance(author, str)
-                    or not author.strip()
-                    or not isinstance(recipient, str)
-                    or not recipient.strip()
-                )
-            )
-        )
-        if (
-            set(item) - {
-                "type", "id", "author", "recipient", "content",
-                "internal_chat_message_metadata_passthrough",
-            }
-            or identity_invalid
-            or not isinstance(content, list)
-            or not content
-            or any(
-                not isinstance(part, dict)
-                or set(part) != {"type", "text"}
-                or part.get("type") not in ("input_text", "text")
-                or not isinstance(part.get("text"), str)
-                for part in content
-            )
-        ):
-            return None
-        text = "\n".join(part["text"] for part in content)
-        if not text.strip():
-            return None
-        # Project only the Cursor chat view; keep the stock input item intact.
-        return {"role": "user", "content": text}
+        validated = _cursor_replay_stock_agent_message_item(item)
+        return validated.value if validated.rejection is None else None
     if item_type == "input_text":
         return {
             "role": "user",
@@ -2239,6 +2276,11 @@ def _find_cursor_full_history_retained_state(
         if item_type == "message":
             validated = _cursor_replay_stock_codex_message_item(
                 item, allow_missing_metadata=True
+            )
+        elif item_type == "agent_message":
+            validated = _cursor_replay_stock_agent_message_item(
+                item,
+                item_index=item_index,
             )
         elif item_type == "function_call":
             validated = _cursor_replay_stock_codex_function_call_item(
