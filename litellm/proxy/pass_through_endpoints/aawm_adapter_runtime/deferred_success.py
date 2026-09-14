@@ -18,9 +18,17 @@ class DeferredPassthroughSuccess:
         self._finalizer: Optional[DeferredSuccessFinalizer] = None
         self._failure_finalizer: Optional[DeferredFailureFinalizer] = None
         self._finalization_task: Optional[asyncio.Task[Any]] = None
+        self._finalization_requested = False
 
-    def set_finalizer(self, finalizer: DeferredSuccessFinalizer) -> None:
+    def set_finalizer(
+        self, finalizer: DeferredSuccessFinalizer
+    ) -> Optional[asyncio.Task[Any]]:
         self._finalizer = finalizer
+        pending_finalization_task: Optional[asyncio.Task[Any]] = None
+        if self._finalization_requested and self._finalization_task is None:
+            self._finalization_task = asyncio.create_task(finalizer())
+            pending_finalization_task = self._finalization_task
+        return pending_finalization_task
 
     def set_failure_finalizer(self, finalizer: DeferredFailureFinalizer) -> None:
         self._failure_finalizer = finalizer
@@ -28,6 +36,7 @@ class DeferredPassthroughSuccess:
     async def finalize(self) -> None:
         if self._finalization_task is None:
             if self._finalizer is None:
+                self._finalization_requested = True
                 return
             self._finalization_task = asyncio.create_task(self._finalizer())
         await asyncio.shield(self._finalization_task)

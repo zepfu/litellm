@@ -2126,7 +2126,13 @@ class PassThroughStreamingHandler:
                     deferred_success_holder is not None
                     and openai_wire_trace is None
                 ):
-                    deferred_success_holder.set_finalizer(_finalize_stream_delivery)
+                    pending_finalization_task = (
+                        deferred_success_holder.set_finalizer(
+                            _finalize_stream_delivery
+                        )
+                    )
+                    if pending_finalization_task is not None:
+                        await asyncio.shield(pending_finalization_task)
                 else:
                     await _finalize_stream_delivery()
 
