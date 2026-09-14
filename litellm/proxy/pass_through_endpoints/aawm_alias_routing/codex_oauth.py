@@ -1901,8 +1901,30 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     skipped = _selection._build_auto_agent_skipped_candidates_from_states(states)
     diagnostic_skipped = _redact_codex_oauth_account_diagnostics(skipped)
 
+    selection_states = states
+    if affinity is not None and not planned_portable_failover:
+        pinned_account_fields = {
+            field: _clean_codex_auth_value(affinity.get(field))
+            for field in (
+                "codex_oauth_account_label",
+                "codex_oauth_account_hash",
+                "codex_oauth_lane_key",
+            )
+        }
+        if any(pinned_account_fields.values()):
+            selection_states = [
+                state
+                for state in states
+                if isinstance(state.get("candidate"), Mapping)
+                and all(
+                    value is None
+                    or state["candidate"].get(field) == value
+                    for field, value in pinned_account_fields.items()
+                )
+            ]
+
     selected_state = _selection._select_first_available_codex_oauth_account_state(
-        states,
+        selection_states,
         bypass_reason=(
             "account_pinned" if affinity is not None else
             "ordinary_continuation"
