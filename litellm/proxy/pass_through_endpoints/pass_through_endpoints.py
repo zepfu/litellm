@@ -26,6 +26,7 @@ from typing import (
     cast,
 )
 from urllib.parse import parse_qsl, urlencode, urlparse
+from uuid import UUID
 
 import httpx
 from fastapi import (
@@ -53,6 +54,7 @@ import litellm
 from litellm._logging import (
     emit_aawm_error_intake_only,
     trigger_egress_guard_alert,
+    verbose_aawm_route_logger,
     verbose_proxy_logger,
 )
 from litellm._uuid import uuid
@@ -5977,6 +5979,139 @@ def _openai_binding_fingerprint(value: Any) -> Optional[str]:
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
 
 
+def _emit_openai_final_send_binding_observation(
+    observation: Mapping[str, Any],
+) -> None:
+    """Emit a fixed-field, non-secret final-send binding observation."""
+
+    try:
+        if not isinstance(observation, Mapping):
+            return
+
+        def _optional_vocab(
+            value: Any,
+            allowed: frozenset[str],
+        ) -> Optional[str]:
+            if value is None:
+                return None
+            if isinstance(value, str) and value in allowed:
+                return value
+            return "unknown"
+
+        def _canonical_uuid(value: Any) -> Optional[str]:
+            if not isinstance(value, str):
+                return None
+            try:
+                return value if str(UUID(value)) == value else None
+            except (AttributeError, TypeError, ValueError):
+                return None
+
+        def _optional_bool(value: Any) -> Optional[bool]:
+            return value if isinstance(value, bool) else None
+
+        def _optional_fingerprint(value: Any) -> Optional[str]:
+            if not isinstance(value, str):
+                return None
+            if len(value) != 16 or re.fullmatch(r"[0-9a-f]{16}", value) is None:
+                return None
+            return value
+
+        def _optional_integer(value: Any) -> Optional[int]:
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+            return None
+
+        payload: dict[str, Any] = {
+            "event": "openai_final_send_binding",
+            "correlation_id": _canonical_uuid(
+                observation.get("correlation_id")
+            ),
+            "outcome": _optional_vocab(
+                observation.get("outcome"),
+                frozenset(
+                    {
+                        "rejected",
+                        "validated",
+                        "reserved",
+                        "transport_returned",
+                        "transport_failed",
+                    }
+                ),
+            ),
+            "owner_comparison_mode": _optional_vocab(
+                observation.get("owner_comparison_mode"),
+                frozenset(
+                    {
+                        "strict_managed_openai",
+                        "portable_transition",
+                        "not_applicable",
+                        "none",
+                    }
+                ),
+            ),
+            "owner_comparison_result": _optional_vocab(
+                observation.get("owner_comparison_result"),
+                frozenset(
+                    {
+                        "no_session",
+                        "unowned_reserved",
+                        "reservation_renewed",
+                        "compatible_owner",
+                        "redispatch_required",
+                        "source",
+                        "destination",
+                        "not_applicable",
+                        "skipped",
+                    }
+                ),
+            ),
+            "auth_binding_present": _optional_bool(
+                observation.get("auth_binding_present")
+            ),
+            "protected_headers_match": _optional_bool(
+                observation.get("protected_headers_match")
+            ),
+            "expected_model_fingerprint": _optional_fingerprint(
+                observation.get("expected_model_fingerprint")
+            ),
+            "serialized_model_fingerprint": _optional_fingerprint(
+                observation.get("serialized_model_fingerprint")
+            ),
+            "selected_account_hash_fingerprint": _optional_fingerprint(
+                observation.get("selected_account_hash_fingerprint")
+            ),
+            "selected_account_lane_fingerprint": _optional_fingerprint(
+                observation.get("selected_account_lane_fingerprint")
+            ),
+            "current_account_hash_fingerprint": _optional_fingerprint(
+                observation.get("current_account_hash_fingerprint")
+            ),
+            "current_account_lane_fingerprint": _optional_fingerprint(
+                observation.get("current_account_lane_fingerprint")
+            ),
+            "ledger_logical_calls_before": _optional_integer(
+                observation.get("ledger_logical_calls_before")
+            ),
+            "reservation_ordinal": _optional_integer(
+                observation.get("reservation_ordinal")
+            ),
+            "transport_outcome": _optional_vocab(
+                observation.get("transport_outcome"),
+                frozenset({"response_returned", "connection_error"}),
+            ),
+            "rejection_reason": _optional_vocab(
+                observation.get("rejection_reason"),
+                frozenset({"final_send_binding_or_owner_guard"}),
+            ),
+        }
+        verbose_aawm_route_logger.info(
+            "AAWM_OPENAI_FINAL_SEND_BINDING: "
+            + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        )
+    except BaseException:  # noqa: BLE001
+        return
+
+
 def _record_openai_final_send_binding_observation(
     *,
     request: Request,
@@ -6047,6 +6182,7 @@ def _record_openai_final_send_binding_observation(
         "transport_outcome": transport_outcome,
         "rejection_reason": rejection_reason,
     }
+    _emit_openai_final_send_binding_observation(observation)
     state = getattr(request, "state", None)
     if state is not None:
         try:
