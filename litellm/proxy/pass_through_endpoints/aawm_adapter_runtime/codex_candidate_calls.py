@@ -5578,6 +5578,16 @@ async def _perform_codex_auto_agent_muse_code_responses_request(
     candidate: dict[str, Any],
     request_body: dict[str, Any],
 ) -> Response:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+        build_producer_provenance_from_egress_context,
+        prepare_encrypted_reasoning_items_for_openai_egress,
+        stamp_encrypted_reasoning_provenance_in_response,
+        stamp_route_identity_in_response,
+        stamp_route_identity_in_sse_chunk,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
+        _iter_sse_event_blocks_with_separator,
+    )
     from litellm.proxy.pass_through_endpoints.muse_code_gateway import (
         MUSE_CODE_RESPONSES_UPSTREAM_URL,
         MUSE_CODE_ROUTE_FAMILY,
@@ -5587,9 +5597,20 @@ async def _perform_codex_auto_agent_muse_code_responses_request(
     if candidate.get("route_family") != MUSE_CODE_ROUTE_FAMILY:
         raise ValueError("Muse Code alias candidates require muse_code.")
     adapter_model = candidate["model"]
+    producer_provider = candidate["provider"]
+    metadata = request_body.get("litellm_metadata")
+    identity_request_body = {
+        "model": adapter_model,
+        "litellm_metadata": dict(metadata) if isinstance(metadata, Mapping) else {},
+    }
+    # The candidate loop owns session compatibility. Restore only the ERP
+    # transport wrapper before the native gateway removes protocol sidecars.
+    native_request_body, _ = prepare_encrypted_reasoning_items_for_openai_egress(
+        request_body
+    )
     response = await proxy_muse_code_responses_candidate(
         request=request,
-        request_body=request_body,
+        request_body=native_request_body,
     )
     response = await _validate_codex_auto_agent_responses_payload(
         response,
@@ -5606,12 +5627,48 @@ async def _perform_codex_auto_agent_muse_code_responses_request(
         request_body=request_body,
     )
     if isinstance(response, StreamingResponse):
+        original_iterator = response.body_iterator
+
+        async def _provenance_iterator() -> Any:
+            event_blocks = _iter_sse_event_blocks_with_separator(original_iterator)
+            try:
+                async for event_block, has_separator in event_blocks:
+                    yield stamp_route_identity_in_sse_chunk(
+                        event_block + ("\n\n" if has_separator else ""),
+                        request_body=identity_request_body,
+                        custom_llm_provider=producer_provider,
+                        egress_credential_family=MUSE_CODE_ROUTE_FAMILY,
+                    )
+            finally:
+                try:
+                    await event_blocks.aclose()
+                finally:
+                    close = getattr(original_iterator, "aclose", None)
+                    if callable(close):
+                        await close()
+
+        # Apply after validation so both lazy forwarding and exhausted replay
+        # retain this candidate's identity, independent of HTTP chunking.
+        response.body_iterator = _provenance_iterator()
         response = _bind_responses_wire_stream(
             response,
             request=request,
             adapter_model=adapter_model,
         )
         setattr(response, "_aawm_session_owner_promotion_deferred", True)
+    else:
+        provenance = build_producer_provenance_from_egress_context(
+            request_body=identity_request_body,
+            custom_llm_provider=producer_provider,
+            egress_credential_family=MUSE_CODE_ROUTE_FAMILY,
+        )
+        response_body = json.loads(response.body)
+        stamp_encrypted_reasoning_provenance_in_response(response_body, provenance)
+        stamp_route_identity_in_response(response_body, provenance)
+        response.body = json.dumps(
+            response_body, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        response.headers["content-length"] = str(len(response.body))
     return response
 
 
