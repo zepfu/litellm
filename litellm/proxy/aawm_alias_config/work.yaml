@@ -4,11 +4,11 @@ defaults: {}
 aliases:
   - name: work
     candidates:
+      - alias_reference: work-other
+        priority: 110
+
       - provider: openai
         model: gpt-5.6-luna
         route_family: codex_responses
-        priority: 110
-        reasoning_effort: high
-
-      - alias_reference: work-other
         priority: 0
+        reasoning_effort: high

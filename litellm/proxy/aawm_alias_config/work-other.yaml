@@ -15,10 +15,14 @@ aliases:
         route_family: codex_zai_coding_plan_chat_completions_adapter
         priority: 100
         schedule:
-          start_time: "03:00:00"
-          end_time: "23:00:00"
-          timezone: "America/Los_Angeles"
+          start_time: "18:00:00"
+          end_time: "14:00:00"
+          utc_offset: "+08:00"
       - alias_reference: sota-moonshot
         priority: 90
+      - provider: muse_code
+        model: muse-spark-1.3-contributor
+        route_family: muse_code
+        priority: 85
       - alias_reference: sota-xai
         priority: 80

@@ -14,12 +14,6 @@ aliases:
         priority: 90
         reasoning_effort: low
 
-      - provider: openrouter
-        model: openrouter/~deepseek/deepseek-v4-flash-latest
-        route_family: codex_openrouter_completion_adapter
-        priority: 0
-        reasoning_effort: low
-
   - name: codex-auto-review
     candidates:
       - alias_reference: auto-review

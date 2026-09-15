@@ -197,26 +197,26 @@ thirteen mixed `orchestration_children`. Provider coverage is selected with
 
 ## Maintained `basic` and `basic-other` alias behavior
 
-The `basic` alias keeps the low-cost common prefix, in order:
-
-1. Direct Cohere North Mini Code (`cohere/north-mini-code-1-0`,
-   `provider: cohere`, `codex_cohere_chat_completions_adapter`,
-   `lane=cohere_native`, priority 90)
-2. OpenRouter Cohere North Mini Code free
-   (`openrouter/cohere/north-mini-code:free`, priority 80) as an independent
-   fallback
-3. OpenCode Zen `big-pickle` (priority 50)
-4. `alias_reference: basic-other` (priority 0)
+The `basic` alias references `basic-other` (priority 110), then falls back to
+OpenAI `gpt-5.6-luna` (priority 0, `reasoning_effort: low`).
 
 `basic-other` orders Alibaba Token Plan
 `alibaba_token_plan/deepseek-v4.1-flash` (priority 100, admitted only during
 the recurring half-open `22:00-08:00 UTC+8` window), Z.AI Coding Plan
 `zai_coding_plan/glm-5.3-flash` (priority 90, admitted only from
-`03:00-23:00 America/Los_Angeles`), and Cursor Agent
-`cursor_agent/composer-2.5` (priority 80). It then has mutually exclusive
-priority-zero tails: OpenAI `gpt-5.6-luna` with `reasoning_effort: low` for
-non-Claude, missing, and unknown origins, or native Anthropic
-`claude-haiku-4-5-20251001` for Claude origins.
+`18:00-14:00 UTC+8`), and Cursor Agent
+`cursor_agent/composer-2.5` (priority 80). These three candidates have no
+configured reasoning-effort override. The helper has no OpenAI or Anthropic
+tail; Luna is configured only on `basic`.
+
+Alibaba candidates reached through `basic*`, `work*`, and `expert*` are gated
+by `start_time: "22:00:00"`, `end_time: "08:00:00"`,
+`utc_offset: "+08:00"`. Z.AI candidates in those aliases use
+`start_time: "18:00:00"`, `end_time: "14:00:00"`,
+`utc_offset: "+08:00"`, excluding the daily 14:00-18:00 peak period.
+Both windows recur every day, include the start, and exclude the end;
+there is no weekday distinction. The `work-other` Alibaba gate is on its
+`sota-deepseek` reference, so direct `sota-deepseek` use is unchanged.
 
 `sota-xai` follows the CFG-038 provider-neutral order: Cursor Grok
 (`cursor_agent/cursor-grok-4.6-high`, priority 110), native xAI/OIDC
@@ -321,11 +321,7 @@ request-local.
 The `work` alias is compiled from `work.yaml`. Candidate order is:
 
 1. Nested `alias_reference: work-other` (priority 110)
-2. Claude-origin only: native Anthropic `claude-sonnet-5[1m]`
-   (priority 80, `reasoning_effort: max`)
-3. Claude-origin only: native Anthropic `claude-sonnet-5`
-   (priority 70, `reasoning_effort: max`)
-4. OpenAI `gpt-5.6-luna` (priority 0, `reasoning_effort: max`)
+2. OpenAI `gpt-5.6-luna` (priority 0, `reasoning_effort: high`)
 
 `work-other` is an ordinary configured alias compiled from `work-other.yaml`.
 It is a valid exact-name route, a valid `alias_reference` target, and an
@@ -334,21 +330,22 @@ Ohmypi orchestration child.
 Its candidates are `alias_reference: sota-deepseek` (priority 110, scheduled
 for the daily half-open window `22:00-08:00 UTC+8`), Z.AI Coding Plan
 `zai_coding_plan/glm-5.3-flash` (priority 100, admitted only from
-`03:00-23:00 America/Los_Angeles`), `alias_reference: sota-moonshot`
-(priority 90), and `alias_reference: sota-xai` (priority 80). The Z.AI
-candidate is skipped during its `23:00-03:00 America/Los_Angeles` blocked
-window, so the next eligible branch is selected.
+`18:00-14:00 UTC+8`), `alias_reference: sota-moonshot`
+(priority 90), Muse `muse-spark-1.3-contributor` (`provider: muse_code`,
+`route_family: muse_code`, priority 85, no reasoning-effort override),
+and `alias_reference: sota-xai` (priority 80). The Z.AI candidate is skipped
+during its daily `14:00-18:00 UTC+8` peak window.
 `sota-xai` currently expands in this order: Cursor
 `cursor_agent/cursor-grok-4.6-high`, native xAI/OIDC `xai/grok-4.6`, then
-managed xAI/OAuth `oa_xai/grok-4.6`. The Claude-only Sonnet leaves do not enter
-this Codex expansion; Luna remains the final OpenAI fallback. Closing the
+managed xAI/OAuth `oa_xai/grok-4.6`. Luna remains the final OpenAI fallback
+on `work`, not `work-other`. Closing the
 window prevents new affinity and does not evict an existing session owner.
 
 ## Maintained `expert` and `expert-other` alias behavior
 
-The `expert` alias first references `expert-other` (priority 100), then falls
-back to OpenAI/Codex `gpt-5.6-terra` (`codex_responses`, priority 0,
-`reasoning_effort: max`). `expert-other` orders scheduled Alibaba Token Plan
+The `expert` alias first references `expert-other` (priority 110), then falls
+back to OpenAI/Codex `gpt-6-astra` (`codex_responses`, priority 0,
+`reasoning_effort: low`). `expert-other` orders scheduled Alibaba Token Plan
 `alibaba_token_plan/qwen3.8-max` (priority 100, `22:00-08:00 UTC+8`), Cursor
 Agent `cursor_agent/cursor-grok-4.6-high` (priority 90), and native xAI/OIDC
 `xai/grok-4.6` (priority 0). It does not include managed xAI/OAuth or
@@ -357,9 +354,7 @@ Anthropic candidates.
 ## Maintained `auto-review` aliases
 
 `auto-review` first references `auto-review-other` (priority 100), then uses
-OpenAI `gpt-5.6-luna` (priority 90) and priority-zero OpenRouter
-`openrouter/~deepseek/deepseek-v4-flash-latest`. The concrete fallback
-candidates use `reasoning_effort: low`.
+OpenAI `gpt-5.6-luna` (priority 90, `reasoning_effort: low`).
 
 `auto-review-other` orders scheduled Alibaba Token Plan
 `alibaba_token_plan/deepseek-v4.1-flash` (priority 100,
@@ -716,13 +711,9 @@ route.
   endpoint. Aliases that include Cohere candidates set the exact `model` string
   and `provider: cohere` in YAML; the selected route family is
   `codex_cohere_chat_completions_adapter` and the lane is `cohere_native`.
-- `basic.yaml` now carries both lanes as independent candidates. Direct trial
-  capacity is preferred: `provider: cohere`, `model: cohere/north-mini-code-1-0`,
-  `route_family: codex_cohere_chat_completions_adapter`, `priority: 90`. The
-  OpenRouter fallback remains `provider: openrouter`,
-  `model: openrouter/cohere/north-mini-code:free`,
-  `route_family: codex_openrouter_completion_adapter`, `priority: 80`. Do not
-  merge capacity, error, or cooldown state across those lanes.
+- `provider-cohere` and `provider-openrouter` expose these lanes separately;
+  neither lane is in the current `basic` graph. Do not merge capacity, error,
+  or cooldown state across those lanes.
 - Direct Cohere is separate from OpenRouter. An OpenRouter candidate such as
   `openrouter/cohere/north-mini-code:free` remains an OpenRouter request and must not be
   recorded or interpreted as direct Cohere-native traffic.
