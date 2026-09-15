@@ -3495,7 +3495,6 @@ async def handle_alias_route(  # noqa: PLR0915
                                         {
                                             sa.SessionOwnerMutationOutcome.RELEASED,
                                             sa.SessionOwnerMutationOutcome.NOT_HELD,
-                                            sa.SessionOwnerMutationOutcome.ALREADY_OWNED,
                                         }
                                         if is_auto_review
                                         else {
@@ -3521,7 +3520,6 @@ async def handle_alias_route(  # noqa: PLR0915
                                 not in {
                                     sa.SessionOwnerMutationOutcome.RELEASED,
                                     sa.SessionOwnerMutationOutcome.NOT_HELD,
-                                    sa.SessionOwnerMutationOutcome.ALREADY_OWNED,
                                 }
                             ):
                                 sa.raise_session_owner_redispatch_required(

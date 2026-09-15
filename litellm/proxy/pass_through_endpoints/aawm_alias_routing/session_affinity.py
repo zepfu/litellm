@@ -67,6 +67,11 @@ class SessionOwnerGuardDecision(str, Enum):
     REDISPATCH_REQUIRED = "redispatch_required"
 
 
+class SessionOwnerLeasePolicy(str, Enum):
+    PERSIST_ON_COMPLETED = "persist_on_completed"
+    RELEASE_ON_TERMINAL = "release_on_terminal"
+
+
 class SessionOwnerMutationOutcome(str, Enum):
     PROMOTED = "promoted"
     ALREADY_OWNED = "already_owned"
@@ -142,6 +147,9 @@ class SessionOwnerLease:
     wire_terminal_pending: bool = False
     wire_disposition: Optional[str] = None
     last_finalization_outcome: Optional[str] = None
+    policy: SessionOwnerLeasePolicy = (
+        SessionOwnerLeasePolicy.PERSIST_ON_COMPLETED
+    )
 
 
 @dataclass(frozen=True)
@@ -151,6 +159,112 @@ class SessionOwnerLeaseRebindResult:
     rebound: bool
     rejection_reason: Optional[str] = None
     source_attributes: Optional[Mapping[str, Any]] = None
+
+
+def _normalize_session_owner_lease_policy(
+    value: Any,
+) -> SessionOwnerLeasePolicy:
+    if isinstance(value, SessionOwnerLeasePolicy):
+        return value
+    try:
+        return SessionOwnerLeasePolicy(str(value))
+    except (TypeError, ValueError):
+        return SessionOwnerLeasePolicy.PERSIST_ON_COMPLETED
+
+
+def session_owner_lease_is_release_only(
+    lease: Optional[SessionOwnerLease],
+) -> bool:
+    return (
+        lease is not None
+        and _normalize_session_owner_lease_policy(lease.policy)
+        is SessionOwnerLeasePolicy.RELEASE_ON_TERMINAL
+    )
+
+
+def session_owner_lease_success_outcomes(
+    lease: Optional[SessionOwnerLease],
+) -> set[SessionOwnerMutationOutcome]:
+    if session_owner_lease_is_release_only(lease):
+        return {
+            SessionOwnerMutationOutcome.RELEASED,
+            SessionOwnerMutationOutcome.NOT_HELD,
+        }
+    return {
+        SessionOwnerMutationOutcome.PROMOTED,
+        SessionOwnerMutationOutcome.ALREADY_OWNED,
+    }
+
+
+def _session_owner_lease_invariant_result(
+    lease: SessionOwnerLease,
+    *,
+    reason: str,
+) -> SessionOwnerMutationResult:
+    return SessionOwnerMutationResult(
+        outcome=SessionOwnerMutationOutcome.ERROR,
+        session_identity=lease.session_identity,
+        cache_key=lease.cache_key,
+        reservation_token=lease.reservation_token,
+        owner_id=lease.owner_id,
+        error=f"session_owner: lease policy invariant violated: {reason}",
+    )
+
+
+def _session_owner_lease_release_invariant(
+    lease: Optional[SessionOwnerLease],
+    *,
+    force_release_only: bool = False,
+) -> Optional[SessionOwnerMutationResult]:
+    if lease is None or not (
+        force_release_only or session_owner_lease_is_release_only(lease)
+    ):
+        return None
+    if lease.promoted:
+        return _session_owner_lease_invariant_result(
+            lease,
+            reason="release-only lease was promoted",
+        )
+    return None
+
+
+def _request_is_codex_auto_review(
+    request: Any,
+    *,
+    alias_model: Optional[str] = None,
+) -> bool:
+    normalized_alias = (
+        alias_model.strip().casefold()
+        if isinstance(alias_model, str)
+        else ""
+    )
+    return (
+        normalized_alias
+        in {
+            "codex-auto-review",
+            "auto-review",
+            "chatgpt/codex-auto-review",
+        }
+        or get_request_codex_auto_review_parent_session_identity(request)
+        is not None
+        or get_request_codex_auto_review_session_identity(request) is not None
+    )
+
+
+def resolve_session_owner_lease_policy(
+    request: Any,
+    *,
+    alias_model: Optional[str] = None,
+    existing_lease: Optional[SessionOwnerLease] = None,
+    policy: Optional[SessionOwnerLeasePolicy] = None,
+) -> SessionOwnerLeasePolicy:
+    if policy is not None:
+        return _normalize_session_owner_lease_policy(policy)
+    if _request_is_codex_auto_review(request, alias_model=alias_model):
+        return SessionOwnerLeasePolicy.RELEASE_ON_TERMINAL
+    if session_owner_lease_is_release_only(existing_lease):
+        return SessionOwnerLeasePolicy.RELEASE_ON_TERMINAL
+    return SessionOwnerLeasePolicy.PERSIST_ON_COMPLETED
 
 
 @dataclass(frozen=True)
@@ -3946,6 +4060,7 @@ def lease_from_guard_result(
     guard: SessionOwnerGuardResult,
     *,
     attributes: Optional[Mapping[str, Any]] = None,
+    policy: SessionOwnerLeasePolicy = SessionOwnerLeasePolicy.PERSIST_ON_COMPLETED,
 ) -> SessionOwnerLease:
     return SessionOwnerLease(
         session_identity=guard.session_identity,
@@ -3955,7 +4070,114 @@ def lease_from_guard_result(
         held_reservation=guard.held_reservation,
         decision=guard.decision.value,
         attributes=dict(attributes or _owner_attributes(guard.owner_record)),
+        policy=_normalize_session_owner_lease_policy(policy),
     )
+
+
+async def _release_session_owner_lease_on_terminal(
+    lease: Optional[SessionOwnerLease],
+    *,
+    request: Any = None,
+    force_release_only: bool = False,
+    respect_wire_pending: bool = True,
+) -> Optional[SessionOwnerMutationResult]:
+    if lease is None:
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_finalize",
+            source="failure",
+            outcome="no_session",
+        )
+        return None
+
+    release_only = force_release_only or session_owner_lease_is_release_only(lease)
+    invariant = _session_owner_lease_release_invariant(
+        lease,
+        force_release_only=force_release_only,
+    )
+    if invariant is not None:
+        lease.last_finalization_outcome = invariant.outcome.value
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_finalize",
+            source="failure",
+            session_identity=lease.session_identity,
+            cache_key=lease.cache_key,
+            outcome=invariant.outcome.value,
+            reason_code="mutation_failed",
+        )
+        return invariant
+    if not lease.held_reservation:
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_finalize",
+            source="failure",
+            session_identity=lease.session_identity,
+            cache_key=lease.cache_key,
+            outcome="not_held",
+        )
+        return None
+    if lease.released:
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_finalize",
+            source="failure",
+            session_identity=lease.session_identity,
+            cache_key=lease.cache_key,
+            outcome=lease.last_finalization_outcome or "already_finalized",
+        )
+        return None
+    if respect_wire_pending and lease.wire_terminal_pending:
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_finalize",
+            source="wire_terminal",
+            session_identity=lease.session_identity,
+            cache_key=lease.cache_key,
+            outcome="pending_wire_terminal",
+            held_reservation=True,
+        )
+        return None
+
+    await _barrier_session_owner_lease_renewal(lease)
+    result = await release_session_owner_reservation(
+        session_identity=lease.session_identity,
+        reservation_token=lease.reservation_token,
+    )
+    if release_only and result.outcome is SessionOwnerMutationOutcome.ALREADY_OWNED:
+        invariant = _session_owner_lease_invariant_result(
+            lease,
+            reason="release returned already_owned",
+        )
+        lease.last_finalization_outcome = invariant.outcome.value
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_finalize",
+            source="failure",
+            session_identity=lease.session_identity,
+            cache_key=lease.cache_key,
+            outcome=invariant.outcome.value,
+            reason_code="mutation_failed",
+        )
+        return invariant
+    if result.outcome in {
+        SessionOwnerMutationOutcome.RELEASED,
+        SessionOwnerMutationOutcome.NOT_HELD,
+        SessionOwnerMutationOutcome.ALREADY_OWNED,
+    }:
+        lease.released = True
+        _stop_session_owner_lease_renewal(lease)
+    lease.last_finalization_outcome = result.outcome.value
+    record_session_owner_continuity_receipt(
+        request,
+        phase="owner_finalize",
+        source="failure",
+        session_identity=lease.session_identity,
+        cache_key=lease.cache_key,
+        outcome=result.outcome.value,
+        reason_code="mutation_failed" if result.error else None,
+    )
+    return result
 
 
 async def finalize_session_owner_lease_on_success(
@@ -3970,6 +4192,19 @@ async def finalize_session_owner_lease_on_success(
             request, phase="owner_finalize", source="success", outcome="no_session"
         )
         return None
+    invariant = _session_owner_lease_release_invariant(lease)
+    if invariant is not None:
+        lease.last_finalization_outcome = invariant.outcome.value
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_finalize",
+            source="success",
+            session_identity=lease.session_identity,
+            cache_key=lease.cache_key,
+            outcome=invariant.outcome.value,
+            reason_code="mutation_failed",
+        )
+        return invariant
     if not lease.held_reservation:
         record_session_owner_continuity_receipt(
             request, phase="owner_finalize", source="success",
@@ -4001,6 +4236,12 @@ async def finalize_session_owner_lease_on_success(
             outcome="pending_wire_terminal",
         )
         return None
+    if session_owner_lease_is_release_only(lease):
+        return await _release_session_owner_lease_on_terminal(
+            lease,
+            request=request,
+            respect_wire_pending=False,
+        )
     await _barrier_session_owner_lease_renewal(lease)
     result = await promote_session_owner_reservation(
         session_identity=lease.session_identity,
@@ -4038,6 +4279,19 @@ async def finalize_session_owner_lease_on_failure(
             request, phase="owner_finalize", source="failure", outcome="no_session"
         )
         return None
+    invariant = _session_owner_lease_release_invariant(lease)
+    if invariant is not None:
+        lease.last_finalization_outcome = invariant.outcome.value
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_finalize",
+            source="failure",
+            session_identity=lease.session_identity,
+            cache_key=lease.cache_key,
+            outcome=invariant.outcome.value,
+            reason_code="mutation_failed",
+        )
+        return invariant
     if not lease.held_reservation:
         record_session_owner_continuity_receipt(
             request, phase="owner_finalize", source="failure",
@@ -4062,29 +4316,11 @@ async def finalize_session_owner_lease_on_failure(
     if lease.wire_terminal_pending and lease.wire_disposition is None:
         lease.wire_disposition = "failed"
         lease.wire_terminal_pending = False
-    await _barrier_session_owner_lease_renewal(lease)
-    result = await release_session_owner_reservation(
-        session_identity=lease.session_identity,
-        reservation_token=lease.reservation_token,
+    return await _release_session_owner_lease_on_terminal(
+        lease,
+        request=request,
+        respect_wire_pending=False,
     )
-    if result.outcome in {
-        SessionOwnerMutationOutcome.RELEASED,
-        SessionOwnerMutationOutcome.NOT_HELD,
-        SessionOwnerMutationOutcome.ALREADY_OWNED,
-    }:
-        lease.released = True
-        _stop_session_owner_lease_renewal(lease)
-    lease.last_finalization_outcome = result.outcome.value
-    record_session_owner_continuity_receipt(
-        request,
-        phase="owner_finalize",
-        source="failure",
-        session_identity=lease.session_identity,
-        cache_key=lease.cache_key,
-        outcome=result.outcome.value,
-        reason_code="mutation_failed" if result.error else None,
-    )
-    return result
 
 
 def defer_session_owner_lease_until_wire_terminal(request: Any) -> bool:
@@ -4114,7 +4350,22 @@ async def finalize_session_owner_lease_on_wire_disposition(
     """Finalize one deferred lease from the immutable final-wire decision."""
 
     lease = get_request_session_owner_lease(request)
-    if lease is None or not lease.held_reservation or lease.promoted or lease.released:
+    if lease is None:
+        return None
+    invariant = _session_owner_lease_release_invariant(lease)
+    if invariant is not None:
+        lease.last_finalization_outcome = invariant.outcome.value
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_finalize",
+            source="wire_terminal",
+            session_identity=lease.session_identity,
+            cache_key=lease.cache_key,
+            outcome=invariant.outcome.value,
+            reason_code="mutation_failed",
+        )
+        return invariant
+    if not lease.held_reservation or lease.released or lease.promoted:
         return None
     if lease.wire_disposition is not None:
         return None
@@ -4155,6 +4406,26 @@ async def finalize_request_session_owner_lease(
             request, phase="owner_finalize", source="request_lease", outcome="no_session"
         )
         return None
+    invariant = _session_owner_lease_release_invariant(active)
+    if invariant is not None:
+        active.last_finalization_outcome = invariant.outcome.value
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_finalize",
+            source="request_lease",
+            session_identity=active.session_identity,
+            cache_key=active.cache_key,
+            outcome=invariant.outcome.value,
+            reason_code="mutation_failed",
+        )
+        if raise_on_promote_failure:
+            raise_session_owner_redispatch_required(
+                session_identity=active.session_identity,
+                mutation=invariant,
+                failure_phase=failure_phase,
+                request=request,
+            )
+        return invariant
     if not active.held_reservation:
         record_session_owner_continuity_receipt(
             request, phase="owner_finalize", source="request_lease",
@@ -4306,10 +4577,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
     if success_finalizer is None:
         success_finalizer = _promote
     if success_outcomes is None:
-        success_outcomes = {
-            SessionOwnerMutationOutcome.PROMOTED,
-            SessionOwnerMutationOutcome.ALREADY_OWNED,
-        }
+        success_outcomes = session_owner_lease_success_outcomes(lease)
 
     def _validation_status() -> tuple[bool, str]:
         state = getattr(response, "_aawm_responses_validation_state", None)
@@ -6636,6 +6904,7 @@ async def ensure_session_owner_guard_for_request(
     alias_model: Optional[str] = None,
     failure_phase: str = "session_owner_pre_egress",
     raise_on_redispatch: bool = True,
+    policy: Optional[SessionOwnerLeasePolicy] = None,
 ) -> SessionOwnerGuardResult:
     """Idempotent request-scoped guard used by every route family.
 
@@ -6649,12 +6918,19 @@ async def ensure_session_owner_guard_for_request(
         session_identity=session_identity,
     )
     existing = get_request_session_owner_lease(request)
+    lease_policy = resolve_session_owner_lease_policy(
+        request,
+        alias_model=alias_model,
+        existing_lease=existing,
+        policy=policy,
+    )
     active_lease = (
         existing
         if existing is not None and not existing.released and not existing.promoted
         else None
     )
     if active_lease is not None:
+        active_lease.policy = lease_policy
         lease_identity = _clean_optional_str(active_lease.session_identity)
         identities_match = (
             resolved_session_identity is not None
@@ -6755,12 +7031,14 @@ async def ensure_session_owner_guard_for_request(
         active_lease.owner_id = guard.owner_id or active_lease.owner_id
         active_lease.promoted = False
         active_lease.released = False
+        active_lease.policy = lease_policy
         set_request_session_owner_lease(request, active_lease)
     else:
         lease = lease_from_guard_result(
             guard,
             attributes=requested_attributes
             or (active_lease.attributes if active_lease is not None else None),
+            policy=lease_policy,
         )
         set_request_session_owner_lease(request, lease)
     return guard
@@ -6817,18 +7095,7 @@ async def finalize_codex_auto_review_lease_on_success(
     free candidate selection on the next review.
     """
 
-    if lease is None or not lease.held_reservation or lease.promoted or lease.released:
-        return None
-    await _barrier_session_owner_lease_renewal(lease)
-    result = await release_session_owner_reservation(
-        session_identity=lease.session_identity,
-        reservation_token=lease.reservation_token,
+    return await _release_session_owner_lease_on_terminal(
+        lease,
+        force_release_only=True,
     )
-    if result.outcome in {
-        SessionOwnerMutationOutcome.RELEASED,
-        SessionOwnerMutationOutcome.NOT_HELD,
-        SessionOwnerMutationOutcome.ALREADY_OWNED,
-    }:
-        lease.released = True
-        _stop_session_owner_lease_renewal(lease)
-    return result
