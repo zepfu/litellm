@@ -8623,7 +8623,13 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
 
     client_requested_stream = bool(request_body.get("stream"))
     requested_tools = bool(request_body.get("tools"))
-    requested_tool_choice = request_body.get("tool_choice") is not None
+    raw_tool_choice = request_body.get("tool_choice")
+    nous_auto_tool_choice = (
+        isinstance(raw_tool_choice, str) and raw_tool_choice == "auto"
+    )
+    requested_tool_choice = (
+        raw_tool_choice is not None and not nous_auto_tool_choice
+    )
     if use_alias_candidate_probe and (
         client_requested_stream
         or requested_tools
@@ -8763,6 +8769,8 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
         adapted_request_body,
         _removed_tool_choice,
     ) = drop_tool_choice(adapted_request_body)
+    if nous_auto_tool_choice:
+        adapted_request_body.pop("tool_choice", None)
     # Keep the qualified candidate identity for catalog-backed policy lookups,
     # but send the resolver's stripped model name to Nous egress.
     adapted_request_body["model"] = adapter_model
