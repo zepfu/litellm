@@ -241,7 +241,8 @@ class CohereV2ModelResponseIterator:
         self._tool_calls: Dict[int, Dict[str, Any]] = {}
         self._tool_call_indexes: Dict[str, int] = {}
         self._next_tool_index = 0
-        self._accumulated_json = ""
+        self._pending_sse_payloads: List[str] = []
+        self._message_end_received = False
 
     @staticmethod
     def _empty_chunk() -> GenericStreamingChunk:
@@ -263,52 +264,73 @@ class CohereV2ModelResponseIterator:
             return value
         return json.dumps(value, ensure_ascii=False)
 
-    def _extract_sse_payload(
-        self, chunk: Union[str, bytes, dict]
-    ) -> Optional[str]:
+    def _extract_sse_payloads(self, chunk: Union[str, bytes, dict]) -> List[str]:
         if isinstance(chunk, bytes):
             chunk = chunk.decode("utf-8")
         if isinstance(chunk, dict):
-            return json.dumps(chunk, ensure_ascii=False)
+            return [json.dumps(chunk, ensure_ascii=False)]
         if not isinstance(chunk, str):
             raise ValueError(f"Unsupported Cohere stream chunk type: {type(chunk)}")
 
-        lines = chunk.strip().splitlines()
-        if not lines:
-            return None
+        if not chunk.strip():
+            return []
 
-        data_lines = []
-        for line in lines:
+        if not any(
+            line.strip().startswith("data:") for line in chunk.splitlines()
+        ):
+            if all(
+                not line.strip()
+                or line.strip().startswith((":", "event:"))
+                for line in chunk.splitlines()
+            ):
+                return []
+            return [chunk.strip()]
+
+        payloads: List[str] = []
+        data_lines: List[str] = []
+
+        def flush_event() -> None:
+            if data_lines:
+                payloads.append("\n".join(data_lines))
+                data_lines.clear()
+
+        for line in chunk.splitlines():
             stripped_line = line.strip()
-            if not stripped_line or stripped_line.startswith(":"):
+            if not stripped_line:
+                flush_event()
+                continue
+            if stripped_line.startswith(":") or stripped_line.startswith("event:"):
                 continue
             if stripped_line.startswith("data:"):
                 data_lines.append(stripped_line[5:].lstrip())
 
-        if data_lines:
-            return "".join(data_lines)
+        flush_event()
+        return payloads
 
-        if all(
-            not line.strip() or line.strip().startswith((":", "event:"))
-            for line in lines
-        ):
-            return None
-        return chunk.strip()
+    def _validate_stream_end(self) -> None:
+        if self._pending_sse_payloads:
+            raise ValueError("Cohere stream ended with unconsumed SSE data")
+        if not self._message_end_received:
+            raise ValueError("Cohere stream ended without a native message-end event")
 
-    def _parse_sse_json(self, chunk: Union[str, bytes, dict]) -> Optional[dict]:
-        payload = self._extract_sse_payload(chunk)
-        if payload is None:
+    def _parse_sse_json(
+        self, chunk: Optional[Union[str, bytes, dict]] = None
+    ) -> Optional[dict]:
+        if chunk is not None:
+            self._pending_sse_payloads.extend(self._extract_sse_payloads(chunk))
+        if not self._pending_sse_payloads:
             return None
+
+        payload = self._pending_sse_payloads.pop(0).strip()
         if payload == "[DONE]":
+            self._validate_stream_end()
             raise StopIteration
 
-        self._accumulated_json += payload
         try:
-            parsed_chunk = json.loads(self._accumulated_json)
-        except json.JSONDecodeError:
-            return None
+            parsed_chunk = json.loads(payload)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Malformed Cohere stream JSON: {e.msg}") from e
 
-        self._accumulated_json = ""
         if not isinstance(parsed_chunk, dict):
             raise ValueError(f"Expected Cohere stream event object, got {parsed_chunk!r}")
         return parsed_chunk
@@ -528,6 +550,7 @@ class CohereV2ModelResponseIterator:
             elif chunk_type == "citation-start":
                 provider_specific_fields = self._parse_citation_start(chunk)
             elif chunk_type == "message-end":
+                self._message_end_received = True
                 (
                     is_finished,
                     finish_reason,
@@ -563,15 +586,23 @@ class CohereV2ModelResponseIterator:
 
     def __next__(self):
         while True:
+            chunk = None
             try:
-                chunk = self.response_iterator.__next__()
+                if self._pending_sse_payloads:
+                    parsed_chunk = self._parse_sse_json()
+                else:
+                    chunk = self.response_iterator.__next__()
+                    parsed_chunk = self._parse_sse_json(chunk=chunk)
             except StopIteration:
+                try:
+                    self._validate_stream_end()
+                except ValueError as e:
+                    raise RuntimeError(f"Error parsing stream termination: {e}") from e
                 raise StopIteration
             except ValueError as e:
                 raise RuntimeError(f"Error receiving chunk from stream: {e}")
 
             try:
-                parsed_chunk = self._parse_sse_json(chunk=chunk)
                 if parsed_chunk is None:
                     continue
                 return self.chunk_parser(chunk=parsed_chunk)
@@ -600,19 +631,37 @@ class CohereV2ModelResponseIterator:
 
     async def __anext__(self):
         while True:
+            chunk = None
             try:
-                chunk = await self.async_response_iterator.__anext__()
+                if self._pending_sse_payloads:
+                    parsed_chunk = self._parse_sse_json()
+                else:
+                    chunk = await self.async_response_iterator.__anext__()
+                    parsed_chunk = self._parse_sse_json(chunk=chunk)
+            except StopIteration:
+                try:
+                    self._validate_stream_end()
+                except ValueError as e:
+                    raise RuntimeError(f"Error parsing stream termination: {e}") from e
+                raise StopAsyncIteration
             except StopAsyncIteration:
+                try:
+                    self._validate_stream_end()
+                except ValueError as e:
+                    raise RuntimeError(f"Error parsing stream termination: {e}") from e
                 raise StopAsyncIteration
             except ValueError as e:
                 raise RuntimeError(f"Error receiving chunk from stream: {e}")
 
             try:
-                parsed_chunk = self._parse_sse_json(chunk=chunk)
                 if parsed_chunk is None:
                     continue
                 return self.chunk_parser(chunk=parsed_chunk)
             except StopIteration:
+                try:
+                    self._validate_stream_end()
+                except ValueError as e:
+                    raise RuntimeError(f"Error parsing stream termination: {e}") from e
                 raise StopAsyncIteration
             except StopAsyncIteration:
                 raise StopAsyncIteration
