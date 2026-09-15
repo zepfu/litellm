@@ -7931,7 +7931,10 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
     try:
         # The provider-prefixed catalog row is the source of truth for the
         # wire shape. Unknown rows retain the historical chat path.
-        model_info = litellm.get_model_info(f"opencode/{adapter_model}")
+        model_info = litellm.get_model_info(
+            f"opencode/{adapter_model}",
+            custom_llm_provider="opencode_go",
+        )
     except Exception:
         model_info = None
     if (
