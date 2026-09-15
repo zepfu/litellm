@@ -10085,6 +10085,16 @@
         "max_output_tokens": 64000,
         "max_tokens": 64000,
         "mode": "chat",
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
         "provider_specific_entry": {
             "cohere": {
                 "aawm_reference_pricing": {
@@ -10124,6 +10134,7 @@
         "supports_tool_choice": true,
         "unsupported_hosted_tools": [
             "custom",
+            "namespace",
             "tool_search"
         ],
         "unsupported_input_item_types": [
