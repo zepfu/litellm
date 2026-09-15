@@ -1,0 +1,16 @@
+# Diagnostic OpenRouter-first alias with an OpenAI/Codex last-resort tail.
+defaults: {}
+
+aliases:
+  - name: openrouter_basic
+    candidates:
+      - provider: openrouter
+        model: openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+
+      - provider: openai
+        model: gpt-5.6-luna
+        route_family: codex_responses
+        priority: 0
+        reasoning_effort: low

@@ -1,0 +1,16 @@
+# Diagnostic NVIDIA-first alias with an OpenAI/Codex last-resort tail.
+defaults: {}
+
+aliases:
+  - name: nvidia_basic
+    candidates:
+      - provider: nvidia
+        model: nvidia/moonshotai/kimi-k3
+        route_family: codex_nvidia_completion_adapter
+        priority: 100
+
+      - provider: openai
+        model: gpt-5.6-luna
+        route_family: codex_responses
+        priority: 0
+        reasoning_effort: low
