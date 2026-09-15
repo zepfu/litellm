@@ -1188,6 +1188,7 @@ _HOST_FUNCTION_NAMES = (
     "_perform_codex_auto_agent_alias_candidate_request",
     # Provider-specific candidate requests
     "_perform_codex_auto_agent_native_openai_request",
+    "_perform_codex_auto_agent_muse_code_responses_request",
     "_perform_codex_auto_agent_grok_native_responses_request",
     "_perform_codex_auto_agent_oa_xai_responses_request",
     "_maybe_wrap_xai_passthrough_responses_stream",
@@ -1711,6 +1712,13 @@ async def _perform_codex_auto_agent_alias_candidate_request(
             request_body=candidate_body,
         )
 
+    async def _muse_code() -> Response:
+        return await _perform_codex_auto_agent_muse_code_responses_request(
+            request=request,
+            candidate=candidate,
+            request_body=candidate_body,
+        )
+
     from functools import partial
 
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.alias_candidate_dispatch import (
@@ -1887,6 +1895,7 @@ async def _perform_codex_auto_agent_alias_candidate_request(
             cohere_provider: _cohere,
             cursor_agent_provider: _cursor_agent,
             nvidia_provider: _nvidia,
+            "muse_code": _muse_code,
         },
         route_family_handlers={
             _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER: {
@@ -5561,6 +5570,49 @@ async def _handle_codex_nvidia_completion_adapter_route(
     )
     return validated_response
 
+
+
+async def _perform_codex_auto_agent_muse_code_responses_request(
+    *,
+    request: Request,
+    candidate: dict[str, Any],
+    request_body: dict[str, Any],
+) -> Response:
+    from litellm.proxy.pass_through_endpoints.muse_code_gateway import (
+        MUSE_CODE_RESPONSES_UPSTREAM_URL,
+        MUSE_CODE_ROUTE_FAMILY,
+        proxy_muse_code_responses_candidate,
+    )
+
+    if candidate.get("route_family") != MUSE_CODE_ROUTE_FAMILY:
+        raise ValueError("Muse Code alias candidates require muse_code.")
+    adapter_model = candidate["model"]
+    response = await proxy_muse_code_responses_candidate(
+        request=request,
+        request_body=request_body,
+    )
+    response = await _validate_codex_auto_agent_responses_payload(
+        response,
+        adapter_model=adapter_model,
+        adapter="codex_auto_agent_muse_code_responses",
+        adapter_label="Muse Code",
+        intake_context=_build_malformed_tool_call_intake_context(
+            request,
+            request_body,
+            adapter="codex_auto_agent_muse_code_responses",
+            upstream_url=MUSE_CODE_RESPONSES_UPSTREAM_URL,
+            provider=MUSE_CODE_ROUTE_FAMILY,
+        ),
+        request_body=request_body,
+    )
+    if isinstance(response, StreamingResponse):
+        response = _bind_responses_wire_stream(
+            response,
+            request=request,
+            adapter_model=adapter_model,
+        )
+        setattr(response, "_aawm_session_owner_promotion_deferred", True)
+    return response
 
 
 async def _perform_codex_auto_agent_native_openai_request(

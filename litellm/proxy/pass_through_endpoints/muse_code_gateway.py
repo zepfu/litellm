@@ -7,6 +7,8 @@ When ``AAWM_MUSE_CODE_FACADE_ENABLED`` is truthy (``1`` / ``true`` /
 - Muse-shaped ``POST /responses`` forwards to ``https://api.meta.ai/v1/responses``
 - Codex ``POST /openai_passthrough/v1/responses`` with those same catalog ids
   uses the same Meta contract (no LiteLLM aliases)
+- Managed ``muse_code`` alias candidates use the same native gateway with their
+  resolved catalog model id and the existing alias retry/session lifecycle
 
 Muse TUI/exec traffic forwards the client's Meta ``Authorization: Bearer``.
 Codex traffic that only names a Muse catalog id uses the host Muse auth file
@@ -945,9 +947,11 @@ async def _proxy_muse_code_request(
     *,
     upstream_url: str,
     catalog: bool,
+    request_body: Optional[bytes] = None,
 ) -> Response:
     register_aawm_route_rollup_access_log_replacement(request)
-    request_body = await request.body()
+    if request_body is None:
+        request_body = await request.body()
     session_id = _muse_code_session_id(request)
     request_payload, route_kwargs, provider_bound_body = _build_gateway_route_state(
         request_body=request_body,
@@ -1087,6 +1091,58 @@ async def _proxy_muse_code_request(
         headers=response_headers,
         media_type=None,
     )
+
+
+async def proxy_muse_code_responses_candidate(
+    request: Request,
+    request_body: dict[str, Any],
+) -> Response:
+    """Use the native gateway for a managed alias without changing ingress state."""
+
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_body import (
+        sanitize_wire_envelope,
+    )
+
+    if not is_muse_code_facade_enabled():
+        exc = HTTPException(
+            status_code=503,
+            detail="Muse Code alias candidates require the enabled Muse Code facade.",
+        )
+        setattr(exc, "attempted_provider_call", False)
+        raise exc
+    provider_body, _ = sanitize_wire_envelope(request_body)
+    try:
+        response = await _proxy_muse_code_request(
+            request,
+            upstream_url=MUSE_CODE_RESPONSES_UPSTREAM_URL,
+            catalog=False,
+            request_body=json.dumps(
+                provider_body, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8"),
+        )
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            setattr(exc, "attempted_provider_call", False)
+        raise
+    # Direct gateway callers receive upstream statuses as Responses. Alias
+    # candidates must raise them so the existing retry/fallback loop owns them.
+    if not 200 <= response.status_code < 300:
+        exc = HTTPException(
+            status_code=response.status_code,
+            detail={
+                "error": {
+                    "message": _sanitize_gateway_error_summary(
+                        response.body,
+                        status_code=response.status_code,
+                    )
+                }
+            },
+            headers=dict(response.headers),
+        )
+        setattr(exc, "attempted_provider_call", True)
+        setattr(exc, "_aawm_provider_returned", True)
+        raise exc
+    return response
 
 
 async def maybe_proxy_muse_code_responses(request: Request) -> Optional[Response]:
