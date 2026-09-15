@@ -4260,7 +4260,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
         observe("binding", binding_outcome="missing_iterator")
         return False
 
-    def _is_xai_wire_owner_context(value: Any) -> bool:
+    def _is_terminal_wire_owner_context(value: Any) -> bool:
         if not isinstance(value, Mapping):
             return False
         provider = str(
@@ -4275,7 +4275,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
         return (
             provider == "xai"
             and route_family in _XAI_DEFERRED_STREAM_ROUTE_FAMILIES
-        )
+        ) or (provider == "muse_code" and route_family == "muse_code")
 
     request_state = getattr(request, "state", None)
     candidate_context = getattr(
@@ -4284,12 +4284,12 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
         None,
     )
     wire_trace = getattr(response, "wire_trace", None)
-    xai_wire_path = (
+    terminal_wire_path = (
         isinstance(response, OpenAIResponsesStreamingResponse)
         and wire_trace is not None
         and (
-            _is_xai_wire_owner_context(getattr(lease, "attributes", None))
-            or _is_xai_wire_owner_context(candidate_context)
+            _is_terminal_wire_owner_context(getattr(lease, "attributes", None))
+            or _is_terminal_wire_owner_context(candidate_context)
         )
     )
 
@@ -4372,12 +4372,12 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
 
     finalization_task: Optional[Any] = None
     terminal_delivered = bool(
-        xai_wire_path
+        terminal_wire_path
         and getattr(wire_trace, "terminal_wire_committed", False)
     )
 
     def _wire_terminal_success_delivered() -> bool:
-        if not xai_wire_path:
+        if not terminal_wire_path:
             return True
         return (
             bool(getattr(wire_trace, "terminal_wire_committed", False))
@@ -4786,7 +4786,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                 )
                 eof_success = (
                     _wire_terminal_success_delivered()
-                    if xai_wire_path
+                    if terminal_wire_path
                     else True
                 )
                 try:
@@ -4872,7 +4872,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                     getattr(wire_trace, "terminal_wire_committed", False)
                 )
                 if (
-                    xai_wire_path
+                    terminal_wire_path
                     and not terminal_delivered
                     and not terminal_was_committed
                     and terminal_is_committed
@@ -4916,7 +4916,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
                         phase="session_owner_reservation_renewal",
                     )
                 await original_stream_response(
-                    _send_with_owner_terminal if xai_wire_path else send
+                    _send_with_owner_terminal if terminal_wire_path else send
                 )
             except BaseException as exc:
                 observe(
