@@ -3,14 +3,21 @@
 from typing import Optional, Tuple
 
 from litellm.exceptions import UnsupportedParamsError
+from litellm.utils import (
+    _get_model_info_helper,
+    supports_function_calling,
+    supports_native_streaming,
+    supports_tool_choice,
+)
+
 from ...openai_like.chat.transformation import OpenAILikeChatConfig
 
 _NOUS_API_BASE = "https://inference-api.nousresearch.com/v1"
-_UNSUPPORTED_UNTIL_D3 = frozenset({"stream", "tools", "tool_choice"})
+_CAPABILITY_GATED_PARAMS = ("stream", "tools", "tool_choice")
 
 
 class NousChatConfig(OpenAILikeChatConfig):
-    """OpenAI-compatible Nous Portal chat config. Streaming/tools stay off until D3."""
+    """OpenAI-compatible Nous Portal chat config."""
 
     @property
     def custom_llm_provider(self) -> Optional[str]:
@@ -32,7 +39,7 @@ class NousChatConfig(OpenAILikeChatConfig):
         return api_base, api_key
 
     def get_supported_openai_params(self, model: str) -> list:
-        return [
+        supported_params = [
             "messages",
             "model",
             "temperature",
@@ -47,6 +54,25 @@ class NousChatConfig(OpenAILikeChatConfig):
             "user",
         ]
 
+        if self._supports_explicit_native_streaming(model):
+            supported_params.append("stream")
+        if supports_function_calling(model=model, custom_llm_provider="nous"):
+            supported_params.append("tools")
+        if supports_tool_choice(model=model, custom_llm_provider="nous"):
+            supported_params.append("tool_choice")
+
+        return supported_params
+
+    @staticmethod
+    def _supports_explicit_native_streaming(model: str) -> bool:
+        if not supports_native_streaming(model=model, custom_llm_provider="nous"):
+            return False
+        try:
+            model_info = _get_model_info_helper(model=model, custom_llm_provider="nous")
+        except Exception:
+            return False
+        return model_info.get("supports_native_streaming") is True
+
     def map_openai_params(
         self,
         non_default_params: dict,
@@ -55,16 +81,12 @@ class NousChatConfig(OpenAILikeChatConfig):
         drop_params: bool,
         **kwargs,
     ) -> dict:
-        for param in _UNSUPPORTED_UNTIL_D3:
-            if param in non_default_params and not drop_params:
+        supported_openai_params = self.get_supported_openai_params(model=model)
+        for param in _CAPABILITY_GATED_PARAMS:
+            if param in non_default_params and param not in supported_openai_params and not drop_params:
                 raise UnsupportedParamsError(
-                    message=(
-                        f"{param} is not supported for Nous Portal models until "
-                        "direct evidence is captured."
-                    ),
+                    message=(f"{param} is not supported for this Nous Portal model."),
                     llm_provider="nous",
                     model=model,
                 )
-        return super().map_openai_params(
-            non_default_params, optional_params, model, drop_params
-        )
+        return super().map_openai_params(non_default_params, optional_params, model, drop_params)

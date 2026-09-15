@@ -26251,7 +26251,9 @@
         "input_cost_per_token": 0,
         "litellm_provider": "nous",
         "mode": "chat",
-        "output_cost_per_token": 0
+        "output_cost_per_token": 0,
+        "supports_function_calling": true,
+        "supports_native_streaming": true
     },
     "nous/tencent/hy3:free": {
         "input_cost_per_token": 0,
