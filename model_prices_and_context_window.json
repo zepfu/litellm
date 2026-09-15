@@ -40940,7 +40940,7 @@
         "output_cost_per_token": 0,
         "cache_read_input_token_cost": 0,
         "litellm_provider": "opencode_go",
-        "mode": "chat",
+        "mode": "responses",
         "provider_specific_entry": {
             "opencode_go": {
                 "aawm_reference_pricing": {
@@ -40958,12 +40958,13 @@
                     "equivalence_status": "unverified",
                     "equivalence_evidence": "OpenCode Go Muse Spark 1.3 Contributor is a hosted route; no route-specific invoice-equivalent per-token pricing is evidenced.",
                     "source": {
-                        "kind": "live_provider_evidence",
-                        "label": "OpenCode Go Muse Spark 1.3 Contributor route",
+                        "kind": "models_dev_model_catalog",
+                        "label": "models.dev OpenCode Go Muse Spark 1.3 Contributor metadata",
                         "urls": [
-                            "https://opencode.ai/zen/go/v1"
+                            "https://raw.githubusercontent.com/anomalyco/models.dev/dev/providers/opencode-go/models/muse-spark-1.3-contributor.toml",
+                            "https://models.dev/api.json"
                         ],
-                        "version": "2026-09-15",
+                        "version": "2026-09-02",
                         "verified_on": "2026-09-15"
                     },
                     "unpriced_reason": "public_per_token_rate_unavailable"
@@ -41009,7 +41010,7 @@
             "custom_tool_call",
             "custom_tool_call_output"
         ],
-        "source": "https://opencode.ai/zen/go/v1"
+        "source": "https://raw.githubusercontent.com/anomalyco/models.dev/dev/providers/opencode-go/models/muse-spark-1.3-contributor.toml"
     },
     "opencode/omen-alpha": {
         "comment": "OpenCode Go Omen Alpha hosted route is deprecated upstream; per-request invoice cost is not exposed as public per-token pricing.",
@@ -41020,7 +41021,7 @@
         "output_cost_per_token": 0,
         "cache_read_input_token_cost": 0,
         "litellm_provider": "opencode_go",
-        "mode": "chat",
+        "mode": "responses",
         "provider_specific_entry": {
             "opencode_go": {
                 "aawm_reference_pricing": {
@@ -41038,12 +41039,13 @@
                     "equivalence_status": "unverified",
                     "equivalence_evidence": "OpenCode Go Omen Alpha is a hosted route; no route-specific invoice-equivalent per-token pricing is evidenced.",
                     "source": {
-                        "kind": "live_provider_evidence",
-                        "label": "OpenCode Go Omen Alpha route",
+                        "kind": "models_dev_model_catalog",
+                        "label": "models.dev OpenCode Go Omen Alpha metadata",
                         "urls": [
-                            "https://opencode.ai/zen/go/v1"
+                            "https://raw.githubusercontent.com/anomalyco/models.dev/dev/providers/opencode-go/models/omen-alpha.toml",
+                            "https://models.dev/api.json"
                         ],
-                        "version": "2026-09-15",
+                        "version": "2026-09-04",
                         "verified_on": "2026-09-15"
                     },
                     "unpriced_reason": "public_per_token_rate_unavailable"
@@ -41055,9 +41057,6 @@
         "supports_response_schema": true,
         "supports_reasoning": true,
         "supports_vision": true,
-        "supports_audio_input": false,
-        "supports_pdf_input": false,
-        "supports_video_input": false,
         "custom_tool_function_adapters": [
             "apply_patch"
         ],
@@ -41089,7 +41088,7 @@
             "custom_tool_call",
             "custom_tool_call_output"
         ],
-        "source": "https://opencode.ai/zen/go/v1"
+        "source": "https://raw.githubusercontent.com/anomalyco/models.dev/dev/providers/opencode-go/models/omen-alpha.toml"
     },
     "opencode/ox-alpha-free": {
         "max_tokens": 200000,
