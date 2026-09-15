@@ -276,11 +276,17 @@ These Codex aliases select a native provider first, then OpenAI
 | `nvidia_basic` | `nvidia/moonshotai/kimi-k3` |
 | `cohere_basic` | `cohere/north-mini-code-1-0` |
 | `nous_basic` | `nous/meituan/longcat-2.0:free` |
+| `opencode_basic` | OpenCode Go `muse-spark-1.3-contributor`, then `omen-alpha` |
 
 Native candidates have no configured reasoning-effort override. Provider
 capability and admission checks still apply; configuring an alias does not
 establish upstream availability or tool support. Native acceptance requires
 the actual provider/model and tool results, not a successful Luna fallback.
+
+OpenCode Go selects its native Responses endpoint for models whose catalog
+mode is `responses`; chat-mode candidates retain the existing chat endpoint.
+Contributor uses Responses, while Omen remains chat. Omen is deprecated in the
+upstream catalog; its configured presence does not establish availability.
 
 ## Candidate failure fall-through
 
