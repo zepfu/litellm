@@ -11,6 +11,11 @@ Implement LiteLLM-owned behavior here and preserve compatibility with the
 unmodified stock Codex client. A Codex fork, patch, custom build, or deployment
 requires explicit operator authorization for work in that repository.
 
+New provider integrations must include registration and native dispatch through
+the shared AAWM alias system, including its existing fallback and continuation
+handling. Direct-model support alone is incomplete. Subsequent aliases for a
+supported provider must require only configuration, not alias-specific code.
+
 Anthropic/Claude models must use Claude-native or Anthropic-native egress with
 credentials accepted for that route. Never route those models through Codex,
 ChatGPT OAuth, an OpenAI/Codex adapter, or another provider's egress. This
