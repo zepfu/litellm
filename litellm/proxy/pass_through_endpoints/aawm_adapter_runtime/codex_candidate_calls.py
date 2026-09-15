@@ -8023,7 +8023,41 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
         import json as _json
 
         canonical_request_body = deepcopy(request_body)
-        adapted_request_body = deepcopy(canonical_request_body)
+        adapted_request_body = normalize_codex_collaboration_dispatch_body(
+            deepcopy(request_body)
+        )
+        input_items = adapted_request_body.get("input")
+        if isinstance(input_items, list):
+            provider_input_items = list(input_items)
+            agent_messages_rewritten = False
+            for index, item in enumerate(input_items):
+                if not isinstance(item, dict) or item.get("type") != "agent_message":
+                    continue
+                content = item.get("content")
+                if isinstance(content, list):
+                    visible_text = "\n".join(
+                        part["text"]
+                        for part in content
+                        if isinstance(part, dict)
+                        and part.get("type") in {"input_text", "text"}
+                        and isinstance(part.get("text"), str)
+                    )
+                elif isinstance(content, str):
+                    visible_text = content
+                else:
+                    visible_text = ""
+                role = item.get("role")
+                if not isinstance(role, str) or not role.strip():
+                    role = "user"
+                provider_input_items[index] = {
+                    "type": "message",
+                    "role": role,
+                    "content": visible_text,
+                }
+                agent_messages_rewritten = True
+            if agent_messages_rewritten:
+                adapted_request_body = dict(adapted_request_body)
+                adapted_request_body["input"] = provider_input_items
         (
             adapted_request_body,
             _adapted_custom_tools,
