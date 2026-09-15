@@ -8169,9 +8169,14 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
 ) -> Response:
     import json as _json
 
+    from fastapi.responses import StreamingResponse
+
     import litellm
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
         _serialize_responses_adapter_response as _serialize_nous_response,
+    )
+    from litellm.responses.litellm_completion_transformation.streaming_iterator import (
+        LiteLLMCompletionStreamingIterator,
     )
     from litellm.responses.litellm_completion_transformation.transformation import (
         LiteLLMCompletionResponsesConfig,
@@ -8182,44 +8187,87 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
     from litellm.secret_managers.hermes_nous_auth import load_nous_invoke_jwt
 
     _ = endpoint, fastapi_response, user_api_key_dict
+    request_body = dict(prepared_request_body)
+    request_body["model"] = adapter_model
+    client_requested_stream = (
+        use_alias_candidate_probe and bool(request_body.get("stream"))
+    )
+    requested_tools = bool(request_body.get("tools"))
+    requested_tool_choice = request_body.get("tool_choice") is not None
+    requested_parallel_tool_calls = (
+        request_body.get("parallel_tool_calls") is not None
+    )
     if use_alias_candidate_probe and (
-        bool(prepared_request_body.get("stream"))
-        or bool(prepared_request_body.get("tools"))
-        or bool(prepared_request_body.get("tool_choice"))
+        client_requested_stream
+        or requested_tools
+        or requested_tool_choice
+        or requested_parallel_tool_calls
     ):
         from litellm.proxy._types import ProxyException
 
-        incompatibility = ValueError(
-            "Nous stealth/ox-alpha cannot accept the stock Codex "
-            "streaming and tool request contract."
+        try:
+            model_info = litellm.get_model_info(
+                model=adapter_model,
+                custom_llm_provider="nous",
+            )
+        except Exception:
+            model_info = {}
+
+        if not isinstance(model_info, dict):
+            model_info = {}
+        supports_streaming = model_info.get("supports_streaming")
+        if supports_streaming is None:
+            supports_streaming = model_info.get("supports_native_streaming")
+        supports_function_calling = model_info.get("supports_function_calling")
+        supports_tool_choice = model_info.get("supports_tool_choice")
+        supports_parallel_function_calling = model_info.get(
+            "supports_parallel_function_calling"
         )
-        message = (
-            "Nous auto-agent candidate is incompatible with the "
-            "requested Codex streaming or tool contract."
-        )
-        exc = ProxyException(
-            message=message,
-            type="invalid_request_error",
-            param="model",
-            code=400,
-        )
-        setattr(exc, "candidate_status", "ineligible")
-        setattr(exc, "ineligibility_reason", "contract_incompatible")
-        setattr(exc, "failure_phase", "candidate_preflight")
-        setattr(exc, "attempted_provider_call", False)
-        setattr(
-            exc,
-            "detail",
-            {
-                "error": {
-                    "message": message,
-                    "code": "aawm_codex_auto_agent_candidate_ineligible",
-                }
-            },
-        )
-        raise exc from incompatibility
-    request_body = dict(prepared_request_body)
-    request_body["model"] = adapter_model
+        unsupported_capabilities = []
+        if client_requested_stream and supports_streaming is not True:
+            unsupported_capabilities.append("streaming")
+        if requested_tools and supports_function_calling is not True:
+            unsupported_capabilities.append("function_calling")
+        if requested_tool_choice and supports_tool_choice is not True:
+            unsupported_capabilities.append("tool_choice")
+        if (
+            requested_parallel_tool_calls
+            and supports_parallel_function_calling is not True
+        ):
+            unsupported_capabilities.append("parallel_function_calling")
+
+        if unsupported_capabilities:
+            incompatibility = ValueError(
+                "Nous candidate capability metadata does not support "
+                + ", ".join(unsupported_capabilities)
+            )
+            message = (
+                "Nous auto-agent candidate is incompatible with the "
+                "requested Codex contract for the selected model."
+            )
+            exc = ProxyException(
+                message=message,
+                type="invalid_request_error",
+                param="model",
+                code=400,
+            )
+            setattr(exc, "candidate_status", "ineligible")
+            setattr(exc, "ineligibility_reason", "contract_incompatible")
+            setattr(exc, "failure_phase", "candidate_preflight")
+            setattr(exc, "attempted_provider_call", False)
+            setattr(
+                exc,
+                "detail",
+                {
+                    "error": {
+                        "message": message,
+                        "code": "aawm_codex_auto_agent_candidate_ineligible",
+                    },
+                    "unsupported_capabilities": unsupported_capabilities,
+                },
+            )
+            raise exc from incompatibility
+
     request_input = request_body.get("input", "")
     responses_api_request = {
         key: value
@@ -8232,10 +8280,20 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
         input=request_input,
         responses_api_request=responses_api_request,
         custom_llm_provider="nous",
-        stream=False,
+        stream=True if client_requested_stream else None,
         metadata=litellm_metadata,
     )
     completion_kwargs["model"] = adapter_model
+    if not requested_tools:
+        completion_kwargs.pop("tools", None)
+    previous_response_id = responses_api_request.get("previous_response_id")
+    if isinstance(previous_response_id, str) and previous_response_id:
+        completion_kwargs = (
+            await LiteLLMCompletionResponsesConfig.async_responses_api_session_handler(
+                previous_response_id=previous_response_id,
+                litellm_completion_request=completion_kwargs,
+            )
+        )
     target_url = "https://inference-api.nousresearch.com/v1/chat/completions"
     try:
         api_key = load_nous_invoke_jwt()
@@ -8322,42 +8380,129 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
             except Exception:
                 pass
         raise
-    if isinstance(completion_response, dict):
-        from litellm.types.utils import ModelResponse
+    response: Response
+    if client_requested_stream:
+        response = StreamingResponse(
+            _responses_sse_from_iterator(
+                LiteLLMCompletionStreamingIterator(
+                    model=adapter_model,
+                    litellm_custom_stream_wrapper=completion_response,
+                    request_input=request_input,
+                    responses_api_request=responses_api_request,
+                    custom_llm_provider="nous",
+                    litellm_metadata=litellm_metadata,
+                ),
+                request_body=request_body,
+            ),
+            media_type="text/event-stream",
+        )
+    else:
+        if isinstance(completion_response, dict):
+            from litellm.types.utils import ModelResponse
 
-        completion_response = ModelResponse(**completion_response)
-    responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
-        chat_completion_response=completion_response,
-        request_input=request_input,
-        responses_api_request=responses_api_request,
-    )
-    try:
-        responses_api_response.object = "response"
-    except Exception:
-        pass
-    serialized = _serialize_nous_response(responses_api_response)
-    try:
-        response_body = json.loads(serialized)
-    except (TypeError, ValueError, NameError):
-        response_body = None
-    if not isinstance(response_body, dict):
+            completion_response = ModelResponse(**completion_response)
+        responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+            chat_completion_response=completion_response,
+            request_input=request_input,
+            responses_api_request=responses_api_request,
+        )
+        try:
+            responses_api_response.object = "response"
+        except Exception:
+            pass
+        serialized = _serialize_nous_response(responses_api_response)
         try:
             response_body = _json.loads(serialized)
-        except (TypeError, ValueError):
-            response_body = {"id": getattr(completion_response, "id", "resp_nous")}
-    response_body["object"] = "response"
-    return _build_responses_response_from_adapter_response(
-        response_body,
-        request_body=(
-            request_body
-            if isinstance(request_body, dict)
-            else (
-                {"litellm_metadata": litellm_metadata}
-                if isinstance(litellm_metadata, dict)
-                else None
-            )
-        ),
+        except (TypeError, ValueError, NameError):
+            response_body = None
+        if not isinstance(response_body, dict):
+            try:
+                response_body = _json.loads(serialized)
+            except (TypeError, ValueError):
+                response_body = {
+                    "id": getattr(completion_response, "id", "resp_nous")
+                }
+        response_body["object"] = "response"
+        response = _build_responses_response_from_adapter_response(
+            response_body,
+            request_body=(
+                request_body
+                if isinstance(request_body, dict)
+                else (
+                    {"litellm_metadata": litellm_metadata}
+                    if isinstance(litellm_metadata, dict)
+                    else None
+                )
+            ),
+        )
+
+    intake_context_builder = globals().get(
+        "_build_malformed_tool_call_intake_context"
     )
+    intake_context = (
+        intake_context_builder(
+            request,
+            request_body,
+            adapter="codex_nous_chat_completions_adapter",
+            upstream_url=target_url,
+            provider="nous",
+        )
+        if callable(intake_context_builder)
+        else None
+    )
+    if isinstance(response, StreamingResponse):
+        bind_timeout = globals().get(
+            "_bind_responses_stream_timeout_terminalizer"
+        )
+        if callable(bind_timeout):
+            response = bind_timeout(
+                response,
+                adapter_model=adapter_model,
+                adapter_label="Nous",
+                provider="nous",
+                intake_context=intake_context,
+                rollup_kwargs=rollup_kwargs,
+            )
+    validate_response = globals().get(
+        "_validate_codex_auto_agent_responses_payload"
+    )
+    validated_response = (
+        await validate_response(
+            response,
+            adapter_model=adapter_model,
+            adapter="codex_nous_chat_completions_adapter",
+            adapter_label="Nous",
+            intake_context=intake_context,
+            request_body=request_body,
+        )
+        if callable(validate_response)
+        else response
+    )
+    if isinstance(validated_response, StreamingResponse):
+        bind_wire = globals().get("_bind_responses_wire_stream")
+        if callable(bind_wire):
+            validated_response = bind_wire(
+                validated_response,
+                request=request,
+                adapter_model=adapter_model,
+            )
+        record_stream = globals().get(
+            "_record_adapted_completed_route_rollup_after_stream"
+        )
+        if callable(record_stream):
+            return record_stream(
+                validated_response,
+                rollup_kwargs,
+                adapter_label="Nous",
+            )
+        return validated_response
+    record_turn = globals().get("_record_adapted_completed_route_rollup_turn")
+    if callable(record_turn):
+        record_turn(
+            rollup_kwargs,
+            adapter_label="Nous",
+        )
+    return validated_response
 
 
 async def _perform_codex_auto_agent_openrouter_completion_request(  # noqa: PLR0915
