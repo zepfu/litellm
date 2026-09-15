@@ -9,8 +9,10 @@ When ``AAWM_MUSE_CODE_FACADE_ENABLED`` is truthy (``1`` / ``true`` /
   uses the same Meta contract (no LiteLLM aliases)
 - Managed ``muse_code`` alias candidates use the same native gateway with their
   resolved catalog model id and the existing alias retry/session lifecycle.
-  Their streams omit subscription-only trailers after ``response.completed``;
-  terminal response payloads and token usage remain unchanged.
+  The gateway omits subscription-only trailers after ``response.completed``
+  without changing terminal response payloads or token usage. The candidate
+  adapter restores native encrypted reasoning before egress and stamps route
+  and reasoning provenance after response validation, before stream binding.
 
 Muse TUI/exec traffic forwards the client's Meta ``Authorization: Bearer``.
 Codex traffic that only names a Muse catalog id uses the host Muse auth file
