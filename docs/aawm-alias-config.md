@@ -250,22 +250,12 @@ input-item types; it does not use hardcoded model-name checks. This describes
 managed `oa_xai` behavior only and does not claim runtime or container
 acceptance.
 
-The final candidate is mutually exclusive by originating TUI:
+The `basic` Luna fallback's YAML `reasoning_effort: low` is authoritative
+through the generic CFG-006 pipeline and replaces caller-provided reasoning.
+Luna uses the intended OpenAI/Codex OAuth route.
 
-- Claude-origin requests use native Anthropic Haiku only.
-- Codex, non-Claude, missing, and unknown origins use OpenAI
-  `gpt-5.6-luna` only.
-
-Luna's YAML `reasoning_effort: low` is authoritative through the generic
-CFG-006 pipeline and replaces caller-provided reasoning. Haiku remains
-Anthropic-native; Luna uses the intended OpenAI/Codex OAuth route. The removed
-candidates are the `qwen3.8-max-preview` promo, `kimi-for-coding`, and
-`gpt-5.4-mini`.
-
-Cost metadata for these shared candidates is route-specific. OpenRouter North
-may carry a third-party hosted reference baseline. OpenCode Big Pickle and its
-free DeepSeek route remain unpriced, and Alibaba DeepSeek V4.1 Flash is
-reference-priced only under the
+Cost metadata for these shared candidates is route-specific. Alibaba DeepSeek
+V4.1 Flash is reference-priced only under the
 subscription `actual_invoice_cost_known=false` contract, using the
 international Model Studio direct list rate rather than claiming Token Plan
 subscription invoice economics. Cursor Composer 2.5 standard and Cursor Grok
