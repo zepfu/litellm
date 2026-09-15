@@ -7811,13 +7811,18 @@ def _build_opencode_go_provider_rejection_evidence(
         elif 0 <= offending_index < len(completion_types):
             offending_type = completion_types[offending_index]
     target = str(target_url or "")
+    target_url_family = (
+        "/zen/go/v1/responses"
+        if "/zen/go/v1/responses" in target
+        else _OPENCODE_GO_CHAT_COMPLETIONS_ROUTE
+    )
     return {
         "route": "codex_opencode_go_adapter",
-        "target_url_family": _OPENCODE_GO_CHAT_COMPLETIONS_ROUTE,
+        "target_url_family": target_url_family,
         "target_url": (
             target
-            if _OPENCODE_GO_CHAT_COMPLETIONS_ROUTE in target
-            else _OPENCODE_GO_CHAT_COMPLETIONS_ROUTE
+            if target_url_family in target
+            else target_url_family
         ),
         "error": {
             "status": status_code if isinstance(status_code, int) else None,
@@ -7922,6 +7927,352 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
     )
     request_body = dict(prepared_request_body)
     request_body["model"] = adapter_model
+    model_info: Any = None
+    try:
+        # The provider-prefixed catalog row is the source of truth for the
+        # wire shape. Unknown rows retain the historical chat path.
+        model_info = litellm.get_model_info(
+            f"opencode/{adapter_model}",
+            custom_llm_provider="opencode_go",
+        )
+    except Exception:
+        model_info = None
+    if (
+        isinstance(model_info, dict)
+        and str(model_info.get("mode") or "").strip().lower() == "responses"
+    ):
+        from copy import deepcopy
+
+        import json as _json
+
+        canonical_request_body = deepcopy(request_body)
+        adapted_request_body = deepcopy(canonical_request_body)
+        (
+            adapted_request_body,
+            _adapted_custom_tools,
+        ) = _adapt_codex_custom_tools_to_functions_from_request_body(
+            adapted_request_body
+        )
+        (
+            adapted_request_body,
+            _adapted_namespace_tools,
+        ) = _adapt_codex_namespace_tools_to_functions_from_request_body(
+            adapted_request_body
+        )
+        (
+            adapted_request_body,
+            _tool_description_patch_events,
+        ) = _apply_codex_tool_description_patches_to_request_body(
+            adapted_request_body
+        )
+        (
+            adapted_request_body,
+            _unsupported_hosted_tools,
+        ) = _drop_unsupported_codex_hosted_tools_from_request_body(
+            adapted_request_body
+        )
+        drop_unsupported_request_params = globals().get(
+            "_drop_unsupported_codex_request_params_from_request_body"
+        )
+        if callable(drop_unsupported_request_params):
+            (
+                adapted_request_body,
+                _unsupported_request_params,
+            ) = drop_unsupported_request_params(adapted_request_body)
+        (
+            adapted_request_body,
+            _unsupported_input_items,
+        ) = _drop_unsupported_codex_input_items_from_request_body(
+            adapted_request_body
+        )
+        (
+            adapted_request_body,
+            _removed_tool_choice,
+        ) = _drop_tool_choice_without_tools_from_request_body(adapted_request_body)
+        litellm_metadata = dict(canonical_request_body.get("litellm_metadata") or {})
+        target_base_url = _get_opencode_go_target_base()
+        target_url = _join_opencode_zen_passthrough_url(
+            base_target_url=target_base_url,
+            endpoint="/v1/responses",
+        )
+        api_key = await _load_opencode_zen_api_key_for_candidate(
+            use_alias_candidate_probe=use_alias_candidate_probe,
+        )
+        custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
+            api_key=api_key,
+            request=request,
+        )
+        HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+            url=target_url,
+            headers=custom_headers,
+            credential_family="opencode",
+            expected_target_family="opencode",
+        )
+        _annotate_request_scope_for_adapted_access_log(
+            request, httpx.URL(target_url)
+        )
+        rollup_kwargs = _build_adapted_route_rollup_kwargs(litellm_metadata)
+        _emit_adapted_route_access_log(
+            request=request,
+            target_url=target_url,
+            request_body=canonical_request_body,
+            rollup_kwargs=rollup_kwargs,
+            adapter_label="OpenCode Go",
+            provider_bound_body=adapted_request_body,
+        )
+        # Forward only request/session correlation headers. Exact auth and
+        # OpenAI session markers stay server-owned to satisfy the egress guard.
+        opencode_responses_identity_headers = [
+            "accept",
+            "accept-encoding",
+            "content-type",
+            "traceparent",
+            "tracestate",
+            "x-aawm-session-id",
+            "x-agent-session-id",
+            "x-client-id",
+            "x-client-request-id",
+            "x-claude-session-id",
+            "x-codex-session-id",
+            "x-conversation-id",
+            "x-meta-ai-gateway-session-id",
+            "x-request-id",
+            "x-session-id",
+            "x-tbh-session-id",
+        ]
+        try:
+            response_awaitable = pass_through_request(
+                request=request,
+                target=target_url,
+                custom_headers=custom_headers,
+                user_api_key_dict=user_api_key_dict,
+                custom_body=adapted_request_body,
+                forward_headers=True,
+                allowed_forward_headers=opencode_responses_identity_headers,
+                allowed_pass_through_prefixed_headers=(
+                    opencode_responses_identity_headers
+                ),
+                blocked_pass_through_prefixed_headers=[
+                    "authorization",
+                    "api-key",
+                    "x-api-key",
+                    "proxy-authorization",
+                    "session-id",
+                    "session_id",
+                ],
+                stream=bool(adapted_request_body.get("stream")),
+                custom_llm_provider="opencode_go",
+                egress_credential_family="opencode",
+                expected_target_family="opencode",
+                retryable_upstream_status_codes=[
+                    429,
+                    *_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES,
+                ],
+                caller_managed_hidden_retry=True,
+                defer_session_owner_promotion=True,
+            )
+            if use_alias_candidate_probe:
+                response = await asyncio.wait_for(
+                    response_awaitable,
+                    timeout=_go_probe_timeout_seconds,
+                )
+            else:
+                response = await response_awaitable
+        except Exception as exc:
+            evidence = _build_opencode_go_provider_rejection_evidence(
+                target_url=target_url,
+                exc=exc,
+                advertised_tools=canonical_request_body.get("tools"),
+                completion_tools=adapted_request_body.get("tools"),
+                api_key=api_key,
+            )
+            _record_opencode_go_provider_rejection_evidence(request, evidence)
+            if use_alias_candidate_probe:
+                if (
+                    isinstance(exc, asyncio.TimeoutError)
+                    or evidence["error"]["status"] == 408
+                ):
+                    _raise_opencode_go_alias_candidate_upstream_timeout(exc)
+                from litellm.proxy.pass_through_endpoints.providers.common import (
+                    _opencode_go_candidate_unavailable_detail,
+                    _raise_opencode_go_auto_agent_candidate_unavailable,
+                )
+
+                if _opencode_go_candidate_unavailable_detail(exc) is not None:
+                    _raise_opencode_go_auto_agent_candidate_unavailable(exc)
+            raise
+
+        intake_context = _build_malformed_tool_call_intake_context(
+            request,
+            canonical_request_body,
+            adapter="codex_opencode_go_adapter",
+            upstream_url=target_url,
+            provider="opencode_go",
+        )
+        if isinstance(response, StreamingResponse):
+            response = _bind_responses_stream_timeout_terminalizer(
+                response,
+                adapter_model=adapter_model,
+                adapter_label="OpenCode Go",
+                provider="opencode_go",
+                intake_context=intake_context,
+                rollup_kwargs=rollup_kwargs,
+            )
+        validated_response = await _validate_codex_auto_agent_responses_payload(
+            response,
+            adapter_model=adapter_model,
+            adapter="codex_opencode_go_adapter",
+            adapter_label="OpenCode Go",
+            intake_context=intake_context,
+            request_body=canonical_request_body,
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+            _stamp_encrypted_reasoning_in_sse_event,
+            _stamp_route_identity_in_sse_event,
+            build_producer_provenance_from_egress_context,
+            stamp_encrypted_reasoning_provenance_in_response,
+            stamp_route_identity_in_response,
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
+            _iter_sse_event_blocks_with_separator,
+        )
+
+        provenance = build_producer_provenance_from_egress_context(
+            request_body=canonical_request_body,
+            custom_llm_provider="opencode_go",
+            egress_credential_family="opencode",
+            expected_target_family="opencode",
+            route_family="codex_opencode_go_adapter",
+        )
+        if isinstance(validated_response, StreamingResponse):
+            original_iterator = validated_response.body_iterator
+
+            async def _provenance_iterator() -> Any:
+                event_blocks = _iter_sse_event_blocks_with_separator(
+                    original_iterator
+                )
+                try:
+                    async for event_block, has_separator in event_blocks:
+                        lines = event_block.split("\n")
+                        data_indexes = [
+                            index
+                            for index, line in enumerate(lines)
+                            if line == "data" or line.startswith("data:")
+                        ]
+                        if data_indexes:
+                            data = "\n".join(
+                                lines[index][5:].removeprefix(" ")
+                                for index in data_indexes
+                            )
+                            try:
+                                event = _json.loads(data)
+                            except _json.JSONDecodeError:
+                                event = None
+                            if isinstance(event, dict):
+                                encrypted_changed = (
+                                    _stamp_encrypted_reasoning_in_sse_event(
+                                        event, provenance
+                                    )
+                                )
+                                identity_changed = _stamp_route_identity_in_sse_event(
+                                    event, provenance
+                                )
+                                if encrypted_changed or identity_changed:
+                                    stamped_lines = [
+                                        line
+                                        for line in lines
+                                        if line != "data"
+                                        and not line.startswith("data:")
+                                    ]
+                                    stamped_lines.insert(
+                                        data_indexes[0],
+                                        "data: "
+                                        + _json.dumps(
+                                            event,
+                                            ensure_ascii=False,
+                                            separators=(",", ":"),
+                                        ),
+                                    )
+                                    event_block = "\n".join(stamped_lines)
+                        yield event_block + ("\n\n" if has_separator else "")
+                finally:
+                    try:
+                        await event_blocks.aclose()
+                    finally:
+                        close = getattr(original_iterator, "aclose", None)
+                        if callable(close):
+                            await close()
+
+            validated_response.body_iterator = _provenance_iterator()
+            validated_response = _bind_responses_wire_stream(
+                validated_response,
+                request=request,
+                adapter_model=adapter_model,
+            )
+            setattr(validated_response, "_aawm_session_owner_promotion_deferred", True)
+            return _record_adapted_completed_route_rollup_after_stream(
+                validated_response,
+                rollup_kwargs,
+                adapter_label="OpenCode Go",
+            )
+
+        raw_response_body = getattr(validated_response, "body", None)
+        if raw_response_body is None:
+            raw_response_body = getattr(validated_response, "content", b"")
+        response_body = _json.loads(raw_response_body)
+        if not isinstance(response_body, dict):
+            response_body = {"id": "resp_opencode_go"}
+        response_body["object"] = "response"
+        restore_custom = globals().get(
+            "_restore_adapted_custom_tool_calls_in_response_body"
+        )
+        if callable(restore_custom):
+            restored_body, restored_custom_count, _custom_tool_adapter_error = (
+                restore_custom(
+                    response_body,
+                    request_body=canonical_request_body,
+                    adapter_model=adapter_model,
+                )
+            )
+            if restored_custom_count:
+                response_body = restored_body
+        restore_namespace = globals().get(
+            "_restore_adapted_namespace_tool_calls_in_response_body"
+        )
+        if callable(restore_namespace):
+            restored_body, restored_namespace_count = restore_namespace(
+                response_body,
+                request_body=canonical_request_body,
+                adapter_model=adapter_model,
+            )
+            if restored_namespace_count:
+                response_body = restored_body
+        _is_codex_auto_agent_empty_success_responses_body.__globals__.setdefault(
+            "_is_empty_success_responses_body",
+            _go_is_empty_success_responses_body,
+        )
+        _raise_codex_auto_agent_empty_success_response.__globals__.setdefault(
+            "_build_empty_success_responses_diagnostic",
+            _go_build_empty_success_diagnostic,
+        )
+        if _is_codex_auto_agent_empty_success_responses_body(response_body):
+            _raise_codex_auto_agent_empty_success_response(
+                response_body=response_body,
+                adapter_model=adapter_model,
+                adapter="codex_opencode_go_adapter",
+                adapter_label="OpenCode Go",
+            )
+        stamp_encrypted_reasoning_provenance_in_response(response_body, provenance)
+        stamp_route_identity_in_response(response_body, provenance)
+        _record_adapted_completed_route_rollup_turn(
+            rollup_kwargs,
+            adapter_label="OpenCode Go",
+        )
+        return _build_responses_response_from_adapter_response(
+            response_body,
+            request_body=canonical_request_body,
+        )
+
     advertised_tools = (
         list(request_body.get("tools") or [])
         if isinstance(request_body.get("tools"), list)

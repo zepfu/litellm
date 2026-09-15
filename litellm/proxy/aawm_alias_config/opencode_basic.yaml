@@ -1,0 +1,21 @@
+# Diagnostic OpenCode Go-first alias with an OpenAI/Codex last-resort tail.
+defaults: {}
+
+aliases:
+  - name: opencode_basic
+    candidates:
+      - provider: opencode_go
+        model: muse-spark-1.3-contributor
+        route_family: codex_opencode_go_adapter
+        priority: 100
+
+      - provider: opencode_go
+        model: omen-alpha
+        route_family: codex_opencode_go_adapter
+        priority: 90
+
+      - provider: openai
+        model: gpt-5.6-luna
+        route_family: codex_responses
+        priority: 0
+        reasoning_effort: low
