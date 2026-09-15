@@ -8167,6 +8167,7 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
     adapter_model: str,
     use_alias_candidate_probe: bool = False,
 ) -> Response:
+    import copy as _copy
     import json as _json
 
     from fastapi.responses import StreamingResponse
@@ -8189,19 +8190,24 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
     _ = endpoint, fastapi_response, user_api_key_dict
     request_body = dict(prepared_request_body)
     request_body["model"] = adapter_model
-    client_requested_stream = (
-        use_alias_candidate_probe and bool(request_body.get("stream"))
-    )
+
+    def _policy_helper(name: str) -> Any:
+        helper = globals().get(name)
+        if callable(helper):
+            return helper
+        from litellm.proxy.pass_through_endpoints import (
+            llm_passthrough_endpoints as _lpe,
+        )
+
+        return getattr(_lpe, name)
+
+    client_requested_stream = bool(request_body.get("stream"))
     requested_tools = bool(request_body.get("tools"))
     requested_tool_choice = request_body.get("tool_choice") is not None
-    requested_parallel_tool_calls = (
-        request_body.get("parallel_tool_calls") is not None
-    )
     if use_alias_candidate_probe and (
         client_requested_stream
         or requested_tools
         or requested_tool_choice
-        or requested_parallel_tool_calls
     ):
         from litellm.proxy._types import ProxyException
 
@@ -8220,9 +8226,6 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
             supports_streaming = model_info.get("supports_native_streaming")
         supports_function_calling = model_info.get("supports_function_calling")
         supports_tool_choice = model_info.get("supports_tool_choice")
-        supports_parallel_function_calling = model_info.get(
-            "supports_parallel_function_calling"
-        )
         unsupported_capabilities = []
         if client_requested_stream and supports_streaming is not True:
             unsupported_capabilities.append("streaming")
@@ -8230,11 +8233,6 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
             unsupported_capabilities.append("function_calling")
         if requested_tool_choice and supports_tool_choice is not True:
             unsupported_capabilities.append("tool_choice")
-        if (
-            requested_parallel_tool_calls
-            and supports_parallel_function_calling is not True
-        ):
-            unsupported_capabilities.append("parallel_function_calling")
 
         if unsupported_capabilities:
             incompatibility = ValueError(
@@ -8268,6 +8266,66 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
             )
             raise exc from incompatibility
 
+    canonical_request_body = _copy.deepcopy(request_body)
+    adapted_request_body = _copy.deepcopy(canonical_request_body)
+    adapt_custom_tools = _policy_helper(
+        "_adapt_codex_custom_tools_to_functions_from_request_body"
+    )
+    adapt_namespace_tools = _policy_helper(
+        "_adapt_codex_namespace_tools_to_functions_from_request_body"
+    )
+    apply_tool_description_patches = _policy_helper(
+        "_apply_codex_tool_description_patches_to_request_body"
+    )
+    drop_hosted_tools = _policy_helper(
+        "_drop_unsupported_codex_hosted_tools_from_request_body"
+    )
+    drop_input_items = _policy_helper(
+        "_drop_unsupported_codex_input_items_from_request_body"
+    )
+    drop_request_params = _policy_helper(
+        "_drop_unsupported_codex_request_params_from_request_body"
+    )
+    drop_tool_choice = _policy_helper(
+        "_drop_tool_choice_without_tools_from_request_body"
+    )
+    (
+        adapted_request_body,
+        _adapted_custom_tools,
+    ) = adapt_custom_tools(
+        adapted_request_body
+    )
+    (
+        adapted_request_body,
+        _adapted_namespace_tools,
+    ) = adapt_namespace_tools(
+        adapted_request_body
+    )
+    (
+        adapted_request_body,
+        _tool_description_patch_events,
+    ) = apply_tool_description_patches(adapted_request_body)
+    (
+        adapted_request_body,
+        _unsupported_hosted_tools,
+    ) = drop_hosted_tools(adapted_request_body)
+    (
+        adapted_request_body,
+        _unsupported_input_items,
+    ) = drop_input_items(adapted_request_body)
+    (
+        adapted_request_body,
+        _unsupported_request_params,
+    ) = drop_request_params(adapted_request_body)
+    (
+        adapted_request_body,
+        _removed_tool_choice,
+    ) = drop_tool_choice(adapted_request_body)
+    # Nous does not advertise native parallel tool calling. Keep the original
+    # request for provenance, but omit this optional field from provider egress.
+    adapted_request_body.pop("parallel_tool_calls", None)
+    request_body = adapted_request_body
+
     request_input = request_body.get("input", "")
     responses_api_request = {
         key: value
@@ -8284,7 +8342,7 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
         metadata=litellm_metadata,
     )
     completion_kwargs["model"] = adapter_model
-    if not requested_tools:
+    if not request_body.get("tools"):
         completion_kwargs.pop("tools", None)
     previous_response_id = responses_api_request.get("previous_response_id")
     if isinstance(previous_response_id, str) and previous_response_id:
@@ -8392,7 +8450,7 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
                     custom_llm_provider="nous",
                     litellm_metadata=litellm_metadata,
                 ),
-                request_body=request_body,
+                request_body=canonical_request_body,
             ),
             media_type="text/event-stream",
         )
@@ -8423,11 +8481,35 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
                     "id": getattr(completion_response, "id", "resp_nous")
                 }
         response_body["object"] = "response"
+        restore_custom = globals().get(
+            "_restore_adapted_custom_tool_calls_in_response_body"
+        )
+        if callable(restore_custom):
+            restored_body, restored_custom_count, _custom_tool_adapter_error = (
+                restore_custom(
+                    response_body,
+                    request_body=canonical_request_body,
+                    adapter_model=adapter_model,
+                )
+            )
+            if restored_custom_count:
+                response_body = restored_body
+        restore_namespace = globals().get(
+            "_restore_adapted_namespace_tool_calls_in_response_body"
+        )
+        if callable(restore_namespace):
+            restored_body, restored_namespace_count = restore_namespace(
+                response_body,
+                request_body=canonical_request_body,
+                adapter_model=adapter_model,
+            )
+            if restored_namespace_count:
+                response_body = restored_body
         response = _build_responses_response_from_adapter_response(
             response_body,
             request_body=(
-                request_body
-                if isinstance(request_body, dict)
+                canonical_request_body
+                if isinstance(canonical_request_body, dict)
                 else (
                     {"litellm_metadata": litellm_metadata}
                     if isinstance(litellm_metadata, dict)
@@ -8442,7 +8524,7 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
     intake_context = (
         intake_context_builder(
             request,
-            request_body,
+            canonical_request_body,
             adapter="codex_nous_chat_completions_adapter",
             upstream_url=target_url,
             provider="nous",
@@ -8473,7 +8555,7 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
             adapter="codex_nous_chat_completions_adapter",
             adapter_label="Nous",
             intake_context=intake_context,
-            request_body=request_body,
+            request_body=canonical_request_body,
         )
         if callable(validate_response)
         else response
