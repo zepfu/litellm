@@ -265,6 +265,23 @@ invoice cost remains unknown. Reference totals are provenance metadata and
 never standard spend or `response_cost_usd`; Luna remains the last-resort
 actual routed fallback.
 
+## Provider-specific basic aliases
+
+These Codex aliases select a native provider first, then OpenAI
+`gpt-5.6-luna` with `reasoning_effort: low` as the last resort:
+
+| Alias | Native candidate |
+| --- | --- |
+| `openrouter_basic` | `openrouter/nvidia/nemotron-3-ultra-550b-a55b:free` |
+| `nvidia_basic` | `nvidia/moonshotai/kimi-k3` |
+| `cohere_basic` | `cohere/north-mini-code-1-0` |
+| `nous_basic` | `nous/meituan/longcat-2.0:free` |
+
+Native candidates have no configured reasoning-effort override. Provider
+capability and admission checks still apply; configuring an alias does not
+establish upstream availability or tool support. Native acceptance requires
+the actual provider/model and tool results, not a successful Luna fallback.
+
 ## Candidate failure fall-through
 
 During Codex alias selection, a deterministic preflight rejection with
