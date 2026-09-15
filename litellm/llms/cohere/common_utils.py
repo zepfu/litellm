@@ -496,7 +496,33 @@ class CohereV2ModelResponseIterator:
         """Parse message-end events to extract finish info and usage."""
         delta = chunk.get("delta", {}) or {}
         is_finished = True
-        raw_finish_reason = delta.get("finish_reason") or "COMPLETE"
+        raw_finish_reason = delta.get("finish_reason")
+        normalized_finish_reason = (
+            str(raw_finish_reason).strip().upper()
+            if raw_finish_reason is not None
+            else ""
+        )
+        native_error = delta.get("error")
+        if native_error:
+            error_message = str(native_error).strip()
+            if error_message:
+                raise CohereError(
+                    status_code=(
+                        408 if normalized_finish_reason == "TIMEOUT" else 500
+                    ),
+                    message=f"Cohere streaming error: {error_message}",
+                )
+
+        if normalized_finish_reason in {"ERROR", "TIMEOUT"}:
+            raise CohereError(
+                status_code=408 if normalized_finish_reason == "TIMEOUT" else 500,
+                message=(
+                    f"Cohere streaming terminated with "
+                    f"{normalized_finish_reason.lower()}"
+                ),
+            )
+
+        raw_finish_reason = raw_finish_reason or "COMPLETE"
         finish_reason = self._FINISH_REASON_MAP.get(
             str(raw_finish_reason).upper(), str(raw_finish_reason).lower()
         )
