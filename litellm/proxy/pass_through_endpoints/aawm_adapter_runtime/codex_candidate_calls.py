@@ -41,6 +41,7 @@ from litellm.secret_managers.credential_error_sanitizer import (
 )
 
 _OPENCODE_GO_ALIAS_CANDIDATE_TIMEOUT_SECONDS = 30.0
+_NOUS_TOOL_CHOICE_ENUMS = frozenset({"auto", "none", "required"})
 _CURSOR_REPLAY_TTL_SECONDS = 600.0
 _CURSOR_REPLAY_MAX_SIZE = 256
 _CURSOR_REPLAY_REGISTRY: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -232,6 +233,70 @@ _CURSOR_CONTINUATION_FIELDS = frozenset(
 _CURSOR_REPLAY_PRESERVED_STATUS_CODES = frozenset(
     {408, 500, 502, 503, 504, 529}
 )
+
+
+def _build_nous_candidate_preflight_diagnostic(
+    *,
+    unsupported_capabilities: list[str],
+    request_body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build a bounded diagnostic for Nous contract-incompatibility rejects."""
+    tool_choice_key_present = "tool_choice" in request_body
+    tool_choice = request_body.get("tool_choice")
+    if not tool_choice_key_present:
+        tool_choice_type = "absent"
+    elif tool_choice is None:
+        tool_choice_type = "null"
+    elif isinstance(tool_choice, bool):
+        tool_choice_type = "boolean"
+    elif isinstance(tool_choice, str):
+        tool_choice_type = "string"
+    elif isinstance(tool_choice, dict):
+        tool_choice_type = "object"
+    elif isinstance(tool_choice, list):
+        tool_choice_type = "array"
+    elif isinstance(tool_choice, (int, float)):
+        tool_choice_type = "number"
+    else:
+        tool_choice_type = "other"
+
+    return {
+        "unsupported_capabilities": [
+            capability
+            for capability in unsupported_capabilities
+            if capability in {"streaming", "function_calling", "tool_choice"}
+        ],
+        "tool_choice_key_present": tool_choice_key_present,
+        "tool_choice_present": tool_choice is not None,
+        "tool_choice_type": tool_choice_type,
+        "tool_choice_enum": (
+            tool_choice
+            if isinstance(tool_choice, str)
+            and tool_choice in _NOUS_TOOL_CHOICE_ENUMS
+            else None
+        ),
+    }
+
+
+def _emit_nous_candidate_preflight_diagnostic(
+    diagnostic: Mapping[str, Any],
+) -> None:
+    """Emit only fixed-domain Nous preflight evidence to the route logger."""
+    try:
+        verbose_aawm_route_logger.warning(
+            "AAWM_NOUS_CANDIDATE_PREFLIGHT_REJECTION: %s",
+            json.dumps(
+                {
+                    "event": "nous_candidate_preflight_rejection",
+                    "diagnostic": dict(diagnostic),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+    except Exception:
+        # Diagnostic logging must never alter candidate selection or fallback.
+        pass
 
 
 class _CursorPostEgressOutputError(ValueError):
@@ -1217,6 +1282,8 @@ _HOST_FUNCTION_NAMES = (
     "_build_opencode_go_provider_rejection_evidence",
     "_record_opencode_go_provider_rejection_evidence",
     "_raise_opencode_go_alias_candidate_upstream_timeout",
+    "_build_nous_candidate_preflight_diagnostic",
+    "_emit_nous_candidate_preflight_diagnostic",
     "_handle_codex_nous_chat_completions_adapter_route",
     "_consume_opencode_zen_tools_mode_header",
     "_build_opencode_zen_completion_call_kwargs",
@@ -1335,6 +1402,7 @@ def install(
         ("_sanitize_opencode_go_error_text", _sanitize_opencode_go_error_text),
         ("_OPENCODE_GO_CHAT_COMPLETIONS_ROUTE", _OPENCODE_GO_CHAT_COMPLETIONS_ROUTE),
         ("_OPENCODE_GO_TOOLS_INDEX_RE", _OPENCODE_GO_TOOLS_INDEX_RE),
+        ("_NOUS_TOOL_CHOICE_ENUMS", _NOUS_TOOL_CHOICE_ENUMS),
     ):
         host_globals.setdefault(_name, _value)
 
@@ -7916,6 +7984,9 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
         _OPENCODE_GO_ALIAS_CANDIDATE_TIMEOUT_SECONDS as _go_probe_timeout_seconds,
     )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as _opencode_session_affinity,
+    )
     from litellm.responses.litellm_completion_transformation.transformation import (
         LiteLLMCompletionResponsesConfig,
     )
@@ -7927,6 +7998,12 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
     )
     request_body = dict(prepared_request_body)
     request_body["model"] = adapter_model
+    opencode_session_identity = (
+        _opencode_session_affinity.resolve_canonical_session_identity(
+            request,
+            request_body,
+        )
+    )
     model_info: Any = None
     try:
         # The provider-prefixed catalog row is the source of truth for the
@@ -8002,6 +8079,8 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
             api_key=api_key,
             request=request,
         )
+        if opencode_session_identity is not None:
+            custom_headers["x-opencode-session"] = opencode_session_identity
         HttpPassThroughEndpointHelpers.validate_outgoing_egress(
             url=target_url,
             headers=custom_headers,
@@ -8345,6 +8424,8 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
         api_key=api_key,
         request=request,
     )
+    if opencode_session_identity is not None:
+        custom_headers["x-opencode-session"] = opencode_session_identity
     HttpPassThroughEndpointHelpers.validate_outgoing_egress(
         url=target_url,
         headers=custom_headers,
@@ -8366,6 +8447,7 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
         "api_key": api_key,
         "api_base": f"{target_base_url.rstrip('/')}/v1",
         "litellm_metadata": litellm_metadata,
+        "extra_headers": custom_headers,
     }
     perform = globals().get("_perform_opencode_zen_completion_call")
     try:
@@ -8555,7 +8637,13 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
 
     client_requested_stream = bool(request_body.get("stream"))
     requested_tools = bool(request_body.get("tools"))
-    requested_tool_choice = request_body.get("tool_choice") is not None
+    raw_tool_choice = request_body.get("tool_choice")
+    nous_auto_tool_choice = (
+        isinstance(raw_tool_choice, str) and raw_tool_choice == "auto"
+    )
+    requested_tool_choice = (
+        raw_tool_choice is not None and not nous_auto_tool_choice
+    )
     if use_alias_candidate_probe and (
         client_requested_stream
         or requested_tools
@@ -8587,6 +8675,15 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
             unsupported_capabilities.append("tool_choice")
 
         if unsupported_capabilities:
+            nous_preflight_diagnostic = (
+                _build_nous_candidate_preflight_diagnostic(
+                    unsupported_capabilities=unsupported_capabilities,
+                    request_body=request_body,
+                )
+            )
+            _emit_nous_candidate_preflight_diagnostic(
+                nous_preflight_diagnostic,
+            )
             incompatibility = ValueError(
                 "Nous candidate capability metadata does not support "
                 + ", ".join(unsupported_capabilities)
@@ -8607,6 +8704,11 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
             setattr(exc, "attempted_provider_call", False)
             setattr(
                 exc,
+                "nous_candidate_preflight_diagnostic",
+                nous_preflight_diagnostic,
+            )
+            setattr(
+                exc,
                 "detail",
                 {
                     "error": {
@@ -8614,6 +8716,9 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
                         "code": "aawm_codex_auto_agent_candidate_ineligible",
                     },
                     "unsupported_capabilities": unsupported_capabilities,
+                    "nous_candidate_preflight_diagnostic": (
+                        nous_preflight_diagnostic
+                    ),
                 },
             )
             raise exc from incompatibility
@@ -8678,6 +8783,8 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
         adapted_request_body,
         _removed_tool_choice,
     ) = drop_tool_choice(adapted_request_body)
+    if nous_auto_tool_choice:
+        adapted_request_body.pop("tool_choice", None)
     # Keep the qualified candidate identity for catalog-backed policy lookups,
     # but send the resolver's stripped model name to Nous egress.
     adapted_request_body["model"] = adapter_model
