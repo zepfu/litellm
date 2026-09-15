@@ -5579,11 +5579,11 @@ async def _perform_codex_auto_agent_muse_code_responses_request(
     request_body: dict[str, Any],
 ) -> Response:
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+        _stamp_encrypted_reasoning_in_sse_event,
+        _stamp_route_identity_in_sse_event,
         build_producer_provenance_from_egress_context,
-        prepare_encrypted_reasoning_items_for_openai_egress,
         stamp_encrypted_reasoning_provenance_in_response,
         stamp_route_identity_in_response,
-        stamp_route_identity_in_sse_chunk,
     )
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
         _iter_sse_event_blocks_with_separator,
@@ -5597,20 +5597,19 @@ async def _perform_codex_auto_agent_muse_code_responses_request(
     if candidate.get("route_family") != MUSE_CODE_ROUTE_FAMILY:
         raise ValueError("Muse Code alias candidates require muse_code.")
     adapter_model = candidate["model"]
-    producer_provider = candidate["provider"]
     metadata = request_body.get("litellm_metadata")
     identity_request_body = {
         "model": adapter_model,
         "litellm_metadata": dict(metadata) if isinstance(metadata, Mapping) else {},
     }
-    # The candidate loop owns session compatibility. Restore only the ERP
-    # transport wrapper before the native gateway removes protocol sidecars.
-    native_request_body, _ = prepare_encrypted_reasoning_items_for_openai_egress(
-        request_body
+    provenance = build_producer_provenance_from_egress_context(
+        request_body=identity_request_body,
+        custom_llm_provider=MUSE_CODE_ROUTE_FAMILY,
+        route_family=MUSE_CODE_ROUTE_FAMILY,
     )
     response = await proxy_muse_code_responses_candidate(
         request=request,
-        request_body=native_request_body,
+        request_body=request_body,
     )
     response = await _validate_codex_auto_agent_responses_payload(
         response,
@@ -5633,12 +5632,43 @@ async def _perform_codex_auto_agent_muse_code_responses_request(
             event_blocks = _iter_sse_event_blocks_with_separator(original_iterator)
             try:
                 async for event_block, has_separator in event_blocks:
-                    yield stamp_route_identity_in_sse_chunk(
-                        event_block + ("\n\n" if has_separator else ""),
-                        request_body=identity_request_body,
-                        custom_llm_provider=producer_provider,
-                        egress_credential_family=MUSE_CODE_ROUTE_FAMILY,
-                    )
+                    lines = event_block.split("\n")
+                    data_indexes = [
+                        index
+                        for index, line in enumerate(lines)
+                        if line == "data" or line.startswith("data:")
+                    ]
+                    if data_indexes:
+                        data = "\n".join(
+                            lines[index][5:].removeprefix(" ")
+                            for index in data_indexes
+                        )
+                        try:
+                            event = json.loads(data)
+                        except json.JSONDecodeError:
+                            event = None
+                        if isinstance(event, dict):
+                            encrypted_changed = _stamp_encrypted_reasoning_in_sse_event(
+                                event, provenance
+                            )
+                            identity_changed = _stamp_route_identity_in_sse_event(
+                                event, provenance
+                            )
+                            if encrypted_changed or identity_changed:
+                                stamped_lines = [
+                                    line
+                                    for line in lines
+                                    if line != "data" and not line.startswith("data:")
+                                ]
+                                stamped_lines.insert(
+                                    data_indexes[0],
+                                    "data: "
+                                    + json.dumps(
+                                        event, ensure_ascii=False, separators=(",", ":")
+                                    ),
+                                )
+                                event_block = "\n".join(stamped_lines)
+                    yield event_block + ("\n\n" if has_separator else "")
             finally:
                 try:
                     await event_blocks.aclose()
@@ -5657,11 +5687,6 @@ async def _perform_codex_auto_agent_muse_code_responses_request(
         )
         setattr(response, "_aawm_session_owner_promotion_deferred", True)
     else:
-        provenance = build_producer_provenance_from_egress_context(
-            request_body=identity_request_body,
-            custom_llm_provider=producer_provider,
-            egress_credential_family=MUSE_CODE_ROUTE_FAMILY,
-        )
         response_body = json.loads(response.body)
         stamp_encrypted_reasoning_provenance_in_response(response_body, provenance)
         stamp_route_identity_in_response(response_body, provenance)

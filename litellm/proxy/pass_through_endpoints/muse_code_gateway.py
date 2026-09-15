@@ -1145,6 +1145,9 @@ async def proxy_muse_code_responses_candidate(
 ) -> Response:
     """Use the native gateway for a managed alias without changing ingress state."""
 
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+        unwrap_encrypted_content_with_provenance,
+    )
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_body import (
         sanitize_wire_envelope,
     )
@@ -1156,7 +1159,41 @@ async def proxy_muse_code_responses_candidate(
         )
         setattr(exc, "attempted_provider_call", False)
         raise exc
-    provider_body, _ = sanitize_wire_envelope(request_body)
+    prepared_body = request_body
+    input_items = request_body.get("input")
+    if isinstance(input_items, list):
+        restored_input = list(input_items)
+        for index, item in enumerate(input_items):
+            if not isinstance(item, dict) or item.get("type") != "reasoning":
+                continue
+            encrypted = item.get("encrypted_content")
+            if not isinstance(encrypted, str) or not encrypted.startswith("aawm_erp:"):
+                continue
+            provenance, native_content = unwrap_encrypted_content_with_provenance(
+                encrypted
+            )
+            if (
+                provenance is None
+                or not native_content
+                or native_content.startswith("aawm_erp:")
+            ):
+                exc = HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": {
+                            "code": "aawm_muse_code_invalid_encrypted_reasoning",
+                            "type": "invalid_request_error",
+                            "param": f"input[{index}].encrypted_content",
+                            "message": "Muse Code reasoning has a malformed provenance wrapper.",
+                        }
+                    },
+                )
+                setattr(exc, "attempted_provider_call", False)
+                setattr(exc, "failure_phase", "muse_code_encrypted_reasoning_pre_egress")
+                raise exc
+            restored_input[index] = {**item, "encrypted_content": native_content}
+        prepared_body = {**request_body, "input": restored_input}
+    provider_body, _ = sanitize_wire_envelope(prepared_body)
     try:
         response = await _proxy_muse_code_request(
             request,
