@@ -1,5 +1,5 @@
 import json
-from typing import List, Optional, Literal, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from litellm.llms.base_llm.base_utils import BaseLLMModelInfo
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
@@ -221,6 +221,15 @@ class ModelResponseIterator:
 class CohereV2ModelResponseIterator:
     """V2-specific response iterator for Cohere streaming"""
 
+    _FINISH_REASON_MAP = {
+        "COMPLETE": "stop",
+        "STOP_SEQUENCE": "stop",
+        "MAX_TOKENS": "length",
+        "TOOL_CALL": "tool_calls",
+        "ERROR": "error",
+        "TIMEOUT": "error",
+    }
+
     def __init__(
         self, streaming_response, sync_stream: bool, json_mode: Optional[bool] = False
     ):
@@ -229,6 +238,125 @@ class CohereV2ModelResponseIterator:
         self.content_blocks: List = []
         self.tool_index = -1
         self.json_mode = json_mode
+        self._tool_calls: Dict[int, Dict[str, Any]] = {}
+        self._tool_call_indexes: Dict[str, int] = {}
+        self._next_tool_index = 0
+        self._accumulated_json = ""
+
+    @staticmethod
+    def _empty_chunk() -> GenericStreamingChunk:
+        return GenericStreamingChunk(
+            text="",
+            tool_use=None,
+            is_finished=False,
+            finish_reason="",
+            usage=None,
+            index=0,
+            provider_specific_fields=None,
+        )
+
+    @staticmethod
+    def _stringify_tool_fragment(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, ensure_ascii=False)
+
+    def _extract_sse_payload(
+        self, chunk: Union[str, bytes, dict]
+    ) -> Optional[str]:
+        if isinstance(chunk, bytes):
+            chunk = chunk.decode("utf-8")
+        if isinstance(chunk, dict):
+            return json.dumps(chunk, ensure_ascii=False)
+        if not isinstance(chunk, str):
+            raise ValueError(f"Unsupported Cohere stream chunk type: {type(chunk)}")
+
+        lines = chunk.strip().splitlines()
+        if not lines:
+            return None
+
+        data_lines = []
+        for line in lines:
+            stripped_line = line.strip()
+            if not stripped_line or stripped_line.startswith(":"):
+                continue
+            if stripped_line.startswith("data:"):
+                data_lines.append(stripped_line[5:].lstrip())
+
+        if data_lines:
+            return "".join(data_lines)
+
+        if all(
+            not line.strip() or line.strip().startswith((":", "event:"))
+            for line in lines
+        ):
+            return None
+        return chunk.strip()
+
+    def _parse_sse_json(self, chunk: Union[str, bytes, dict]) -> Optional[dict]:
+        payload = self._extract_sse_payload(chunk)
+        if payload is None:
+            return None
+        if payload == "[DONE]":
+            raise StopIteration
+
+        self._accumulated_json += payload
+        try:
+            parsed_chunk = json.loads(self._accumulated_json)
+        except json.JSONDecodeError:
+            return None
+
+        self._accumulated_json = ""
+        if not isinstance(parsed_chunk, dict):
+            raise ValueError(f"Expected Cohere stream event object, got {parsed_chunk!r}")
+        return parsed_chunk
+
+    @staticmethod
+    def _tool_call_entries(chunk: dict) -> List[dict]:
+        delta = chunk.get("delta", {}) or {}
+        message = delta.get("message", {}) or {}
+        tool_calls = message.get("tool_calls")
+        if tool_calls is None:
+            tool_calls = delta.get("tool_calls")
+        if isinstance(tool_calls, dict):
+            return [tool_calls]
+        if isinstance(tool_calls, list):
+            return [call for call in tool_calls if isinstance(call, dict)]
+        return []
+
+    def _resolve_tool_index(self, chunk: dict, tool_call: dict, position: int = 0) -> int:
+        tool_id = tool_call.get("id") or tool_call.get("call_id")
+        if isinstance(tool_id, str) and tool_id in self._tool_call_indexes:
+            return self._tool_call_indexes[tool_id]
+
+        raw_index = tool_call.get("index")
+        if raw_index is None:
+            raw_index = chunk.get("index")
+        if raw_index is None:
+            raw_index = self._next_tool_index + position
+
+        try:
+            tool_index = int(raw_index)
+        except (TypeError, ValueError):
+            tool_index = self._next_tool_index + position
+
+        self._next_tool_index = max(self._next_tool_index, tool_index + 1)
+        if isinstance(tool_id, str) and tool_id:
+            self._tool_call_indexes[tool_id] = tool_index
+        self.tool_index = max(self.tool_index, tool_index)
+        return tool_index
+
+    def _tool_call_state(self, tool_index: int) -> Dict[str, Any]:
+        return self._tool_calls.setdefault(
+            tool_index,
+            {
+                "id": None,
+                "name": None,
+                "arguments": "",
+            },
+        )
 
     def _parse_content_delta(self, chunk: dict) -> str:
         """Parse content-delta chunks to extract text."""
@@ -245,24 +373,85 @@ class CohereV2ModelResponseIterator:
         self, chunk: dict
     ) -> Optional[ChatCompletionToolCallChunk]:
         """Parse tool-call-delta chunks to extract tool calls."""
-        delta = chunk.get("delta", {})
-        tool_calls = delta.get("tool_calls", [])
+        tool_calls = self._tool_call_entries(chunk)
+        if not tool_calls:
+            return None
+
+        tool_call = tool_calls[0]
+        tool_index = self._resolve_tool_index(chunk, tool_call)
+        state = self._tool_call_state(tool_index)
+        function = tool_call.get("function", {}) or {}
+        tool_id = tool_call.get("id") or tool_call.get("call_id")
+        name = function.get("name") or tool_call.get("name")
+        arguments = self._stringify_tool_fragment(
+            function.get("arguments", tool_call.get("arguments"))
+        )
+
+        if tool_id:
+            state["id"] = tool_id
+            self._tool_call_indexes[str(tool_id)] = tool_index
+        if name:
+            state["name"] = name
+        state["arguments"] += arguments
+
+        return {
+            "id": state["id"],
+            "type": "function",
+            "function": {
+                "name": state["name"],
+                "arguments": arguments,
+            },
+            "index": tool_index,
+        }
+
+    def _parse_tool_call_start(
+        self, chunk: dict
+    ) -> Optional[ChatCompletionToolCallChunk]:
+        """Parse a tool-call-start event and register its indexed identity."""
+        tool_calls = self._tool_call_entries(chunk)
+        if not tool_calls:
+            return None
+
+        tool_call = tool_calls[0]
+        tool_index = self._resolve_tool_index(chunk, tool_call)
+        state = self._tool_call_state(tool_index)
+        function = tool_call.get("function", {}) or {}
+        tool_id = tool_call.get("id") or tool_call.get("call_id")
+        name = function.get("name") or tool_call.get("name")
+        arguments = self._stringify_tool_fragment(
+            function.get("arguments", tool_call.get("arguments"))
+        )
+
+        if tool_id:
+            state["id"] = tool_id
+            self._tool_call_indexes[str(tool_id)] = tool_index
+        if name:
+            state["name"] = name
+        if arguments:
+            state["arguments"] = arguments
+
+        return {
+            "id": state["id"],
+            "type": "function",
+            "function": {
+                "name": state["name"],
+                "arguments": arguments,
+            },
+            "index": tool_index,
+        }
+
+    def _parse_tool_call_end(self, chunk: dict) -> None:
+        """Record the end of an indexed tool call without duplicating arguments."""
+        tool_calls = self._tool_call_entries(chunk)
         if tool_calls:
-            return {
-                "id": tool_calls[0].get("id", ""),
-                "type": "function",
-                "function": {
-                    "name": tool_calls[0].get("name", ""),
-                    "arguments": tool_calls[0].get("arguments", ""),
-                },
-            }  # type: ignore
-        return None
+            self._resolve_tool_index(chunk, tool_calls[0])
+        elif chunk.get("index") is not None:
+            self._resolve_tool_index(chunk, {})
 
     def _parse_tool_plan_delta(self, chunk: dict) -> Optional[dict]:
         """Parse tool-plan-delta events to extract tool plan."""
-        data = chunk.get("data", {})
-        delta = data.get("delta", {})
-        message = delta.get("message", {})
+        delta = chunk.get("delta", {}) or {}
+        message = delta.get("message", {}) or {}
         tool_plan = message.get("tool_plan", "")
         if tool_plan:
             return {"tool_plan": tool_plan}
@@ -270,42 +459,39 @@ class CohereV2ModelResponseIterator:
 
     def _parse_citation_start(self, chunk: dict) -> Optional[dict]:
         """Parse citation-start events to extract citations."""
-        data = chunk.get("data", {})
-        delta = data.get("delta", {})
-        message = delta.get("message", {})
-        citations = message.get("citations", {})
+        delta = chunk.get("delta", {}) or {}
+        message = delta.get("message", {}) or {}
+        citations = message.get("citations")
         if citations:
-            citation_data = {
-                "start": citations.get("start", 0),
-                "end": citations.get("end", 0),
-                "text": citations.get("text", ""),
-                "sources": citations.get("sources", []),
-                "type": citations.get("type", "TEXT_CONTENT"),
-            }
-            return {"citations": [citation_data]}
+            if isinstance(citations, dict):
+                citations = [citations]
+            return {"citations": citations}
         return None
 
     def _parse_message_end(
         self, chunk: dict
-    ) -> Tuple[bool, str, Optional[ChatCompletionUsageBlock]]:
+    ) -> Tuple[bool, str, Optional[ChatCompletionUsageBlock], Optional[str]]:
         """Parse message-end events to extract finish info and usage."""
-        data = chunk.get("data", {})
-        delta = data.get("delta", {})
+        delta = chunk.get("delta", {}) or {}
         is_finished = True
-        finish_reason = delta.get("finish_reason", "stop")
+        raw_finish_reason = delta.get("finish_reason") or "COMPLETE"
+        finish_reason = self._FINISH_REASON_MAP.get(
+            str(raw_finish_reason).upper(), str(raw_finish_reason).lower()
+        )
 
         usage = None
-        usage_data = delta.get("usage", {})
+        usage_data = delta.get("usage", {}) or {}
         if usage_data:
-            tokens_data = usage_data.get("tokens", {})
+            tokens_data = usage_data.get("tokens", {}) or {}
+            prompt_tokens = int(tokens_data.get("input_tokens", 0) or 0)
+            completion_tokens = int(tokens_data.get("output_tokens", 0) or 0)
             usage = ChatCompletionUsageBlock(
-                prompt_tokens=tokens_data.get("input_tokens", 0),
-                completion_tokens=tokens_data.get("output_tokens", 0),
-                total_tokens=tokens_data.get("input_tokens", 0)
-                + tokens_data.get("output_tokens", 0),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
             )
 
-        return is_finished, finish_reason, usage
+        return is_finished, finish_reason, usage, str(raw_finish_reason)
 
     def chunk_parser(self, chunk: dict) -> GenericStreamingChunk:
         """
@@ -313,10 +499,10 @@ class CohereV2ModelResponseIterator:
 
         v2 format:
         - Content: chunk.type == "content-delta" -> chunk.delta.message.content.text
-        - Tool calls: chunk.type == "tool-call-delta" -> chunk.delta.tool_calls
-        - Tool plan: chunk.event == "tool-plan-delta" -> chunk.data.delta.message.tool_plan
-        - Citations: chunk.event == "citation-start" -> chunk.data.delta.message.citations
-        - Finish: chunk.event == "message-end" -> chunk.data.delta.finish_reason
+        - Tool calls: chunk.type == "tool-call-{start,delta,end}"
+        - Tool plan: chunk.type == "tool-plan-delta" -> chunk.delta.message.tool_plan
+        - Citations: chunk.type == "citation-start" -> chunk.delta.message.citations
+        - Finish: chunk.type == "message-end" -> chunk.delta.finish_reason
         """
         try:
             text = ""
@@ -326,21 +512,31 @@ class CohereV2ModelResponseIterator:
             usage: Optional[ChatCompletionUsageBlock] = None
             provider_specific_fields = None
 
-            index = int(chunk.get("index", 0))
             chunk_type = chunk.get("type", "")
-            event_type = chunk.get("event", "")
 
             # Handle different chunk types
             if chunk_type == "content-delta":
                 text = self._parse_content_delta(chunk)
+            elif chunk_type == "tool-call-start":
+                tool_use = self._parse_tool_call_start(chunk)
             elif chunk_type == "tool-call-delta":
                 tool_use = self._parse_tool_call_delta(chunk)
-            elif event_type == "tool-plan-delta":
+            elif chunk_type == "tool-call-end":
+                self._parse_tool_call_end(chunk)
+            elif chunk_type == "tool-plan-delta":
                 provider_specific_fields = self._parse_tool_plan_delta(chunk)
-            elif event_type == "citation-start":
+            elif chunk_type == "citation-start":
                 provider_specific_fields = self._parse_citation_start(chunk)
-            elif event_type == "message-end":
-                is_finished, finish_reason, usage = self._parse_message_end(chunk)
+            elif chunk_type == "message-end":
+                (
+                    is_finished,
+                    finish_reason,
+                    usage,
+                    raw_finish_reason,
+                ) = self._parse_message_end(chunk)
+                provider_specific_fields = {
+                    "native_finish_reason": raw_finish_reason
+                }
 
             # Handle citations in any chunk type (fallback)
             if "citations" in chunk:
@@ -354,7 +550,7 @@ class CohereV2ModelResponseIterator:
                 is_finished=is_finished,
                 finish_reason=finish_reason,
                 usage=usage,
-                index=index,
+                index=0,
                 provider_specific_fields=provider_specific_fields,
             )
 
@@ -366,34 +562,35 @@ class CohereV2ModelResponseIterator:
         return self
 
     def __next__(self):
-        try:
-            chunk = self.response_iterator.__next__()
-        except StopIteration:
-            raise StopIteration
-        except ValueError as e:
-            raise RuntimeError(f"Error receiving chunk from stream: {e}")
+        while True:
+            try:
+                chunk = self.response_iterator.__next__()
+            except StopIteration:
+                raise StopIteration
+            except ValueError as e:
+                raise RuntimeError(f"Error receiving chunk from stream: {e}")
 
-        try:
-            return self.convert_str_chunk_to_generic_chunk(chunk=chunk)
-        except StopIteration:
-            raise StopIteration
-        except ValueError as e:
-            raise RuntimeError(f"Error parsing chunk: {e},\nReceived chunk: {chunk}")
+            try:
+                parsed_chunk = self._parse_sse_json(chunk=chunk)
+                if parsed_chunk is None:
+                    continue
+                return self.chunk_parser(chunk=parsed_chunk)
+            except StopIteration:
+                raise StopIteration
+            except ValueError as e:
+                raise RuntimeError(f"Error parsing chunk: {e},\nReceived chunk: {chunk}")
 
-    def convert_str_chunk_to_generic_chunk(self, chunk: str) -> GenericStreamingChunk:
+    def convert_str_chunk_to_generic_chunk(
+        self, chunk: Union[str, bytes, dict]
+    ) -> GenericStreamingChunk:
         """
         Convert a string chunk to a GenericStreamingChunk for v2
 
         Note: This is used for Cohere v2 pass through streaming logging
         """
-        str_line = chunk
-        if isinstance(chunk, bytes):  # Handle binary data
-            str_line = chunk.decode("utf-8")  # Convert bytes to string
-            index = str_line.find("data:")
-            if index != -1:
-                str_line = str_line[index:]
-
-        data_json = json.loads(str_line)
+        data_json = self._parse_sse_json(chunk=chunk)
+        if data_json is None:
+            return self._empty_chunk()
         return self.chunk_parser(chunk=data_json)
 
     # Async iterator
@@ -402,16 +599,22 @@ class CohereV2ModelResponseIterator:
         return self
 
     async def __anext__(self):
-        try:
-            chunk = await self.async_response_iterator.__anext__()
-        except StopAsyncIteration:
-            raise StopAsyncIteration
-        except ValueError as e:
-            raise RuntimeError(f"Error receiving chunk from stream: {e}")
+        while True:
+            try:
+                chunk = await self.async_response_iterator.__anext__()
+            except StopAsyncIteration:
+                raise StopAsyncIteration
+            except ValueError as e:
+                raise RuntimeError(f"Error receiving chunk from stream: {e}")
 
-        try:
-            return self.convert_str_chunk_to_generic_chunk(chunk=chunk)
-        except StopAsyncIteration:
-            raise StopAsyncIteration
-        except ValueError as e:
-            raise RuntimeError(f"Error parsing chunk: {e},\nReceived chunk: {chunk}")
+            try:
+                parsed_chunk = self._parse_sse_json(chunk=chunk)
+                if parsed_chunk is None:
+                    continue
+                return self.chunk_parser(chunk=parsed_chunk)
+            except StopIteration:
+                raise StopAsyncIteration
+            except StopAsyncIteration:
+                raise StopAsyncIteration
+            except ValueError as e:
+                raise RuntimeError(f"Error parsing chunk: {e},\nReceived chunk: {chunk}")
