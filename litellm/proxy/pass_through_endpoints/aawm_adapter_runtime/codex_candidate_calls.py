@@ -8189,6 +8189,7 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
 
     _ = endpoint, fastapi_response, user_api_key_dict
     request_body = dict(prepared_request_body)
+    qualified_candidate_model = request_body.get("model")
     request_body["model"] = adapter_model
 
     def _policy_helper(name: str) -> Any:
@@ -8267,6 +8268,11 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
             raise exc from incompatibility
 
     canonical_request_body = _copy.deepcopy(request_body)
+    if (
+        isinstance(qualified_candidate_model, str)
+        and qualified_candidate_model.strip()
+    ):
+        canonical_request_body["model"] = qualified_candidate_model
     adapted_request_body = _copy.deepcopy(canonical_request_body)
     adapt_custom_tools = _policy_helper(
         "_adapt_codex_custom_tools_to_functions_from_request_body"
@@ -8321,6 +8327,9 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
         adapted_request_body,
         _removed_tool_choice,
     ) = drop_tool_choice(adapted_request_body)
+    # Keep the qualified candidate identity for catalog-backed policy lookups,
+    # but send the resolver's stripped model name to Nous egress.
+    adapted_request_body["model"] = adapter_model
     # Nous does not advertise native parallel tool calling. Keep the original
     # request for provenance, but omit this optional field from provider egress.
     adapted_request_body.pop("parallel_tool_calls", None)
@@ -8489,7 +8498,9 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
                 restore_custom(
                     response_body,
                     request_body=canonical_request_body,
-                    adapter_model=adapter_model,
+                    adapter_model=canonical_request_body.get(
+                        "model", adapter_model
+                    ),
                 )
             )
             if restored_custom_count:
@@ -8501,7 +8512,9 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
             restored_body, restored_namespace_count = restore_namespace(
                 response_body,
                 request_body=canonical_request_body,
-                adapter_model=adapter_model,
+                adapter_model=canonical_request_body.get(
+                    "model", adapter_model
+                ),
             )
             if restored_namespace_count:
                 response_body = restored_body
@@ -8551,7 +8564,7 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
     validated_response = (
         await validate_response(
             response,
-            adapter_model=adapter_model,
+            adapter_model=canonical_request_body.get("model", adapter_model),
             adapter="codex_nous_chat_completions_adapter",
             adapter_label="Nous",
             intake_context=intake_context,
