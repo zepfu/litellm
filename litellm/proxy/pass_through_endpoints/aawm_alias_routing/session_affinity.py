@@ -4465,12 +4465,17 @@ async def finalize_request_session_owner_lease(
     if (
         raise_on_promote_failure
         and result is not None
-        and result.outcome
-        in {
-            SessionOwnerMutationOutcome.CONFLICT,
-            SessionOwnerMutationOutcome.ERROR,
-            SessionOwnerMutationOutcome.NOT_HELD,
-        }
+        and (
+            result.outcome
+            in {
+                SessionOwnerMutationOutcome.CONFLICT,
+                SessionOwnerMutationOutcome.ERROR,
+            }
+            or (
+                result.outcome is SessionOwnerMutationOutcome.NOT_HELD
+                and not session_owner_lease_is_release_only(active)
+            )
+        )
     ):
         raise_session_owner_redispatch_required(
             session_identity=active.session_identity,
@@ -6924,13 +6929,63 @@ async def ensure_session_owner_guard_for_request(
         existing_lease=existing,
         policy=policy,
     )
+    if existing is not None:
+        existing.policy = lease_policy
+        invariant = _session_owner_lease_release_invariant(existing)
+        if invariant is not None:
+            invariant_session_identity = (
+                existing.session_identity or resolved_session_identity
+            )
+            invariant_cache_key = existing.cache_key or (
+                build_aawm_alias_routing_session_owner_cache_key(
+                    session_identity=invariant_session_identity
+                )
+                if invariant_session_identity is not None
+                else None
+            )
+            guard = SessionOwnerGuardResult(
+                decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                session_identity=invariant_session_identity,
+                cache_key=invariant_cache_key,
+                reservation_token=existing.reservation_token,
+                owner_id=existing.owner_id,
+                mismatch_reason=invariant.error,
+                provenance=build_session_owner_provenance(
+                    session_identity=invariant_session_identity,
+                    decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,
+                    owner_id=existing.owner_id,
+                    mismatch_reason=invariant.error,
+                    cache_key=invariant_cache_key,
+                    reservation_token=existing.reservation_token,
+                ),
+            )
+            set_request_session_owner_lease(request, existing)
+            record_session_owner_continuity_receipt(
+                request,
+                phase="owner_guard",
+                source="request_lease",
+                session_identity=invariant_session_identity,
+                cache_key=invariant_cache_key,
+                outcome=guard.decision.value,
+                reason_code="guard_rejected",
+            )
+            if raise_on_redispatch:
+                raise_session_owner_redispatch_required(
+                    session_identity=guard.session_identity or session_identity,
+                    guard=guard,
+                    mutation=invariant,
+                    alias_model=alias_model,
+                    candidate=candidate or requested_attributes,
+                    failure_phase=failure_phase,
+                    request=request,
+                )
+            return guard
     active_lease = (
         existing
         if existing is not None and not existing.released and not existing.promoted
         else None
     )
     if active_lease is not None:
-        active_lease.policy = lease_policy
         lease_identity = _clean_optional_str(active_lease.session_identity)
         identities_match = (
             resolved_session_identity is not None
