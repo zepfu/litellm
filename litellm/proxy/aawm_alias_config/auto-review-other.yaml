@@ -20,9 +20,9 @@ aliases:
         priority: 90
         reasoning_effort: low
         schedule:
-          start_time: "03:00:00"
-          end_time: "23:00:00"
-          timezone: "America/Los_Angeles"
+          start_time: "18:00:00"
+          end_time: "14:00:00"
+          utc_offset: "+08:00"
 
       - provider: cursor_agent
         model: cursor_agent/composer-2.5

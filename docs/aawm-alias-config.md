@@ -350,7 +350,7 @@ OpenAI `gpt-5.6-luna` (priority 90, `reasoning_effort: low`).
 `alibaba_token_plan/deepseek-v4.1-flash` (priority 100,
 `22:00-08:00 UTC+8`), Z.AI Coding Plan
 `zai_coding_plan/glm-5.3-flash` (priority 90, admitted only from
-`03:00-23:00 America/Los_Angeles`), and Cursor Agent
+`18:00-14:00 UTC+8` daily, excluding 14:00-18:00 peak hours), and Cursor Agent
 `cursor_agent/composer-2.5` (priority 80), all at low effort.
 `codex-auto-review` remains a public name but contains only
 `alias_reference: auto-review`; both public aliases are defined in
