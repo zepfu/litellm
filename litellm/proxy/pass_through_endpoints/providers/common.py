@@ -83,7 +83,7 @@ def _opencode_go_candidate_unavailable_detail(
         normalized_status_code = int(status_code)
     except (TypeError, ValueError):
         return None
-    if normalized_status_code != 401:
+    if normalized_status_code not in {401, 403}:
         return None
 
     detail = getattr(exc, "detail", None)
@@ -105,6 +105,16 @@ def _opencode_go_candidate_unavailable_detail(
         if part is not None
     )
     normalized = " ".join(exception_text.lower().split())
+    if normalized_status_code == 403:
+        if not all(
+            marker in normalized
+            for marker in (
+                "this model collects data used to improve its quality",
+                "requires explicit opt in",
+            )
+        ):
+            return None
+        return exception_text
     if "model ox-alpha-free is not supported" not in normalized:
         return None
     return exception_text
