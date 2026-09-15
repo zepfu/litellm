@@ -9,10 +9,11 @@ When ``AAWM_MUSE_CODE_FACADE_ENABLED`` is truthy (``1`` / ``true`` /
   uses the same Meta contract (no LiteLLM aliases)
 - Managed ``muse_code`` alias candidates use the same native gateway with their
   resolved catalog model id and the existing alias retry/session lifecycle.
-  The gateway omits subscription-only trailers after ``response.completed``
-  without changing terminal response payloads or token usage. The candidate
-  adapter restores native encrypted reasoning before egress and stamps route
-  and reasoning provenance after response validation, before stream binding.
+  The gateway restores native encrypted reasoning before egress and validates
+  a bounded native epilogue before releasing unchanged completion payloads.
+  Subscription snapshots are retained separately from unchanged terminal usage.
+  The candidate adapter stamps route and reasoning provenance after response
+  validation, before stream binding.
 
 Muse TUI/exec traffic forwards the client's Meta ``Authorization: Bearer``.
 Codex traffic that only names a Muse catalog id uses the host Muse auth file
@@ -29,7 +30,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any, Optional
 
 import fastapi
@@ -75,6 +76,10 @@ MUSE_CODE_MODEL_ID_PREFIX = "muse-"
 MUSE_CODE_CATALOG_UPSTREAM_URL = "https://api.meta.ai/muse-code/models"
 MUSE_CODE_RESPONSES_UPSTREAM_URL = "https://api.meta.ai/v1/responses"
 MUSE_CODE_GATEWAY_TIMEOUT_SECONDS = 120.0
+_MUSE_CODE_ALIAS_TERMINAL_MAX_BYTES = 8 * 1024 * 1024
+_MUSE_CODE_ALIAS_EPILOGUE_MAX_BYTES = 64 * 1024
+_MUSE_CODE_ALIAS_EPILOGUE_MAX_EVENTS = 16
+_MUSE_CODE_ALIAS_EPILOGUE_TIMEOUT_SECONDS = 5.0
 AAWM_MUSE_CODE_HIDDEN_RETRY_BUDGET_SECONDS_ENV = (
     "AAWM_MUSE_CODE_HIDDEN_RETRY_BUDGET_SECONDS"
 )
@@ -833,9 +838,17 @@ async def _stream_response(
     route_kwargs: _GatewayRouteKwargs,
     session_id: str,
     provider_bound_body: Optional[dict[str, Any]] = None,
+    alias_subscription_snapshots: Optional[list[dict[str, Any]]] = None,
 ) -> AsyncIterator[bytes]:
+    body_iterator: Any = response.aiter_raw()
+    if alias_subscription_snapshots is not None:
+        body_iterator = _stream_muse_code_alias_response(
+            body_iterator,
+            subscription_snapshots=alias_subscription_snapshots,
+            on_epilogue_complete=lambda: record_aawm_route_rollup_turn(route_kwargs),
+        )
     try:
-        async for chunk in response.aiter_raw():
+        async for chunk in body_iterator:
             yield chunk
     except httpx.HTTPError:
         _log_gateway_failure(
@@ -852,9 +865,29 @@ async def _stream_response(
             or response.headers.get("x-request-id")
             or response.headers.get("x-fb-trace-id"),
         )
+        if alias_subscription_snapshots is not None:
+            raise
+    except HTTPException as exc:
+        _log_gateway_failure(
+            request=request,
+            target=target,
+            request_payload=request_payload,
+            kwargs=route_kwargs,
+            status_code=exc.status_code,
+            detail=exc.detail,
+            failure_kind="gateway_alias_epilogue_failed",
+            session_id=session_id,
+            provider_bound_body=provider_bound_body,
+            trace_id=response.headers.get("x-trace-id")
+            or response.headers.get("x-request-id")
+            or response.headers.get("x-fb-trace-id"),
+        )
+        raise
     else:
         record_aawm_route_rollup_turn(route_kwargs)
     finally:
+        if alias_subscription_snapshots is not None:
+            await body_iterator.aclose()
         await response.aclose()
         await client.aclose()
 
@@ -956,6 +989,7 @@ async def _proxy_muse_code_request(
     upstream_url: str,
     catalog: bool,
     request_body: Optional[bytes] = None,
+    alias_subscription_snapshots: Optional[list[dict[str, Any]]] = None,
 ) -> Response:
     register_aawm_route_rollup_access_log_replacement(request)
     if request_body is None:
@@ -1047,6 +1081,7 @@ async def _proxy_muse_code_request(
                 route_kwargs=route_kwargs,
                 session_id=session_id,
                 provider_bound_body=provider_bound_body,
+                alias_subscription_snapshots=alias_subscription_snapshots,
             ),
             status_code=upstream_response.status_code,
             headers=response_headers,
@@ -1101,42 +1136,138 @@ async def _proxy_muse_code_request(
     )
 
 
-async def _stream_muse_code_alias_response(
+async def _stream_muse_code_alias_response(  # noqa: PLR0915
     body_iterator: Any,
+    *,
+    subscription_snapshots: list[dict[str, Any]],
+    on_epilogue_complete: Callable[[], None],
 ) -> AsyncIterator[bytes]:
-    """Omit native subscription trailers before shared Responses validation."""
+    """Consume a bounded native epilogue before releasing unchanged completion."""
 
     buffer = b""
-    completed_seen = False
+    terminal: Optional[bytes] = None
+    done_block: Optional[bytes] = None
+    epilogue_bytes = 0
+    epilogue_events = 0
+    deadline: Optional[float] = None
+    loop = asyncio.get_running_loop()
+
+    def _failure(reason: str, *, event_type: Optional[str] = None) -> HTTPException:
+        exc = HTTPException(
+            status_code=504 if reason == "timeout" else 502,
+            detail={
+                "error": {
+                    "message": f"Muse Code native response epilogue failed: {reason}.",
+                    "type": "upstream_error",
+                    "code": (
+                        "aawm_auto_agent_invalid_responses_shape"
+                        if reason in {"malformed_event", "event_after_terminal"}
+                        else f"muse_code_epilogue_{reason}"
+                    ),
+                },
+                "diagnostic": {
+                    "terminal_seen": terminal is not None,
+                    "reason": reason,
+                    "event_type": event_type,
+                },
+            },
+        )
+        setattr(exc, "attempted_provider_call", True)
+        setattr(exc, "_aawm_provider_returned", True)
+        return exc
+
     try:
-        async for chunk in body_iterator:
+        while True:
+            eof = False
+            try:
+                if deadline is None:
+                    chunk = await body_iterator.__anext__()
+                else:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise _failure("timeout")
+                    try:
+                        chunk = await asyncio.wait_for(
+                            body_iterator.__anext__(), timeout=remaining
+                        )
+                    except asyncio.TimeoutError as exc:
+                        raise _failure("timeout") from exc
+            except StopAsyncIteration:
+                chunk = b""
+                eof = True
+            except httpx.HTTPError as exc:
+                if terminal is not None:
+                    raise _failure(f"transport_{type(exc).__name__}") from exc
+                raise
+            if terminal is not None:
+                epilogue_bytes += len(chunk)
+                if epilogue_bytes > _MUSE_CODE_ALIAS_EPILOGUE_MAX_BYTES:
+                    raise _failure("byte_limit")
             blocks, buffer = _split_sse_blocks(buffer + chunk)
+            if eof and buffer:
+                blocks.append(buffer)
+                buffer = b""
             retained_blocks: list[bytes] = []
-            for block in blocks:
+            for index, block in enumerate(blocks):
                 event_type, payload, saw_done, malformed = _parse_sse_block(block)
+                if terminal is None:
+                    if event_type == "response.completed" and not malformed:
+                        if len(block) > _MUSE_CODE_ALIAS_TERMINAL_MAX_BYTES:
+                            raise _failure("terminal_byte_limit")
+                        terminal = block
+                        deadline = (
+                            loop.time() + _MUSE_CODE_ALIAS_EPILOGUE_TIMEOUT_SECONDS
+                        )
+                        epilogue_bytes = sum(
+                            len(tail) for tail in blocks[index + 1 :]
+                        ) + len(buffer)
+                        if epilogue_bytes > _MUSE_CODE_ALIAS_EPILOGUE_MAX_BYTES:
+                            raise _failure("byte_limit")
+                    else:
+                        retained_blocks.append(block)
+                    continue
+                epilogue_events += 1
+                if epilogue_events > _MUSE_CODE_ALIAS_EPILOGUE_MAX_EVENTS:
+                    raise _failure("event_limit")
+                if malformed:
+                    raise _failure("malformed_event", event_type=event_type)
+                if payload is None and event_type is None and not saw_done:
+                    retained_blocks.append(block)
+                    continue
+                if done_block is not None:
+                    raise _failure("event_after_terminal", event_type=event_type)
+                if saw_done:
+                    done_block = block
+                    continue
                 if (
-                    completed_seen
-                    and not malformed
-                    and not saw_done
-                    and event_type == "response.subscription_usage"
+                    event_type == "response.subscription_usage"
                     and isinstance(payload, dict)
                     and payload.get("type") == "response.subscription_usage"
                     and isinstance(payload.get("subscription"), dict)
                     and payload.keys() <= {"type", "subscription"}
                 ):
+                    subscription_snapshots.append(payload["subscription"])
                     continue
-                retained_blocks.append(block)
-                if saw_done:
-                    completed_seen = False
-                elif event_type == "response.completed" and not malformed:
-                    completed_seen = True
+                raise _failure("event_after_terminal", event_type=event_type)
+            if done_block is not None and buffer.strip():
+                raise _failure("malformed_event")
+            if terminal is None and len(buffer) > _MUSE_CODE_ALIAS_TERMINAL_MAX_BYTES:
+                raise _failure("terminal_byte_limit")
             if retained_blocks:
-                # Preserve coalesced post-terminal events for strict validation.
                 yield b"".join(retained_blocks)
-        if buffer:
-            yield buffer
+            if done_block is not None or eof:
+                if terminal is not None:
+                    # The downstream coordinator closes immediately after this yield.
+                    on_epilogue_complete()
+                    yield terminal + (done_block or b"")
+                return
     finally:
-        await body_iterator.aclose()
+        try:
+            await body_iterator.aclose()
+        except Exception:
+            verbose_proxy_logger.debug(
+                "Failed to close Muse Code alias SSE iterator", exc_info=True
+            )
 
 
 async def proxy_muse_code_responses_candidate(
@@ -1194,6 +1325,7 @@ async def proxy_muse_code_responses_candidate(
             restored_input[index] = {**item, "encrypted_content": native_content}
         prepared_body = {**request_body, "input": restored_input}
     provider_body, _ = sanitize_wire_envelope(prepared_body)
+    subscription_snapshots: list[dict[str, Any]] = []
     try:
         response = await _proxy_muse_code_request(
             request,
@@ -1202,6 +1334,7 @@ async def proxy_muse_code_responses_candidate(
             request_body=json.dumps(
                 provider_body, ensure_ascii=False, separators=(",", ":")
             ).encode("utf-8"),
+            alias_subscription_snapshots=subscription_snapshots,
         )
     except HTTPException as exc:
         if exc.status_code == 401:
@@ -1226,8 +1359,8 @@ async def proxy_muse_code_responses_candidate(
         setattr(exc, "_aawm_provider_returned", True)
         raise exc
     if isinstance(response, StreamingResponse):
-        response.body_iterator = _stream_muse_code_alias_response(
-            response.body_iterator
+        setattr(
+            response, "_aawm_muse_code_subscription_snapshots", subscription_snapshots
         )
     return response
 
