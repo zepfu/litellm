@@ -8,7 +8,9 @@ When ``AAWM_MUSE_CODE_FACADE_ENABLED`` is truthy (``1`` / ``true`` /
 - Codex ``POST /openai_passthrough/v1/responses`` with those same catalog ids
   uses the same Meta contract (no LiteLLM aliases)
 - Managed ``muse_code`` alias candidates use the same native gateway with their
-  resolved catalog model id and the existing alias retry/session lifecycle
+  resolved catalog model id and the existing alias retry/session lifecycle.
+  Their streams omit subscription-only trailers after ``response.completed``;
+  terminal response payloads and token usage remain unchanged.
 
 Muse TUI/exec traffic forwards the client's Meta ``Authorization: Bearer``.
 Codex traffic that only names a Muse catalog id uses the host Muse auth file
@@ -53,6 +55,10 @@ from litellm.proxy.auth.user_api_key_auth import (
     custom_litellm_key_header as _custom_litellm_key_header,
     google_ai_studio_api_key_header as _google_ai_studio_api_key_header,
     user_api_key_auth,
+)
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_wire import (
+    _parse_sse_block,
+    _split_sse_blocks,
 )
 
 AAWM_MUSE_CODE_FACADE_ENABLED_ENV = "AAWM_MUSE_CODE_FACADE_ENABLED"
@@ -1093,6 +1099,44 @@ async def _proxy_muse_code_request(
     )
 
 
+async def _stream_muse_code_alias_response(
+    body_iterator: Any,
+) -> AsyncIterator[bytes]:
+    """Omit native subscription trailers before shared Responses validation."""
+
+    buffer = b""
+    completed_seen = False
+    try:
+        async for chunk in body_iterator:
+            blocks, buffer = _split_sse_blocks(buffer + chunk)
+            retained_blocks: list[bytes] = []
+            for block in blocks:
+                event_type, payload, saw_done, malformed = _parse_sse_block(block)
+                if (
+                    completed_seen
+                    and not malformed
+                    and not saw_done
+                    and event_type == "response.subscription_usage"
+                    and isinstance(payload, dict)
+                    and payload.get("type") == "response.subscription_usage"
+                    and isinstance(payload.get("subscription"), dict)
+                    and payload.keys() <= {"type", "subscription"}
+                ):
+                    continue
+                retained_blocks.append(block)
+                if saw_done:
+                    completed_seen = False
+                elif event_type == "response.completed" and not malformed:
+                    completed_seen = True
+            if retained_blocks:
+                # Preserve coalesced post-terminal events for strict validation.
+                yield b"".join(retained_blocks)
+        if buffer:
+            yield buffer
+    finally:
+        await body_iterator.aclose()
+
+
 async def proxy_muse_code_responses_candidate(
     request: Request,
     request_body: dict[str, Any],
@@ -1142,6 +1186,10 @@ async def proxy_muse_code_responses_candidate(
         setattr(exc, "attempted_provider_call", True)
         setattr(exc, "_aawm_provider_returned", True)
         raise exc
+    if isinstance(response, StreamingResponse):
+        response.body_iterator = _stream_muse_code_alias_response(
+            response.body_iterator
+        )
     return response
 
 
