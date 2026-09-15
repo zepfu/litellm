@@ -1144,6 +1144,11 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             choices=[],
         )
 
+    def _should_propagate_stream_errors(self) -> bool:
+        # The Cohere adapter has an outer SSE error owner; preserve failures for it
+        # instead of converting them into a synthetic successful completion.
+        return self.custom_llm_provider == "cohere"
+
     def _fallback_terminal_response_event(self) -> ResponseCompletedEvent:
         response_data = self._default_response_created_event_data()
         response_data["status"] = "completed"
@@ -1159,6 +1164,8 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         try:
             return self.common_done_event_logic(sync_mode=sync_mode)
         except Exception:
+            if self._should_propagate_stream_errors():
+                raise
             return self._fallback_terminal_response_event()
 
     def common_done_event_logic(
@@ -1366,6 +1373,8 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                 self._ensure_terminal_done_event(sync_mode=False)
             )
         except Exception as e:
+            if self._should_propagate_stream_errors():
+                raise
             # After response.created, wrapper/transform errors must still
             # close Ohmypi with a terminal Responses event. Only re-raise
             # once finished so the next pull becomes StopAsyncIteration.
@@ -1450,6 +1459,8 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                 self._ensure_terminal_done_event(sync_mode=True)
             )
         except Exception as e:
+            if self._should_propagate_stream_errors():
+                raise
             if self.finished:
                 raise e
             return self._record_response_stream_event(
@@ -1567,6 +1578,8 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
 
         It's unclear how users expect litellm to translate multiple-choices-per-chunk to the responses API output.
         """
+        if not choices:
+            return ""
         choice = choices[0]
         chat_completion_delta: ChatCompletionDelta = choice.delta
         return chat_completion_delta.content or ""
@@ -1640,4 +1653,6 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                 response=encoded_response,
             )
         except Exception:
+            if self._should_propagate_stream_errors():
+                raise
             return None
