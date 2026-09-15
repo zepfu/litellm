@@ -7984,6 +7984,9 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
         _OPENCODE_GO_ALIAS_CANDIDATE_TIMEOUT_SECONDS as _go_probe_timeout_seconds,
     )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as _opencode_session_affinity,
+    )
     from litellm.responses.litellm_completion_transformation.transformation import (
         LiteLLMCompletionResponsesConfig,
     )
@@ -7995,6 +7998,12 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
     )
     request_body = dict(prepared_request_body)
     request_body["model"] = adapter_model
+    opencode_session_identity = (
+        _opencode_session_affinity.resolve_canonical_session_identity(
+            request,
+            request_body,
+        )
+    )
     model_info: Any = None
     try:
         # The provider-prefixed catalog row is the source of truth for the
@@ -8070,6 +8079,8 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
             api_key=api_key,
             request=request,
         )
+        if opencode_session_identity is not None:
+            custom_headers["x-opencode-session"] = opencode_session_identity
         HttpPassThroughEndpointHelpers.validate_outgoing_egress(
             url=target_url,
             headers=custom_headers,
@@ -8413,6 +8424,8 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
         api_key=api_key,
         request=request,
     )
+    if opencode_session_identity is not None:
+        custom_headers["x-opencode-session"] = opencode_session_identity
     HttpPassThroughEndpointHelpers.validate_outgoing_egress(
         url=target_url,
         headers=custom_headers,
@@ -8434,6 +8447,7 @@ async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
         "api_key": api_key,
         "api_base": f"{target_base_url.rstrip('/')}/v1",
         "litellm_metadata": litellm_metadata,
+        "extra_headers": custom_headers,
     }
     perform = globals().get("_perform_opencode_zen_completion_call")
     try:
