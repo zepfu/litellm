@@ -140,6 +140,9 @@ _CODEX_AUTO_REVIEW_ACTION_INPUT_TYPES = frozenset(
 _CODEX_AUTO_REVIEW_MESSAGE_ROLES = frozenset(
     {"assistant", "developer", "system", "user"}
 )
+_CODEX_AUTO_REVIEW_TEXT_PART_TYPES = frozenset(
+    {"input_text", "output_text", "text"}
+)
 
 
 def _codex_auto_review_nonempty_string(value: Any) -> bool:
@@ -195,6 +198,12 @@ def _codex_auto_review_action_payload_present(value: Any) -> bool:
     if isinstance(value, str):
         return bool(value.strip())
     if isinstance(value, Mapping):
+        item_type = value.get("type")
+        if (
+            isinstance(item_type, str)
+            and item_type.strip().casefold() in _CODEX_AUTO_REVIEW_TEXT_PART_TYPES
+        ):
+            return _codex_auto_review_visible_text(value.get("text"))
         text_fields = tuple(
             field
             for field in ("content", "input_text", "output_text", "text")
