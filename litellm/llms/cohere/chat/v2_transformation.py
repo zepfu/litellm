@@ -1,4 +1,5 @@
 import time
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterator, List, Optional, Union
 
 import httpx
@@ -173,10 +174,45 @@ class CohereV2ChatConfig(OpenAIGPTConfig):
         Cohere v2 chat api is in openai format, so we can use the openai transform request function to transform the request.
         """
         data = super().transform_request(
-            model, messages, optional_params, litellm_params, headers
+            model,
+            self._project_messages_for_cohere_v2(messages),
+            optional_params,
+            litellm_params,
+            headers,
         )
 
         return data
+
+    async def async_transform_request(
+        self,
+        model: str,
+        messages: List[AllMessageValues],
+        optional_params: dict,
+        litellm_params: dict,
+        headers: dict,
+    ) -> dict:
+        return await super().async_transform_request(
+            model=model,
+            messages=self._project_messages_for_cohere_v2(messages),
+            optional_params=optional_params,
+            litellm_params=litellm_params,
+            headers=headers,
+        )
+
+    @staticmethod
+    def _project_messages_for_cohere_v2(
+        messages: List[AllMessageValues],
+    ) -> List[AllMessageValues]:
+        """Remove OpenAI streaming-only tool-call indexes from request history."""
+        projected_messages = deepcopy(messages)
+        for message in projected_messages:
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            for tool_call in tool_calls:
+                if isinstance(tool_call, dict):
+                    tool_call.pop("index", None)
+        return projected_messages
 
     def transform_response(
         self,
