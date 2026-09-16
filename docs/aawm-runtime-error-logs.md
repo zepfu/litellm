@@ -1162,6 +1162,28 @@ structured outputs using ``input_text``, ``input_image``, or ``input_file``.
 The exact serialized request body rejected in the incident was not captured;
 the rejected shape therefore remains unresolved.
 
+## Codex collaboration MESSAGE plaintext frames
+
+A split Codex `agent_message` can carry a visible `MESSAGE` envelope followed
+by an `encrypted_content` part whose value is actually a CFG-047 plaintext
+text frame. Before OpenAI Responses egress, LiteLLM validates the envelope
+and identity, then materializes positively recognized frames using the
+existing strict CFG-047 parser. The result remains an `agent_message` with
+the original `MESSAGE` envelope and exact decoded text in one visible part.
+
+This is representation normalization, not decryption or blanket ciphertext
+removal. Unknown or opaque payloads retain their existing behavior, as do
+`NEW_TASK`, `FINAL_ANSWER`, and ordinary visible messages. Tool-output
+sanitation and account/session ownership are separate and unchanged.
+
+The September 16 child incident contained a plaintext MESSAGE frame in an
+encrypted-content field immediately before an upstream
+`invalid_encrypted_content` rejection burst. Source inspection identifies a
+survival path for that representation, but the historical serialized request
+and loaded container revision were not retained. A reconstructed check can
+verify normalization behavior, not identify which field the historical
+upstream rejected.
+
 ## Codex OAuth continuation affinity
 
 Direct Codex OAuth account affinity comes only from durable server-owned session

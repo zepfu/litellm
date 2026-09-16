@@ -5,6 +5,22 @@ delivery, and cross-repository reporting. This file adds LiteLLM-specific
 requirements. Authorized implementation includes synchronizing documentation
 for the affected behavior; it does not waive global test approval.
 
+## Selected CLI TODO Work
+
+The operator's September 16, 2026 request selects `aawmdt todo` for the
+approval-review and encrypted-collaboration incidents in sessions
+`01a0ac2c-bc19-7aa0-aef3-37b85ff65b87` and
+`01a0ab3b-3130-7630-ba9e-20a2405dab85`.
+For these items, the authoritative root is `/home/zepfu/projects/litellm`,
+using explicit `--config /home/zepfu/projects/litellm/.aawm-devtools.toml`.
+The existing store is `.analysis/current.jsonl`, with
+`.analysis/todo-manifest.json`, `.analysis/todo-agent-events.jsonl`, and
+`.analysis/archive/{year}/{prefix}-{year}.jsonl`; use the configured `OPENAI`
+prefix. Use `$aawmdt-todo-goal`, `$aawmdt-todo-maintain`, and
+`$aawmdt-todo-summary` instead of their Markdown counterparts for these items.
+Do not duplicate them in Markdown queues. Supporting worklogs remain evidence,
+not queue authority. This selection does not migrate or change other queues.
+
 ## Ownership and Routing
 
 Implement LiteLLM-owned behavior here and preserve compatibility with the
