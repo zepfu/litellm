@@ -11,7 +11,9 @@ from .failure_classification import (
 )
 from .model_metadata import (
     K2_7_MODEL_IDS,
+    K3_256K_MODEL_ID,
     K3_MODEL_ID,
+    K3_MODEL_IDS,
     MANAGED_KIMI_CODE_MODEL_IDS,
     KimiCodeModelMetadata,
     KimiCodeThinkEfforts,
@@ -29,7 +31,9 @@ from .model_metadata import (
 
 __all__ = [
     "K2_7_MODEL_IDS",
+    "K3_256K_MODEL_ID",
     "K3_MODEL_ID",
+    "K3_MODEL_IDS",
     "MANAGED_KIMI_CODE_MODEL_IDS",
     "KimiCodeFailureKind",
     "KimiCodeFailureMetadata",

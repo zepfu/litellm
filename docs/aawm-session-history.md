@@ -1798,11 +1798,14 @@ during the same window before low-effort Z.AI Flash and Cursor Composer.
 `codex-auto-review` remains a public alias reference to `auto-review`, so both
 public names share one concrete candidate graph.
 
-OpenAI `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` pricing in
+OpenAI `gpt-5.6-sol` and `gpt-5.6-terra` pricing in
 `model_prices_and_context_window.json` follows the official GPT-5.6 preview page
 (`https://openai.com/index/previewing-gpt-5-6-sol/`): per-token input/output
 costs, cache write at 1.25× uncached input, and cache read at 10% of uncached
-input. Official GPT-5.6 API documentation also verifies reasoning efforts
+input. `gpt-5.6-luna` uses the current standard, non-promotional API rates:
+$0.20 input, $1.20 output, $0.02 cache read, and $0.25 cache write per million
+tokens. Its catalog entry records the current pricing source.
+Official GPT-5.6 API documentation also verifies reasoning efforts
 `none`, `low`, `medium`, `high`, `xhigh`, and `max`; all three entries therefore
 set `supports_reasoning`, `supports_none_reasoning_effort`,
 `supports_xhigh_reasoning_effort`, and `supports_max_reasoning_effort`.

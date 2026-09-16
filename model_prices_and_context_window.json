@@ -912,6 +912,79 @@
             "max_output_tokens"
         ]
     },
+    "kimi_code/k3-256k": {
+        "comment": "Kimi Code subscription route; per-request invoice cost is not exposed as public per-token pricing.",
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
+        "default_reasoning_effort": "high",
+        "litellm_provider": "kimi_code",
+        "max_input_tokens": 262144,
+        "mode": "chat",
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
+        "provider_specific_entry": {
+            "kimi_code": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "provider_subscription_reference",
+                    "billing_mode": "kimi_code_subscription",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "kimi_code",
+                        "model": "kimi_code/k3-256k"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_applicable",
+                    "equivalence_evidence": "Extra Usage is described as close to API rates; no official per-token tariff is published for the Kimi Code 256K route.",
+                    "source": {
+                        "kind": "official_provider_catalog",
+                        "label": "Kimi Code model configuration",
+                        "urls": [
+                            "https://www.kimi.com/code/docs/en/kimi-code/models.html"
+                        ],
+                        "version": "2026-09-16",
+                        "verified_on": "2026-09-16"
+                    },
+                    "unpriced_reason": "public_per_token_rate_unavailable"
+                }
+            }
+        },
+        "source": "https://www.kimi.com/code/docs/en/kimi-code/models.html",
+        "supports_function_calling": true,
+        "supports_high_reasoning_effort": true,
+        "supports_low_reasoning_effort": true,
+        "supports_max_reasoning_effort": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "supports_response_schema": true,
+        "supports_tool_choice": true,
+        "supports_vision": true,
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search",
+            "web_search"
+        ],
+        "unsupported_input_item_types": [
+            "custom_tool_call",
+            "custom_tool_call_output"
+        ],
+        "unsupported_request_params": [
+            "max_output_tokens"
+        ]
+    },
     "kimi_code/k3-high": {
         "cache_read_input_token_cost": 3e-07,
         "comment": "Public reference costs for the kimi_code subscription route, not known invoice billing.",
@@ -20377,10 +20450,12 @@
         "supported_endpoints": [
             "/v1/responses"
         ],
-        "input_cost_per_token": 1e-06,
-        "output_cost_per_token": 6e-06,
-        "cache_creation_input_token_cost": 1.25e-06,
-        "cache_read_input_token_cost": 1e-07,
+        "input_cost_per_token": 2e-07,
+        "output_cost_per_token": 1.2e-06,
+        "cache_creation_input_token_cost": 2.5e-07,
+        "cache_read_input_token_cost": 2e-08,
+        "pricing_note": "OpenAI Standard API list rates; Batch and Flex discounts are not applied.",
+        "source": "https://developers.openai.com/api/docs/pricing",
         "supports_reasoning": true,
         "supports_none_reasoning_effort": true,
         "supports_xhigh_reasoning_effort": true,
@@ -41027,7 +41102,7 @@
             "opencode_go": {
                 "aawm_reference_pricing": {
                     "schema_version": 1,
-                    "status": "unpriced",
+                    "status": "priced",
                     "kind": "hosted_route_reference",
                     "billing_mode": "opencode_go_hosted_route",
                     "actual_invoice_cost_known": false,
@@ -41036,9 +41111,14 @@
                         "provider": "opencode_go",
                         "model": "opencode/muse-spark-1.3-contributor"
                     },
-                    "cache_mode": "none",
-                    "equivalence_status": "unverified",
-                    "equivalence_evidence": "OpenCode Go Muse Spark 1.3 Contributor is a hosted route; no route-specific invoice-equivalent per-token pricing is evidenced.",
+                    "rates": {
+                        "input_usd_per_million_tokens": 0.1,
+                        "cache_read_usd_per_million_tokens": 0.002,
+                        "output_usd_per_million_tokens": 0.2
+                    },
+                    "cache_mode": "provider_cache_read",
+                    "equivalence_status": "direct_reference",
+                    "equivalence_evidence": "OpenCode Go Muse Spark 1.3 Contributor rates from the provider-maintained models.dev catalog.",
                     "source": {
                         "kind": "models_dev_model_catalog",
                         "label": "models.dev OpenCode Go Muse Spark 1.3 Contributor metadata",
@@ -41047,9 +41127,8 @@
                             "https://models.dev/api.json"
                         ],
                         "version": "2026-09-02",
-                        "verified_on": "2026-09-15"
-                    },
-                    "unpriced_reason": "public_per_token_rate_unavailable"
+                        "verified_on": "2026-09-16"
+                    }
                 }
             }
         },
@@ -41108,7 +41187,7 @@
             "opencode_go": {
                 "aawm_reference_pricing": {
                     "schema_version": 1,
-                    "status": "unpriced",
+                    "status": "priced",
                     "kind": "hosted_route_reference",
                     "billing_mode": "opencode_go_hosted_route",
                     "actual_invoice_cost_known": false,
@@ -41117,9 +41196,14 @@
                         "provider": "opencode_go",
                         "model": "opencode/omen-alpha"
                     },
-                    "cache_mode": "none",
-                    "equivalence_status": "unverified",
-                    "equivalence_evidence": "OpenCode Go Omen Alpha is a hosted route; no route-specific invoice-equivalent per-token pricing is evidenced.",
+                    "rates": {
+                        "input_usd_per_million_tokens": 0.2,
+                        "cache_read_usd_per_million_tokens": 0.04,
+                        "output_usd_per_million_tokens": 0.66
+                    },
+                    "cache_mode": "provider_cache_read",
+                    "equivalence_status": "direct_reference",
+                    "equivalence_evidence": "OpenCode Go Omen Alpha rates from the provider-maintained models.dev catalog.",
                     "source": {
                         "kind": "models_dev_model_catalog",
                         "label": "models.dev OpenCode Go Omen Alpha metadata",
@@ -41128,9 +41212,8 @@
                             "https://models.dev/api.json"
                         ],
                         "version": "2026-09-04",
-                        "verified_on": "2026-09-15"
-                    },
-                    "unpriced_reason": "public_per_token_rate_unavailable"
+                        "verified_on": "2026-09-16"
+                    }
                 }
             }
         },

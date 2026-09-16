@@ -8,8 +8,10 @@ from typing import Dict, Final, FrozenSet, Optional, Tuple
 
 
 K3_MODEL_ID: Final[str] = "k3"
+K3_256K_MODEL_ID: Final[str] = "k3-256k"
+K3_MODEL_IDS: Final[FrozenSet[str]] = frozenset({K3_MODEL_ID, K3_256K_MODEL_ID})
 K2_7_MODEL_IDS: Final[FrozenSet[str]] = frozenset({"kimi-for-coding", "kimi-for-coding-highspeed"})
-MANAGED_KIMI_CODE_MODEL_IDS: Final[FrozenSet[str]] = frozenset({K3_MODEL_ID, *K2_7_MODEL_IDS})
+MANAGED_KIMI_CODE_MODEL_IDS: Final[FrozenSet[str]] = frozenset({*K3_MODEL_IDS, *K2_7_MODEL_IDS})
 KIMI_CODE_PROVIDER_PREFIX: Final[str] = "kimi_code"
 
 _EXPLICIT_CAPABILITY_FIELDS: Final[FrozenSet[str]] = frozenset(
@@ -65,9 +67,9 @@ def normalize_managed_kimi_code_model_id(model_id: object) -> Optional[str]:
 
 
 def is_k3_model_id(model_id: object) -> bool:
-    """Return whether `model_id` is exactly the managed K3 ID."""
+    """Return whether `model_id` is one of the managed K3-family IDs."""
 
-    return model_id == K3_MODEL_ID
+    return isinstance(model_id, str) and model_id in K3_MODEL_IDS
 
 
 def is_k2_7_model_id(model_id: object) -> bool:

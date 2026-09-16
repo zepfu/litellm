@@ -194,10 +194,10 @@ def resolve_aawm_reference_pricing(  # noqa: PLR0915
         return None
 
     model_cost = _load_bundled_model_cost_map()
-    if provider == "opencode_zen":
+    if provider in {"opencode_zen", "opencode_go"}:
         if model.startswith("opencode/"):
             route_key = model
-        elif model.startswith("opencode_zen/"):
+        elif model.startswith(f"{provider}/"):
             route_key = f"opencode/{model.split('/', 1)[1]}"
         else:
             route_key = f"opencode/{model}"

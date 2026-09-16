@@ -24,11 +24,14 @@ Retrieve detailed information about each model listed in the `/model/info` endpo
 
 LiteLLM's canonical cost map includes `gpt-5.6-sol`, `gpt-5.6-terra`, and
 `gpt-5.6-luna` in both `model_prices_and_context_window.json` and
-`litellm/bundled_model_prices_and_context_window_fallback.json`. Pricing and
-cache billing fields are sourced from
+`litellm/bundled_model_prices_and_context_window_fallback.json`. Sol and Terra
+pricing and cache billing fields are sourced from
 [Previewing GPT-5.6 Sol](https://openai.com/index/previewing-gpt-5-6-sol/)
-(per 1M tokens: Sol $5/$30, Terra $2.50/$15, Luna $1/$6; cache write 1.25× input;
-cache read 10% of input). All three entries advertise reasoning efforts through
+(per 1M tokens: Sol $5/$30, Terra $2.50/$15; cache write 1.25× input;
+cache read 10% of input). Luna uses current standard, non-promotional API
+pricing: $0.20 input, $1.20 output, $0.02 cache read, and $0.25 cache write
+per 1M tokens; its catalog entry records the current source.
+All three entries advertise reasoning efforts through
 API value `max` (`none`, `low`, `medium`, `high`, `xhigh`, `max`) using the
 config-driven `supports_max_reasoning_effort` capability. Context-window and
 unrelated capability fields remain omitted until independently verified.
