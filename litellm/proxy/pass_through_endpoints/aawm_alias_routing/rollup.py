@@ -610,6 +610,14 @@ def install(host_globals: dict) -> None:
         _resolve_aawm_route_rollup_reasoning_effort,
     )
     host_globals.setdefault(
+        "_safe_aawm_route_target_label",
+        _safe_aawm_route_target_label,
+    )
+    host_globals.setdefault(
+        "ALIBABA_TOKEN_PLAN_CHAT_COMPLETIONS_URL",
+        ALIBABA_TOKEN_PLAN_CHAT_COMPLETIONS_URL,
+    )
+    host_globals.setdefault(
         "_auto_agent_alias_event_request_identity",
         _auto_agent_alias_event_request_identity,
     )
