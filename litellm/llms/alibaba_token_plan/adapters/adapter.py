@@ -136,6 +136,30 @@ def _append_codex_auto_review_schema_instruction(
 
 _MISSING = object()
 
+_AUTO_REVIEW_VALIDATION_REASON_BY_MESSAGE = {
+    "Alibaba Token Plan auto-review requires exactly one completion choice.": (
+        "choice_count"
+    ),
+    "Alibaba Token Plan auto-review requires provider-native finish-reason evidence.": (
+        "native_finish_reason_missing"
+    ),
+    "Alibaba Token Plan auto-review requires a native stop finish reason.": (
+        "finish_reason"
+    ),
+    "Alibaba Token Plan auto-review requires one assistant decision message.": (
+        "message_role"
+    ),
+    "Alibaba Token Plan auto-review does not allow refusal output.": "refusal",
+    "Alibaba Token Plan auto-review does not allow tool calls.": "tool_calls",
+    "Alibaba Token Plan auto-review does not allow function calls.": "function_call",
+    "Alibaba Token Plan auto-review does not allow additional messages.": (
+        "additional_messages"
+    ),
+    "Alibaba Token Plan auto-review requires one text decision message.": (
+        "content_type"
+    ),
+}
+
 
 def _response_value(response: Any, key: str, default: Any = _MISSING) -> Any:
     if isinstance(response, Mapping):
@@ -167,6 +191,97 @@ def _raw_alibaba_completion_choices(
             return raw_choices, True
 
     return getattr(completion_response, "choices", _MISSING), False
+
+
+def _bounded_completion_field(value: Any, *, field: str) -> str:
+    if value is _MISSING:
+        return "missing"
+    if value is None:
+        return "null"
+    if field == "finish":
+        if isinstance(value, str) and value in {
+            "stop",
+            "tool_calls",
+            "function_call",
+            "length",
+            "content_filter",
+        }:
+            return value
+        return "other"
+    if field == "role":
+        if isinstance(value, str) and value in {
+            "assistant",
+            "user",
+            "system",
+            "tool",
+        }:
+            return value
+        return "other"
+    return "other"
+
+
+def _bounded_content_type(value: Any) -> str:
+    if value is _MISSING:
+        return "missing"
+    if value is None:
+        return "null"
+    if isinstance(value, str):
+        return "str"
+    if isinstance(value, list):
+        return "list"
+    if isinstance(value, Mapping):
+        return "dict"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    return "other"
+
+
+def codex_auto_review_completion_diagnostic(
+    completion_response: Any,
+    *,
+    validation_error: Optional[ValueError] = None,
+) -> dict[str, Any]:
+    """Return bounded diagnostics for a rejected native review completion."""
+
+    choices, raw_retention_present = _raw_alibaba_completion_choices(
+        completion_response
+    )
+    choice_count = len(choices) if isinstance(choices, list) else -1
+    choice = choices[0] if choice_count == 1 else _MISSING
+
+    finish_reason = _response_value(choice, "finish_reason")
+    if not raw_retention_present:
+        provider_specific_fields = _response_value(
+            choice,
+            "provider_specific_fields",
+            {},
+        )
+        native_finish_reason = _response_value(
+            provider_specific_fields,
+            "native_finish_reason",
+        )
+        if native_finish_reason is not _MISSING:
+            finish_reason = native_finish_reason
+
+    message = _response_value(choice, "message")
+    role = _response_value(message, "role")
+    content = _response_value(message, "content")
+    reason = _AUTO_REVIEW_VALIDATION_REASON_BY_MESSAGE.get(
+        str(validation_error) if validation_error is not None else "",
+        "unknown",
+    )
+    return {
+        "reason": reason,
+        "choice_count": choice_count,
+        "finish": _bounded_completion_field(finish_reason, field="finish"),
+        "role": _bounded_completion_field(role, field="role"),
+        "content_type": _bounded_content_type(content),
+        "raw_retention_present": raw_retention_present,
+    }
 
 
 def validate_codex_auto_review_completion(

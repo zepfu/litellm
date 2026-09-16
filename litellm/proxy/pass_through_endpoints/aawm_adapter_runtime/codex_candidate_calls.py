@@ -303,11 +303,28 @@ class _CursorPostEgressOutputError(ValueError):
     """A returned Cursor payload could not be normalized after provider Run."""
 
 
-def _raise_codex_alibaba_auto_review_validation_error(reason: str) -> None:
+def _raise_codex_alibaba_auto_review_validation_error(
+    reason: str,
+    *,
+    diagnostic: Optional[Mapping[str, Any]] = None,
+) -> None:
     from litellm.proxy._types import ProxyException
 
+    detail_message = reason
+    if isinstance(diagnostic, Mapping):
+        detail_message = (
+            f"{reason} "
+            f"guard={diagnostic.get('reason', 'unknown')};"
+            f"choice_count={diagnostic.get('choice_count', -1)};"
+            f"finish={diagnostic.get('finish', 'unknown')};"
+            f"role={diagnostic.get('role', 'unknown')};"
+            f"content_type={diagnostic.get('content_type', 'unknown')};"
+            "raw_retention_present="
+            f"{bool(diagnostic.get('raw_retention_present', False))}"
+        )
+
     proxy_exc = ProxyException(
-        message=reason,
+        message=detail_message,
         type="upstream_error",
         param="model",
         code=502,
@@ -322,10 +339,15 @@ def _raise_codex_alibaba_auto_review_validation_error(reason: str) -> None:
         "detail",
         {
             "error": {
-                "message": reason,
+                "message": detail_message,
                 "code": "upstream_transient_internal",
                 "type": "upstream_error",
-            }
+            },
+            **(
+                {"diagnostic": dict(diagnostic)}
+                if isinstance(diagnostic, Mapping)
+                else {}
+            ),
         },
     )
     raise proxy_exc from None
@@ -345,10 +367,17 @@ def _validate_codex_alibaba_auto_review_completion_or_raise(
             completion_response,
             schema=schema,
         )
-    except ValueError:
+    except ValueError as exc:
+        diagnostic = (
+            _alibaba_token_plan_adapters.codex_auto_review_completion_diagnostic(
+                completion_response,
+                validation_error=exc,
+            )
+        )
         _raise_codex_alibaba_auto_review_validation_error(
             "Alibaba Token Plan auto-review provider response failed "
-            "native completion validation."
+            "native completion validation.",
+            diagnostic=diagnostic,
         )
 
 
