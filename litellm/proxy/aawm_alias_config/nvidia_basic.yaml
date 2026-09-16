@@ -5,7 +5,7 @@ aliases:
   - name: nvidia_basic
     candidates:
       - provider: nvidia
-        model: nvidia/moonshotai/kimi-k3-256k
+        model: nvidia/moonshotai/kimi-k3
         route_family: codex_nvidia_completion_adapter
         priority: 100
 
