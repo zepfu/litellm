@@ -785,6 +785,11 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
 
                         logging_obj.model_call_details["response_headers"] = headers
                         stringified_response = response.model_dump()
+                        response_hidden_params = (
+                            provider_config.get_response_hidden_params(
+                                stringified_response
+                            )
+                        )
                         logging_obj.post_call(
                             input=messages,
                             api_key=api_key,
@@ -795,6 +800,10 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                         final_response_obj = convert_to_model_response_object(
                             response_object=stringified_response,
                             model_response_object=model_response,
+                            hidden_params={
+                                **response_hidden_params,
+                                "headers": headers,
+                            },
                             _response_headers=headers,
                         )
                         if fake_stream is True:
@@ -933,6 +942,9 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                     logging_obj=logging_obj,
                 )
                 stringified_response = response.model_dump()
+                response_hidden_params = provider_config.get_response_hidden_params(
+                    stringified_response
+                )
                 logging_obj.post_call(
                     input=data["messages"],
                     api_key=api_key,
@@ -943,7 +955,10 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                 final_response_obj = convert_to_model_response_object(
                     response_object=stringified_response,
                     model_response_object=model_response,
-                    hidden_params={"headers": headers},
+                    hidden_params={
+                        **response_hidden_params,
+                        "headers": headers,
+                    },
                     _response_headers=headers,
                 )
 

@@ -363,6 +363,10 @@ class BaseConfig(ABC):
             headers=headers,
         )
 
+    def get_response_hidden_params(self, response: Any) -> dict:
+        """Return provider-specific hidden metadata from a parsed response."""
+        return {}
+
     @abstractmethod
     def transform_response(
         self,

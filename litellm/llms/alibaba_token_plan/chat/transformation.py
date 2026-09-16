@@ -55,6 +55,16 @@ class AlibabaTokenPlanAuthenticationError(OpenAIError):
 class AlibabaTokenPlanChatConfig(DashScopeChatConfig):
     """DashScope-compatible transport with Token Plan identity and credentials."""
 
+    def get_response_hidden_params(self, response: Any) -> dict[str, Any]:
+        """Retain provider-native choices before OpenAI SDK conversion."""
+
+        if not isinstance(response, dict):
+            return {}
+        raw_choices = response.get("choices")
+        if not isinstance(raw_choices, list):
+            return {}
+        return {ALIBABA_TOKEN_PLAN_RAW_CHOICES_HIDDEN_PARAM: raw_choices}
+
     def transform_response(
         self,
         model: str,
@@ -98,7 +108,7 @@ class AlibabaTokenPlanChatConfig(DashScopeChatConfig):
         if not isinstance(hidden_params, dict):
             hidden_params = {}
             response._hidden_params = hidden_params
-        hidden_params[ALIBABA_TOKEN_PLAN_RAW_CHOICES_HIDDEN_PARAM] = raw_choices
+        hidden_params.update(self.get_response_hidden_params(raw_body))
         return response
 
     @staticmethod
