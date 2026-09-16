@@ -100,6 +100,24 @@ def _candidate_schema_rejection(
     )
     return diagnostic.to_dict() if diagnostic is not None else None
 
+
+def _extract_auto_agent_alias_request_reasoning_effort(
+    request_body: Mapping[str, Any],
+) -> tuple[Any, Optional[str]]:
+    """Return the caller's effective effort field for status attribution."""
+    reasoning = request_body.get("reasoning")
+    if isinstance(reasoning, Mapping) and "effort" in reasoning:
+        return reasoning.get("effort"), "reasoning.effort"
+    if isinstance(reasoning, str) and reasoning.strip():
+        return reasoning, "reasoning"
+    if "reasoning_effort" in request_body:
+        return request_body.get("reasoning_effort"), "reasoning_effort"
+    output_config = request_body.get("output_config")
+    if isinstance(output_config, Mapping) and "effort" in output_config:
+        return output_config.get("effort"), "output_config.effort"
+    return None, None
+
+
 _host_globals: Optional[dict] = None
 _MISSING = object()
 _runtime_restore_stacks: dict[str, list[tuple[object, object, object]]] = {}
@@ -414,6 +432,24 @@ def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
         value = candidate.get(field)
         if value is not None:
             event[field] = value
+    # Candidate-level config is authoritative even when the raw candidate was
+    # used to build a status event before attempt metadata was attached.
+    if event.get("reasoning_effort_config_value") is None:
+        configured_effort = candidate.get("reasoning_effort")
+        if configured_effort is not None:
+            event["reasoning_effort_config_value"] = configured_effort
+            event["reasoning_effort_config_source"] = "candidate_yaml"
+    # Unconfigured candidates retain caller intent. Carry it onto the status
+    # event so zero-turn rollups use the same effort as completed turns.
+    if (
+        event.get("reasoning_effort_native_value") is None
+        and event.get("reasoning_effort_config_value") is None
+    ):
+        request_effort, _request_effort_field = (
+            _extract_auto_agent_alias_request_reasoning_effort(request_body)
+        )
+        if request_effort is not None:
+            event["reasoning_effort_native_value"] = request_effort
 
     include_activity_status = (
         event_type
@@ -902,6 +938,10 @@ def install(host_globals: dict) -> None:
         ("_auto_agent_alias_int", _auto_agent_alias_int),
         ("_auto_agent_alias_cooldown_until", _auto_agent_alias_cooldown_until),
         ("_candidate_schema_rejection", _candidate_schema_rejection),
+        (
+            "_extract_auto_agent_alias_request_reasoning_effort",
+            _extract_auto_agent_alias_request_reasoning_effort,
+        ),
         ("normalize_schema_rejection", normalize_schema_rejection),
         (
             "resolve_schema_rejection_failure_identity",
