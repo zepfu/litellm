@@ -12,6 +12,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import re
 import time
 import uuid
@@ -121,25 +122,25 @@ _CURSOR_AUTO_REVIEW_ALIASES = frozenset(
         "chatgpt/codex-auto-review",
     }
 )
+_CURSOR_AUTO_REVIEW_DIAGNOSTIC_ENVIRONMENT = "litellm-alpha"
+_CURSOR_AUTO_REVIEW_DIAGNOSTIC_MAX_RESULT_BYTES = 64 * 1024
 _CURSOR_AUTO_REVIEW_DIAGNOSTIC_MAX_EVENTS = 64
-_CURSOR_AUTO_REVIEW_DIAGNOSTIC_EVENT_KEYS = frozenset(
-    {
-        "interactionUpdate",
-        "textDelta",
-        "turnEnded",
-        "execServerMessage",
-        "toolCall",
-        "toolCallStarted",
-        "toolCallDelta",
-        "toolCallCompleted",
-        "mcpToolCall",
-        "mcpToolCallStarted",
-        "mcpToolCallDelta",
-        "mcpToolCallCompleted",
-        "partialToolCall",
-        "functionCall",
-        "toolUse",
-    }
+_CURSOR_AUTO_REVIEW_DIAGNOSTIC_EVENT_FIELDS = (
+    ("interactionUpdate", "interaction_update_count"),
+    ("textDelta", "text_delta_count"),
+    ("turnEnded", "turn_ended_count"),
+    ("execServerMessage", "exec_server_message_count"),
+    ("toolCall", "tool_event_count"),
+    ("toolCallStarted", "tool_event_count"),
+    ("toolCallDelta", "tool_event_count"),
+    ("toolCallCompleted", "tool_event_count"),
+    ("partialToolCall", "tool_event_count"),
+    ("mcpToolCall", "mcp_tool_event_count"),
+    ("mcpToolCallStarted", "mcp_tool_event_count"),
+    ("mcpToolCallDelta", "mcp_tool_event_count"),
+    ("mcpToolCallCompleted", "mcp_tool_event_count"),
+    ("functionCall", "tool_event_count"),
+    ("toolUse", "tool_event_count"),
 )
 _CURSOR_AGENT_ALLOWED_TOOLS_HEADER = "x-cursor-agent-allowed-tools"
 _CURSOR_REQUEST_SCHEMA_REJECTION_REASONS = frozenset(
@@ -2298,19 +2299,6 @@ def _cursor_auto_review_json_type(value: Any) -> str:
     return "other"
 
 
-def _cursor_auto_review_json_sha256(value: Any) -> Optional[str]:
-    try:
-        canonical = json.dumps(
-            value,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    except (TypeError, ValueError):
-        return None
-    return hashlib.sha256(canonical).hexdigest()
-
-
 def _cursor_auto_review_request_schema_diagnostic(
     request_body: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -2342,65 +2330,97 @@ def _cursor_auto_review_request_schema_diagnostic(
             if schema_present
             else "absent"
         ),
+        "schema_category": "absent",
     }
-    if isinstance(format_param, Mapping):
-        format_name = _cursor_replay_safe_diagnostic_token(format_param.get("type"))
-        if format_name is not None:
-            diagnostic["schema_format_type"] = format_name
     if schema_present:
-        diagnostic["schema_sha256"] = _cursor_auto_review_json_sha256(schema)
-        if isinstance(schema, Mapping):
-            diagnostic["schema_key_count"] = len(schema)
+        format_kind = (
+            format_param.get("type") if isinstance(format_param, Mapping) else None
+        )
+        if format_kind == "json_schema":
+            diagnostic["schema_category"] = "json_schema"
+        elif isinstance(format_kind, str):
+            diagnostic["schema_category"] = "other"
+        else:
+            diagnostic["schema_category"] = "unknown"
     return diagnostic
 
 
 def _cursor_auto_review_event_diagnostic(
     events: Any,
 ) -> dict[str, Any]:
-    if not isinstance(events, list):
-        return {
-            "event_count": 0,
-            "event_types": [],
-            "event_text_lengths": [],
-            "events_truncated": False,
-        }
-
-    event_types: list[list[str]] = []
-    event_text_lengths: list[int] = []
-
-    for event in events[:_CURSOR_AUTO_REVIEW_DIAGNOSTIC_MAX_EVENTS]:
-        names: set[str] = set()
-        text_length = 0
-
-        def _walk(value: Any) -> None:
-            nonlocal text_length
-            if isinstance(value, Mapping):
-                for key, nested in value.items():
-                    key_text = str(key)
-                    if key_text in _CURSOR_AUTO_REVIEW_DIAGNOSTIC_EVENT_KEYS:
-                        names.add(key_text)
-                    if key_text == "textDelta":
-                        if isinstance(nested, Mapping):
-                            text = nested.get("text")
-                        else:
-                            text = nested
-                        if isinstance(text, str):
-                            text_length += len(text)
-                    _walk(nested)
-            elif isinstance(value, list):
-                for nested in value:
-                    _walk(nested)
-
-        _walk(event)
-        event_types.append(sorted(names) or ["unknown"])
-        event_text_lengths.append(text_length)
-
-    return {
-        "event_count": len(events),
-        "event_types": event_types,
-        "event_text_lengths": event_text_lengths,
-        "events_truncated": len(events) > _CURSOR_AUTO_REVIEW_DIAGNOSTIC_MAX_EVENTS,
+    diagnostic: dict[str, Any] = {
+        "event_count": 0,
+        "sampled_event_count": 0,
+        "events_truncated": False,
+        "unknown_event_count": 0,
     }
+    for _key, field in _CURSOR_AUTO_REVIEW_DIAGNOSTIC_EVENT_FIELDS:
+        diagnostic.setdefault(field, 0)
+    if not isinstance(events, list):
+        diagnostic.update(
+            {
+                "saw_interaction_update": False,
+                "saw_text_delta": False,
+                "saw_turn_ended": False,
+                "saw_exec_server_message": False,
+                "saw_tool_event": False,
+                "saw_mcp_tool_event": False,
+                "saw_unknown_event": False,
+            }
+        )
+        return diagnostic
+
+    diagnostic["event_count"] = len(events)
+    sampled_events = events[:_CURSOR_AUTO_REVIEW_DIAGNOSTIC_MAX_EVENTS]
+    diagnostic["sampled_event_count"] = len(sampled_events)
+    diagnostic["events_truncated"] = len(events) > len(sampled_events)
+
+    for event in sampled_events:
+        if not isinstance(event, Mapping):
+            diagnostic["unknown_event_count"] += 1
+            continue
+        mappings: tuple[Mapping[str, Any], ...] = (event,)
+        interaction_update = event.get("interactionUpdate")
+        if isinstance(interaction_update, Mapping):
+            mappings = (event, interaction_update)
+
+        recognized = False
+        for mapping in mappings:
+            for key, field in _CURSOR_AUTO_REVIEW_DIAGNOSTIC_EVENT_FIELDS:
+                if key in mapping:
+                    diagnostic[field] += 1
+                    recognized = True
+        if not recognized:
+            diagnostic["unknown_event_count"] += 1
+
+    diagnostic.update(
+        {
+            "saw_interaction_update": diagnostic["interaction_update_count"] > 0,
+            "saw_text_delta": diagnostic["text_delta_count"] > 0,
+            "saw_turn_ended": diagnostic["turn_ended_count"] > 0,
+            "saw_exec_server_message": (
+                diagnostic["exec_server_message_count"] > 0
+            ),
+            "saw_tool_event": diagnostic["tool_event_count"] > 0,
+            "saw_mcp_tool_event": diagnostic["mcp_tool_event_count"] > 0,
+            "saw_unknown_event": diagnostic["unknown_event_count"] > 0,
+        }
+    )
+    return diagnostic
+
+
+def _cursor_auto_review_bounded_result_bytes(
+    text: str,
+) -> tuple[bytes, bool]:
+    bounded = bytearray()
+    for character in text:
+        encoded = character.encode("utf-8", errors="replace")
+        remaining = _CURSOR_AUTO_REVIEW_DIAGNOSTIC_MAX_RESULT_BYTES - len(bounded)
+        if len(encoded) > remaining:
+            bounded.extend(encoded[:remaining])
+            return bytes(bounded), True
+        bounded.extend(encoded)
+    return bytes(bounded), False
 
 
 def _cursor_auto_review_result_diagnostic(
@@ -2412,20 +2432,25 @@ def _cursor_auto_review_result_diagnostic(
     if not isinstance(text, str):
         text = ""
 
-    encoded_text = text.encode("utf-8", errors="replace")
-    result_text_sha256 = hashlib.sha256(encoded_text).hexdigest() if text else None
+    encoded_text, text_truncated = _cursor_auto_review_bounded_result_bytes(text)
+    result_text_sha256 = (
+        hashlib.sha256(encoded_text).hexdigest() if encoded_text else None
+    )
     json_parse_status = "empty"
     json_top_level_type: Optional[str] = None
     json_parse_error_offset: Optional[int] = None
     if text:
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError as exc:
-            json_parse_status = "invalid"
-            json_parse_error_offset = max(0, int(exc.pos))
+        if text_truncated:
+            json_parse_status = "truncated"
         else:
-            json_parse_status = "valid"
-            json_top_level_type = _cursor_auto_review_json_type(parsed)
+            try:
+                parsed = json.loads(encoded_text.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError as exc:
+                json_parse_status = "invalid"
+                json_parse_error_offset = max(0, int(exc.pos))
+            else:
+                json_parse_status = "valid"
+                json_top_level_type = _cursor_auto_review_json_type(parsed)
 
     tool_calls = getattr(result, "tool_calls", [])
     if not isinstance(tool_calls, list):
@@ -2439,7 +2464,9 @@ def _cursor_auto_review_result_diagnostic(
         {
             "result_text_length": len(text),
             "result_text_utf8_bytes": len(encoded_text),
+            "result_text_truncated": text_truncated,
             "result_text_sha256": result_text_sha256,
+            "result_text_sha256_truncated": text_truncated,
             "json_parse_status": json_parse_status,
             "json_top_level_type": json_top_level_type,
             "json_parse_error_offset": json_parse_error_offset,
@@ -2464,10 +2491,17 @@ def _emit_cursor_auto_review_result_diagnostic(
     request: Any,
     request_body: Mapping[str, Any],
     result: Any,
-    alias: str,
 ) -> None:
     """Emit bounded post-Run review evidence without retaining response text."""
     try:
+        if (
+            os.getenv("AAWM_LITELLM_ENVIRONMENT", "").strip()
+            != _CURSOR_AUTO_REVIEW_DIAGNOSTIC_ENVIRONMENT
+        ):
+            return
+        alias = _cursor_auto_review_alias_from_request_body(request_body)
+        if alias is None:
+            return
         payload: dict[str, Any] = {
             "event": "cursor_auto_review_result",
             "alias": _cursor_replay_safe_diagnostic_token(alias) or "unknown",
@@ -4787,13 +4821,11 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             result = await retained_session.continue_with_tool_outputs(
                 cursor_tool_outputs
             )
-            if cursor_auto_review_alias is not None:
-                _emit_cursor_auto_review_result_diagnostic(
-                    request=request,
-                    request_body=request_body,
-                    result=result,
-                    alias=cursor_auto_review_alias,
-                )
+            _emit_cursor_auto_review_result_diagnostic(
+                request=request,
+                request_body=request_body,
+                result=result,
+            )
             if cursor_auto_review_alias is not None and result.tool_calls:
                 raise _CursorPostEgressOutputError(
                     "Cursor auto-review returned executable tool calls; "
@@ -4927,13 +4959,11 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             stop_on_tool_call=True,
             retain_on_tool_call=True,
         )
-        if cursor_auto_review_alias is not None:
-            _emit_cursor_auto_review_result_diagnostic(
-                request=request,
-                request_body=request_body,
-                result=result,
-                alias=cursor_auto_review_alias,
-            )
+        _emit_cursor_auto_review_result_diagnostic(
+            request=request,
+            request_body=request_body,
+            result=result,
+        )
     except _CursorPostEgressOutputError:
         raise
     except Exception as exc:
