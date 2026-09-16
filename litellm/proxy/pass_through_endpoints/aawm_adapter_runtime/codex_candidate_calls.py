@@ -122,6 +122,7 @@ _CURSOR_AUTO_REVIEW_ALIASES = frozenset(
         "chatgpt/codex-auto-review",
     }
 )
+_CURSOR_AUTO_REVIEW_DIAGNOSTIC_SWITCH = "1"
 _CURSOR_AUTO_REVIEW_DIAGNOSTIC_ENVIRONMENT = "litellm-alpha"
 _CURSOR_AUTO_REVIEW_DIAGNOSTIC_MAX_RESULT_BYTES = 64 * 1024
 _CURSOR_AUTO_REVIEW_DIAGNOSTIC_MAX_EVENTS = 64
@@ -2494,6 +2495,11 @@ def _emit_cursor_auto_review_result_diagnostic(
 ) -> None:
     """Emit bounded post-Run review evidence without retaining response text."""
     try:
+        if (
+            os.getenv("AAWM_CURSOR_AUTO_REVIEW_DIAGNOSTICS", "").strip()
+            != _CURSOR_AUTO_REVIEW_DIAGNOSTIC_SWITCH
+        ):
+            return
         if (
             os.getenv("AAWM_LITELLM_ENVIRONMENT", "").strip()
             != _CURSOR_AUTO_REVIEW_DIAGNOSTIC_ENVIRONMENT
