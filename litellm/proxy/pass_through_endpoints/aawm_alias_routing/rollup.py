@@ -15,9 +15,13 @@ from typing import Any, Callable, Optional, Union
 
 import httpx
 
+from litellm.llms.alibaba_token_plan.chat.transformation import (
+    ALIBABA_TOKEN_PLAN_CHAT_COMPLETIONS_URL,
+)
 from litellm.proxy.aawm_route_logging import (
     _normalize_aawm_route_log_reasoning_effort,
     _resolve_aawm_route_rollup_reasoning_effort,
+    _safe_aawm_route_target_label,
     build_aawm_route_rollup_group_header_label,
     emit_aawm_route_status_event,
     record_aawm_route_rollup,
@@ -27,7 +31,10 @@ from .policy import (
     CODEX_AUTO_AGENT_NATIVE_PROVIDER as _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
 )
 
-from .codex_oauth import _clean_codex_auth_value
+from .codex_oauth import (
+    _clean_codex_auth_value,
+    _codex_oauth_responses_target_url,
+)
 
 # ---------------------------------------------------------------------------
 # Injected runtime seams (cross-module)
@@ -80,6 +87,15 @@ def _resolve_auto_agent_alias_route_rollup_outgoing_target(
     if target_url is not None:
         assert _get_anthropic_adapter_access_log_target_label is not None
         return _get_anthropic_adapter_access_log_target_label(target_url)
+    if cleaned_route_family == "codex_responses":
+        return _safe_aawm_route_target_label(_codex_oauth_responses_target_url())
+    if (
+        cleaned_route_family
+        == "codex_alibaba_token_plan_chat_completions_adapter"
+    ):
+        return _safe_aawm_route_target_label(
+            ALIBABA_TOKEN_PLAN_CHAT_COMPLETIONS_URL
+        )
     route_family_target_labels = {
         "codex_cohere_chat_completions_adapter": "api.cohere.com/v2/chat",
         "codex_nous_chat_completions_adapter": (
