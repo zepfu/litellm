@@ -817,6 +817,30 @@ def _validate_envelope_identity(
         raise CodexCollaborationDispatchError("invalid_envelope")
 
 
+def _normalize_codex_message_payload(
+    item: dict[str, Any],
+    visible_part: dict[str, Any],
+    visible_text: str,
+    payload: Any,
+) -> tuple[dict[str, Any], bool]:
+    if not isinstance(payload, str) or not payload:
+        raise CodexCollaborationDispatchError("invalid_envelope")
+    try:
+        assignment = parse_codex_collaboration_text_frame(payload)
+    except CodexCollaborationDispatchError as exc:
+        if exc.reason != "unknown_representation":
+            raise
+        return item, False
+    normalized_item = _NormalizedCodexAgentMessage(item)
+    normalized_item["content"] = [
+        {
+            "type": visible_part["type"],
+            "text": f"{visible_text}{assignment}",
+        }
+    ]
+    return normalized_item, True
+
+
 def _validate_visible_agent_message(
     item: dict[str, Any],
     visible_part: dict[str, Any],
@@ -886,6 +910,13 @@ def _normalize_agent_message_item(item: dict[str, Any]) -> tuple[dict[str, Any],
         if payload_offset != len(visible_text):
             raise CodexCollaborationDispatchError("invalid_envelope")
         _validate_envelope_identity(item, task_name=task_name, sender=sender)
+        if message_type == "MESSAGE":
+            return _normalize_codex_message_payload(
+                item,
+                visible_part,
+                visible_text,
+                payload_part.get("encrypted_content"),
+            )
         if message_type != "NEW_TASK":
             return item, False
         payload = payload_part.get("encrypted_content")
