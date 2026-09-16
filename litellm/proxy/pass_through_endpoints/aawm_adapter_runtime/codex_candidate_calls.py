@@ -2529,55 +2529,13 @@ def _emit_cursor_auto_review_result_diagnostic(
         return
 
 
-def _cursor_auto_review_raw_capture_message_context(
-    messages: Any,
-) -> dict[str, Any]:
-    if not isinstance(messages, list):
-        return {}
-
-    effective_instructions: list[str] = []
-    native_user_messages: list[str] = []
-    message_roles: list[str] = []
-    message_text_truncated = False
-    for message in messages:
-        if not isinstance(message, Mapping):
-            continue
-        role = message.get("role")
-        role_text = str(role) if role is not None else "unknown"
-        message_roles.append(role_text)
-        text, truncated = _cursor_auto_review_bounded_capture_text(
-            _cursor_response_content_text(message.get("content"))
-        )
-        message_text_truncated = message_text_truncated or truncated
-        if role_text == "system":
-            effective_instructions.append(text)
-        elif role_text == "user":
-            native_user_messages.append(text)
-
-    context: dict[str, Any] = {
-        "effective_review_instructions": effective_instructions,
-        "native_user_messages": native_user_messages,
-        "native_message_count": len(messages),
-        "native_message_roles": message_roles,
-    }
-    if message_text_truncated:
-        context["message_text_truncated"] = True
-    return context
-
-
-def _cursor_auto_review_bounded_capture_text(value: Any) -> tuple[str, bool]:
-    text = value if isinstance(value, str) else str(value or "")
-    bounded_bytes, truncated = _cursor_auto_review_bounded_result_bytes(text)
-    return bounded_bytes.decode("utf-8", errors="replace"), truncated
-
-
 def _capture_cursor_auto_review_native_result(
     *,
     request: Any,
     request_body: Mapping[str, Any],
     result: Any,
     cursor_url: str,
-    native_messages: Any,
+    cursor_request: Mapping[str, Any],
     candidate: Mapping[str, Any],
 ) -> None:
     """Persist bounded native review text only under explicit raw-capture gates."""
@@ -2594,6 +2552,7 @@ def _capture_cursor_auto_review_native_result(
             return
 
         from litellm.integrations.aawm_passthrough_shape_capture import (
+            _truncate_to_byte_limit_with_counts,
             capture_passthrough_shape,
             passthrough_full_payload_capture_enabled,
         )
@@ -2602,21 +2561,25 @@ def _capture_cursor_auto_review_native_result(
             return
 
         result_text = getattr(result, "text", "")
-        bounded_text, text_truncated = _cursor_auto_review_bounded_capture_text(
-            result_text
+        if not isinstance(result_text, str):
+            result_text = ""
+        bounded_text, stored_text_bytes, original_text_bytes = (
+            _truncate_to_byte_limit_with_counts(
+                result_text,
+                _CURSOR_AUTO_REVIEW_DIAGNOSTIC_MAX_RESULT_BYTES,
+            )
         )
-        original_text_bytes = (
-            len(result_text.encode("utf-8", errors="replace"))
-            if isinstance(result_text, str)
-            else 0
-        )
+        text_truncated = stored_text_bytes < original_text_bytes
+        bounded_text_bytes = bounded_text.encode("utf-8", errors="replace")
         result_payload: dict[str, Any] = {
             "text": bounded_text,
             "text_utf8_bytes": original_text_bytes,
+            "text_stored_utf8_bytes": stored_text_bytes,
             "text_truncated": text_truncated,
             "text_sha256": hashlib.sha256(
-                bounded_text.encode("utf-8", errors="replace")
+                bounded_text_bytes
             ).hexdigest(),
+            "text_sha256_truncated": text_truncated,
             "turn_ended": bool(getattr(result, "turn_ended", False)),
             "end_stream": bool(getattr(result, "end_stream", False)),
             "tool_call_count": len(
@@ -2630,12 +2593,36 @@ def _capture_cursor_auto_review_native_result(
                 else []
             ),
         }
-        capture_request = _cursor_auto_review_raw_capture_message_context(
-            native_messages
+        run_request = _cursor_as_mapping(cursor_request.get("runRequest"))
+        action = _cursor_as_mapping(run_request.get("action"))
+        user_message_action = _cursor_as_mapping(
+            action.get("userMessageAction")
         )
-        response_schema = _cursor_auto_review_response_schema(request_body)
-        if response_schema is not None:
-            capture_request["response_schema"] = response_schema
+        native_capture: dict[str, Any] = {}
+        if "userMessage" in user_message_action:
+            native_capture["userMessage"] = user_message_action["userMessage"]
+        if "conversationHistory" in user_message_action:
+            native_capture["conversationHistory"] = user_message_action[
+                "conversationHistory"
+            ]
+
+        original_request_capture: dict[str, Any] = {}
+        if "instructions" in request_body:
+            original_request_capture["instructions"] = request_body["instructions"]
+        text_param = request_body.get("text")
+        format_param = (
+            text_param.get("format")
+            if isinstance(text_param, Mapping)
+            else None
+        )
+        if isinstance(format_param, Mapping) and "schema" in format_param:
+            original_request_capture["text"] = {
+                "format": {"schema": format_param["schema"]}
+            }
+        capture_request = {
+            "native_user_message_action": native_capture,
+            "original_request": original_request_capture,
+        }
 
         correlation_id = _cursor_retained_history_correlation_id(request)
         capture_passthrough_shape(
@@ -2648,7 +2635,7 @@ def _capture_cursor_auto_review_native_result(
             litellm_call_id=correlation_id,
             extra_metadata={
                 "cursor_auto_review_alias": alias,
-                "cursor_capture_scope": "native_result_and_review_context",
+                "cursor_capture_scope": "native_result_and_native_request",
                 "cursor_route_family": str(candidate.get("route_family") or ""),
                 "cursor_result_text_truncated": text_truncated,
             },
@@ -4962,14 +4949,6 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
                 request_body=request_body,
                 result=result,
             )
-            _capture_cursor_auto_review_native_result(
-                request=request,
-                request_body=request_body,
-                result=result,
-                cursor_url=cursor_url,
-                native_messages=messages,
-                candidate=candidate,
-            )
             if cursor_auto_review_alias is not None and result.tool_calls:
                 raise _CursorPostEgressOutputError(
                     "Cursor auto-review returned executable tool calls; "
@@ -5113,7 +5092,7 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             request_body=request_body,
             result=result,
             cursor_url=cursor_url,
-            native_messages=messages,
+            cursor_request=cursor_request,
             candidate=candidate,
         )
     except _CursorPostEgressOutputError:
