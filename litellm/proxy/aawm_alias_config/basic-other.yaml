@@ -4,9 +4,9 @@ defaults: {}
 aliases:
   - name: basic-other
     candidates:
-      - provider: opencode_go
+      - provider: opencode_zen
         model: union-alpha
-        route_family: codex_opencode_go_adapter
+        route_family: codex_opencode_zen_adapter
         priority: 180
 
       - provider: zai_coding_plan
