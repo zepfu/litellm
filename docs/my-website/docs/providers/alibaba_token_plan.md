@@ -90,6 +90,19 @@ uses `anthropic_alibaba_token_plan_chat_completions_adapter`. Both preserve the
 inbound alias in observability metadata while sending only the resolved
 provider model upstream.
 
+### Auto-review structured output
+
+For schema-bearing Codex auto-review requests routed to Alibaba Token Plan,
+the adapter includes the requested JSON schema in the prompt instead of
+sending an upstream `response_format`. This does not imply native structured
+output support on the Token Plan endpoint.
+
+Before returning a review, the adapter requires exactly one native assistant
+text choice with `finish_reason="stop"`, without tool calls or refusals, and
+validates its JSON against the requested schema. Streaming responses are
+buffered until validation completes. Invalid output cannot become an approval.
+This handling does not change ordinary request formats or alias ordering.
+
 ## Cost provenance
 
 Token Plan generations record:
