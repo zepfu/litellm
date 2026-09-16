@@ -912,6 +912,79 @@
             "max_output_tokens"
         ]
     },
+    "kimi_code/k3-256k": {
+        "comment": "Kimi Code subscription route; per-request invoice cost is not exposed as public per-token pricing.",
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
+        "default_reasoning_effort": "high",
+        "litellm_provider": "kimi_code",
+        "max_input_tokens": 262144,
+        "mode": "chat",
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
+        "provider_specific_entry": {
+            "kimi_code": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "provider_subscription_reference",
+                    "billing_mode": "kimi_code_subscription",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "kimi_code",
+                        "model": "kimi_code/k3-256k"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_applicable",
+                    "equivalence_evidence": "Extra Usage is described as close to API rates; no official per-token tariff is published for the Kimi Code 256K route.",
+                    "source": {
+                        "kind": "official_provider_catalog",
+                        "label": "Kimi Code model configuration",
+                        "urls": [
+                            "https://www.kimi.com/code/docs/en/kimi-code/models.html"
+                        ],
+                        "version": "2026-09-16",
+                        "verified_on": "2026-09-16"
+                    },
+                    "unpriced_reason": "public_per_token_rate_unavailable"
+                }
+            }
+        },
+        "source": "https://www.kimi.com/code/docs/en/kimi-code/models.html",
+        "supports_function_calling": true,
+        "supports_high_reasoning_effort": true,
+        "supports_low_reasoning_effort": true,
+        "supports_max_reasoning_effort": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "supports_response_schema": true,
+        "supports_tool_choice": true,
+        "supports_vision": true,
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search",
+            "web_search"
+        ],
+        "unsupported_input_item_types": [
+            "custom_tool_call",
+            "custom_tool_call_output"
+        ],
+        "unsupported_request_params": [
+            "max_output_tokens"
+        ]
+    },
     "kimi_code/k3-high": {
         "cache_read_input_token_cost": 3e-07,
         "comment": "Public reference costs for the kimi_code subscription route, not known invoice billing.",
