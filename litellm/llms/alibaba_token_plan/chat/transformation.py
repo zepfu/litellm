@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from litellm.llms.dashscope.chat.transformation import DashScopeChatConfig
 from litellm.secret_managers.main import get_secret_str
+from litellm.types.llms.openai import AllMessageValues
+from litellm.types.utils import ModelResponse
 
 from ...openai.common_utils import OpenAIError
 
@@ -19,6 +21,7 @@ ALIBABA_TOKEN_PLAN_SETTINGS_FILE_ENV = (
     "LITELLM_ALIBABA_TOKEN_PLAN_SETTINGS_FILE"
 )
 ALIBABA_TOKEN_PLAN_PROVIDER_NAME = "alibaba_token_plan"
+ALIBABA_TOKEN_PLAN_RAW_CHOICES_HIDDEN_PARAM = "_alibaba_token_plan_raw_choices"
 # Catalog metadata only: credential discovery and model admission are
 # validated structurally, never against this static enumeration.
 ALIBABA_TOKEN_PLAN_MODEL_IDS = frozenset(
@@ -51,6 +54,52 @@ class AlibabaTokenPlanAuthenticationError(OpenAIError):
 
 class AlibabaTokenPlanChatConfig(DashScopeChatConfig):
     """DashScope-compatible transport with Token Plan identity and credentials."""
+
+    def transform_response(
+        self,
+        model: str,
+        raw_response: Any,
+        model_response: ModelResponse,
+        logging_obj: Any,
+        request_data: dict,
+        messages: List[AllMessageValues],
+        optional_params: dict,
+        litellm_params: dict,
+        encoding: Any,
+        api_key: Optional[str] = None,
+        json_mode: Optional[bool] = None,
+    ) -> ModelResponse:
+        """Retain provider-native choices for the auto-review gate."""
+
+        response = super().transform_response(
+            model=model,
+            raw_response=raw_response,
+            model_response=model_response,
+            logging_obj=logging_obj,
+            request_data=request_data,
+            messages=messages,
+            optional_params=optional_params,
+            litellm_params=litellm_params,
+            encoding=encoding,
+            api_key=api_key,
+            json_mode=json_mode,
+        )
+        try:
+            raw_body = raw_response.json()
+        except Exception:
+            return response
+        if not isinstance(raw_body, dict):
+            return response
+        raw_choices = raw_body.get("choices")
+        if not isinstance(raw_choices, list):
+            return response
+
+        hidden_params = getattr(response, "_hidden_params", None)
+        if not isinstance(hidden_params, dict):
+            hidden_params = {}
+            response._hidden_params = hidden_params
+        hidden_params[ALIBABA_TOKEN_PLAN_RAW_CHOICES_HIDDEN_PARAM] = raw_choices
+        return response
 
     @staticmethod
     def _model_id(model: str) -> str:

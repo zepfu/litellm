@@ -1346,6 +1346,14 @@ def install(
         "_load_codex_auto_agent_opencode_zen_api_key",
     ):
         host_globals.setdefault(_name, _mod[_name])
+    from litellm.llms.alibaba_token_plan.adapters import (
+        adapter as _alibaba_token_plan_adapters,
+    )
+
+    host_globals.setdefault(
+        "_alibaba_token_plan_adapters",
+        _alibaba_token_plan_adapters,
+    )
 
     for _name in _HOST_FUNCTION_NAMES:
         _obj = _mod[_name]
@@ -6838,7 +6846,7 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
     responses_api_request: ResponsesAPIOptionalRequestParams,
     litellm_metadata: Payload,
     upstream_model: str,
-    auto_review_schema: Optional[dict[str, Any]],
+    auto_review_schema: Optional[dict[str, Any]] = None,
 ) -> Response:
     """Execute Token Plan chat completions through the standard Responses wrapper."""
     from litellm.responses.litellm_completion_transformation.transformation import (
@@ -6889,6 +6897,10 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
             **_stream_acompletion_kwargs
         )
         for _stream_attempt in range(_ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES + 1):
+            _alibaba_token_plan_adapters.validate_codex_auto_review_completion(
+                _stream_completion_response,
+                schema=auto_review_schema,
+            )
             _stream_responses_api_response = (
                 LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
                     chat_completion_response=_stream_completion_response,
@@ -6971,6 +6983,10 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
     # observes the Alibaba provider and can route accordingly.
     _last_encrypted_findings: list[dict[str, Any]] = []
     for _attempt in range(_ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES + 1):
+        _alibaba_token_plan_adapters.validate_codex_auto_review_completion(
+            completion_response,
+            schema=auto_review_schema,
+        )
         responses_api_response = (
             LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
                 chat_completion_response=completion_response,

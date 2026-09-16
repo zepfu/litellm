@@ -9,6 +9,7 @@ from typing import Any, Iterable, Optional, cast
 from litellm.llms.alibaba_token_plan.chat.transformation import (
     ALIBABA_TOKEN_PLAN_API_BASE,
     ALIBABA_TOKEN_PLAN_CHAT_COMPLETIONS_URL,
+    ALIBABA_TOKEN_PLAN_RAW_CHOICES_HIDDEN_PARAM,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     adapter_config,
@@ -131,6 +132,118 @@ def _append_codex_auto_review_schema_instruction(
         {"role": "system", "content": schema_instruction},
         *updated_messages,
     ]
+
+
+_MISSING = object()
+
+
+def _response_value(response: Any, key: str, default: Any = _MISSING) -> Any:
+    if isinstance(response, Mapping):
+        return response.get(key, default)
+    return getattr(response, key, default)
+
+
+def _has_nonempty_value(value: Any) -> bool:
+    if value is _MISSING or value is None:
+        return False
+    if isinstance(value, (str, bytes, Mapping, list, tuple, set)):
+        return bool(value)
+    return True
+
+
+def _raw_alibaba_completion_choices(
+    completion_response: Any,
+) -> tuple[Any, bool]:
+    if isinstance(completion_response, Mapping):
+        return completion_response.get("choices", _MISSING), True
+
+    hidden_params = getattr(completion_response, "_hidden_params", None)
+    if isinstance(hidden_params, Mapping):
+        raw_choices = hidden_params.get(
+            ALIBABA_TOKEN_PLAN_RAW_CHOICES_HIDDEN_PARAM,
+            _MISSING,
+        )
+        if raw_choices is not _MISSING:
+            return raw_choices, True
+
+    return getattr(completion_response, "choices", _MISSING), False
+
+
+def validate_codex_auto_review_completion(
+    completion_response: Any,
+    *,
+    schema: Optional[dict[str, Any]],
+) -> None:
+    """Reject non-terminal or mixed Alibaba review choices before conversion."""
+
+    if schema is None:
+        return
+
+    choices, has_provider_native_choices = _raw_alibaba_completion_choices(
+        completion_response
+    )
+    if not isinstance(choices, list) or len(choices) != 1:
+        raise ValueError(
+            "Alibaba Token Plan auto-review requires exactly one completion choice."
+        )
+
+    choice = choices[0]
+    finish_reason = _response_value(choice, "finish_reason")
+    if not has_provider_native_choices:
+        provider_specific_fields = _response_value(
+            choice,
+            "provider_specific_fields",
+            {},
+        )
+        native_finish_reason = _response_value(
+            provider_specific_fields,
+            "native_finish_reason",
+        )
+        if native_finish_reason is _MISSING:
+            raise ValueError(
+                "Alibaba Token Plan auto-review requires provider-native "
+                "finish-reason evidence."
+            )
+        finish_reason = native_finish_reason
+    if finish_reason != "stop":
+        raise ValueError(
+            "Alibaba Token Plan auto-review requires a native stop finish reason."
+        )
+
+    message = _response_value(choice, "message")
+    if message is _MISSING or _response_value(message, "role") != "assistant":
+        raise ValueError(
+            "Alibaba Token Plan auto-review requires one assistant decision message."
+        )
+
+    if _has_nonempty_value(_response_value(choice, "refusal")) or _has_nonempty_value(
+        _response_value(message, "refusal")
+    ):
+        raise ValueError(
+            "Alibaba Token Plan auto-review does not allow refusal output."
+        )
+    if _has_nonempty_value(_response_value(choice, "tool_calls")) or _has_nonempty_value(
+        _response_value(message, "tool_calls")
+    ):
+        raise ValueError(
+            "Alibaba Token Plan auto-review does not allow tool calls."
+        )
+    if _has_nonempty_value(
+        _response_value(choice, "function_call")
+    ) or _has_nonempty_value(_response_value(message, "function_call")):
+        raise ValueError(
+            "Alibaba Token Plan auto-review does not allow function calls."
+        )
+    if _has_nonempty_value(_response_value(choice, "messages")):
+        raise ValueError(
+            "Alibaba Token Plan auto-review does not allow additional messages."
+        )
+
+    content = _response_value(message, "content")
+    if not isinstance(content, str):
+        raise ValueError(
+            "Alibaba Token Plan auto-review requires one text decision message."
+        )
 
 
 def validate_codex_auto_review_response_body(
