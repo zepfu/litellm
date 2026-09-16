@@ -303,6 +303,77 @@ class _CursorPostEgressOutputError(ValueError):
     """A returned Cursor payload could not be normalized after provider Run."""
 
 
+def _raise_codex_alibaba_auto_review_validation_error(reason: str) -> None:
+    from litellm.proxy._types import ProxyException
+
+    proxy_exc = ProxyException(
+        message=reason,
+        type="upstream_error",
+        param="model",
+        code=502,
+    )
+    setattr(proxy_exc, "status_code", 502)
+    setattr(proxy_exc, "_aawm_provider_returned", True)
+    setattr(proxy_exc, "attempted_provider_call", True)
+    setattr(proxy_exc, "failure_phase", "candidate_post_egress_normalization")
+    setattr(proxy_exc, "candidate_status", "retryable")
+    setattr(
+        proxy_exc,
+        "detail",
+        {
+            "error": {
+                "message": reason,
+                "code": "upstream_transient_internal",
+                "type": "upstream_error",
+            }
+        },
+    )
+    raise proxy_exc from None
+
+
+def _validate_codex_alibaba_auto_review_completion_or_raise(
+    completion_response: Any,
+    *,
+    schema: Optional[dict[str, Any]],
+) -> None:
+    from litellm.llms.alibaba_token_plan.adapters import (
+        adapter as _alibaba_token_plan_adapters,
+    )
+
+    try:
+        _alibaba_token_plan_adapters.validate_codex_auto_review_completion(
+            completion_response,
+            schema=schema,
+        )
+    except ValueError:
+        _raise_codex_alibaba_auto_review_validation_error(
+            "Alibaba Token Plan auto-review provider response failed "
+            "native completion validation."
+        )
+
+
+def _validate_codex_alibaba_auto_review_response_body_or_raise(
+    response_body: Mapping[str, Any],
+    *,
+    schema: Optional[dict[str, Any]],
+) -> None:
+    from litellm.exceptions import JSONSchemaValidationError
+    from litellm.llms.alibaba_token_plan.adapters import (
+        adapter as _alibaba_token_plan_adapters,
+    )
+
+    try:
+        _alibaba_token_plan_adapters.validate_codex_auto_review_response_body(
+            response_body,
+            schema=schema,
+        )
+    except JSONSchemaValidationError:
+        _raise_codex_alibaba_auto_review_validation_error(
+            "Alibaba Token Plan auto-review provider response failed "
+            "output schema validation."
+        )
+
+
 class _CursorRequestSchemaError(ValueError):
     """A bounded pre-egress Cursor request-shape rejection."""
 
@@ -1344,6 +1415,9 @@ def install(
         "_raise_cursor_agent_alias_error",
         "_raise_codex_auto_agent_missing_credential_preflight",
         "_load_codex_auto_agent_opencode_zen_api_key",
+        "_raise_codex_alibaba_auto_review_validation_error",
+        "_validate_codex_alibaba_auto_review_completion_or_raise",
+        "_validate_codex_alibaba_auto_review_response_body_or_raise",
     ):
         host_globals.setdefault(_name, _mod[_name])
     from litellm.llms.alibaba_token_plan.adapters import (
@@ -6897,27 +6971,10 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
             **_stream_acompletion_kwargs
         )
         for _stream_attempt in range(_ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES + 1):
-            try:
-                _alibaba_token_plan_adapters.validate_codex_auto_review_completion(
-                    _stream_completion_response,
-                    schema=auto_review_schema,
-                )
-            except ValueError as exc:
-                _raise_codex_auto_agent_failed_responses_payload(
-                    response_body={
-                        "status": "failed",
-                        "model": adapter_model,
-                        "output": [],
-                        "error": {
-                            "type": "invalid_response",
-                            "code": "aawm_alibaba_auto_review_invalid_completion",
-                            "message": str(exc),
-                        },
-                    },
-                    adapter_model=adapter_model,
-                    adapter="codex_alibaba_token_plan_chat_completions_adapter",
-                    adapter_label="Alibaba Token Plan",
-                )
+            _validate_codex_alibaba_auto_review_completion_or_raise(
+                _stream_completion_response,
+                schema=auto_review_schema,
+            )
             _stream_responses_api_response = (
                 LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
                     chat_completion_response=_stream_completion_response,
@@ -6936,7 +6993,7 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
                         _stream_responses_api_response
                     )
                 )
-                _alibaba_token_plan_adapters.validate_codex_auto_review_response_body(
+                _validate_codex_alibaba_auto_review_response_body_or_raise(
                     _stream_response_body,
                     schema=auto_review_schema,
                 )
@@ -7000,27 +7057,10 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
     # observes the Alibaba provider and can route accordingly.
     _last_encrypted_findings: list[dict[str, Any]] = []
     for _attempt in range(_ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES + 1):
-        try:
-            _alibaba_token_plan_adapters.validate_codex_auto_review_completion(
-                completion_response,
-                schema=auto_review_schema,
-            )
-        except ValueError as exc:
-            _raise_codex_auto_agent_failed_responses_payload(
-                response_body={
-                    "status": "failed",
-                    "model": adapter_model,
-                    "output": [],
-                    "error": {
-                        "type": "invalid_response",
-                        "code": "aawm_alibaba_auto_review_invalid_completion",
-                        "message": str(exc),
-                    },
-                },
-                adapter_model=adapter_model,
-                adapter="codex_alibaba_token_plan_chat_completions_adapter",
-                adapter_label="Alibaba Token Plan",
-            )
+        _validate_codex_alibaba_auto_review_completion_or_raise(
+            completion_response,
+            schema=auto_review_schema,
+        )
         responses_api_response = (
             LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
                 chat_completion_response=completion_response,
@@ -7037,7 +7077,7 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
             response_body = json.loads(
                 _serialize_responses_adapter_response(responses_api_response)
             )
-            _alibaba_token_plan_adapters.validate_codex_auto_review_response_body(
+            _validate_codex_alibaba_auto_review_response_body_or_raise(
                 response_body,
                 schema=auto_review_schema,
             )
