@@ -121,6 +121,14 @@ _CODEX_AUTO_REVIEW_DECISION_PROMPT = (
     "setup, exploration, task execution, wrapping, or commentary."
 )
 _CODEX_AUTO_REVIEW_ID_ONLY_REASONING_KEYS = frozenset({"type", "id"})
+_CODEX_AUTO_REVIEW_EXPLICIT_REFERENCE_KEYS = frozenset(
+    {
+        "item_id",
+        "item_reference",
+        "provider_item_id",
+        "response_item_id",
+    }
+)
 _CODEX_AUTO_REVIEW_ACTION_INPUT_TYPES = frozenset(
     {
         "function_call",
@@ -136,6 +144,16 @@ _CODEX_AUTO_REVIEW_MESSAGE_ROLES = frozenset(
 
 def _codex_auto_review_nonempty_string(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def _codex_auto_review_nonempty_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (Mapping, list, tuple, set, frozenset)):
+        return bool(value)
+    return bool(value)
 
 
 def _codex_auto_review_visible_text(value: Any) -> bool:
@@ -172,11 +190,30 @@ def _codex_auto_review_function_name(item: Mapping[str, Any]) -> bool:
 
 
 def _codex_auto_review_action_payload_present(value: Any) -> bool:
+    if value is None:
+        return False
     if isinstance(value, str):
         return bool(value.strip())
-    if isinstance(value, (Mapping, list, tuple, set, frozenset)):
-        return bool(value)
-    return False
+    if isinstance(value, Mapping):
+        text_fields = tuple(
+            field
+            for field in ("content", "input_text", "output_text", "text")
+            if field in value
+        )
+        if text_fields:
+            return any(
+                _codex_auto_review_visible_text(value[field])
+                for field in text_fields
+            )
+        return any(
+            _codex_auto_review_action_payload_present(child)
+            for child in value.values()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(
+            _codex_auto_review_action_payload_present(item) for item in value
+        )
+    return True
 
 
 def _codex_auto_review_action_arguments_present(
@@ -271,6 +308,40 @@ def _is_codex_auto_review_id_only_reasoning_item(value: Any) -> bool:
     )
 
 
+def _codex_auto_review_replay_reference_present(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        item_id = value.get("id")
+        item_type = value.get("type")
+        meaningful_keys = {
+            key
+            for key, child in value.items()
+            if _codex_auto_review_nonempty_value(child)
+        }
+        if _codex_auto_review_nonempty_string(item_id):
+            if meaningful_keys == {"id"}:
+                return True
+            if (
+                isinstance(item_type, str)
+                and item_type.strip().casefold().endswith("_reference")
+            ):
+                return True
+        if any(
+            _codex_auto_review_nonempty_value(value[key])
+            for key in _CODEX_AUTO_REVIEW_EXPLICIT_REFERENCE_KEYS
+            if key in value
+        ):
+            return True
+        return any(
+            _codex_auto_review_replay_reference_present(child)
+            for child in value.values()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(
+            _codex_auto_review_replay_reference_present(item) for item in value
+        )
+    return False
+
+
 def _project_codex_auto_review_replay_input(
     request_body: dict[str, Any],
 ) -> dict[str, Any]:
@@ -285,7 +356,16 @@ def _project_codex_auto_review_replay_input(
         for item in input_items
         if not _is_codex_auto_review_id_only_reasoning_item(item)
     ]
-    if len(retained_items) == len(input_items) or not any(
+    if len(retained_items) == len(input_items):
+        return request_body
+    if _codex_auto_review_nonempty_value(request_body.get("conversation")):
+        return request_body
+    if any(
+        _codex_auto_review_replay_reference_present(item)
+        for item in retained_items
+    ):
+        return request_body
+    if not any(
         _codex_auto_review_input_item_has_visible_evidence(item)
         for item in retained_items
     ):
