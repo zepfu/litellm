@@ -1,7 +1,7 @@
 """Audit-context extraction: request context, agent dispatch, prior-tool activity.
 
-Wave 5D extraction from ``llm_passthrough_endpoints.py``.  Behavior-preserving
-relocation only; no logic changes.
+Wave 5D extraction from ``llm_passthrough_endpoints.py``.  Repository identity
+uses the shared request-scoped observability extractor.
 
 Dependencies on the god module are injected via :func:`configure_audit_context_runtime`.
 ``_clean_codex_auth_value`` is consumed from ``codex_oauth.py`` and
@@ -20,6 +20,7 @@ from typing_extensions import NotRequired, TypedDict
 
 from litellm.proxy.common_utils.http_parsing_utils import _safe_get_request_headers
 
+from ..aawm_request_policy.observability_metadata import _extract_passthrough_repository
 from .codex_oauth import _clean_codex_auth_value
 from .request_metadata import (
     _extract_auto_agent_alias_canonical_thread_id,
@@ -618,13 +619,7 @@ def _get_auto_agent_alias_request_context(
     if isinstance(cached_value, dict):
         cached = _normalize_auto_agent_alias_request_context(cached_value)
     else:
-        repository = _extract_auto_agent_alias_metadata_value(
-            request_body,
-            "repository",
-            "repo",
-            "repo_name",
-            "repository_name",
-        )
+        repository = _extract_passthrough_repository(request, request_body)
         client_product_label = _extract_auto_agent_alias_client_product_label(
             request,
             request_body,
