@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from typing import Any, Iterable, Optional, cast
 
 from litellm.llms.alibaba_token_plan.chat.transformation import (
@@ -19,6 +21,13 @@ from litellm.responses.litellm_completion_transformation.transformation import (
 from litellm.types.llms.openai import ResponsesAPIOptionalRequestParams
 
 ALIBABA_TOKEN_PLAN_CREDENTIAL_SENTINEL = "canonical-alibaba-token-plan-credential"
+_CODEX_AUTO_REVIEW_ALIASES = frozenset(
+    {
+        "codex-auto-review",
+        "auto-review",
+        "chatgpt/codex-auto-review",
+    }
+)
 
 
 def normalize_alibaba_token_plan_adapter_model_name(
@@ -43,6 +52,122 @@ def _resolve_upstream_model(adapter_model: str) -> str:
     if normalized is None:
         raise ValueError(f"Unsupported Alibaba Token Plan adapter model {adapter_model!r}.")
     return normalized.removeprefix("alibaba_token_plan/")
+
+
+def _is_codex_auto_review_request(request_body: Mapping[str, Any]) -> bool:
+    """Identify the canonical review alias after candidate model replacement."""
+
+    values: list[Any] = [request_body.get("model")]
+    metadata = request_body.get("litellm_metadata")
+    if isinstance(metadata, Mapping):
+        values.extend(
+            metadata.get(key)
+            for key in (
+                "codex_auto_agent_alias",
+                "model_alias",
+                "requested_model_alias",
+                "inbound_model_alias",
+            )
+        )
+    return any(
+        isinstance(value, str)
+        and value.strip().casefold() in _CODEX_AUTO_REVIEW_ALIASES
+        for value in values
+    )
+
+
+def _codex_auto_review_response_schema(
+    request_body: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Return the original Responses JSON schema, when one was requested."""
+
+    if not _is_codex_auto_review_request(request_body):
+        return None
+    text_param = request_body.get("text")
+    if not isinstance(text_param, Mapping):
+        return None
+    format_param = text_param.get("format")
+    if not isinstance(format_param, Mapping):
+        return None
+    if format_param.get("type") != "json_schema":
+        return None
+    schema = format_param.get("schema")
+    return dict(schema) if isinstance(schema, dict) else None
+
+
+def _append_codex_auto_review_schema_instruction(
+    completion_kwargs: dict[str, Any],
+    *,
+    schema: dict[str, Any],
+) -> None:
+    """Give prompt-only Alibaba review generation the complete source schema."""
+
+    schema_instruction = (
+        "Return exactly one complete JSON object matching this JSON Schema. "
+        "Do not use Markdown fences or add commentary:\n"
+        f"{json.dumps(schema, ensure_ascii=False, sort_keys=True)}"
+    )
+    messages = completion_kwargs.get("messages")
+    if not isinstance(messages, list):
+        completion_kwargs["messages"] = [
+            {"role": "system", "content": schema_instruction}
+        ]
+        return
+
+    updated_messages = list(messages)
+    for index, message in enumerate(updated_messages):
+        if not isinstance(message, dict) or message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            updated_message = dict(message)
+            updated_message["content"] = f"{content}\n\n{schema_instruction}"
+            updated_messages[index] = updated_message
+            completion_kwargs["messages"] = updated_messages
+            return
+        break
+
+    completion_kwargs["messages"] = [
+        {"role": "system", "content": schema_instruction},
+        *updated_messages,
+    ]
+
+
+def validate_codex_auto_review_response_body(
+    response_body: Mapping[str, Any],
+    *,
+    schema: Optional[dict[str, Any]],
+) -> None:
+    """Fail closed when an Alibaba review response violates its source schema."""
+
+    if schema is None:
+        return
+
+    output_texts: list[str] = []
+    output = response_body.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, Mapping) or item.get("type") != "message":
+                continue
+            if item.get("role") != "assistant":
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for content_item in content:
+                if (
+                    isinstance(content_item, Mapping)
+                    and content_item.get("type") == "output_text"
+                    and isinstance(content_item.get("text"), str)
+                ):
+                    output_texts.append(content_item["text"])
+
+    from litellm.litellm_core_utils.json_validation_rule import validate_schema
+
+    validate_schema(
+        schema=schema,
+        response=output_texts[0] if len(output_texts) == 1 else "",
+    )
 
 
 def _add_adapter_metadata(
@@ -186,6 +311,18 @@ async def prepare_codex_alibaba_token_plan_adapter_route(
         stream=bool(request_body.get("stream")),
         metadata=litellm_metadata,
     )
+    is_auto_review = _is_codex_auto_review_request(request_body)
+    auto_review_schema = _codex_auto_review_response_schema(request_body)
+    if is_auto_review:
+        # Alibaba Token Plan accepts the translated chat request but not
+        # OpenAI's response_format field. Keep the source Responses schema for
+        # the post-egress validation gate below.
+        completion_kwargs.pop("response_format", None)
+        if auto_review_schema is not None:
+            _append_codex_auto_review_schema_instruction(
+                completion_kwargs,
+                schema=auto_review_schema,
+            )
     completion_kwargs.update(
         {
             "metadata": litellm_metadata,
@@ -213,6 +350,7 @@ async def prepare_codex_alibaba_token_plan_adapter_route(
             "responses_api_request": responses_api_request,
             "litellm_metadata": litellm_metadata,
             "upstream_model": upstream_model,
+            "auto_review_schema": auto_review_schema,
         },
     )
 

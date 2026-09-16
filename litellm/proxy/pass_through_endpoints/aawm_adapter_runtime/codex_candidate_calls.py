@@ -6838,6 +6838,7 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
     responses_api_request: ResponsesAPIOptionalRequestParams,
     litellm_metadata: Payload,
     upstream_model: str,
+    auto_review_schema: Optional[dict[str, Any]],
 ) -> Response:
     """Execute Token Plan chat completions through the standard Responses wrapper."""
     from litellm.responses.litellm_completion_transformation.transformation import (
@@ -6905,6 +6906,10 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
                     _serialize_responses_adapter_response(
                         _stream_responses_api_response
                     )
+                )
+                _alibaba_token_plan_adapters.validate_codex_auto_review_response_body(
+                    _stream_response_body,
+                    schema=auto_review_schema,
                 )
                 return StreamingResponse(
                     _responses_sse_from_repaired_response_body(
@@ -6979,6 +6984,13 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
             )
         )
         if not _encrypted_findings:
+            response_body = json.loads(
+                _serialize_responses_adapter_response(responses_api_response)
+            )
+            _alibaba_token_plan_adapters.validate_codex_auto_review_response_body(
+                response_body,
+                schema=auto_review_schema,
+            )
             return _build_responses_response_from_adapter_response(
                 responses_api_response,
                 request_body=(
