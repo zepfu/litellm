@@ -122,6 +122,7 @@ _CURSOR_AUTO_REVIEW_ALIASES = frozenset(
         "chatgpt/codex-auto-review",
     }
 )
+_CURSOR_AUTO_REVIEW_CANONICAL_ALIAS = "codex-auto-review"
 _CURSOR_AUTO_REVIEW_DIAGNOSTIC_SWITCH = "1"
 _CURSOR_AUTO_REVIEW_DIAGNOSTIC_ENVIRONMENT = "litellm-alpha"
 _CURSOR_AUTO_REVIEW_DIAGNOSTIC_MAX_RESULT_BYTES = 64 * 1024
@@ -2528,6 +2529,135 @@ def _emit_cursor_auto_review_result_diagnostic(
         return
 
 
+def _cursor_auto_review_raw_capture_message_context(
+    messages: Any,
+) -> dict[str, Any]:
+    if not isinstance(messages, list):
+        return {}
+
+    effective_instructions: list[str] = []
+    native_user_messages: list[str] = []
+    message_roles: list[str] = []
+    message_text_truncated = False
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        role = message.get("role")
+        role_text = str(role) if role is not None else "unknown"
+        message_roles.append(role_text)
+        text, truncated = _cursor_auto_review_bounded_capture_text(
+            _cursor_response_content_text(message.get("content"))
+        )
+        message_text_truncated = message_text_truncated or truncated
+        if role_text == "system":
+            effective_instructions.append(text)
+        elif role_text == "user":
+            native_user_messages.append(text)
+
+    context: dict[str, Any] = {
+        "effective_review_instructions": effective_instructions,
+        "native_user_messages": native_user_messages,
+        "native_message_count": len(messages),
+        "native_message_roles": message_roles,
+    }
+    if message_text_truncated:
+        context["message_text_truncated"] = True
+    return context
+
+
+def _cursor_auto_review_bounded_capture_text(value: Any) -> tuple[str, bool]:
+    text = value if isinstance(value, str) else str(value or "")
+    bounded_bytes, truncated = _cursor_auto_review_bounded_result_bytes(text)
+    return bounded_bytes.decode("utf-8", errors="replace"), truncated
+
+
+def _capture_cursor_auto_review_native_result(
+    *,
+    request: Any,
+    request_body: Mapping[str, Any],
+    result: Any,
+    cursor_url: str,
+    native_messages: Any,
+    candidate: Mapping[str, Any],
+) -> None:
+    """Persist bounded native review text only under explicit raw-capture gates."""
+    try:
+        if (
+            os.getenv("AAWM_CURSOR_AUTO_REVIEW_DIAGNOSTICS", "").strip()
+            != _CURSOR_AUTO_REVIEW_DIAGNOSTIC_SWITCH
+            or os.getenv("AAWM_LITELLM_ENVIRONMENT", "").strip()
+            != _CURSOR_AUTO_REVIEW_DIAGNOSTIC_ENVIRONMENT
+        ):
+            return
+        alias = _cursor_auto_review_alias_from_request_body(request_body)
+        if alias != _CURSOR_AUTO_REVIEW_CANONICAL_ALIAS:
+            return
+
+        from litellm.integrations.aawm_passthrough_shape_capture import (
+            capture_passthrough_shape,
+            passthrough_full_payload_capture_enabled,
+        )
+
+        if not passthrough_full_payload_capture_enabled():
+            return
+
+        result_text = getattr(result, "text", "")
+        bounded_text, text_truncated = _cursor_auto_review_bounded_capture_text(
+            result_text
+        )
+        original_text_bytes = (
+            len(result_text.encode("utf-8", errors="replace"))
+            if isinstance(result_text, str)
+            else 0
+        )
+        result_payload: dict[str, Any] = {
+            "text": bounded_text,
+            "text_utf8_bytes": original_text_bytes,
+            "text_truncated": text_truncated,
+            "text_sha256": hashlib.sha256(
+                bounded_text.encode("utf-8", errors="replace")
+            ).hexdigest(),
+            "turn_ended": bool(getattr(result, "turn_ended", False)),
+            "end_stream": bool(getattr(result, "end_stream", False)),
+            "tool_call_count": len(
+                getattr(result, "tool_calls", [])
+                if isinstance(getattr(result, "tool_calls", []), list)
+                else []
+            ),
+            "exec_server_message_count": len(
+                getattr(result, "exec_server_messages", [])
+                if isinstance(getattr(result, "exec_server_messages", []), list)
+                else []
+            ),
+        }
+        capture_request = _cursor_auto_review_raw_capture_message_context(
+            native_messages
+        )
+        response_schema = _cursor_auto_review_response_schema(request_body)
+        if response_schema is not None:
+            capture_request["response_schema"] = response_schema
+
+        correlation_id = _cursor_retained_history_correlation_id(request)
+        capture_passthrough_shape(
+            mode="nonstream",
+            provider=str(candidate.get("provider") or "cursor_agent"),
+            endpoint_type="cursor_agent",
+            url_route=cursor_url,
+            request_body=capture_request,
+            response_body={"native_result": result_payload},
+            litellm_call_id=correlation_id,
+            extra_metadata={
+                "cursor_auto_review_alias": alias,
+                "cursor_capture_scope": "native_result_and_review_context",
+                "cursor_route_family": str(candidate.get("route_family") or ""),
+                "cursor_result_text_truncated": text_truncated,
+            },
+        )
+    except Exception:
+        # Raw diagnostics must never alter the provider result or fallback.
+        return
+
+
 def _cursor_function_call_message(
     item: dict[str, Any],
     function_calls: dict[str, str],
@@ -4832,6 +4962,14 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
                 request_body=request_body,
                 result=result,
             )
+            _capture_cursor_auto_review_native_result(
+                request=request,
+                request_body=request_body,
+                result=result,
+                cursor_url=cursor_url,
+                native_messages=messages,
+                candidate=candidate,
+            )
             if cursor_auto_review_alias is not None and result.tool_calls:
                 raise _CursorPostEgressOutputError(
                     "Cursor auto-review returned executable tool calls; "
@@ -4969,6 +5107,14 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             request=request,
             request_body=request_body,
             result=result,
+        )
+        _capture_cursor_auto_review_native_result(
+            request=request,
+            request_body=request_body,
+            result=result,
+            cursor_url=cursor_url,
+            native_messages=messages,
+            candidate=candidate,
         )
     except _CursorPostEgressOutputError:
         raise
