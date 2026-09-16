@@ -6897,10 +6897,27 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
             **_stream_acompletion_kwargs
         )
         for _stream_attempt in range(_ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES + 1):
-            _alibaba_token_plan_adapters.validate_codex_auto_review_completion(
-                _stream_completion_response,
-                schema=auto_review_schema,
-            )
+            try:
+                _alibaba_token_plan_adapters.validate_codex_auto_review_completion(
+                    _stream_completion_response,
+                    schema=auto_review_schema,
+                )
+            except ValueError as exc:
+                _raise_codex_auto_agent_failed_responses_payload(
+                    response_body={
+                        "status": "failed",
+                        "model": adapter_model,
+                        "output": [],
+                        "error": {
+                            "type": "invalid_response",
+                            "code": "aawm_alibaba_auto_review_invalid_completion",
+                            "message": str(exc),
+                        },
+                    },
+                    adapter_model=adapter_model,
+                    adapter="codex_alibaba_token_plan_chat_completions_adapter",
+                    adapter_label="Alibaba Token Plan",
+                )
             _stream_responses_api_response = (
                 LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
                     chat_completion_response=_stream_completion_response,
@@ -6983,10 +7000,27 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
     # observes the Alibaba provider and can route accordingly.
     _last_encrypted_findings: list[dict[str, Any]] = []
     for _attempt in range(_ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES + 1):
-        _alibaba_token_plan_adapters.validate_codex_auto_review_completion(
-            completion_response,
-            schema=auto_review_schema,
-        )
+        try:
+            _alibaba_token_plan_adapters.validate_codex_auto_review_completion(
+                completion_response,
+                schema=auto_review_schema,
+            )
+        except ValueError as exc:
+            _raise_codex_auto_agent_failed_responses_payload(
+                response_body={
+                    "status": "failed",
+                    "model": adapter_model,
+                    "output": [],
+                    "error": {
+                        "type": "invalid_response",
+                        "code": "aawm_alibaba_auto_review_invalid_completion",
+                        "message": str(exc),
+                    },
+                },
+                adapter_model=adapter_model,
+                adapter="codex_alibaba_token_plan_chat_completions_adapter",
+                adapter_label="Alibaba Token Plan",
+            )
         responses_api_response = (
             LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
                 chat_completion_response=completion_response,
