@@ -17,6 +17,7 @@ import httpx
 
 from litellm.proxy.aawm_route_logging import (
     _normalize_aawm_route_log_reasoning_effort,
+    _resolve_aawm_route_rollup_reasoning_effort,
     build_aawm_route_rollup_group_header_label,
     emit_aawm_route_status_event,
     record_aawm_route_rollup,
@@ -418,11 +419,11 @@ def _record_auto_agent_alias_route_status_rollup(  # noqa: PLR0915
         )
         or "candidate_selection"
     )
-    # Zero-turn status rollups use same-request native effort only.
-    # Core normalization renders absent/invalid values as "none"; never consult
-    # candidate config, defaults, or model capabilities here.
-    effort = _normalize_aawm_route_log_reasoning_effort(
-        event.get("reasoning_effort_native_value")
+    # Keep zero-turn status records on the same effort resolution path as
+    # completed turns. Absent/invalid values still render as "none".
+    effort = _resolve_aawm_route_rollup_reasoning_effort(
+        metadata=event,
+        provider_bound_body=None,
     )
     from litellm.proxy.aawm_route_logging import _AawmRouteRollupOriginIdentity
 
@@ -587,6 +588,10 @@ def install(host_globals: dict) -> None:
     host_globals.setdefault(
         "_normalize_aawm_route_log_reasoning_effort",
         _normalize_aawm_route_log_reasoning_effort,
+    )
+    host_globals.setdefault(
+        "_resolve_aawm_route_rollup_reasoning_effort",
+        _resolve_aawm_route_rollup_reasoning_effort,
     )
     host_globals.setdefault(
         "_auto_agent_alias_event_request_identity",

@@ -2619,9 +2619,10 @@ def _resolve_aawm_route_rollup_reasoning_effort(
     if has_provider_body_effort:
         return _normalize_aawm_route_log_reasoning_effort(resolved_effort)
 
-    return _normalize_aawm_route_log_reasoning_effort(
-        metadata.get(_AAWM_ROUTE_LOG_REASONING_EFFORT_METADATA_KEY)
-    )
+    metadata_effort = metadata.get(_AAWM_ROUTE_LOG_REASONING_EFFORT_METADATA_KEY)
+    if metadata_effort is None:
+        metadata_effort = metadata.get("reasoning_effort_config_value")
+    return _normalize_aawm_route_log_reasoning_effort(metadata_effort)
 
 
 def _get_aawm_route_rollup_model_label(
