@@ -913,14 +913,17 @@
         ]
     },
     "kimi_code/k3-256k": {
-        "comment": "Kimi Code subscription route; per-request invoice cost is not exposed as public per-token pricing.",
+        "cache_read_input_token_cost": 3e-07,
+        "comment": "Public reference costs for the kimi_code subscription route, not known invoice billing.",
         "custom_tool_function_adapters": [
             "apply_patch"
         ],
         "default_reasoning_effort": "high",
+        "input_cost_per_token": 3e-06,
         "litellm_provider": "kimi_code",
         "max_input_tokens": 262144,
         "mode": "chat",
+        "output_cost_per_token": 1.5e-05,
         "namespace_tool_function_adapters": {
             "collaboration": [
                 "followup_task",
@@ -935,7 +938,7 @@
             "kimi_code": {
                 "aawm_reference_pricing": {
                     "schema_version": 1,
-                    "status": "unpriced",
+                    "status": "priced",
                     "kind": "provider_subscription_reference",
                     "billing_mode": "kimi_code_subscription",
                     "actual_invoice_cost_known": false,
@@ -944,9 +947,14 @@
                         "provider": "kimi_code",
                         "model": "kimi_code/k3-256k"
                     },
-                    "cache_mode": "none",
-                    "equivalence_status": "not_applicable",
-                    "equivalence_evidence": "Extra Usage is described as close to API rates; no official per-token tariff is published for the Kimi Code 256K route.",
+                    "rates": {
+                        "input_usd_per_million_tokens": 3.0,
+                        "cache_read_usd_per_million_tokens": 0.3,
+                        "output_usd_per_million_tokens": 15.0
+                    },
+                    "cache_mode": "provider_cache_read",
+                    "equivalence_status": "not_exact",
+                    "equivalence_evidence": "Operator-directed parity with the kimi_code/k3 nonpromotional reference rates on 2026-09-16: input is $3.00/1M, cache-read is $0.30/1M, and output is $15.00/1M. This is not provider-published exact256k pricing.",
                     "source": {
                         "kind": "official_provider_catalog",
                         "label": "Kimi Code model configuration",
@@ -955,8 +963,7 @@
                         ],
                         "version": "2026-09-16",
                         "verified_on": "2026-09-16"
-                    },
-                    "unpriced_reason": "public_per_token_rate_unavailable"
+                    }
                 }
             }
         },
