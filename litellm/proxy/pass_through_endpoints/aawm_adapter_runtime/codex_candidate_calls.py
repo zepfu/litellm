@@ -2239,8 +2239,11 @@ def _cursor_auto_review_alias_from_request_body(
 def _cursor_auto_review_response_schema(
     request_body: Mapping[str, Any],
 ) -> Optional[dict[str, Any]]:
-    """Return the caller-supplied Responses output schema for review requests."""
-    if _cursor_auto_review_alias_from_request_body(request_body) is None:
+    """Return the caller-supplied schema for canonical Cursor reviews."""
+    if (
+        _cursor_auto_review_alias_from_request_body(request_body)
+        != _CURSOR_AUTO_REVIEW_CANONICAL_ALIAS
+    ):
         return None
     text_param = request_body.get("text")
     if not isinstance(text_param, Mapping):
@@ -2254,17 +2257,31 @@ def _cursor_auto_review_response_schema(
     return dict(schema) if isinstance(schema, dict) else None
 
 
+def _cursor_auto_review_schema_instruction(schema: Mapping[str, Any]) -> str:
+    return (
+        "Return exactly one complete JSON object matching this JSON Schema. "
+        "Do not use Markdown fences or add commentary:\n"
+        f"{json.dumps(schema, ensure_ascii=False, sort_keys=True)}"
+    )
+
+
+def _cursor_auto_review_active_user_instruction(
+    schema: Mapping[str, Any],
+) -> str:
+    return (
+        "This is a decision-only approval review. Do not call tools or perform "
+        "actions. "
+        f"{_cursor_auto_review_schema_instruction(schema)}"
+    )
+
+
 def _append_cursor_auto_review_schema_instruction(
     request_body: dict[str, Any],
     *,
     schema: dict[str, Any],
 ) -> dict[str, Any]:
     """Copy review input and append the exact caller-supplied output schema."""
-    schema_instruction = (
-        "Return exactly one complete JSON object matching this JSON Schema. "
-        "Do not use Markdown fences or add commentary:\n"
-        f"{json.dumps(schema, ensure_ascii=False, sort_keys=True)}"
-    )
+    schema_instruction = _cursor_auto_review_schema_instruction(schema)
     existing_instructions = request_body.get("instructions")
     if isinstance(existing_instructions, str):
         if schema_instruction in existing_instructions:
@@ -2283,6 +2300,23 @@ def _append_cursor_auto_review_schema_instruction(
     updated_body = dict(request_body)
     updated_body["instructions"] = instructions
     return updated_body
+
+
+def _append_cursor_auto_review_active_user_instruction(
+    messages: list[dict[str, Any]],
+    instruction: str,
+) -> None:
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            return
+        if instruction in content:
+            return
+        separator = "\n\n" if content.strip() else ""
+        message["content"] = f"{content}{separator}{instruction}"
+        return
 
 
 def _cursor_auto_review_json_type(value: Any) -> str:
@@ -4586,6 +4620,11 @@ def _responses_input_to_cursor_messages(  # noqa: PLR0915
         messages.append(continuation_message)
     if not messages:
         messages.append({"role": "user", "content": ""})
+    if response_schema is not None and not prior_messages:
+        _append_cursor_auto_review_active_user_instruction(
+            messages,
+            _cursor_auto_review_active_user_instruction(response_schema),
+        )
     return messages
 
 

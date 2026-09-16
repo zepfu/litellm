@@ -142,10 +142,15 @@ context. Executable tool results are rejected rather than forwarded as review
 decisions. Ordinary Cursor tool use and unknown-operation rejection are
 unchanged.
 
-When the caller supplies a Responses `text.format` JSON Schema, the adapter
-includes that schema in the review instructions. This is prompt guidance, not
-provider-enforced constrained decoding. Returned assessment text is unchanged
-and remains subject to the client's approval validation.
+When the canonical `codex-auto-review` caller supplies a Responses
+`text.format` JSON Schema, the adapter preserves the full policy and
+conversation history, then appends a decision-only JSON response instruction
+with the exact schema to the final user text sent as native
+`userMessage.text`. The schema also remains in the supported review
+instructions. This placement avoids the unsupported `customSystemPrompt`
+field and is prompt guidance, not provider-enforced constrained decoding.
+Returned assessment text is unchanged and remains subject to the client's
+approval validation.
 
 ## Stock Codex child agents
 
