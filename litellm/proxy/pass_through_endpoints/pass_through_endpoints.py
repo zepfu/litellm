@@ -183,6 +183,7 @@ from .aawm_text_watermark.policy import (
 from .aawm_alias_routing.output_guard_config import (
     output_guard_context_from_passthrough,
 )
+from .aawm_alias_routing import audit_persist as _aawm_audit_persist
 from .aawm_alias_routing.audit_persist import _emit_aawm_terminal_error
 from .aawm_adapter_runtime.deferred_success import (
     DeferredPassthroughSuccess,
@@ -6108,6 +6109,12 @@ def _emit_openai_final_send_binding_observation(
                 frozenset({"final_send_binding_or_owner_guard"}),
             ),
         }
+        if (
+            payload["outcome"]
+            in {"validated", "reserved", "transport_returned"}
+            and not _aawm_audit_persist._aawm_alias_route_healthy_json_enabled()
+        ):
+            return
         verbose_aawm_route_logger.info(
             "AAWM_OPENAI_FINAL_SEND_BINDING: "
             + json.dumps(payload, sort_keys=True, separators=(",", ":"))

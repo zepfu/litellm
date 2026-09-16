@@ -496,6 +496,10 @@ candidate inventories, or upstream error text). Full structured
 `verbose`). Healthy alias selection events remain suppressed unless
 `AAWM_ALIAS_ROUTE_LOG_HEALTHY=1`.
 
+The same flag controls healthy `AAWM_OPENAI_FINAL_SEND_BINDING` console logs
+(`validated`, `reserved`, and `transport_returned`). Rejection and transport
+failure logs remain enabled; observation persistence is unchanged.
+
 `provider_terminal_error` and `candidate_unavailable` alias cooldowns are
 durable per-candidate cooldowns because those outcomes are reusable across
 requests. They prevent repeated retry/log spam for the same terminal or
