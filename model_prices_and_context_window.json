@@ -41334,6 +41334,43 @@
         ],
         "source": "https://opencode.ai/zen/go/v1"
     },
+    "opencode/union-alpha": {
+        "comment": "OpenCode Go Union Alpha stealth hosted route; current 0/0 route pricing is operator-attested as temporarily free on 2026-09-16. Underlying vendor/model identity and post-retirement base pricing are unknown.",
+        "input_cost_per_token": 0,
+        "output_cost_per_token": 0,
+        "litellm_provider": "opencode_go",
+        "mode": "chat",
+        "provider_specific_entry": {
+            "opencode_go": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "hosted_route_reference",
+                    "billing_mode": "opencode_go_hosted_route",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "opencode_go",
+                        "model": "opencode/union-alpha"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "unverified",
+                    "equivalence_evidence": "OpenCode Go union-alpha is a stealth hosted route with current 0/0 input/output pricing operator-attested on 2026-09-16. This is not a permanent or non-promotional tariff; underlying vendor/model identity and post-retirement base pricing are unknown.",
+                    "source": {
+                        "kind": "live_provider_evidence",
+                        "label": "OpenCode Go union-alpha current temporary-free route attestation",
+                        "urls": [
+                            "https://opencode.ai/zen/go/v1"
+                        ],
+                        "version": "2026-09-16",
+                        "verified_on": "2026-09-16"
+                    },
+                    "unpriced_reason": "temporary_free_hosted_route"
+                }
+            }
+        },
+        "source": "https://opencode.ai/zen/go/v1"
+    },
     "claude-sonnet-5": {
         "cache_creation_input_token_cost": 3.75e-06,
         "cache_creation_input_token_cost_above_200k_tokens": 7.5e-06,
