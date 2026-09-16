@@ -2201,7 +2201,18 @@ family, so operators can distinguish provider traffic without also seeing raw
 
 ### Codex auto-review decision rollups
 
-Codex auto-review preserves guardian correlation, but it does not create durable session ownership. Ownership is request-local, the reservation is released after each successful review, self-contained full adapter reasoning items with local correlation IDs and no unresolved provider state are replay-safe, and genuine provider-owned continuation or reference state remains fail-closed before provider egress.
+Codex auto-review preserves guardian correlation without creating durable
+per-review ownership. Its `RELEASE_ON_TERMINAL` lease releases only the
+request-local effective reservation on success, failure, incomplete response,
+timeout, cancellation, or disconnect; the logical parent owner is unchanged.
+Deferred streaming keeps the reservation renewable until final wire disposition.
+Release-only leases never promote; an already-promoted or already-owned review
+lease is an invariant violation, not successful cleanup. Ordinary conversation
+leases retain `PERSIST_ON_COMPLETED` behavior.
+
+Self-contained full adapter reasoning items with local correlation IDs and no
+unresolved provider state are replay-safe. Genuine provider-owned continuation
+or reference state remains fail-closed before provider egress.
 
 `codex-auto-review` responses are recognized only when the completed response
 contains exactly one assistant `output_text` item whose entire text is one JSON

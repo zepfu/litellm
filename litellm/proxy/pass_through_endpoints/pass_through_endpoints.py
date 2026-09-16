@@ -6603,10 +6603,19 @@ async def _finalize_native_openai_responses_owner_wire_disposition(  # noqa: PLR
             if outcome is not None:
                 trace.metadata["session_owner_wire_outcome"] = outcome
 
+        release_only = sa.session_owner_lease_is_release_only(lease)
         expected_outcomes = (
-            {"promoted", "already_owned"}
+            (
+                {"released", "not_held"}
+                if release_only
+                else {"promoted", "already_owned"}
+            )
             if disposition is OpenAIResponsesWireDisposition.COMPLETED
-            else {"released", "not_held", "already_owned"}
+            else (
+                {"released", "not_held"}
+                if release_only
+                else {"released", "not_held", "already_owned"}
+            )
         )
         owner_finalized = (
             disposition is not OpenAIResponsesWireDisposition.COMPLETED
