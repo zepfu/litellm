@@ -113,6 +113,14 @@ _CURSOR_RETAINED_HISTORY_DIAGNOSTIC_KEYS = frozenset(
         "internal_chat_message_metadata_passthrough",
     }
 )
+_CURSOR_AUTO_REVIEW_ALIASES = frozenset(
+    {
+        "codex-auto-review",
+        "auto-review",
+        "chatgpt/codex-auto-review",
+    }
+)
+_CURSOR_AGENT_ALLOWED_TOOLS_HEADER = "x-cursor-agent-allowed-tools"
 _CURSOR_REQUEST_SCHEMA_REJECTION_REASONS = frozenset(
     {
         "function_call_fields",
@@ -2186,6 +2194,22 @@ def _cursor_call_id(item: dict[str, Any]) -> str:
 def _cursor_function_name(item: dict[str, Any]) -> str:
     function = _cursor_as_mapping(item.get("function"))
     return str(item.get("name") or function.get("name") or "")
+
+
+def _cursor_auto_review_alias_from_request_body(
+    request_body: Mapping[str, Any],
+) -> Optional[str]:
+    """Return the canonical auto-review alias retained in route metadata."""
+    metadata = request_body.get("litellm_metadata")
+    if not isinstance(metadata, Mapping):
+        return None
+    alias = metadata.get("codex_auto_agent_alias")
+    if not isinstance(alias, str):
+        return None
+    normalized = alias.strip().casefold()
+    if normalized not in _CURSOR_AUTO_REVIEW_ALIASES:
+        return None
+    return normalized
 
 
 def _cursor_function_call_message(
@@ -4342,6 +4366,7 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         )
 
     request_body = dict(candidate_body)
+    cursor_auto_review_alias = _cursor_auto_review_alias_from_request_body(request_body)
     litellm_metadata = request_body.get("litellm_metadata")
     rollup_kwargs = _build_adapted_route_rollup_kwargs(
         litellm_metadata if isinstance(litellm_metadata, dict) else {}
@@ -4480,6 +4505,11 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             result = await retained_session.continue_with_tool_outputs(
                 cursor_tool_outputs
             )
+            if cursor_auto_review_alias is not None and result.tool_calls:
+                raise _CursorPostEgressOutputError(
+                    "Cursor auto-review returned executable tool calls; "
+                    "review decisions must be text-only."
+                )
             _validate_cursor_result_and_consume_replay_state(
                 result=result,
                 previous_response_id=None,
@@ -4585,8 +4615,14 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         messages=messages,
         optional_params=optional_params,
     )
+    if cursor_auto_review_alias is not None:
+        # Cursor's built-in tool allowlist and MCP advertisement are separate
+        # controls. Apply the empty MCP list after all candidate/tool merging.
+        cursor_request["runRequest"]["mcpTools"] = {"mcpTools": []}
 
     extra_headers: dict[str, str] = {}
+    if cursor_auto_review_alias is not None:
+        extra_headers[_CURSOR_AGENT_ALLOWED_TOOLS_HEADER] = ""
     request_headers = getattr(request, "headers", None)
     if request_headers is not None:
         request_id = request_headers.get("x-request-id")
@@ -4619,6 +4655,13 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             )
         raise
 
+    if cursor_auto_review_alias is not None and result.tool_calls:
+        if result.retained_session is not None:
+            await result.retained_session.aclose()
+        raise _CursorPostEgressOutputError(
+            "Cursor auto-review returned executable tool calls; "
+            "review decisions must be text-only."
+        )
     _validate_cursor_result_and_consume_replay_state(
         result=result,
         previous_response_id=previous_response_id,
