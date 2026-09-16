@@ -133,6 +133,15 @@ Lifecycle records use sanitized termination reasons and an explicit
 non-sensitive header allowlist. Request payloads, access credentials, cookies,
 and arbitrary custom headers are excluded from persisted telemetry.
 
+## Automatic approval reviews
+
+Requests identified by the canonical auto-review alias are decision-only.
+The Cursor adapter sends an explicitly empty built-in tool allowlist and an
+empty derived MCP tool list, preserving the approval policy and request
+context. Executable tool results are rejected rather than forwarded as review
+decisions. Ordinary Cursor tool use and unknown-operation rejection are
+unchanged.
+
 ## Stock Codex child agents
 
 The Codex adapter advertises configured `collaboration` namespace tools as child
