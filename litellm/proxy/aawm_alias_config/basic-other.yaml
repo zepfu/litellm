@@ -4,6 +4,36 @@ defaults: {}
 aliases:
   - name: basic-other
     candidates:
+      - provider: cohere
+        model: cohere/north-mini-code-1-0
+        route_family: codex_cohere_chat_completions_adapter
+        priority: 160
+
+      - provider: nous
+        model: nous/meituan/longcat-2.0:free
+        route_family: codex_nous_chat_completions_adapter
+        priority: 150
+
+      - provider: nvidia
+        model: nvidia/moonshotai/kimi-k3
+        route_family: codex_nvidia_completion_adapter
+        priority: 140
+
+      - provider: openrouter
+        model: openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+        route_family: codex_openrouter_completion_adapter
+        priority: 130
+
+      - provider: opencode_go
+        model: omen-alpha
+        route_family: codex_opencode_go_adapter
+        priority: 120
+
+      - provider: opencode_go
+        model: muse-spark-1.3-contributor
+        route_family: codex_opencode_go_adapter
+        priority: 110
+
       - provider: alibaba_token_plan
         model: alibaba_token_plan/deepseek-v4.1-flash
         route_family: codex_alibaba_token_plan_chat_completions_adapter
