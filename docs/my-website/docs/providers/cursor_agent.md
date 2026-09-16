@@ -142,6 +142,11 @@ context. Executable tool results are rejected rather than forwarded as review
 decisions. Ordinary Cursor tool use and unknown-operation rejection are
 unchanged.
 
+When the caller supplies a Responses `text.format` JSON Schema, the adapter
+includes that schema in the review instructions. This is prompt guidance, not
+provider-enforced constrained decoding. Returned assessment text is unchanged
+and remains subject to the client's approval validation.
+
 ## Stock Codex child agents
 
 The Codex adapter advertises configured `collaboration` namespace tools as child

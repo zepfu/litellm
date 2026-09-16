@@ -2212,6 +2212,55 @@ def _cursor_auto_review_alias_from_request_body(
     return normalized
 
 
+def _cursor_auto_review_response_schema(
+    request_body: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Return the caller-supplied Responses output schema for review requests."""
+    if _cursor_auto_review_alias_from_request_body(request_body) is None:
+        return None
+    text_param = request_body.get("text")
+    if not isinstance(text_param, Mapping):
+        return None
+    format_param = text_param.get("format")
+    if not isinstance(format_param, Mapping):
+        return None
+    if format_param.get("type") != "json_schema":
+        return None
+    schema = format_param.get("schema")
+    return dict(schema) if isinstance(schema, dict) else None
+
+
+def _append_cursor_auto_review_schema_instruction(
+    request_body: dict[str, Any],
+    *,
+    schema: dict[str, Any],
+) -> dict[str, Any]:
+    """Copy review input and append the exact caller-supplied output schema."""
+    schema_instruction = (
+        "Return exactly one complete JSON object matching this JSON Schema. "
+        "Do not use Markdown fences or add commentary:\n"
+        f"{json.dumps(schema, ensure_ascii=False, sort_keys=True)}"
+    )
+    existing_instructions = request_body.get("instructions")
+    if isinstance(existing_instructions, str):
+        if schema_instruction in existing_instructions:
+            return request_body
+        existing_text = existing_instructions.strip()
+        instructions = (
+            schema_instruction
+            if not existing_text
+            else f"{existing_instructions}\n\n{schema_instruction}"
+        )
+    elif "instructions" not in request_body or existing_instructions is None:
+        instructions = schema_instruction
+    else:
+        return request_body
+
+    updated_body = dict(request_body)
+    updated_body["instructions"] = instructions
+    return updated_body
+
+
 def _cursor_function_call_message(
     item: dict[str, Any],
     function_calls: dict[str, str],
@@ -4035,6 +4084,12 @@ def _responses_input_to_cursor_messages(  # noqa: PLR0915
     prior_messages: Optional[list[dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
     """Translate one Responses request, including a tool continuation."""
+    response_schema = _cursor_auto_review_response_schema(request_body)
+    if response_schema is not None:
+        request_body = _append_cursor_auto_review_schema_instruction(
+            request_body,
+            schema=response_schema,
+        )
     messages = copy.deepcopy(prior_messages or [])
     instructions = request_body.get("instructions")
     if instructions and not prior_messages:
