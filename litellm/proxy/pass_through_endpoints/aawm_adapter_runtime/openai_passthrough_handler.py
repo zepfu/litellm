@@ -1066,12 +1066,12 @@ class BaseOpenAIPassThroughHandler:
                     extra_headers,
                     request=request,
                 )
-            if selected_openai_headers is not None:
-                from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
-                    _OPENAI_PROTECTED_PASSTHROUGH_HEADERS,
-                    HttpPassThroughEndpointHelpers,
-                )
+            from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+                _OPENAI_PROTECTED_PASSTHROUGH_HEADERS,
+                HttpPassThroughEndpointHelpers,
+            )
 
+            if selected_openai_headers is not None:
                 extra_headers = dict(
                     HttpPassThroughEndpointHelpers.canonicalize_openai_protected_headers(
                         dict(extra_headers or {}),
@@ -1086,9 +1086,7 @@ class BaseOpenAIPassThroughHandler:
 
             def _build_endpoint_func(current_api_key: Optional[str]):
                 bound_api_key = (
-                    current_api_key
-                    if openai_selected_credential_family == "openai"
-                    else None
+                    None if selected_openai_headers is not None else current_api_key
                 )
                 return rt.create_pass_through_route_fn(
                     endpoint=endpoint,
