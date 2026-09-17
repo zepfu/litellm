@@ -5,6 +5,19 @@ delivery, and cross-repository reporting. This file adds LiteLLM-specific
 requirements. Authorized implementation includes synchronizing documentation
 for the affected behavior; it does not waive global test approval.
 
+## CLI TODO Backend
+
+The operator's September 16, 2026 clarification selects `aawmdt todo` for all
+TODO entries. The authoritative root is `/home/zepfu/projects/litellm`,
+using explicit `--config /home/zepfu/projects/litellm/.aawm-devtools.toml`.
+The existing store is `.analysis/current.jsonl`, with
+`.analysis/todo-manifest.json`, `.analysis/todo-agent-events.jsonl`, and
+`.analysis/archive/{year}/{prefix}-{year}.jsonl`. Preserve existing IDs and use
+the configured prefix appropriate to each item. Use `$aawmdt-todo-goal`,
+`$aawmdt-todo-maintain`, and `$aawmdt-todo-summary` instead of their Markdown
+counterparts. Former Markdown queues are non-authoritative; do not duplicate
+CLI records there. Supporting worklogs remain evidence, not queue authority.
+
 ## Selected CLI TODO Work
 
 The operator's September 16, 2026 request selects `aawmdt todo` for the

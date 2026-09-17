@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional, Protocol
+from typing import Any, Mapping, Optional, Protocol
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.lane_keys import (
     _AAWM_READ_AGENT_GUIDANCE_POLICY_NAME,
@@ -120,6 +120,269 @@ _CODEX_AUTO_REVIEW_DECISION_PROMPT = (
     "rationale?, risk_level?, user_authorization?}` schema. Do not use tools, "
     "setup, exploration, task execution, wrapping, or commentary."
 )
+_CODEX_AUTO_REVIEW_ID_ONLY_REASONING_KEYS = frozenset({"type", "id"})
+_CODEX_AUTO_REVIEW_EXPLICIT_REFERENCE_KEYS = frozenset(
+    {
+        "item_id",
+        "item_reference",
+        "provider_item_id",
+        "response_item_id",
+    }
+)
+_CODEX_AUTO_REVIEW_ACTION_INPUT_TYPES = frozenset(
+    {
+        "function_call",
+        "function_call_output",
+        "mcp_call",
+        "mcp_call_output",
+    }
+)
+_CODEX_AUTO_REVIEW_MESSAGE_ROLES = frozenset(
+    {"assistant", "developer", "system", "user"}
+)
+_CODEX_AUTO_REVIEW_TEXT_PART_TYPES = frozenset(
+    {"input_text", "output_text", "text"}
+)
+
+
+def _codex_auto_review_nonempty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _codex_auto_review_nonempty_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (Mapping, list, tuple, set, frozenset)):
+        return bool(value)
+    return bool(value)
+
+
+def _codex_auto_review_visible_text(value: Any) -> bool:
+    if _codex_auto_review_nonempty_string(value):
+        return True
+    if isinstance(value, Mapping):
+        return any(
+            _codex_auto_review_visible_text(value[key])
+            for key in ("content", "input_text", "output_text", "text")
+            if key in value
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_codex_auto_review_visible_text(item) for item in value)
+    return False
+
+
+def _codex_auto_review_call_id(
+    item: Mapping[str, Any],
+    *,
+    fields: tuple[str, ...] = ("call_id", "callId", "id"),
+) -> bool:
+    return any(
+        _codex_auto_review_nonempty_string(item.get(field))
+        for field in fields
+    )
+
+
+def _codex_auto_review_function_name(item: Mapping[str, Any]) -> bool:
+    function = item.get("function")
+    return _codex_auto_review_nonempty_string(item.get("name")) or (
+        isinstance(function, Mapping)
+        and _codex_auto_review_nonempty_string(function.get("name"))
+    )
+
+
+def _codex_auto_review_action_payload_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, Mapping):
+        item_type = value.get("type")
+        if (
+            isinstance(item_type, str)
+            and item_type.strip().casefold() in _CODEX_AUTO_REVIEW_TEXT_PART_TYPES
+        ):
+            return _codex_auto_review_visible_text(value.get("text"))
+        text_fields = tuple(
+            field
+            for field in ("content", "input_text", "output_text", "text")
+            if field in value
+        )
+        if text_fields:
+            return any(
+                _codex_auto_review_visible_text(value[field])
+                for field in text_fields
+            )
+        return any(
+            _codex_auto_review_action_payload_present(child)
+            for child in value.values()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(
+            _codex_auto_review_action_payload_present(item) for item in value
+        )
+    return True
+
+
+def _codex_auto_review_action_arguments_present(
+    item: Mapping[str, Any],
+) -> bool:
+    function = item.get("function")
+    sources = (item, function) if isinstance(function, Mapping) else (item,)
+    return any(
+        field in source
+        and _codex_auto_review_action_payload_present(source[field])
+        for source in sources
+        for field in ("arguments", "input")
+    )
+
+
+def _codex_auto_review_action_output_present(item: Mapping[str, Any]) -> bool:
+    return any(
+        field in item
+        and _codex_auto_review_action_payload_present(item[field])
+        for field in ("content", "output")
+    )
+
+
+def _codex_auto_review_tool_call_has_evidence(item: Any) -> bool:
+    if not isinstance(item, Mapping):
+        return False
+    return (
+        _codex_auto_review_call_id(item)
+        and _codex_auto_review_function_name(item)
+        and _codex_auto_review_action_arguments_present(item)
+    )
+
+
+def _codex_auto_review_input_item_has_visible_evidence(item: Any) -> bool:
+    if _codex_auto_review_nonempty_string(item):
+        return True
+    if not isinstance(item, Mapping):
+        return False
+
+    item_type = item.get("type")
+    if item_type in _CODEX_AUTO_REVIEW_ACTION_INPUT_TYPES:
+        if item_type in {"function_call", "mcp_call"}:
+            return _codex_auto_review_call_id(
+                item
+            ) and _codex_auto_review_function_name(
+                item
+            ) and _codex_auto_review_action_arguments_present(item)
+        return _codex_auto_review_call_id(
+            item,
+            fields=("call_id", "callId"),
+        ) and _codex_auto_review_action_output_present(item)
+    if item.get("role") == "tool":
+        return _codex_auto_review_call_id(
+            item,
+            fields=("tool_call_id", "toolCallId", "call_id", "callId"),
+        ) and _codex_auto_review_action_output_present(item)
+    if item_type == "input_text":
+        return _codex_auto_review_visible_text(item.get("text"))
+    if item_type == "agent_message":
+        content = item.get("content")
+        return (
+            isinstance(content, list)
+            and bool(content)
+            and all(
+                isinstance(part, Mapping)
+                and set(part) == {"type", "text"}
+                and part.get("type") in {"input_text", "text"}
+                and _codex_auto_review_nonempty_string(part.get("text"))
+                for part in content
+            )
+        )
+    if item_type == "message" or (
+        item.get("role") in _CODEX_AUTO_REVIEW_MESSAGE_ROLES
+    ):
+        if _codex_auto_review_visible_text(item.get("content")):
+            return True
+        tool_calls = item.get("tool_calls") or item.get("toolCalls")
+        return isinstance(tool_calls, list) and any(
+            _codex_auto_review_tool_call_has_evidence(tool_call)
+            for tool_call in tool_calls
+        )
+    return False
+
+
+def _is_codex_auto_review_id_only_reasoning_item(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) == _CODEX_AUTO_REVIEW_ID_ONLY_REASONING_KEYS
+        and value.get("type") == "reasoning"
+        and isinstance(value.get("id"), str)
+        and value["id"].startswith("rs_")
+    )
+
+
+def _codex_auto_review_replay_reference_present(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        item_id = value.get("id")
+        item_type = value.get("type")
+        meaningful_keys = {
+            key
+            for key, child in value.items()
+            if _codex_auto_review_nonempty_value(child)
+        }
+        if _codex_auto_review_nonempty_string(item_id):
+            if meaningful_keys == {"id"}:
+                return True
+            if (
+                isinstance(item_type, str)
+                and item_type.strip().casefold().endswith("_reference")
+            ):
+                return True
+        if any(
+            _codex_auto_review_nonempty_value(value[key])
+            for key in _CODEX_AUTO_REVIEW_EXPLICIT_REFERENCE_KEYS
+            if key in value
+        ):
+            return True
+        return any(
+            _codex_auto_review_replay_reference_present(child)
+            for child in value.values()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(
+            _codex_auto_review_replay_reference_present(item) for item in value
+        )
+    return False
+
+
+def _project_codex_auto_review_replay_input(
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    # Cursor ignores reasoning-only items, but replay safety must remain
+    # fail-closed when no visible review history survives the projection.
+    input_items = request_body.get("input")
+    if not isinstance(input_items, list):
+        return request_body
+
+    retained_items = [
+        item
+        for item in input_items
+        if not _is_codex_auto_review_id_only_reasoning_item(item)
+    ]
+    if len(retained_items) == len(input_items):
+        return request_body
+    if _codex_auto_review_nonempty_value(request_body.get("conversation")):
+        return request_body
+    if any(
+        _codex_auto_review_replay_reference_present(item)
+        for item in retained_items
+    ):
+        return request_body
+    if not any(
+        _codex_auto_review_input_item_has_visible_evidence(item)
+        for item in retained_items
+    ):
+        return request_body
+
+    updated_body = dict(request_body)
+    updated_body["input"] = retained_items
+    return updated_body
 
 
 def _apply_codex_auto_review_decision_shaping_to_request_body(
@@ -136,7 +399,9 @@ def _apply_codex_auto_review_decision_shaping_to_request_body(
     ):
         return request_body
 
-    updated_body = dict(request_body)
+    updated_body = _project_codex_auto_review_replay_input(request_body)
+    if updated_body is request_body:
+        updated_body = dict(request_body)
     for field in ("tools", "tool_choice", "parallel_tool_calls"):
         updated_body.pop(field, None)
 
