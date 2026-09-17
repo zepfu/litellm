@@ -248,6 +248,8 @@ class _PrefixedHttpxByteStream:
                     yield attach_responses_events(chunk, events)
             if self._remainder is None:
                 return
+            if self._aawm_responses_event_pipeline is not None:
+                self._aawm_responses_event_pipeline.retain_events = False
             async for chunk in self._remainder:
                 if not chunk:
                     continue

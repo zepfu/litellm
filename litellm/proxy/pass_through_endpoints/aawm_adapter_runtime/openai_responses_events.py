@@ -830,6 +830,9 @@ class ResponsesEventPipeline:
         self._replay_consumed_bytes = 0
         self._replay_consumed_event_bytes = 0
         self._replay_buffer = bytes(self._buffer)
+        # Already-held events are the precommit prefix. Live remainder is
+        # bounded by max_stream_events, not the hold budget.
+        self.retain_events = False
 
     def _drain_replayed_events(self) -> list[ParsedResponsesEvent]:
         ready: list[ParsedResponsesEvent] = []
@@ -849,6 +852,7 @@ class ResponsesEventPipeline:
         if not data:
             return []
         if self._replay_remaining_bytes <= 0:
+            self.retain_events = False
             return self.feed(data)
 
         prefix_length = min(len(data), self._replay_remaining_bytes)
@@ -858,6 +862,8 @@ class ResponsesEventPipeline:
         if self._replay_remaining_bytes == 0 and self._replay_buffer is not None:
             self._buffer = bytearray(self._replay_buffer)
             self._replay_buffer = None
+        if self._replay_remaining_bytes == 0:
+            self.retain_events = False
         remainder = data[prefix_length:]
         if remainder:
             events.extend(self.feed(remainder))
@@ -876,6 +882,7 @@ class ResponsesEventPipeline:
         events = list(self._held_events)
         self._held_events.clear()
         self._held_event_bytes = 0
+        self.retain_events = False
         return events
 
     def diagnostics(self) -> Dict[str, Any]:

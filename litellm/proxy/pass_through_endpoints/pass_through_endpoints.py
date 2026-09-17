@@ -8945,7 +8945,9 @@ async def pass_through_request(  # noqa: PLR0915
             ]:
                 nonlocal responses_event_pipeline
                 responses_event_pipeline = (
-                    create_responses_event_pipeline(retain_events=True)
+                    create_responses_event_pipeline(
+                        retain_events=is_native_openai_responses_route
+                    )
                     if (
                         is_native_openai_responses_route
                         or is_xai_responses_wire_owned_route
@@ -9417,7 +9419,9 @@ async def pass_through_request(  # noqa: PLR0915
         async def _send_non_stream_pre_first_byte() -> httpx.Response:  # noqa: PLR0915
             nonlocal responses_event_pipeline
             responses_event_pipeline = (
-                create_responses_event_pipeline(retain_events=True)
+                create_responses_event_pipeline(
+                    retain_events=is_native_openai_responses_route
+                )
                 if (
                     is_native_openai_responses_route
                     or is_xai_responses_wire_owned_route
