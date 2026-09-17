@@ -1725,6 +1725,13 @@ async def handle_alias_route(  # noqa: PLR0915
             fresh_fallback_body,
             extra_fields={"aawm_redispatch_ordinal": 1},
         )
+        adopt_receipt = getattr(
+            codex_candidate_calls,
+            "_adopt_cursor_replay_request_receipt",
+            None,
+        )
+        if callable(adopt_receipt):
+            adopt_receipt(fresh_fallback_body, final_fallback_body)
         _session_affinity_mod().set_validated_cursor_replay(
             request,
             body=final_fallback_body,

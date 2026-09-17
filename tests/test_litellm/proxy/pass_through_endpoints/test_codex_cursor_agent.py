@@ -2980,6 +2980,7 @@ def test_cursor_replay_registry_expires_idle_retained_session(
         assert state["expiry_handle"] is not None
 
         await asyncio.sleep(0.03)
+        await codex_candidate_calls._await_cursor_replay_disposal_tasks()
 
         assert "resp-idle" not in codex_candidate_calls._CURSOR_REPLAY_REGISTRY
 
@@ -3027,7 +3028,9 @@ def test_cursor_replay_registry_replacement_timer_isolated(
         current = codex_candidate_calls._CURSOR_REPLAY_REGISTRY["resp-replaced"]
         assert current["retained_session"] is new_session
         assert new_session.close_calls == 0
+        await codex_candidate_calls._await_cursor_replay_disposal_tasks()
         codex_candidate_calls._clear_cursor_replay_registry()
+        await codex_candidate_calls._await_cursor_replay_disposal_tasks()
 
     asyncio.run(run_scenario())
     assert old_session.close_calls == 1
@@ -3071,6 +3074,7 @@ def test_cursor_replay_registry_consume_and_clear_cancel_expiry(
         assert cleared_handle.cancelled()
 
         await asyncio.sleep(0.03)
+        await codex_candidate_calls._await_cursor_replay_disposal_tasks()
 
     asyncio.run(run_scenario())
     assert consumed_session.close_calls == 1
