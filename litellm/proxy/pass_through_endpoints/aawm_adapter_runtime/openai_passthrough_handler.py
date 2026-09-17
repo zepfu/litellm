@@ -804,6 +804,8 @@ class BaseOpenAIPassThroughHandler:
             )
 
         session_owner_lease = None
+        canonical_session_identity = None
+        requested_attributes = None
         if not _sa.should_skip_session_owner_for_openai_models_discovery(
             request,
             endpoint=endpoint,
@@ -1021,6 +1023,13 @@ class BaseOpenAIPassThroughHandler:
                                 request=request,
                             )
                     break
+        if canonical_session_identity is not None:
+            # The guard validates current request attributes; keep the lease's
+            # success-promotion tuple synchronized for compatible-owner refresh.
+            _sa.refresh_request_session_owner_lease_attributes(
+                request,
+                requested_attributes,
+            )
         session_owner_lease = _sa.get_request_session_owner_lease(request)
         defer_managed_xai_promotion = (
             managed_xai_oauth_request

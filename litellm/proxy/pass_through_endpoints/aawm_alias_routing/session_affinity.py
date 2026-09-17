@@ -31,7 +31,7 @@ import math
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Awaitable, Callable, Mapping, Optional, TypeVar, cast
 
@@ -133,6 +133,11 @@ class SessionOwnerLease:
     held_reservation: bool = False
     decision: Optional[str] = None
     attributes: Payload = field(default_factory=dict)
+    # Durable owned-record snapshot admitted by the request guard. Used only
+    # for a compatible-owner terminal mutable refresh; held reservations have
+    # no admitted owner snapshot. Lua CAS compares this map so a later
+    # completion cannot be overwritten by an older in-flight success.
+    expected_owner_record: Optional[Payload] = None
     promoted: bool = False
     released: bool = False
     renewal_task: Optional[Any] = field(
@@ -396,7 +401,12 @@ _MUTABLE_OPENAI_ACCOUNT_ATTRIBUTE_KEYS = (
     "account_lane",
     "credential_affinity",
 )
-
+_MUTABLE_OPENAI_STORED_ATTRIBUTE_KEYS = (
+    "account_hash",
+    "account_label",
+    "account_lane",
+    "credential_affinity",
+)
 # Canonical endpoint/state for the two equivalent managed direct-OpenAI shapes.
 _MANAGED_DIRECT_OPENAI_OWNER_ID_ENDPOINT = "codex_responses"
 _MANAGED_DIRECT_OPENAI_OWNER_ID_STATE = "codex_responses"
@@ -1471,6 +1481,58 @@ def _core_owner_attributes(attributes: Mapping[str, Any]) -> Payload:
     return core
 
 
+def _mutable_same_hosted_provider_owner_attributes(
+    current_attributes: Mapping[str, Any],
+    attributes: Mapping[str, Any],
+) -> Payload:
+    mutable: Payload = {
+        key: attributes[key]
+        for key in _MUTABLE_SAME_HOSTED_PROVIDER_ATTRIBUTE_KEYS
+        if key in attributes
+    }
+    if _same_hosted_provider_account_identity_is_mutable(
+        current_attributes, attributes
+    ):
+        mutable.update(
+            {
+                key: attributes[key]
+                for key in _MUTABLE_OPENAI_STORED_ATTRIBUTE_KEYS
+                if key in attributes
+            }
+        )
+    return mutable
+
+
+def _mutable_refresh_expected_attributes(
+    current_attributes: Mapping[str, Any],
+    requested_attributes: Mapping[str, Any],
+) -> Payload:
+    """Build the exact Lua CAS expected map for a mutable owner refresh.
+
+    The expected map is the complete admitted snapshot, including mutable
+    fields present on that snapshot even when the pending request omits or
+    clears one. Lua still writes only the allowlisted mutable keys.
+    ``requested_attributes`` selects which account keys are in the mutable
+    domain for this completion; it is not copied into the expected map.
+    """
+
+    expected: Payload = dict(current_attributes)
+    if not isinstance(requested_attributes, Mapping):
+        return expected
+    if _hosted_providers_match(current_attributes, requested_attributes):
+        for key in _MUTABLE_SAME_HOSTED_PROVIDER_ATTRIBUTE_KEYS:
+            if key in current_attributes:
+                expected[key] = current_attributes[key]
+        if _same_hosted_provider_account_identity_is_mutable(
+            current_attributes,
+            requested_attributes,
+        ):
+            for key in _MUTABLE_OPENAI_ACCOUNT_ATTRIBUTE_KEYS:
+                if key in current_attributes:
+                    expected[key] = current_attributes[key]
+    return expected
+
+
 def _accounts_are_interchangeable(
     left: Mapping[str, Any],
     right: Optional[Mapping[str, Any]] = None,
@@ -1715,6 +1777,17 @@ def _owner_attributes(record: Optional[Mapping[str, Any]]) -> Payload:
             for k, v in attrs.items()
             if v is not None and str(v).strip() != ""
         }
+    return {}
+
+
+def _cas_owner_attributes(record: Optional[Mapping[str, Any]]) -> Payload:
+    """Stored attributes for Lua expected-map CAS, including explicit nulls."""
+
+    if not isinstance(record, Mapping):
+        return {}
+    attrs = record.get(_RECORD_ATTRIBUTES_FIELD)
+    if isinstance(attrs, Mapping):
+        return {str(k): v for k, v in attrs.items()}
     return {}
 
 
@@ -2071,7 +2144,7 @@ def _build_owned_record(
     record: Payload = {
         _RECORD_STATE_FIELD: SessionOwnerRecordState.OWNED.value,
         _RECORD_OWNER_FIELD: owner_id,
-        _RECORD_ATTRIBUTES_FIELD: dict(_core_owner_attributes(attributes)),
+        _RECORD_ATTRIBUTES_FIELD: dict(attributes),
         _RECORD_OWNED_AT_FIELD: ts,
         _RECORD_LAST_RENEWED_AT_FIELD: ts,
         durable.PERSISTENT_MARKER: True,
@@ -3712,7 +3785,10 @@ async def rebind_session_owner_for_portable_failover(  # noqa: PLR0911
 
     if authorization != "codex_oauth_portable_account_failover":
         return _error("session_owner: portable failover authorization rejected")
-    if type(failover_ordinal) is not int or failover_ordinal != 1:
+    if not isinstance(failover_ordinal, int) or isinstance(
+        failover_ordinal,
+        bool,
+    ) or failover_ordinal != 1:
         return _error("session_owner: portable failover ordinal rejected")
 
     source_owner = _clean_optional_str(source_owner_id)
@@ -3725,13 +3801,12 @@ async def rebind_session_owner_for_portable_failover(  # noqa: PLR0911
             "session_owner: portable failover destination attributes missing"
         )
 
-    source = _core_owner_attributes(
-        build_session_owner_attributes(extra=source_attributes)
-    )
-    destination = _core_owner_attributes(
-        build_session_owner_attributes(extra=destination_attributes)
-    )
-    for label, attributes in (("source", source), ("destination", destination)):
+    source = build_session_owner_attributes(extra=source_attributes)
+    destination = build_session_owner_attributes(extra=destination_attributes)
+    for label, attributes in (
+        ("source", _core_owner_attributes(source)),
+        ("destination", _core_owner_attributes(destination)),
+    ):
         incomplete = incomplete_owner_attribute_reason(
             attributes,
             for_promotion=True,
@@ -3769,6 +3844,15 @@ async def rebind_session_owner_for_portable_failover(  # noqa: PLR0911
         reservation_token=None,
     )
 
+    def _expected_attribute_record(attributes: Mapping[str, Any]) -> Payload:
+        # Full rendered contract for Lua equality, including requested_model
+        # and other non-core stored fields. Promotion completeness remains
+        # core-only via incomplete_owner_attribute_reason above.
+        return {
+            _RECORD_STATE_FIELD: SessionOwnerRecordState.OWNED.value,
+            _RECORD_ATTRIBUTES_FIELD: dict(attributes),
+        }
+
     def _destination_record_matches(record: Optional[Mapping[str, Any]]) -> bool:
         if not isinstance(record, Mapping):
             return False
@@ -3778,6 +3862,9 @@ async def rebind_session_owner_for_portable_failover(  # noqa: PLR0911
             _clean_optional_str(record.get(_RECORD_OWNER_FIELD))
             != destination_owner
         ):
+            return False
+        ordinal = record.get("terminal_completion_ordinal_epoch")
+        if ordinal is not None and type(ordinal) not in {int, float}:
             return False
         actual_attributes = _owner_attributes(record)
         if set(actual_attributes) != set(destination):
@@ -3804,10 +3891,16 @@ async def rebind_session_owner_for_portable_failover(  # noqa: PLR0911
       if type(left) ~= 'table' or type(right) ~= 'table' then
         return false
       end
+      local function normalize(value)
+        if value == cjson.null then
+          return nil
+        end
+        return value
+      end
       local left_count = 0
       for key, value in pairs(left) do
         left_count = left_count + 1
-        if right[key] ~= value then
+        if tostring(normalize(value)) ~= tostring(normalize(right[key])) then
           return false
         end
       end
@@ -3839,6 +3932,9 @@ async def rebind_session_owner_for_portable_failover(  # noqa: PLR0911
     if type(current['attributes']) ~= 'table' then
       return {-1, 'malformed'}
     end
+    if type(expected_source['attributes']) ~= 'table' then
+      return {-1, 'malformed'}
+    end
     if (
       current['state'] == 'owned'
       and current['owner'] == ARGV[3]
@@ -3852,9 +3948,17 @@ async def rebind_session_owner_for_portable_failover(  # noqa: PLR0911
     if current['state'] ~= 'owned' then
       return {3, cjson.encode(current)}
     end
+    local old_ordinal = tonumber(current['terminal_completion_ordinal_epoch'] or 0) or 0
+    local new_ordinal = tonumber(ARGV[5] or 0) or 0
+    if new_ordinal <= old_ordinal then
+      return {0, cjson.encode(current)}
+    end
     if (
       current['owner'] ~= ARGV[1]
-      or not attributes_equal(current['attributes'], expected_source)
+      or not attributes_equal(
+        current['attributes'],
+        expected_source['attributes']
+      )
     ) then
       return {0, cjson.encode(current)}
     end
@@ -3864,6 +3968,9 @@ async def rebind_session_owner_for_portable_failover(  # noqa: PLR0911
     end
     if current['reserved_at_epoch'] ~= nil then
       payload['reserved_at_epoch'] = current['reserved_at_epoch']
+    end
+    if new_ordinal > 0 then
+      payload['terminal_completion_ordinal_epoch'] = new_ordinal
     end
     redis.call('SET', KEYS[1], cjson.encode(payload))
     redis.call('PERSIST', KEYS[1])
@@ -3875,9 +3982,10 @@ async def rebind_session_owner_for_portable_failover(  # noqa: PLR0911
             1,
             namespaced,
             source_owner,
-            json.dumps(source),
+            json.dumps(_expected_attribute_record(source)),
             destination_owner,
             json.dumps(owned_record),
+            repr(time.time()),
         )
     except Exception as exc:  # noqa: BLE001
         return _error(f"session_owner: portable failover rebind failed: {exc}")
@@ -3968,11 +4076,11 @@ async def rebind_session_owner_for_portable_failover(  # noqa: PLR0911
             owner_id=actual_owner,
             owner_record=payload,
         )
-    return _error(
-        "session_owner: portable failover returned unknown result",
-        owner_id=actual_owner,
-        owner_record=payload,
-    )
+        return _error(
+            "session_owner: portable failover returned unknown result",
+            owner_id=actual_owner,
+            owner_record=payload,
+        )
 
 
 async def release_session_owner_reservation(
@@ -4056,12 +4164,301 @@ async def release_session_owner_reservation(
     )
 
 
+async def refresh_session_owner_mutable_attributes(
+    *,
+    session_identity: Optional[str],
+    owner_id: Optional[str],
+    owner_record: Optional[Mapping[str, Any]] = None,
+    expected_owner_record: Optional[Mapping[str, Any]] = None,
+    attributes: Optional[Mapping[str, Any]] = None,
+    completion_ordinal: Optional[float] = None,
+) -> SessionOwnerMutationResult:
+    """CAS-refresh the mutable attribute tuple on a compatible owned record.
+
+    The owner identity and immutable route/endpoint/state contract remain
+    authoritative. ``completion_ordinal`` makes a later observed terminal
+    success beat an older completion without allowing a mixed tuple.
+
+    ``expected_owner_record`` is the admitted compatible-owner snapshot. When
+    supplied, its attributes form the Redis expected map; a completion that
+    observed a newer durable tuple is rejected instead of replacing it.
+    """
+
+    cleaned = _clean_optional_str(session_identity)
+    if cleaned is None:
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.SKIPPED,
+            session_identity=None,
+        )
+    cleaned = _strip_legacy_affinity_prefixes(cleaned)
+    cache_key = build_aawm_alias_routing_session_owner_cache_key(
+        session_identity=cleaned
+    )
+    current_attributes = _cas_owner_attributes(owner_record)
+    expected_current_attributes = _cas_owner_attributes(
+        owner_record if expected_owner_record is None else expected_owner_record
+    )
+    requested_attributes = build_session_owner_attributes(extra=attributes)
+    if isinstance(attributes, Mapping) and "requested_model" in attributes:
+        requested_attributes["requested_model"] = attributes["requested_model"]
+    if not requested_attributes:
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.SKIPPED,
+            session_identity=cleaned,
+            cache_key=cache_key,
+            error="session_owner: mutable owner refresh has no attributes",
+        )
+    cas_attributes = expected_current_attributes or current_attributes
+    mutable_keys = list(_MUTABLE_SAME_HOSTED_PROVIDER_ATTRIBUTE_KEYS)
+    if _same_hosted_provider_account_identity_is_mutable(
+        cas_attributes,
+        requested_attributes,
+    ):
+        mutable_keys.extend(_MUTABLE_OPENAI_STORED_ATTRIBUTE_KEYS)
+    if not cas_attributes:
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.SKIPPED,
+            session_identity=cleaned,
+            cache_key=cache_key,
+            error="session_owner: mutable owner refresh has no current owner",
+        )
+    incompatible = _compatibility_mismatch_reason(
+        owner_record={
+            _RECORD_STATE_FIELD: SessionOwnerRecordState.OWNED.value,
+            _RECORD_OWNER_FIELD: owner_id,
+            _RECORD_ATTRIBUTES_FIELD: cas_attributes,
+        },
+        requested_attributes=requested_attributes,
+        require_exact_attributes=False,
+    )
+    if incompatible is not None:
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.CONFLICT,
+            session_identity=cleaned,
+            cache_key=cache_key,
+            owner_id=_clean_optional_str(owner_id),
+            owner_record=(
+                owner_record
+                if expected_owner_record is None
+                else expected_owner_record
+            ),
+            error=incompatible,
+        )
+    # Materialize every allowlisted key, including explicit nulls, so Lua
+    # replaces the complete mutable tuple instead of merging a sparse map.
+    next_attributes: Payload = {
+        key: requested_attributes.get(key) for key in mutable_keys
+    }
+    if isinstance(attributes, Mapping) and "requested_model" in attributes:
+        next_attributes["requested_model"] = attributes["requested_model"]
+    expected_attributes = _mutable_refresh_expected_attributes(
+        cas_attributes,
+        requested_attributes,
+    )
+    try:
+        ordinal = (
+            float(time.time())
+            if completion_ordinal is None
+            else float(completion_ordinal)
+        )
+    except (TypeError, ValueError):
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.ERROR,
+            session_identity=cleaned,
+            cache_key=cache_key,
+            error="session_owner: invalid terminal completion ordinal",
+        )
+    if not math.isfinite(ordinal):
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.ERROR,
+            session_identity=cleaned,
+            cache_key=cache_key,
+            error="session_owner: invalid terminal completion ordinal",
+        )
+
+    redis_cache, error = await _get_redis_cache()
+    if error is not None or redis_cache is None:
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.ERROR,
+            session_identity=cleaned,
+            cache_key=cache_key,
+            error=error,
+        )
+
+    client = await _raw_redis_client(redis_cache)
+    namespaced = _namespaced_key(redis_cache, cache_key)
+    lua = """
+    local raw = redis.call('GET', KEYS[1])
+    if not raw then
+      return {0, 'missing'}
+    end
+    local ok, current = pcall(cjson.decode, raw)
+    if not ok or type(current) ~= 'table' then
+      return {-1, 'malformed'}
+    end
+    if current['state'] ~= 'owned' then
+      return {0, cjson.encode(current)}
+    end
+    if ARGV[1] ~= '' and current['owner'] ~= ARGV[1] then
+      return {0, cjson.encode(current)}
+    end
+    local ordinal_key = 'terminal_completion_ordinal_epoch'
+    local old_ordinal = tonumber(current[ordinal_key] or 0) or 0
+    local new_ordinal = tonumber(ARGV[3] or 0) or 0
+    if new_ordinal <= old_ordinal then
+      return {0, cjson.encode(current)}
+    end
+    local ok_attrs, updates = pcall(cjson.decode, ARGV[2])
+    if not ok_attrs or type(updates) ~= 'table' then
+      return {-1, 'malformed_attributes'}
+    end
+    local ok_contract, expected = pcall(cjson.decode, ARGV[5])
+    if not ok_contract or type(expected) ~= 'table' then
+      return {-1, 'malformed_contract'}
+    end
+    local ok_allowlist, mutable_keys = pcall(cjson.decode, ARGV[6])
+    if not ok_allowlist or type(mutable_keys) ~= 'table' then
+      return {-1, 'malformed_mutable_keys'}
+    end
+    local mutable = {}
+    for _, key in ipairs(mutable_keys) do
+      mutable[key] = true
+    end
+    local attrs = current['attributes']
+    if type(attrs) ~= 'table' then
+      attrs = {}
+    end
+    for key in pairs(updates) do
+      if not mutable[key] then
+        return {-1, 'mutable_contract_violation'}
+      end
+    end
+    local function normalize(value)
+      if value == cjson.null then
+        return nil
+      end
+      return value
+    end
+    local function attributes_equal(left, right)
+      if type(left) ~= 'table' or type(right) ~= 'table' then
+        return false
+      end
+      local left_count = 0
+      for key, value in pairs(left) do
+        left_count = left_count + 1
+        if tostring(normalize(value)) ~= tostring(normalize(right[key])) then
+          return false
+        end
+      end
+      local right_count = 0
+      for key, _ in pairs(right) do
+        right_count = right_count + 1
+      end
+      return left_count == right_count
+    end
+    if not attributes_equal(attrs, expected) then
+      return {0, cjson.encode(current)}
+    end
+    for _, key in ipairs(mutable_keys) do
+      local value = updates[key]
+      if value == cjson.null or value == nil then
+        attrs[key] = nil
+      else
+        attrs[key] = value
+      end
+    end
+    current['attributes'] = attrs
+    current[ordinal_key] = new_ordinal
+    current['last_renewed_at_epoch'] = tonumber(ARGV[4]) or
+      tonumber(ARGV[3]) or old_ordinal
+    redis.call('SET', KEYS[1], cjson.encode(current))
+    redis.call('PERSIST', KEYS[1])
+    return {1, cjson.encode(current)}
+    """
+    now = time.time()
+    try:
+        result = await client.eval(
+            lua,
+            1,
+            namespaced,
+            _clean_optional_str(owner_id) or "",
+            json.dumps(next_attributes),
+            repr(ordinal),
+            repr(now),
+            json.dumps(expected_attributes),
+            json.dumps(mutable_keys),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.ERROR,
+            session_identity=cleaned,
+            cache_key=cache_key,
+            error=f"session_owner: mutable refresh failed: {exc}",
+        )
+
+    code = int(result[0]) if isinstance(result, (list, tuple)) and result else -99
+    raw_payload = (
+        result[1] if isinstance(result, (list, tuple)) and len(result) > 1 else None
+    )
+    payload: Optional[Payload] = None
+    if isinstance(raw_payload, (bytes, bytearray)):
+        raw_payload = raw_payload.decode("utf-8")
+    if isinstance(raw_payload, str) and raw_payload not in {
+        "missing", "malformed", "malformed_attributes", "malformed_contract",
+        "malformed_mutable_keys",
+    }:
+        try:
+            decoded = json.loads(raw_payload)
+            if isinstance(decoded, dict):
+                payload = cast(Payload, decoded)
+        except Exception:  # noqa: BLE001
+            payload = None
+    if code == 1:
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.PROMOTED,
+            session_identity=cleaned,
+            cache_key=cache_key,
+            owner_id=_clean_optional_str(owner_id),
+            owner_record=payload,
+        )
+    if code == 0:
+        if raw_payload == "missing":
+            return SessionOwnerMutationResult(
+                outcome=SessionOwnerMutationOutcome.SKIPPED,
+                session_identity=cleaned,
+                cache_key=cache_key,
+                owner_id=_clean_optional_str(owner_id),
+                error="session_owner: mutable owner refresh has no current owner",
+            )
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.ALREADY_OWNED,
+            session_identity=cleaned,
+            cache_key=cache_key,
+            owner_id=_clean_optional_str(owner_id),
+            owner_record=payload,
+        )
+    return SessionOwnerMutationResult(
+        outcome=SessionOwnerMutationOutcome.ERROR,
+        session_identity=cleaned,
+        cache_key=cache_key,
+        owner_id=_clean_optional_str(owner_id),
+        error=f"session_owner: mutable refresh returned {code}",
+    )
+
+
 def lease_from_guard_result(
     guard: SessionOwnerGuardResult,
     *,
     attributes: Optional[Mapping[str, Any]] = None,
     policy: SessionOwnerLeasePolicy = SessionOwnerLeasePolicy.PERSIST_ON_COMPLETED,
 ) -> SessionOwnerLease:
+    expected_owner_record: Optional[Payload] = None
+    if (
+        guard.decision is SessionOwnerGuardDecision.COMPATIBLE_OWNER
+        and not guard.held_reservation
+        and isinstance(guard.owner_record, Mapping)
+    ):
+        expected_owner_record = dict(guard.owner_record)
     return SessionOwnerLease(
         session_identity=guard.session_identity,
         cache_key=guard.cache_key,
@@ -4070,6 +4467,7 @@ def lease_from_guard_result(
         held_reservation=guard.held_reservation,
         decision=guard.decision.value,
         attributes=dict(attributes or _owner_attributes(guard.owner_record)),
+        expected_owner_record=expected_owner_record,
         policy=_normalize_session_owner_lease_policy(policy),
     )
 
@@ -4206,12 +4604,88 @@ async def finalize_session_owner_lease_on_success(
         )
         return invariant
     if not lease.held_reservation:
+        if session_owner_lease_is_release_only(lease):
+            record_session_owner_continuity_receipt(
+                request, phase="owner_finalize", source="success",
+                session_identity=lease.session_identity,
+                cache_key=lease.cache_key,
+                outcome="not_held",
+            )
+            return None
+        record_session_owner_continuity_receipt(
+            request, phase="owner_finalize", source="success",
+            session_identity=lease.session_identity,
+            cache_key=lease.cache_key,
+            outcome="not_held",
+        )
+        if lease.wire_terminal_pending:
+            record_session_owner_continuity_receipt(
+                request, phase="owner_finalize", source="success",
+                session_identity=lease.session_identity,
+                cache_key=lease.cache_key,
+                outcome="pending_wire_terminal",
+            )
+            return None
         record_session_owner_continuity_receipt(
             request, phase="owner_finalize", source="success",
             session_identity=lease.session_identity, cache_key=lease.cache_key,
             outcome="not_held",
         )
-        return None
+        if lease.promoted:
+            return None
+        owner_record, _lookup_cache_key, lookup_error = (
+            await get_session_owner_record(
+                session_identity=lease.session_identity,
+                request=request,
+            )
+        )
+        if lookup_error is not None:
+            refresh_result = SessionOwnerMutationResult(
+                outcome=SessionOwnerMutationOutcome.ERROR,
+                session_identity=lease.session_identity,
+                cache_key=lease.cache_key,
+                owner_id=lease.owner_id,
+                error=lookup_error,
+            )
+            lease.last_finalization_outcome = refresh_result.outcome.value
+            record_session_owner_continuity_receipt(
+                request,
+                phase="owner_finalize",
+                source="success",
+                session_identity=lease.session_identity,
+                cache_key=lease.cache_key,
+                outcome=refresh_result.outcome.value,
+                reason_code="mutation_failed",
+            )
+            return refresh_result
+        expected_owner_record = lease.expected_owner_record
+        if expected_owner_record is None and isinstance(owner_record, Mapping):
+            expected_owner_record = dict(owner_record)
+        refresh_result = await refresh_session_owner_mutable_attributes(
+            session_identity=lease.session_identity,
+            owner_id=lease.owner_id,
+            owner_record=owner_record,
+            expected_owner_record=expected_owner_record,
+            attributes=attributes or lease.attributes,
+            completion_ordinal=time.time(),
+        )
+        lease.last_finalization_outcome = refresh_result.outcome.value
+        if refresh_result.outcome in {
+            SessionOwnerMutationOutcome.PROMOTED,
+            SessionOwnerMutationOutcome.ALREADY_OWNED,
+        }:
+            lease.promoted = True
+            _stop_session_owner_lease_renewal(lease)
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_finalize",
+            source="success",
+            session_identity=lease.session_identity,
+            cache_key=lease.cache_key,
+            outcome=refresh_result.outcome.value,
+            reason_code="mutation_failed" if refresh_result.error else None,
+        )
+        return refresh_result
     if lease.promoted or lease.released:
         record_session_owner_continuity_receipt(
             request,
@@ -4243,13 +4717,32 @@ async def finalize_session_owner_lease_on_success(
             respect_wire_pending=False,
         )
     await _barrier_session_owner_lease_renewal(lease)
+    success_attributes = attributes or lease.attributes
+    terminal_ordinal = time.time()
     result = await promote_session_owner_reservation(
         session_identity=lease.session_identity,
         reservation_token=lease.reservation_token,
-        attributes=attributes or lease.attributes,
+        attributes=success_attributes,
         candidate=candidate,
         owner_id=lease.owner_id,
     )
+    if result.outcome is SessionOwnerMutationOutcome.ALREADY_OWNED:
+        refresh_result = await refresh_session_owner_mutable_attributes(
+            session_identity=lease.session_identity,
+            owner_id=lease.owner_id,
+            owner_record=result.owner_record,
+            expected_owner_record=result.owner_record,
+            attributes=success_attributes,
+            completion_ordinal=terminal_ordinal,
+        )
+        if refresh_result.owner_record is not None:
+            result = replace(result, owner_record=refresh_result.owner_record)
+        if refresh_result.outcome is SessionOwnerMutationOutcome.ERROR:
+            result = replace(
+                result,
+                outcome=refresh_result.outcome,
+                error=refresh_result.error,
+            )
     if result.outcome in {
         SessionOwnerMutationOutcome.PROMOTED,
         SessionOwnerMutationOutcome.ALREADY_OWNED,
@@ -4298,6 +4791,8 @@ async def finalize_session_owner_lease_on_failure(
             session_identity=lease.session_identity, cache_key=lease.cache_key,
             outcome="not_held",
         )
+        if session_owner_lease_is_release_only(lease):
+            lease.released = True
         return None
     if lease.promoted or lease.released:
         record_session_owner_continuity_receipt(
@@ -4324,7 +4819,7 @@ async def finalize_session_owner_lease_on_failure(
 
 
 def defer_session_owner_lease_until_wire_terminal(request: Any) -> bool:
-    """Keep a native OpenAI lease reserved until final wire disposition."""
+    """Keep a held lease reserved until its actual accepted wire terminal."""
 
     lease = get_request_session_owner_lease(request)
     if lease is None or not lease.held_reservation or lease.promoted or lease.released:
@@ -4365,7 +4860,12 @@ async def finalize_session_owner_lease_on_wire_disposition(
             reason_code="mutation_failed",
         )
         return invariant
-    if not lease.held_reservation or lease.released or lease.promoted:
+    if lease.released or lease.promoted:
+        return None
+    if not lease.held_reservation and not lease.wire_terminal_pending:
+        # Non-held compatible-owner leases must remain skipped at ordinary
+        # success finalization. Arm this gate only when the wire helper had
+        # actually accepted and deferred the lease.
         return None
     if lease.wire_disposition is not None:
         return None
@@ -4432,7 +4932,25 @@ async def finalize_request_session_owner_lease(
             session_identity=active.session_identity, cache_key=active.cache_key,
             outcome="not_held",
         )
-        return None
+        if exc is not None:
+            return await finalize_session_owner_lease_on_failure(
+                active,
+                request=request,
+            )
+        status = getattr(response, "status_code", None)
+        if response is not None and (
+            status is None or (isinstance(status, int) and status < 300)
+        ):
+            return await finalize_session_owner_lease_on_success(
+                active,
+                request=request,
+                attributes=attributes or active.attributes,
+                candidate=candidate,
+            )
+        return await finalize_session_owner_lease_on_failure(
+            active,
+            request=request,
+        )
     if active.promoted or active.released:
         record_session_owner_continuity_receipt(
             request, phase="owner_finalize", source="request_lease",
@@ -4837,6 +5355,7 @@ def bind_deferred_session_owner_lease_to_streaming_response(  # noqa: PLR0915
         if (
             result is not None
             and result.outcome not in success_outcomes
+            and result.outcome is not SessionOwnerMutationOutcome.ALREADY_OWNED
         ):
             release_result = await finalize_session_owner_lease_on_failure(
                 lease, request=request
@@ -7096,6 +7615,13 @@ async def ensure_session_owner_guard_for_request(
             policy=lease_policy,
         )
         set_request_session_owner_lease(request, lease)
+    if (
+        active_lease is not None
+        and guard.decision is SessionOwnerGuardDecision.COMPATIBLE_OWNER
+        and not guard.held_reservation
+        and isinstance(guard.owner_record, Mapping)
+    ):
+        active_lease.expected_owner_record = dict(guard.owner_record)
     return guard
 
 
@@ -7113,14 +7639,31 @@ def refresh_request_session_owner_lease_attributes(
     request holds no lease or no attributes are supplied.
     """
 
-    if not attributes:
+    if not isinstance(attributes, Mapping) or not attributes:
         return
     lease = get_request_session_owner_lease(request)
     if lease is None:
         return
-    lease.attributes = dict(
-        _core_owner_attributes(build_session_owner_attributes(extra=attributes))
+    preserve_requested_model = "requested_model" in attributes
+    requested_model = (
+        attributes["requested_model"] if preserve_requested_model else None
     )
+    refreshed = build_session_owner_attributes(extra=attributes)
+    if preserve_requested_model:
+        refreshed["requested_model"] = requested_model
+    updates: Payload = {
+        key: refreshed[key]
+        for key in _CORE_OWNER_ATTRIBUTE_KEYS
+        if key in refreshed
+    }
+    if preserve_requested_model:
+        updates["requested_model"] = requested_model
+    elif "requested_model" in refreshed:
+        updates["requested_model"] = refreshed["requested_model"]
+    lease.attributes = {
+        **lease.attributes,
+        **updates,
+    }
 # Back-compat aliases used by draft call sites / tests naming.
 SessionOwnerConsultDecision = SessionOwnerGuardDecision
 SessionOwnerClaimOutcome = SessionOwnerMutationOutcome
