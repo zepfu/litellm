@@ -2782,6 +2782,7 @@ def _record_passthrough_hidden_retry_metadata(
     request: Optional[Request] = None,
     logical_provider_call_start: Optional[int] = None,
     reservation_rejected: bool = False,
+    immutable_openai_binding: Optional[Any] = None,
 ) -> None:
     if not isinstance(kwargs, dict):
         return
@@ -2809,6 +2810,9 @@ def _record_passthrough_hidden_retry_metadata(
         attempt_record["status_code"] = status_code
     if failure_classification is not None:
         attempt_record["failure_classification"] = failure_classification
+    if isinstance(immutable_openai_binding, _OpenAIEgressBinding):
+        attempt_record["expected_model"] = immutable_openai_binding.expected_model
+        attempt_record["route_family"] = immutable_openai_binding.route_family
 
     logical_provider_send_count: Optional[int] = None
     request_ledger = (
@@ -2869,6 +2873,10 @@ def _record_passthrough_hidden_retry_metadata(
         metadata[
             "aawm_passthrough_hidden_retry_failure_classification"
         ] = failure_classification
+    if isinstance(immutable_openai_binding, _OpenAIEgressBinding):
+        metadata["aawm_openai_final_send_binding_expected_model"] = (
+            immutable_openai_binding.expected_model
+        )
 
 
 def _mark_passthrough_hidden_retry_budget_exhausted(
@@ -2896,6 +2904,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
     request: Optional[Request] = None,
     url: Optional[httpx.URL] = None,
     custom_llm_provider: Optional[str] = None,
+    immutable_openai_binding: Optional[_OpenAIEgressBinding] = None,
     openai_capacity_coordinator: Optional[
         OpenAIAlphaCapacityRetryCoordinator
     ] = None,
@@ -3016,6 +3025,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     final_outcome="success_after_retry",
                     request=request,
                     logical_provider_call_start=logical_provider_call_start,
+                    immutable_openai_binding=immutable_openai_binding,
                 )
             return result
         except Exception as exc:
@@ -3041,6 +3051,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     failure_classification=failure_classification,
                     request=request,
                     logical_provider_call_start=logical_provider_call_start,
+                    immutable_openai_binding=immutable_openai_binding,
                 )
                 _mark_passthrough_hidden_retry_budget_exhausted(
                     kwargs,
@@ -3169,6 +3180,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                         failure_classification=failure_classification,
                         request=request,
                         logical_provider_call_start=logical_provider_call_start,
+                        immutable_openai_binding=immutable_openai_binding,
                         reservation_rejected=bool(
                             getattr(
                                 terminal_exception,
@@ -3232,6 +3244,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     failure_classification=failure_classification,
                     request=request,
                     logical_provider_call_start=logical_provider_call_start,
+                    immutable_openai_binding=immutable_openai_binding,
                     reservation_rejected=bool(
                         getattr(exc, "aawm_call_ledger_exhausted", False)
                         or getattr(
@@ -3280,6 +3293,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                     failure_classification=failure_classification,
                     request=request,
                     logical_provider_call_start=logical_provider_call_start,
+                    immutable_openai_binding=immutable_openai_binding,
                     reservation_rejected=bool(
                         getattr(exc, "aawm_call_ledger_exhausted", False)
                         or getattr(
@@ -3316,6 +3330,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(  # noqa: PLR0
                 failure_classification=failure_classification,
                 request=request,
                 logical_provider_call_start=logical_provider_call_start,
+                immutable_openai_binding=immutable_openai_binding,
             )
             verbose_proxy_logger.info(
                 "Pass-through %s hidden retry attempt %s/%s after %s; sleeping %.1fs",
@@ -4862,7 +4877,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 and ("codex" in user_agent.lower() or "openai" in user_agent.lower())
             )
         ):
-            marker_families.add("openai")
+            marker_families.add("codex_oauth")
 
         if (
             "x-goog-api-key" in normalized_headers
@@ -5045,7 +5060,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
 
         HttpPassThroughEndpointHelpers.validate_outgoing_egress(
             url=prepared_request.url,
-            headers=dict(prepared_request.headers),
+            headers=prepared_request.headers,
             credential_family=credential_family,
             expected_target_family=expected_target_family,
         )
@@ -6086,6 +6101,9 @@ def _build_immutable_openai_binding(
         "",
     )
     candidate_context = _current_candidate_context(request)
+    target_family = HttpPassThroughEndpointHelpers.get_target_provider_family(
+        target_url
+    )
     route_family = str(
         expected_target_family
         or (
@@ -6094,18 +6112,13 @@ def _build_immutable_openai_binding(
             else (
                 candidate_context.get("route_family")
                 or egress_credential_family
-                or HttpPassThroughEndpointHelpers.get_target_provider_family(
-                    target_url
-                )
+                or target_family
                 or "openai"
             )
         )
         or (
-            HttpPassThroughEndpointHelpers.get_target_provider_family(target_url)
+            target_family
         )
-    )
-    target_family = HttpPassThroughEndpointHelpers.get_target_provider_family(
-        target_url
     )
     return _OpenAIEgressBinding(
         custom_llm_provider=(
@@ -6133,6 +6146,22 @@ def _build_immutable_openai_binding(
             prepared_request=prepared_request,
         ),
     )
+
+
+def _resolve_immutable_openai_credential_family(
+    *,
+    egress_credential_family: Optional[str],
+    expected_target_family: Optional[str],
+    selected_openai_headers: Optional[Mapping[str, str]],
+    target_url: Union[str, httpx.URL],
+) -> Optional[str]:
+    """Treat server-selected managed OpenAI traffic as Codex-managed egress."""
+
+    if egress_credential_family is not None:
+        return egress_credential_family
+    if selected_openai_headers or expected_target_family == "codex_oauth":
+        return "codex_oauth"
+    return HttpPassThroughEndpointHelpers.get_target_provider_family(target_url)
 
 
 def _selected_openai_model(
@@ -6237,12 +6266,16 @@ def _validate_immutable_openai_binding(
             None,
             False,
         )
-    current_context = _current_openai_account_context(request)
-    expected_model = _resolve_immutable_openai_model(
-        request,
-        selected_openai_headers=selected_openai_headers,
-        prepared_request=prepared_request,
-    )
+        current_context = _current_openai_account_context(request)
+        expected_model = (
+            openai_binding.expected_model
+            if openai_binding is not None
+            else _resolve_immutable_openai_model(
+                request,
+                selected_openai_headers=selected_openai_headers,
+                prepared_request=prepared_request,
+            )
+        )
     serialized_model = (
         HttpPassThroughEndpointHelpers._get_prepared_openai_model(
             prepared_request
@@ -7484,6 +7517,15 @@ async def pass_through_request(  # noqa: PLR0915
         ):
             register_aawm_route_rollup_access_log_replacement(request)
         url = httpx.URL(target)
+        selected_openai_headers = egress_selected_openai_headers
+        managed_openai_credential_family = (
+            _resolve_immutable_openai_credential_family(
+                egress_credential_family=egress_credential_family,
+                expected_target_family=expected_target_family,
+                selected_openai_headers=selected_openai_headers,
+                target_url=url,
+            )
+        )
         managed_xai_oauth_egress = (
             HttpPassThroughEndpointHelpers._is_managed_xai_oauth_egress(
                 egress_credential_family
@@ -7494,7 +7536,7 @@ async def pass_through_request(  # noqa: PLR0915
         )
         openai_bound_egress = HttpPassThroughEndpointHelpers._is_openai_bound_egress(
             custom_llm_provider=custom_llm_provider,
-            egress_credential_family=egress_credential_family,
+            egress_credential_family=managed_openai_credential_family,
             expected_target_family=expected_target_family,
             url=url,
         )
@@ -7508,7 +7550,7 @@ async def pass_through_request(  # noqa: PLR0915
         immutable_openai_binding = _build_immutable_openai_binding(
             target_url=url,
             custom_llm_provider=custom_llm_provider,
-            egress_credential_family=egress_credential_family,
+            egress_credential_family=managed_openai_credential_family,
             expected_target_family=expected_target_family,
             selected_openai_headers=selected_openai_headers,
             request=request,
@@ -7516,21 +7558,13 @@ async def pass_through_request(  # noqa: PLR0915
         validate_prepared_request_fn: Optional[
             Callable[[httpx.Request], None]
         ] = None
-        if (
-            HttpPassThroughEndpointHelpers._is_exact_xai_egress_credential_family(
-                egress_credential_family
-            )
-            or expected_target_family
-            in {XAI_OAUTH_ROUTE_FAMILY, GROK_NATIVE_OAUTH_ROUTE_FAMILY}
-        ):
-
+        if not (openai_bound_egress or managed_xai_oauth_request):
             def _validate_prepared_request(prepared_request: httpx.Request) -> None:
                 HttpPassThroughEndpointHelpers.validate_prepared_request_egress(
                     prepared_request=prepared_request,
                     credential_family=egress_credential_family,
                     expected_target_family=expected_target_family,
                 )
-
         if openai_bound_egress:
             def _validate_prepared_openai_request(
                 prepared_request: httpx.Request,
@@ -7551,8 +7585,26 @@ async def pass_through_request(  # noqa: PLR0915
                     openai_binding=immutable_openai_binding,
                 )
             validate_prepared_request_fn = _validate_prepared_openai_request
-        else:
-            validate_prepared_request_fn = _validate_prepared_request
+        elif managed_xai_oauth_request:
+            def _validate_prepared_xai_request(
+                prepared_request: httpx.Request,
+            ) -> None:
+                HttpPassThroughEndpointHelpers.validate_prepared_request_egress(
+                    prepared_request=prepared_request,
+                    credential_family=egress_credential_family,
+                    expected_target_family=expected_target_family,
+                )
+            validate_prepared_request_fn = _validate_prepared_xai_request
+        if not (openai_bound_egress or managed_xai_oauth_request):
+            exact_xai_egress = (
+                HttpPassThroughEndpointHelpers._is_exact_xai_egress_credential_family(
+                    egress_credential_family
+                )
+                or expected_target_family
+                in {XAI_OAUTH_ROUTE_FAMILY, GROK_NATIVE_OAUTH_ROUTE_FAMILY}
+            )
+            if exact_xai_egress:
+                validate_prepared_request_fn = _validate_prepared_request
         effective_blocked_pass_through_prefixed_headers = list(
             blocked_pass_through_prefixed_headers or []
         )
@@ -7567,6 +7619,23 @@ async def pass_through_request(  # noqa: PLR0915
                 )
             effective_blocked_pass_through_prefixed_headers.extend(
                 list(_OPENAI_PROTECTED_PASSTHROUGH_HEADERS)
+            )
+        raw_request_header_items = [
+            (name.decode("latin-1"), value.decode("latin-1"))
+            for name, value in getattr(request.scope, "get", lambda _k, _d: [])(
+                "headers", []
+            )
+        ]
+        raw_request_header_names = [
+            str(name).casefold() for name, _value in raw_request_header_items
+        ]
+        if len(raw_request_header_names) != len(set(raw_request_header_names)):
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Blocked passthrough egress: raw duplicate request headers "
+                    "cannot be validated safely."
+                ),
             )
         headers = HttpPassThroughEndpointHelpers.forward_headers_from_request(
             request_headers=_safe_get_request_headers(request).copy(),
@@ -8006,7 +8075,18 @@ async def pass_through_request(  # noqa: PLR0915
 
             _transfer_identity = build_transfer_identity(
                 request=request,
-                request_body=_parsed_body if isinstance(_parsed_body, dict) else None,
+                request_body=(
+                    (
+                        {
+                            **_parsed_body,
+                            "model": immutable_openai_binding.expected_model,
+                        }
+                        if immutable_openai_binding.expected_model is not None
+                        else _parsed_body
+                    )
+                    if isinstance(_parsed_body, dict)
+                    else None
+                ),
                 logging_obj=logging_obj,
                 kwargs=kwargs,
                 litellm_call_id=litellm_call_id,
@@ -8795,9 +8875,23 @@ async def pass_through_request(  # noqa: PLR0915
                     "logical_provider_calls"
                 )
                 if openai_bound_egress and selected_openai_headers:
+                    raw_prepared_header_names = [
+                        str(name).casefold()
+                        for name, _value in prepared_request.headers.multi_items()
+                    ]
+                    if len(raw_prepared_header_names) != len(
+                        set(raw_prepared_header_names)
+                    ):
+                        raise HTTPException(
+                            status_code=500,
+                            detail=(
+                                "Blocked OpenAI egress: raw duplicate protected "
+                                "headers cannot be canonicalized safely."
+                            ),
+                        )
                     prepared_request.headers = (
                         HttpPassThroughEndpointHelpers.canonicalize_openai_protected_headers(
-                            dict(prepared_request.headers),
+                            prepared_request.headers,
                             protected_headers=selected_openai_headers,
                         )
                     )
@@ -9352,6 +9446,7 @@ async def pass_through_request(  # noqa: PLR0915
                         request=request,
                         url=url,
                         custom_llm_provider=custom_llm_provider,
+                        immutable_openai_binding=immutable_openai_binding,
                         openai_capacity_coordinator=capacity_retry_coordinator,
                     ),
                 )
@@ -9874,6 +9969,7 @@ async def pass_through_request(  # noqa: PLR0915
                     request=request,
                     url=url,
                     custom_llm_provider=custom_llm_provider,
+                    immutable_openai_binding=immutable_openai_binding,
                     openai_capacity_coordinator=capacity_retry_coordinator,
                 ),
             )
@@ -10204,7 +10300,8 @@ async def pass_through_request(  # noqa: PLR0915
                 ),
                 request_body=_parsed_body if isinstance(_parsed_body, dict) else None,
                 route_family=immutable_openai_binding.route_family,
-                account_label=_current_openai_account_context(request).get(
+                selected_model=immutable_openai_binding.expected_model,
+            account_label=_current_openai_account_context(request).get(
                     "account_label"
                 ),
                 account_lane=immutable_openai_binding.expected_lane_key,

@@ -6483,7 +6483,11 @@ async def _perform_codex_auto_agent_native_openai_request(
                 if custom_headers is not None or forward_headers
                 else None
             ),
-            expected_target_family="openai",
+            expected_target_family=(
+                "codex_oauth"
+                if custom_headers is not None
+                else "openai"
+            ),
             # RR-054 #24
             retryable_upstream_status_codes=list(_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES_DEFAULT),
             caller_managed_hidden_retry=caller_managed_hidden_retry,

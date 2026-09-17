@@ -285,10 +285,7 @@ class BaseOpenAIPassThroughHandler:
     ) -> dict:
         base_headers: dict[str, str] = {}
         if api_key is not None:
-            base_headers = {
-                "authorization": "Bearer {}".format(api_key),
-                "api-key": "{}".format(api_key),
-            }
+            base_headers["authorization"] = "Bearer {}".format(api_key)
         if extra_headers is not None:
             base_headers.update(extra_headers)
         return BaseOpenAIPassThroughHandler._append_openai_beta_header(
@@ -1109,7 +1106,7 @@ class BaseOpenAIPassThroughHandler:
                     expected_target_family=(
                         expected_target_family
                         if expected_target_family is not None
-                        else "openai"
+                        else "codex_oauth"
                         if openai_selected_credential_family is not None
                         else None
                     ),
