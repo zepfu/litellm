@@ -36,7 +36,7 @@ import copy
 import hashlib
 import inspect
 import time
-from typing import TYPE_CHECKING, Any, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
 
 import httpx
 from fastapi import HTTPException
@@ -207,6 +207,143 @@ def _admission_denial_shares_account_hash(
         remaining_candidate=remaining_candidate,
         remaining_selection=remaining_selection,
     )
+
+
+def _candidate_admission_identity_key(
+    candidate: Mapping[str, Any],
+    selection: Optional[Mapping[str, Any]] = None,
+) -> tuple[str, str, str, str, str]:
+    """Stable non-secret identity for skipping the already-denied lane."""
+    lane_key = None
+    if selection is not None:
+        lane_key = selection.get("lane_key")
+    if not lane_key:
+        lane_key = (
+            candidate.get("codex_oauth_lane_key")
+            or candidate.get("xai_oauth_lane_key")
+            or candidate.get("lane_key")
+        )
+    account_hash = resolve_candidate_account_hash(candidate, selection=selection)
+    return (
+        str(candidate.get("provider") or "").strip().lower(),
+        str(candidate.get("model") or "").strip(),
+        str(candidate.get("route_family") or "").strip(),
+        str(lane_key or "").strip(),
+        str(account_hash or "").strip(),
+    )
+
+
+def _xai_admission_lane_kind(
+    candidate: Optional[Mapping[str, Any]],
+) -> Optional[str]:
+    """Classify an xAI candidate as native Grok or managed xAI OAuth."""
+    if not isinstance(candidate, Mapping):
+        return None
+    if str(candidate.get("provider") or "").strip().lower() != "xai":
+        return None
+    route_family = str(candidate.get("route_family") or "").strip().lower()
+    if "grok_native" in route_family:
+        return "native"
+    if "xai_oauth" in route_family:
+        return "managed"
+    return None
+
+
+def _native_and_managed_xai_lanes(
+    denied_candidate: Mapping[str, Any],
+    remaining_candidate: Mapping[str, Any],
+) -> bool:
+    """True when the denied and remaining lanes are native vs managed xAI."""
+    return {
+        _xai_admission_lane_kind(denied_candidate),
+        _xai_admission_lane_kind(remaining_candidate),
+    } == {"native", "managed"}
+
+
+def _request_enumerated_candidates(
+    request: Any,
+    *,
+    alias_model: str,
+    alias_family: str,
+) -> Sequence[Mapping[str, Any]]:
+    """Return the request-local snapshot enumeration, if one exists."""
+    ingress = "codex" if validate_alias_family(alias_family) == "codex" else "anthropic"
+    context = getattr(
+        getattr(request, "state", None),
+        "aawm_alias_selection_context",
+        None,
+    )
+    if isinstance(context, dict):
+        cached = context.get((ingress, alias_model))
+        candidates = getattr(cached, "candidates", None) if cached is not None else None
+        if candidates:
+            return tuple(candidates)
+    try:
+        from .snapshot_select import _resolve_aawm_alias_selection_enumeration
+
+        enumeration = _resolve_aawm_alias_selection_enumeration(
+            request,
+            alias_model,
+            ingress=ingress,
+        )
+        return tuple(enumeration.candidates or ())
+    except Exception:
+        return ()
+
+
+def _peek_request_local_excluded_keys(request: Any) -> set[str]:
+    try:
+        from .selection import _peek_codex_auto_agent_request_local_excluded_keys
+
+        return set(_peek_codex_auto_agent_request_local_excluded_keys(request))
+    except Exception:
+        excluded = getattr(
+            getattr(request, "state", None),
+            "aawm_alias_request_local_excluded_keys",
+            None,
+        )
+        return set(excluded) if isinstance(excluded, (set, frozenset, list, tuple)) else set()
+
+
+def _peek_remaining_admission_candidate(
+    request: Any,
+    *,
+    alias_model: str,
+    alias_family: str,
+    denied_candidate: Mapping[str, Any],
+    denied_selection: Optional[Mapping[str, Any]] = None,
+) -> Optional[Mapping[str, Any]]:
+    """Return the next enumerated lane, not the already-denied candidate."""
+    denied_key = _candidate_admission_identity_key(
+        denied_candidate, denied_selection
+    )
+    excluded = _peek_request_local_excluded_keys(request)
+    for remaining in _request_enumerated_candidates(
+        request,
+        alias_model=alias_model,
+        alias_family=alias_family,
+    ):
+        if not isinstance(remaining, Mapping):
+            continue
+        if _candidate_admission_identity_key(remaining) == denied_key:
+            continue
+        try:
+            from .selection import _get_codex_auto_agent_request_local_cooldown_key
+
+            remaining_key = _get_codex_auto_agent_request_local_cooldown_key(
+                candidate=dict(remaining),
+                lane_key=(
+                    remaining.get("codex_oauth_lane_key")
+                    or remaining.get("xai_oauth_lane_key")
+                    or remaining.get("lane_key")
+                ),
+            )
+        except Exception:
+            remaining_key = None
+        if remaining_key is not None and remaining_key in excluded:
+            continue
+        return remaining
+    return None
 
 
 
@@ -2706,27 +2843,26 @@ async def handle_alias_route(  # noqa: PLR0915
                 account_failover_replay_safe=account_failover_replay_safe,
                 provider_status_code=attempt_record.get("error_status_code"),
             )
-            denied_hash = getattr(admission_decision, "account_hash", None)
-            remaining_hash = resolve_candidate_account_hash(
-                candidate, selection=selection
+            remaining_candidate = _peek_remaining_admission_candidate(
+                request,
+                alias_model=alias_model,
+                alias_family=alias_family,
+                denied_candidate=candidate,
+                denied_selection=selection,
             )
-            same_denied_identity = (
-                isinstance(denied_hash, str)
-                and bool(denied_hash.strip())
-                and remaining_hash == denied_hash.strip()
+            same_denied_identity = _admission_denial_shares_account_hash(
+                admission_decision,
+                remaining_candidate=remaining_candidate,
             )
-            native_vs_managed_xai = (
-                str(candidate.get("provider") or "").strip().lower() == "xai"
-                and str(getattr(admission_decision, "provider", "") or "")
-                .strip()
-                .lower()
-                == "xai"
-                and isinstance(denied_hash, str)
-                and bool(denied_hash.strip())
-                and remaining_hash not in {None, denied_hash.strip()}
+            native_vs_managed_xai = remaining_candidate is not None and (
+                _native_and_managed_xai_lanes(candidate, remaining_candidate)
             )
-            independent_lane_fallback = native_vs_managed_xai or (
-                account_failover_planned and not same_denied_identity
+            independent_lane_fallback = remaining_candidate is not None and (
+                not same_denied_identity
+                and (
+                    native_vs_managed_xai
+                    or account_failover_planned
+                )
             )
             if independent_lane_fallback:
                 _carry_native_openai_responses_owner_snapshot(
@@ -3629,7 +3765,6 @@ async def handle_alias_route(  # noqa: PLR0915
                             if deferred_success_committed:
                                 return
                             deferred_success_committed = True
-                            assert intent is not None
                             try:
                                 if (
                                     codex_failure_evidence_alias is not None

@@ -586,6 +586,7 @@ def resolve_candidate_account_hash(
         candidate.get("codex_oauth_account_hash"),
         candidate.get("provider_account_hash"),
         candidate.get("account_hash"),
+        candidate.get("xai_oauth_account_hash"),
         candidate.get("codex_auto_agent_selected_account_hash"),
     ]
     if selection is not None:
@@ -594,6 +595,7 @@ def resolve_candidate_account_hash(
                 selection.get("codex_oauth_account_hash"),
                 selection.get("provider_account_hash"),
                 selection.get("account_hash"),
+                selection.get("xai_oauth_account_hash"),
             ]
         )
         quota_observation = selection.get("quota_observation")
