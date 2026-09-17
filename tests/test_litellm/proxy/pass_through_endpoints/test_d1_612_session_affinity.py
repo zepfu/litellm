@@ -64,11 +64,38 @@ class _FakeRedisClient:
         self._parent._expires_at.pop(name, None)
         return True
 
+    def _eval_retire(self, raw: Any, expected_owner: Any, key: str) -> Any:
+        if raw is None:
+            return [0, "missing"]
+        current = json.loads(raw.decode("utf-8"))
+        if current.get("state") != "owned":
+            return [3, json.dumps(current)]
+        if current.get("owner") != expected_owner:
+            return [2, json.dumps(current)]
+        self._parent._data.pop(key, None)
+        self._parent._ttl.pop(key, None)
+        self._parent._expires_at.pop(key, None)
+        return [1, json.dumps(current)]
+
+    def _eval_xai_migration(self, raw: Any, payload_json: Any, key: str) -> Any:
+        if raw is None:
+            payload = json.loads(payload_json)
+            self._parent._data[key] = json.dumps(payload).encode("utf-8")
+            self._parent._ttl.pop(key, None)
+            self._parent._expires_at.pop(key, None)
+            return [1, json.dumps(payload)]
+        current = json.loads(raw.decode("utf-8"))
+        return [2, json.dumps(current)]
+
     async def eval(self, script: str, numkeys: int, *args: Any) -> Any:
         # Minimal Lua semantics used by session_affinity promote/release/renew.
         key = args[0]
         self._parent._purge_expired(key)
         raw = self._parent._data.get(key)
+        if "session_owner_retire_owned" in script:
+            return self._eval_retire(raw, args[1], key)
+        if "session_owner_xai_migration" in script:
+            return self._eval_xai_migration(raw, args[1], key)
         if "PERSIST" in script and "reservation_token" in script and "owned" in script:
             # promote
             token = args[1]
@@ -4466,3 +4493,317 @@ async def test_direct_openai_owner_accepts_legacy_and_current_managed_shapes() -
     assert stored[0]["attributes"]["route_family"] == "codex_responses"
     assert stored[0]["attributes"]["endpoint_contract"] == "codex_responses"
     assert stored[0]["attributes"]["state_format"] == "codex_responses"
+
+
+def _xai_native_owner_attrs(**over: Any) -> dict[str, Any]:
+    base = {
+        "provider": "xai",
+        "model": "grok-4",
+        "route_family": "grok_cli_chat_proxy",
+        "endpoint_contract": "grok_cli_chat_proxy",
+        "state_format": "grok_cli_chat_proxy",
+        "account_hash": "xai-native-acct",
+        "account_label": "native-primary",
+        "account_lane": "xai-native-lane",
+        "account_scope": "native-scope",
+    }
+    base.update(over)
+    return base
+
+
+def _xai_managed_owner_attrs(**over: Any) -> dict[str, Any]:
+    base = {
+        "provider": "xai",
+        "model": "grok-4",
+        "route_family": "xai_oauth_api",
+        "endpoint_contract": "xai_oauth_api",
+        "state_format": "xai_oauth_api",
+        "account_hash": "xai-managed-acct",
+        "account_label": "managed-primary",
+        "account_lane": "xai-managed-lane",
+        "account_scope": "managed-scope",
+    }
+    base.update(over)
+    return base
+
+
+async def _promote_owned_session(
+    redis: _FakeRedisCache,
+    *,
+    session_identity: str,
+    attributes: dict[str, Any],
+) -> sa.SessionOwnerMutationResult:
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        reserved = await sa.guard_session_owner_before_egress(
+            session_identity=session_identity,
+            requested_attributes=attributes,
+        )
+        assert reserved.decision is sa.SessionOwnerGuardDecision.UNOWNED_RESERVED
+        promoted = await sa.promote_session_owner_reservation(
+            session_identity=session_identity,
+            reservation_token=reserved.reservation_token,
+            attributes=attributes,
+        )
+    assert promoted.outcome is sa.SessionOwnerMutationOutcome.PROMOTED
+    return promoted
+
+
+@pytest.mark.asyncio
+async def test_retire_session_owner_cas_deletes_base_and_effective_together() -> None:
+    redis = _FakeRedisCache()
+    attrs = _full_attrs()
+    owner_id = sa.build_session_owner_id(attributes=attrs)
+    base_identity = "sess-retire-base"
+    effective_identity = sa.derive_session_owner_effective_identity(base_identity)
+    assert effective_identity is not None
+    await _promote_owned_session(
+        redis, session_identity=base_identity, attributes=attrs
+    )
+    await _promote_owned_session(
+        redis, session_identity=effective_identity, attributes=attrs
+    )
+
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        retired = await sa.retire_session_owner(
+            session_identity=base_identity,
+            expected_owner_id=owner_id,
+            trigger=sa.SessionOwnerRetirementTrigger.CLIENT_SESSION_ENDED,
+        )
+        base_record, _, base_error = await sa.get_session_owner_record(
+            session_identity=base_identity
+        )
+        effective_record, _, effective_error = await sa.get_session_owner_record(
+            session_identity=effective_identity
+        )
+
+    assert retired.outcome is sa.SessionOwnerMutationOutcome.RETIRED
+    assert base_error is None and base_record is None
+    assert effective_error is None and effective_record is None
+
+
+@pytest.mark.asyncio
+async def test_retire_session_owner_does_not_delete_successor_or_mismatch() -> None:
+    redis = _FakeRedisCache()
+    original_attrs = _full_attrs()
+    successor_attrs = _xai_managed_owner_attrs()
+    original_owner = sa.build_session_owner_id(attributes=original_attrs)
+    successor_owner = sa.build_session_owner_id(attributes=successor_attrs)
+    assert original_owner != successor_owner
+    base_identity = "sess-retire-successor"
+    effective_identity = sa.derive_session_owner_effective_identity(base_identity)
+    assert effective_identity is not None
+    await _promote_owned_session(
+        redis, session_identity=base_identity, attributes=original_attrs
+    )
+    await _promote_owned_session(
+        redis, session_identity=effective_identity, attributes=successor_attrs
+    )
+
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        retired = await sa.retire_session_owner(
+            session_identity=base_identity,
+            expected_owner_id=original_owner,
+            trigger=sa.SessionOwnerRetirementTrigger.CLIENT_SESSION_ENDED,
+        )
+        mismatch = await sa.retire_session_owner(
+            session_identity=effective_identity,
+            expected_owner_id=original_owner,
+            trigger=sa.SessionOwnerRetirementTrigger.CLIENT_SESSION_ENDED,
+        )
+        base_record, _, _ = await sa.get_session_owner_record(
+            session_identity=base_identity
+        )
+        successor_record, _, _ = await sa.get_session_owner_record(
+            session_identity=effective_identity
+        )
+
+    assert retired.outcome is sa.SessionOwnerMutationOutcome.RETIRED
+    assert mismatch.outcome is sa.SessionOwnerMutationOutcome.CONFLICT
+    assert base_record is None
+    assert successor_record is not None
+    assert successor_record["owner"] == successor_owner
+
+
+@pytest.mark.asyncio
+async def test_retire_session_owner_rejects_ttl_and_non_session_end_triggers() -> None:
+    redis = _FakeRedisCache()
+    attrs = _full_attrs()
+    owner_id = sa.build_session_owner_id(attributes=attrs)
+    session_identity = "sess-retire-ttl"
+    await _promote_owned_session(
+        redis, session_identity=session_identity, attributes=attrs
+    )
+    redis.advance_time(24 * 3600)
+
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        rejected = await sa.retire_session_owner(
+            session_identity=session_identity,
+            expected_owner_id=owner_id,
+            trigger="elapsed_ttl",
+        )
+        still_owned, _, error = await sa.get_session_owner_record(
+            session_identity=session_identity
+        )
+
+    assert rejected.outcome is sa.SessionOwnerMutationOutcome.ERROR
+    assert "client_session_ended" in (rejected.error or "")
+    assert error is None
+    assert still_owned is not None
+    assert still_owned["state"] == "owned"
+    assert still_owned["owner"] == owner_id
+
+
+@pytest.mark.asyncio
+async def test_native_to_managed_xai_migration_uses_later_generation_identity() -> None:
+    redis = _FakeRedisCache()
+    native_attrs = _xai_native_owner_attrs()
+    managed_attrs = _xai_managed_owner_attrs()
+    native_owner = sa.build_session_owner_id(attributes=native_attrs)
+    managed_owner = sa.build_session_owner_id(attributes=managed_attrs)
+    assert native_owner != managed_owner
+    base_identity = "sess-xai-native"
+    await _promote_owned_session(
+        redis, session_identity=base_identity, attributes=native_attrs
+    )
+    replay_safe_body = {"input": [{"role": "user", "content": "portable"}]}
+    first_generation = sa.derive_session_owner_effective_identity(base_identity)
+    later_generation = sa.derive_session_owner_xai_migration_effective_identity(
+        base_identity
+    )
+    assert later_generation is not None
+    assert later_generation != first_generation
+    assert later_generation != base_identity
+
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        migrated = await sa.migrate_native_xai_owner_to_managed_xai(
+            session_identity=base_identity,
+            native_owner_id=native_owner,
+            native_attributes=native_attrs,
+            managed_attributes=managed_attrs,
+            authorization=sa._NATIVE_XAI_TO_MANAGED_XAI_MIGRATION_AUTHORIZATION,
+            request_body=replay_safe_body,
+        )
+        native_record, _, native_error = await sa.get_session_owner_record(
+            session_identity=base_identity
+        )
+        managed_record, _, managed_error = await sa.get_session_owner_record(
+            session_identity=later_generation
+        )
+        first_gen_record, _, first_gen_error = await sa.get_session_owner_record(
+            session_identity=first_generation
+        )
+
+    assert migrated.outcome is sa.SessionOwnerMutationOutcome.PROMOTED
+    assert migrated.session_identity == later_generation
+    assert migrated.owner_id == managed_owner
+    assert native_error is None and native_record is not None
+    assert native_record["owner"] == native_owner
+    assert native_record["attributes"]["route_family"] == "grok_cli_chat_proxy"
+    assert managed_error is None and managed_record is not None
+    assert managed_record["owner"] == managed_owner
+    assert first_gen_error is None and first_gen_record is None
+
+
+@pytest.mark.asyncio
+async def test_native_to_managed_xai_migration_fail_closed_identity() -> None:
+    redis = _FakeRedisCache()
+    native_attrs = _xai_native_owner_attrs()
+    managed_attrs = _xai_managed_owner_attrs()
+    native_owner = sa.build_session_owner_id(attributes=native_attrs)
+    base_identity = "sess-xai-fail-closed"
+    await _promote_owned_session(
+        redis, session_identity=base_identity, attributes=native_attrs
+    )
+    replay_safe_body = {"input": [{"role": "user", "content": "portable"}]}
+
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        unauthorized = await sa.migrate_native_xai_owner_to_managed_xai(
+            session_identity=base_identity,
+            native_owner_id=native_owner,
+            native_attributes=native_attrs,
+            managed_attributes=managed_attrs,
+            authorization="global_native_managed_equivalence",
+            request_body=replay_safe_body,
+        )
+        replay_unsafe = await sa.migrate_native_xai_owner_to_managed_xai(
+            session_identity=base_identity,
+            native_owner_id=native_owner,
+            native_attributes=native_attrs,
+            managed_attributes=managed_attrs,
+            authorization=sa._NATIVE_XAI_TO_MANAGED_XAI_MIGRATION_AUTHORIZATION,
+            request_body={"previous_response_id": "resp_native_state"},
+        )
+        equivalent_owners = await sa.migrate_native_xai_owner_to_managed_xai(
+            session_identity=base_identity,
+            native_owner_id=native_owner,
+            native_attributes=native_attrs,
+            managed_attributes=native_attrs,
+            authorization=sa._NATIVE_XAI_TO_MANAGED_XAI_MIGRATION_AUTHORIZATION,
+            request_body=replay_safe_body,
+        )
+        missing_native = await sa.migrate_native_xai_owner_to_managed_xai(
+            session_identity="sess-xai-missing",
+            native_owner_id=native_owner,
+            native_attributes=native_attrs,
+            managed_attributes=managed_attrs,
+            authorization=sa._NATIVE_XAI_TO_MANAGED_XAI_MIGRATION_AUTHORIZATION,
+            request_body=replay_safe_body,
+        )
+        native_record, _, _ = await sa.get_session_owner_record(
+            session_identity=base_identity
+        )
+        later_generation = sa.derive_session_owner_xai_migration_effective_identity(
+            base_identity
+        )
+        migrated_record, _, _ = await sa.get_session_owner_record(
+            session_identity=later_generation
+        )
+
+    assert unauthorized.outcome is sa.SessionOwnerMutationOutcome.ERROR
+    assert "authorization rejected" in (unauthorized.error or "")
+    assert replay_unsafe.outcome is sa.SessionOwnerMutationOutcome.ERROR
+    assert "replay-safe" in (replay_unsafe.error or "")
+    assert equivalent_owners.outcome is sa.SessionOwnerMutationOutcome.ERROR
+    assert "not managed xAI" in (equivalent_owners.error or "")
+    assert missing_native.outcome is sa.SessionOwnerMutationOutcome.NOT_HELD
+    assert native_record is not None
+    assert native_record["owner"] == native_owner
+    assert migrated_record is None
+
+
+@pytest.mark.asyncio
+async def test_close_retained_session_once_cannot_skip_cleanup_on_cancel() -> None:
+    class SlowClose:
+        def __init__(self) -> None:
+            self.close_calls = 0
+            self.started = asyncio.Event()
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+        async def aclose(self) -> None:
+            self.started.set()
+            await asyncio.sleep(0.05)
+            self.close()
+
+    session = SlowClose()
+    task = asyncio.create_task(sa.close_retained_session_once(session))
+    await session.started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert session.close_calls == 1
+    await sa.close_retained_session_once(session)
+    assert session.close_calls == 1

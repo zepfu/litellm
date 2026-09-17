@@ -3131,6 +3131,299 @@ def test_cursor_retained_session_failure_closes_once() -> None:
     assert session.close_calls == 1
 
 
+def _store_retained_handoff_state(
+    session: Any,
+    response_id: str = "resp-handoff",
+    call_id: str = "read-call",
+) -> None:
+    # CURSOR-035 leftover retained-session handoff; archived CURSOR-016 is
+    # preconfigured future-model cooldown, not this ownership transfer.
+    codex_candidate_calls._store_cursor_replay_state(
+        response_id,
+        messages=[
+            {"role": "user", "content": "run the requested read"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": '{"cmd":"read"}',
+                        },
+                    }
+                ],
+            },
+        ],
+        tools=[],
+        retained_session=session,
+    )
+
+
+def _retained_handoff_body(
+    response_id: str = "resp-handoff",
+    call_id: str = "read-call",
+) -> dict[str, Any]:
+    return {
+        "model": "work",
+        "previous_response_id": response_id,
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "LITELLM_CURSOR_READ_V1:envelope",
+            }
+        ],
+    }
+
+
+def _assert_no_live_retained_registry_owner(session: Any) -> None:
+    live_owners = [
+        state.get("retained_session")
+        for state in codex_candidate_calls._CURSOR_REPLAY_REGISTRY.values()
+        if state.get("retained_session") is session
+    ]
+    assert live_owners == []
+
+
+def test_cursor_continuation_validation_failure_closes_retained_session() -> None:
+    class EmptyResultSession(_CountingRetainedSession):
+        async def continue_with_tool_outputs(
+            self,
+            _outputs: list[tuple[str, Any]],
+        ) -> CursorAgentRunResult:
+            return CursorAgentRunResult()
+
+    session = EmptyResultSession()
+    _store_retained_handoff_state(session)
+
+    with pytest.raises(CursorConnectProtocolError):
+        _call(_retained_handoff_body())
+
+    assert session.close_calls == 1
+    _assert_no_live_retained_registry_owner(session)
+
+
+def test_cursor_continuation_registry_store_failure_closes_retained_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ToolCallSession(_CountingRetainedSession):
+        async def continue_with_tool_outputs(
+            self,
+            _outputs: list[tuple[str, Any]],
+        ) -> CursorAgentRunResult:
+            return CursorAgentRunResult(
+                tool_calls=[
+                    {
+                        "id": "cursor-item-2",
+                        "call_id": "call-2",
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"date"}',
+                    }
+                ],
+                retained_session=self,
+            )
+
+    session = ToolCallSession()
+    _store_retained_handoff_state(session)
+
+    real_store = codex_candidate_calls._store_cursor_replay_state
+
+    def _fail_live_store(*args: Any, **kwargs: Any) -> None:
+        if kwargs.get("retained_session") is not None:
+            raise RuntimeError("registry store failed")
+        return real_store(*args, **kwargs)
+
+    monkeypatch.setattr(
+        codex_candidate_calls,
+        "_store_cursor_replay_state",
+        _fail_live_store,
+    )
+
+    with pytest.raises(RuntimeError, match="registry store failed"):
+        _call(_retained_handoff_body())
+
+    assert session.close_calls == 1
+    _assert_no_live_retained_registry_owner(session)
+
+
+def test_cursor_continuation_cancellation_closes_retained_session() -> None:
+    class CancellingSession(_CountingRetainedSession):
+        async def continue_with_tool_outputs(
+            self,
+            _outputs: list[tuple[str, Any]],
+        ) -> CursorAgentRunResult:
+            raise asyncio.CancelledError()
+
+    session = CancellingSession()
+    _store_retained_handoff_state(session)
+
+    with pytest.raises(asyncio.CancelledError):
+        _call(_retained_handoff_body())
+
+    assert session.close_calls == 1
+    _assert_no_live_retained_registry_owner(session)
+
+
+def test_cursor_continuation_post_processing_failure_closes_retained_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ToolCallSession(_CountingRetainedSession):
+        async def continue_with_tool_outputs(
+            self,
+            _outputs: list[tuple[str, Any]],
+        ) -> CursorAgentRunResult:
+            return CursorAgentRunResult(
+                tool_calls=[
+                    {
+                        "id": "cursor-item-2",
+                        "call_id": "call-2",
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"date"}',
+                    }
+                ],
+                retained_session=self,
+            )
+
+    session = ToolCallSession()
+    _store_retained_handoff_state(session)
+
+    def _fail_post_process(*_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
+        raise codex_candidate_calls._CursorPostEgressOutputError(
+            "Cursor Agent returned a malformed function call; "
+            "call_id and name are required."
+        )
+
+    monkeypatch.setattr(
+        codex_candidate_calls,
+        "_cursor_messages_with_result_tool_calls",
+        _fail_post_process,
+    )
+
+    from litellm.proxy._types import ProxyException
+
+    with pytest.raises(ProxyException) as exc_info:
+        _call(_retained_handoff_body())
+
+    assert exc_info.value.failure_phase == "candidate_post_egress_normalization"
+    assert session.close_calls == 1
+    _assert_no_live_retained_registry_owner(session)
+
+
+def test_cursor_continuation_success_keeps_one_registry_owner() -> None:
+    class ToolCallSession(_CountingRetainedSession):
+        async def continue_with_tool_outputs(
+            self,
+            _outputs: list[tuple[str, Any]],
+        ) -> CursorAgentRunResult:
+            return CursorAgentRunResult(
+                tool_calls=[
+                    {
+                        "id": "cursor-item-2",
+                        "call_id": "call-2",
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"date"}',
+                    }
+                ],
+                retained_session=self,
+            )
+
+    session = ToolCallSession()
+    _store_retained_handoff_state(session)
+    response = _call(_retained_handoff_body())
+    body = json.loads(response.body)
+
+    assert session.close_calls == 0
+    stored = codex_candidate_calls._peek_cursor_replay_state(body["id"])
+    assert stored["retained_session"] is session
+    live_owners = [
+        state.get("retained_session")
+        for state in codex_candidate_calls._CURSOR_REPLAY_REGISTRY.values()
+        if state.get("retained_session") is session
+    ]
+    assert live_owners == [session]
+
+
+def test_cursor_fresh_result_validation_failure_closes_retained_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _CountingRetainedSession()
+
+    class FakeCursorClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def run(
+            self,
+            _payload: dict[str, Any],
+            **_kwargs: Any,
+        ) -> CursorAgentRunResult:
+            return CursorAgentRunResult(retained_session=session)
+
+    monkeypatch.setattr(
+        "litellm.llms.cursor_agent.connect.CursorAgentConnectClient",
+        FakeCursorClient,
+    )
+
+    with pytest.raises(CursorConnectProtocolError):
+        _call({"model": "work", "input": "run pwd"})
+
+    assert session.close_calls == 1
+    _assert_no_live_retained_registry_owner(session)
+
+
+def test_cursor_fresh_result_registry_store_failure_closes_retained_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _CountingRetainedSession()
+
+    class FakeCursorClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def run(
+            self,
+            _payload: dict[str, Any],
+            **_kwargs: Any,
+        ) -> CursorAgentRunResult:
+            return CursorAgentRunResult(
+                tool_calls=[
+                    {
+                        "id": "cursor-item-1",
+                        "call_id": "call-1",
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"pwd"}',
+                    }
+                ],
+                retained_session=session,
+            )
+
+    monkeypatch.setattr(
+        "litellm.llms.cursor_agent.connect.CursorAgentConnectClient",
+        FakeCursorClient,
+    )
+    real_store = codex_candidate_calls._store_cursor_replay_state
+
+    def _fail_live_store(*args: Any, **kwargs: Any) -> None:
+        if kwargs.get("retained_session") is not None:
+            raise RuntimeError("registry store failed")
+        return real_store(*args, **kwargs)
+
+    monkeypatch.setattr(
+        codex_candidate_calls,
+        "_store_cursor_replay_state",
+        _fail_live_store,
+    )
+
+    with pytest.raises(RuntimeError, match="registry store failed"):
+        _call({"model": "work", "input": "run pwd"})
+
+    assert session.close_calls == 1
+    _assert_no_live_retained_registry_owner(session)
+
+
 def test_cursor_stream_uses_responses_event_schema(
     monkeypatch: pytest.MonkeyPatch,
     _route_rollup_state: None,

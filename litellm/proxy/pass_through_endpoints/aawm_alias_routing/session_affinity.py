@@ -17,6 +17,15 @@ Lifecycle (every alias / direct / nested path must use this guard):
    6h expiry); reserved records use a short renewable TTL.
 3. ``release_session_owner_reservation`` — on failure/terminal error, delete
    only our still-reserved tokenized hold. Never erases an owned record.
+4. ``retire_session_owner`` — on an authoritative client session-end only,
+   expected-owner CAS-delete the canonical base record together with its
+   deterministic effective-owner derivatives. Owned records have no fixed
+   TTL; a successor or owner mismatch cannot be deleted.
+5. ``migrate_native_xai_owner_to_managed_xai`` — a later HTTP request may
+   create managed-xAI ownership only under a bounded second deterministic
+   identity. Native success stays committed. Native and managed xAI are
+   never globally equivalent; replay-unsafe or unauthorized requests fail
+   closed.
 
 Process-local state never authorizes ownership. Conflicts and errors raise
 structured ``redispatch_required`` (never ignored).
@@ -79,10 +88,21 @@ class SessionOwnerMutationOutcome(str, Enum):
     PROMOTED = "promoted"
     ALREADY_OWNED = "already_owned"
     RELEASED = "released"
+    RETIRED = "retired"
     NOT_HELD = "not_held"
     CONFLICT = "conflict"
     ERROR = "error"
     SKIPPED = "skipped"
+
+
+class SessionOwnerRetirementTrigger(str, Enum):
+    """Authoritative session-end events that may retire durable owners.
+
+    Owned records persist until this trigger. Elapsed wall-clock time alone
+    is not a retirement signal and must not be used as a fixed TTL.
+    """
+
+    CLIENT_SESSION_ENDED = "client_session_ended"
 
 
 class SessionOwnerLeaseRenewalError(RuntimeError):
@@ -291,6 +311,16 @@ _SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX = (
 _SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_DOMAIN_SEPARATOR = (
     "aawm-session-owner-redispatch-v1\x00"
 )
+_SESSION_OWNER_XAI_MIGRATION_EFFECTIVE_IDENTITY_PREFIX = (
+    "aawm-session-owner-xai-migration-v1:"
+)
+_SESSION_OWNER_XAI_MIGRATION_EFFECTIVE_IDENTITY_DOMAIN_SEPARATOR = (
+    "aawm-session-owner-xai-migration-v1\x00"
+)
+_NATIVE_XAI_TO_MANAGED_XAI_MIGRATION_AUTHORIZATION = (
+    "native_xai_to_managed_xai_later_generation"
+)
+_RETAINED_SESSION_CLOSED_MARKER = "_aawm_session_owner_retained_closed"
 _REQUEST_STATE_EFFECTIVE_SESSION_IDENTITY_ATTR = (
     "_aawm_session_owner_effective_identity"
 )
@@ -462,7 +492,8 @@ _REPLAY_SAFETY_MAX_FIELD_PATH_CHARS = 256
 _REPLAY_SAFETY_MAPPING_PATH_SEGMENT = object()
 
 # Short renewable hold while upstream I/O is in flight. Not a fixed ownership
-# expiry — owned records are persistent until explicit retirement.
+# expiry — owned records are persistent until ``retire_session_owner`` sees an
+# authoritative ``SessionOwnerRetirementTrigger.CLIENT_SESSION_ENDED``.
 _DEFAULT_RESERVATION_TTL_SECONDS = 120.0
 _MIN_RESERVATION_TTL_SECONDS = 30.0
 _MAX_RESERVATION_TTL_SECONDS = 900.0
@@ -1333,6 +1364,41 @@ def is_session_owner_redispatch_effective_identity(
     return bool(
         identity
         and identity.startswith(_SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX)
+    )
+
+
+def derive_session_owner_xai_migration_effective_identity(
+    base_session_identity: Optional[str],
+) -> Optional[str]:
+    """Derive the bounded later-generation native→managed xAI identity.
+
+    Distinct from the first-generation redispatch identity. One immutable
+    effective identity cannot be reused for native and managed owners.
+    """
+
+    base = _clean_optional_str(base_session_identity)
+    if base is None:
+        return None
+    digest = hashlib.sha256(
+        (
+            _SESSION_OWNER_XAI_MIGRATION_EFFECTIVE_IDENTITY_DOMAIN_SEPARATOR
+            + base
+        ).encode("utf-8")
+    ).hexdigest()
+    return (
+        f"{_SESSION_OWNER_XAI_MIGRATION_EFFECTIVE_IDENTITY_PREFIX}{digest}"
+    )
+
+
+def is_session_owner_xai_migration_effective_identity(
+    session_identity: Optional[str],
+) -> bool:
+    """Return whether an identity is the native→managed xAI migration id."""
+
+    identity = _clean_optional_str(session_identity)
+    return bool(
+        identity
+        and identity.startswith(_SESSION_OWNER_XAI_MIGRATION_EFFECTIVE_IDENTITY_PREFIX)
     )
 
 
@@ -4528,6 +4594,864 @@ async def refresh_session_owner_mutable_attributes(
         owner_id=_clean_optional_str(owner_id),
         error=f"session_owner: mutable refresh returned {code}",
     )
+
+
+def _decode_session_owner_eval_payload(raw_payload: Any) -> Optional[Payload]:
+    payload: Optional[Payload] = None
+    if isinstance(raw_payload, (bytes, bytearray)):
+        raw_payload = raw_payload.decode("utf-8", errors="replace")
+    if isinstance(raw_payload, Mapping):
+        return cast(Payload, dict(raw_payload))
+    if isinstance(raw_payload, str) and raw_payload not in {
+        "missing",
+        "malformed",
+    }:
+        try:
+            decoded = json.loads(raw_payload)
+            if isinstance(decoded, dict):
+                payload = cast(Payload, decoded)
+        except Exception:  # noqa: BLE001
+            payload = None
+    return payload
+
+
+def _is_native_xai_owner_attributes(attributes: Mapping[str, Any]) -> bool:
+    provider = str(attributes.get("provider") or "").strip().lower()
+    route_family = str(attributes.get("route_family") or "").strip().lower()
+    return provider == "xai" and route_family == GROK_NATIVE_OAUTH_ROUTE_FAMILY
+
+
+def _is_managed_xai_oauth_owner_attributes(attributes: Mapping[str, Any]) -> bool:
+    provider = str(attributes.get("provider") or "").strip().lower()
+    route_family = str(attributes.get("route_family") or "").strip().lower()
+    if provider != "xai":
+        return False
+    if route_family == GROK_NATIVE_OAUTH_ROUTE_FAMILY:
+        return False
+    return (
+        route_family == XAI_OAUTH_ROUTE_FAMILY
+        or "xai_oauth" in route_family
+    )
+
+
+def session_owner_retirement_identities(
+    session_identity: Optional[str],
+) -> tuple[str, ...]:
+    """Canonical base plus deterministic effective-owner derivatives."""
+
+    cleaned = _clean_optional_str(session_identity)
+    if cleaned is None:
+        return ()
+    cleaned = _strip_legacy_affinity_prefixes(cleaned)
+    identities = [cleaned]
+    for derived in (
+        derive_session_owner_effective_identity(cleaned),
+        derive_session_owner_xai_migration_effective_identity(cleaned),
+    ):
+        if derived and derived not in identities:
+            identities.append(derived)
+    return tuple(identities)
+
+
+def _normalize_session_owner_retirement_trigger(
+    trigger: Any,
+) -> Optional[SessionOwnerRetirementTrigger]:
+    if isinstance(trigger, SessionOwnerRetirementTrigger):
+        return trigger
+    cleaned = _clean_optional_str(trigger)
+    if cleaned is None:
+        return None
+    try:
+        return SessionOwnerRetirementTrigger(cleaned)
+    except ValueError:
+        return None
+
+
+async def _cas_retire_owned_session_identity(
+    *,
+    session_identity: str,
+    expected_owner_id: str,
+) -> SessionOwnerMutationResult:
+    cache_key = build_aawm_alias_routing_session_owner_cache_key(
+        session_identity=session_identity
+    )
+    redis_cache, error = await _get_redis_cache()
+    if error is not None or redis_cache is None:
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.ERROR,
+            session_identity=session_identity,
+            cache_key=cache_key,
+            owner_id=expected_owner_id,
+            error=error or "session_owner: durable cache unavailable",
+        )
+    try:
+        client = await _raw_redis_client(redis_cache)
+        namespaced = _namespaced_key(redis_cache, cache_key)
+    except Exception as exc:  # noqa: BLE001
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.ERROR,
+            session_identity=session_identity,
+            cache_key=cache_key,
+            owner_id=expected_owner_id,
+            error=f"session_owner: retire redis unavailable: {exc}",
+        )
+    lua = """
+    -- session_owner_retire_owned
+    local raw = redis.call('GET', KEYS[1])
+    if not raw then
+      return {0, 'missing'}
+    end
+    local ok, current = pcall(cjson.decode, raw)
+    if not ok or type(current) ~= 'table' then
+      return {-1, 'malformed'}
+    end
+    if current['state'] ~= 'owned' then
+      return {3, cjson.encode(current)}
+    end
+    if current['owner'] ~= ARGV[1] then
+      return {2, cjson.encode(current)}
+    end
+    redis.call('DEL', KEYS[1])
+    return {1, cjson.encode(current)}
+    """
+    try:
+        result = await client.eval(lua, 1, namespaced, expected_owner_id)
+    except Exception as exc:  # noqa: BLE001
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.ERROR,
+            session_identity=session_identity,
+            cache_key=cache_key,
+            owner_id=expected_owner_id,
+            error=f"session_owner: retire failed: {exc}",
+        )
+    if not isinstance(result, (list, tuple)) or not result:
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.ERROR,
+            session_identity=session_identity,
+            cache_key=cache_key,
+            owner_id=expected_owner_id,
+            error="session_owner: retire returned malformed result",
+        )
+    try:
+        code = int(result[0])
+    except (TypeError, ValueError):
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.ERROR,
+            session_identity=session_identity,
+            cache_key=cache_key,
+            owner_id=expected_owner_id,
+            error="session_owner: retire returned invalid result",
+        )
+    raw_payload = result[1] if len(result) > 1 else None
+    payload = _decode_session_owner_eval_payload(raw_payload)
+    actual_owner = (
+        _clean_optional_str(payload.get(_RECORD_OWNER_FIELD))
+        if isinstance(payload, Mapping)
+        else None
+    )
+    if code == 1:
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.RETIRED,
+            session_identity=session_identity,
+            cache_key=cache_key,
+            owner_id=expected_owner_id,
+            owner_record=payload,
+        )
+    if code == 2:
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.CONFLICT,
+            session_identity=session_identity,
+            cache_key=cache_key,
+            owner_id=actual_owner,
+            owner_record=payload,
+            error="session_owner: retire expected-owner mismatch",
+        )
+    if code == 0 and raw_payload == "missing":
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.NOT_HELD,
+            session_identity=session_identity,
+            cache_key=cache_key,
+            owner_id=expected_owner_id,
+            error="session_owner: retire record missing",
+        )
+    if code == 3:
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.CONFLICT,
+            session_identity=session_identity,
+            cache_key=cache_key,
+            owner_id=actual_owner,
+            owner_record=payload,
+            error="session_owner: retire record is not owned",
+        )
+    return SessionOwnerMutationResult(
+        outcome=SessionOwnerMutationOutcome.ERROR,
+        session_identity=session_identity,
+        cache_key=cache_key,
+        owner_id=actual_owner or expected_owner_id,
+        owner_record=payload,
+        error="session_owner: retire returned unknown result",
+    )
+
+
+async def retire_session_owner(
+    *,
+    session_identity: Optional[str],
+    expected_owner_id: Optional[str],
+    trigger: Any,
+    request: Any = None,
+) -> SessionOwnerMutationResult:
+    """CAS-delete durable owners on an authoritative client session-end.
+
+    Owned records have no fixed TTL. Only
+    ``SessionOwnerRetirementTrigger.CLIENT_SESSION_ENDED`` may retire, and
+    only when the stored owner still matches *expected_owner_id*. The
+    canonical base identity and its deterministic effective-owner records
+    are retired together; a successor or competing owner is left in place.
+    """
+
+    cleaned = resolve_canonical_session_identity(
+        session_identity=session_identity,
+    )
+    expected_owner = _clean_optional_str(expected_owner_id)
+    normalized_trigger = _normalize_session_owner_retirement_trigger(trigger)
+    if cleaned is None:
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.SKIPPED,
+            session_identity=None,
+            error="session_owner: retire requires session_identity",
+        )
+    if expected_owner is None:
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.ERROR,
+            session_identity=cleaned,
+            error="session_owner: retire requires expected_owner_id",
+        )
+    if normalized_trigger is not SessionOwnerRetirementTrigger.CLIENT_SESSION_ENDED:
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.ERROR,
+            session_identity=cleaned,
+            owner_id=expected_owner,
+            error=(
+                "session_owner: retire requires authoritative "
+                "client_session_ended trigger"
+            ),
+        )
+
+    retired: list[SessionOwnerMutationResult] = []
+    conflict: Optional[SessionOwnerMutationResult] = None
+    last_not_held: Optional[SessionOwnerMutationResult] = None
+    for identity in session_owner_retirement_identities(cleaned):
+        result = await _cas_retire_owned_session_identity(
+            session_identity=identity,
+            expected_owner_id=expected_owner,
+        )
+        if result.outcome is SessionOwnerMutationOutcome.ERROR:
+            record_session_owner_continuity_receipt(
+                request,
+                phase="owner_finalize",
+                source="failure",
+                session_identity=identity,
+                cache_key=result.cache_key,
+                outcome=result.outcome.value,
+                reason_code="mutation_failed",
+            )
+            return result
+        if result.outcome is SessionOwnerMutationOutcome.RETIRED:
+            retired.append(result)
+            continue
+        if result.outcome is SessionOwnerMutationOutcome.CONFLICT:
+            if conflict is None:
+                conflict = result
+            continue
+        last_not_held = result
+
+    if retired:
+        primary = retired[0]
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_finalize",
+            source="success",
+            session_identity=cleaned,
+            cache_key=primary.cache_key,
+            outcome=SessionOwnerMutationOutcome.RETIRED.value,
+        )
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.RETIRED,
+            session_identity=cleaned,
+            cache_key=primary.cache_key,
+            owner_id=expected_owner,
+            owner_record=primary.owner_record,
+        )
+    if conflict is not None:
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_finalize",
+            source="failure",
+            session_identity=cleaned,
+            cache_key=conflict.cache_key,
+            outcome=conflict.outcome.value,
+            reason_code="mutation_failed",
+        )
+        return conflict
+    record_session_owner_continuity_receipt(
+        request,
+        phase="owner_finalize",
+        source="failure",
+        session_identity=cleaned,
+        outcome=SessionOwnerMutationOutcome.NOT_HELD.value,
+    )
+    return last_not_held or SessionOwnerMutationResult(
+        outcome=SessionOwnerMutationOutcome.NOT_HELD,
+        session_identity=cleaned,
+        owner_id=expected_owner,
+        error="session_owner: retire record missing",
+    )
+
+
+def _session_owner_migration_rejection(
+    *,
+    request: Any,
+    session_identity: Optional[str],
+    reason: str,
+    outcome: SessionOwnerMutationOutcome = SessionOwnerMutationOutcome.ERROR,
+    cache_key: Optional[str] = None,
+    owner_id: Optional[str] = None,
+    owner_record: Optional[Payload] = None,
+) -> SessionOwnerMutationResult:
+    result = SessionOwnerMutationResult(
+        outcome=outcome,
+        session_identity=session_identity,
+        cache_key=cache_key,
+        owner_id=owner_id,
+        owner_record=owner_record,
+        error=reason,
+    )
+    record_session_owner_continuity_receipt(
+        request,
+        phase="owner_rejection",
+        source="failure",
+        session_identity=session_identity,
+        cache_key=cache_key,
+        outcome=outcome.value,
+        reason_code="mutation_failed",
+    )
+    return result
+
+
+def _native_xai_to_managed_xai_contract(
+    *,
+    session_identity: Optional[str],
+    native_owner_id: Optional[str],
+    native_attributes: Optional[Mapping[str, Any]],
+    managed_attributes: Optional[Mapping[str, Any]],
+    authorization: Optional[str],
+    request_body: Optional[Mapping[str, Any]],
+    request: Any,
+) -> tuple[
+    Optional[SessionOwnerMutationResult],
+    Optional[str],
+    Optional[Payload],
+    Optional[Payload],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+]:
+    cleaned = resolve_canonical_session_identity(session_identity=session_identity)
+    expected_native_owner = _clean_optional_str(native_owner_id)
+
+    def fail(reason: str, **kwargs: Any) -> SessionOwnerMutationResult:
+        identity = kwargs.pop("identity", cleaned)
+        return _session_owner_migration_rejection(
+            request=request,
+            session_identity=identity,
+            reason=reason,
+            **kwargs,
+        )
+    if cleaned is None:
+        return (
+            fail("session_owner: native-to-managed xAI migration requires session_identity"),
+            None, None, None, None, None, None,
+        )
+    if authorization != _NATIVE_XAI_TO_MANAGED_XAI_MIGRATION_AUTHORIZATION:
+        return (
+            fail("session_owner: native-to-managed xAI migration authorization rejected"),
+            None, None, None, None, None, None,
+        )
+    if expected_native_owner is None:
+        return (
+            fail("session_owner: native-to-managed xAI migration requires native owner"),
+            None, None, None, None, None, None,
+        )
+    if not is_replay_safe_session_owner_redispatch_body(request_body):
+        replay_safety = classify_session_owner_replay_safety_body(request_body)
+        classification = replay_safety.classification or "invalid_body_shape"
+        return (
+            fail(
+                "session_owner: native-to-managed xAI migration requires "
+                f"provider-neutral replay-safe body ({classification})"
+            ),
+            None, None, None, None, None, None,
+        )
+    if not isinstance(native_attributes, Mapping) or not isinstance(
+        managed_attributes, Mapping
+    ):
+        return (
+            fail(
+                "session_owner: native-to-managed xAI migration requires native "
+                "and managed attributes"
+            ),
+            None, None, None, None, None, None,
+        )
+    native = _core_owner_attributes(
+        build_session_owner_attributes(extra=native_attributes)
+    )
+    managed = _core_owner_attributes(
+        build_session_owner_attributes(extra=managed_attributes)
+    )
+    if not _is_native_xai_owner_attributes(native):
+        return (
+            fail("session_owner: native-to-managed xAI migration source is not native xAI"),
+            None, None, None, None, None, None,
+        )
+    if not _is_managed_xai_oauth_owner_attributes(managed):
+        return (
+            fail(
+                "session_owner: native-to-managed xAI migration destination is "
+                "not managed xAI"
+            ),
+            None, None, None, None, None, None,
+        )
+    native_incomplete = incomplete_owner_attribute_reason(native, for_promotion=True)
+    managed_incomplete = incomplete_owner_attribute_reason(managed, for_promotion=True)
+    if native_incomplete is not None:
+        return fail(native_incomplete), None, None, None, None, None, None
+    if managed_incomplete is not None:
+        return fail(managed_incomplete), None, None, None, None, None, None
+    native_owner = build_session_owner_id(attributes=native)
+    managed_owner = build_session_owner_id(attributes=managed)
+    if native_owner != expected_native_owner:
+        return (
+            fail(
+                "session_owner: native-to-managed xAI migration native owner mismatch",
+                outcome=SessionOwnerMutationOutcome.CONFLICT,
+                owner_id=native_owner,
+            ),
+            None, None, None, None, None, None,
+        )
+    if native_owner == managed_owner:
+        return (
+            fail("session_owner: native and managed xAI cannot share one owner identity"),
+            None, None, None, None, None, None,
+        )
+    migration_identity = derive_session_owner_xai_migration_effective_identity(cleaned)
+    redispatch_identity = derive_session_owner_effective_identity(cleaned)
+    if (
+        migration_identity is None
+        or migration_identity == cleaned
+        or migration_identity == redispatch_identity
+    ):
+        return (
+            fail("session_owner: native-to-managed xAI migration identity is not distinct"),
+            None, None, None, None, None, None,
+        )
+    return (
+        None,
+        cleaned,
+        native,
+        managed,
+        native_owner,
+        managed_owner,
+        migration_identity,
+    )
+
+
+async def _verify_committed_native_xai_owner(
+    *,
+    session_identity: str,
+    expected_native_owner: str,
+    native_attributes: Mapping[str, Any],
+    request: Any,
+) -> Optional[SessionOwnerMutationResult]:
+    native_record, native_cache_key, native_error = await get_session_owner_record(
+        session_identity=session_identity,
+        request=request,
+        wait_for_foreign_reservation=False,
+    )
+
+    def fail(reason: str, **kwargs: Any) -> SessionOwnerMutationResult:
+        return _session_owner_migration_rejection(
+            request=request,
+            session_identity=session_identity,
+            cache_key=native_cache_key,
+            reason=reason,
+            **kwargs,
+        )
+    if native_error is not None:
+        return fail(native_error)
+    if native_record is None:
+        return fail(
+            "session_owner: native xAI owner is unavailable",
+            outcome=SessionOwnerMutationOutcome.NOT_HELD,
+            owner_id=expected_native_owner,
+        )
+    stored_native_owner = _clean_optional_str(native_record.get(_RECORD_OWNER_FIELD))
+    stored_native_attrs = _owner_attributes(native_record)
+    if _record_state(native_record) != SessionOwnerRecordState.OWNED.value:
+        return fail(
+            "session_owner: native xAI owner is not owned",
+            outcome=SessionOwnerMutationOutcome.CONFLICT,
+            owner_id=stored_native_owner,
+            owner_record=native_record,
+        )
+    if stored_native_owner != expected_native_owner:
+        return fail(
+            "session_owner: native xAI owner does not match expected owner",
+            outcome=SessionOwnerMutationOutcome.CONFLICT,
+            owner_id=stored_native_owner,
+            owner_record=native_record,
+        )
+    if not _is_native_xai_owner_attributes(stored_native_attrs):
+        return fail(
+            "session_owner: stored owner is not native xAI",
+            outcome=SessionOwnerMutationOutcome.CONFLICT,
+            owner_id=stored_native_owner,
+            owner_record=native_record,
+        )
+    if not _attributes_exactly_equal(left=stored_native_attrs, right=native_attributes):
+        return fail(
+            "session_owner: stored native xAI attributes do not match",
+            outcome=SessionOwnerMutationOutcome.CONFLICT,
+            owner_id=stored_native_owner,
+            owner_record=native_record,
+        )
+    return None
+
+
+def _managed_xai_migration_record_matches(
+    record: Optional[Mapping[str, Any]],
+    *,
+    managed_owner: str,
+    managed_attributes: Mapping[str, Any],
+) -> bool:
+    if not isinstance(record, Mapping):
+        return False
+    if record.get(_RECORD_STATE_FIELD) != SessionOwnerRecordState.OWNED.value:
+        return False
+    if _clean_optional_str(record.get(_RECORD_OWNER_FIELD)) != managed_owner:
+        return False
+    return _attributes_exactly_equal(
+        left=_owner_attributes(record),
+        right=managed_attributes,
+    )
+
+
+async def _create_managed_xai_migration_owner(
+    *,
+    migration_identity: str,
+    managed_owner: str,
+    managed_attributes: Mapping[str, Any],
+    request: Any,
+) -> SessionOwnerMutationResult:
+    def fail(reason: str, **kwargs: Any) -> SessionOwnerMutationResult:
+        return _session_owner_migration_rejection(
+            request=request,
+            session_identity=migration_identity,
+            reason=reason,
+            **kwargs,
+        )
+
+    managed_record = _build_owned_record(
+        owner_id=managed_owner,
+        attributes=managed_attributes,
+        reservation_token=None,
+    )
+    try:
+        cache_key = build_aawm_alias_routing_session_owner_cache_key(
+            session_identity=migration_identity
+        )
+    except Exception as exc:  # noqa: BLE001
+        return fail(
+            f"session_owner: native-to-managed xAI migration cache key failed: {exc}"
+        )
+    redis_cache, error = await _get_redis_cache()
+    if error is not None or redis_cache is None:
+        return fail(
+            error or "session_owner: durable cache unavailable",
+            cache_key=cache_key,
+        )
+    try:
+        client = await _raw_redis_client(redis_cache)
+        namespaced = _namespaced_key(redis_cache, cache_key)
+    except Exception as exc:  # noqa: BLE001
+        return fail(
+            f"session_owner: native-to-managed xAI migration redis unavailable: {exc}",
+            cache_key=cache_key,
+        )
+    lua = """
+    -- session_owner_xai_migration
+    local raw = redis.call('GET', KEYS[1])
+    if not raw then
+      redis.call('SET', KEYS[1], ARGV[1])
+      redis.call('PERSIST', KEYS[1])
+      return {1, ARGV[1]}
+    end
+    local ok, current = pcall(cjson.decode, raw)
+    if not ok or type(current) ~= 'table' then
+      return {-1, 'malformed'}
+    end
+    return {2, cjson.encode(current)}
+    """
+    try:
+        result = await client.eval(
+            lua,
+            1,
+            namespaced,
+            json.dumps(managed_record),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return fail(
+            f"session_owner: native-to-managed xAI migration failed: {exc}",
+            cache_key=cache_key,
+        )
+    if not isinstance(result, (list, tuple)) or not result:
+        return fail(
+            "session_owner: native-to-managed xAI migration returned malformed result",
+            cache_key=cache_key,
+        )
+    try:
+        code = int(result[0])
+    except (TypeError, ValueError):
+        return fail(
+            "session_owner: native-to-managed xAI migration returned invalid result",
+            cache_key=cache_key,
+        )
+    payload = _decode_session_owner_eval_payload(
+        result[1] if len(result) > 1 else None
+    )
+    actual_owner = (
+        _clean_optional_str(payload.get(_RECORD_OWNER_FIELD))
+        if isinstance(payload, Mapping)
+        else None
+    )
+    if code == 1:
+        created = payload or managed_record
+        if not _managed_xai_migration_record_matches(
+            created,
+            managed_owner=managed_owner,
+            managed_attributes=managed_attributes,
+        ):
+            return fail(
+                "session_owner: native-to-managed xAI migration stored invalid owner",
+                cache_key=cache_key,
+                owner_id=actual_owner,
+                owner_record=payload,
+            )
+        record_session_owner_continuity_receipt(
+            request,
+            phase="owner_finalize",
+            source="success",
+            session_identity=migration_identity,
+            cache_key=cache_key,
+            outcome=SessionOwnerMutationOutcome.PROMOTED.value,
+        )
+        return SessionOwnerMutationResult(
+            outcome=SessionOwnerMutationOutcome.PROMOTED,
+            session_identity=migration_identity,
+            cache_key=cache_key,
+            owner_id=managed_owner,
+            owner_record=created,
+        )
+    if code == 2:
+        if _managed_xai_migration_record_matches(
+            payload,
+            managed_owner=managed_owner,
+            managed_attributes=managed_attributes,
+        ):
+            record_session_owner_continuity_receipt(
+                request,
+                phase="owner_finalize",
+                source="success",
+                session_identity=migration_identity,
+                cache_key=cache_key,
+                outcome=SessionOwnerMutationOutcome.ALREADY_OWNED.value,
+            )
+            return SessionOwnerMutationResult(
+                outcome=SessionOwnerMutationOutcome.ALREADY_OWNED,
+                session_identity=migration_identity,
+                cache_key=cache_key,
+                owner_id=managed_owner,
+                owner_record=payload,
+            )
+        return fail(
+            "session_owner: native-to-managed xAI migration identity is already owned",
+            outcome=SessionOwnerMutationOutcome.CONFLICT,
+            cache_key=cache_key,
+            owner_id=actual_owner,
+            owner_record=payload,
+        )
+    return fail(
+        "session_owner: native-to-managed xAI migration returned unknown result",
+        cache_key=cache_key,
+        owner_id=actual_owner,
+        owner_record=payload,
+    )
+
+
+async def migrate_native_xai_owner_to_managed_xai(
+    *,
+    session_identity: Optional[str],
+    native_owner_id: Optional[str],
+    native_attributes: Optional[Mapping[str, Any]] = None,
+    managed_attributes: Optional[Mapping[str, Any]] = None,
+    authorization: Optional[str] = None,
+    request_body: Optional[Mapping[str, Any]] = None,
+    request: Any = None,
+) -> SessionOwnerMutationResult:
+    """Later-request native→managed xAI ownership under a new generation.
+
+    Native success stays committed on the canonical identity. Managed xAI
+    ownership may be created only on the bounded later-generation identity
+    after an explicit authorization and a provider-neutral replay-safe body.
+    Native and managed xAI are never globally equivalent, and one immutable
+    effective identity cannot hold both owners.
+    """
+
+    (
+        rejection,
+        cleaned,
+        native,
+        managed,
+        native_owner,
+        managed_owner,
+        migration_identity,
+    ) = _native_xai_to_managed_xai_contract(
+        session_identity=session_identity,
+        native_owner_id=native_owner_id,
+        native_attributes=native_attributes,
+        managed_attributes=managed_attributes,
+        authorization=authorization,
+        request_body=request_body,
+        request=request,
+    )
+    if rejection is not None:
+        return rejection
+    assert cleaned is not None
+    assert native is not None
+    assert managed is not None
+    assert native_owner is not None
+    assert managed_owner is not None
+    assert migration_identity is not None
+    native_rejection = await _verify_committed_native_xai_owner(
+        session_identity=cleaned,
+        expected_native_owner=native_owner,
+        native_attributes=native,
+        request=request,
+    )
+    if native_rejection is not None:
+        return native_rejection
+    return await _create_managed_xai_migration_owner(
+        migration_identity=migration_identity,
+        managed_owner=managed_owner,
+        managed_attributes=managed,
+        request=request,
+    )
+
+
+def retained_session_is_closed(session: Any) -> bool:
+    """Return whether a retained session has already been closed once."""
+
+    if session is None:
+        return True
+    if getattr(session, _RETAINED_SESSION_CLOSED_MARKER, False):
+        return True
+    closed = getattr(session, "_closed", None)
+    return closed is True
+
+
+async def close_retained_session_once(session: Any) -> None:
+    """Close a retained session exactly once on the async path.
+
+    CURSOR-035 leftover work is distinct from archived CURSOR-016 (preconfigured
+    future-model cooldown). Cancellation cannot skip this close. The sync
+    registry disposer still uses ``close()``.
+    """
+
+    if retained_session_is_closed(session):
+        return
+    try:
+        setattr(session, _RETAINED_SESSION_CLOSED_MARKER, True)
+    except Exception:  # noqa: BLE001
+        pass
+    aclose = getattr(session, "aclose", None)
+    close = getattr(session, "close", None)
+    if not callable(aclose):
+        if callable(close):
+            close()
+        return
+
+    close_task = asyncio.ensure_future(aclose())
+    try:
+        await asyncio.shield(close_task)
+    except asyncio.CancelledError:
+        if not close_task.done():
+            try:
+                await close_task
+            except asyncio.CancelledError:
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                raise
+            except Exception:  # noqa: BLE001
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:  # noqa: BLE001
+                        pass
+        elif close_task.cancelled() or close_task.exception() is not None:
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001
+                    pass
+        raise
+    except Exception:
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001
+                pass
+        raise
+
+
+async def transfer_or_close_retained_session(
+    *,
+    session: Any,
+    next_session: Any,
+    store: Callable[[], Any],
+) -> bool:
+    """Store *next_session* as the sole registry owner, or close.
+
+    Returns True when the registry owns *next_session*. Store failure and a
+    missing next session close the live session. Success never double-closes
+    a transferred session.
+    """
+
+    try:
+        store()
+    except BaseException:
+        await close_retained_session_once(session)
+        if next_session is not None and next_session is not session:
+            await close_retained_session_once(next_session)
+        raise
+    if next_session is None:
+        await close_retained_session_once(session)
+        return False
+    if next_session is not session:
+        await close_retained_session_once(session)
+    return True
+
 
 
 def lease_from_guard_result(
