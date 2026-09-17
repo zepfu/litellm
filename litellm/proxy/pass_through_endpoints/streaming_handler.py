@@ -687,44 +687,6 @@ class PassThroughStreamingHandler:
         return False
 
     @staticmethod
-    def _iter_responses_sse_events(
-        lines: List[str],
-    ) -> List[tuple[Optional[str], Optional[Dict[str, Any]]]]:
-        events: List[tuple[Optional[str], Optional[Dict[str, Any]]]] = []
-        pending_event_type: Optional[str] = None
-        for raw_line in lines:
-            line = _strip_chunk_line(raw_line)
-            if not line:
-                continue
-            if line.startswith("event:"):
-                pending_event_type = line.removeprefix("event:").strip() or None
-                continue
-            if not line.startswith("data:"):
-                continue
-            payload_text = line.removeprefix("data:").strip()
-            if payload_text == "[DONE]":
-                events.append(("[DONE]", None))
-                pending_event_type = None
-                continue
-            payload: Optional[Dict[str, Any]] = None
-            payload_type: Optional[str] = None
-            try:
-                decoded = json.loads(payload_text)
-            except (TypeError, json.JSONDecodeError):
-                decoded = None
-            if isinstance(decoded, dict):
-                payload = decoded
-                raw_type = decoded.get("type")
-                if isinstance(raw_type, str) and raw_type.strip():
-                    payload_type = raw_type.strip()
-            event_type = pending_event_type or payload_type
-            events.append((event_type, payload))
-            pending_event_type = None
-        if pending_event_type is not None:
-            events.append((pending_event_type, None))
-        return events
-
-    @staticmethod
     def _is_responses_non_substantive_lifecycle_event(
         event_type: Optional[str],
         payload: Optional[Dict[str, Any]] = None,
@@ -1093,29 +1055,6 @@ class PassThroughStreamingHandler:
                 continue
             converted.append((event_type, payload))
         return converted
-
-    @staticmethod
-    def _find_responses_stream_recovery_failure(
-        lines: List[str],
-    ) -> Optional[ResponsesStreamPreCommitFailure]:
-        for event_type, payload in PassThroughStreamingHandler._iter_responses_sse_events(
-            lines
-        ):
-            error_payload = (
-                PassThroughStreamingHandler._extract_responses_stream_error_payload(
-                    event_type,
-                    payload,
-                )
-            )
-            if error_payload is None:
-                continue
-            failure = PassThroughStreamingHandler._build_responses_pre_commit_failure(
-                error_payload=error_payload,
-                event_type=event_type,
-            )
-            if failure.error_class in _RESPONSES_STREAM_REDISPATCH_CLASSES:
-                return failure
-        return None
 
     @staticmethod
     def _build_responses_pre_commit_failure(
@@ -1917,7 +1856,7 @@ class PassThroughStreamingHandler:
                 custom_llm_provider=custom_llm_provider,
             )
             metadata["aawm_stream_raw_bytes_buffered"] = buffer_raw_bytes
-            raw_bytes_budget = resolve_responses_stream_limits()[0]
+            raw_bytes_max_bytes = resolve_responses_stream_limits()[0] // 2
             transfer_identity = extract_transfer_identity(
                 request_body=request_body if isinstance(request_body, dict) else None,
                 logging_obj=litellm_logging_obj,
@@ -1969,15 +1908,12 @@ class PassThroughStreamingHandler:
 
             def _record_responses_wire_chunk(chunk: bytes) -> None:
                 nonlocal downstream_chunk_count, downstream_byte_count
-                nonlocal raw_bytes_budget
+                nonlocal raw_bytes_max_bytes
                 if buffer_raw_bytes:
                     raw_bytes.append(chunk)
-                    raw_bytes_budget -= len(chunk)
-                    if raw_bytes_budget < 0:
+                    raw_bytes_bytes = sum(len(item) for item in raw_bytes)
+                    if raw_bytes_bytes > raw_bytes_max_bytes:
                         del raw_bytes[: len(raw_bytes) // 2]
-                        raw_bytes_budget = (
-                            raw_bytes_budget + sum(len(item) for item in raw_bytes)
-                        )
                         metadata["aawm_stream_raw_bytes_dropped"] = True
                 if line_accumulator is not None:
                     line_accumulator.feed(chunk)
@@ -2438,13 +2374,9 @@ class PassThroughStreamingHandler:
 
                 if buffer_raw_bytes:
                     raw_bytes.append(chunk)
-                    raw_bytes_budget -= len(chunk)
-                    if raw_bytes_budget < 0:
+                    raw_bytes_bytes = sum(len(item) for item in raw_bytes)
+                    if raw_bytes_bytes > raw_bytes_max_bytes:
                         del raw_bytes[: len(raw_bytes) // 2]
-                        raw_bytes_budget = (
-                            raw_bytes_budget
-                            + sum(len(item) for item in raw_bytes)
-                        )
                         metadata["aawm_stream_raw_bytes_dropped"] = True
                 if line_accumulator is not None:
                     line_accumulator.feed(chunk)

@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 
 # Replicated constant from god module (line 345).
 _AAWM_REQUEST_BODY_WALK_MAX_DEPTH = 64
+_PARSED_RESPONSES_EVENTS_ATTR = "aawm_parsed_responses_events"
 
 
 _HOST_FUNCTION_NAMES = (
@@ -70,6 +71,22 @@ _HOST_GLOBAL_DEFAULTS = (
     ("SimpleNamespace", SimpleNamespace),
     ("RESPONSES_API_TERMINAL_STREAM_EVENTS", RESPONSES_API_TERMINAL_STREAM_EVENTS),
 )
+
+
+class _ParsedResponsesSSEText(str):
+    """Complete SSE text carrying its already-parsed typed events."""
+
+
+def _preserve_parsed_responses_events(
+    value: str,
+    source: Any,
+) -> str:
+    parsed_events = getattr(source, _PARSED_RESPONSES_EVENTS_ATTR, None)
+    if not isinstance(parsed_events, list):
+        return value
+    value = _ParsedResponsesSSEText(value)
+    setattr(value, _PARSED_RESPONSES_EVENTS_ATTR, parsed_events)
+    return value
 
 
 def install(host_globals: dict) -> None:
@@ -157,6 +174,7 @@ async def _iter_sse_event_blocks_with_separator(body_iterator: Any):
         text_chunk = decoder.decode(raw_chunk) if isinstance(raw_chunk, bytes) else str(raw_chunk)
         if not text_chunk:
             continue
+        text_chunk = _preserve_parsed_responses_events(text_chunk, raw_chunk)
 
         if trailing_cr:
             text_chunk = f"\r{text_chunk}"
@@ -209,7 +227,7 @@ async def _iterate_responses_sse_events(
                 yield parsed_chunk
 
 
-async def _responses_sse_from_iterator(
+async def _responses_sse_from_iterator(  # noqa: PLR0915
     responses_iterator: Any,
     on_complete: Optional[Callable[[], None]] = None,
     on_stream_error: Optional[Callable[[Exception], Optional[str]]] = None,

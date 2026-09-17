@@ -22,6 +22,7 @@ from litellm._logging import verbose_proxy_logger
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
     _iter_sse_event_blocks_with_separator,
     _mapping_or_attr_get,
+    _preserve_parsed_responses_events,
     _responses_event_text_key,
 )
 from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
@@ -418,10 +419,11 @@ class VisibleTextRepetitionDetector:
 def _parse_sse_event_block(event_block: str) -> list[Any]:
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
         ResponsesEventPipeline,
+        resolve_responses_event_limits,
     )
 
     pipeline = ResponsesEventPipeline(
-        max_event_bytes=max(2 * 1024 * 1024, len(event_block.encode("utf-8"))),
+        max_event_bytes=resolve_responses_event_limits()[0],
         max_raw_events=0,
     )
     encoded = event_block.encode("utf-8")
@@ -899,7 +901,7 @@ async def _iterate_responses_sse_with_repetitive_output_guard(  # noqa: PLR0915
                 ):
                     yield chunk
                 return
-            yield raw_chunk
+            yield _preserve_parsed_responses_events(raw_chunk, event_block)
             if block_has_visible:
                 yielded_visible = True
     finally:

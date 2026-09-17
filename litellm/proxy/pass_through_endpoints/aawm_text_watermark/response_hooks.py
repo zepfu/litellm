@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any, Optional
 
 from fastapi import HTTPException
@@ -116,20 +116,14 @@ def _visible_texts_from_event(payload: Mapping[str, Any], event_type: str) -> li
     return texts
 
 
-def _visible_texts_from_sse_block(block: str) -> list[str]:
+def _visible_texts_from_sse_block(
+    block: str,
+    *,
+    parse_sse_block: Optional[Callable[[str], list[Any]]] = None,
+) -> list[str]:
     texts: list[str] = []
-    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
-        ResponsesEventPipeline,
-    )
-
-    pipeline = ResponsesEventPipeline(
-        max_event_bytes=max(2 * 1024 * 1024, len(block.encode("utf-8"))),
-        max_raw_events=0,
-    )
-    encoded = block.encode("utf-8")
-    if not encoded.endswith(b"\n\n"):
-        encoded += b"\n\n"
-    for parsed_event in pipeline.feed(encoded):
+    parser = parse_sse_block or _parse_responses_sse_block
+    for parsed_event in parser(block):
         if (
             parsed_event.is_malformed
             or parsed_event.is_done_marker
@@ -240,6 +234,31 @@ def _rewrite_visible_sse_block(
             + newline
         )
     return "".join(rewritten)
+
+
+def _parse_responses_sse_block(block: str) -> list[Any]:
+    """Parse one complete SSE block with configured event bounds."""
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
+        _PARSED_RESPONSES_EVENTS_ATTR,
+    )
+
+    parsed_events = getattr(block, _PARSED_RESPONSES_EVENTS_ATTR, None)
+    if isinstance(parsed_events, list):
+        return parsed_events
+
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_responses_events import (
+        ResponsesEventPipeline,
+        resolve_responses_event_limits,
+    )
+
+    pipeline = ResponsesEventPipeline(
+        max_event_bytes=resolve_responses_event_limits()[0],
+        max_raw_events=0,
+    )
+    encoded = block.encode("utf-8")
+    if not encoded.endswith(b"\n\n"):
+        encoded += b"\n\n"
+    return pipeline.feed(encoded)
 
 
 def _encode_sse_block(event_block: str, had_separator: bool) -> bytes:
@@ -375,6 +394,7 @@ async def _wrap_passthrough_watermark_responses_stream_audit_only(
     endpoint: str,
     stream_policy: str,
     sse_iter: Any,
+    parse_sse_block: Optional[Callable[[str], list[Any]]] = None,
 ) -> AsyncIterator[Any]:
     """Yield original SSE blocks; attach bounded output audit during iteration."""
 
@@ -384,7 +404,10 @@ async def _wrap_passthrough_watermark_responses_stream_audit_only(
     max_bytes = config.limits.max_text_bytes_per_direction
     async for event_block, had_separator in sse_iter(iterator):
         if not attached and config.unicode.enabled:
-            for visible in _visible_texts_from_sse_block(event_block):
+            for visible in _visible_texts_from_sse_block(
+                event_block,
+                parse_sse_block=parse_sse_block,
+            ):
                 retained = _append_bounded_visible_text(
                     retained, visible, max_bytes
                 )
@@ -410,6 +433,7 @@ async def _wrap_passthrough_watermark_responses_stream_buffer_response(
     success_handler_kwargs: Any,
     endpoint: str,
     sse_iter: Any,
+    parse_sse_block: Optional[Callable[[str], list[Any]]] = None,
 ) -> AsyncIterator[Any]:
     """Buffer the complete SSE stream, sanitize/verify, then emit."""
 
@@ -424,7 +448,10 @@ async def _wrap_passthrough_watermark_responses_stream_buffer_response(
         if buffered_bytes > max_stream_bytes:
             raise ValueError("Responses watermark stream exceeded configured bound")
         buffered.append((event_block, had_separator))
-        for visible in _visible_texts_from_sse_block(event_block):
+        for visible in _visible_texts_from_sse_block(
+            event_block,
+            parse_sse_block=parse_sse_block,
+        ):
             retained = _append_bounded_visible_text(retained, visible, max_bytes)
 
     audit = _audit_retained_visible_text(retained, config, endpoint)
@@ -485,7 +512,6 @@ def maybe_wrap_passthrough_watermark_responses_stream(
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
         _iter_sse_event_blocks_with_separator,
     )
-
     if mutating and stream_policy == "buffer_response":
         return _wrap_passthrough_watermark_responses_stream_buffer_response(
             iterator,
@@ -493,6 +519,7 @@ def maybe_wrap_passthrough_watermark_responses_stream(
             success_handler_kwargs=success_handler_kwargs,
             endpoint=endpoint,
             sse_iter=_iter_sse_event_blocks_with_separator,
+            parse_sse_block=_parse_responses_sse_block,
         )
 
     return _wrap_passthrough_watermark_responses_stream_audit_only(
@@ -502,4 +529,5 @@ def maybe_wrap_passthrough_watermark_responses_stream(
         endpoint=endpoint,
         stream_policy=stream_policy,
         sse_iter=_iter_sse_event_blocks_with_separator,
+        parse_sse_block=_parse_responses_sse_block,
     )
