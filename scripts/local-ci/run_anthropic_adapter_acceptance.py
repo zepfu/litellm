@@ -9587,10 +9587,6 @@ _CFG004_NAMESPACE_PREFIX = "aawm-routing-dev-cfg004-"
 _CFG004_COMPOSE_FILE = "docker-compose.dev.yml"
 _CFG004_READINESS_TIMEOUT_SECONDS = 120.0
 _CFG004_READINESS_POLL_INTERVAL = 3.0
-_CFG004_DEV_CONFIG_PATH = ROOT / "litellm-dev-config.yaml"
-_CFG004_DISPOSABLE_CONFIG_PATH = ROOT / "litellm-dev-config.cfg004-acceptance.yaml"
-_CFG004_DISPOSABLE_CONFIG_CONTAINER_PATH = "/app/litellm-dev-config.yaml"
-_CFG004_PUBLIC_ROUTE = "/openai_passthrough/*"
 
 
 def _cfg004_generate_run_id() -> str:
@@ -9603,59 +9599,23 @@ def _cfg004_generate_master_key() -> str:
     return f"sk-cfg004-acceptance-{uuid.uuid4().hex}{uuid.uuid4().hex}"
 
 
-def _cfg004_build_disposable_config() -> str:
-    """Derive a disposable acceptance config from the canonical dev config.
-
-    Adds ONLY ``/openai_passthrough/*`` to ``general_settings.public_routes``
-    so ``user_api_key_auth`` bypasses gateway-key validation on the model
-    route while the client's OAuth Authorization header is forwarded
-    unchanged.  The canonical checked-in config is never modified.  Returns
-    the disposable config path as a string.
-    """
-    with _CFG004_DEV_CONFIG_PATH.open("r", encoding="utf-8") as handle:
-        config = yaml.safe_load(handle)
-    if not isinstance(config, dict):
-        raise RuntimeError("canonical dev config did not parse to a mapping")
-    general = config.get("general_settings")
-    if not isinstance(general, dict):
-        general = {}
-        config["general_settings"] = general
-    existing = general.get("public_routes")
-    routes = list(existing) if isinstance(existing, list) else []
-    if _CFG004_PUBLIC_ROUTE not in routes:
-        routes.append(_CFG004_PUBLIC_ROUTE)
-    general["public_routes"] = routes
-    with _CFG004_DISPOSABLE_CONFIG_PATH.open("w", encoding="utf-8") as handle:
-        yaml.safe_dump(config, handle, sort_keys=False)
-    return str(_CFG004_DISPOSABLE_CONFIG_PATH)
-
-
-def _cfg004_remove_disposable_config() -> None:
-    """Remove the disposable acceptance config if present (best effort)."""
-    try:
-        _CFG004_DISPOSABLE_CONFIG_PATH.unlink()
-    except FileNotFoundError:
-        pass
-
-
 def _cfg004_compose_override_yaml(
     *,
     master_key: str,
     run_id: str,
     langfuse_public_key: str = "",
     langfuse_secret_key: str = "",
-    disposable_config_host_path: str = "",
 ) -> str:
     """Build a Compose override YAML string passed via stdin.
 
     Sets the acceptance env vars, master key, and target-owned Langfuse
-    credentials on litellm-dev only.  When ``disposable_config_host_path``
-    is provided, mounts it over the canonical container config path so the
-    acceptance runtime uses the OAuth pass-through public route.
+    credentials on litellm-dev only.  Shared OpenAI passthrough routes keep
+    ordinary ``user_api_key_auth``; this override does not declare a public
+    route or mount a disposable config overlay.
     Never written to disk or CLI args.
     """
     namespace = f"{_CFG004_NAMESPACE_PREFIX}{run_id}"
-    parts = [
+    return (
         "services:\n"
         "  litellm-dev:\n"
         "    environment:\n"
@@ -9667,13 +9627,7 @@ def _cfg004_compose_override_yaml(
         "      - AAWM_ALIAS_ROUTING_COOLDOWN_CLEAR_SINGLE_WORKER=1\n"
         f"      - LANGFUSE_PUBLIC_KEY={langfuse_public_key}\n"
         f"      - LANGFUSE_SECRET_KEY={langfuse_secret_key}\n"
-    ]
-    if disposable_config_host_path:
-        parts.append(
-            "    volumes:\n"
-            f"      - {disposable_config_host_path}:{_CFG004_DISPOSABLE_CONFIG_CONTAINER_PATH}\n"
-        )
-    return "".join(parts)
+    )
 
 
 def _cfg004_docker_compose_up(
@@ -10886,6 +10840,10 @@ def _cfg004_cooldown_clear_live_test(  # noqa: PLR0915
     8. Inspect (verify target cleared local+durable, controls remain both).
     9. Run exactly one real Codex TUI proof case (OAuth-only egress; no
        LiteLLM/proxy API key supplied, parent OPENAI_API_KEY suppressed).
+       After ordinary ``user_api_key_auth`` restoration on the shared OpenAI
+       passthrough route, this OAuth-only TUI proof is not a passing
+       supported proof when a proxy master key is configured; it is retained
+       fail-closed as historical/stale proof plumbing, not live acceptance.
     10. Verify observed selection matches Alibaba target + exact route family.
     11. Inspect again: every control remains cooled.
     12. Restore (unconditional).
@@ -10901,11 +10859,9 @@ def _cfg004_cooldown_clear_live_test(  # noqa: PLR0915
     }
     run_id = _cfg004_generate_run_id()
     master_key = _cfg004_generate_master_key()
-    disposable_config_path = _cfg004_build_disposable_config()
     override_yaml = _cfg004_compose_override_yaml(
         master_key=master_key, run_id=run_id,
         langfuse_public_key=public_key, langfuse_secret_key=secret_key,
-        disposable_config_host_path=disposable_config_path,
     )
     proof_case = _CFG003_CODEX_PROOF_CASE
     restored = False
@@ -11088,9 +11044,13 @@ def _cfg004_cooldown_clear_live_test(  # noqa: PLR0915
         # The TUI retains its existing resolved provider with
         # requires_openai_auth=true and uses its normal Codex OAuth
         # Authorization credential.  No LiteLLM/proxy API key is supplied.
-        # The disposable config's /openai_passthrough/* public route lets
-        # user_api_key_auth bypass gateway-key validation on the model route
-        # while the client OAuth header is forwarded unchanged.
+        # Shared OpenAI passthrough routes use ordinary user_api_key_auth;
+        # there is no public-route overlay that bypasses gateway-key
+        # validation.  After that restoration this OAuth-only TUI proof is
+        # not a passing supported proof when a proxy master key is
+        # configured; it is retained fail-closed as historical/stale proof
+        # plumbing, not live acceptance.  Do not inject x-litellm-api-key
+        # or relabel auth rejection as success.
         # Enforce OAuth-only Codex egress: even if the parent shell exports
         # OPENAI_API_KEY, it must not reach the TUI child.  Temporarily pop
         # it from os.environ for the synchronous proof call and restore the
@@ -11381,9 +11341,6 @@ def _cfg004_cooldown_clear_live_test(  # noqa: PLR0915
             evidence["failures"].append("restore did not complete successfully")
         if not base_recreated:
             evidence["failures"].append("base recreation failed")
-
-        # Remove the disposable acceptance config after base recreation.
-        _cfg004_remove_disposable_config()
 
     evidence["passed"] = not evidence["failures"]
     return RA._redact_sensitive_artifact_fields(evidence)
