@@ -103,6 +103,7 @@ from .schema_rejections import (
     normalize_schema_rejection,
     resolve_schema_rejection_failure_identity,
 )
+from .admission import resolve_candidate_account_hash
 from .state import (
     ClaimOutcome,
     alias_routing_state,
@@ -137,13 +138,13 @@ def _record_no_io_skipped_selection(
     attempt_record.setdefault("skip_reason", reason)
     attempt_record.setdefault("status", reason)
     attempt_record.setdefault("attempted_provider_call", False)
-    attempt_record.setdefault("provider_attempt_budget_refunded", True)
 
 
 def _admission_identities_are_independent(
     denied: Any,
     *,
     remaining_candidate: Optional[Mapping[str, Any]] = None,
+    remaining_selection: Optional[Mapping[str, Any]] = None,
 ) -> bool:
     """True when a denied lane may yield to a different admission identity."""
     denied_hash = getattr(denied, "account_hash", None)
@@ -151,10 +152,14 @@ def _admission_identities_are_independent(
     denied_provider = str(getattr(denied, "provider", "") or "").strip().lower()
     if remaining_candidate is None:
         return False
-    remaining_hash = remaining_candidate.get("codex_oauth_account_hash") or (
-        remaining_candidate.get("account_hash")
+    remaining_hash = resolve_candidate_account_hash(
+        remaining_candidate, selection=remaining_selection
     )
-    remaining_fingerprint = remaining_candidate.get("admission_lane_fingerprint")
+    remaining_fingerprint = None
+    if remaining_selection is not None:
+        remaining_fingerprint = remaining_selection.get("admission_lane_fingerprint")
+    if remaining_fingerprint is None:
+        remaining_fingerprint = remaining_candidate.get("admission_lane_fingerprint")
     remaining_provider = str(remaining_candidate.get("provider") or "").strip().lower()
     if (
         isinstance(denied_hash, str)
@@ -188,13 +193,15 @@ def _admission_denial_shares_account_hash(
     decision: Any,
     *,
     remaining_candidate: Optional[Mapping[str, Any]] = None,
+    remaining_selection: Optional[Mapping[str, Any]] = None,
 ) -> bool:
     """True when a denied lane shares admission identity with remaining work."""
     if remaining_candidate is None:
-        account_hash = getattr(decision, "account_hash", None)
-        return isinstance(account_hash, str) and bool(account_hash.strip())
+        return False
     return not _admission_identities_are_independent(
-        decision, remaining_candidate=remaining_candidate
+        decision,
+        remaining_candidate=remaining_candidate,
+        remaining_selection=remaining_selection,
     )
 
 
@@ -2695,13 +2702,19 @@ async def handle_alias_route(  # noqa: PLR0915
                 account_failover_replay_safe=account_failover_replay_safe,
                 provider_status_code=attempt_record.get("error_status_code"),
             )
-            independent_lane_fallback = (
-                account_failover_planned
-                and _admission_identities_are_independent(
-                    admission_decision,
-                    remaining_candidate=candidate,
-                )
+            independent_lane_fallback = not _admission_denial_shares_account_hash(
+                admission_decision,
+                remaining_candidate=candidate,
+                remaining_selection=selection,
             )
+            if account_failover_planned:
+                independent_lane_fallback = True
+            if _admission_denial_shares_account_hash(
+                admission_decision,
+                remaining_candidate=candidate,
+                remaining_selection=selection,
+            ):
+                independent_lane_fallback = False
             if independent_lane_fallback:
                 _carry_native_openai_responses_owner_snapshot(
                     durable_source_snapshot

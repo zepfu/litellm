@@ -738,6 +738,20 @@ def test_healthy_same_key_traffic_skips_probe_lock_acquire() -> None:
         denied,
         remaining_candidate=None,
     )
+    native_denied = SimpleNamespace(
+        account_hash="native-hash",
+        lane_fingerprint="native-lane",
+        provider="xai",
+    )
+    remaining_managed = {
+        "provider": "xai",
+        "xai_oauth_account_hash": "managed-hash",
+        "route_family": "codex_xai_oauth_responses",
+    }
+    assert candidate_loop._admission_identities_are_independent(
+        native_denied,
+        remaining_candidate=remaining_managed,
+    )
 
 
 
