@@ -1703,7 +1703,7 @@ class TestCodexSelectorLastResort:
         assert result["candidate"]["provider"] == "xai"
 
     @pytest.mark.asyncio
-    async def test_last_resort_bypasses_its_own_cooldown(self):
+    async def test_cooled_last_resort_is_not_selector_eligible(self):
         request = _make_request()
         candidates = (
             _candidate("openai", "gpt-4o"),
@@ -1731,12 +1731,15 @@ class TestCodexSelectorLastResort:
                 )
             },
         ):
-            result = await selection._select_codex_auto_agent_candidate(
-                request=request,
-                request_body={"model": "basic"},
-            )
-        assert result["selection_reason"] == "last_resort"
-        assert result["candidate"]["provider"] == "xai"
+            with pytest.raises(HTTPException) as vis:
+                await selection._select_codex_auto_agent_candidate(
+                    request=request,
+                    request_body={"model": "basic"},
+                )
+        assert vis.value.status_code == 429
+        assert vis.value.detail["error"]["code"] == (
+            "aawm_codex_auto_agent_all_candidates_cooling_down"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2115,7 +2118,7 @@ class TestAnthropicSelectorAllCooled:
 
 class TestAnthropicSelectorLastResort:
     @pytest.mark.asyncio
-    async def test_last_resort_bypasses_its_own_cooldown(self):
+    async def test_cooled_last_resort_is_not_selector_eligible(self):
         request = _make_request()
         candidates = (
             _candidate("anthropic", "claude-sonnet-4-20250514"),
@@ -2135,12 +2138,15 @@ class TestAnthropicSelectorLastResort:
             _all_cooled,
         )
 
-        result = await selection._select_anthropic_auto_agent_candidate(
-            request=request,
-            request_body={"model": "basic"},
+        with pytest.raises(HTTPException) as vis:
+            await selection._select_anthropic_auto_agent_candidate(
+                request=request,
+                request_body={"model": "basic"},
+            )
+        assert vis.value.status_code == 429
+        assert vis.value.detail["error"]["code"] == (
+            "aawm_anthropic_auto_agent_all_candidates_cooling_down"
         )
-        assert result["selection_reason"] == "last_resort"
-        assert result["candidate"]["provider"] == "openai"
 
 
 # ---------------------------------------------------------------------------

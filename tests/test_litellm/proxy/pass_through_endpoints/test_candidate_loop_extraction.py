@@ -283,7 +283,10 @@ async def test_candidate_loop_records_in_flight_pinned_cooldown_without_no_candi
         candidate_loop,
         "_session_affinity_mod",
         lambda: SimpleNamespace(
-            is_replay_safe_session_owner_redispatch_body=lambda _body: False
+            DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS=0,
+            is_replay_safe_session_owner_redispatch_body=lambda _body: False,
+            set_competing_reservation_log_deferred=lambda *_a, **_k: None,
+            competing_reservation_retry_attempts=lambda *_a, **_k: 0,
         ),
     )
     monkeypatch.setattr(
@@ -394,7 +397,10 @@ async def test_candidate_loop_typed_redispatch_429_emits_terminal_event(
         candidate_loop,
         "_session_affinity_mod",
         lambda: SimpleNamespace(
-            is_replay_safe_session_owner_redispatch_body=lambda _body: False
+            DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS=0,
+            is_replay_safe_session_owner_redispatch_body=lambda _body: False,
+            set_competing_reservation_log_deferred=lambda *_a, **_k: None,
+            competing_reservation_retry_attempts=lambda *_a, **_k: 0,
         ),
     )
     monkeypatch.setattr(
@@ -525,7 +531,10 @@ async def test_candidate_loop_records_non_failover_admission_denial_before_raise
         candidate_loop,
         "_session_affinity_mod",
         lambda: SimpleNamespace(
-            is_replay_safe_session_owner_redispatch_body=lambda _body: False
+            DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS=0,
+            is_replay_safe_session_owner_redispatch_body=lambda _body: False,
+            set_competing_reservation_log_deferred=lambda *_a, **_k: None,
+            competing_reservation_retry_attempts=lambda *_a, **_k: 0,
         ),
     )
     monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
@@ -589,6 +598,498 @@ async def test_candidate_loop_records_non_failover_admission_denial_before_raise
     assert event["admission_lane_fingerprint"] == "lane-fingerprint"
     assert len(persisted) == 1
     assert persisted[0][-1] == event
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_shared_account_hash_admission_denial_does_not_continue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/openai_passthrough/v1/responses",
+            "headers": [(b"user-agent", b"codex-cli/1.0")],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
+    body = {"model": "basic", "input": "hello", "stream": False}
+    candidate = {
+        "provider": "openai",
+        "model": "gpt-5.5-codex",
+        "route_family": "codex_responses",
+        "codex_oauth_account_hash": "shared-hash",
+        "codex_oauth_lane_key": "codex-oauth:account",
+    }
+    selection = {
+        "candidate": candidate,
+        "cooldown_key": "openai:account",
+        "lane_key": "codex-oauth:account",
+        "selection_reason": "first_choice",
+    }
+    remaining = {
+        "provider": "openai",
+        "model": "gpt-5.4",
+        "route_family": "codex_responses",
+        "codex_oauth_account_hash": "shared-hash",
+        "codex_oauth_lane_key": "codex-oauth:other",
+        "cooldown_identity_tag": "alias:basic:openai:gpt-5.4:codex_responses",
+    }
+    cursor_leftover = {
+        "provider": "cursor_agent",
+        "model": "cursor_agent/cursor-grok-4.6-high",
+        "route_family": "codex_cursor_agent_aiserver_adapter",
+        "cooldown_identity_tag": "alias:basic:cursor_agent:cursor_agent/cursor-grok-4.6-high:codex_cursor_agent_aiserver_adapter",
+    }
+    request.state.aawm_alias_selection_context = {
+        ("codex", "basic"): SimpleNamespace(
+            candidates=(cursor_leftover, candidate, remaining)
+        ),
+    }
+    admission_decision = SimpleNamespace(
+        allowed=False,
+        reason="capacity_unavailable",
+        detail_code="aawm_provider_lane_capacity_unavailable",
+        lane_fingerprint="lane-fingerprint",
+        provider="openai",
+        account_hash="shared-hash",
+        limit_scope="concurrency",
+        exhaustion_kind=None,
+    )
+    original_exc = HTTPException(status_code=429, detail="denied")
+    selections = {"count": 0}
+    provider_calls: list[dict[str, Any]] = []
+
+    async def _select(**_kwargs: Any) -> dict[str, Any]:
+        selections["count"] += 1
+        return selection
+
+    async def _perform(**kwargs: Any) -> object:
+        provider_calls.append(kwargs)
+        raise AssertionError("shared-hash denial must not reach provider I/O")
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            return admission_decision
+
+        def admission_deny_error_class(self, _decision: object) -> str:
+            return "capacity_exhausted"
+
+        def raise_provider_lane_admission_rejected(self, *_args: Any, **_kwargs: Any) -> None:
+            raise original_exc
+
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: SimpleNamespace(
+            DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS=0,
+            is_replay_safe_session_owner_redispatch_body=lambda _body: False,
+            set_competing_reservation_log_deferred=lambda *_a, **_k: None,
+            competing_reservation_retry_attempts=lambda *_a, **_k: 0,
+        ),
+    )
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        lpe,
+        "_plan_codex_oauth_account_failover",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(lpe, "_emit_auto_agent_alias_route_event", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        lpe,
+        "_persist_auto_agent_alias_audit_only_events_best_effort",
+        lambda *_a, **_k: None,
+    )
+
+    with pytest.raises(HTTPException) as vis:
+        await candidate_loop.handle_alias_route(
+            SimpleNamespace(
+                select_candidate_fn=_select,
+                perform_candidate_request_fn=_perform,
+                resolve_cooldown_publication_fn=None,
+                publish_cooldown_memory_fn=None,
+                persist_cooldown_fn=None,
+                set_session_affinity_fn=_noop_async,
+                add_alias_metadata_fn=lambda request_body, **_kwargs: request_body,
+                raise_redispatch_fn=None,
+            ),
+            alias_family="codex_auto_agent",
+            alias_model="basic",
+            request=request,
+            prepared_request_body=body,
+            max_candidate_attempts=3,
+            get_active_cooldown_state_fn=None,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    assert vis.value is original_exc
+    assert selections["count"] == 1
+    assert provider_calls == []
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_native_xai_admission_denial_continues_to_managed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/openai_passthrough/v1/responses",
+            "headers": [(b"user-agent", b"codex-cli/1.0")],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
+    body = {"model": "basic", "input": "hello", "stream": False}
+    native = {
+        "provider": "xai",
+        "model": "grok-4",
+        "route_family": "codex_grok_native_responses_adapter",
+        "account_hash": "native-hash",
+        "codex_oauth_lane_key": "grok-native",
+    }
+    managed = {
+        "provider": "xai",
+        "model": "grok-4",
+        "route_family": "codex_xai_oauth_responses_adapter",
+        "xai_oauth_account_hash": "managed-hash",
+        "codex_oauth_lane_key": "xai-managed",
+    }
+    cursor_leftover = {
+        "provider": "cursor_agent",
+        "model": "cursor_agent/cursor-grok-4.6-high",
+        "route_family": "codex_cursor_agent_aiserver_adapter",
+        "cooldown_identity_tag": "alias:basic:cursor_agent:cursor_agent/cursor-grok-4.6-high:codex_cursor_agent_aiserver_adapter",
+    }
+    cooled_openai = {
+        "provider": "openai",
+        "model": "gpt-5.5-codex",
+        "route_family": "codex_responses",
+        "codex_oauth_account_hash": "native-hash",
+        "codex_oauth_lane_key": "codex-oauth:account",
+        "cooldown_identity_tag": "alias:basic:openai:gpt-5.5-codex:codex_responses",
+    }
+    native_selection = {
+        "candidate": native,
+        "cooldown_key": "xai:native",
+        "lane_key": "grok-native",
+        "selection_reason": "first_choice",
+    }
+    managed_selection = {
+        "candidate": managed,
+        "cooldown_key": "xai:managed",
+        "lane_key": "xai-managed",
+        "selection_reason": "independent_lane",
+    }
+    request.state.aawm_alias_selection_context = {
+        ("codex", "basic"): SimpleNamespace(
+            candidates=(cursor_leftover, native, cooled_openai, managed)
+        ),
+    }
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.lane_keys import (
+        _codex_auto_agent_candidate_key,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+        CODEX_AUTO_AGENT_CURSOR_AGENT_LANE_KEY,
+    )
+
+    family = candidate_loop.alias_routing_state.family("codex")
+    family.cooldown_until_monotonic_by_key[
+        _codex_auto_agent_candidate_key(
+            cursor_leftover,
+            CODEX_AUTO_AGENT_CURSOR_AGENT_LANE_KEY,
+            cooldown_identity_tag=cursor_leftover["cooldown_identity_tag"],
+        )
+    ] = __import__("time").monotonic() + 30.0
+    family.cooldown_until_monotonic_by_key[
+        _codex_auto_agent_candidate_key(
+            cooled_openai,
+            cooled_openai["codex_oauth_lane_key"],
+            cooldown_identity_tag=cooled_openai["cooldown_identity_tag"],
+        )
+    ] = __import__("time").monotonic() + 12.0
+    native_denial = SimpleNamespace(
+        allowed=False,
+        reason="capacity_unavailable",
+        detail_code="aawm_provider_lane_capacity_unavailable",
+        lane_fingerprint="native-lane",
+        provider="xai",
+        account_hash="native-hash",
+        limit_scope="concurrency",
+        exhaustion_kind=None,
+        lease=None,
+    )
+    managed_admit = SimpleNamespace(
+        allowed=True,
+        reason="reserved",
+        detail_code="ok",
+        lane_fingerprint="managed-lane",
+        provider="xai",
+        account_hash="managed-hash",
+        limit_scope="concurrency",
+        exhaustion_kind=None,
+        lease=None,
+    )
+    selections: list[str] = []
+    provider_calls: list[str] = []
+    exclusion_calls: list[dict[str, Any]] = []
+
+    async def _select(**_kwargs: Any) -> dict[str, Any]:
+        if not selections:
+            selections.append("native")
+            return native_selection
+        selections.append("managed")
+        return managed_selection
+
+    async def _perform(*, candidate: dict[str, Any], **_kwargs: Any) -> object:
+        provider_calls.append(str(candidate.get("route_family")))
+        from starlette.responses import Response
+        return Response(content=b'{"ok":true}', media_type="application/json")
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _owner_guard(**_kwargs: Any) -> object:
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="unowned_reserved"),
+            reservation_token="t",
+            held_reservation=True,
+            provenance=None,
+        )
+
+    class _Admission:
+        async def admit_selected_candidate(self, *, candidate, **_kwargs: Any) -> object:
+            if candidate.get("account_hash") == "native-hash":
+                return native_denial
+            return managed_admit
+
+        def admission_deny_error_class(self, _decision: object) -> str:
+            return "capacity_exhausted"
+
+        def raise_provider_lane_admission_rejected(self, *_args: Any, **_kwargs: Any) -> None:
+            raise HTTPException(status_code=429, detail="native denied")
+
+        async def release_provider_lane_admission(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: SimpleNamespace(
+            DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS=0,
+            is_replay_safe_session_owner_redispatch_body=lambda _body: False,
+            set_competing_reservation_log_deferred=lambda *_a, **_k: None,
+            competing_reservation_retry_attempts=lambda *_a, **_k: 0,
+            classify_session_owner_replay_safety_body=lambda _body: SimpleNamespace(
+                safe=False
+            ),
+            resolve_canonical_session_identity=lambda *_a, **_k: None,
+            get_request_codex_auto_review_parent_session_identity=lambda *_a, **_k: None,
+            build_session_owner_attributes=lambda **_k: {},
+            ensure_session_owner_guard_for_request=_owner_guard,
+            get_request_session_owner_lease=lambda *_a, **_k: None,
+            SessionOwnerGuardDecision=SimpleNamespace(UNOWNED_RESERVED="unowned_reserved"),
+            SessionOwnerMutationOutcome=SimpleNamespace(
+                CONFLICT="conflict",
+                ERROR="error",
+                NOT_HELD="not_held",
+                PROMOTED="promoted",
+                ALREADY_OWNED="already_owned",
+                RELEASED="released",
+            ),
+            request_has_effective_session_identity=lambda _request: False,
+            validate_cursor_replay_matches_body=lambda *_a, **_k: False,
+            finalize_session_owner_lease_on_success=_noop_async,
+            finalize_session_owner_lease_on_failure=_noop_async,
+            get_session_owner_continuity_receipt=lambda _request: None,
+            record_session_owner_continuity_receipt=lambda *_a, **_k: None,
+            bind_deferred_session_owner_lease_to_streaming_response=lambda *_a, **_k: False,
+        ),
+    )
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(lpe, "_plan_codex_oauth_account_failover", lambda *_a, **_k: False)
+    monkeypatch.setattr(lpe, "_emit_auto_agent_alias_route_event", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        lpe,
+        "_persist_auto_agent_alias_audit_only_events_best_effort",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_exclude_codex_auto_agent_request_local_candidate_without_cooldown",
+        lambda request, **kwargs: exclusion_calls.append(
+            {"request": request, **kwargs}
+        ),
+    )
+    monkeypatch.setattr(lpe, "_record_auto_agent_alias_attempt_failure", lambda **_k: None)
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_started",
+        lambda **_k: _k["prepared_request_body"],
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_success",
+        lambda **_k: None,
+    )
+    async def _no_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    def _noop_plan(**_kwargs: Any) -> object:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
+            CooldownPublicationPlan,
+        )
+
+        return CooldownPublicationPlan()
+
+    response = await candidate_loop.handle_alias_route(
+        SimpleNamespace(
+            select_candidate_fn=_select,
+            perform_candidate_request_fn=_perform,
+            resolve_cooldown_publication_fn=_noop_plan,
+            publish_cooldown_memory_fn=None,
+            persist_cooldown_fn=None,
+            set_session_affinity_fn=_noop_async,
+            add_alias_metadata_fn=lambda request_body, **_kwargs: request_body,
+            raise_redispatch_fn=None,
+        ),
+        alias_family="codex_auto_agent",
+        alias_model="basic",
+        request=request,
+        prepared_request_body=body,
+        max_candidate_attempts=3,
+        get_active_cooldown_state_fn=_no_cooldown,
+        attempts_metadata_key="codex_auto_agent_attempts",
+        skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+        no_candidate_detail="no candidates",
+        log_label="Codex",
+    )
+    assert selections == ["native", "managed"]
+    assert provider_calls == ["codex_xai_oauth_responses_adapter"]
+    assert response.body == b'{"ok":true}'
+    assert len(exclusion_calls) == 1
+    assert exclusion_calls[0]["candidate"] is native
+
+
+def test_healthy_same_key_traffic_skips_probe_lock_acquire() -> None:
+    denied = SimpleNamespace(
+        account_hash="acct-a",
+        lane_fingerprint="lane-a",
+        provider="openai",
+    )
+    assert candidate_loop._admission_denial_shares_account_hash(
+        denied,
+        remaining_candidate={
+            "codex_oauth_account_hash": "acct-a",
+            "provider": "openai",
+        },
+    )
+    assert candidate_loop._admission_identities_are_independent(
+        denied,
+        remaining_candidate={"account_hash": "acct-b", "provider": "xai"},
+    )
+    assert candidate_loop._admission_identities_are_independent(
+        denied,
+        remaining_candidate=None,
+    )
+    native_denied = SimpleNamespace(
+        account_hash="native-hash",
+        lane_fingerprint="native-lane",
+        provider="xai",
+    )
+    remaining_managed = {
+        "provider": "xai",
+        "model": "oa_xai/grok-4",
+        "xai_oauth_account_hash": "managed-hash",
+        "route_family": "codex_xai_oauth_responses_adapter",
+        "cooldown_identity_tag": "alias:basic:xai:oa_xai/grok-4:codex_xai_oauth_responses_adapter",
+    }
+    assert candidate_loop._admission_identities_are_independent(
+        native_denied,
+        remaining_candidate=remaining_managed,
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/openai_passthrough/v1/responses",
+            "headers": [(b"user-agent", b"codex-cli/1.0")],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
+    native = {
+        "provider": "xai",
+        "model": "grok-4",
+        "route_family": "codex_grok_native_responses_adapter",
+        "account_hash": "native-hash",
+        "codex_oauth_lane_key": "grok-native",
+    }
+    cursor_leftover = {
+        "provider": "cursor_agent",
+        "model": "cursor_agent/cursor-grok-4.6-high",
+        "route_family": "codex_cursor_agent_aiserver_adapter",
+        "cooldown_identity_tag": "alias:basic:cursor_agent:cursor_agent/cursor-grok-4.6-high:codex_cursor_agent_aiserver_adapter",
+    }
+    request.state.aawm_alias_selection_context = {
+        ("codex", "basic"): SimpleNamespace(
+            candidates=(cursor_leftover, native, remaining_managed)
+        ),
+    }
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.lane_keys import (
+        _codex_auto_agent_candidate_key,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+        CODEX_AUTO_AGENT_CURSOR_AGENT_LANE_KEY,
+    )
+
+    candidate_loop.alias_routing_state.family("codex").cooldown_until_monotonic_by_key[
+        _codex_auto_agent_candidate_key(
+            cursor_leftover,
+            CODEX_AUTO_AGENT_CURSOR_AGENT_LANE_KEY,
+            cooldown_identity_tag=cursor_leftover["cooldown_identity_tag"],
+        )
+    ] = __import__("time").monotonic() + 30.0
+    remaining = candidate_loop._peek_remaining_admission_candidate(
+        request,
+        alias_model="basic",
+        alias_family="codex_auto_agent",
+        denied_candidate=native,
+        denied_selection={"lane_key": "grok-native"},
+    )
+    assert remaining is remaining_managed
+
+
+
+def test_no_io_skipped_selection_records_named_reason_once() -> None:
+    attempt: dict[str, Any] = {}
+    candidate_loop._record_no_io_skipped_selection(
+        attempt, reason=candidate_loop._NO_IO_SKIP_FOLLOWER
+    )
+    candidate_loop._record_no_io_skipped_selection(
+        attempt, reason=candidate_loop._NO_IO_SKIP_PRECHECK_COOLDOWN
+    )
+    assert attempt["skip_reason"] == "skipped_follower"
+    assert attempt["terminal_disposition"] == "skipped"
+    attempt["attempted_provider_call"] = True
+    candidate_loop._record_no_io_skipped_selection(
+        attempt, reason=candidate_loop._NO_IO_SKIP_TOCTOU_COOLDOWN
+    )
+    assert attempt["skip_reason"] == "skipped_follower"
 
 
 def test_resolve_failure_plan_classifies_alibaba_model_not_found_as_candidate_unavailable() -> None:

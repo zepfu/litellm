@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock
 
@@ -32,22 +33,22 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
 # ---------------------------------------------------------------------------
 
 
-def _minimal_request(session_id: str) -> MagicMock:
-    request = MagicMock(spec=Request)
-    request.method = "POST"
-    request.headers = {
-        "session_id": session_id,
-        "user-agent": "codex-cli/1.0",
-        "originator": "codex_cli_rs",
-    }
-    request.query_params = {}
-    request.url = MagicMock()
-    request.scope = {
-        "path": "/openai_passthrough/v1/responses",
-        "query_string": b"",
-        "parsed_body": None,
-    }
-    request.state = MagicMock()
+def _minimal_request(session_id: str) -> Request:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/openai_passthrough/v1/responses",
+            "headers": [
+                (b"user-agent", b"codex-cli/1.0"),
+                (b"originator", b"codex_cli_rs"),
+            ],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
     request.state.aawm_alias_request_local_cooldown_until = {}
     request.state.aawm_alias_request_local_excluded_keys = set()
     return request

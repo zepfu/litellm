@@ -4195,7 +4195,7 @@ def _select_codex_oauth_account_within_identity(
     return (
         _select_first_available_codex_oauth_account_state(
             identity_states,
-            allow_cooled_down=last_resort,
+            allow_cooled_down=bypass_reason is not None,
             bypass_reason=bypass_reason,
         )
         or selected_state
