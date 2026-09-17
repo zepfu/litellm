@@ -57,6 +57,15 @@ W6B_OWNED_SYMBOLS: set[str] = {
     "_iterate_responses_sse_events",
     "_mapping_or_attr_get",
     "_coerce_namespace_to_mapping",
+    "_coerce_sequence_number",
+    "_ensure_responses_sse_sequence_number",
+    "_event_sequence_number",
+    "_ensure_reasoning_item_summary",
+    "_ensure_response_text_format",
+    "_ensure_response_usage_details",
+    "_ensure_responses_event_indexes",
+    "_ensure_grok_responses_sse_compat",
+    "_reattach_sequence_number_json",
     "_responses_event_text_key",
     "_responses_stream_event_summary",
     "_responses_repaired_output_item_id",
@@ -350,6 +359,102 @@ class TestSerializeResponsesAdapterResponse:
         result = sse_mod._serialize_responses_adapter_response({"a": 1})
         assert json.loads(result) == {"a": 1}
 
+    def test_reattaches_sequence_number_dropped_by_model_dump_json(self):
+        class FakeModel:
+            def __init__(self):
+                self.__dict__["sequence_number"] = 3
+
+            def model_dump_json(self, exclude_none: bool = False) -> str:
+                return '{"type":"response.created"}'
+
+        result = json.loads(sse_mod._serialize_responses_adapter_response(FakeModel()))
+        assert result == {"type": "response.created", "sequence_number": 3}
+
+    def test_stamps_empty_summary_on_reasoning_item(self):
+        result = json.loads(
+            sse_mod._serialize_responses_adapter_response(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"id": "rs_1", "type": "reasoning", "status": "in_progress"},
+                    "sequence_number": 3,
+                }
+            )
+        )
+        assert result["item"]["summary"] == []
+        assert result["sequence_number"] == 3
+
+    def test_preserves_existing_reasoning_summary(self):
+        result = json.loads(
+            sse_mod._serialize_responses_adapter_response(
+                {
+                    "type": "response.output_item.added",
+                    "item": {
+                        "id": "rs_1",
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "hi"}],
+                    },
+                }
+            )
+        )
+        assert result["item"]["summary"] == [{"type": "summary_text", "text": "hi"}]
+
+    def test_stamps_text_format_on_completed_response(self):
+        result = json.loads(
+            sse_mod._serialize_responses_adapter_response(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "status": "completed",
+                        "output": [],
+                        "text": {},
+                    },
+                    "sequence_number": 9,
+                }
+            )
+        )
+        assert result["response"]["text"] == {"format": {"type": "text"}}
+        assert result["sequence_number"] == 9
+
+    def test_stamps_summary_index_on_reasoning_summary_delta(self):
+        result = json.loads(
+            sse_mod._serialize_responses_adapter_response(
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "delta": "The",
+                    "sequence_number": 4,
+                }
+            )
+        )
+        assert result["summary_index"] == 0
+        assert result["delta"] == "The"
+
+    def test_stamps_input_tokens_details_on_completed_usage(self):
+        result = json.loads(
+            sse_mod._serialize_responses_adapter_response(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "status": "completed",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 2,
+                            "output_tokens_details": {"reasoning_tokens": 1},
+                            "total_tokens": 12,
+                        },
+                    },
+                }
+            )
+        )
+        assert result["response"]["usage"]["input_tokens_details"] == {
+            "cached_tokens": 0
+        }
+
 
 # ===========================================================================
 # SECTION 6: Behavior tests - _iterate_responses_sse_events
@@ -488,6 +593,43 @@ class TestResponsesSSEFromIterator:
         assert chunks[0].startswith("event: response.created\n")
         assert "data: " in chunks[0]
         assert chunks[-1] == "data: [DONE]\n\n"
+
+    def test_stamps_sequence_number_when_missing(self):
+        async def events():
+            yield {"type": "response.created", "response": {"id": "r1"}}
+            yield {
+                "type": "response.completed",
+                "response": {"id": "r1", "status": "completed", "output": []},
+            }
+
+        chunks = _run(_collect_agen(sse_mod._responses_sse_from_iterator(events())))
+        payloads = []
+        for chunk in chunks:
+            if not chunk.startswith("event:") or "data: " not in chunk:
+                continue
+            payloads.append(json.loads(chunk.split("data: ", 1)[1]))
+        assert [p["type"] for p in payloads] == [
+            "response.created",
+            "response.completed",
+        ]
+        assert [p["sequence_number"] for p in payloads] == [1, 2]
+
+    def test_preserves_existing_sequence_number(self):
+        async def events():
+            yield {"type": "response.created", "sequence_number": 7, "id": "r1"}
+            yield {
+                "type": "response.completed",
+                "sequence_number": 8,
+                "response": {"id": "r1", "status": "completed", "output": []},
+            }
+
+        chunks = _run(_collect_agen(sse_mod._responses_sse_from_iterator(events())))
+        payloads = [
+            json.loads(chunk.split("data: ", 1)[1])
+            for chunk in chunks
+            if chunk.startswith("event:") and "data: " in chunk
+        ]
+        assert [p["sequence_number"] for p in payloads] == [7, 8]
 
     def test_stamps_aawm_route_identity_from_iterator_metadata(self):
         class MetaIter:
@@ -985,6 +1127,29 @@ class TestResponsesSSEFromRepairedResponseBody:
         assert "response.completed" in chunks[0]
         assert chunks[1] == "data: [DONE]\n\n"
 
+    def test_stamps_sequence_number_on_repaired_events(self):
+        body = {
+            "output": [
+                {"type": "reasoning", "id": "rs_1", "status": "completed"},
+                {"type": "message", "id": "msg_1", "content": []},
+            ]
+        }
+        chunks = _run(_collect_agen(sse_mod._responses_sse_from_repaired_response_body(body)))
+        payloads = [
+            json.loads(chunk.split("data: ", 1)[1])
+            for chunk in chunks
+            if chunk.startswith("event:") and "data: " in chunk
+        ]
+        assert [p["type"] for p in payloads] == [
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.completed",
+        ]
+        assert [p["sequence_number"] for p in payloads] == [1, 2, 3, 4, 5]
+        assert payloads[0]["item"]["summary"] == []
+
     def test_missing_output_key(self):
         body = {"id": "resp_x"}
         chunks = _run(_collect_agen(sse_mod._responses_sse_from_repaired_response_body(body)))
@@ -1260,6 +1425,8 @@ class TestInstallRebinding:
             assert host["sentinel"] is sentinel
             assert set(host) == W6B_OWNED_SYMBOLS | {
                 "SimpleNamespace",
+                "RESPONSES_API_TERMINAL_STREAM_EVENTS",
+                "_GROK_SSE_DEFAULT_INDEX_FIELDS",
                 "sentinel",
             }
         finally:

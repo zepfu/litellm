@@ -59,6 +59,15 @@ _HOST_FUNCTION_NAMES = (
     "_iterate_responses_sse_events",
     "_mapping_or_attr_get",
     "_coerce_namespace_to_mapping",
+    "_coerce_sequence_number",
+    "_ensure_responses_sse_sequence_number",
+    "_event_sequence_number",
+    "_ensure_reasoning_item_summary",
+    "_ensure_response_text_format",
+    "_ensure_response_usage_details",
+    "_ensure_responses_event_indexes",
+    "_ensure_grok_responses_sse_compat",
+    "_reattach_sequence_number_json",
     "_responses_event_text_key",
     "_responses_stream_event_summary",
     "_responses_repaired_output_item_id",
@@ -67,9 +76,24 @@ _HOST_FUNCTION_NAMES = (
     "_build_anthropic_streaming_response_from_completion_adapter_stream",
 )
 
+_GROK_SSE_DEFAULT_INDEX_FIELDS: dict[str, tuple[str, ...]] = {
+    "response.reasoning_summary_text.delta": ("summary_index",),
+    "response.reasoning_summary_text.done": ("summary_index",),
+    "response.reasoning_summary_part.added": ("summary_index",),
+    "response.reasoning_summary_part.done": ("summary_index",),
+    "response.output_text.delta": ("content_index",),
+    "response.output_text.done": ("content_index",),
+    "response.output_text.annotation.added": ("content_index", "annotation_index"),
+    "response.content_part.added": ("content_index",),
+    "response.content_part.done": ("content_index",),
+    "response.refusal.delta": ("content_index",),
+    "response.refusal.done": ("content_index",),
+}
+
 _HOST_GLOBAL_DEFAULTS = (
     ("SimpleNamespace", SimpleNamespace),
     ("RESPONSES_API_TERMINAL_STREAM_EVENTS", RESPONSES_API_TERMINAL_STREAM_EVENTS),
+    ("_GROK_SSE_DEFAULT_INDEX_FIELDS", _GROK_SSE_DEFAULT_INDEX_FIELDS),
 )
 
 
@@ -151,11 +175,202 @@ def _coerce_namespace_to_mapping(
     return value
 
 
+def _coerce_sequence_number(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value >= 0:
+        return value
+    return None
+
+
+def _ensure_responses_sse_sequence_number(
+    payload: Any,
+    *,
+    sequence_number: int,
+) -> Any:
+    """Grok Build requires OpenAI Responses SSE `sequence_number` on every event.
+
+    Adapter-produced events often omit it (LiteLLM's ResponseCreatedEvent type
+    does not declare the field). Preserve an existing non-negative int; otherwise
+    stamp the caller-assigned counter. Extra fields are allowed on
+    BaseLiteLLMOpenAIResponseObject.
+    """
+
+    existing = _coerce_sequence_number(_mapping_or_attr_get(payload, "sequence_number"))
+    if existing is None and hasattr(payload, "__dict__"):
+        existing = _coerce_sequence_number(payload.__dict__.get("sequence_number"))
+    assigned = existing if existing is not None else sequence_number
+    if isinstance(payload, dict):
+        payload["sequence_number"] = assigned
+        return payload
+    try:
+        setattr(payload, "sequence_number", assigned)
+    except Exception:
+        verbose_proxy_logger.debug(
+            "Failed to stamp sequence_number on Responses SSE event",
+            extra={"event_type": str(_mapping_or_attr_get(payload, "type"))},
+        )
+        if hasattr(payload, "__dict__"):
+            payload.__dict__["sequence_number"] = assigned
+    return payload
+
+
+def _event_sequence_number(response_obj: Any) -> Optional[int]:
+    seq = _coerce_sequence_number(_mapping_or_attr_get(response_obj, "sequence_number"))
+    if seq is not None:
+        return seq
+    if hasattr(response_obj, "__dict__"):
+        return _coerce_sequence_number(response_obj.__dict__.get("sequence_number"))
+    return None
+
+
+def _ensure_reasoning_item_summary(item: Any) -> bool:
+    """Grok Build requires `summary` on Responses reasoning items.
+
+    Adapter reasoning items often omit it. Stamp an empty list without
+    overwriting an existing summary.
+    """
+
+    if not isinstance(item, dict):
+        return False
+    if item.get("type") != "reasoning":
+        return False
+    if "summary" in item:
+        return False
+    item["summary"] = []
+    return True
+
+
+def _ensure_response_text_format(response: Any) -> bool:
+    """Grok Build requires `text.format` on Responses envelopes.
+
+    Adapter `response.completed` events often emit `"text": {}`. Stamp the
+    OpenAI default `{type: text}` format without overwriting an existing one.
+    """
+
+    if not isinstance(response, dict):
+        return False
+    text = response.get("text")
+    if text is None:
+        response["text"] = {"format": {"type": "text"}}
+        return True
+    if not isinstance(text, dict):
+        return False
+    if "format" in text:
+        return False
+    text["format"] = {"type": "text"}
+    response["text"] = text
+    return True
+
+
+def _ensure_response_usage_details(response: Any) -> bool:
+    """Grok Build requires `usage.input_tokens_details` on Responses envelopes."""
+
+    if not isinstance(response, dict):
+        return False
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        return False
+    changed = False
+    details = usage.get("input_tokens_details")
+    if not isinstance(details, dict):
+        usage["input_tokens_details"] = {"cached_tokens": 0}
+        changed = True
+    elif "cached_tokens" not in details:
+        details["cached_tokens"] = 0
+        usage["input_tokens_details"] = details
+        changed = True
+    output_details = usage.get("output_tokens_details")
+    if not isinstance(output_details, dict):
+        usage["output_tokens_details"] = {"reasoning_tokens": 0}
+        changed = True
+    elif "reasoning_tokens" not in output_details:
+        output_details["reasoning_tokens"] = 0
+        usage["output_tokens_details"] = output_details
+        changed = True
+    response["usage"] = usage
+    return changed
+
+
+def _ensure_responses_event_indexes(payload: dict[str, Any]) -> bool:
+    """Stamp missing integer indexes Grok Build requires on Responses SSE events."""
+
+    event_type = payload.get("type")
+    if not isinstance(event_type, str):
+        return False
+    fields = _GROK_SSE_DEFAULT_INDEX_FIELDS.get(event_type)
+    if not fields:
+        return False
+    changed = False
+    for field in fields:
+        if field in payload:
+            continue
+        payload[field] = 0
+        changed = True
+    return changed
+
+
+def _ensure_grok_responses_sse_compat(payload: dict[str, Any]) -> dict[str, Any]:
+    item = payload.get("item")
+    if isinstance(item, dict):
+        _ensure_reasoning_item_summary(item)
+        payload["item"] = item
+    response = payload.get("response")
+    if isinstance(response, dict):
+        _ensure_response_text_format(response)
+        _ensure_response_usage_details(response)
+        output = response.get("output")
+        if isinstance(output, list):
+            for entry in output:
+                _ensure_reasoning_item_summary(entry)
+    _ensure_responses_event_indexes(payload)
+    return payload
+
+
+def _reattach_sequence_number_json(serialized: str, seq: Optional[int]) -> str:
+    try:
+        payload = json.loads(serialized)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return serialized
+    if not isinstance(payload, dict):
+        return serialized
+    changed = False
+    if seq is not None and payload.get("sequence_number") != seq:
+        payload["sequence_number"] = seq
+        changed = True
+    before = json.dumps(payload, sort_keys=True)
+    _ensure_grok_responses_sse_compat(payload)
+    after = json.dumps(payload, sort_keys=True)
+    if not changed and before == after:
+        return serialized
+    return json.dumps(payload)
+
+
 def _serialize_responses_adapter_response(response_obj: Any) -> str:
+    """Serialize one Responses SSE event, keeping Grok-required wire fields.
+
+    Pydantic `model_dump_json(exclude_none=True)` drops extra `__dict__` values
+    that adapter iterators stamp outside declared fields. Grok Build requires
+    `sequence_number` on every event and `summary` on reasoning items.
+    """
+
+    seq = _event_sequence_number(response_obj)
     if hasattr(response_obj, "model_dump_json"):
-        return response_obj.model_dump_json(exclude_none=True)
+        return _reattach_sequence_number_json(
+            response_obj.model_dump_json(exclude_none=True),
+            seq,
+        )
     if hasattr(response_obj, "json"):
-        return response_obj.json(exclude_none=True)
+        return _reattach_sequence_number_json(
+            response_obj.json(exclude_none=True),
+            seq,
+        )
+    if isinstance(response_obj, dict):
+        payload = dict(response_obj)
+        if seq is not None:
+            payload["sequence_number"] = seq
+        _ensure_grok_responses_sse_compat(payload)
+        return json.dumps(payload)
     return json.dumps(response_obj)
 
 
@@ -237,6 +452,7 @@ async def _responses_sse_from_iterator(  # noqa: PLR0915
     has_emitted = False
     has_terminal = False
     last_event: Any = None
+    sse_sequence = 0
 
     def _identity_request_body() -> Optional[dict[str, Any]]:
         if isinstance(request_body, dict):
@@ -261,6 +477,7 @@ async def _responses_sse_from_iterator(  # noqa: PLR0915
         return stamped if isinstance(stamped, str) else sse_text
 
     def _injected_terminal_sse(*, event_type: str, status: str) -> str:
+        nonlocal sse_sequence
         last_response = (
             _mapping_or_attr_get(last_event, "response")
             if last_event is not None
@@ -306,6 +523,8 @@ async def _responses_sse_from_iterator(  # noqa: PLR0915
             "type": event_type,
             "response": response_payload,
         }
+        sse_sequence += 1
+        _ensure_responses_sse_sequence_number(injected, sequence_number=sse_sequence)
         serialized = _serialize_responses_adapter_response(injected)
         return f"event: {event_type}\ndata: {serialized}\n\n"
 
@@ -321,6 +540,19 @@ async def _responses_sse_from_iterator(  # noqa: PLR0915
                 and event_type in RESPONSES_API_TERMINAL_STREAM_EVENTS
             ):
                 has_terminal = True
+            existing_seq = _coerce_sequence_number(
+                _mapping_or_attr_get(event, "sequence_number")
+            )
+            if existing_seq is None:
+                sse_sequence += 1
+                assigned_seq = sse_sequence
+            else:
+                assigned_seq = existing_seq
+                if existing_seq > sse_sequence:
+                    sse_sequence = existing_seq
+            _ensure_responses_sse_sequence_number(
+                event, sequence_number=assigned_seq
+            )
             serialized = _serialize_responses_adapter_response(event)
             if isinstance(event_type, str) and event_type:
                 yield _stamp_sse_text(
@@ -475,65 +707,44 @@ async def _responses_sse_from_repaired_response_body(
     output = response_body.get("output")
     if not isinstance(output, list):
         output = []
+    sse_sequence = 0
+
+    def _emit(event_type: str, payload: dict[str, Any]) -> str:
+        nonlocal sse_sequence
+        sse_sequence += 1
+        event = dict(payload)
+        event["type"] = event_type
+        _ensure_responses_sse_sequence_number(event, sequence_number=sse_sequence)
+        serialized = _serialize_responses_adapter_response(event)
+        return f"event: {event_type}\ndata: {serialized}\n\n"
+
     for index, item in enumerate(output):
         if not isinstance(item, dict):
             continue
         item_id = _responses_repaired_output_item_id(item, index)
-        yield (
-            "event: response.output_item.added\n"
-            + "data: "
-            + json.dumps(
-                {
-                    "type": "response.output_item.added",
-                    "output_index": index,
-                    "item": item,
-                },
-                ensure_ascii=False,
-            )
-            + "\n\n"
+        yield _emit(
+            "response.output_item.added",
+            {"output_index": index, "item": item},
         )
         if item.get("type") == "function_call":
             arguments = item.get("arguments")
             if not isinstance(arguments, str):
                 arguments = _stringify_grok_native_input_item_value(arguments)  # noqa: F821
-            yield (
-                "event: response.function_call_arguments.done\n"
-                + "data: "
-                + json.dumps(
-                    {
-                        "type": "response.function_call_arguments.done",
-                        "item_id": item_id,
-                        "output_index": index,
-                        "arguments": arguments,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n\n"
-            )
-        yield (
-            "event: response.output_item.done\n"
-            + "data: "
-            + json.dumps(
+            yield _emit(
+                "response.function_call_arguments.done",
                 {
-                    "type": "response.output_item.done",
+                    "item_id": item_id,
                     "output_index": index,
-                    "item": item,
+                    "arguments": arguments,
                 },
-                ensure_ascii=False,
             )
-            + "\n\n"
+        yield _emit(
+            "response.output_item.done",
+            {"output_index": index, "item": item},
         )
-    yield (
-        "event: response.completed\n"
-        + "data: "
-        + json.dumps(
-            {
-                "type": "response.completed",
-                "response": response_body,
-            },
-            ensure_ascii=False,
-        )
-        + "\n\n"
+    yield _emit(
+        "response.completed",
+        {"response": response_body},
     )
     yield "data: [DONE]\n\n"
 

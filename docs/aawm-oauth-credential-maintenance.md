@@ -816,7 +816,70 @@ nonsecret configuration, including credential path topology. The proxy,
 readiness status, and sidecar inventory events use this same identity. The
 digest changes with meaningful inventory configuration and does not change with
 credential rotation. A mismatch between two runtime identities is observable in
-those outputs and does not route-block requests.
+those outputs and does not route-block requests. Persisted Codex observations
+and selected-account request metadata carry the generation. During rolling
+deployment, compare the proxy readiness generation with the newest persisted
+sidecar observation cycle; while they differ, readiness is degraded but
+existing requests continue without an immediate inventory hard-stop. An
+orchestrator may use the resulting readiness `503` to drain new traffic from
+the worker, but the readiness check does not terminate request handlers or
+cancel in-flight routing.
+
+The sidecar also publishes one whole-inventory marker on each generic
+observation cadence, independently of refresh eligibility and per-account
+health polling. The marker uses the stable persistence identity
+`provider=openai`, `auth_family=codex_oauth_inventory`,
+`credential_scope=inventory`, and a null `auth_file_hash`; the generation is
+metadata, not part of the identity. Its allowlisted metadata contains
+`codex_oauth_inventory_generation`, `inventory_state`, `account_count`,
+`enabled_account_count`, and `observation_cadence_seconds`. A valid inventory
+with every account disabled still publishes its digest with an enabled count of
+zero. Invalid or unconfigured inventory publishes no generation and remains
+diagnostic; the inventory parser still rejects a literal empty `accounts`
+array.
+
+The proxy exposes the local generation in `aawm_alias_config` and reports the
+comparison under `codex_oauth_inventory_generation` on `/health/readiness`.
+`status=matched` / `health=healthy` means the current marker is fresh, valid,
+and has the same generation. `status=mismatch` / `health=degraded` is emitted
+only when a fresh valid marker differs from the local generation; that
+confirmed mismatch returns HTTP `503`. Marker freshness is derived from the
+published `observation_cadence_seconds` with a bounded two-cadence budget,
+rather than credential expiry or refresh eligibility. Missing, malformed,
+invalid, unconfigured, future-dated, stale, or temporarily unavailable marker
+observations stay `status=unknown` and do not stop live routing. The reader
+selects the current marker before validating it, so a newer unavailable marker
+cannot fall back to an older matching generation. Older rows for retired
+credential scopes or auth-file identities are not used as inventory authority.
+A readiness `503` can cause an orchestrator to drain new traffic, while request
+handlers and in-flight routing continue under their existing lifecycle.
+
+Every Codex refresh, passive-health, and quota event carries
+`codex_oauth_inventory_generation`; each aggregate event also carries
+`codex_oauth_inventory_generation_status` (`valid`, `missing`, or `invalid`).
+The `codex_oauth_inventory_observation` event is the authoritative sidecar
+generation evidence and does not assert credential usability. When `--once`
+emits `provider_status_sidecar_one_shot_status`, it prefers that marker and
+falls back to aggregate generation evidence only when no marker was emitted;
+this does not change the existing required-refresh exit policy. The following
+fields summarize the selected evidence:
+
+- `codex_oauth_inventory_generation`: the one valid generation, or `null` when
+  none or more than one generation is available.
+- `codex_oauth_inventory_generation_status`: `not_applicable`, `healthy`,
+  `unknown`, or `degraded`.
+- `codex_oauth_inventory_generation_reason`: the bounded reason, such as
+  `codex_generation_valid`, `codex_generation_missing`, or
+  `codex_generation_mismatch`.
+- `codex_oauth_inventory_generations`: sorted distinct valid generations.
+- `codex_oauth_inventory_generation_observation_count`: aggregate observations
+  considered for this one-shot run.
+
+The digest input contains only validated schema, routing, record, path, enable,
+priority, weight, model, and expected-hash fields. It never contains account
+IDs, access or refresh tokens, or credential-file contents. A null generation
+on an unavailable candidate means that inventory identity could not be
+validated; it is diagnostic metadata and does not authorize fallback routing.
 
 | Area | Location |
 | --- | --- |

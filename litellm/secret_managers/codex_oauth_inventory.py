@@ -29,12 +29,16 @@ CODEX_OAUTH_AUTH_FILE_MODE = 0o600
 CODEX_OAUTH_AUTH_FILE_MAX_BYTES = 1_048_576
 CODEX_OAUTH_SNAPSHOT_CACHE_MAX_ENTRIES = 128
 CODEX_OAUTH_ACCOUNT_ENABLE_FILE_ENV = "AAWM_CODEX_OAUTH_ACCOUNT_ENABLE_FILE"
+CODEX_OAUTH_INVENTORY_GENERATION_LENGTH = hashlib.sha256().digest_size * 2
 _TRUE_ENABLE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_ENABLE_VALUES = frozenset({"0", "false", "no", "off"})
 
 _SAFE_LABEL_RE = re.compile(r"\A[a-z][a-z0-9._-]{0,63}\Z")
 _ACCOUNT_HASH_RE = re.compile(
     rf"\A[0-9a-f]{{{CODEX_OAUTH_ACCOUNT_HASH_LENGTH}}}\Z"
+)
+_INVENTORY_GENERATION_RE = re.compile(
+    rf"\A[0-9a-f]{{{CODEX_OAUTH_INVENTORY_GENERATION_LENGTH}}}\Z"
 )
 _EMAIL_LOCAL_PART_RE = re.compile(r"\A[A-Za-z0-9._%+-]+\Z")
 _EMAIL_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -302,6 +306,14 @@ def codex_oauth_inventory_generation_digest(
         sort_keys=True,
     )
     return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+
+def is_codex_oauth_inventory_generation(value: Any) -> bool:
+    """Return whether *value* has the canonical inventory digest shape."""
+    return (
+        isinstance(value, str)
+        and _INVENTORY_GENERATION_RE.fullmatch(value) is not None
+    )
 
 
 def codex_oauth_masked_account_display(email: Any) -> Optional[str]:
@@ -971,6 +983,7 @@ __all__ = [
     "CODEX_OAUTH_AUTH_FILE_MAX_BYTES",
     "CODEX_OAUTH_AUTH_FILE_MODE",
     "CODEX_OAUTH_INVENTORY_ENV",
+    "CODEX_OAUTH_INVENTORY_GENERATION_LENGTH",
     "CODEX_OAUTH_INVENTORY_SCHEMA_VERSION",
     "CODEX_OAUTH_ACCOUNT_ENABLE_FILE_ENV",
     "CodexOAuthCredentialError",
@@ -983,6 +996,7 @@ __all__ = [
     "codex_oauth_account_identity_hash",
     "codex_oauth_masked_account_display",
     "codex_oauth_inventory_generation_digest",
+    "is_codex_oauth_inventory_generation",
     "get_codex_oauth_token_data",
     "get_codex_oauth_token_expiry",
     "load_codex_oauth_credential",

@@ -1555,6 +1555,9 @@ def _add_codex_auto_agent_alias_metadata(
                 candidate.get("xai_oauth_lane_key")
                 or candidate.get("codex_oauth_lane_key")
             ),
+            "codex_oauth_inventory_generation": candidate.get(
+                "codex_oauth_inventory_generation"
+            ),
             "aawm_selected_account_scope": candidate.get(
                 "xai_oauth_scope_identity"
             ),

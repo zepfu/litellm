@@ -1341,17 +1341,39 @@ async def health_readiness():
     # orchestrators do not route traffic to a worker without a valid
     # routing snapshot.
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        get_codex_oauth_inventory_generation_status as _get_codex_oauth_inventory_generation_status,
         get_startup_status as _get_aawm_alias_config_startup_status,
         is_startup_healthy as _aawm_alias_config_startup_healthy,
     )
 
+    aawm_alias_config_status = _get_aawm_alias_config_startup_status()
     if not _aawm_alias_config_startup_healthy():
         raise HTTPException(
             status_code=503,
             detail={
                 "status": "not_ready",
                 "reason": "aawm_alias_config_not_active",
-                "aawm_alias_config": _get_aawm_alias_config_startup_status(),
+                "aawm_alias_config": aawm_alias_config_status,
+            },
+        )
+
+    codex_oauth_inventory_generation_status = (
+        await _get_codex_oauth_inventory_generation_status(
+            local_generation=aawm_alias_config_status.get(
+                "codex_oauth_inventory_generation"
+            )
+        )
+    )
+    if codex_oauth_inventory_generation_status.get("readiness_degraded"):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "not_ready",
+                "reason": "codex_oauth_inventory_generation_mismatch",
+                "aawm_alias_config": aawm_alias_config_status,
+                "codex_oauth_inventory_generation": (
+                    codex_oauth_inventory_generation_status
+                ),
             },
         )
 
@@ -1415,7 +1437,10 @@ async def health_readiness():
                 "db": db_health_status["status"],
                 "cache": cache_type,
                 "litellm_version": version,
-                "aawm_alias_config": _get_aawm_alias_config_startup_status(),
+                "aawm_alias_config": aawm_alias_config_status,
+                "codex_oauth_inventory_generation": (
+                    codex_oauth_inventory_generation_status
+                ),
                 "aawm_claude_control_plane": aawm_claude_control_plane_status,
                 "aawm_alias_routing_cache": _get_aawm_alias_routing_cache_status(),
                 "success_callbacks": success_callback_names,
@@ -1429,7 +1454,10 @@ async def health_readiness():
                 "db": "Not connected",
                 "cache": cache_type,
                 "litellm_version": version,
-                "aawm_alias_config": _get_aawm_alias_config_startup_status(),
+                "aawm_alias_config": aawm_alias_config_status,
+                "codex_oauth_inventory_generation": (
+                    codex_oauth_inventory_generation_status
+                ),
                 "aawm_claude_control_plane": aawm_claude_control_plane_status,
                 "aawm_alias_routing_cache": _get_aawm_alias_routing_cache_status(),
                 "success_callbacks": success_callback_names,
