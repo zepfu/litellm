@@ -8202,6 +8202,9 @@ async def pass_through_request(  # noqa: PLR0915
                     _strict_managed_openai_owner_enabled(expected_model),
                 )
 
+            if validate_prepared_request_fn is None and openai_bound_egress:
+                validate_prepared_request_fn = _validate_final_openai_binding
+
             def _openai_owner_attributes_exact(
                 left: Mapping[str, Any],
                 right: Mapping[str, Any],

@@ -52,6 +52,8 @@ The following rules determine which headers are forwarded (see [`_get_forwardabl
 | **User information headers** | When `add_user_information_to_llm_headers: true`, LiteLLM adds `x-litellm-user-id`, `x-litellm-org-id`, etc. | [User Information Headers](#user-information-headers-optional) |
 | **Vertex AI pass-through** | Uses a separate, stricter allowlist: only `anthropic-beta` and `content-type`. | [Source code](https://github.com/litellm/litellm/blob/main/litellm/constants.py) |
 
+On OpenAI-bound pass-through routes, LiteLLM removes client-supplied credential, account, organization, project, and session headers before egress. If the route has a server-selected credential binding, LiteLLM canonicalizes the server-owned protected headers and verifies the exact serialized request at final send; mismatched targets, credentials, models, or protected headers fail closed. Redirected responses are rejected rather than followed.
+
 ## Configuration
 
 ## Enable Globally
