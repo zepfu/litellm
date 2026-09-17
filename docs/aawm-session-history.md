@@ -2089,8 +2089,9 @@ from the same structured identity aliases used by `session_history`, including
 `aawm_claude_project` is the preferred trusted project source; client product
 strings such as `claude-cli` alone do not establish repository ownership.
 LiteLLM omits prompt-like, sentence-like, or punctuation-heavy identity values
-instead of printing raw request text. LiteLLM intentionally does not inspect
-prompt text or raw tool arguments for the route log.
+instead of printing raw request text. Route-log identity extraction does not
+inspect prompt text or raw tool arguments. Memory-workload rollups reuse the
+existing classifier's payload markers without logging payload content.
 
 Route logs must not include API keys, authorization headers, full request or
 response bodies, prompt content, tool arguments, or arbitrary query strings.
@@ -2132,6 +2133,11 @@ interval elapses. Each rollup subline uses
 `:<effort-or-none>` segment and an optional trailing status tag (`[Degraded]`,
 `[Cooling Down]`, `[Failed]`, or `[Exhausted]`). Existing aliases remain inside
 the model label, producing shapes such as `gpt-5.6-luna(work):max`.
+Requests classified as `workload_type=agent_memory` and
+`workload_subtype=codex_memory_writer` use `AUTO-MEMORY` in the alias position
+and aggregate separately from ordinary requests for the same model. This
+display label does not change routing or session-history identity; model,
+masked account, effort, turn count, and destination formatting remain unchanged.
 Managed OpenAI provider egress uses ` - model(alias) (masked-account):effort`
 only for the attempted account; configured or pre-egress-skipped accounts do not
 render. Same-account retries aggregate, and distinct attempted accounts remain
