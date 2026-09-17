@@ -305,6 +305,50 @@ def _peek_request_local_excluded_keys(request: Any) -> set[str]:
         return set(excluded) if isinstance(excluded, (set, frozenset, list, tuple)) else set()
 
 
+def _remaining_admission_candidate_key(
+    remaining: Mapping[str, Any],
+) -> Optional[str]:
+    try:
+        from .selection import _get_codex_auto_agent_request_local_cooldown_key
+
+        return _get_codex_auto_agent_request_local_cooldown_key(
+            candidate=dict(remaining),
+            lane_key=(
+                remaining.get("codex_oauth_lane_key")
+                or remaining.get("xai_oauth_lane_key")
+                or remaining.get("lane_key")
+            ),
+        )
+    except Exception:
+        return None
+
+
+def _remaining_admission_candidate_is_eligible(
+    remaining: Mapping[str, Any],
+    *,
+    alias_family: str,
+    excluded: set[str],
+) -> bool:
+    """Skip cooled, skipped, and request-local excluded leftovers."""
+    if remaining.get("skip_reason"):
+        return False
+    cooldown_seconds = remaining.get("cooldown_seconds")
+    if isinstance(cooldown_seconds, (int, float)) and cooldown_seconds > 0:
+        return False
+    remaining_key = _remaining_admission_candidate_key(remaining)
+    if remaining_key is not None and remaining_key in excluded:
+        return False
+    if remaining_key is None:
+        return True
+    try:
+        remaining_cool = alias_routing_state.family(
+            validate_alias_family(alias_family)
+        ).peek_cooldown_remaining(remaining_key)
+    except Exception:
+        remaining_cool = 0.0
+    return remaining_cool <= 0
+
+
 def _peek_remaining_admission_candidate(
     request: Any,
     *,
@@ -313,11 +357,18 @@ def _peek_remaining_admission_candidate(
     denied_candidate: Mapping[str, Any],
     denied_selection: Optional[Mapping[str, Any]] = None,
 ) -> Optional[Mapping[str, Any]]:
-    """Return the next enumerated lane, not the already-denied candidate."""
+    """Return the next eligible remaining lane, not the denied candidate.
+
+    Cooled, skipped, and request-local excluded leftovers are ignored. When
+    the denied lane is native or managed xAI, remaining is the next eligible
+    opposite native/managed identity, not the first leftover snapshot member.
+    """
     denied_key = _candidate_admission_identity_key(
         denied_candidate, denied_selection
     )
+    denied_kind = _xai_admission_lane_kind(denied_candidate)
     excluded = _peek_request_local_excluded_keys(request)
+    eligible: list[Mapping[str, Any]] = []
     for remaining in _request_enumerated_candidates(
         request,
         alias_model=alias_model,
@@ -327,23 +378,20 @@ def _peek_remaining_admission_candidate(
             continue
         if _candidate_admission_identity_key(remaining) == denied_key:
             continue
-        try:
-            from .selection import _get_codex_auto_agent_request_local_cooldown_key
-
-            remaining_key = _get_codex_auto_agent_request_local_cooldown_key(
-                candidate=dict(remaining),
-                lane_key=(
-                    remaining.get("codex_oauth_lane_key")
-                    or remaining.get("xai_oauth_lane_key")
-                    or remaining.get("lane_key")
-                ),
-            )
-        except Exception:
-            remaining_key = None
-        if remaining_key is not None and remaining_key in excluded:
+        if not _remaining_admission_candidate_is_eligible(
+            remaining,
+            alias_family=alias_family,
+            excluded=excluded,
+        ):
             continue
-        return remaining
-    return None
+        eligible.append(remaining)
+    if denied_kind in {"native", "managed"}:
+        opposite = "managed" if denied_kind == "native" else "native"
+        for remaining in eligible:
+            if _xai_admission_lane_kind(remaining) == opposite:
+                return remaining
+        return None
+    return eligible[0] if eligible else None
 
 
 

@@ -758,6 +758,23 @@ async def test_candidate_loop_native_xai_admission_denial_continues_to_managed(
         "xai_oauth_account_hash": "managed-hash",
         "codex_oauth_lane_key": "xai-managed",
     }
+    cursor_leftover = {
+        "provider": "cursor_agent",
+        "model": "cursor_agent/cursor-grok-4.6-high",
+        "route_family": "codex_cursor_agent_aiserver_adapter",
+        "skip_reason": "cooled",
+        "cooldown_seconds": 30.0,
+        "codex_oauth_lane_key": "cursor-grok",
+    }
+    cooled_openai = {
+        "provider": "openai",
+        "model": "gpt-5.5-codex",
+        "route_family": "codex_responses",
+        "codex_oauth_account_hash": "native-hash",
+        "codex_oauth_lane_key": "codex-oauth:account",
+        "skip_reason": "request_local_transient_failure",
+        "cooldown_seconds": 12.0,
+    }
     native_selection = {
         "candidate": native,
         "cooldown_key": "xai:native",
@@ -771,7 +788,9 @@ async def test_candidate_loop_native_xai_admission_denial_continues_to_managed(
         "selection_reason": "independent_lane",
     }
     request.state.aawm_alias_selection_context = {
-        ("codex", "basic"): SimpleNamespace(candidates=(native, managed)),
+        ("codex", "basic"): SimpleNamespace(
+            candidates=(cursor_leftover, native, cooled_openai, managed)
+        ),
     }
     native_denial = SimpleNamespace(
         allowed=False,
@@ -990,8 +1009,17 @@ def test_healthy_same_key_traffic_skips_probe_lock_acquire() -> None:
         "account_hash": "native-hash",
         "codex_oauth_lane_key": "grok-native",
     }
+    cursor_leftover = {
+        "provider": "cursor_agent",
+        "model": "cursor_agent/cursor-grok-4.6-high",
+        "route_family": "codex_cursor_agent_aiserver_adapter",
+        "skip_reason": "cooled",
+        "cooldown_seconds": 30.0,
+    }
     request.state.aawm_alias_selection_context = {
-        ("codex", "basic"): SimpleNamespace(candidates=(native, remaining_managed)),
+        ("codex", "basic"): SimpleNamespace(
+            candidates=(cursor_leftover, native, remaining_managed)
+        ),
     }
     remaining = candidate_loop._peek_remaining_admission_candidate(
         request,
