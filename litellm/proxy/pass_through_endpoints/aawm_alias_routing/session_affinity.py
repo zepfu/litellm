@@ -42,6 +42,9 @@ from litellm.llms.xai.route_descriptors import (
     GROK_NATIVE_OAUTH_ROUTE_FAMILY,
     XAI_OAUTH_ROUTE_FAMILY,
 )
+from litellm.proxy.common_utils.http_parsing_utils import (
+    _safe_get_request_parsed_body,
+)
 from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
 )
@@ -406,6 +409,14 @@ _MUTABLE_OPENAI_STORED_ATTRIBUTE_KEYS = (
     "account_label",
     "account_lane",
     "credential_affinity",
+)
+# Native OpenAI/Codex Responses ownership is committed by the wire coordinator,
+# not by HTTP 2xx / first-byte control-plane success.
+_WIRE_COORDINATOR_OWNER_CONTRACTS = frozenset(
+    {
+        "openai_responses",
+        "codex_responses",
+    }
 )
 # Canonical endpoint/state for the two equivalent managed direct-OpenAI shapes.
 _MANAGED_DIRECT_OPENAI_OWNER_ID_ENDPOINT = "codex_responses"
@@ -1347,6 +1358,74 @@ def _same_hosted_provider_account_identity_is_mutable(
         _hosted_providers_match(left, right)
         and _hosted_provider_from_attributes(left) == "openai"
     )
+
+
+def _session_owner_request_body(
+    request: Any = None,
+    request_body: Optional[Mapping[str, Any]] = None,
+) -> Optional[Mapping[str, Any]]:
+    if isinstance(request_body, Mapping):
+        return request_body
+    parsed = _safe_get_request_parsed_body(request)
+    return parsed if isinstance(parsed, Mapping) else None
+
+
+def _session_owner_request_has_account_bound_state(
+    request_body: Optional[Mapping[str, Any]],
+) -> bool:
+    """Fail closed when the request body is absent or cannot be classified."""
+
+    if not isinstance(request_body, Mapping):
+        return True
+    from .audit_build import (
+        _aawm_auto_agent_audit_request_has_account_bound_state as classifier,
+    )
+
+    return bool(classifier(request_body))
+
+
+def _mutable_refresh_may_update_account_identity(
+    current_attributes: Mapping[str, Any],
+    requested_attributes: Mapping[str, Any],
+    *,
+    request_body: Optional[Mapping[str, Any]] = None,
+    has_account_bound_state: Optional[bool] = None,
+) -> bool:
+    """Account keys follow the portable-failover replay/unbound authorization."""
+
+    if not _same_hosted_provider_account_identity_is_mutable(
+        current_attributes,
+        requested_attributes,
+    ):
+        return False
+    if has_account_bound_state is None:
+        has_account_bound_state = _session_owner_request_has_account_bound_state(
+            request_body
+        )
+    if has_account_bound_state:
+        return False
+    return is_replay_safe_session_owner_redispatch_body(request_body)
+
+
+def _lease_uses_wire_coordinator_terminal(
+    lease: Optional[SessionOwnerLease],
+    attributes: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """True when HTTP 2xx is first-byte, not the accepted owner terminal."""
+
+    if isinstance(attributes, Mapping) and attributes:
+        attrs: Mapping[str, Any] = attributes
+    elif lease is not None and isinstance(lease.attributes, Mapping):
+        attrs = lease.attributes
+    else:
+        return False
+    if _hosted_provider_from_attributes(attrs) != "openai":
+        return False
+    for key in ("endpoint_contract", "state_format", "route_family"):
+        value = str(attrs.get(key) or "").strip().casefold()
+        if value in _WIRE_COORDINATOR_OWNER_CONTRACTS:
+            return True
+    return False
 
 
 def _normalized_owner_id_endpoint_state(attrs: Mapping[str, Any]) -> tuple[str, str]:
@@ -4076,11 +4155,11 @@ async def rebind_session_owner_for_portable_failover(  # noqa: PLR0911
             owner_id=actual_owner,
             owner_record=payload,
         )
-        return _error(
-            "session_owner: portable failover returned unknown result",
-            owner_id=actual_owner,
-            owner_record=payload,
-        )
+    return _error(
+        "session_owner: portable failover returned unknown result",
+        owner_id=actual_owner,
+        owner_record=payload,
+    )
 
 
 async def release_session_owner_reservation(
@@ -4172,6 +4251,9 @@ async def refresh_session_owner_mutable_attributes(
     expected_owner_record: Optional[Mapping[str, Any]] = None,
     attributes: Optional[Mapping[str, Any]] = None,
     completion_ordinal: Optional[float] = None,
+    request: Any = None,
+    request_body: Optional[Mapping[str, Any]] = None,
+    has_account_bound_state: Optional[bool] = None,
 ) -> SessionOwnerMutationResult:
     """CAS-refresh the mutable attribute tuple on a compatible owned record.
 
@@ -4210,9 +4292,11 @@ async def refresh_session_owner_mutable_attributes(
         )
     cas_attributes = expected_current_attributes or current_attributes
     mutable_keys = list(_MUTABLE_SAME_HOSTED_PROVIDER_ATTRIBUTE_KEYS)
-    if _same_hosted_provider_account_identity_is_mutable(
+    if _mutable_refresh_may_update_account_identity(
         cas_attributes,
         requested_attributes,
+        request_body=_session_owner_request_body(request, request_body),
+        has_account_bound_state=has_account_bound_state,
     ):
         mutable_keys.extend(_MUTABLE_OPENAI_STORED_ATTRIBUTE_KEYS)
     if not cas_attributes:
@@ -4633,6 +4717,16 @@ async def finalize_session_owner_lease_on_success(
         )
         if lease.promoted:
             return None
+        # Native OpenAI/Codex Responses treat HTTP 2xx as first-byte, not
+        # accepted terminal. Compatible refresh waits for `completed`.
+        if (
+            lease.wire_disposition != "completed"
+            and _lease_uses_wire_coordinator_terminal(
+                lease,
+                attributes or lease.attributes,
+            )
+        ):
+            return None
         owner_record, _lookup_cache_key, lookup_error = (
             await get_session_owner_record(
                 session_identity=lease.session_identity,
@@ -4668,6 +4762,7 @@ async def finalize_session_owner_lease_on_success(
             expected_owner_record=expected_owner_record,
             attributes=attributes or lease.attributes,
             completion_ordinal=time.time(),
+            request=request,
         )
         lease.last_finalization_outcome = refresh_result.outcome.value
         if refresh_result.outcome in {
@@ -4734,6 +4829,7 @@ async def finalize_session_owner_lease_on_success(
             expected_owner_record=result.owner_record,
             attributes=success_attributes,
             completion_ordinal=terminal_ordinal,
+            request=request,
         )
         if refresh_result.owner_record is not None:
             result = replace(result, owner_record=refresh_result.owner_record)
@@ -4862,14 +4958,15 @@ async def finalize_session_owner_lease_on_wire_disposition(
         return invariant
     if lease.released or lease.promoted:
         return None
+    normalized = str(disposition or "").strip().lower()
     if not lease.held_reservation and not lease.wire_terminal_pending:
-        # Non-held compatible-owner leases must remain skipped at ordinary
-        # success finalization. Arm this gate only when the wire helper had
-        # actually accepted and deferred the lease.
-        return None
+        # Held-only deferral does not arm non-held leases. Ordinary first-byte
+        # success remains a no-op; accepted `completed` still CAS-refreshes
+        # mutable attributes from the captured expected owner snapshot.
+        if normalized != "completed":
+            return None
     if lease.wire_disposition is not None:
         return None
-    normalized = str(disposition or "").strip().lower()
     lease.wire_disposition = normalized or "failed"
     lease.wire_terminal_pending = False
     if normalized == "completed":
