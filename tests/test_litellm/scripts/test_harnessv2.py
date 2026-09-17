@@ -1450,7 +1450,10 @@ def test_should_plan_codex_catalog_model_and_orchestration_as_non_stub(hv, confi
     assert list(model.models) != hv.compiled_aliases(config)
     assert "hv2-codex-child" in model.extra["pong_prompt"]
     assert "PONG" not in model.extra["pong_prompt"]
-    assert "model=basic" in model.extra["pong_prompt"]
+    assert "agent_type=basic" in model.extra["pong_prompt"]
+    assert "Call spawn_agent" in model.extra["pong_prompt"]
+    assert "model=basic" not in model.extra["pong_prompt"]
+    assert "agent=basic" not in model.extra["pong_prompt"]
     assert "ChatGPT-unsupported" in model.extra["pong_prompt"]
     assert "Do not run the command yourself" in model.extra["pong_prompt"]
     assert "print that exact stdout" in model.extra["pong_prompt"]
@@ -1468,9 +1471,12 @@ def test_should_plan_codex_catalog_model_and_orchestration_as_non_stub(hv, confi
         write_artifact=None,
     )
     assert list(work.orchestration_children) == ["work"]
-    assert "model=work" in work.extra["orchestration_prompt_template"]
+    assert "agent_type=work" in work.extra["orchestration_prompt_template"]
+    assert "Call spawn_agent" in work.extra["orchestration_prompt_template"]
+    assert "model=work" not in work.extra["orchestration_prompt_template"]
     assert "hv2-codex-child" in work.extra["orchestration_prompt_template"]
     assert "agent=sota-xai" not in work.extra["orchestration_prompt_template"]
+    assert "agent=work" not in work.extra["orchestration_prompt_template"]
 
 
 def test_should_plan_codex_luna_readbasic_overlay_orchestration(hv, config) -> None:
@@ -1493,14 +1499,16 @@ def test_should_plan_codex_luna_readbasic_overlay_orchestration(hv, config) -> N
     assert list(plan.orchestration_parents) == ["gpt-5.6-luna"]
     assert list(plan.orchestration_children) == ["readbasic"]
     prompt = plan.extra["orchestration_prompt_template"]
-    assert "model=readbasic" in prompt
+    assert "agent_type=readbasic" in prompt
     assert "Call spawn_agent" in prompt
     assert "hv2-codex-child" in prompt
     assert "`pwd`" in prompt
     assert "Do not run the command yourself" in prompt
+    assert "model=readbasic" not in prompt
     assert "model=basicread" not in prompt
     assert "model=basic " not in prompt
     assert "model=basic\n" not in prompt
+    assert "agent=readbasic" not in prompt
     argv = [
         token.replace("{model}", "gpt-5.6-luna")
         for token in merged["tuis"]["codex"]["argv_launch_model"]
@@ -2378,6 +2386,164 @@ def test_should_plan_comma_separated_provider_alias_orchestration_children(
     assert "agent=provider-kimi_code,provider-openrouter" not in prompt
     for name in _ORCH_BASELINE_CHILDREN:
         assert f"agent={name}" not in prompt
+
+
+def test_should_plan_ohmypi_sota_parents_spawning_basic_work_expert_without_model_fields(
+    hv, config
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+    from hv2.plan import expand_orchestration_prompt
+
+    parents = ("sota-xai", "sota-moonshot", "sota-zai")
+    children = ("basic", "work", "expert")
+    driver = OhmypiDriver(config)
+    for parent in parents:
+        plan = hv.build_plan(
+            config=config,
+            kind="orchestration",
+            instance_token="alpha",
+            tui="ohmypi",
+            models=None,
+            orchestration_parent=parent,
+            orchestration_children=",".join(children),
+            dry_run=True,
+            write_artifact=None,
+        )
+        assert plan.tui == "ohmypi"
+        assert plan.container == "litellm-alpha"
+        assert list(plan.orchestration_parents) == [parent]
+        assert list(plan.orchestration_children) == list(children)
+        template = plan.extra["orchestration_prompt_template"]
+        prompt = expand_orchestration_prompt(
+            template, parent=parent, children=children
+        )
+        assert f"parent on alias {parent}" in prompt
+        assert "Ohmypi `task` tool" in prompt
+        assert "no `model=` field" in prompt
+        assert "Spawn all 3 subagents" in prompt
+        for name in children:
+            assert f"agent={name}" in prompt
+            assert f"model={name}" not in prompt
+        assert "model=basic" not in prompt
+        assert "Call spawn_agent" not in prompt
+        assert "spawn_agent" not in prompt
+        argv = driver.launch_argv(parent)
+        assert argv[0] == "omp"
+        assert "-p" not in argv
+        assert "--print" not in argv
+        assert f"litellm-alpha-passthrough/{parent}" in argv
+        assert driver.model_selector(parent) == f"litellm-alpha-passthrough/{parent}"
+
+
+def test_should_stage_ohmypi_basic_work_expert_agent_profiles_only(
+    hv, config, tmp_path: Path
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    children = ("basic", "work", "expert")
+    cfg = _clone_config(config)
+    cwd = tmp_path / "omp-alpha-workspace"
+    dest = cwd / ".omp" / "agents"
+    cfg["tuis"]["ohmypi"]["cwd"] = str(cwd)
+    cfg["tuis"]["ohmypi"]["project_agents_dir"] = str(dest)
+    driver = OhmypiDriver(cfg)
+    staged = driver.stage_orchestration_agents(children)
+    assert staged["ok"] is True
+    assert staged["missing"] == []
+    written_names = {Path(path).name for path in staged["written"]}
+    assert written_names == {f"{name}.md" for name in children}
+    for name in children:
+        target = dest / f"{name}.md"
+        assert target.is_file()
+        text = target.read_text(encoding="utf-8")
+        assert f'name: {name}' in text or f"name: {name}" in text
+        assert f"litellm-alpha-passthrough/{name}" in text
+        assert "model=" not in text.split("---", 2)[-1]
+    for leftover in _ORCH_BASELINE_CHILDREN:
+        if leftover in children:
+            continue
+        assert not (dest / f"{leftover}.md").is_file()
+
+
+def test_should_keep_codex_spawn_and_identity_distinct_from_ohmypi_agent_profiles(
+    hv, config
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    ohmypi = hv.build_plan(
+        config=config,
+        kind="orchestration",
+        instance_token="alpha",
+        tui="ohmypi",
+        models=None,
+        orchestration_parent="sota-xai",
+        orchestration_children="basic,work,expert",
+        dry_run=True,
+        write_artifact=None,
+    )
+    ohmypi_prompt = ohmypi.extra["orchestration_prompt_template"]
+    assert "agent=basic" in ohmypi_prompt
+    assert "agent=work" in ohmypi_prompt
+    assert "agent=expert" in ohmypi_prompt
+    assert "Call spawn_agent" not in ohmypi_prompt
+    assert "model=basic" not in ohmypi_prompt
+
+    codex_model = hv.build_plan(
+        config=config,
+        kind="model",
+        instance_token="alpha",
+        tui="codex",
+        models=["basic"],
+        orchestration_parent=None,
+        orchestration_children=None,
+        dry_run=True,
+        write_artifact=None,
+    )
+    codex_prompt = codex_model.extra["pong_prompt"]
+    assert "Call spawn_agent" in codex_prompt
+    assert "agent_type=basic" in codex_prompt
+    assert "hv2-codex-child" in codex_prompt
+    assert "agent=basic" not in codex_prompt
+    assert "Ohmypi `task` tool" not in codex_prompt
+    assert "PONG" not in codex_prompt
+
+    codex_orch = hv.build_plan(
+        config=config,
+        kind="orchestration",
+        instance_token="alpha",
+        tui="codex",
+        models=None,
+        orchestration_parent="basic",
+        orchestration_children="work",
+        dry_run=True,
+        write_artifact=None,
+    )
+    codex_orch_prompt = codex_orch.extra["orchestration_prompt_template"]
+    assert "Call spawn_agent" in codex_orch_prompt
+    assert "agent_type=work" in codex_orch_prompt
+    assert "agent=sota-xai" not in codex_orch_prompt
+    assert "agent=basic" not in codex_orch_prompt
+    assert "Ohmypi `task` tool" not in codex_orch_prompt
+
+    ohmypi_headers = OhmypiDriver(config).identity_overlay_payload()["providers"][
+        "litellm-alpha"
+    ]["headers"]
+    ohmypi_argv = OhmypiDriver(config).launch_argv("sota-xai")
+    codex_argv = CodexDriver(config).launch_argv("basic")
+    assert ohmypi_argv[0] == "omp"
+    assert "-c" not in ohmypi_argv
+    assert ohmypi_headers["x-aawm-client"] == "Oh My Pi"
+    assert ohmypi_headers["x-aawm-client-name"] == "omp"
+    assert CodexDriver(config).identity_overlay_payload()["headers"]["x-aawm-client"] == "Codex"
+    assert ohmypi_argv[0] != codex_argv[0]
+    joined_codex = " ".join(codex_argv)
+    assert "x-aawm-client-name" in joined_codex
+    assert "Codex" in joined_codex
+    assert "-p" not in codex_argv
+    assert "exec" not in codex_argv
+    assert "litellm-alpha-passthrough" not in joined_codex
 
 
 def test_should_refuse_redis_flush(hv) -> None:
@@ -6040,3 +6206,60 @@ def test_should_wait_again_for_ohmypi_selected_needles_after_mcp(
     launched = driver.ensure_session("work", tools=False)
     assert launched["ok"] is True
     assert launched["selected"] is True
+
+
+def test_should_treat_ohmypi_18_2_4_composer_chrome_as_selected(hv, config) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    pane = (_FIXTURES / "ohmypi_idle_18_2_4.txt").read_text(encoding="utf-8")
+    driver = OhmypiDriver(config)
+    assert "Connected to MCP" not in pane
+    assert "No MCP" not in pane
+    assert "╭── π > ◕ AAWM alias sota-xai >" in pane
+    assert "π >" in config["tuis"]["ohmypi"]["select_model"]["idle_needles"]
+    assert (
+        "╭── π > ◕ AAWM alias {model} >"
+        in config["tuis"]["ohmypi"]["select_model"]["selected_needles"]
+    )
+    assert driver.pane_has_selector("sota-xai", pane) is True
+    assert driver.pane_has_selector("sota-xai-other", pane) is False
+    assert driver._pane_is_idle(pane) is True
+
+
+def test_should_launch_ohmypi_when_18_2_4_idle_composer_omits_mcp_chrome(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+    from hv2.pane import _pane_has_any
+
+    pane = (_FIXTURES / "ohmypi_idle_18_2_4.txt").read_text(encoding="utf-8")
+    driver = OhmypiDriver(config)
+    monkeypatch.setattr(
+        driver,
+        "_run_tmux",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(driver, "tmux_has_session", lambda name=None: False)
+    monkeypatch.setattr(driver, "ensure_workspace", lambda: None)
+    monkeypatch.setattr(driver, "capture_pane", lambda: pane)
+
+    def fake_wait(
+        needle: str | Sequence[str],
+        timeout_seconds: float | None = None,
+        *,
+        prompt: str | None = None,
+    ) -> bool:
+        needles = [needle] if isinstance(needle, str) else [str(item) for item in needle]
+        if any("Connected to MCP" in item or "No MCP" in item for item in needles):
+            return False
+        return _pane_has_any(pane, needles)
+
+    monkeypatch.setattr(driver, "wait_for_pane", fake_wait)
+    launched = driver.ensure_session("sota-xai", tools=False)
+    assert launched["selected"] is True
+    assert launched["mcp_ready"] is True
+    assert launched["ok"] is True
+    assert "Connected to MCP" not in pane
+    assert "-p" not in launched["argv"]
+    assert "--print" not in launched["argv"]
+    assert "litellm-alpha-passthrough/sota-xai" in launched["argv"]

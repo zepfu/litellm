@@ -423,7 +423,7 @@ From `config/tuis.yaml`:
 | Item | Value |
 |---|---|
 | Binary | `omp` (wrapper `ompla`) |
-| Min version | 17.3.8 |
+| Min version | 17.3.8 (live 18.2.4 may omit MCP chrome; selected idle composer still ready) |
 | Overlay | Identity first, then operator: `PI_CONFIG_FILES=<session_dir>/hv2-ohmypi-identity.yml:$HOME/.omp/agent/litellm-alpha.yml`. Ohmypi `task` children inherit tmux env, not parent `--config`. Identity first so those children inherit `x-aawm-client*` headers; parent still gets `--config`. Do not revert this to operator-only `PI_CONFIG_FILES`. That overlay is what stamps rollup as `litellm#Ohmypi[<version>]@<host>`. |
 | CWD | `/tmp/omp-alpha-workspace` |
 | Session dir | `/tmp/omp-alpha-sessions/hv2-<alias>` (identity overlay stays in `/tmp/omp-alpha-sessions`) |
