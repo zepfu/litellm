@@ -283,7 +283,10 @@ async def test_candidate_loop_records_in_flight_pinned_cooldown_without_no_candi
         candidate_loop,
         "_session_affinity_mod",
         lambda: SimpleNamespace(
-            is_replay_safe_session_owner_redispatch_body=lambda _body: False
+            DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS=0,
+            is_replay_safe_session_owner_redispatch_body=lambda _body: False,
+            set_competing_reservation_log_deferred=lambda *_a, **_k: None,
+            competing_reservation_retry_attempts=lambda *_a, **_k: 0,
         ),
     )
     monkeypatch.setattr(
@@ -394,7 +397,10 @@ async def test_candidate_loop_typed_redispatch_429_emits_terminal_event(
         candidate_loop,
         "_session_affinity_mod",
         lambda: SimpleNamespace(
-            is_replay_safe_session_owner_redispatch_body=lambda _body: False
+            DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS=0,
+            is_replay_safe_session_owner_redispatch_body=lambda _body: False,
+            set_competing_reservation_log_deferred=lambda *_a, **_k: None,
+            competing_reservation_retry_attempts=lambda *_a, **_k: 0,
         ),
     )
     monkeypatch.setattr(
@@ -525,7 +531,10 @@ async def test_candidate_loop_records_non_failover_admission_denial_before_raise
         candidate_loop,
         "_session_affinity_mod",
         lambda: SimpleNamespace(
-            is_replay_safe_session_owner_redispatch_body=lambda _body: False
+            DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS=0,
+            is_replay_safe_session_owner_redispatch_body=lambda _body: False,
+            set_competing_reservation_log_deferred=lambda *_a, **_k: None,
+            competing_reservation_retry_attempts=lambda *_a, **_k: 0,
         ),
     )
     monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
@@ -589,6 +598,151 @@ async def test_candidate_loop_records_non_failover_admission_denial_before_raise
     assert event["admission_lane_fingerprint"] == "lane-fingerprint"
     assert len(persisted) == 1
     assert persisted[0][-1] == event
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_shared_account_hash_admission_denial_does_not_continue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/openai_passthrough/v1/responses",
+            "headers": [(b"user-agent", b"codex-cli/1.0")],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
+    body = {"model": "basic", "input": "hello", "stream": False}
+    candidate = {
+        "provider": "openai",
+        "model": "gpt-5.5-codex",
+        "route_family": "codex_responses",
+        "codex_oauth_account_hash": "shared-hash",
+        "codex_oauth_lane_key": "codex-oauth:account",
+    }
+    selection = {
+        "candidate": candidate,
+        "cooldown_key": "openai:account",
+        "lane_key": "codex-oauth:account",
+        "selection_reason": "first_choice",
+    }
+    admission_decision = SimpleNamespace(
+        allowed=False,
+        reason="capacity_unavailable",
+        detail_code="aawm_provider_lane_capacity_unavailable",
+        lane_fingerprint="lane-fingerprint",
+        provider="openai",
+        account_hash="shared-hash",
+        limit_scope="concurrency",
+        exhaustion_kind=None,
+    )
+    original_exc = HTTPException(status_code=429, detail="denied")
+    selections = {"count": 0}
+    provider_calls: list[dict[str, Any]] = []
+
+    async def _select(**_kwargs: Any) -> dict[str, Any]:
+        selections["count"] += 1
+        return selection
+
+    async def _perform(**kwargs: Any) -> object:
+        provider_calls.append(kwargs)
+        raise AssertionError("shared-hash denial must not reach provider I/O")
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            return admission_decision
+
+        def admission_deny_error_class(self, _decision: object) -> str:
+            return "capacity_exhausted"
+
+        def raise_provider_lane_admission_rejected(self, *_args: Any, **_kwargs: Any) -> None:
+            raise original_exc
+
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: SimpleNamespace(
+            DEFAULT_COMPETING_RESERVATION_RETRY_ATTEMPTS=0,
+            is_replay_safe_session_owner_redispatch_body=lambda _body: False,
+            set_competing_reservation_log_deferred=lambda *_a, **_k: None,
+            competing_reservation_retry_attempts=lambda *_a, **_k: 0,
+        ),
+    )
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        lpe,
+        "_plan_codex_oauth_account_failover",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(lpe, "_emit_auto_agent_alias_route_event", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        lpe,
+        "_persist_auto_agent_alias_audit_only_events_best_effort",
+        lambda *_a, **_k: None,
+    )
+
+    with pytest.raises(HTTPException) as vis:
+        await candidate_loop.handle_alias_route(
+            SimpleNamespace(
+                select_candidate_fn=_select,
+                perform_candidate_request_fn=_perform,
+                resolve_cooldown_publication_fn=None,
+                publish_cooldown_memory_fn=None,
+                persist_cooldown_fn=None,
+                set_session_affinity_fn=_noop_async,
+                add_alias_metadata_fn=lambda request_body, **_kwargs: request_body,
+                raise_redispatch_fn=None,
+            ),
+            alias_family="codex_auto_agent",
+            alias_model="basic",
+            request=request,
+            prepared_request_body=body,
+            max_candidate_attempts=3,
+            get_active_cooldown_state_fn=None,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    assert vis.value is original_exc
+    assert selections["count"] == 1
+    assert provider_calls == []
+
+
+def test_healthy_same_key_traffic_skips_probe_lock_acquire() -> None:
+    family = candidate_loop.alias_routing_state.family("codex_auto_agent")
+    assert family.get_generation("openai:account") == 0
+    assert candidate_loop._admission_denial_shares_account_hash(
+        SimpleNamespace(account_hash="shared")
+    )
+    assert not candidate_loop._admission_denial_shares_account_hash(
+        SimpleNamespace(account_hash="")
+    )
+
+
+def test_no_io_skipped_selection_records_named_reason_once() -> None:
+    attempt: dict[str, Any] = {}
+    candidate_loop._record_no_io_skipped_selection(
+        attempt, reason=candidate_loop._NO_IO_SKIP_FOLLOWER
+    )
+    candidate_loop._record_no_io_skipped_selection(
+        attempt, reason=candidate_loop._NO_IO_SKIP_FOLLOWER
+    )
+    assert attempt["skip_reason"] == "skipped_follower"
+    assert attempt["terminal_disposition"] == "skipped"
+    attempt["attempted_provider_call"] = True
+    candidate_loop._record_no_io_skipped_selection(
+        attempt, reason=candidate_loop._NO_IO_SKIP_PRECHECK_COOLDOWN
+    )
+    assert attempt["skip_reason"] == "skipped_follower"
 
 
 def test_resolve_failure_plan_classifies_alibaba_model_not_found_as_candidate_unavailable() -> None:

@@ -103,7 +103,11 @@ from .schema_rejections import (
     normalize_schema_rejection,
     resolve_schema_rejection_failure_identity,
 )
-from .state import alias_routing_state, validate_alias_family
+from .state import (
+    ClaimOutcome,
+    alias_routing_state,
+    validate_alias_family,
+)
 
 _MAX_ATTEMPT_FAILURE_PHASE_LENGTH = 128
 _ALPHA_PROBE_INJECTION_COUNT_STATE_KEY = (
@@ -113,6 +117,33 @@ _ALPHA_PROBE_INJECTION_COUNT_STATE_KEY = (
 
 class _AlphaProbeCandidateSkip(Exception):
     """Short-circuit one synthetic no-I/O candidate after reservation."""
+
+
+_NO_IO_SKIP_CLEAR_RESERVATION = "skipped_clear_reservation"
+_NO_IO_SKIP_FOLLOWER = "skipped_follower"
+_NO_IO_SKIP_PRECHECK_COOLDOWN = "skipped_precheck_cooldown"
+_NO_IO_SKIP_TOCTOU_COOLDOWN = "skipped_toctou_cooldown"
+
+
+def _record_no_io_skipped_selection(
+    attempt_record: dict[str, Any],
+    *,
+    reason: str,
+) -> None:
+    """Stamp one bounded no-I/O skip without overwriting a later reason."""
+    if attempt_record.get("attempted_provider_call") is True:
+        return
+    attempt_record["terminal_disposition"] = "skipped"
+    attempt_record["skip_reason"] = reason
+    attempt_record.setdefault("status", reason)
+
+
+def _admission_denial_shares_account_hash(decision: Any) -> bool:
+    """True when a denied lane is bound to a shared account identity."""
+    account_hash = getattr(decision, "account_hash", None)
+    if not isinstance(account_hash, str):
+        return False
+    return bool(account_hash.strip())
 
 
 def _session_affinity_mod():
@@ -2593,9 +2624,18 @@ async def handle_alias_route(  # noqa: PLR0915
                 account_failover_replay_safe=account_failover_replay_safe,
                 provider_status_code=attempt_record.get("error_status_code"),
             )
-            if account_failover_planned:
+            independent_lane_fallback = (
+                account_failover_planned
+                and not _admission_denial_shares_account_hash(admission_decision)
+            )
+            if independent_lane_fallback:
                 _carry_native_openai_responses_owner_snapshot(
                     durable_source_snapshot
+                )
+                _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
+                    request,
+                    candidate=candidate,
+                    lane_key=selection.get("lane_key"),
                 )
                 _refund_selection_budget_if_no_provider_egress(
                     attempt_record=attempt_record,
@@ -2668,17 +2708,15 @@ async def handle_alias_route(  # noqa: PLR0915
                 #    calling it outside the probe lock prevents lock inversion
                 #    with execute_cooldown_publication_transaction (which
                 #    acquires family lock -> sorted probe locks).
-                # 2. Acquire the selected probe lock.
-                # 3. Check for an active PublicationIntent on this cooldown_key.
-                #    If found (follower path): release probe lock, await intent
-                #    completion, then break to re-select (no second provider call).
-                # 4. Leader path: create intent, perform provider I/O under the
-                #    probe lock.
-                # 5. On failure: resolve plan, attach to intent, RELEASE probe
-                #    lock, then enter cooldown mutation with NO pre-held lock
-                #    (execute_cooldown_publication_transaction acquires the
-                #    family lock + sorted probe locks internally).
-                # 6. Signal intent complete, remove from registry.
+                # 2. Healthy same-key traffic does not hold the probe lock or
+                #    create publication intent during provider I/O.
+                # 3. Half-open / recovery probes acquire the probe lock, claim
+                #    publication intent, and remain single-flight.
+                # 4. Followers await an existing probe intent without holding
+                #    admission and without a second provider call.
+                # 5. On probe failure: resolve plan, attach to intent, RELEASE
+                #    probe lock, then enter cooldown mutation with NO pre-held
+                #    lock so followers cannot race the publish.
                 probe_failure_exc: Optional[Exception] = None
                 probe_failure_plan: Optional[CooldownPublicationPlan] = None
                 xai_no_io_selection_skip_reason: Optional[str] = None
@@ -2701,34 +2739,46 @@ async def handle_alias_route(  # noqa: PLR0915
                     skip_after_probe_wait = True
                     attempt_record["status"] = "skipped_single_flight_cooldown"
                     attempt_record["cooldown_seconds"] = active_seconds
+                    _record_no_io_skipped_selection(
+                        attempt_record,
+                        reason=_NO_IO_SKIP_PRECHECK_COOLDOWN,
+                    )
 
-                probe_lock = await alias_routing_state.candidate_probe_lock(
-                    alias_family=alias_family,
-                    cooldown_key=selection["cooldown_key"],
+                family_state = alias_routing_state.family(alias_family)
+                cooldown_generation = family_state.get_generation(
+                    selection["cooldown_key"]
                 )
-                await probe_lock.acquire()
-
-                # Follower path: an active intent means a leader is probing or
-                # publishing for this key.  Await completion, then re-select.
-                # CFG-004 Defect 1 fix: atomic claim_publication_or_wait checks
-                # clear reservations AND active intents AND claims a leader intent
-                # in ONE registry-lock critical section.  This closes the race
-                # where a clear reservation could be created between the intent
-                # claim and a separate get_clear_reservation check.
-                from .state import ClaimOutcome
-
-                _claim = alias_routing_state.publication_intents.claim_publication_or_wait(
-                    alias_family=alias_family,
-                    cooldown_keys=frozenset({selection["cooldown_key"]}),
-                    identity_hash=_active_lane_identity_hash(candidate=candidate),
+                is_recovery_probe = cooldown_generation > 0
+                healthy_same_key_traffic = (
+                    probe_failure_exc is None
+                    and not skip_after_probe_wait
+                    and active_seconds <= 0
+                    and not is_recovery_probe
                 )
-                if _claim.outcome is ClaimOutcome.BLOCKED_BY_CLEAR:
-                    # Clear reservation covers this key: wait, then reselect
-                    # without provider I/O.
-                    probe_lock.release()
-                    assert _claim.clear_reservation is not None
-                    await _claim.clear_reservation.done.wait()
+
+                existing_probe_intent = (
+                    alias_routing_state.publication_intents.get(
+                        alias_family, selection["cooldown_key"]
+                    )
+                )
+                if (
+                    existing_probe_intent is not None
+                    and not existing_probe_intent.done.is_set()
+                ):
+                    if admission_lease is not None:
+                        try:
+                            await admission.release_provider_lane_admission(
+                                admission_lease
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        admission_lease = None
+                    await existing_probe_intent.done.wait()
                     skip_after_probe_wait = True
+                    _record_no_io_skipped_selection(
+                        attempt_record,
+                        reason=_NO_IO_SKIP_FOLLOWER,
+                    )
                     _refund_selection_budget_if_no_provider_egress(
                         attempt_record=attempt_record,
                         budget_was_counted=selection_budget_counted,
@@ -2737,69 +2787,163 @@ async def handle_alias_route(  # noqa: PLR0915
                         ),
                     )
                     break
-                if _claim.outcome is ClaimOutcome.FOLLOWER:
-                    probe_lock.release()
-                    assert _claim.intent is not None
-                    await _claim.intent.done.wait()
-                    skip_after_probe_wait = True
-                    _refund_selection_budget_if_no_provider_egress(
-                        attempt_record=attempt_record,
-                        budget_was_counted=selection_budget_counted,
-                        selection_provider_egress_reached=(
-                            selection_provider_egress_reached
-                        ),
-                    )
-                    break
-                assert _claim.intent is not None
-                intent = _claim.intent
 
-                # TOCTOU guard: the pre-check ran BEFORE probe lock acquisition.
-                # A concurrent leader may have completed publication (cooldown
-                # committed, intent removed) between our pre-check and probe lock
-                # acquisition.  The publication transaction holds this same probe
-                # lock while mutating cooldown memory, so a lock-free peek here
-                # (no family lock, no mutation) sees a consistent snapshot.
-                # This closes the final singleflight TOCTOU window without
-                # introducing a family-locking read under the probe lock.
-                if not skip_after_probe_wait and probe_failure_exc is None:
-                    _toctou_remaining = (
-                        alias_routing_state.family(alias_family)
-                        .peek_cooldown_remaining(selection["cooldown_key"])
+                if healthy_same_key_traffic:
+                    clear_reservation = (
+                        alias_routing_state.publication_intents.get_clear_reservation(
+                            alias_family, selection["cooldown_key"]
+                        )
                     )
-                    if _toctou_remaining > 0:
+                    if clear_reservation is not None:
+                        if admission_lease is not None:
+                            try:
+                                await admission.release_provider_lane_admission(
+                                    admission_lease
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
+                            admission_lease = None
+                        await clear_reservation.done.wait()
                         skip_after_probe_wait = True
-                        attempt_record["status"] = "skipped_single_flight_cooldown"
-                        attempt_record["cooldown_seconds"] = _toctou_remaining
-
-                # If the pre-check found an active cooldown or raised, we still
-                # need to create + complete the intent so followers are notified.
-                if skip_after_probe_wait or probe_failure_exc is not None:
-                    probe_lock.release()
-                    intent.complete(error=probe_failure_exc)
-                    alias_routing_state.publication_intents.remove(intent)
-                    if probe_failure_exc is not None:
-                        if _emit_validated_redispatch_terminal_event(
-                            exc=probe_failure_exc,
-                            request=request,
-                            alias_family=alias_family,
-                            alias_model=alias_model,
-                            request_body=prepared_request_body,
-                            selection=selection,
-                            attempts=attempts,
-                            emit_pre_attempt_terminal_event=(
-                                _emit_auto_agent_alias_pre_attempt_terminal_event
+                        _record_no_io_skipped_selection(
+                            attempt_record,
+                            reason=_NO_IO_SKIP_CLEAR_RESERVATION,
+                        )
+                        _refund_selection_budget_if_no_provider_egress(
+                            attempt_record=attempt_record,
+                            budget_was_counted=selection_budget_counted,
+                            selection_provider_egress_reached=(
+                                selection_provider_egress_reached
                             ),
-                        ):
-                            raise probe_failure_exc
-                        raise probe_failure_exc
-                    _refund_selection_budget_if_no_provider_egress(
-                        attempt_record=attempt_record,
-                        budget_was_counted=selection_budget_counted,
-                        selection_provider_egress_reached=(
-                            selection_provider_egress_reached
-                        ),
+                        )
+                        break
+                    probe_lock = None
+                    intent = None
+                else:
+                    probe_lock = await alias_routing_state.candidate_probe_lock(
+                        alias_family=alias_family,
+                        cooldown_key=selection["cooldown_key"],
                     )
-                    break
+                    await probe_lock.acquire()
+
+                    # Follower path: an active intent means a leader is probing or
+                    # publishing for this key.  Await completion, then re-select.
+                    # CFG-004 Defect 1 fix: atomic claim_publication_or_wait checks
+                    # clear reservations AND active intents AND claims a leader intent
+                    # in ONE registry-lock critical section.  This closes the race
+                    # where a clear reservation could be created between the intent
+                    # claim and a separate get_clear_reservation check.
+                    _claim = alias_routing_state.publication_intents.claim_publication_or_wait(
+                        alias_family=alias_family,
+                        cooldown_keys=frozenset({selection["cooldown_key"]}),
+                        identity_hash=_active_lane_identity_hash(candidate=candidate),
+                    )
+                    if _claim.outcome is ClaimOutcome.BLOCKED_BY_CLEAR:
+                        # Clear reservation covers this key: wait, then reselect
+                        # without provider I/O.
+                        probe_lock.release()
+                        if admission_lease is not None:
+                            try:
+                                await admission.release_provider_lane_admission(
+                                    admission_lease
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
+                            admission_lease = None
+                        assert _claim.clear_reservation is not None
+                        await _claim.clear_reservation.done.wait()
+                        skip_after_probe_wait = True
+                        _record_no_io_skipped_selection(
+                            attempt_record,
+                            reason=_NO_IO_SKIP_CLEAR_RESERVATION,
+                        )
+                        _refund_selection_budget_if_no_provider_egress(
+                            attempt_record=attempt_record,
+                            budget_was_counted=selection_budget_counted,
+                            selection_provider_egress_reached=(
+                                selection_provider_egress_reached
+                            ),
+                        )
+                        break
+                    if _claim.outcome is ClaimOutcome.FOLLOWER:
+                        probe_lock.release()
+                        if admission_lease is not None:
+                            try:
+                                await admission.release_provider_lane_admission(
+                                    admission_lease
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
+                            admission_lease = None
+                        assert _claim.intent is not None
+                        await _claim.intent.done.wait()
+                        skip_after_probe_wait = True
+                        _record_no_io_skipped_selection(
+                            attempt_record,
+                            reason=_NO_IO_SKIP_FOLLOWER,
+                        )
+                        _refund_selection_budget_if_no_provider_egress(
+                            attempt_record=attempt_record,
+                            budget_was_counted=selection_budget_counted,
+                            selection_provider_egress_reached=(
+                                selection_provider_egress_reached
+                            ),
+                        )
+                        break
+                    assert _claim.intent is not None
+                    intent = _claim.intent
+
+                    # TOCTOU guard: the pre-check ran BEFORE probe lock acquisition.
+                    # A concurrent leader may have completed publication (cooldown
+                    # committed, intent removed) between our pre-check and probe lock
+                    # acquisition.  The publication transaction holds this same probe
+                    # lock while mutating cooldown memory, so a lock-free peek here
+                    # (no family lock, no mutation) sees a consistent snapshot.
+                    # This closes the final singleflight TOCTOU window without
+                    # introducing a family-locking read under the probe lock.
+                    if not skip_after_probe_wait and probe_failure_exc is None:
+                        _toctou_remaining = family_state.peek_cooldown_remaining(
+                            selection["cooldown_key"]
+                        )
+                        if _toctou_remaining > 0:
+                            skip_after_probe_wait = True
+                            attempt_record["status"] = "skipped_single_flight_cooldown"
+                            attempt_record["cooldown_seconds"] = _toctou_remaining
+                            _record_no_io_skipped_selection(
+                                attempt_record,
+                                reason=_NO_IO_SKIP_TOCTOU_COOLDOWN,
+                            )
+
+                    # If the pre-check found an active cooldown or raised, we still
+                    # need to create + complete the intent so followers are notified.
+                    if skip_after_probe_wait or probe_failure_exc is not None:
+                        probe_lock.release()
+                        if intent is not None:
+                            intent.complete(error=probe_failure_exc)
+                            alias_routing_state.publication_intents.remove(intent)
+                        if probe_failure_exc is not None:
+                            if _emit_validated_redispatch_terminal_event(
+                                exc=probe_failure_exc,
+                                request=request,
+                                alias_family=alias_family,
+                                alias_model=alias_model,
+                                request_body=prepared_request_body,
+                                selection=selection,
+                                attempts=attempts,
+                                emit_pre_attempt_terminal_event=(
+                                    _emit_auto_agent_alias_pre_attempt_terminal_event
+                                ),
+                            ):
+                                raise probe_failure_exc
+                            raise probe_failure_exc
+                        _refund_selection_budget_if_no_provider_egress(
+                            attempt_record=attempt_record,
+                            budget_was_counted=selection_budget_counted,
+                            selection_provider_egress_reached=(
+                                selection_provider_egress_reached
+                            ),
+                        )
+                        break
 
                 # BaseException-safe: intent is ALWAYS completed and removed,
                 # probe lock is ALWAYS released, regardless of exception type
@@ -3438,16 +3582,20 @@ async def handle_alias_route(  # noqa: PLR0915
                                         ),
                                     )
                             except BaseException as success_exc:
-                                if not intent.done.is_set():
+                                if intent is not None and not intent.done.is_set():
                                     intent.complete(error=success_exc)
-                                alias_routing_state.publication_intents.remove(intent)
+                                    alias_routing_state.publication_intents.remove(
+                                        intent
+                                    )
                                 raise
-                            intent.complete()
-                            alias_routing_state.publication_intents.remove(intent)
+                            if intent is not None:
+                                intent.complete()
+                                alias_routing_state.publication_intents.remove(intent)
                             await finalize_deferred_success(response)
 
                         async def _complete_deferred_failure(cause):
-                            assert intent is not None
+                            if intent is None:
+                                return
                             if not intent.done.is_set():
                                 intent.complete(
                                     error=(
@@ -3586,8 +3734,10 @@ async def handle_alias_route(  # noqa: PLR0915
                                 pass
                     finally:
                         # Release probe lock FIRST (unconditional, before any
-                        # resolver call that might raise).
-                        probe_lock.release()
+                        # resolver call that might raise). Healthy traffic never
+                        # holds this lock during provider I/O.
+                        if probe_lock is not None and probe_lock.locked():
+                            probe_lock.release()
 
                     renewal_error_type = getattr(
                         sa,
@@ -3791,8 +3941,9 @@ async def handle_alias_route(  # noqa: PLR0915
                                 error_class="token_invalidated",
                                 add_alias_metadata_fn=add_alias_metadata_fn,
                             )
-                            intent.complete(error=probe_failure_exc)
-                            alias_routing_state.publication_intents.remove(intent)
+                            if intent is not None:
+                                intent.complete(error=probe_failure_exc)
+                                alias_routing_state.publication_intents.remove(intent)
                             attempt_record = _codex_auto_agent_candidate_public_shape(
                                 candidate,
                                 lane_key=selection.get("lane_key"),
@@ -3876,11 +4027,13 @@ async def handle_alias_route(  # noqa: PLR0915
                                     probe_failure_plan.kimi_failure_metadata
                                 ),
                             )
-                        intent.plan = probe_failure_plan
+                        if intent is not None:
+                            intent.plan = probe_failure_plan
 
                     if skip_after_probe_wait:
-                        intent.complete()
-                        alias_routing_state.publication_intents.remove(intent)
+                        if intent is not None:
+                            intent.complete()
+                            alias_routing_state.publication_intents.remove(intent)
                         if alpha_probe_terminal_exc is not None:
                             _raise_terminal_alias_failure(
                                 alpha_probe_terminal_exc,
@@ -3905,8 +4058,9 @@ async def handle_alias_route(  # noqa: PLR0915
                             # promotion and authoritative success callbacks
                             # remain deferred until the stream finalizer has
                             # validated the complete response.
-                            intent.complete()
-                            alias_routing_state.publication_intents.remove(intent)
+                            if intent is not None:
+                                intent.complete()
+                                alias_routing_state.publication_intents.remove(intent)
                             return response
                         else:
                             await _commit_candidate_success()
@@ -4036,7 +4190,8 @@ async def handle_alias_route(  # noqa: PLR0915
                                 else None
                             ),
                         )
-                        intent.plan = probe_failure_plan
+                        if intent is not None:
+                            intent.plan = probe_failure_plan
                     skip_cooldown_for_same_account_retry = (
                         not prefer_account_failover
                         and
@@ -4097,12 +4252,13 @@ async def handle_alias_route(  # noqa: PLR0915
                             transaction_result=publication_transaction_result,
                         )
                     # Mutation complete (or no plan): signal intent.
-                    intent.complete(error=probe_failure_exc)
-                    alias_routing_state.publication_intents.remove(intent)
+                    if intent is not None:
+                        intent.complete(error=probe_failure_exc)
+                        alias_routing_state.publication_intents.remove(intent)
                 except BaseException as cleanup_exc:
                     # BaseException-safe: covers CancelledError, KeyboardInterrupt,
                     # SystemExit, and any exception from cooldown mutation.
-                    if not intent.done.is_set():
+                    if intent is not None and not intent.done.is_set():
                         intent.complete(error=cleanup_exc)
                         alias_routing_state.publication_intents.remove(intent)
                     raise
