@@ -4833,6 +4833,10 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.tool_call_restore import (
         _restore_adapted_namespace_tool_calls_in_response_body,
     )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity import (
+        close_retained_session_once,
+        transfer_or_close_retained_session,
+    )
     from litellm.proxy.pass_through_endpoints.aawm_request_policy.codex_tool_policy import (
         _adapt_codex_namespace_tools_to_functions_from_request_body,
     )
@@ -4979,6 +4983,8 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             close_retained_session=False,
         )
         _record_cursor_replay_outcome(previous_response_id, replay_state, "claimed")
+        # CURSOR-035 leftover handoff (distinct from archived CURSOR-016).
+        transferred = False
         try:
             result = await retained_session.continue_with_tool_outputs(
                 cursor_tool_outputs
@@ -4998,33 +5004,21 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
                 previous_response_id=None,
                 replay_state=None,
             )
-        except Exception as exc:
-            await retained_session.aclose()
             _record_cursor_replay_outcome(
                 previous_response_id, replay_state, "consumed"
             )
-            _mark_cursor_retained_transport_failure(
-                exc,
-                session=retained_session,
-                replay_state=replay_state,
-                full_history=full_history_continuation,
+            model = str(candidate.get("model") or request_body.get("model") or "")
+            response_body = _cursor_responses_response_body(
+                model=model,
+                result=result,
             )
-            raise
-        _record_cursor_replay_outcome(
-            previous_response_id, replay_state, "consumed"
-        )
-
-        model = str(candidate.get("model") or request_body.get("model") or "")
-        response_body = _cursor_responses_response_body(
-            model=model,
-            result=result,
-        )
-        response_body, _ = _restore_adapted_namespace_tool_calls_in_response_body(
-            response_body,
-            request_body=restoration_request_body,
-            adapter_model=adapter_model,
-        )
-        try:
+            response_body, _ = (
+                _restore_adapted_namespace_tool_calls_in_response_body(
+                    response_body,
+                    request_body=restoration_request_body,
+                    adapter_model=adapter_model,
+                )
+            )
             replay_messages = _cursor_messages_with_result_tool_calls(
                 messages,
                 [
@@ -5033,22 +5027,44 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
                 ],
                 result.text,
             )
-        except _CursorPostEgressOutputError as exc:
-            _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
-        if result.tool_calls:
-            next_session = result.retained_session
-            _store_cursor_replay_state(
-                response_body["id"],
-                messages=replay_messages,
-                tools=request_tools if isinstance(request_tools, list) else [],
-                retained_session=next_session,
-                owner_scope=owner_scope,
-                pending_call_ids=[call["call_id"] for call in result.tool_calls],
+            if result.tool_calls:
+                next_session = result.retained_session
+                transferred = await transfer_or_close_retained_session(
+                    session=retained_session,
+                    next_session=next_session,
+                    store=lambda: _store_cursor_replay_state(
+                        response_body["id"],
+                        messages=replay_messages,
+                        tools=(
+                            request_tools
+                            if isinstance(request_tools, list)
+                            else []
+                        ),
+                        retained_session=next_session,
+                        owner_scope=owner_scope,
+                        pending_call_ids=[
+                            call["call_id"] for call in result.tool_calls
+                        ],
+                    ),
+                )
+            else:
+                await close_retained_session_once(retained_session)
+        except BaseException as exc:
+            if not transferred:
+                await close_retained_session_once(retained_session)
+            _record_cursor_replay_outcome(
+                previous_response_id, replay_state, "consumed"
             )
-            if next_session is None:
-                await retained_session.aclose()
-        else:
-            await retained_session.aclose()
+            if isinstance(exc, Exception):
+                _mark_cursor_retained_transport_failure(
+                    exc,
+                    session=retained_session,
+                    replay_state=replay_state,
+                    full_history=full_history_continuation,
+                )
+            if isinstance(exc, _CursorPostEgressOutputError):
+                _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
+            raise
         _record_adapted_completed_route_rollup_turn(
             rollup_kwargs,
             adapter_label="Cursor Agent",
