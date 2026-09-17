@@ -62,6 +62,7 @@ W6B_OWNED_SYMBOLS: set[str] = {
     "_event_sequence_number",
     "_ensure_reasoning_item_summary",
     "_ensure_response_text_format",
+    "_ensure_responses_event_indexes",
     "_ensure_grok_responses_sse_compat",
     "_reattach_sequence_number_json",
     "_responses_event_text_key",
@@ -414,6 +415,21 @@ class TestSerializeResponsesAdapterResponse:
         )
         assert result["response"]["text"] == {"format": {"type": "text"}}
         assert result["sequence_number"] == 9
+
+    def test_stamps_summary_index_on_reasoning_summary_delta(self):
+        result = json.loads(
+            sse_mod._serialize_responses_adapter_response(
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "delta": "The",
+                    "sequence_number": 4,
+                }
+            )
+        )
+        assert result["summary_index"] == 0
+        assert result["delta"] == "The"
 
 
 # ===========================================================================
@@ -1363,6 +1379,7 @@ class TestInstallRebinding:
             assert set(host) == W6B_OWNED_SYMBOLS | {
                 "SimpleNamespace",
                 "RESPONSES_API_TERMINAL_STREAM_EVENTS",
+                "_GROK_SSE_DEFAULT_INDEX_FIELDS",
                 "sentinel",
             }
         finally:

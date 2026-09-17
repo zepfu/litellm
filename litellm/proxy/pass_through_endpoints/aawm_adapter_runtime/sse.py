@@ -63,6 +63,7 @@ _HOST_FUNCTION_NAMES = (
     "_event_sequence_number",
     "_ensure_reasoning_item_summary",
     "_ensure_response_text_format",
+    "_ensure_responses_event_indexes",
     "_ensure_grok_responses_sse_compat",
     "_reattach_sequence_number_json",
     "_responses_event_text_key",
@@ -73,9 +74,24 @@ _HOST_FUNCTION_NAMES = (
     "_build_anthropic_streaming_response_from_completion_adapter_stream",
 )
 
+_GROK_SSE_DEFAULT_INDEX_FIELDS: dict[str, tuple[str, ...]] = {
+    "response.reasoning_summary_text.delta": ("summary_index",),
+    "response.reasoning_summary_text.done": ("summary_index",),
+    "response.reasoning_summary_part.added": ("summary_index",),
+    "response.reasoning_summary_part.done": ("summary_index",),
+    "response.output_text.delta": ("content_index",),
+    "response.output_text.done": ("content_index",),
+    "response.output_text.annotation.added": ("content_index", "annotation_index"),
+    "response.content_part.added": ("content_index",),
+    "response.content_part.done": ("content_index",),
+    "response.refusal.delta": ("content_index",),
+    "response.refusal.done": ("content_index",),
+}
+
 _HOST_GLOBAL_DEFAULTS = (
     ("SimpleNamespace", SimpleNamespace),
     ("RESPONSES_API_TERMINAL_STREAM_EVENTS", RESPONSES_API_TERMINAL_STREAM_EVENTS),
+    ("_GROK_SSE_DEFAULT_INDEX_FIELDS", _GROK_SSE_DEFAULT_INDEX_FIELDS),
 )
 
 
@@ -229,6 +245,24 @@ def _ensure_response_text_format(response: Any) -> bool:
     return True
 
 
+def _ensure_responses_event_indexes(payload: dict[str, Any]) -> bool:
+    """Stamp missing integer indexes Grok Build requires on Responses SSE events."""
+
+    event_type = payload.get("type")
+    if not isinstance(event_type, str):
+        return False
+    fields = _GROK_SSE_DEFAULT_INDEX_FIELDS.get(event_type)
+    if not fields:
+        return False
+    changed = False
+    for field in fields:
+        if field in payload:
+            continue
+        payload[field] = 0
+        changed = True
+    return changed
+
+
 def _ensure_grok_responses_sse_compat(payload: dict[str, Any]) -> dict[str, Any]:
     item = payload.get("item")
     if isinstance(item, dict):
@@ -241,6 +275,7 @@ def _ensure_grok_responses_sse_compat(payload: dict[str, Any]) -> dict[str, Any]
         if isinstance(output, list):
             for entry in output:
                 _ensure_reasoning_item_summary(entry)
+    _ensure_responses_event_indexes(payload)
     return payload
 
 
