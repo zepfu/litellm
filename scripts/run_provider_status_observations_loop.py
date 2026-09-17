@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import http.client
 import importlib
+import inspect
 import json
 import math
 import os
@@ -9630,6 +9631,8 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
 
 def _build_codex_quota_observation_db_payload(
     observation: Mapping[str, Any],
+    *,
+    inventory_generation: Optional[str] = None,
 ) -> tuple[Any, ...]:
     """Map one finalized Codex quota row onto the rate-limit insert contract.
 
@@ -9673,6 +9676,9 @@ def _build_codex_quota_observation_db_payload(
             remaining_pct = max(0.0, min(100.0, 100.0 - used_percentage))
         elif bool(observation.get("exhausted")):
             remaining_pct = 0.0
+    evidence = dict(observation.get("evidence") or {})
+    if inventory_generation is not None:
+        evidence["codex_oauth_inventory_generation"] = inventory_generation
     return (
         observation["observed_at"],
         client,
@@ -9696,7 +9702,7 @@ def _build_codex_quota_observation_db_payload(
             )
         ),
         json.dumps(
-            _json_safe_codex_quota_value(observation.get("evidence") or {})
+            _json_safe_codex_quota_value(evidence)
         ),
         observation.get("source"),
         observation.get("session_id"),
@@ -9705,9 +9711,32 @@ def _build_codex_quota_observation_db_payload(
     )
 
 
+def _call_codex_observation_writer(
+    writer: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+    *,
+    inventory_generation: Optional[str],
+) -> Any:
+    """Preserve two-argument writer seams while stamping current generations."""
+    generation_kwargs = dict(kwargs)
+    generation_kwargs["inventory_generation"] = inventory_generation
+    try:
+        signature = inspect.signature(writer)
+    except (TypeError, ValueError):
+        return writer(*args, **generation_kwargs)
+    try:
+        signature.bind(*args, **generation_kwargs)
+    except TypeError:
+        return writer(*args, **kwargs)
+    return writer(*args, **generation_kwargs)
+
+
 def _persist_codex_quota_observations(
     config: ProviderStatusLoopConfig,
     observations: Sequence[Dict[str, Any]],
+    *,
+    inventory_generation: Optional[str] = None,
 ) -> int:
     if not observations:
         return 0
@@ -9725,7 +9754,10 @@ def _persist_codex_quota_observations(
                     for observation in observations:
                         cur.execute(
                             GROK_BILLING_RATE_LIMIT_INSERT_SQL,
-                            _build_codex_quota_observation_db_payload(observation),
+                            _build_codex_quota_observation_db_payload(
+                                observation,
+                                inventory_generation=inventory_generation,
+                            ),
                         )
                         inserted_count += max(0, cur.rowcount)
             except (
@@ -9768,6 +9800,7 @@ def _persist_codex_reset_credit_observation(
     attempt_count: int,
     retry_count: int,
     poll_url: Optional[str] = None,
+    inventory_generation: Optional[str] = None,
 ) -> tuple[int, int]:
     resolved_poll_url = poll_url or _resolve_codex_reset_credit_poll_url(config)
     observations = _build_codex_reset_credit_observations(
@@ -9827,6 +9860,17 @@ def _persist_codex_reset_credit_observation(
         poll_url=resolved_poll_url,
     )
     rows = observations + seed_rows + lifecycle_rows
+    if inventory_generation is not None:
+        rows = [
+            {
+                **row,
+                "evidence": {
+                    **(row.get("evidence") or {}),
+                    "codex_oauth_inventory_generation": inventory_generation,
+                },
+            }
+            for row in rows
+        ]
     dsn = _resolve_dsn(config)
     inserted_count = probes.insert_provider_credit_observations(
         dsn,
@@ -9967,17 +10011,19 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
                     )
                 )
                 if config.apply:
-                    credit_count, credit_inserted = (
-                        _persist_codex_reset_credit_observation(
-                            config,
-                            observed_at=observed_at,
-                            response_body=detail_fetch["payload"],
-                            auth_context=detail_fetch["auth_context"],
-                            status_code=detail_fetch["status_code"],
-                            attempt_count=summary["attempt_count"],
-                            retry_count=summary["retry_count"],
-                            poll_url=detail_fetch.get("poll_url"),
-                        )
+                    credit_count, credit_inserted = _call_codex_observation_writer(
+                        _persist_codex_reset_credit_observation,
+                        (config,),
+                        {
+                            "observed_at": observed_at,
+                            "response_body": detail_fetch["payload"],
+                            "auth_context": detail_fetch["auth_context"],
+                            "status_code": detail_fetch["status_code"],
+                            "attempt_count": summary["attempt_count"],
+                            "retry_count": summary["retry_count"],
+                            "poll_url": detail_fetch.get("poll_url"),
+                        },
+                        inventory_generation=inventory_generation,
                     )
                     summary["credit_observation_count"] = credit_count
                     summary["credit_inserted_count"] = credit_inserted
@@ -10031,11 +10077,11 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
                 else:
                     summary["quota_health"] = "degraded"
                 if config.apply and quota_observations:
-                    summary["quota_inserted_count"] = (
-                        _persist_codex_quota_observations(
-                            config,
-                            quota_observations,
-                        )
+                    summary["quota_inserted_count"] = _call_codex_observation_writer(
+                        _persist_codex_quota_observations,
+                        (config, quota_observations),
+                        {},
+                        inventory_generation=inventory_generation,
                     )
                     summary["quota_storage_status"] = "persisted"
                 elif not config.apply:
