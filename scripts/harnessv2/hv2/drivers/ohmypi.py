@@ -495,13 +495,24 @@ class OhmypiDriver:
         deadline = time.time() + timeout
         while time.time() < deadline:
             pane = self.capture_pane()
-            if any(token in pane for token in busy_needles):
-                time.sleep(interval)
-                continue
-            if any(token in pane for token in idle_needles):
+            if self._pane_is_idle(pane, idle_needles=idle_needles, busy_needles=busy_needles):
                 return True
             time.sleep(interval)
         return False
+
+    def _pane_is_idle(
+        self,
+        pane: str,
+        *,
+        idle_needles: Sequence[str] | None = None,
+        busy_needles: Sequence[str] | None = None,
+    ) -> bool:
+        select = self._select_spec()
+        idle = [str(item) for item in (idle_needles or as_str_list(select.get("idle_needles")))]
+        busy = [str(item) for item in (busy_needles or as_str_list(select.get("busy_needles")))]
+        if any(token in pane for token in busy if token):
+            return False
+        return any(token in pane for token in idle if token)
 
     def _session_env_pairs(self) -> list[str]:
         child = self.child_env()
@@ -619,6 +630,12 @@ class OhmypiDriver:
                 mcp_needles,
                 timeout_seconds=self._tmux_float("wait_mcp_seconds", 30),
             )
+            if not mcp_ready:
+                # Ohmypi 18.2.4 idle composer can omit MCP chrome entirely.
+                # Selected alias plus idle footer is enough to send the prompt.
+                pane_now = self.capture_pane()
+                if self.pane_has_selector(model, pane_now) and self._pane_is_idle(pane_now):
+                    mcp_ready = True
         if not selected:
             # Alias chrome can paint after MCP connect on long model ids.
             selected = self.wait_for_pane(

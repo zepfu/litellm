@@ -1,0 +1,24 @@
+│      Welcome back!       │ # for prompt actions                            │
+│                          │ / for commands                                  │
+│       ████████████       │ ! to run bash                                   │
+│          ██  ██          │ $ to run python                                 │
+│          ██  ██          │ ─────────────────────────────────────────────── │
+│          ▒▒  ██          │ LSP Servers                                     │
+│              ██          │ No LSP servers                                  │
+│                          │                                                 │
+│   AAWM alias sota-xai    │                                                 │
+│litellm-alpha-passthrough │                                                 │
+│                          │ ─────────────────────────────────────────────── │
+│                          │ Recent sessions                                 │
+│                          │ No recent sessions                              │
+│                          │                                                 │
+│                          │                                                 │
+│                          │                                                 │
+│                          │                                                 │
+╰──────────────────────────┴─────────────────────────────────────────────────╯
+ Tip: Press shift+tab to cycle through reasoning effort levels
+
+
+╭── π > ◕ AAWM alias sota-xai > 🗑 omp-alpha-workspace ▶──11%────────╎┃──128K───╮
+╰─                                                                            ─╯
+interactive

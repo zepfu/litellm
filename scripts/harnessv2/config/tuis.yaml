@@ -91,6 +91,7 @@ tuis:
       idle_needles:
         - "╰─"
         - "π  >"
+        - "π >"
         - "Default model:"
       # In-flight chrome only. Launch splash (Welcome back / Recent
       # sessions / Connecting to MCP / Discovering available models)
@@ -112,6 +113,9 @@ tuis:
         # OhMyPi 17.4.2 header chrome. The following " >" keeps "work"
         # from matching "work-other".
         - "╭── π  > ⬢ {model} >"
+        # OhMyPi 18.2.4 composer chrome. One space after π; selected
+        # alias is prefixed with AAWM alias, not a raw model id.
+        - "╭── π > ◕ AAWM alias {model} >"
       # Recap is wait-only. Exact PONG is NOT a substring wait needle:
       # recent-session titles can contain the word PONG. Live PONG is a
       # standalone exact pane line after a prompt echo newer than the
