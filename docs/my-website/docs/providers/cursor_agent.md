@@ -16,6 +16,49 @@ Cloud Agents stay on `custom_llm_provider="cursor"` and
 `LITELLM_PROXY_BASE_URL/cursor`. Do not send Agent CLI turns through
 `/cursor` or `api.cursor.com`. This route is not `openai_like`.
 
+## Inbound CLI intercept (`--agent-endpoint`)
+
+The default CLI turn is HTTP/2 Connect `POST /agent.v1.AgentService/Run` on
+Cursor `agentn` (`https://agentn.global.api5.cursor.sh`). LiteLLM intercepts
+that turn only when the client passes hidden `--agent-endpoint <url>` at a
+named container (`:4000` prod `cursoral`, `:4001` dev `cursoralt`, `:4011`
+alpha `cursorala`). The flag has no environment twin; do not invent
+`CURSOR_AGENT_ENDPOINT`.
+
+`CURSOR_API_ENDPOINT` / `--endpoint` is dashboard login on
+`https://api2.cursor.sh` only. Pointing it at a LiteLLM host drops stored
+`api2` login and never intercepts HTTP/2 `Run`. A mis-aimed dashboard
+override is an auth/login failure, not a successful turn intercept. Default
+(no `--agent-endpoint`) still uses server `agentnUrl` / `agentUrl`, not
+LiteLLM `/cursor`.
+
+Host wrappers pass `--agent-endpoint` and must not set `CURSOR_API_ENDPOINT`
+to LiteLLM. Example:
+
+```bash
+cursor-agent --agent-endpoint http://127.0.0.1:4011 --print "hello"
+```
+
+Inbound `Run` requires HTTP/2. HTTP/1.1 on that path is rejected (`505
+http2_required`). Named containers start Hypercorn (`--run_hypercorn`) so
+prior-knowledge HTTP/2 can complete the handshake without converting the
+whole proxy. HTTP/1.1 `RunSSE` + `BidiAppend` is a compatibility lane, not
+the first inbound landing and not a substitute for HTTP/2 `Run`.
+
+Inbound auth is `Authorization: Bearer <accessToken>` from stored login /
+`CURSOR_AUTH_TOKEN`. `CURSOR_CLI_KEY` does not authenticate the route.
+Cloud Agents Basic `API_KEY:` is unchanged on `/cursor` and is not accepted
+here. Raw `CURSOR_API_KEY` is not sent as the Connect credential; API-key
+exchange stays on `api2`.
+
+`session_history` / Langfuse rows for inbound `Run` use provider
+`cursor_agent_cli_inbound`, tags `route:cursor_agent_cli_inbound` /
+`inbound-versus-outbound:inbound`, and metadata
+`inbound_versus_outbound=inbound`. They are not outbound `cursor_agent`
+adapter rows (`codex-cursor-agent-aiserver-adapter`) and not Cloud Agents
+`cursor:agent:*` `/v0` operations. Inbound turns do not write candidate-loop
+tool-activity rows.
+
 ## API key
 
 The raw API key is **not** the request credential. LiteLLM sends
@@ -287,6 +330,7 @@ cleanup path without promoting the pending owner.
 
 - Cloud Agents `/v0/agents` on `https://api.cursor.com`
 - OpenAI `/v1/chat/completions`
-- HTTP/1.1 `RunSSE` + `BidiAppend`
+- A substitute first landing of HTTP/1.1 `RunSSE` + `BidiAppend` for HTTP/2 `Run`
 - A `cursor-agent` / `agent` subprocess
 - Cloud Agents `GET /v0/me` usage
+- `CURSOR_API_ENDPOINT` / `--endpoint` aimed at LiteLLM as a turn intercept

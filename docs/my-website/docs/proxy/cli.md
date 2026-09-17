@@ -105,7 +105,7 @@ This page documents all command-line interface (CLI) arguments available for the
 ### --run_hypercorn
    - **Default:** `False`
    - **Type:** `bool` (Flag)
-   - Starts proxy via hypercorn instead of uvicorn. Supports HTTP/2.
+   - Starts proxy via hypercorn instead of uvicorn. Supports HTTP/2, including inbound Cursor Agent CLI Connect `POST /agent.v1.AgentService/Run` on `--agent-endpoint`. Named `litellm-dev` / `litellm-alpha` compose commands pass this flag. Other HTTP/1.1 LiteLLM routes keep working. This is not an HTTP/1.1 `RunSSE` substitute.
    - **Usage:** 
      ```shell
      litellm --run_hypercorn
