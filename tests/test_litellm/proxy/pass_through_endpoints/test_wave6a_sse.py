@@ -57,6 +57,10 @@ W6B_OWNED_SYMBOLS: set[str] = {
     "_iterate_responses_sse_events",
     "_mapping_or_attr_get",
     "_coerce_namespace_to_mapping",
+    "_coerce_sequence_number",
+    "_ensure_responses_sse_sequence_number",
+    "_event_sequence_number",
+    "_reattach_sequence_number_json",
     "_responses_event_text_key",
     "_responses_stream_event_summary",
     "_responses_repaired_output_item_id",
@@ -350,6 +354,17 @@ class TestSerializeResponsesAdapterResponse:
         result = sse_mod._serialize_responses_adapter_response({"a": 1})
         assert json.loads(result) == {"a": 1}
 
+    def test_reattaches_sequence_number_dropped_by_model_dump_json(self):
+        class FakeModel:
+            def __init__(self):
+                self.__dict__["sequence_number"] = 3
+
+            def model_dump_json(self, exclude_none: bool = False) -> str:
+                return '{"type":"response.created"}'
+
+        result = json.loads(sse_mod._serialize_responses_adapter_response(FakeModel()))
+        assert result == {"type": "response.created", "sequence_number": 3}
+
 
 # ===========================================================================
 # SECTION 6: Behavior tests - _iterate_responses_sse_events
@@ -488,6 +503,43 @@ class TestResponsesSSEFromIterator:
         assert chunks[0].startswith("event: response.created\n")
         assert "data: " in chunks[0]
         assert chunks[-1] == "data: [DONE]\n\n"
+
+    def test_stamps_sequence_number_when_missing(self):
+        async def events():
+            yield {"type": "response.created", "response": {"id": "r1"}}
+            yield {
+                "type": "response.completed",
+                "response": {"id": "r1", "status": "completed", "output": []},
+            }
+
+        chunks = _run(_collect_agen(sse_mod._responses_sse_from_iterator(events())))
+        payloads = []
+        for chunk in chunks:
+            if not chunk.startswith("event:") or "data: " not in chunk:
+                continue
+            payloads.append(json.loads(chunk.split("data: ", 1)[1]))
+        assert [p["type"] for p in payloads] == [
+            "response.created",
+            "response.completed",
+        ]
+        assert [p["sequence_number"] for p in payloads] == [1, 2]
+
+    def test_preserves_existing_sequence_number(self):
+        async def events():
+            yield {"type": "response.created", "sequence_number": 7, "id": "r1"}
+            yield {
+                "type": "response.completed",
+                "sequence_number": 8,
+                "response": {"id": "r1", "status": "completed", "output": []},
+            }
+
+        chunks = _run(_collect_agen(sse_mod._responses_sse_from_iterator(events())))
+        payloads = [
+            json.loads(chunk.split("data: ", 1)[1])
+            for chunk in chunks
+            if chunk.startswith("event:") and "data: " in chunk
+        ]
+        assert [p["sequence_number"] for p in payloads] == [7, 8]
 
     def test_stamps_aawm_route_identity_from_iterator_metadata(self):
         class MetaIter:
@@ -1260,6 +1312,7 @@ class TestInstallRebinding:
             assert host["sentinel"] is sentinel
             assert set(host) == W6B_OWNED_SYMBOLS | {
                 "SimpleNamespace",
+                "RESPONSES_API_TERMINAL_STREAM_EVENTS",
                 "sentinel",
             }
         finally:
