@@ -109,6 +109,20 @@ def test_require_inbound_cli_bearer_does_not_use_raw_api_key_env(monkeypatch) ->
     assert exc.value.reason == "missing_authorization"
 
 
+def test_require_inbound_cli_bearer_does_not_use_auth_token_env(monkeypatch) -> None:
+    monkeypatch.setenv("CURSOR_AUTH_TOKEN", "stored-access-token-is-not-a-header")
+    with pytest.raises(InboundCursorAgentCliAuthError) as exc:
+        require_inbound_cli_bearer({})
+    assert exc.value.reason == "missing_authorization"
+
+
+def test_require_inbound_cli_bearer_rejects_empty_bearer() -> None:
+    with pytest.raises(InboundCursorAgentCliAuthError) as exc:
+        require_inbound_cli_bearer({"Authorization": "Bearer   "})
+    assert exc.value.reason == "empty_bearer"
+    assert exc.value.status_code == 401
+
+
 def test_inbound_session_history_kwargs_are_inbound_cli_not_adapters() -> None:
     kwargs = build_inbound_cli_session_history_kwargs(
         call_id="call-1",
@@ -132,7 +146,9 @@ def test_inbound_session_history_kwargs_are_inbound_cli_not_adapters() -> None:
     assert metadata["trace_name"] == CURSOR_AGENT_CLI_INBOUND_TRACE_NAME
     assert metadata["cursor_connect_method"] == "Run"
     assert "route:cursor_agent_cli_inbound" in tags
+    assert "inbound-versus-outbound:inbound" in tags
     assert "codex-cursor-agent-aiserver-adapter" not in tags
+    assert "anthropic-cursor-agent-aiserver-adapter" not in tags
     assert "cursor:agent:create" not in tags
     assert "authorization" not in kwargs["litellm_params"]["proxy_server_request"]["headers"]
     assert kwargs["standard_logging_object"]["session_id"] == "conv-1"
@@ -175,12 +191,17 @@ def test_build_session_history_record_for_inbound_cli() -> None:
     assert "inbound_cli_error" not in metadata
     request_tags = metadata.get("request_tags") or []
     assert "route:cursor_agent_cli_inbound" in request_tags
+    assert "inbound-versus-outbound:inbound" in request_tags
     assert "codex-cursor-agent-aiserver-adapter" not in request_tags
+    assert "anthropic-cursor-agent-aiserver-adapter" not in request_tags
     assert "cursor:agent:create" not in request_tags
     assert record["client_name"] == "cursor-cli"
     assert record["client_version"] == "2026.09.08-6caf4ff"
     assert record["client_user_agent"].startswith("Cursor-CLI/")
     assert record["litellm_environment"] or record["litellm_version"]
+    assert record["provider"] not in {"cursor_agent", "cursor"}
+    assert record.get("tool_activity") in (None, [])
+    assert (record.get("tool_call_count") or 0) == 0
 
 
 class _FakeSession:
@@ -191,6 +212,10 @@ class _FakeSession:
         self.response_status = 200
         self.closed = False
         self._chunks = [b"upstream-connect-bytes"]
+        self.reader_termination_event = asyncio.Event()
+        self._flush_termination_event = asyncio.Event()
+        self.upstream_termination_reason: Optional[str] = None
+        self.flush_termination_reason: Optional[str] = None
 
     async def open(self, request_headers):
         self.opened_headers = request_headers
@@ -205,20 +230,27 @@ class _FakeSession:
         for chunk in self._chunks:
             yield chunk
 
-    async def aclose(self) -> None:
+    async def aclose(self, reason: str = "normal_response") -> bool:
         self.closed = True
+        return True
 
 
 @pytest.mark.asyncio
-async def test_proxy_inbound_cli_run_forwards_bearer_and_body() -> None:
+async def test_proxy_inbound_cli_run_forwards_bearer_and_body(monkeypatch) -> None:
+    monkeypatch.setenv("CURSOR_API_KEY", "raw-key-must-not-be-sent")
+    monkeypatch.setenv(CURSOR_CLI_KEY_ENV, "cli-key-must-be-ignored")
     session = _FakeSession()
     sent: List[Dict[str, Any]] = []
     request_messages = [
         {"type": "http.request", "body": _run_frame(), "more_body": False},
     ]
+    parked = asyncio.Event()
 
     async def receive():
-        return request_messages.pop(0)
+        if request_messages:
+            return request_messages.pop(0)
+        await parked.wait()
+        return {"type": "http.disconnect"}
 
     async def send(message):
         sent.append(message)
@@ -248,6 +280,9 @@ async def test_proxy_inbound_cli_run_forwards_bearer_and_body() -> None:
 
     assert session.opened_headers is not None
     assert ("authorization", "Bearer cursor-access-token") in session.opened_headers
+    assert ("authorization", "Bearer raw-key-must-not-be-sent") not in session.opened_headers
+    assert all("raw-key-must-not-be-sent" not in value for _name, value in session.opened_headers)
+    assert all("cli-key-must-be-ignored" not in value for _name, value in session.opened_headers)
     assert ("te", "trailers") in session.opened_headers
     assert any(b"cursor-access-token" != chunk for chunk in session.written) or session.written
     assert b"raw-key" not in b"".join(session.written)
@@ -329,6 +364,13 @@ async def test_proxy_inbound_cli_run_rejects_http1() -> None:
         )
     start = next(message for message in sent if message.get("type") == "http.response.start")
     assert start["status"] == 505
+    assert start["status"] != 404
+    body = next(message["body"] for message in sent if message.get("type") == "http.response.body")
+    assert b"http2_required" in body
+    persist.assert_awaited()
+    persist_kwargs = persist.await_args.kwargs
+    assert persist_kwargs["connect_method"] == "Run"
+    assert persist_kwargs["http_version"] == "1.1"
 
 
 def test_connect_header_flush_frame_is_empty_asgi_body() -> None:
@@ -448,14 +490,19 @@ async def test_proxy_inbound_cli_run_starts_response_before_client_end_body() ->
     client_ended = asyncio.Event()
     first_chunk = {"type": "http.request", "body": _run_frame(), "more_body": True}
 
+    parked = asyncio.Event()
+
     async def receive():
         if first_chunk:
             message = dict(first_chunk)
             first_chunk.clear()
             return message
         await response_started.wait()
-        client_ended.set()
-        return {"type": "http.request", "body": b"", "more_body": False}
+        if not client_ended.is_set():
+            client_ended.set()
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await parked.wait()
+        return {"type": "http.disconnect"}
 
     async def send(message):
         sent.append(message)
@@ -513,14 +560,21 @@ async def test_inbound_middleware_bypasses_fastapi_before_end_body() -> None:
     sent: List[Dict[str, Any]] = []
     response_started = asyncio.Event()
     first_chunk = {"type": "http.request", "body": _run_frame(), "more_body": True}
+    parked = asyncio.Event()
+    body_ended = False
 
     async def receive():
+        nonlocal body_ended
         if first_chunk:
             message = dict(first_chunk)
             first_chunk.clear()
             return message
         await response_started.wait()
-        return {"type": "http.request", "body": b"", "more_body": False}
+        if not body_ended:
+            body_ended = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await parked.wait()
+        return {"type": "http.disconnect"}
 
     async def send(message):
         sent.append(message)
@@ -571,9 +625,10 @@ async def test_proxy_inbound_cli_run_persists_when_client_disconnects_before_ups
             if False:
                 yield b""
 
-        async def aclose(self) -> None:
+        async def aclose(self, reason: str = "normal_response") -> bool:
             self.closed = True
             self._closed.set()
+            return await super().aclose(reason=reason)
 
     session = _HangUntilClosedSession()
     sent: List[Dict[str, Any]] = []
@@ -837,9 +892,10 @@ async def test_proxy_inbound_cli_runsse_and_bidiappend_share_agentn_lane() -> No
             for chunk in list(self._chunks):
                 yield chunk
 
-        async def aclose(self) -> None:
+        async def aclose(self, reason: str = "normal_response") -> bool:
             self.closed = True
             self._closed.set()
+            return True
 
     session = _LaneSession()
     lanes = _Http1LaneRegistry()
@@ -866,10 +922,13 @@ async def test_proxy_inbound_cli_runsse_and_bidiappend_share_agentn_lane() -> No
     sent_append: List[Dict[str, Any]] = []
     response_started = asyncio.Event()
 
+    parked = asyncio.Event()
+
     async def receive_runsse():
         if runsse_messages:
             return runsse_messages.pop(0)
         await response_started.wait()
+        await parked.wait()
         return {"type": "http.disconnect"}
 
     async def send_runsse(message):
@@ -877,8 +936,13 @@ async def test_proxy_inbound_cli_runsse_and_bidiappend_share_agentn_lane() -> No
         if message.get("type") == "http.response.start":
             response_started.set()
 
+    append_parked = asyncio.Event()
+
     async def receive_append():
-        return append_messages.pop(0)
+        if append_messages:
+            return append_messages.pop(0)
+        await append_parked.wait()
+        return {"type": "http.disconnect"}
 
     async def send_append(message):
         sent_append.append(message)

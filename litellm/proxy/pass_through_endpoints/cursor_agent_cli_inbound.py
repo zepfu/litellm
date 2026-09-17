@@ -1484,7 +1484,7 @@ def _reduce_lifecycle_reasons(
                 if role == "flush"
                 else session.upstream_termination_reason
             )
-            if reason == "normal_response":
+            if reason in {"normal_response", None}:
                 continue
         elif role == "lane":
             reason = lane.termination_reason if lane is not None else None
@@ -1767,6 +1767,10 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
                     reason = session.upstream_termination_reason
                     if reason not in {"normal_response", None}:
                         candidate_reason = candidate_reason or str(reason)
+                elif task is flush_termination_task:
+                    reason = session.flush_termination_reason
+                    if reason not in {"normal_response", None}:
+                        candidate_reason = candidate_reason or str(reason)
 
             if response_task in done_tasks and candidate_reason == "client_disconnect":
                 try:
@@ -1798,6 +1802,16 @@ async def proxy_inbound_cli_run(  # noqa: PLR0915
             )
             if reduced_reason is not None:
                 candidate_reason = reduced_reason
+            if (
+                response_task is not None
+                and response_task.done()
+                and not response_task.cancelled()
+            ):
+                try:
+                    if response_task.result() == "normal_response":
+                        candidate_reason = "normal_response"
+                except (asyncio.CancelledError, Exception):
+                    pass
             if candidate_reason is not None:
                 termination_reason = _sanitize_termination_reason(candidate_reason)
                 break
@@ -2202,6 +2216,10 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
                     reason = session.upstream_termination_reason
                     if reason not in {"normal_response", None}:
                         candidate_reason = candidate_reason or str(reason)
+                elif task is flush_termination_task:
+                    reason = session.flush_termination_reason
+                    if reason not in {"normal_response", None}:
+                        candidate_reason = candidate_reason or str(reason)
             if response_task in done and candidate_reason == "client_disconnect":
                 try:
                     if response_task.result() == "normal_response":
@@ -2233,6 +2251,16 @@ async def proxy_inbound_cli_runsse(  # noqa: PLR0915
             )
             if reduced_reason is not None:
                 candidate_reason = reduced_reason
+            if (
+                response_task is not None
+                and response_task.done()
+                and not response_task.cancelled()
+            ):
+                try:
+                    if response_task.result() == "normal_response":
+                        candidate_reason = "normal_response"
+                except (asyncio.CancelledError, Exception):
+                    pass
             if candidate_reason is not None:
                 termination_reason = _sanitize_termination_reason(candidate_reason)
                 break
