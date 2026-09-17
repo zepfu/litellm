@@ -734,7 +734,7 @@ def test_healthy_same_key_traffic_skips_probe_lock_acquire() -> None:
         denied,
         remaining_candidate={"account_hash": "acct-b", "provider": "xai"},
     )
-    assert not candidate_loop._admission_identities_are_independent(
+    assert candidate_loop._admission_identities_are_independent(
         denied,
         remaining_candidate=None,
     )

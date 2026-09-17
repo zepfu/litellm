@@ -146,12 +146,16 @@ def _admission_identities_are_independent(
     remaining_candidate: Optional[Mapping[str, Any]] = None,
     remaining_selection: Optional[Mapping[str, Any]] = None,
 ) -> bool:
-    """True when a denied lane may yield to a different admission identity."""
+    """True when a denied lane may yield to a different admission identity.
+
+    Compare the denied decision to a remaining-lane identity, not to the
+    denied candidate itself. Missing remaining identity is independent.
+    """
     denied_hash = getattr(denied, "account_hash", None)
     denied_fingerprint = getattr(denied, "lane_fingerprint", None)
     denied_provider = str(getattr(denied, "provider", "") or "").strip().lower()
     if remaining_candidate is None:
-        return False
+        return True
     remaining_hash = resolve_candidate_account_hash(
         remaining_candidate, selection=remaining_selection
     )
@@ -2702,19 +2706,28 @@ async def handle_alias_route(  # noqa: PLR0915
                 account_failover_replay_safe=account_failover_replay_safe,
                 provider_status_code=attempt_record.get("error_status_code"),
             )
-            independent_lane_fallback = not _admission_denial_shares_account_hash(
-                admission_decision,
-                remaining_candidate=candidate,
-                remaining_selection=selection,
+            denied_hash = getattr(admission_decision, "account_hash", None)
+            remaining_hash = resolve_candidate_account_hash(
+                candidate, selection=selection
             )
-            if account_failover_planned:
-                independent_lane_fallback = True
-            if _admission_denial_shares_account_hash(
-                admission_decision,
-                remaining_candidate=candidate,
-                remaining_selection=selection,
-            ):
-                independent_lane_fallback = False
+            same_denied_identity = (
+                isinstance(denied_hash, str)
+                and bool(denied_hash.strip())
+                and remaining_hash == denied_hash.strip()
+            )
+            native_vs_managed_xai = (
+                str(candidate.get("provider") or "").strip().lower() == "xai"
+                and str(getattr(admission_decision, "provider", "") or "")
+                .strip()
+                .lower()
+                == "xai"
+                and isinstance(denied_hash, str)
+                and bool(denied_hash.strip())
+                and remaining_hash not in {None, denied_hash.strip()}
+            )
+            independent_lane_fallback = native_vs_managed_xai or (
+                account_failover_planned and not same_denied_identity
+            )
             if independent_lane_fallback:
                 _carry_native_openai_responses_owner_snapshot(
                     durable_source_snapshot
