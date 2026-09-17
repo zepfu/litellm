@@ -112,6 +112,7 @@ from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthCredentialRecord,
     CodexOAuthCredentialSnapshot,
     CodexOAuthInventory,
+    CodexOAuthInventoryError,
     codex_oauth_inventory_generation_digest,
     is_codex_oauth_inventory_generation,
     load_codex_oauth_credential,
@@ -200,6 +201,14 @@ CODEX_SIDECAR_DEFAULT_AUTH_PATHS = (
 )
 DEFAULT_CODEX_OAUTH_REFRESH_INTERVAL_SECONDS = 300.0
 DEFAULT_CODEX_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
+CODEX_OAUTH_INVENTORY_OBSERVATION_EVENT = (
+    "codex_oauth_inventory_observation"
+)
+CODEX_OAUTH_INVENTORY_OBSERVATION_AUTH_FAMILY = "codex_oauth_inventory"
+CODEX_OAUTH_INVENTORY_OBSERVATION_SCOPE = "inventory"
+CODEX_OAUTH_INVENTORY_OBSERVATION_SOURCE_TASK = (
+    "codex_oauth_inventory_observation"
+)
 DEFAULT_XAI_OAUTH_AUTH_FILE = xai_oauth_refresh.DEFAULT_XAI_OAUTH_AUTH_FILE
 DEFAULT_XAI_OAUTH_LOCK_FILE = FOUNDATION_DEFAULT_XAI_OAUTH_LOCK_FILE
 XAI_OAUTH_SIDECAR_AUTH_FILE_ENV_VARS = XAI_OAUTH_AUTH_FILE_ENV_VARS
@@ -1755,6 +1764,7 @@ class ProviderStatusLoopConfig:
 @dataclass
 class SidecarTaskState:
     next_generic_cycle_due_monotonic: Optional[float] = None
+    codex_oauth_inventory_last_observation_monotonic: Optional[float] = None
     grok_oidc_refresh_schedule: "OAuthRefreshScheduleState" = dataclass_field(
         default_factory=lambda: OAuthRefreshScheduleState()
     )
@@ -1985,7 +1995,13 @@ def _load_codex_inventory_for_config(
 ) -> Optional[CodexOAuthInventory]:
     if not refresh_enabled and not quota_poll_enabled and not health_poll_enabled:
         return None
-    return load_codex_oauth_inventory()
+    try:
+        return load_codex_oauth_inventory()
+    except CodexOAuthInventoryError:
+        # Keep the sidecar alive long enough to publish an explicit
+        # invalid/unconfigured inventory marker. Tasks that require the
+        # inventory still fail closed when they run.
+        return None
 
 
 def _codex_oauth_inventory_is_configured() -> bool:
@@ -7140,6 +7156,126 @@ def _persist_passive_provider_auth_observation(
     except Exception as exc:
         return False, 0, exc.__class__.__name__, _redacted_failure_message(str(exc))
     return True, inserted_count, None, None
+
+
+def _build_codex_oauth_inventory_observation(
+    config: ProviderStatusLoopConfig,
+    *,
+    observed_at: datetime,
+) -> Dict[str, Any]:
+    """Build one stable whole-inventory observation without credential reads."""
+    inventory_state = "valid"
+    inventory_generation: Optional[str] = None
+    account_count: Optional[int] = None
+    enabled_account_count: Optional[int] = None
+    error_class: Optional[str] = None
+    error_message: Optional[str] = None
+
+    try:
+        inventory = _resolve_codex_oauth_inventory(config)
+        if inventory is None:
+            inventory = load_codex_oauth_inventory()
+        inventory_generation = codex_oauth_inventory_generation_digest(inventory)
+        if not is_codex_oauth_inventory_generation(inventory_generation):
+            raise ValueError("Codex OAuth inventory generation is invalid.")
+        account_count = len(inventory.records)
+        enabled_account_count = sum(
+            1 for record in inventory.records if record.enabled
+        )
+    except Exception as exc:
+        inventory_state = (
+            "unconfigured"
+            if not _codex_oauth_inventory_is_configured()
+            else "invalid"
+        )
+        error_class = exc.__class__.__name__
+        error_message = (
+            "Codex OAuth inventory is not configured."
+            if inventory_state == "unconfigured"
+            else "Codex OAuth inventory is invalid."
+        )
+
+    metadata = {
+        "codex_oauth_inventory_generation": inventory_generation,
+        "inventory_state": inventory_state,
+        "account_count": account_count,
+        "enabled_account_count": enabled_account_count,
+        "observation_cadence_seconds": config.interval_seconds,
+    }
+    return {
+        "event": CODEX_OAUTH_INVENTORY_OBSERVATION_EVENT,
+        "observed_at": _scheduler_timestamp(observed_at),
+        "environment": config.environment,
+        "provider": "openai",
+        "auth_family": CODEX_OAUTH_INVENTORY_OBSERVATION_AUTH_FAMILY,
+        "credential_scope": CODEX_OAUTH_INVENTORY_OBSERVATION_SCOPE,
+        "auth_file_hash": None,
+        "status": "observed" if inventory_state == "valid" else "failed",
+        "attempted": True,
+        "refreshed": False,
+        "skipped": False,
+        "expires_at": None,
+        "last_success_at": None,
+        "source_task": CODEX_OAUTH_INVENTORY_OBSERVATION_SOURCE_TASK,
+        "error_class": _redacted_summary_field(error_class),
+        "error_message": error_message,
+        "codex_oauth_inventory_generation": inventory_generation,
+        "codex_oauth_inventory_generation_status": (
+            "valid"
+            if inventory_generation is not None
+            else "invalid"
+            if inventory_state == "invalid"
+            else "missing"
+        ),
+        "inventory_state": inventory_state,
+        "account_count": account_count,
+        "enabled_account_count": enabled_account_count,
+        "observation_cadence_seconds": config.interval_seconds,
+        "metadata": metadata,
+    }
+
+
+def _persist_codex_oauth_inventory_observation(
+    config: ProviderStatusLoopConfig,
+    observation: Mapping[str, Any],
+) -> tuple[bool, int, Optional[str], Optional[str]]:
+    if not config.apply:
+        return False, 0, None, "apply_disabled"
+    try:
+        inserted_count = probes.insert_provider_auth_observations(
+            _resolve_dsn(config),
+            [dict(observation)],
+            lock_timeout_ms=config.db_lock_timeout_ms,
+            statement_timeout_ms=config.db_statement_timeout_ms,
+        )
+    except probes.ProviderStatusDatabaseWriteSkipped as exc:
+        return False, 0, exc.error_class, _redacted_failure_message(str(exc))
+    except Exception as exc:
+        return False, 0, exc.__class__.__name__, _redacted_failure_message(str(exc))
+    return True, inserted_count, None, None
+
+
+def _run_codex_oauth_inventory_observation_task(
+    config: ProviderStatusLoopConfig,
+    *,
+    now_wall: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    observed_at = _normalize_scheduler_wall_now(now_wall)
+    event = _build_codex_oauth_inventory_observation(
+        config,
+        observed_at=observed_at,
+    )
+    (
+        persisted,
+        inserted_count,
+        skip_error_class,
+        skip_reason,
+    ) = _persist_codex_oauth_inventory_observation(config, event)
+    event["auth_observation_persisted"] = persisted
+    event["auth_observation_inserted_count"] = inserted_count
+    event["auth_observation_skip_error_class"] = skip_error_class
+    event["auth_observation_skip_reason"] = skip_reason
+    return event
 
 
 def _build_grok_oidc_auth_observation(
@@ -16633,7 +16769,31 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
             event["auth_observation_skip_reason"] = skip_reason
             events.append(event)
 
-    inventory = _resolve_codex_oauth_inventory(config)
+    try:
+        inventory = _resolve_codex_oauth_inventory(config)
+    except CodexOAuthInventoryError as exc:
+        if not non_codex_due:
+            return events
+        events.append(
+            {
+                "event": "codex_oauth_passive_health_inspection",
+                "source_task": "provider_auth_health_poll",
+                "observed_at": _utc_timestamp(),
+                "environment": config.environment,
+                "attempted": True,
+                "refreshed": False,
+                "skipped": True,
+                "health_status": "malformed",
+                "error_class": _redacted_summary_field(exc.__class__.__name__),
+                "error_message": _redacted_failure_message(str(exc)),
+                "auth_observation_status": "malformed",
+                "auth_observation_persisted": False,
+                "auth_observation_inserted_count": 0,
+                "auth_observation_skip_error_class": None,
+                "auth_observation_skip_reason": "inventory_unavailable",
+            }
+        )
+        return events
     if inventory is None:
         if not non_codex_due:
             return events
@@ -18422,7 +18582,7 @@ def _append_optional_poll_future_result(
         events.append(result)
 
 
-def run_due_sidecar_tasks(
+def run_due_sidecar_tasks(  # noqa: PLR0915 - bounded scheduler dispatch
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
     *,
@@ -18432,6 +18592,59 @@ def run_due_sidecar_tasks(
     now = time.monotonic() if now_monotonic is None else now_monotonic
     wall_now = _normalize_scheduler_wall_now(now_wall)
     events: list[Dict[str, Any]] = []
+    last_inventory_observation = (
+        state.codex_oauth_inventory_last_observation_monotonic
+    )
+    if (
+        last_inventory_observation is None
+        or now - last_inventory_observation >= config.interval_seconds
+    ):
+        state.codex_oauth_inventory_last_observation_monotonic = now
+        try:
+            events.append(
+                _run_codex_oauth_inventory_observation_task(
+                    config,
+                    now_wall=wall_now,
+                )
+            )
+        except Exception as exc:
+            events.append(
+                {
+                    "event": CODEX_OAUTH_INVENTORY_OBSERVATION_EVENT,
+                    "observed_at": _scheduler_timestamp(wall_now),
+                    "environment": config.environment,
+                    "provider": "openai",
+                    "auth_family": CODEX_OAUTH_INVENTORY_OBSERVATION_AUTH_FAMILY,
+                    "credential_scope": CODEX_OAUTH_INVENTORY_OBSERVATION_SCOPE,
+                    "auth_file_hash": None,
+                    "source_task": CODEX_OAUTH_INVENTORY_OBSERVATION_SOURCE_TASK,
+                    "status": "failed",
+                    "attempted": True,
+                    "refreshed": False,
+                    "skipped": False,
+                    "expires_at": None,
+                    "last_success_at": None,
+                    "codex_oauth_inventory_generation": None,
+                    "codex_oauth_inventory_generation_status": "invalid",
+                    "inventory_state": "invalid",
+                    "account_count": None,
+                    "enabled_account_count": None,
+                    "observation_cadence_seconds": config.interval_seconds,
+                    "error_class": _redacted_summary_field(exc.__class__.__name__),
+                    "error_message": _redacted_failure_message(str(exc)),
+                    "metadata": {
+                        "codex_oauth_inventory_generation": None,
+                        "inventory_state": "invalid",
+                        "account_count": None,
+                        "enabled_account_count": None,
+                        "observation_cadence_seconds": config.interval_seconds,
+                    },
+                    "auth_observation_persisted": False,
+                    "auth_observation_inserted_count": 0,
+                    "auth_observation_skip_error_class": None,
+                    "auth_observation_skip_reason": "publisher_failed",
+                }
+            )
     required_runners = {
         _run_grok_oidc_metadata_repair_task,
         _run_grok_oidc_refresh_task,
@@ -18566,6 +18779,8 @@ def run_due_sidecar_tasks(
 
 def _sidecar_one_shot_policy(event: Mapping[str, Any]) -> str:
     event_name = str(event.get("event") or "")
+    if event_name == CODEX_OAUTH_INVENTORY_OBSERVATION_EVENT:
+        return "summary"
     if event_name in {
         "grok_oidc_refresh",
         "codex_oauth_refresh",
@@ -18589,11 +18804,43 @@ _CODEX_OAUTH_GENERATION_AGGREGATE_EVENTS = frozenset(
 )
 
 
-def _codex_oauth_generation_maintenance_status(
+def _codex_oauth_generation_maintenance_status(  # noqa: PLR0915 - bounded one-shot generation summary
     config: ProviderStatusLoopConfig,
     events: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
     """Summarize whether this one-shot run published a usable generation."""
+    inventory_events = [
+        event
+        for event in events
+        if event.get("event") == CODEX_OAUTH_INVENTORY_OBSERVATION_EVENT
+    ]
+    if inventory_events:
+        marker = inventory_events[-1]
+        generation = marker.get("codex_oauth_inventory_generation")
+        safe_generation = (
+            generation if is_codex_oauth_inventory_generation(generation) else None
+        )
+        inventory_state = marker.get("inventory_state")
+        if inventory_state == "valid" and safe_generation is not None:
+            status = "healthy"
+            reason = "codex_generation_valid"
+        elif inventory_state == "unconfigured":
+            status = "unknown"
+            reason = "codex_inventory_unconfigured"
+        elif inventory_state == "invalid":
+            status = "unknown"
+            reason = "codex_inventory_invalid"
+        else:
+            status = "unknown"
+            reason = "codex_generation_unavailable"
+        return {
+            "status": status,
+            "generation": safe_generation,
+            "generations": [safe_generation] if safe_generation is not None else [],
+            "observation_count": len(inventory_events),
+            "reason": reason,
+        }
+
     maintenance_enabled = any(
         (
             config.codex_oauth_refresh_enabled,

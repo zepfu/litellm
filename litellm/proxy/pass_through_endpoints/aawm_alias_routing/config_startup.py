@@ -34,11 +34,13 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import stat
 import threading
 from contextlib import ExitStack
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
 
@@ -72,26 +74,19 @@ _YAML_SUFFIXES = frozenset({".yaml", ".yml"})
 _MAX_CONFIG_FILE_BYTES = 10 * 1024 * 1024
 
 _CODEX_OAUTH_INVENTORY_GENERATION_QUERY = """
-WITH current_codex_observations AS (
-    SELECT id, observed_at, metadata
-    FROM public.provider_auth_current
-    WHERE environment = $1::text
-      AND provider = 'openai'
-      AND auth_family = 'codex_oauth'
-),
-latest_cycle AS (
-    SELECT MAX(observed_at) AS observed_at
-    FROM current_codex_observations
-)
-SELECT observations.id, observations.observed_at, observations.metadata
-FROM current_codex_observations AS observations
-JOIN latest_cycle
-  ON observations.observed_at = latest_cycle.observed_at
-ORDER BY observations.id DESC
-LIMIT $2::integer
+SELECT id, observed_at, created_at, status, error_class, metadata
+FROM public.provider_auth_current
+WHERE environment = $1::text
+  AND provider = 'openai'
+  AND auth_family = 'codex_oauth_inventory'
+  AND credential_scope = 'inventory'
+  AND COALESCE(auth_file_hash, '') = ''
+ORDER BY observed_at DESC, id DESC
+LIMIT 1
 """
-_CODEX_OAUTH_GENERATION_QUERY_MAX_ROWS = 128
 _CODEX_OAUTH_GENERATION_QUERY_TIMEOUT_SECONDS = 1.5
+_CODEX_OAUTH_INVENTORY_OBSERVATION_DEFAULT_CADENCE_SECONDS = 300.0
+_CODEX_OAUTH_INVENTORY_OBSERVATION_FRESHNESS_MULTIPLIER = 2.0
 _CODEX_OAUTH_OBSERVATION_ENVIRONMENT_ENV = (
     "AAWM_CODEX_OAUTH_QUOTA_OBSERVATION_ENVIRONMENT"
 )
@@ -705,20 +700,34 @@ def _resolve_codex_oauth_observation_environment() -> Optional[str]:
     return None
 
 
+def _codex_oauth_row_values(row: Any) -> dict[str, Any]:
+    if isinstance(row, Mapping):
+        return dict(row)
+    try:
+        return dict(row)
+    except (TypeError, ValueError):
+        return {}
+
+
+def _codex_oauth_row_metadata(row: Any) -> Optional[Mapping[str, Any]]:
+    metadata = _codex_oauth_row_values(row).get("metadata")
+    if isinstance(metadata, Mapping):
+        return metadata
+    if isinstance(metadata, (str, bytes, bytearray)):
+        try:
+            decoded = json.loads(metadata)
+        except (TypeError, ValueError):
+            return None
+        if isinstance(decoded, Mapping):
+            return decoded
+    return None
+
+
 def _codex_oauth_generation_from_row(
     row: Any,
 ) -> tuple[str, Optional[str]]:
-    try:
-        values = dict(row)
-    except (TypeError, ValueError):
-        values = {}
-    metadata = values.get("metadata")
-    if isinstance(metadata, (str, bytes, bytearray)):
-        try:
-            metadata = json.loads(metadata)
-        except (TypeError, ValueError):
-            metadata = None
-    if not isinstance(metadata, Mapping):
+    metadata = _codex_oauth_row_metadata(row)
+    if metadata is None:
         return "missing", None
     generation = metadata.get("codex_oauth_inventory_generation")
     if generation is None or generation == "":
@@ -728,10 +737,46 @@ def _codex_oauth_generation_from_row(
     return "invalid", None
 
 
-async def get_codex_oauth_inventory_generation_status(
+def _codex_oauth_observation_timestamp(row: Any) -> Optional[datetime]:
+    value = _codex_oauth_row_values(row).get("observed_at")
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _codex_oauth_inventory_observation_freshness_budget_seconds(
+    metadata: Optional[Mapping[str, Any]],
+) -> float:
+    cadence = _CODEX_OAUTH_INVENTORY_OBSERVATION_DEFAULT_CADENCE_SECONDS
+    if metadata is not None:
+        candidate = metadata.get("observation_cadence_seconds")
+        try:
+            parsed = float(candidate)
+        except (TypeError, ValueError):
+            parsed = cadence
+        if math.isfinite(parsed) and parsed > 0:
+            cadence = parsed
+    return cadence * _CODEX_OAUTH_INVENTORY_OBSERVATION_FRESHNESS_MULTIPLIER
+
+
+async def get_codex_oauth_inventory_generation_status(  # noqa: PLR0915 - bounded readiness evidence parser
     *,
     local_generation: Optional[str],
     get_pool: Optional[Callable[[], Awaitable[Any]]] = None,
+    now: Optional[datetime] = None,
 ) -> dict[str, Any]:
     """Compare the local inventory digest with current sidecar observations.
 
@@ -756,6 +801,12 @@ async def get_codex_oauth_inventory_generation_status(
         "sidecar_generations": [],
         "observation_count": 0,
         "valid_observation_count": 0,
+        "observation_id": None,
+        "observed_at": None,
+        "observation_age_seconds": None,
+        "freshness_budget_seconds": None,
+        "inventory_state": None,
+        "sidecar_status": None,
         "reason": None,
     }
     if environment is None:
@@ -776,7 +827,6 @@ async def get_codex_oauth_inventory_generation_status(
             pool,
             _CODEX_OAUTH_INVENTORY_GENERATION_QUERY,
             environment,
-            _CODEX_OAUTH_GENERATION_QUERY_MAX_ROWS,
             get_timeout=lambda: _CODEX_OAUTH_GENERATION_QUERY_TIMEOUT_SECONDS,
         )
 
@@ -790,40 +840,67 @@ async def get_codex_oauth_inventory_generation_status(
         result["error_class"] = exc.__class__.__name__
         return result
 
-    if not isinstance(rows, Sequence):
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes, bytearray)):
         result["reason"] = "observation_rows_invalid"
         return result
-    result["observation_count"] = len(rows)
-    generation_values: set[str] = set()
-    valid_observation_count = 0
-    missing_count = 0
-    invalid_count = 0
-    for row in rows:
-        generation_state, generation = _codex_oauth_generation_from_row(row)
-        if generation_state == "valid" and generation is not None:
-            valid_observation_count += 1
-            generation_values.add(generation)
-        elif generation_state == "missing":
-            missing_count += 1
-        else:
-            invalid_count += 1
-    result["valid_observation_count"] = valid_observation_count
-    result["sidecar_generations"] = sorted(generation_values)
-    if len(generation_values) == 1:
-        result["sidecar_generation"] = next(iter(generation_values))
     if not rows:
         result["reason"] = "no_current_codex_observation"
         return result
-    if missing_count or invalid_count:
+
+    row = rows[0]
+    values = _codex_oauth_row_values(row)
+    metadata = _codex_oauth_row_metadata(row)
+    result["observation_count"] = 1
+    result["observation_id"] = values.get("id")
+    result["sidecar_status"] = values.get("status")
+    inventory_state = metadata.get("inventory_state") if metadata else None
+    result["inventory_state"] = inventory_state
+    observed_at = _codex_oauth_observation_timestamp(row)
+    if observed_at is None:
+        result["reason"] = "observation_timestamp_invalid"
+        return result
+    result["observed_at"] = observed_at.isoformat().replace("+00:00", "Z")
+    freshness_budget = _codex_oauth_inventory_observation_freshness_budget_seconds(
+        metadata
+    )
+    result["freshness_budget_seconds"] = freshness_budget
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    else:
+        current_time = current_time.astimezone(timezone.utc)
+    age_seconds = (current_time - observed_at).total_seconds()
+    result["observation_age_seconds"] = age_seconds
+    if age_seconds < 0:
+        result["reason"] = "observation_timestamp_in_future"
+        return result
+    if age_seconds > freshness_budget:
+        result["reason"] = "observation_stale"
+        return result
+
+    generation_state, generation = _codex_oauth_generation_from_row(row)
+    if generation_state == "valid" and generation is not None:
+        result["valid_observation_count"] = 1
+        result["sidecar_generation"] = generation
+        result["sidecar_generations"] = [generation]
+    if values.get("status") != "observed" or inventory_state != "valid":
+        if inventory_state == "unconfigured":
+            result["reason"] = "inventory_unconfigured"
+        elif inventory_state == "invalid" or generation_state == "invalid":
+            result["reason"] = "inventory_invalid"
+        elif values.get("status") != "observed":
+            result["reason"] = "inventory_observation_failed"
+        else:
+            result["reason"] = "sidecar_generation_missing"
+        return result
+    if generation_state != "valid" or generation is None:
         result["reason"] = (
-            "sidecar_generation_incomplete"
-            if missing_count and invalid_count
+            "sidecar_generation_invalid"
+            if generation_state == "invalid"
             else "sidecar_generation_missing"
-            if missing_count
-            else "sidecar_generation_invalid"
         )
         return result
-    if generation_values == {safe_local_generation}:
+    if generation == safe_local_generation:
         result.update(
             {
                 "status": "matched",
@@ -831,15 +908,15 @@ async def get_codex_oauth_inventory_generation_status(
                 "reason": "generation_match",
             }
         )
-        return result
-    result.update(
-        {
-            "status": "mismatch",
-            "health": "degraded",
-            "readiness_degraded": True,
-            "reason": "generation_mismatch",
-        }
-    )
+    else:
+        result.update(
+            {
+                "status": "mismatch",
+                "health": "degraded",
+                "readiness_degraded": True,
+                "reason": "generation_mismatch",
+            }
+        )
     return result
 
 
