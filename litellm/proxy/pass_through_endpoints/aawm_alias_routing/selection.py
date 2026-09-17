@@ -64,6 +64,7 @@ from .policy import (
     CODEX_AUTO_AGENT_OPENROUTER_PROVIDER as _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
     CODEX_AUTO_AGENT_XAI_PROVIDER as _CODEX_AUTO_AGENT_XAI_PROVIDER,
 )
+from .request_metadata import _normalize_tui_family
 from .snapshot_select import (
     _commit_round_robin_selection,
     _lookup_active_snapshot_canonical_alias,
@@ -6398,10 +6399,22 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         if affinity is not None
         else None
     )
+    ohmypi_client_history_without_owner = (
+        _normalize_tui_family(client_product_label) == "ohmypi"
+        and affinity is None
+        and (
+            sa._record_state(session_owner_record)
+            if isinstance(session_owner_record, dict)
+            else None
+        )
+        is None
+        and not has_previous_response_id
+    )
     if (
         provider_owned_continuation
         and affinity is None
         and not (is_auto_review and replay_safe)
+        and not ohmypi_client_history_without_owner
     ):
         owner_state = (
             sa._record_state(session_owner_record)

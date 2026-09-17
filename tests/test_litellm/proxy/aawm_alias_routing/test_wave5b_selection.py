@@ -621,6 +621,169 @@ class TestCodexSelectorFirstChoice:
         assert result["affinity_bypassed"] is False
 
     @pytest.mark.asyncio
+    async def test_ohmypi_continuation_without_owner_still_selects_first_available(
+        self,
+    ):
+        request = _make_request()
+        candidates = (
+            _candidate("openai", "gpt-4o"),
+            _candidate("xai", "grok-4", last_resort=True),
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
+            SelectionEnumeration,
+        )
+
+        mock_enum = SelectionEnumeration(candidates=candidates, commit_token=None)
+        _set_selection_runtime("_has_continuation_state", lambda v: True)
+        _set_selection_runtime(
+            "_extract_client_product_label", lambda r, b: "Ohmypi/18.2.4"
+        )
+        with patch.dict(
+            selection._select_codex_auto_agent_candidate.__globals__,
+            {
+                "_resolve_aawm_alias_selection_enumeration": (
+                    lambda request, canonical_alias, *, ingress, client_product_label=None: mock_enum
+                )
+            },
+        ):
+            result = await selection._select_codex_auto_agent_candidate(
+                request=request,
+                request_body={
+                    "model": "basic",
+                    "input": [
+                        {"role": "assistant", "content": "PONG"},
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_date",
+                            "output": "Thu 17 Sep 2026 07:20:50 PM EDT",
+                        },
+                    ],
+                },
+            )
+        assert result["selection_reason"] == "first_available"
+        assert result["candidate"]["provider"] == "openai"
+        assert result["candidate"]["model"] == "gpt-4o"
+
+    @pytest.mark.asyncio
+    async def test_codex_continuation_without_owner_still_redispatches(self):
+        request = _make_request()
+        candidates = (_candidate("openai", "gpt-4o"),)
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
+            SelectionEnumeration,
+        )
+
+        mock_enum = SelectionEnumeration(candidates=candidates, commit_token=None)
+        _set_selection_runtime("_has_continuation_state", lambda v: True)
+        _set_selection_runtime(
+            "_extract_client_product_label", lambda r, b: "Codex/0.154.0"
+        )
+        with patch.dict(
+            selection._select_codex_auto_agent_candidate.__globals__,
+            {
+                "_resolve_aawm_alias_selection_enumeration": (
+                    lambda request, canonical_alias, *, ingress, client_product_label=None: mock_enum
+                )
+            },
+        ):
+            with pytest.raises(HTTPException) as orig:
+                await selection._select_codex_auto_agent_candidate(
+                    request=request,
+                    request_body={
+                        "model": "basic",
+                        "input": [
+                            {"role": "assistant", "content": "PONG"},
+                            {
+                                "type": "function_call_output",
+                                "call_id": "call_date",
+                                "output": "Thu 17 Sep 2026 07:20:50 PM EDT",
+                            },
+                        ],
+                    },
+                )
+        assert orig.value.status_code == 409
+        detail = orig.value.detail
+        error = detail["error"] if isinstance(detail, dict) else {}
+        assert error.get("code") == "aawm_session_owner_redispatch_required"
+        assert detail.get("failure_phase") == "session_owner_continuation_no_owner_affinity"
+        assert "state=missing" in str(detail.get("redispatch_reason") or "")
+
+    @pytest.mark.asyncio
+    async def test_ohmypi_previous_response_id_without_owner_still_redispatches(self):
+        request = _make_request()
+        candidates = (_candidate("openai", "gpt-4o"),)
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
+            SelectionEnumeration,
+        )
+
+        mock_enum = SelectionEnumeration(candidates=candidates, commit_token=None)
+        _set_selection_runtime("_has_continuation_state", lambda v: True)
+        _set_selection_runtime(
+            "_extract_client_product_label", lambda r, b: "Ohmypi/18.2.4"
+        )
+        with patch.dict(
+            selection._select_codex_auto_agent_candidate.__globals__,
+            {
+                "_resolve_aawm_alias_selection_enumeration": (
+                    lambda request, canonical_alias, *, ingress, client_product_label=None: mock_enum
+                )
+            },
+        ):
+            with pytest.raises(HTTPException) as orig:
+                await selection._select_codex_auto_agent_candidate(
+                    request=request,
+                    request_body={
+                        "model": "basic",
+                        "previous_response_id": "resp_ohmypi",
+                    },
+                )
+        assert orig.value.status_code == 409
+        detail = orig.value.detail
+        error = detail["error"] if isinstance(detail, dict) else {}
+        assert error.get("code") == "aawm_session_owner_redispatch_required"
+
+    @pytest.mark.asyncio
+    async def test_unknown_client_continuation_without_owner_still_redispatches(self):
+        request = _make_request()
+        candidates = (_candidate("openai", "gpt-4o"),)
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
+            SelectionEnumeration,
+        )
+
+        mock_enum = SelectionEnumeration(candidates=candidates, commit_token=None)
+        _set_selection_runtime("_has_continuation_state", lambda v: True)
+        _set_selection_runtime(
+            "_extract_client_product_label", lambda r, b: "mytool/1.0"
+        )
+        with patch.dict(
+            selection._select_codex_auto_agent_candidate.__globals__,
+            {
+                "_resolve_aawm_alias_selection_enumeration": (
+                    lambda request, canonical_alias, *, ingress, client_product_label=None: mock_enum
+                )
+            },
+        ):
+            with pytest.raises(HTTPException) as orig:
+                await selection._select_codex_auto_agent_candidate(
+                    request=request,
+                    request_body={
+                        "model": "basic",
+                        "input": [
+                            {"role": "assistant", "content": "PONG"},
+                            {
+                                "type": "function_call_output",
+                                "call_id": "call_date",
+                                "output": "Thu 17 Sep 2026 07:20:50 PM EDT",
+                            },
+                        ],
+                    },
+                )
+        assert orig.value.status_code == 409
+        detail = orig.value.detail
+        error = detail["error"] if isinstance(detail, dict) else {}
+        assert error.get("code") == "aawm_session_owner_redispatch_required"
+        assert detail.get("failure_phase") == "session_owner_continuation_no_owner_affinity"
+
+    @pytest.mark.asyncio
     async def test_fresh_redispatch_ordinal_falls_back_to_next_candidate(self):
         request = _make_request()
         candidates = (
