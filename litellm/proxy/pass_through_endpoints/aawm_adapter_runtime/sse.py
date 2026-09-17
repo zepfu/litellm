@@ -689,65 +689,44 @@ async def _responses_sse_from_repaired_response_body(
     output = response_body.get("output")
     if not isinstance(output, list):
         output = []
+    sse_sequence = 0
+
+    def _emit(event_type: str, payload: dict[str, Any]) -> str:
+        nonlocal sse_sequence
+        sse_sequence += 1
+        event = dict(payload)
+        event["type"] = event_type
+        _ensure_responses_sse_sequence_number(event, sequence_number=sse_sequence)
+        serialized = _serialize_responses_adapter_response(event)
+        return f"event: {event_type}\ndata: {serialized}\n\n"
+
     for index, item in enumerate(output):
         if not isinstance(item, dict):
             continue
         item_id = _responses_repaired_output_item_id(item, index)
-        yield (
-            "event: response.output_item.added\n"
-            + "data: "
-            + json.dumps(
-                {
-                    "type": "response.output_item.added",
-                    "output_index": index,
-                    "item": item,
-                },
-                ensure_ascii=False,
-            )
-            + "\n\n"
+        yield _emit(
+            "response.output_item.added",
+            {"output_index": index, "item": item},
         )
         if item.get("type") == "function_call":
             arguments = item.get("arguments")
             if not isinstance(arguments, str):
                 arguments = _stringify_grok_native_input_item_value(arguments)  # noqa: F821
-            yield (
-                "event: response.function_call_arguments.done\n"
-                + "data: "
-                + json.dumps(
-                    {
-                        "type": "response.function_call_arguments.done",
-                        "item_id": item_id,
-                        "output_index": index,
-                        "arguments": arguments,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n\n"
-            )
-        yield (
-            "event: response.output_item.done\n"
-            + "data: "
-            + json.dumps(
+            yield _emit(
+                "response.function_call_arguments.done",
                 {
-                    "type": "response.output_item.done",
+                    "item_id": item_id,
                     "output_index": index,
-                    "item": item,
+                    "arguments": arguments,
                 },
-                ensure_ascii=False,
             )
-            + "\n\n"
+        yield _emit(
+            "response.output_item.done",
+            {"output_index": index, "item": item},
         )
-    yield (
-        "event: response.completed\n"
-        + "data: "
-        + json.dumps(
-            {
-                "type": "response.completed",
-                "response": response_body,
-            },
-            ensure_ascii=False,
-        )
-        + "\n\n"
+    yield _emit(
+        "response.completed",
+        {"response": response_body},
     )
     yield "data: [DONE]\n\n"
 

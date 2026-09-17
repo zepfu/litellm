@@ -1127,6 +1127,29 @@ class TestResponsesSSEFromRepairedResponseBody:
         assert "response.completed" in chunks[0]
         assert chunks[1] == "data: [DONE]\n\n"
 
+    def test_stamps_sequence_number_on_repaired_events(self):
+        body = {
+            "output": [
+                {"type": "reasoning", "id": "rs_1", "status": "completed"},
+                {"type": "message", "id": "msg_1", "content": []},
+            ]
+        }
+        chunks = _run(_collect_agen(sse_mod._responses_sse_from_repaired_response_body(body)))
+        payloads = [
+            json.loads(chunk.split("data: ", 1)[1])
+            for chunk in chunks
+            if chunk.startswith("event:") and "data: " in chunk
+        ]
+        assert [p["type"] for p in payloads] == [
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.completed",
+        ]
+        assert [p["sequence_number"] for p in payloads] == [1, 2, 3, 4, 5]
+        assert payloads[0]["item"]["summary"] == []
+
     def test_missing_output_key(self):
         body = {"id": "resp_x"}
         chunks = _run(_collect_agen(sse_mod._responses_sse_from_repaired_response_body(body)))
