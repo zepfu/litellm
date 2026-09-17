@@ -37,6 +37,7 @@ _AAWM_ROUTE_ACCESS_LOG_TYPE = "ROUTE"
 _AAWM_ROUTE_LOG_MAX_FIELD_CHARS = 180
 _AAWM_ROUTE_LOG_MAX_IDENTITY_CHARS = 96
 _AAWM_ROUTE_LOG_MAX_CODEX_TURN_METADATA_CHARS = 4096
+_AAWM_ROUTE_ROLLUP_MEMORY_WORKLOAD_ALIAS = "AUTO-MEMORY"
 _AAWM_ROUTE_LOG_DEDUP_LIMIT = 4096
 _AAWM_ROUTE_ROLLUP_INTERVAL_ENV = "AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS"
 _AAWM_ROUTE_ROLLUP_DEFAULT_INTERVAL_SECONDS = 60
@@ -1527,6 +1528,8 @@ _AAWM_ROUTE_LOG_TOP_LEVEL_METADATA_KEYS = (
         "logical_model",
         "trace_name",
         "trace_user_id",
+        "workload_type",
+        "workload_subtype",
     )
 )
 _AAWM_ROUTE_LOG_TENANT_REPOSITORY_FRAGMENTS = (
@@ -2634,6 +2637,37 @@ def _get_aawm_route_rollup_model_label(
     return model_label
 
 
+def _is_aawm_route_rollup_memory_workload(
+    metadata: dict[str, Any],
+) -> bool:
+    return (
+        metadata.get("workload_type") == "agent_memory"
+        and metadata.get("workload_subtype") == "codex_memory_writer"
+    )
+
+
+def _prepare_aawm_route_rollup_memory_workload(
+    *,
+    kwargs: Optional[dict],
+    metadata: dict[str, Any],
+    repository: Optional[str],
+    request_body: Optional[dict[str, Any]],
+) -> None:
+    if _is_aawm_route_rollup_memory_workload(metadata) or not repository:
+        return
+
+    from litellm.integrations.aawm_agent_identity import (
+        _apply_codex_memory_workflow_repository,
+    )
+
+    _apply_codex_memory_workflow_repository(
+        kwargs if isinstance(kwargs, dict) else {},
+        metadata,
+        repository,
+        request_body=request_body,
+    )
+
+
 def _normalize_aawm_route_rollup_identity(value: Any) -> Optional[str]:
     cleaned = _clean_aawm_route_log_field(value)
     if not cleaned or len(cleaned) > _AAWM_ROUTE_LOG_MAX_IDENTITY_CHARS:
@@ -2815,6 +2849,12 @@ def build_aawm_route_rollup_context(
         _AAWM_ROUTE_LOG_REPOSITORY_TENANT_HEADER_KEYS,
         normalizer=_normalize_aawm_route_log_tenant_repository_label,
     )
+    _prepare_aawm_route_rollup_memory_workload(
+        kwargs=kwargs,
+        metadata=metadata,
+        repository=repository,
+        request_body=request_body,
+    )
     if request is not None:
         host_attribution = _select_aawm_route_host_attribution_for_request(
             request=request,
@@ -2837,7 +2877,15 @@ def build_aawm_route_rollup_context(
         host_name=host_attribution.get("host_name"),
     )
     model_label = _get_aawm_route_rollup_model_label(
-        model_label=_get_aawm_route_log_model_label(request_body, metadata),
+        model_label=_get_aawm_route_log_model_label(
+            request_body,
+            metadata,
+            alias_override=(
+                _AAWM_ROUTE_ROLLUP_MEMORY_WORKLOAD_ALIAS
+                if _is_aawm_route_rollup_memory_workload(metadata)
+                else None
+            ),
+        ),
     )
     incoming_endpoint = _safe_aawm_route_endpoint_label(request)
     outgoing_target = _safe_aawm_route_target_label(target)
@@ -3789,6 +3837,8 @@ def register_aawm_route_rollup_access_log_replacement(request: Request) -> None:
 def _get_aawm_route_log_model_label(
     request_body: Optional[dict[str, Any]],
     metadata: dict[str, Any],
+    *,
+    alias_override: Optional[str] = None,
 ) -> Optional[str]:
     model = None
     if isinstance(request_body, dict):
@@ -3799,7 +3849,7 @@ def _get_aawm_route_log_model_label(
             keys=_AAWM_ROUTE_LOG_SELECTED_MODEL_METADATA_KEYS,
         )
 
-    alias = _first_aawm_route_log_value(
+    alias = alias_override or _first_aawm_route_log_value(
         metadata,
         keys=_AAWM_ROUTE_LOG_MODEL_ALIAS_METADATA_KEYS,
     )
