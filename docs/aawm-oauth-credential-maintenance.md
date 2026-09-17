@@ -816,7 +816,11 @@ nonsecret configuration, including credential path topology. The proxy,
 readiness status, and sidecar inventory events use this same identity. The
 digest changes with meaningful inventory configuration and does not change with
 credential rotation. A mismatch between two runtime identities is observable in
-those outputs and does not route-block requests.
+those outputs and does not route-block requests. Persisted Codex observations
+and selected-account request metadata carry the generation. During rolling
+deployment, compare the proxy readiness generation with the latest sidecar
+aggregate generation; while they differ, readiness is degraded but existing
+requests continue without an immediate inventory hard-stop.
 
 | Area | Location |
 | --- | --- |

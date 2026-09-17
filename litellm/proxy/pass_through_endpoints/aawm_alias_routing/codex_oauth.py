@@ -1615,6 +1615,9 @@ async def _resolve_model_less_direct_codex_oauth_contexts(
                         "auth_status": "degraded",
                         "skip_reason": "auth_degraded",
                         "failure_phase": "account_identity_mismatch",
+                        "codex_oauth_inventory_generation": (
+                            codex_oauth_inventory_generation_digest(inventory)
+                        ),
                         "attempted_provider_call": False,
                     }
                 )

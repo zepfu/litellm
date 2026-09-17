@@ -15894,7 +15894,7 @@ def _codex_account_aggregate_event(
     *,
     event_name: str,
     config: ProviderStatusLoopConfig,
-    inventory_generation: str,
+    inventory_generation: Optional[str] = None,
     records: Sequence[CodexOAuthCredentialRecord],
     usable_by_label: Mapping[str, bool],
     status_by_label: Mapping[str, str],
