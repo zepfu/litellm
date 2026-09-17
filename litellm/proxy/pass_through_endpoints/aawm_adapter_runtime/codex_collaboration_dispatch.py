@@ -823,13 +823,9 @@ def _normalize_codex_message_payload(
     visible_text: str,
     payload: Any,
 ) -> tuple[dict[str, Any], bool]:
-    if not isinstance(payload, str) or not payload:
-        raise CodexCollaborationDispatchError("invalid_envelope")
     try:
         assignment = parse_codex_collaboration_text_frame(payload)
-    except CodexCollaborationDispatchError as exc:
-        if exc.reason != "unknown_representation":
-            raise
+    except CodexCollaborationDispatchError:
         return item, False
     normalized_item = _NormalizedCodexAgentMessage(item)
     normalized_item["content"] = [
