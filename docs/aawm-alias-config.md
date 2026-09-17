@@ -288,11 +288,6 @@ mode is `responses`; chat-mode candidates retain the existing chat endpoint.
 Contributor uses Responses, while Omen remains chat. Omen is deprecated in the
 upstream catalog; its configured presence does not establish availability.
 
-`union-alpha` in `basic-other`, `work-other`, and `zai_basic` uses OpenCode
-Zen (`opencode_zen`, `codex_opencode_zen_adapter`) at
-`https://opencode.ai/zen/v1`, not OpenCode Go. Its alias priorities and
-fallback order are unchanged.
-
 ## Candidate failure fall-through
 
 During Codex alias selection, a deterministic preflight rejection with

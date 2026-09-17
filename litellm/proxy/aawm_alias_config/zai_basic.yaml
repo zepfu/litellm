@@ -4,11 +4,6 @@ defaults: {}
 aliases:
   - name: zai_basic
     candidates:
-      - provider: opencode_zen
-        model: union-alpha
-        route_family: codex_opencode_zen_adapter
-        priority: 110
-
       - provider: zai_coding_plan
         model: zai_coding_plan/glm-5.3-flash
         route_family: codex_zai_coding_plan_chat_completions_adapter
