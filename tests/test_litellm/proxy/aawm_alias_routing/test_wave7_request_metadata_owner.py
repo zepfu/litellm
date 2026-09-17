@@ -31,6 +31,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.request_metadata im
     _extract_auto_agent_alias_metadata_value,
     _extract_auto_agent_alias_session_id,
     _normalize_auto_agent_alias_client_product,
+    _normalize_tui_family,
     _resolve_auto_agent_alias_route_host_attribution,
     configure_request_metadata_runtime,
 )
@@ -328,6 +329,36 @@ class TestNormalizeClientProduct:
             _normalize_auto_agent_alias_client_product("Oh My Pi/17.4.2")
             == "Ohmypi/17.4.2"
         )
+
+
+class TestNormalizeTuiFamily:
+    def test_codex_stays_codex(self):
+        for raw in ("Codex", "Codex/0.154.0", "codex-cli/2.0", "codex_tui"):
+            assert _normalize_tui_family(raw) == "codex"
+
+    def test_ohmypi_labels_are_ohmypi_not_codex_or_unknown(self):
+        for raw in (
+            "Ohmypi",
+            "Ohmypi/18.2.4",
+            "Oh My Pi",
+            "Oh My Pi/17.4.2",
+            "omp",
+            "omp/18.2.4",
+            "ompla",
+            "oh-my-pi",
+        ):
+            assert _normalize_tui_family(raw) == "ohmypi"
+
+    def test_missing_and_unrelated_labels_stay_unknown(self):
+        assert _normalize_tui_family(None) == "unknown"
+        assert _normalize_tui_family("") == "unknown"
+        assert _normalize_tui_family("mytool/1.0") == "unknown"
+
+    def test_other_registered_families_unchanged(self):
+        assert _normalize_tui_family("Claude/1.2") == "claude"
+        assert _normalize_tui_family("Grok/0.1") == "grok"
+        assert _normalize_tui_family("Qwen/1") == "qwen"
+        assert _normalize_tui_family("Kimi/1") == "kimi"
 
 
 # ---------------------------------------------------------------------------

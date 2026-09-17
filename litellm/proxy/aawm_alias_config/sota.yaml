@@ -2,6 +2,10 @@ defaults: {}
 
 aliases:
   - name: sota
+    # Logical sota only. Ohmypi (ompla) parents that need xAI / Moonshot /
+    # Z.AI must request sota-xai, sota-moonshot, or sota-zai by name.
+    # Do not add tui_family: ohmypi here; that would remap ompla's logical
+    # sota away from the Codex-compatible default.
     dispatch:
       by_tui:
         - tui_family: codex

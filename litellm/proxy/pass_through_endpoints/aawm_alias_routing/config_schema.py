@@ -143,8 +143,10 @@ REGISTERED_REASONING_EFFORTS: frozenset[str] = frozenset(
 )
 
 # TUI family normalization vocabulary (CFG-007 dispatch).
+# `ohmypi` is a first-class origin (Oh My Pi / ompla / omp). It is not a
+# `sota.yaml` by_tui target; logical `sota` still uses `default` for it.
 REGISTERED_TUI_FAMILIES: frozenset[str] = frozenset(
-    {"codex", "claude", "grok", "qwen", "kimi", "unknown"}
+    {"codex", "claude", "grok", "qwen", "kimi", "ohmypi", "unknown"}
 )
 
 
