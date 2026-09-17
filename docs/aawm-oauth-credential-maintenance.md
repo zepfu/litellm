@@ -818,20 +818,25 @@ digest changes with meaningful inventory configuration and does not change with
 credential rotation. A mismatch between two runtime identities is observable in
 those outputs and does not route-block requests. Persisted Codex observations
 and selected-account request metadata carry the generation. During rolling
-deployment, compare the proxy readiness generation with the latest sidecar
-aggregate generation; while they differ, readiness is degraded but existing
-requests continue without an immediate inventory hard-stop.
+deployment, compare the proxy readiness generation with the newest persisted
+sidecar observation cycle; while they differ, readiness is degraded but
+existing requests continue without an immediate inventory hard-stop. An
+orchestrator may use the resulting readiness `503` to drain new traffic from
+the worker, but the readiness check does not terminate request handlers or
+cancel in-flight routing.
 
 The proxy exposes the local generation in `aawm_alias_config` and reports the
 comparison under `codex_oauth_inventory_generation` on `/health/readiness`.
-`status=matched` / `health=healthy` means every latest sidecar observation for
-the environment has the same valid generation. `status=mismatch` /
-`health=degraded` is emitted only when current observations are present, valid,
-and differ from the local generation; that confirmed mismatch returns HTTP
-`503`. Missing, malformed, empty, or temporarily unavailable observations stay
-`status=unknown` and do not stop live routing. The comparison reads the newest
-row per credential scope so older auth-file identity rows do not create a
-false mismatch.
+`status=matched` / `health=healthy` means every observation in the newest
+persisted sidecar cycle for the environment has the same valid generation.
+`status=mismatch` / `health=degraded` is emitted only when current-cycle
+observations are present, valid, and differ from the local generation; that
+confirmed mismatch returns HTTP `503`. Missing, malformed, empty, or
+temporarily unavailable observations stay `status=unknown` and do not stop
+live routing. Older rows for retired credential scopes or auth-file identities
+are outside the newest cycle and do not create a false mismatch. A readiness
+`503` can cause an orchestrator to drain new traffic, while request handlers
+and in-flight routing continue under their existing lifecycle.
 
 Every Codex refresh, passive-health, and quota event carries
 `codex_oauth_inventory_generation`; each aggregate event also carries

@@ -72,20 +72,22 @@ _YAML_SUFFIXES = frozenset({".yaml", ".yml"})
 _MAX_CONFIG_FILE_BYTES = 10 * 1024 * 1024
 
 _CODEX_OAUTH_INVENTORY_GENERATION_QUERY = """
-SELECT id, observed_at, metadata
-FROM (
-    SELECT DISTINCT ON (COALESCE(credential_scope, ''))
-        id, observed_at, metadata
+WITH current_codex_observations AS (
+    SELECT id, observed_at, metadata
     FROM public.provider_auth_current
     WHERE environment = $1::text
       AND provider = 'openai'
       AND auth_family = 'codex_oauth'
-    ORDER BY
-        COALESCE(credential_scope, ''),
-        observed_at DESC,
-        id DESC
-) AS latest_by_scope
-ORDER BY observed_at DESC, id DESC
+),
+latest_cycle AS (
+    SELECT MAX(observed_at) AS observed_at
+    FROM current_codex_observations
+)
+SELECT observations.id, observations.observed_at, observations.metadata
+FROM current_codex_observations AS observations
+JOIN latest_cycle
+  ON observations.observed_at = latest_cycle.observed_at
+ORDER BY observations.id DESC
 LIMIT $2::integer
 """
 _CODEX_OAUTH_GENERATION_QUERY_MAX_ROWS = 128
