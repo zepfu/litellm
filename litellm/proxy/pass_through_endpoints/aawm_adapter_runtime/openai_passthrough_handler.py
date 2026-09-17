@@ -464,6 +464,7 @@ class BaseOpenAIPassThroughHandler:
         egress_credential_family: Optional[str] = None
         expected_target_family: Optional[str] = None
         selected_openai_headers: Optional[dict[str, str]] = None
+        openai_selected_credential_family: Optional[str] = None
         endpoint_custom_body: Optional[dict[str, Any]] = None
         canonical_managed_oa_xai_request_body: Optional[dict[str, Any]] = None
         bound_codex_oauth_identity: Optional[dict[str, str]] = None
@@ -532,6 +533,7 @@ class BaseOpenAIPassThroughHandler:
 
                 selected_auth = await _load_bound_codex_oauth_auth(request)
                 selected_openai_headers = dict(selected_auth.headers)
+                openai_selected_credential_family = "codex_oauth"
                 if bound_codex_oauth_identity is None:
                     bound_codex_oauth_identity = {
                         "account_label": selected_auth.account_label,
@@ -680,6 +682,7 @@ class BaseOpenAIPassThroughHandler:
                 egress_credential_family = XAI_OAUTH_CREDENTIAL_FAMILY
                 managed_xai_oauth_request = True
                 expected_target_family = XAI_OAUTH_ROUTE_FAMILY
+                openai_selected_credential_family = None
             elif rt.is_openai_responses_endpoint_fn(endpoint):
                 grok_native_context = await BaseOpenAIPassThroughHandler._prepare_openai_grok_native_oauth_context(
                     endpoint=endpoint,
@@ -701,6 +704,7 @@ class BaseOpenAIPassThroughHandler:
                     forward_headers = False
                     egress_credential_family = GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY
                     expected_target_family = GROK_NATIVE_OAUTH_ROUTE_FAMILY
+                    openai_selected_credential_family = None
                 elif is_codex_responses_request:
                     try:
                         dispatched_response = await rt.try_dispatch_codex_request_fn(
@@ -789,6 +793,12 @@ class BaseOpenAIPassThroughHandler:
             and rt.is_openai_responses_endpoint_fn(endpoint)
             else "stream" in str(updated_url)
         )
+        if (
+            openai_selected_credential_family is None
+            and custom_llm_provider == litellm.LlmProviders.OPENAI
+            and api_key is not None
+        ):
+            openai_selected_credential_family = "openai"
 
         # D1-612: request-scoped session-owner guard for direct OpenAI fallthrough.
         # Does not mutate the egress body (preserves caller body identity). Nested
@@ -1058,6 +1068,7 @@ class BaseOpenAIPassThroughHandler:
                 )
             if selected_openai_headers is not None:
                 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+                    _OPENAI_PROTECTED_PASSTHROUGH_HEADERS,
                     HttpPassThroughEndpointHelpers,
                 )
 
@@ -1070,15 +1081,20 @@ class BaseOpenAIPassThroughHandler:
             assemble_headers = (
                 BaseOpenAIPassThroughHandler._assemble_xai_oauth_headers
                 if managed_xai_oauth_request
-                else BaseOpenAIPassThroughHandler._assemble_headers
+        else BaseOpenAIPassThroughHandler._assemble_headers
             )
 
             def _build_endpoint_func(current_api_key: Optional[str]):
+                bound_api_key = (
+                    current_api_key
+                    if openai_selected_credential_family == "openai"
+                    else None
+                )
                 return rt.create_pass_through_route_fn(
                     endpoint=endpoint,
                     target=str(updated_url),
                     custom_headers=assemble_headers(
-                        api_key=current_api_key,
+                        api_key=bound_api_key,
                         request=request,
                         extra_headers=extra_headers,
                     ),
@@ -1087,24 +1103,23 @@ class BaseOpenAIPassThroughHandler:
                     custom_llm_provider=custom_llm_provider.value
                     if isinstance(custom_llm_provider, litellm.LlmProviders)
                     else custom_llm_provider,
-                    egress_credential_family=egress_credential_family,
-                    expected_target_family=expected_target_family,
+                    egress_credential_family=(
+                        egress_credential_family
+                        if egress_credential_family is not None
+                        else openai_selected_credential_family
+                    ),
+                    expected_target_family=(
+                        expected_target_family
+                        if expected_target_family is not None
+                        else "openai"
+                        if openai_selected_credential_family is not None
+                        else None
+                    ),
                     egress_selected_openai_headers=selected_openai_headers,
                     managed_xai_oauth_request=managed_xai_oauth_request,
                     defer_session_owner_promotion=defer_managed_xai_promotion,
-                    blocked_pass_through_prefixed_headers=(
-                        [
-                            "authorization",
-                            "api-key",
-                            "x-api-key",
-                            "chatgpt-account-id",
-                            "openai-organization",
-                            "openai-project",
-                            "session-id",
-                            "session_id",
-                        ]
-                        if managed_xai_oauth_request
-                        else None
+                    blocked_pass_through_prefixed_headers=list(
+                        _OPENAI_PROTECTED_PASSTHROUGH_HEADERS
                     ),
                 )
 
