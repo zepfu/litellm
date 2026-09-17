@@ -60,6 +60,8 @@ W6B_OWNED_SYMBOLS: set[str] = {
     "_coerce_sequence_number",
     "_ensure_responses_sse_sequence_number",
     "_event_sequence_number",
+    "_ensure_reasoning_item_summary",
+    "_ensure_grok_responses_sse_compat",
     "_reattach_sequence_number_json",
     "_responses_event_text_key",
     "_responses_stream_event_summary",
@@ -364,6 +366,35 @@ class TestSerializeResponsesAdapterResponse:
 
         result = json.loads(sse_mod._serialize_responses_adapter_response(FakeModel()))
         assert result == {"type": "response.created", "sequence_number": 3}
+
+    def test_stamps_empty_summary_on_reasoning_item(self):
+        result = json.loads(
+            sse_mod._serialize_responses_adapter_response(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"id": "rs_1", "type": "reasoning", "status": "in_progress"},
+                    "sequence_number": 3,
+                }
+            )
+        )
+        assert result["item"]["summary"] == []
+        assert result["sequence_number"] == 3
+
+    def test_preserves_existing_reasoning_summary(self):
+        result = json.loads(
+            sse_mod._serialize_responses_adapter_response(
+                {
+                    "type": "response.output_item.added",
+                    "item": {
+                        "id": "rs_1",
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "hi"}],
+                    },
+                }
+            )
+        )
+        assert result["item"]["summary"] == [{"type": "summary_text", "text": "hi"}]
 
 
 # ===========================================================================

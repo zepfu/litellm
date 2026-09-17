@@ -61,6 +61,8 @@ _HOST_FUNCTION_NAMES = (
     "_coerce_sequence_number",
     "_ensure_responses_sse_sequence_number",
     "_event_sequence_number",
+    "_ensure_reasoning_item_summary",
+    "_ensure_grok_responses_sse_compat",
     "_reattach_sequence_number_json",
     "_responses_event_text_key",
     "_responses_stream_event_summary",
@@ -187,27 +189,62 @@ def _event_sequence_number(response_obj: Any) -> Optional[int]:
     return None
 
 
+def _ensure_reasoning_item_summary(item: Any) -> bool:
+    """Grok Build requires `summary` on Responses reasoning items.
+
+    Adapter reasoning items often omit it. Stamp an empty list without
+    overwriting an existing summary.
+    """
+
+    if not isinstance(item, dict):
+        return False
+    if item.get("type") != "reasoning":
+        return False
+    if "summary" in item:
+        return False
+    item["summary"] = []
+    return True
+
+
+def _ensure_grok_responses_sse_compat(payload: dict[str, Any]) -> dict[str, Any]:
+    item = payload.get("item")
+    if isinstance(item, dict):
+        _ensure_reasoning_item_summary(item)
+        payload["item"] = item
+    response = payload.get("response")
+    if isinstance(response, dict):
+        output = response.get("output")
+        if isinstance(output, list):
+            for entry in output:
+                _ensure_reasoning_item_summary(entry)
+    return payload
+
+
 def _reattach_sequence_number_json(serialized: str, seq: Optional[int]) -> str:
-    if seq is None:
-        return serialized
     try:
         payload = json.loads(serialized)
     except (TypeError, ValueError, json.JSONDecodeError):
         return serialized
     if not isinstance(payload, dict):
         return serialized
-    if payload.get("sequence_number") == seq:
+    changed = False
+    if seq is not None and payload.get("sequence_number") != seq:
+        payload["sequence_number"] = seq
+        changed = True
+    before = json.dumps(payload, sort_keys=True)
+    _ensure_grok_responses_sse_compat(payload)
+    after = json.dumps(payload, sort_keys=True)
+    if not changed and before == after:
         return serialized
-    payload["sequence_number"] = seq
     return json.dumps(payload)
 
 
 def _serialize_responses_adapter_response(response_obj: Any) -> str:
-    """Serialize one Responses SSE event, keeping `sequence_number` on the wire.
+    """Serialize one Responses SSE event, keeping Grok-required wire fields.
 
     Pydantic `model_dump_json(exclude_none=True)` drops extra `__dict__` values
     that adapter iterators stamp outside declared fields. Grok Build requires
-    `sequence_number` on every event, so reattach it after dump when present.
+    `sequence_number` on every event and `summary` on reasoning items.
     """
 
     seq = _event_sequence_number(response_obj)
@@ -225,6 +262,7 @@ def _serialize_responses_adapter_response(response_obj: Any) -> str:
         payload = dict(response_obj)
         if seq is not None:
             payload["sequence_number"] = seq
+        _ensure_grok_responses_sse_compat(payload)
         return json.dumps(payload)
     return json.dumps(response_obj)
 
